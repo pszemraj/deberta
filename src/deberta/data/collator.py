@@ -310,6 +310,8 @@ class DebertaV3ElectraCollator:
         if pad_id is not None:
             doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
 
+        # TODO(roadmap): replace dense (B,S,S) mask materialization with compact doc-boundary
+        # metadata and construct block structure lazily on device.
         same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
         keep = same_doc & active[:, :, None] & active[:, None, :]
 

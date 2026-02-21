@@ -17,3 +17,4 @@ For implemented behavior, use the concept docs:
 ## Data/Packing
 
 - evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts
+- replace collator-time dense document attention mask materialization (`B x S x S`) with a compact doc-boundary representation and on-device block masking to reduce CPU bottlenecks at long context lengths
