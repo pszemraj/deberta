@@ -37,6 +37,24 @@ Key options in `ModelConfig`:
 - optional activation checkpointing:
   - `gradient_checkpointing`
 
+## Norm Architecture Rationale (`norm_arch`)
+
+`model.norm_arch: post` is the default by design, not a legacy leftover.
+
+Why:
+
+- This repo's primary encoder targets are shallow-to-mid depth (roughly 12-28 layers in shipped configs), where standard Post-LN is typically stable at the learning-rate ranges used in this project.
+- Pre-LN became the dominant default because it is easier to optimize at very large depth in decoder-only LLMs. That does not automatically make it the best default for moderate-depth encoders.
+- Empirical and recent literature trends point to stronger layer coupling / depth utilization under Post-LN style blocks, while Pre-LN can show higher layer redundancy as depth increases.
+
+How to choose:
+
+- Use `post` for the standard training recipes in this repo (recommended default).
+- Use `keel` when pushing depth and/or optimization aggressiveness and you want additional stability margin while keeping Post-LN style behavior.
+- Treat KEEL as the depth-scaling path, not as a correctness fix required for normal 12-28 layer runs.
+
+For details on KEEL's residual form and paper context, see [`docs/keel-paper-technical-overview.md`](keel-paper-technical-overview.md).
+
 ## Generator/Discriminator Configuration
 
 RTD uses separate generator and discriminator backbones.

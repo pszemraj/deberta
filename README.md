@@ -80,7 +80,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 
 ## Documentation
 
-- Model/backbone options (`rope` vs `hf_deberta_v2`, `swiglu`, KEEL toggles, embedding sharing): [`docs/model.md`](docs/model.md)
+- Model/backbone options (`rope` vs `hf_deberta_v2`, `swiglu`, `norm_arch` rationale for `post` vs `keel`, embedding sharing): [`docs/model.md`](docs/model.md)
 - Data loading, packing, masking, and SDPA/attention-mask behavior: [`docs/data.md`](docs/data.md)
 - RTD objective, loss terms, and generator masked-only logits path: [`docs/objective.md`](docs/objective.md)
 - FSDP2 setup, precision/runtime knobs (`bf16` autocast, TF32, `torch.compile`, SDPA policy), and export flow: [`docs/fsdp2.md`](docs/fsdp2.md)

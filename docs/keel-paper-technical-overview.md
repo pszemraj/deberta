@@ -19,6 +19,12 @@ Main intent:
 - keep Post-LN depth expressivity
 - stabilize gradient flow at larger depth
 
+Important scope note:
+
+- The headline KEEL experiments are decoder-only and very deep.
+- This repo is encoder-focused at moderate depth by default.
+- That is why `post` remains the default here, with `keel` as an explicit deeper-scaling option.
+
 ## Repo Mapping
 
 In this repo KEEL is enabled by:
@@ -34,6 +40,11 @@ Default path remains standard Post-norm (`model.norm_arch: post`).
 For typical encoder depths, `post` is the default and usually sufficient.
 
 Try KEEL when you are increasing depth aggressively and want additional stability margin while keeping a Post-LN style architecture.
+
+Practical decision rule in this repo:
+
+- `norm_arch: post` for standard 12-28 layer encoder pretraining.
+- `norm_arch: keel` when scaling much deeper and/or when optimization stability becomes the bottleneck.
 
 ## Scope and Limits
 
