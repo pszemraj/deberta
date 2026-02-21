@@ -1,10 +1,16 @@
-# DeBERTaV3 Modernized Pretraining (RTD / ELECTRA-style)
+# deberta: Modern Refresh (RTD / ELECTRA-style)
 
-A PyTorch-first pretraining toolkit for DeBERTaV3-style replaced token detection, with a modern RoPE backbone and Accelerate/FSDP2 workflows.
+A PyTorch-first modern refresh of DeBERTa pretraining, focused on DeBERTaV3-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
 
 ## Install
 
+This project is GitHub-first and is not published on PyPI.
+
+Clone + editable install:
+
 ```bash
+git clone https://github.com/pszemraj/deberta.git
+cd deberta
 pip install -U pip
 pip install -e .
 ```
@@ -14,6 +20,12 @@ Optional extras:
 ```bash
 pip install -e '.[dev]'
 pip install -e '.[wandb]'
+```
+
+Direct install from GitHub:
+
+```bash
+pip install "git+https://github.com/pszemraj/deberta.git"
 ```
 
 ## CLI Entrypoints

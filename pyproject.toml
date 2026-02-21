@@ -1,16 +1,19 @@
 [build-system]
-requires = ["setuptools>=70", "wheel"]
+requires = ["setuptools>=77.0.0", "setuptools-scm[toml]>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "debertav3-modernized"
-version = "0.3.1"
-description = "Modernized DeBERTaV3 (RTD/ELECTRA-style) pretraining toolkit built on PyTorch, Transformers, Accelerate, and Datasets."
+name = "deberta"
+dynamic = ["version"]
+description = "Modern refresh of DeBERTa RTD/ELECTRA-style pretraining built on PyTorch, Transformers, Accelerate, and Datasets."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-  {name = "Your Team", email = "ml@example.com"}
+  {name = "Peter Szemraj", email = "peterszemraj+dev@gmail.com"}
+]
+maintainers = [
+  {name = "Peter Szemraj", email = "peterszemraj+dev@gmail.com"}
 ]
 keywords = ["deberta", "deberta-v3", "pretraining", "rtd", "electra", "fsdp2", "accelerate", "transformers"]
 classifiers = [
@@ -38,6 +41,12 @@ dependencies = [
   "sentencepiece>=0.2.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/pszemraj/deberta"
+Repository = "https://github.com/pszemraj/deberta.git"
+Issues = "https://github.com/pszemraj/deberta/issues"
+Documentation = "https://github.com/pszemraj/deberta/tree/main/docs"
+
 [project.optional-dependencies]
 # Logging
 wandb = ["wandb>=0.17.0"]
@@ -62,6 +71,11 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools_scm]
+write_to = "src/deberta/_version.py"
+version_scheme = "no-guess-dev"
+local_scheme = "dirty-tag"
 
 [tool.ruff]
 line-length = 110
