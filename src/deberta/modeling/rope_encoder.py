@@ -525,9 +525,16 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
             keep ``None`` to preserve SDPA flash-friendly unpadded execution.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
-        :param Any kwargs: Additional compatibility kwargs forwarded by callers.
+        :param Any kwargs: Unsupported compatibility kwargs.
         :return BaseModelOutput: Last hidden states container.
         """
+        if kwargs:
+            unsupported = ", ".join(sorted(str(k) for k in kwargs.keys()))
+            raise TypeError(
+                "Unsupported kwargs for DebertaRoPEModel.forward: "
+                f"{unsupported}. Supported args are input_ids, attention_mask, token_type_ids, return_dict."
+            )
+
         if attention_mask is None:
             pad_id = getattr(self.config, "pad_token_id", None)
             if pad_id is not None:

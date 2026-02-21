@@ -75,6 +75,7 @@ class DebertaV3ElectraCollator:
         self._special_token_ids = self._collect_special_token_ids()
         self._non_special_token_ids_cpu = self._build_non_special_token_ids()
         self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
+        self._word_boundary_scheme = self._detect_word_boundary_scheme()
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         features = self._harmonize_optional_attention_masks(features)
@@ -259,6 +260,38 @@ class DebertaV3ElectraCollator:
 
         return inferred
 
+    def _detect_word_boundary_scheme(self) -> str | None:
+        """Detect tokenizer continuation marker scheme once when possible.
+
+        :return str | None: One of ``wordpiece`` / ``sentencepiece`` / ``gpt2`` or ``None``.
+        """
+        tokenize = getattr(self.tokenizer, "tokenize", None)
+        if not callable(tokenize):
+            return None
+
+        try:
+            probe = tokenize("hello world")
+        except Exception:
+            return None
+
+        if not isinstance(probe, list) or not probe:
+            return None
+        return self._infer_word_boundary_scheme_from_tokens([str(tok) for tok in probe])
+
+    def _infer_word_boundary_scheme_from_tokens(self, tokens: Sequence[str]) -> str:
+        """Infer continuation marker style from token strings.
+
+        :param Sequence[str] tokens: Token strings.
+        :return str: One of ``wordpiece`` / ``sentencepiece`` / ``gpt2`` / ``none``.
+        """
+        if any(tok.startswith("##") for tok in tokens):
+            return "wordpiece"
+        if any(tok.startswith("▁") for tok in tokens):
+            return "sentencepiece"
+        if any(tok.startswith("Ġ") for tok in tokens):
+            return "gpt2"
+        return "none"
+
     def _build_document_attention_mask(
         self,
         *,
@@ -306,7 +339,8 @@ class DebertaV3ElectraCollator:
 
         cls_id = getattr(self.tokenizer, "cls_token_id", None)
         if cls_id is not None:
-            doc_ids = doc_ids.masked_fill(input_ids.eq(int(cls_id)), 0)
+            # Keep CLS in document 1 so it can aggregate packed-sequence content.
+            doc_ids = doc_ids.masked_fill(input_ids.eq(int(cls_id)), 1)
         if pad_id is not None:
             doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
 
@@ -358,37 +392,44 @@ class DebertaV3ElectraCollator:
 
         # Use a fixed budget per sequence (rounded from maskable count) to stabilize
         # effective masked-token counts across microbatches.
-        B, _ = input_ids.shape
-        for b in range(B):
-            ids = input_ids[b]
-            maskable = ~special_tokens_mask[b]
-            if pad_token_id is not None:
-                maskable = maskable & ids.ne(int(pad_token_id))
+        maskable = ~special_tokens_mask
+        if pad_token_id is not None:
+            maskable = maskable & input_ids.ne(int(pad_token_id))
 
-            candidates = torch.nonzero(maskable, as_tuple=False).flatten()
-            if int(candidates.numel()) == 0:
-                continue
+        candidate_counts = maskable.sum(dim=1)
+        num_to_mask = torch.round(candidate_counts.to(torch.float32) * mlm_prob).to(torch.long)
+        num_to_mask = torch.where(
+            candidate_counts > 0,
+            torch.clamp(num_to_mask, min=1),
+            torch.zeros_like(num_to_mask),
+        )
+        num_to_mask = torch.minimum(num_to_mask, candidate_counts)
 
-            num_to_mask = max(1, int(round(float(candidates.numel()) * mlm_prob)))
-            num_to_mask = min(num_to_mask, int(candidates.numel()))
+        max_to_mask = int(num_to_mask.max().item()) if int(num_to_mask.numel()) > 0 else 0
+        if max_to_mask <= 0:
+            return input_ids, labels
 
-            choice = torch.randperm(int(candidates.numel()), device=input_ids.device)[:num_to_mask]
-            masked_idx = candidates[choice]
+        # Row-wise random ranking over candidate positions, then take per-row top-k.
+        scores = torch.rand(input_ids.shape, device=input_ids.device, dtype=torch.float32)
+        scores = scores.masked_fill(~maskable, 2.0)
+        topk_idx = torch.topk(scores, k=max_to_mask, dim=1, largest=False).indices
+        topk_rank = torch.arange(max_to_mask, device=input_ids.device).unsqueeze(0)
+        topk_valid = topk_rank < num_to_mask.unsqueeze(1)
 
-            labels[b, masked_idx] = ids[masked_idx]
+        masked_indices = torch.zeros_like(maskable)
+        masked_indices.scatter_(1, topk_idx, topk_valid)
 
-            repl_roll = torch.rand((num_to_mask,), device=input_ids.device)
-            mask_sel = repl_roll < mask_prob
-            rand_sel = (repl_roll >= mask_prob) & (repl_roll < (mask_prob + random_prob))
+        labels[masked_indices] = input_ids[masked_indices]
 
-            if bool(mask_sel.any().item()):
-                input_ids[b, masked_idx[mask_sel]] = mask_token_id
-            if bool(rand_sel.any().item()):
-                rand_words = self._sample_random_words(
-                    (int(rand_sel.sum().item()),),
-                    device=input_ids.device,
-                )
-                input_ids[b, masked_idx[rand_sel]] = rand_words
+        repl_roll = torch.rand(input_ids.shape, device=input_ids.device, dtype=torch.float32)
+        mask_sel = masked_indices & (repl_roll < mask_prob)
+        rand_sel = masked_indices & (repl_roll >= mask_prob) & (repl_roll < (mask_prob + random_prob))
+
+        if bool(mask_sel.any().item()):
+            input_ids[mask_sel] = mask_token_id
+        if bool(rand_sel.any().item()):
+            rand_words = self._sample_random_words(input_ids.shape, device=input_ids.device)
+            input_ids[rand_sel] = rand_words[rand_sel]
 
         # Remaining masked positions keep original token.
         return input_ids, labels
@@ -525,14 +566,15 @@ class DebertaV3ElectraCollator:
         prev_i: int | None = None
 
         special_tokens = set(getattr(self.tokenizer, "all_special_tokens", []))
-        lexical_tokens = [
-            tok
-            for tok, is_spec in zip(tokens, spec, strict=True)
-            if (not is_spec) and tok is not None and tok != "" and tok not in special_tokens
-        ]
-        uses_wordpiece_cont = any(tok.startswith("##") for tok in lexical_tokens)
-        uses_sentencepiece_markers = any(tok.startswith("▁") for tok in lexical_tokens)
-        uses_gpt2_markers = any(tok.startswith("Ġ") for tok in lexical_tokens)
+        scheme = self._word_boundary_scheme
+        if scheme is None:
+            lexical_tokens = [
+                tok
+                for tok, is_spec in zip(tokens, spec, strict=True)
+                if (not is_spec) and tok is not None and tok != "" and tok not in special_tokens
+            ]
+            scheme = self._infer_word_boundary_scheme_from_tokens(lexical_tokens)
+            self._word_boundary_scheme = scheme
 
         def _is_continuation(tok: str) -> bool:
             """Detect whether token text continues the previous word.
@@ -542,13 +584,13 @@ class DebertaV3ElectraCollator:
             """
             if tok.startswith("##"):
                 return True
-            if uses_sentencepiece_markers:
+            if scheme == "sentencepiece":
                 return not tok.startswith("▁")
-            if uses_gpt2_markers:
+            if scheme == "gpt2":
                 return not tok.startswith("Ġ")
             # WordPiece tokenizers often emit plain tokens for word starts and
             # reserve only '##' for continuations.
-            if uses_wordpiece_cont:
+            if scheme == "wordpiece":
                 return False
             # Conservative fallback: if we cannot infer continuation markers,
             # avoid over-merging unrelated adjacent tokens.

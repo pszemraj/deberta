@@ -21,6 +21,7 @@ from deberta.config import (
     validate_training_workflow_options,
 )
 from deberta.export_cli import _build_export_parser
+from deberta.modeling.rtd import compute_generator_loss_term
 from deberta.training.pretrain import (
     _build_optimizer,
     _count_rtd_tokens_for_batch,
@@ -353,6 +354,30 @@ def test_token_weighted_micro_objective_matches_full_batch_normalization():
         (gen_losses[0] * gen_counts[0] + gen_losses[1] * gen_counts[1]) / gen_total
     ) + disc_w * ((disc_losses[0] * disc_counts[0] + disc_losses[1] * disc_counts[1]) / disc_total)
     torch.testing.assert_close(combined, expected)
+
+
+def test_compute_generator_loss_term_matches_decoupled_formula():
+    gen_loss = torch.tensor(2.0)
+    disc_loss = torch.tensor(10.0)
+
+    term = compute_generator_loss_term(
+        gen_loss=gen_loss,
+        disc_loss=disc_loss,
+        decoupled_loss_scaling=True,
+    )
+    expected = (disc_loss / gen_loss) * gen_loss
+    torch.testing.assert_close(term, expected)
+
+
+def test_compute_generator_loss_term_passthrough_when_disabled():
+    gen_loss = torch.tensor(1.5)
+    disc_loss = torch.tensor(7.0)
+    term = compute_generator_loss_term(
+        gen_loss=gen_loss,
+        disc_loss=disc_loss,
+        decoupled_loss_scaling=False,
+    )
+    torch.testing.assert_close(term, gen_loss)
 
 
 def test_finalize_window_metric_loss_averages_non_token_weighted_windows():

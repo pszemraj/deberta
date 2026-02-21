@@ -39,8 +39,8 @@ class RMSNorm(nn.Module):
         # rms = sqrt(mean(x^2))
         dtype = x.dtype
         x_float = x.float() if dtype != torch.float32 else x
-        rms = x_float.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        y = (x_float / rms).to(dtype)
+        inv_rms = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        y = (x_float * inv_rms).to(dtype)
         if self.weight is not None:
             y = y * self.weight.to(dtype)
         return y

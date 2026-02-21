@@ -28,6 +28,23 @@ def _get_act_fn(name_or_fn: str | Any) -> Any:
         return name_or_fn
 
 
+def compute_generator_loss_term(
+    *, gen_loss: torch.Tensor, disc_loss: torch.Tensor, decoupled_loss_scaling: bool
+) -> torch.Tensor:
+    """Return generator loss term with optional decoupled RTD scaling.
+
+    :param torch.Tensor gen_loss: Raw generator loss.
+    :param torch.Tensor disc_loss: Raw discriminator loss.
+    :param bool decoupled_loss_scaling: Whether to rescale generator loss.
+    :return torch.Tensor: Generator loss term used in total objective.
+    """
+    if not decoupled_loss_scaling:
+        return gen_loss
+    eps = 1e-6
+    alpha = (disc_loss.detach() / (gen_loss.detach() + eps)).clamp(min=0.0, max=1e4)
+    return alpha * gen_loss
+
+
 class _TiedEmbedding(nn.Module):
     """Embedding that reads weights from a different module.
 
@@ -553,12 +570,11 @@ class DebertaV3RTDPretrainer(nn.Module):
         # -------------------
         # Total
         # -------------------
-        gen_loss_scaled = gen_loss
-        if decoupled_loss_scaling:
-            # Match original implementations: scale gen_loss by disc/gen magnitudes.
-            eps = 1e-6
-            alpha = (disc_loss.detach() / (gen_loss.detach() + eps)).clamp(min=0.0, max=1e4)
-            gen_loss_scaled = alpha * gen_loss
+        gen_loss_scaled = compute_generator_loss_term(
+            gen_loss=gen_loss,
+            disc_loss=disc_loss,
+            decoupled_loss_scaling=bool(decoupled_loss_scaling),
+        )
 
         total = float(gen_loss_weight) * gen_loss_scaled + float(disc_loss_weight) * disc_loss
         return RTDOutput(

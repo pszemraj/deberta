@@ -32,6 +32,7 @@ from deberta.data.streaming import PackedStreamingConfig
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import merge_embeddings_into_export_backbone
+from deberta.modeling.rtd import compute_generator_loss_term
 
 logger = logging.getLogger(__name__)
 
@@ -468,11 +469,11 @@ def _token_weighted_micro_objective(
     gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
     disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
 
-    gen_term = gen_loss
-    if decoupled_loss_scaling:
-        eps = 1e-6
-        alpha = (disc_loss.detach() / (gen_loss.detach() + eps)).clamp(min=0.0, max=1e4)
-        gen_term = alpha * gen_loss
+    gen_term = compute_generator_loss_term(
+        gen_loss=gen_loss,
+        disc_loss=disc_loss,
+        decoupled_loss_scaling=bool(decoupled_loss_scaling),
+    )
 
     return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
 

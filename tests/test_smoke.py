@@ -209,6 +209,10 @@ def test_collator_builds_document_block_attention_mask_when_internal_separators_
     assert attn[0, 3, 1].item() == 0
     assert attn[0, 1, 2].item() == 1
     assert attn[0, 3, 5].item() == 1
+    # CLS participates in doc 1 instead of being isolated.
+    assert attn[0, 0, 1].item() == 1
+    assert attn[0, 1, 0].item() == 1
+    assert attn[0, 0, 3].item() == 0
 
 
 def test_ngram_masking_respects_specials():
@@ -256,6 +260,25 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
     assert set(counts) == {1}
 
 
+def test_token_level_masking_uses_fixed_budget_for_variable_length_batch():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.4, max_ngram=1))
+
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 10, 11, 12, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 0, 0, 1],
+        },
+        {"input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
+    ]
+    batch = coll(features)
+    labels = batch["labels"]
+
+    masked_counts = labels.ne(-100).sum(dim=1).tolist()
+    # seq0 has 3 candidates => round(1.2)=1, seq1 has 2 candidates => round(0.8)=1
+    assert masked_counts == [1, 1]
+
+
 def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
     class WordPieceLikeTokenizer(DummyTokenizer):
         def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
@@ -271,6 +294,33 @@ def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
             return [table.get(i, f"tok{i}") for i in ids]
 
     tok = WordPieceLikeTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.5, max_ngram=3))
+
+    ids = [tok.cls_token_id, 10, 11, 12, tok.sep_token_id]
+    spec = [1, 0, 0, 0, 1]
+    groups = coll._build_word_groups(ids, spec)
+    assert groups == [[1], [2], [3]]
+
+
+def test_word_boundary_scheme_detected_once_from_tokenizer_probe():
+    class ProbeWordPieceTokenizer(DummyTokenizer):
+        def tokenize(self, text: str) -> list[str]:
+            del text
+            return ["hello", "##world"]
+
+        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+            table = {
+                self.pad_token_id: "[PAD]",
+                self.cls_token_id: "[CLS]",
+                self.sep_token_id: "[SEP]",
+                self.mask_token_id: "[MASK]",
+                10: "Ġalpha",
+                11: "beta",
+                12: "Ġgamma",
+            }
+            return [table.get(i, f"tok{i}") for i in ids]
+
+    tok = ProbeWordPieceTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.5, max_ngram=3))
 
     ids = [tok.cls_token_id, 10, 11, 12, tok.sep_token_id]
@@ -847,6 +897,32 @@ def test_rope_model_accepts_positional_input_ids_call():
     torch.testing.assert_close(out_positional, out_keyword, rtol=0.0, atol=0.0)
 
 
+def test_rope_model_rejects_unknown_forward_kwargs():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaRoPEModel(cfg).eval()
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 6), dtype=torch.long)
+
+    with pytest.raises(TypeError, match="Unsupported kwargs"):
+        _ = model(input_ids=input_ids, output_hidden_states=True)
+
+
 def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
     import pytest
 
@@ -1034,3 +1110,19 @@ def test_rotary_apply_full_dim_matches_reference():
 
     torch.testing.assert_close(q_out, q_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(k_out, k_ref, rtol=0.0, atol=0.0)
+
+
+def test_rmsnorm_matches_reference_division_form():
+    from deberta.modeling.norm import RMSNorm
+
+    torch.manual_seed(0)
+    x = torch.randn((3, 5, 16), dtype=torch.float32)
+    layer = RMSNorm(hidden_size=16, eps=1e-6, elementwise_affine=True).eval()
+
+    with torch.no_grad():
+        out = layer(x)
+        x_float = x.float()
+        rms = x_float.pow(2).mean(dim=-1, keepdim=True).add(layer.eps).sqrt()
+        ref = (x_float / rms).to(dtype=x.dtype) * layer.weight.to(dtype=x.dtype)
+
+    torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-7)
