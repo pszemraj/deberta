@@ -160,17 +160,10 @@ def _apply_rope_config_overrides(
         # No effect on loaded parameters, but keep explicit metadata override consistent.
         cfg.initializer_range = float(model_cfg.initializer_range)
 
-    apply_dropout_overrides = bool(model_cfg.from_scratch) or (
-        model_cfg.hidden_dropout_prob is not None and float(model_cfg.hidden_dropout_prob) != 0.0
-    )
-    if apply_dropout_overrides and model_cfg.hidden_dropout_prob is not None:
+    if model_cfg.hidden_dropout_prob is not None:
         cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
 
-    apply_attention_dropout_overrides = bool(model_cfg.from_scratch) or (
-        model_cfg.attention_probs_dropout_prob is not None
-        and float(model_cfg.attention_probs_dropout_prob) != 0.0
-    )
-    if apply_attention_dropout_overrides and model_cfg.attention_probs_dropout_prob is not None:
+    if model_cfg.attention_probs_dropout_prob is not None:
         cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
 
 
@@ -209,20 +202,13 @@ def build_backbone_configs(
         else:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
 
-        # Optional dropout overrides.
-        # Keep 0.0 as "unset" here so default HF checkpoints can keep native values.
-        apply_dropout_overrides = (
-            model_cfg.hidden_dropout_prob is not None and float(model_cfg.hidden_dropout_prob) != 0.0
-        )
-        if apply_dropout_overrides and model_cfg.hidden_dropout_prob is not None:
+        # Optional dropout overrides. ``None`` preserves checkpoint-native values;
+        # any numeric value (including 0.0) is an explicit override.
+        if model_cfg.hidden_dropout_prob is not None:
             disc_cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
             gen_cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
 
-        apply_attention_dropout_overrides = (
-            model_cfg.attention_probs_dropout_prob is not None
-            and float(model_cfg.attention_probs_dropout_prob) != 0.0
-        )
-        if apply_attention_dropout_overrides and model_cfg.attention_probs_dropout_prob is not None:
+        if model_cfg.attention_probs_dropout_prob is not None:
             disc_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
             gen_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
 

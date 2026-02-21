@@ -931,6 +931,96 @@ def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs(
         assert getattr(cfg, "eos_token_id", None) == 5
 
 
+def test_build_backbone_configs_hf_respects_explicit_zero_dropout_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeHFConfig:
+        def __init__(self) -> None:
+            self.vocab_size = 64
+            self.hidden_size = 32
+            self.num_hidden_layers = 2
+            self.num_attention_heads = 4
+            self.intermediate_size = 64
+            self.hidden_act = "gelu"
+            self.hidden_dropout_prob = 0.1
+            self.attention_probs_dropout_prob = 0.2
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=lambda _src: _FakeHFConfig())
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    class _Tokenizer:
+        pad_token_id = 0
+        cls_token_id = 1
+        sep_token_id = 2
+        mask_token_id = 3
+
+        def __len__(self) -> int:
+            return 128
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=True,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    disc_cfg, gen_cfg = build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_Tokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.0)
+    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.0)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.0)
+    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.0)
+
+
+def test_build_backbone_configs_hf_preserves_dropout_when_set_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeHFConfig:
+        def __init__(self) -> None:
+            self.vocab_size = 64
+            self.hidden_size = 32
+            self.num_hidden_layers = 2
+            self.num_attention_heads = 4
+            self.intermediate_size = 64
+            self.hidden_act = "gelu"
+            self.hidden_dropout_prob = 0.1
+            self.attention_probs_dropout_prob = 0.2
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=lambda _src: _FakeHFConfig())
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    class _Tokenizer:
+        pad_token_id = 0
+        cls_token_id = 1
+        sep_token_id = 2
+        mask_token_id = 3
+
+        def __len__(self) -> int:
+            return 128
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=True,
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
+    )
+    disc_cfg, gen_cfg = build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_Tokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.1)
+    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.1)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
+    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
+
+
 def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ):
