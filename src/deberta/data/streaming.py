@@ -205,6 +205,12 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 yield self._build_example_from_chunk(chunk=chunk, max_seq=max_seq)
 
         # Flush trailing remainder instead of silently dropping it.
+        #
+        # We append one explicit document separator after each document, so the final
+        # buffer commonly ends with SEP. Emitting that SEP-only tail would produce a
+        # degenerate [CLS, SEP, SEP, PAD...] example with no training signal.
+        if buffer and buffer[-1] == sep_id:
+            buffer = buffer[:-1]
         if buffer:
             yield self._build_example_from_chunk(chunk=buffer[:block_len], max_seq=max_seq)
 

@@ -144,6 +144,30 @@ def test_packed_streaming_flushes_tail_instead_of_dropping():
     assert (tok.pad_token_id in rows[1]["input_ids"]) is True
 
 
+def test_packed_streaming_does_not_emit_separator_only_tail_chunk():
+    tok = DummyTokenizer(vocab_size=64)
+    # max_seq=8 => block_len=6, so this document fills exactly one block.
+    hf_dataset = [{"text": "a b c d e f"}]
+
+    ds = PackedStreamingDataset(
+        hf_dataset=hf_dataset,
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(text_column_name="text", max_seq_length=8, seed=0, shuffle_buffer_size=0),
+        process_index=0,
+        num_processes=1,
+    )
+    rows = list(ds)
+
+    # We should emit exactly one fully useful row, not an extra [CLS, SEP, SEP, PAD...] tail.
+    assert len(rows) == 1
+    ex = rows[0]
+    assert ex["input_ids"][0] == tok.cls_token_id
+    assert ex["input_ids"][-1] == tok.sep_token_id
+    assert tok.pad_token_id not in ex["input_ids"]
+    assert "attention_mask" not in ex
+    assert ex["special_tokens_mask"] == [1, 0, 0, 0, 0, 0, 0, 1]
+
+
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a b c d e f g h i"}]
