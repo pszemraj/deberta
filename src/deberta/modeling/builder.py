@@ -148,6 +148,7 @@ def _apply_rope_config_overrides(
             cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
 
     cfg.attention_implementation = str(model_cfg.attention_implementation)
+    cfg.use_rmsnorm_heads = True
     if model_cfg.from_scratch:
         # Scratch RoPE builds fully follow model_cfg architecture knobs.
         cfg.ffn_type = str(model_cfg.ffn_type)
@@ -211,6 +212,9 @@ def build_backbone_configs(
         if model_cfg.attention_probs_dropout_prob is not None:
             disc_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
             gen_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
+
+        disc_cfg.use_rmsnorm_heads = False
+        gen_cfg.use_rmsnorm_heads = False
 
         _apply_tokenizer_special_ids(disc_cfg, tokenizer)
         _apply_tokenizer_special_ids(gen_cfg, tokenizer)

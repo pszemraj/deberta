@@ -355,11 +355,9 @@ class DebertaV3ElectraCollator:
         doc_ids = sep_before + 1
 
         cls_id = getattr(self.tokenizer, "cls_token_id", None)
-        cls_positions: torch.Tensor | None = None
         if cls_id is not None:
             cls_positions = input_ids.eq(int(cls_id)) & active
-            # Keep CLS in document 1 for base same-doc logic; we then promote CLS to
-            # a global token in the final keep-mask so it can aggregate across packed docs.
+            # Keep CLS in document 1 so strict packed doc-blocking stays block-diagonal.
             doc_ids = doc_ids.masked_fill(cls_positions, 1)
         if pad_id is not None:
             doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
@@ -368,13 +366,6 @@ class DebertaV3ElectraCollator:
         # metadata and construct block structure lazily on device.
         same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
         keep = same_doc & active[:, :, None] & active[:, None, :]
-
-        # Make CLS global inside packed sequences: CLS can attend to all active tokens,
-        # and all active tokens can attend back to CLS.
-        if cls_positions is not None:
-            cls_query = cls_positions[:, :, None]
-            cls_key = cls_positions[:, None, :]
-            keep = keep | (cls_query & active[:, None, :]) | (active[:, :, None] & cls_key)
 
         # Guarantee at least self-attend for active queries to avoid all-masked rows.
         eye = torch.eye(input_ids.shape[1], dtype=torch.bool, device=input_ids.device).unsqueeze(0)

@@ -67,8 +67,14 @@ def attention_mask_to_active_tokens(
     if mask.ndim == 2:
         return mask
     if mask.ndim == 3:
+        # Packed pairwise masks encode document constraints, not padding identity.
+        # Recover token activity from input ids when padding metadata is available.
+        if pad_token_id is not None:
+            return input_ids.ne(int(pad_token_id))
         return mask.any(dim=-1)
     if mask.ndim == 4:
+        if pad_token_id is not None:
+            return input_ids.ne(int(pad_token_id))
         active = mask.any(dim=-1)
         if active.ndim == 3:
             active = active.any(dim=1)
@@ -152,9 +158,11 @@ class MLMTransform(nn.Module):
         hidden_size = int(config.hidden_size)
         self.dense = nn.Linear(hidden_size, hidden_size)
         self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
-        self.norm = RMSNorm(
-            hidden_size, eps=float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
-        )
+        eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
+        if bool(getattr(config, "use_rmsnorm_heads", True)):
+            self.norm = RMSNorm(hidden_size, eps=eps)
+        else:
+            self.norm = nn.LayerNorm(hidden_size, eps=eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Transform hidden states before vocab projection.
@@ -246,9 +254,11 @@ class RTDHead(nn.Module):
         # A small transform helps stability.
         self.dense = nn.Linear(hidden_size, hidden_size)
         self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
-        self.norm = RMSNorm(
-            hidden_size, eps=float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
-        )
+        eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
+        if bool(getattr(config, "use_rmsnorm_heads", True)):
+            self.norm = RMSNorm(hidden_size, eps=eps)
+        else:
+            self.norm = nn.LayerNorm(hidden_size, eps=eps)
         self.classifier = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

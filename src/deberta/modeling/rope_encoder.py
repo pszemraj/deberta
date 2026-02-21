@@ -226,6 +226,7 @@ class DebertaRoPESelfAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope.apply(q, k)
 
+        use_sdpa = self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention")
         sdpa_attn_mask = None
         eager_attn_mask = None
         query_keep_tokens = None
@@ -238,7 +239,8 @@ class DebertaRoPESelfAttention(nn.Module):
                 # PyTorch SDPA bool masks use True=keep, False=masked.
                 sdpa_attn_mask = key_keep[:, None, None, :]  # (B,1,1,S) bool
                 # Eager path uses masked_fill, so True marks masked positions.
-                eager_attn_mask = ~sdpa_attn_mask
+                if not use_sdpa:
+                    eager_attn_mask = ~sdpa_attn_mask
                 query_keep = key_keep
             elif mask.ndim == 3:
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
@@ -252,7 +254,8 @@ class DebertaRoPESelfAttention(nn.Module):
                 pair_keep[:, diag_idx, diag_idx] = True
 
                 sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
-                eager_attn_mask = ~sdpa_attn_mask
+                if not use_sdpa:
+                    eager_attn_mask = ~sdpa_attn_mask
             else:
                 raise ValueError(
                     "attention_mask must have shape (B,S) or (B,S,S) for DebertaRoPESelfAttention."
@@ -261,7 +264,7 @@ class DebertaRoPESelfAttention(nn.Module):
             # Explicitly zero masked query outputs after output projection.
             query_keep_tokens = query_keep[:, :, None].to(dtype=q.dtype)
 
-        if self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
+        if use_sdpa:
             out = F.scaled_dot_product_attention(
                 q,
                 k,

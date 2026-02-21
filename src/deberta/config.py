@@ -369,11 +369,12 @@ class DataConfig:
         },
     )
     block_cross_document_attention: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": (
-                "When data.pack_sequences=true, emit 3D pairwise masks that block cross-document attention "
-                "inside packed sequences. Disable to keep packed batches on 2D/no-mask fast paths."
+                "When data.pack_sequences=true, optionally emit 3D pairwise masks that block cross-document "
+                "attention inside packed sequences. Default false to avoid quadratic mask overhead; "
+                "enable only when strict doc-blocking is required."
             )
         },
     )

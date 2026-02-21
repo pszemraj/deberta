@@ -871,8 +871,14 @@ def _export_discriminator_hf(
         unwrapped = accelerator.unwrap_model(model)
 
         # Try to gather state dicts via accelerator (preferred for distributed).
-        disc_sd = accelerator.get_state_dict(model.discriminator)
-        gen_sd = accelerator.get_state_dict(model.generator)
+        disc_mod = getattr(unwrapped, "discriminator", None)
+        gen_mod = getattr(unwrapped, "generator", None)
+        if disc_mod is None or gen_mod is None:
+            raise RuntimeError(
+                "Unwrapped RTD model must expose discriminator and generator modules for export."
+            )
+        disc_sd = accelerator.get_state_dict(disc_mod)
+        gen_sd = accelerator.get_state_dict(gen_mod)
 
         # Build a fresh model from config.
         if DebertaRoPEConfig is not None and isinstance(
