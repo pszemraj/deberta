@@ -4,7 +4,6 @@ from typing import Any
 
 import torch
 
-from deberta.cli import _load_yaml
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
 
@@ -98,18 +97,6 @@ class DummyTokenizer:
         if return_tensors == "pt":
             return {k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()}
         return batch
-
-
-def test_yaml_config_parses_overwrite_output_dir(tmp_path):
-    import pytest
-
-    pytest.importorskip("yaml")
-
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text("train:\n  overwrite_output_dir: true\n", encoding="utf-8")
-
-    _, _, train_cfg = _load_yaml(cfg_path)
-    assert train_cfg.overwrite_output_dir is True
 
 
 def test_packed_streaming_marks_internal_sep_as_special():

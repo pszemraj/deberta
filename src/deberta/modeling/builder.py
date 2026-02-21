@@ -42,6 +42,45 @@ def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
     return gen_cfg
 
 
+def _apply_rope_config_overrides(
+    cfg: Any,
+    *,
+    model_cfg: ModelConfig,
+    tokenizer: Any,
+    max_position_embeddings: int,
+) -> None:
+    """Apply shared RoPE config overrides for generator/discriminator configs.
+
+    :param Any cfg: Target config object.
+    :param ModelConfig model_cfg: User model configuration.
+    :param Any tokenizer: Tokenizer for vocab/pad metadata.
+    :param int max_position_embeddings: Sequence length budget.
+    """
+    cfg.vocab_size = int(len(tokenizer))
+    cfg.pad_token_id = int(tokenizer.pad_token_id or 0)
+    cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
+
+    cfg.rope_theta = float(model_cfg.rope_theta)
+    cfg.rotary_pct = float(model_cfg.rotary_pct)
+    cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
+    cfg.type_vocab_size = int(model_cfg.type_vocab_size)
+
+    cfg.norm_eps = float(model_cfg.norm_eps)
+    cfg.norm_arch = str(model_cfg.norm_arch)
+    cfg.keel_alpha_init = float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
+    cfg.attention_implementation = str(model_cfg.attention_implementation)
+    if model_cfg.from_scratch:
+        # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
+        cfg.ffn_type = str(model_cfg.ffn_type)
+    cfg.initializer_range = float(model_cfg.initializer_range)
+
+    if model_cfg.hidden_dropout_prob is not None:
+        cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
+    if model_cfg.attention_probs_dropout_prob is not None:
+        cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
+
+
 def build_backbone_configs(
     *,
     model_cfg: ModelConfig,
@@ -87,40 +126,16 @@ def build_backbone_configs(
 
         return disc_cfg, gen_cfg
 
-    if bt != "rope":
-        raise ValueError(f"Unsupported backbone_type: {model_cfg.backbone_type}")
-
     # RoPE backbone
     disc_src = model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
     disc_cfg = DebertaRoPEConfig.from_pretrained(disc_src)
 
-    # Override/force critical fields for RoPE mode
-    disc_cfg.vocab_size = int(len(tokenizer))
-    disc_cfg.pad_token_id = int(tokenizer.pad_token_id or 0)
-    disc_cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
-
-    disc_cfg.rope_theta = float(model_cfg.rope_theta)
-    disc_cfg.rotary_pct = float(model_cfg.rotary_pct)
-    disc_cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
-    disc_cfg.type_vocab_size = int(model_cfg.type_vocab_size)
-
-    disc_cfg.norm_eps = float(model_cfg.norm_eps)
-    disc_cfg.norm_arch = str(model_cfg.norm_arch)
-    disc_cfg.keel_alpha_init = (
-        float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    _apply_rope_config_overrides(
+        disc_cfg,
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=max_position_embeddings,
     )
-    disc_cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
-    disc_cfg.attention_implementation = str(model_cfg.attention_implementation)
-    if model_cfg.from_scratch:
-        # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
-        disc_cfg.ffn_type = str(model_cfg.ffn_type)
-    disc_cfg.initializer_range = float(model_cfg.initializer_range)
-
-    # Optional dropout overrides
-    if model_cfg.hidden_dropout_prob is not None:
-        disc_cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
-    if model_cfg.attention_probs_dropout_prob is not None:
-        disc_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
 
     # Generator config
     if model_cfg.generator_config_name_or_path:
@@ -130,32 +145,12 @@ def build_backbone_configs(
     else:
         gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
 
-    # Make sure generator uses the same RoPE/norm settings unless explicitly overridden
-    gen_cfg.vocab_size = int(len(tokenizer))
-    gen_cfg.pad_token_id = int(tokenizer.pad_token_id or 0)
-    gen_cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
-
-    gen_cfg.rope_theta = float(model_cfg.rope_theta)
-    gen_cfg.rotary_pct = float(model_cfg.rotary_pct)
-    gen_cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
-    gen_cfg.type_vocab_size = int(model_cfg.type_vocab_size)
-
-    gen_cfg.norm_eps = float(model_cfg.norm_eps)
-    gen_cfg.norm_arch = str(model_cfg.norm_arch)
-    gen_cfg.keel_alpha_init = (
-        float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    _apply_rope_config_overrides(
+        gen_cfg,
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=max_position_embeddings,
     )
-    gen_cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
-    gen_cfg.attention_implementation = str(model_cfg.attention_implementation)
-    if model_cfg.from_scratch:
-        # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
-        gen_cfg.ffn_type = str(model_cfg.ffn_type)
-    gen_cfg.initializer_range = float(model_cfg.initializer_range)
-
-    if model_cfg.hidden_dropout_prob is not None:
-        gen_cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
-    if model_cfg.attention_probs_dropout_prob is not None:
-        gen_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
 
     return disc_cfg, gen_cfg
 

@@ -48,8 +48,6 @@ Set `data.pack_sequences=false` to switch to one-document chunking:
 
 When `streaming=false`, training still routes through the same iterable packing wrappers (`PackedStreamingDataset` / `SequentialStreamingDataset`) used in streaming mode, but backed by a map-style HF dataset iterator.
 
-`_maybe_tokenize_non_streaming` remains in the codebase as a legacy helper and is currently not wired into the active training path.
-
 ## Collator Behavior (Dynamic MLM Masking)
 
 `DebertaV3ElectraCollator` performs dynamic masking at batch time.
@@ -83,5 +81,4 @@ Downstream model code treats missing masks as unpadded (`attention_mask=None`).
 
 ## Deferred TODOs
 
-- TODO: decide whether to remove or rewire `_maybe_tokenize_non_streaming` so non-streaming behavior has a single documented path without dormant helper code.
 - TODO: evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts.

@@ -18,6 +18,8 @@ from deberta.config import (
     DataConfig,
     ModelConfig,
     TrainConfig,
+    _normalize_sdpa_kernel,
+    _normalize_torch_compile_mode,
     validate_data_config,
     validate_model_config,
     validate_train_config,
@@ -27,22 +29,11 @@ from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset, Seque
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
+from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling.export_utils import merge_embeddings_into_export_backbone
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_logging(is_main: bool) -> None:
-    """Configure process-local logging.
-
-    :param bool is_main: True for main process.
-    """
-    level = logging.INFO if is_main else logging.WARN
-    logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=level,
-    )
 
 
 def _json_dump(obj: Any, path: Path) -> None:
@@ -110,29 +101,6 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     # Legacy fallback.
     torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
     torch.backends.cudnn.allow_tf32 = bool(enabled)
-
-
-def _normalize_sdpa_kernel(value: Any) -> str:
-    """Normalize SDPA kernel policy values.
-
-    :param Any value: Raw policy value.
-    :return str: Canonical policy.
-    """
-    v = str(value).strip().lower()
-    aliases = {
-        "mem": "mem_efficient",
-        "mem-efficient": "mem_efficient",
-        "efficient": "mem_efficient",
-        "flashattention": "flash",
-        "flash_attention": "flash",
-    }
-    policy = aliases.get(v, v)
-
-    allowed = {"auto", "flash", "mem_efficient", "math", "flash_only"}
-    if policy not in allowed:
-        opts = "|".join(sorted(allowed))
-        raise ValueError(f"train.sdpa_kernel must be one of: {opts}. Got: {value}")
-    return policy
 
 
 def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
@@ -211,27 +179,6 @@ def _bf16_runtime_sanity_check() -> bool:
     except Exception as e:
         logger.warning(f"bf16 autocast preflight failed; falling back to full precision. Error: {e}")
         return False
-
-
-def _normalize_torch_compile_mode(value: Any) -> str:
-    """Normalize torch.compile mode names.
-
-    :param Any value: Raw compile mode value.
-    :return str: Canonical compile mode string.
-    """
-    v = str(value).strip().lower()
-    aliases = {
-        "reduce_overhead": "reduce-overhead",
-        "max_autotune": "max-autotune",
-        "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
-    }
-    mode = aliases.get(v, v)
-
-    allowed = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
-    if mode not in allowed:
-        opts = "|".join(sorted(allowed))
-        raise ValueError(f"train.torch_compile_mode must be one of: {opts}. Got: {value}")
-    return mode
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:
@@ -572,113 +519,6 @@ def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
             logger.warning(f"Failed to delete checkpoint {p}: {e}")
 
 
-def _maybe_tokenize_non_streaming(
-    *,
-    raw_ds: Any,
-    tokenizer: Any,
-    data_cfg: DataConfig,
-    is_train: bool,
-) -> Any:
-    """Tokenize and pack non-streaming datasets to fixed-length blocks.
-
-    :param Any raw_ds: Source dataset object.
-    :param Any tokenizer: HF tokenizer.
-    :param DataConfig data_cfg: Data configuration.
-    :param bool is_train: Whether dataset is for training mode.
-    :return Any: Packed dataset object.
-    """
-
-    try:
-        import datasets
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("datasets is required.") from e
-
-    if not isinstance(raw_ds, datasets.Dataset):
-        # Already iterable or dict; caller should handle.
-        return raw_ds
-
-    text_key = data_cfg.text_column_name
-    if text_key not in raw_ds.column_names:
-        raise KeyError(f"Text column '{text_key}' not found. Available: {raw_ds.column_names}")
-
-    remove_columns = [c for c in raw_ds.column_names if c != text_key]
-
-    cls_id = int(tokenizer.cls_token_id)
-    sep_id = int(tokenizer.sep_token_id)
-
-    def tokenize_fn(examples: dict[str, list[str]]) -> dict[str, Any]:
-        """Tokenize text batch without adding special tokens.
-
-        :param dict[str, list[str]] examples: Batch of dataset examples.
-        :return dict[str, Any]: Tokenized batch.
-        """
-        texts = examples[text_key]
-        # No special tokens: we will add [CLS]/[SEP] after packing.
-        return tokenizer(
-            texts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )
-
-    tokenized = raw_ds.map(
-        tokenize_fn,
-        batched=True,
-        num_proc=int(data_cfg.preprocessing_num_workers),
-        remove_columns=remove_columns,
-        desc="Tokenizing",
-    )
-
-    block_len = int(data_cfg.max_seq_length) - 2
-    if block_len <= 0:
-        raise ValueError("max_seq_length must be >= 3")
-
-    def group_texts(examples: dict[str, list[list[int]]]) -> dict[str, Any]:
-        """Concatenate tokens and split into fixed-size blocks.
-
-        :param dict[str, list[list[int]]] examples: Tokenized examples batch.
-        :return dict[str, Any]: Packed ``input_ids`` and ``special_tokens_mask``.
-        """
-        # Concatenate all texts.
-        concatenated: list[int] = []
-        for seq in examples["input_ids"]:
-            concatenated.extend(seq)
-            concatenated.append(sep_id)
-
-        total_length = len(concatenated)
-        total_length = (total_length // block_len) * block_len
-        if total_length == 0:
-            return {"input_ids": [], "special_tokens_mask": []}
-
-        input_ids = []
-        special_tokens_mask = []
-
-        for i in range(0, total_length, block_len):
-            chunk = concatenated[i : i + block_len]
-            ids = [cls_id] + chunk + [sep_id]
-            input_ids.append(ids)
-            chunk_special = [1 if (t == sep_id or t == cls_id) else 0 for t in chunk]
-            special_tokens_mask.append([1] + chunk_special + [1])
-
-        return {
-            "input_ids": input_ids,
-            "special_tokens_mask": special_tokens_mask,
-        }
-
-    packed = tokenized.map(
-        group_texts,
-        batched=True,
-        num_proc=int(data_cfg.preprocessing_num_workers),
-        remove_columns=tokenized.column_names,
-        desc="Packing",
-    )
-
-    # Drop empty rows (can happen for small datasets)
-    packed = packed.filter(lambda x: len(x["input_ids"]) == data_cfg.max_seq_length)
-
-    return packed
-
-
 def _export_discriminator_hf(
     *,
     accelerator: Any,
@@ -746,35 +586,13 @@ def _export_discriminator_hf(
             )
 
         mode = (embedding_sharing or "none").lower()
-        if mode in {"es", "gdes"}:
-
-            def merge_embedding(attr: str) -> None:
-                """Merge generator/discriminator embedding weights into export model.
-
-                :param str attr: Embedding attribute name under ``embeddings``.
-                """
-                if not hasattr(export_disc, "embeddings") or not hasattr(export_disc.embeddings, attr):
-                    return
-                gen_key = f"embeddings.{attr}.weight"
-                gen_w = gen_sd.get(gen_key)
-                if gen_w is None:
-                    return
-
-                if mode == "es":
-                    merged = gen_w
-                else:
-                    bias = disc_sd.get(f"embeddings.{attr}.bias")
-                    if bias is None:
-                        raise RuntimeError(f"discriminator embedding bias not found for '{attr}' (gdes)")
-                    merged = gen_w.to(dtype=bias.dtype) + bias
-
-                emb_mod = getattr(export_disc.embeddings, attr)
-                if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
-                    emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
-
-            merge_embedding("word_embeddings")
-            merge_embedding("position_embeddings")
-            merge_embedding("token_type_embeddings")
+        merge_embeddings_into_export_backbone(
+            export_model=export_disc,
+            disc_sd=disc_sd,
+            gen_sd=gen_sd,
+            mode=mode,
+            fp32_accumulate=False,
+        )
 
         tokenizer.save_pretrained(str(output_dir))
         export_disc.save_pretrained(str(output_dir / "discriminator"), safe_serialization=True)
@@ -811,7 +629,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         mixed_precision=mixed_precision,
     )
 
-    _setup_logging(accelerator.is_main_process)
+    setup_process_logging(accelerator.is_main_process)
     # Validate config contract up-front before side effects (filesystem/network/model loading).
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)

@@ -19,22 +19,11 @@ from deberta.config import (
     validate_data_config,
     validate_model_config,
 )
+from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling.export_utils import merge_embeddings_into_export_backbone
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_logging(is_main: bool) -> None:
-    """Configure process-local logger settings.
-
-    :param bool is_main: True for primary process.
-    """
-    level = logging.INFO if is_main else logging.WARN
-    logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=level,
-    )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -197,55 +186,6 @@ def _split_state_dict(
     return disc, gen
 
 
-def _merge_embeddings_into_export(
-    *,
-    export_model: Any,
-    disc_sd: dict[str, torch.Tensor],
-    gen_sd: dict[str, torch.Tensor],
-    mode: str,
-) -> None:
-    """Merge tied embedding weights into an export backbone.
-
-    :param Any export_model: Export backbone model.
-    :param dict[str, torch.Tensor] disc_sd: Discriminator state dict.
-    :param dict[str, torch.Tensor] gen_sd: Generator state dict.
-    :param str mode: Embedding sharing mode.
-    """
-    if mode not in {"es", "gdes"}:
-        return
-
-    if not hasattr(export_model, "embeddings"):
-        return
-
-    def merge_attr(attr: str) -> None:
-        """Merge one embedding attribute.
-
-        :param str attr: Embedding attribute name.
-        """
-        if not hasattr(export_model.embeddings, attr):
-            return
-        gen_w = gen_sd.get(f"embeddings.{attr}.weight")
-        if gen_w is None:
-            return
-
-        if mode == "es":
-            merged = gen_w
-        else:
-            bias = disc_sd.get(f"embeddings.{attr}.bias")
-            if bias is None:
-                raise RuntimeError(f"Missing discriminator bias for embeddings.{attr}.bias (gdes)")
-            # Merge in fp32 for numerical stability, then cast at the end.
-            merged = gen_w.detach().float() + bias.detach().float()
-
-        emb_mod = getattr(export_model.embeddings, attr)
-        if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
-            emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
-
-    merge_attr("word_embeddings")
-    merge_attr("position_embeddings")
-    merge_attr("token_type_embeddings")
-
-
 def _build_export_backbone(
     model_cfg: ModelConfig, disc_config: Any, gen_config: Any, export_what: str
 ) -> tuple[Any | None, Any | None]:
@@ -295,7 +235,7 @@ def run_export(cfg: ExportConfig) -> None:
     from accelerate.utils import DistributedType
 
     accelerator = Accelerator()
-    _setup_logging(accelerator.is_main_process)
+    setup_process_logging(accelerator.is_main_process)
 
     checkpoint_dir = Path(cfg.checkpoint_dir).expanduser().resolve()
     if not checkpoint_dir.exists():
@@ -425,8 +365,12 @@ def run_export(cfg: ExportConfig) -> None:
             filtered = {k: v for k, v in disc_sd.items() if k in export_keys}
             export_disc.load_state_dict(filtered, strict=False)
             if embedding_sharing in {"es", "gdes"}:
-                _merge_embeddings_into_export(
-                    export_model=export_disc, disc_sd=disc_sd, gen_sd=gen_sd, mode=embedding_sharing
+                merge_embeddings_into_export_backbone(
+                    export_model=export_disc,
+                    disc_sd=disc_sd,
+                    gen_sd=gen_sd,
+                    mode=embedding_sharing,
+                    fp32_accumulate=True,
                 )
 
             export_disc.save_pretrained(
