@@ -2,11 +2,11 @@
 
 A **PyTorch 2.9.1+** pretraining toolkit for DeBERTaV3-style **Replaced Token Detection (RTD)** with a modern encoder backbone and first-class **Accelerate + FSDP2** support.
 
-This **v3.1** update includes:
+This **v4.0** update includes:
 
-- **RoPE** replacing DeBERTa’s *disentangled position bias*  
-  → compatible with **PyTorch SDPA / FlashAttention** kernels and better length generalization
-- **Post-Norm topology** retained (encoder-depth friendly), swapping **LayerNorm → RMSNorm**
+- **RoPE** replacing DeBERTa's *disentangled position bias*  
+  -> compatible with **PyTorch SDPA / FlashAttention** kernels and better length generalization
+- **Post-Norm topology** retained (encoder-depth friendly), swapping **LayerNorm -> RMSNorm**
 - **SwiGLU FFN** (`ffn_type: swiglu`) as the default FFN block for RoPE backbones
 - Optional **KEEL** residual topology via config (`norm_arch: keel`) for extra stability margin
 - **Long-context presets** for 2048 and 4096 sequence lengths
@@ -46,7 +46,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
 
 The YAML config format supports either:
 
-- nested sections (`model:`, `data:`, `train:`) — recommended
+- nested sections (`model:`, `data:`, `train:`) - recommended
 - a flat dict with keys from `ModelConfig`, `DataConfig`, `TrainConfig`
 
 See `configs/` for examples.
@@ -69,7 +69,8 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pre
 ```
 
 Notes:
-- Attention uses **`torch.nn.functional.scaled_dot_product_attention`** (`--attention_implementation sdpa`) and will dispatch to FlashAttention kernels when available.
+
+- Attention uses **`torch.nn.functional.scaled_dot_product_attention`** (`--attention_implementation sdpa`) and will dispatch to FlashAttention kernels when inputs are compatible.
 - For length generalization, keep `--use_absolute_position_embeddings false` (default).
 - Training defaults to `train.mixed_precision=bf16` (autocast), not full-parameter bf16 casting.
 - Optional compile modes: `--torch_compile true --torch_compile_mode max-autotune-no-cudagraphs` can be a safer fallback on some CUDA stacks.
@@ -119,6 +120,7 @@ You can also request SDPA backend preference via `train.sdpa_kernel`:
 - **Whole-word n-gram masking (closer to DeBERTa):** set `mlm_max_ngram = 3` (or similar)
 
 Replacement probabilities:
+
 - `mask_token_prob` (default 0.8)
 - `random_token_prob` (default 0.1)
 - remaining probability keeps the original token
@@ -155,7 +157,7 @@ accelerate launch --config_file configs/fsdp2_hf_deberta_1node.yaml --no_python 
   --output_dir runs/deberta_hf_deberta_rtd
 ```
 
-**Important:** RoPE/RMSNorm/KEEL are **not** applied in `hf_deberta_v2` mode.
+**Important:** RoPE/RMSNorm/KEEL/SwiGLU are **not** applied in `hf_deberta_v2` mode.
 
 ---
 
@@ -175,6 +177,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-exp
 ```
 
 This will:
+
 1) load the sharded checkpoint,
 2) gather a **FULL_STATE_DICT on rank0**,
 3) merge tied embeddings (`es` / `gdes`) into standalone HF backbones,
@@ -184,8 +187,8 @@ This will:
 
 ## Repo layout
 
-- `src/deberta/` – core package
-- `src/deberta/training/pretrain.py` – training loop
-- `src/deberta/export_cli.py` – consolidation + export tool
-- `configs/` – accelerate configs (FSDP2 examples + YAML training configs)
-- `docs/` – minimal docs for key pieces
+- `src/deberta/` - core package
+- `src/deberta/training/pretrain.py` - training loop
+- `src/deberta/export_cli.py` - consolidation + export tool
+- `configs/` - accelerate configs (FSDP2 examples + YAML training configs)
+- `docs/` - minimal docs for key pieces
