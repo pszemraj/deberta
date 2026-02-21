@@ -301,7 +301,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         self,
         *,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor,
         token_type_ids: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
@@ -312,7 +312,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         """Run one ELECTRA-style forward pass.
 
         :param torch.Tensor input_ids: Masked input ids.
-        :param torch.Tensor attention_mask: Binary mask (1 real token, 0 pad).
+        :param torch.Tensor | None attention_mask: Binary mask (1 real token, 0 pad).
         :param torch.Tensor labels: Original token ids at masked positions, else -100.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param float sampling_temperature: Sampling temperature for generator tokens.
@@ -377,7 +377,10 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_hidden = disc_out.last_hidden_state
         disc_logits = self.discriminator_head(disc_hidden)
 
-        active = attention_mask.to(torch.bool)
+        if attention_mask is None:
+            active = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            active = attention_mask.to(torch.bool)
         disc_loss = F.binary_cross_entropy_with_logits(disc_logits[active].float(), disc_labels[active])
 
         # Accuracy for monitoring: threshold at 0

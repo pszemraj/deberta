@@ -14,8 +14,8 @@ When `data.streaming=true`, we use Hugging Face Datasets in streaming mode and w
 ```python
 {
   "input_ids":          [CLS] + chunk + [SEP] + pad,
-  "attention_mask":     1s for real tokens, 0s for pad,
   "special_tokens_mask": 1 for CLS/SEP/PAD tokens, 0 otherwise,
+  "attention_mask":     optional, only when padding is present
 }
 ```
 
@@ -40,3 +40,16 @@ The labels follow HF convention:
 
 - `labels[i] = original_token_id` for masked positions
 - `labels[i] = -100` for all other positions
+
+## FlashAttention and Masks
+
+For packed pretraining batches, sequences are usually fixed-length and unpadded. In this case,
+an explicit all-ones `attention_mask` is redundant and can reduce SDPA backend flexibility.
+
+This repo keeps that path lean by:
+
+1. Omitting `attention_mask` from packed datasets when no padding is present.
+2. Having the collator try `tokenizer.pad(..., return_attention_mask=False)` when possible.
+3. Dropping all-ones attention masks from the collated batch.
+
+The model accepts `attention_mask=None` and treats it as an unpadded batch.

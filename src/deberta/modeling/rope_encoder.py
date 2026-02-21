@@ -495,14 +495,15 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         """Run encoder forward pass.
 
         :param torch.Tensor input_ids: Input token ids.
-        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None attention_mask: Optional attention mask. Pass ``None`` for
+            packed/unpadded batches to avoid creating an SDPA mask.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
         :param Any kwargs: Additional compatibility kwargs forwarded by callers.
         :return BaseModelOutput: Last hidden states container.
         """
-        if attention_mask is None:
-            attention_mask = input_ids.ne(int(self.config.pad_token_id)).to(dtype=torch.long)
+        if attention_mask is not None and attention_mask.dtype != torch.long:
+            attention_mask = attention_mask.to(dtype=torch.long)
 
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         x = self.encoder(x, attention_mask)

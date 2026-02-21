@@ -10,6 +10,7 @@ This **v3.1** update includes:
 - **SwiGLU FFN** (`ffn_type: swiglu`) as the default FFN block for RoPE backbones
 - Optional **KEEL** residual topology via config (`norm_arch: keel`) for extra stability margin
 - **Long-context presets** for 2048 and 4096 sequence lengths
+- **FlashAttention-aware SDPA tuning** (mask handling + optional `train.sdpa_kernel` policy)
 - **Streaming-first** data pipeline (default), plus `load_from_disk()` and non-streaming `load_dataset()`
 - Optional **DeBERTa-style whole-word n-gram masking** (`mlm_max_ngram > 1`)
 - **FSDP2-safe embedding sharing** (`none | es | gdes`) + a dedicated exporter that consolidates sharded checkpoints
@@ -72,6 +73,7 @@ Notes:
 - For length generalization, keep `--use_absolute_position_embeddings false` (default).
 - Training defaults to `train.mixed_precision=bf16` (autocast), not full-parameter bf16 casting.
 - Optional compile modes: `--torch_compile true --torch_compile_mode max-autotune-no-cudagraphs` can be a safer fallback on some CUDA stacks.
+- Optional SDPA backend policy: `--sdpa_kernel auto|flash|mem_efficient|math|flash_only`
 
 ---
 
@@ -90,6 +92,24 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
 ```
 
 Practical note: the 4096 preset enables `model.gradient_checkpointing: true` and assumes conservative global tokens/step via small per-device batch + high accumulation.
+
+---
+
+## FlashAttention / SDPA Tuning
+
+The training path is tuned for packed pretraining batches:
+
+- Packed datasets omit `attention_mask` when there is no padding.
+- The collator avoids creating masks when possible and drops all-ones masks.
+- Models accept `attention_mask=None`, which keeps SDPA eligible for flash kernels on compatible hardware.
+
+You can also request SDPA backend preference via `train.sdpa_kernel`:
+
+- `auto` (default)
+- `flash`
+- `mem_efficient`
+- `math`
+- `flash_only` (strict; can fail if unsupported on your hardware/shapes)
 
 ---
 
@@ -169,10 +189,3 @@ This will:
 - `src/deberta/export_cli.py` – consolidation + export tool
 - `configs/` – accelerate configs (FSDP2 examples + YAML training configs)
 - `docs/` – minimal docs for key pieces
-
----
-
-## Next steps (not implemented yet)
-
-Planned follow-up:
-- FlashAttention-specific tuning

@@ -104,6 +104,78 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     torch.backends.cudnn.allow_tf32 = bool(enabled)
 
 
+def _normalize_sdpa_kernel(value: Any) -> str:
+    """Normalize SDPA kernel policy values.
+
+    :param Any value: Raw policy value.
+    :return str: Canonical policy.
+    """
+    v = str(value).strip().lower()
+    aliases = {
+        "mem": "mem_efficient",
+        "mem-efficient": "mem_efficient",
+        "efficient": "mem_efficient",
+        "flashattention": "flash",
+        "flash_attention": "flash",
+    }
+    policy = aliases.get(v, v)
+
+    allowed = {"auto", "flash", "mem_efficient", "math", "flash_only"}
+    if policy not in allowed:
+        opts = "|".join(sorted(allowed))
+        raise ValueError(f"train.sdpa_kernel must be one of: {opts}. Got: {value}")
+    return policy
+
+
+def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
+    """Configure PyTorch SDPA backend toggles on CUDA.
+
+    :param str policy: SDPA kernel policy.
+    :param bool is_main: Whether current process should emit logs.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    policy = _normalize_sdpa_kernel(policy)
+
+    enable_flash = True
+    enable_mem_efficient = True
+    enable_math = True
+
+    if policy == "flash_only":
+        enable_mem_efficient = False
+        enable_math = False
+    elif policy == "mem_efficient":
+        enable_flash = False
+    elif policy == "math":
+        enable_flash = False
+        enable_mem_efficient = False
+
+    try:
+        cuda_backend = getattr(torch.backends, "cuda", None)
+        if cuda_backend is not None:
+            for name, enabled in (
+                ("enable_flash_sdp", enable_flash),
+                ("enable_mem_efficient_sdp", enable_mem_efficient),
+                ("enable_math_sdp", enable_math),
+            ):
+                fn = getattr(cuda_backend, name, None)
+                if callable(fn):
+                    fn(bool(enabled))
+    except Exception:
+        # Best-effort only; do not fail training if this backend API changes.
+        pass
+
+    if is_main:
+        logger.info(
+            "SDPA kernel policy=%s (requested flash=%s, mem_efficient=%s, math=%s).",
+            policy,
+            enable_flash,
+            enable_mem_efficient,
+            enable_math,
+        )
+
+
 def _bf16_runtime_sanity_check() -> bool:
     """Check whether bf16 autocast executes a tiny CUDA matmul.
 
@@ -490,7 +562,7 @@ def _maybe_tokenize_non_streaming(
         """Concatenate tokens and split into fixed-size blocks.
 
         :param dict[str, list[list[int]]] examples: Tokenized examples batch.
-        :return dict[str, Any]: Packed ``input_ids`` and masks.
+        :return dict[str, Any]: Packed ``input_ids`` and ``special_tokens_mask``.
         """
         # Concatenate all texts.
         concatenated: list[int] = []
@@ -501,23 +573,20 @@ def _maybe_tokenize_non_streaming(
         total_length = len(concatenated)
         total_length = (total_length // block_len) * block_len
         if total_length == 0:
-            return {"input_ids": [], "attention_mask": [], "special_tokens_mask": []}
+            return {"input_ids": [], "special_tokens_mask": []}
 
         input_ids = []
-        attention_mask = []
         special_tokens_mask = []
 
         for i in range(0, total_length, block_len):
             chunk = concatenated[i : i + block_len]
             ids = [cls_id] + chunk + [sep_id]
             input_ids.append(ids)
-            attention_mask.append([1] * len(ids))
             chunk_special = [1 if (t == sep_id or t == cls_id) else 0 for t in chunk]
             special_tokens_mask.append([1] + chunk_special + [1])
 
         return {
             "input_ids": input_ids,
-            "attention_mask": attention_mask,
             "special_tokens_mask": special_tokens_mask,
         }
 
@@ -678,6 +747,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             "to avoid known TF32 API conflicts on some PyTorch builds."
         )
     _maybe_enable_tf32(train_cfg.tf32, force_legacy=force_legacy_tf32)
+    _maybe_configure_sdpa_kernels(str(train_cfg.sdpa_kernel), is_main=accelerator.is_main_process)
 
     logger.info(f"Accelerate state: {accelerator.state}")
 
@@ -844,7 +914,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         with accelerator.accumulate(model):
             out = model(
                 input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
+                attention_mask=batch.get("attention_mask"),
                 labels=batch["labels"],
                 token_type_ids=batch.get("token_type_ids"),
                 sampling_temperature=train_cfg.sampling_temperature,

@@ -29,8 +29,8 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
     Output examples are dicts with:
       - input_ids: List[int]
-      - attention_mask: List[int]
       - special_tokens_mask: List[int]
+      - attention_mask: List[int] (only emitted when padding is present)
     """
 
     def __init__(
@@ -158,12 +158,11 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 buffer = buffer[block_len:]
 
                 input_ids = [cls_id] + chunk + [sep_id]
-                attention_mask = [1] * len(input_ids)
 
+                # In packed mode this is usually zero because chunk is exactly block_len.
                 pad_len = max_seq - len(input_ids)
                 if pad_len > 0:
                     input_ids.extend([pad_id] * pad_len)
-                    attention_mask.extend([0] * pad_len)
 
                 # Mask specials + pad as special to prevent MLM masking.
                 # Note: chunk may contain internal [SEP] doc separators; mark them special too.
@@ -171,8 +170,10 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 chunk_special = [1 if t in special_ids else 0 for t in chunk]
                 special_tokens_mask = [1] + chunk_special + [1] + [1] * pad_len
 
-                yield {
+                ex_out = {
                     "input_ids": input_ids,
-                    "attention_mask": attention_mask,
                     "special_tokens_mask": special_tokens_mask,
                 }
+                if pad_len > 0:
+                    ex_out["attention_mask"] = [1] * (max_seq - pad_len) + [0] * pad_len
+                yield ex_out

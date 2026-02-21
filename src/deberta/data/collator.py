@@ -32,7 +32,7 @@ class DebertaV3ElectraCollator:
     Produces:
       - input_ids (masked)
       - labels (original token ids at masked positions, -100 elsewhere)
-      - attention_mask
+      - attention_mask (optional; omitted for fully-unpadded batches)
       - token_type_ids (if present)
 
     Notes:
@@ -74,11 +74,33 @@ class DebertaV3ElectraCollator:
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         # Let tokenizer handle padding for non-packed datasets.
-        batch = self.tokenizer.pad(
-            features,
-            return_tensors="pt",
-            pad_to_multiple_of=self.pad_to_multiple_of,
-        )
+        pad_kwargs: dict[str, Any] = {
+            "return_tensors": "pt",
+            "pad_to_multiple_of": self.pad_to_multiple_of,
+        }
+        # If the dataset does not provide attention_mask, attempt to avoid materializing one.
+        if not any("attention_mask" in f for f in features):
+            pad_kwargs["return_attention_mask"] = False
+        try:
+            batch = self.tokenizer.pad(features, **pad_kwargs)
+        except TypeError:
+            # Some minimal tokenizer stubs do not accept return_attention_mask.
+            pad_kwargs.pop("return_attention_mask", None)
+            batch = self.tokenizer.pad(features, **pad_kwargs)
+
+        # Packed/unpadded pretraining examples often have all-ones attention masks.
+        # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
+        attn = batch.get("attention_mask")
+        if attn is not None:
+            try:
+                if attn.dtype == torch.bool:
+                    all_active = bool(attn.all().item())
+                else:
+                    all_active = bool((attn == 1).all().item())
+                if all_active:
+                    batch.pop("attention_mask", None)
+            except Exception:
+                pass
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         if special_tokens_mask is None:

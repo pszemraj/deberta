@@ -395,6 +395,16 @@ class TrainConfig:
 
     tf32: bool = field(default=True, metadata={"help": "Enable TF32 matmul on Ampere+ GPUs."})
 
+    sdpa_kernel: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "SDPA kernel policy: auto|flash|mem_efficient|math|flash_only. "
+                "Best-effort preference for PyTorch SDPA backends on CUDA."
+            )
+        },
+    )
+
     resume_from_checkpoint: str | None = field(
         default=None,
         metadata={

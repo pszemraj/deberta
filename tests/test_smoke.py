@@ -116,6 +116,7 @@ def test_packed_streaming_marks_internal_sep_as_special():
     )
 
     ex = next(iter(ds))
+    assert "attention_mask" not in ex
     input_ids = ex["input_ids"]
     stm = ex["special_tokens_mask"]
 
@@ -152,6 +153,40 @@ def test_ngram_masking_respects_specials():
     assert masked[0, 0].item() == tok.cls_token_id
     assert masked[0, 3].item() == tok.sep_token_id
     assert masked[0, 5].item() == tok.pad_token_id
+
+
+def test_collator_drops_all_ones_attention_mask():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    features = [
+        {"input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
+        {"input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
+    ]
+    batch = coll(features)
+    assert "attention_mask" not in batch
+
+
+def test_collator_keeps_attention_mask_when_padding_present():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id],
+            "attention_mask": [1, 1, 1],
+            "special_tokens_mask": [1, 0, 1],
+        },
+        {
+            "input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id],
+            "attention_mask": [1, 1, 1, 1],
+            "special_tokens_mask": [1, 0, 0, 1],
+        },
+    ]
+    batch = coll(features)
+    assert "attention_mask" in batch
+    assert batch["attention_mask"].shape == batch["input_ids"].shape
+    assert (batch["attention_mask"] == 0).any()
 
 
 def test_pretrainer_forward_smoke():
@@ -205,15 +240,12 @@ def test_pretrainer_forward_smoke():
 
     B, S = 2, 16
     input_ids = torch.randint(low=0, high=128, size=(B, S), dtype=torch.long)
-    attention_mask = torch.ones((B, S), dtype=torch.long)
-
     labels = torch.full((B, S), -100, dtype=torch.long)
     labels[:, 3] = input_ids[:, 3]
     labels[:, 7] = input_ids[:, 7]
 
     out = model(
         input_ids=input_ids,
-        attention_mask=attention_mask,
         labels=labels,
         sampling_temperature=1.0,
         gen_loss_weight=1.0,
