@@ -66,7 +66,11 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
     - Enables fused AdamW if supported on the current CUDA build
     """
 
-    gen_lr = float(cfg.generator_learning_rate) if float(cfg.generator_learning_rate) > 0 else float(cfg.learning_rate)
+    gen_lr = (
+        float(cfg.generator_learning_rate)
+        if float(cfg.generator_learning_rate) > 0
+        else float(cfg.learning_rate)
+    )
     disc_lr = float(cfg.learning_rate)
 
     gen_decay: list[torch.nn.Parameter] = []
@@ -76,9 +80,9 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
 
     def _is_no_decay(name: str, p: torch.Tensor) -> bool:
         lname = name.lower()
-        if lname.endswith('.bias'):
+        if lname.endswith(".bias"):
             return True
-        if 'layernorm' in lname or 'layer_norm' in lname or 'rmsnorm' in lname or 'rms_norm' in lname:
+        if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
             return True
         # 1D params are almost always norm scales / biases
         if p.dim() == 1:
@@ -86,7 +90,7 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
         return False
 
     def _is_generator(name: str) -> bool:
-        return name.startswith('generator.') or name.startswith('generator_lm_head.')
+        return name.startswith("generator.") or name.startswith("generator_lm_head.")
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -102,13 +106,13 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
 
     groups: list[dict[str, Any]] = []
     if gen_decay:
-        groups.append({'params': gen_decay, 'weight_decay': float(cfg.weight_decay), 'lr': gen_lr})
+        groups.append({"params": gen_decay, "weight_decay": float(cfg.weight_decay), "lr": gen_lr})
     if gen_no_decay:
-        groups.append({'params': gen_no_decay, 'weight_decay': 0.0, 'lr': gen_lr})
+        groups.append({"params": gen_no_decay, "weight_decay": 0.0, "lr": gen_lr})
     if disc_decay:
-        groups.append({'params': disc_decay, 'weight_decay': float(cfg.weight_decay), 'lr': disc_lr})
+        groups.append({"params": disc_decay, "weight_decay": float(cfg.weight_decay), "lr": disc_lr})
     if disc_no_decay:
-        groups.append({'params': disc_no_decay, 'weight_decay': 0.0, 'lr': disc_lr})
+        groups.append({"params": disc_no_decay, "weight_decay": 0.0, "lr": disc_lr})
 
     fused_kwargs = _maybe_fused_adamw_kwargs()
     opt = torch.optim.AdamW(
@@ -152,6 +156,7 @@ def _parse_checkpoint_step(path: str) -> int:
         return int(m.group(1))
     return 0
 
+
 def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     """Return the latest checkpoint-* directory in output_dir, or None.
 
@@ -169,7 +174,6 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
 
     checkpoints.sort(key=lambda x: x[0])
     return checkpoints[-1][1]
-
 
 
 def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
@@ -332,7 +336,9 @@ def _export_discriminator_hf(
         gen_sd = accelerator.get_state_dict(model.generator)
 
         # Build a fresh model from config.
-        if DebertaRoPEConfig is not None and isinstance(getattr(unwrapped, "disc_config", None), DebertaRoPEConfig):
+        if DebertaRoPEConfig is not None and isinstance(
+            getattr(unwrapped, "disc_config", None), DebertaRoPEConfig
+        ):
             export_disc = DebertaRoPEModel(unwrapped.disc_config)  # type: ignore[arg-type]
         else:
             export_disc = AutoModel.from_config(unwrapped.disc_config)
@@ -342,10 +348,13 @@ def _export_discriminator_hf(
         filtered_disc_sd = {k: v for k, v in disc_sd.items() if k in export_keys}
         missing = export_disc.load_state_dict(filtered_disc_sd, strict=False)
         if missing.missing_keys:
-            logger.info(f"HF export: missing keys (often expected with tied embeddings): {missing.missing_keys[:5]}...")
+            logger.info(
+                f"HF export: missing keys (often expected with tied embeddings): {missing.missing_keys[:5]}..."
+            )
 
         mode = (embedding_sharing or "none").lower()
         if mode in {"es", "gdes"}:
+
             def merge_embedding(attr: str) -> None:
                 if not hasattr(export_disc, "embeddings") or not hasattr(export_disc.embeddings, attr):
                     return
@@ -389,7 +398,9 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
-    accelerator = Accelerator(gradient_accumulation_steps=train_cfg.gradient_accumulation_steps, log_with=log_with)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps, log_with=log_with
+    )
 
     _setup_logging(accelerator.is_main_process)
     _maybe_enable_tf32(train_cfg.tf32)
@@ -438,7 +449,9 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             num_processes=accelerator.num_processes,
         )
     else:
-        train_dataset = _maybe_tokenize_non_streaming(raw_ds=raw_train, tokenizer=tokenizer, data_cfg=data_cfg, is_train=True)
+        train_dataset = _maybe_tokenize_non_streaming(
+            raw_ds=raw_train, tokenizer=tokenizer, data_cfg=data_cfg, is_train=True
+        )
 
     collator = DebertaV3ElectraCollator(
         tokenizer=tokenizer,
@@ -463,7 +476,9 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     )
 
     # Model
-    disc_config, gen_config = build_backbone_configs(model_cfg=model_cfg, tokenizer=tokenizer, max_position_embeddings=int(data_cfg.max_seq_length))
+    disc_config, gen_config = build_backbone_configs(
+        model_cfg=model_cfg, tokenizer=tokenizer, max_position_embeddings=int(data_cfg.max_seq_length)
+    )
 
     # Instantiate backbones
     disc_backbone, gen_backbone = build_backbones(
@@ -519,7 +534,9 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         if str(ckpt).lower() == "auto":
             latest = _find_latest_checkpoint(output_dir)
             if latest is None:
-                logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
+                logger.info(
+                    "resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch."
+                )
                 ckpt = None
             else:
                 ckpt = str(latest)

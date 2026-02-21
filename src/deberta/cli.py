@@ -35,10 +35,7 @@ def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
 
     if unknown:
         keys = ", ".join(sorted(unknown.keys()))
-        raise ValueError(
-            "Unknown keys in config file (not in ModelConfig/DataConfig/TrainConfig): "
-            f"{keys}"
-        )
+        raise ValueError(f"Unknown keys in config file (not in ModelConfig/DataConfig/TrainConfig): {keys}")
 
     return model_dict, data_dict, train_dict
 
@@ -47,7 +44,9 @@ def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
     try:
         import yaml  # type: ignore
     except Exception as e:  # pragma: no cover
-        raise RuntimeError("pyyaml is required for YAML config files. Install with `pip install pyyaml`.") from e
+        raise RuntimeError(
+            "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
+        ) from e
 
     raw = yaml.safe_load(path.read_text())
     if raw is None:
@@ -59,7 +58,11 @@ def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
         model_dict = raw.get("model", {}) or {}
         data_dict = raw.get("data", {}) or {}
         train_dict = raw.get("train", {}) or {}
-        if not isinstance(model_dict, dict) or not isinstance(data_dict, dict) or not isinstance(train_dict, dict):
+        if (
+            not isinstance(model_dict, dict)
+            or not isinstance(data_dict, dict)
+            or not isinstance(train_dict, dict)
+        ):
             raise ValueError("YAML config sections model/data/train must be dicts.")
     else:
         model_dict, data_dict, train_dict = _split_flat_dict(raw)
@@ -79,7 +82,11 @@ def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
         model_dict = raw.get("model", {}) or {}
         data_dict = raw.get("data", {}) or {}
         train_dict = raw.get("train", {}) or {}
-        if not isinstance(model_dict, dict) or not isinstance(data_dict, dict) or not isinstance(train_dict, dict):
+        if (
+            not isinstance(model_dict, dict)
+            or not isinstance(data_dict, dict)
+            or not isinstance(train_dict, dict)
+        ):
             raise ValueError("JSON config sections model/data/train must be dicts.")
         return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
 

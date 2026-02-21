@@ -53,7 +53,9 @@ class ExportConfig:
     embedding_sharing: str | None = None
 
 
-def _split_state_dict(full_sd: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _split_state_dict(
+    full_sd: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     disc: dict[str, torch.Tensor] = {}
     gen: dict[str, torch.Tensor] = {}
 
@@ -176,7 +178,9 @@ def main() -> None:
     )
 
     # Build backbones + pretrainer container so accelerate.load_state can restore the exact structure.
-    disc_backbone, gen_backbone = build_backbones(model_cfg=model_cfg, disc_config=disc_config, gen_config=gen_config)
+    disc_backbone, gen_backbone = build_backbones(
+        model_cfg=model_cfg, disc_config=disc_config, gen_config=gen_config
+    )
     if model_cfg.gradient_checkpointing:
         if hasattr(disc_backbone, "gradient_checkpointing_enable"):
             disc_backbone.gradient_checkpointing_enable()
@@ -212,7 +216,9 @@ def main() -> None:
                 "Make sure you are launching with the same accelerate FSDP config used for training."
             )
 
-        cfg_full = FullStateDictConfig(offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only))
+        cfg_full = FullStateDictConfig(
+            offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
+        )
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
             full_sd = model.state_dict()
     else:
@@ -255,9 +261,13 @@ def main() -> None:
         filtered = {k: v for k, v in disc_sd.items() if k in export_keys}
         export_disc.load_state_dict(filtered, strict=False)
         if embedding_sharing in {"es", "gdes"}:
-            _merge_embeddings_into_export(export_model=export_disc, disc_sd=disc_sd, gen_sd=gen_sd, mode=embedding_sharing)
+            _merge_embeddings_into_export(
+                export_model=export_disc, disc_sd=disc_sd, gen_sd=gen_sd, mode=embedding_sharing
+            )
 
-        export_disc.save_pretrained(str(out_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization))
+        export_disc.save_pretrained(
+            str(out_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
+        )
         meta["exported_discriminator"] = True
 
     # Generator
@@ -265,7 +275,9 @@ def main() -> None:
         export_keys = set(export_gen.state_dict().keys())
         filtered = {k: v for k, v in gen_sd.items() if k in export_keys}
         export_gen.load_state_dict(filtered, strict=False)
-        export_gen.save_pretrained(str(out_dir / "generator"), safe_serialization=bool(cfg.safe_serialization))
+        export_gen.save_pretrained(
+            str(out_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
+        )
         meta["exported_generator"] = True
 
     with (out_dir / "export_meta.json").open("w", encoding="utf-8") as f:

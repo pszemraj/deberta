@@ -92,7 +92,9 @@ class DebertaRoPEEmbeddings(nn.Module):
     def __init__(self, config: DebertaRoPEConfig) -> None:
         super().__init__()
         self.config = config
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        self.word_embeddings = nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+        )
 
         if config.type_vocab_size and config.type_vocab_size > 0:
             self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
@@ -117,7 +119,9 @@ class DebertaRoPEEmbeddings(nn.Module):
             x = x + self.token_type_embeddings(token_type_ids)
 
         if self.position_embeddings is not None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
+            position_ids = (
+                torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
+            )
             x = x + self.position_embeddings(position_ids)
 
         x = self.norm(x)
@@ -277,7 +281,9 @@ class DebertaRoPEEncoder(nn.Module):
             # Per user guidance: alpha defaults to 2 * num_layers (number of sublayers).
             alpha_init = float(2 * int(config.num_hidden_layers))
 
-        self.layers = nn.ModuleList([DebertaRoPELayer(config, alpha_init=alpha_init) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [DebertaRoPELayer(config, alpha_init=alpha_init) for _ in range(config.num_hidden_layers)]
+        )
         self.gradient_checkpointing = False
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:

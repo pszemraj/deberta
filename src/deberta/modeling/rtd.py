@@ -74,7 +74,9 @@ class MLMTransform(nn.Module):
         hidden_size = int(config.hidden_size)
         self.dense = nn.Linear(hidden_size, hidden_size)
         self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
-        self.norm = RMSNorm(hidden_size, eps=float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6))))
+        self.norm = RMSNorm(
+            hidden_size, eps=float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = self.dense(hidden_states)
@@ -101,7 +103,9 @@ class MaskedLMHead(nn.Module):
 
         self.tie_word_embeddings = bool(tie_word_embeddings)
 
-    def forward(self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None
+    ) -> torch.Tensor:
         x = self.transform(hidden_states)
 
         if self.tie_word_embeddings and word_embedding_weight is not None:
@@ -130,7 +134,9 @@ class RTDHead(nn.Module):
         # A small transform helps stability.
         self.dense = nn.Linear(hidden_size, hidden_size)
         self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
-        self.norm = RMSNorm(hidden_size, eps=float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6))))
+        self.norm = RMSNorm(
+            hidden_size, eps=float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
+        )
         self.classifier = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -321,4 +327,6 @@ class DebertaV3RTDPretrainer(nn.Module):
             gen_loss_scaled = alpha * gen_loss
 
         total = float(gen_loss_weight) * gen_loss_scaled + float(disc_loss_weight) * disc_loss
-        return RTDOutput(loss=total, gen_loss=gen_loss.detach(), disc_loss=disc_loss.detach(), disc_accuracy=disc_acc)
+        return RTDOutput(
+            loss=total, gen_loss=gen_loss.detach(), disc_loss=disc_loss.detach(), disc_accuracy=disc_acc
+        )

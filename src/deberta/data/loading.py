@@ -25,7 +25,7 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool):
     try:
         import datasets
     except Exception as e:  # pragma: no cover
-        raise RuntimeError("datasets is required. Install with `pip install datasets`." ) from e
+        raise RuntimeError("datasets is required. Install with `pip install datasets`.") from e
 
     if cfg.load_from_disk:
         if streaming:

@@ -100,9 +100,7 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
             raw = ex.get(text_key, None)
             if raw is None:
                 # Fail fast: the dataset doesn't have the expected column.
-                raise KeyError(
-                    f"Text column '{text_key}' not found. Available keys: {list(ex.keys())}"
-                )
+                raise KeyError(f"Text column '{text_key}' not found. Available keys: {list(ex.keys())}")
 
             if isinstance(raw, (list, tuple)):
                 # Some datasets store pre-split lines.

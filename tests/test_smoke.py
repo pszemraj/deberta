@@ -53,7 +53,12 @@ class DummyTokenizer:
                 out.append("▁" + str(i))
         return out
 
-    def pad(self, features: list[dict[str, Any]], return_tensors: str = "pt", pad_to_multiple_of: int | None = None):
+    def pad(
+        self,
+        features: list[dict[str, Any]],
+        return_tensors: str = "pt",
+        pad_to_multiple_of: int | None = None,
+    ):
         # Minimal padding for collator tests.
         max_len = max(len(f["input_ids"]) for f in features)
         if pad_to_multiple_of is not None:

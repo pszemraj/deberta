@@ -93,7 +93,9 @@ def build_backbone_configs(
 
     disc_cfg.norm_eps = float(model_cfg.norm_eps)
     disc_cfg.norm_arch = str(model_cfg.norm_arch)
-    disc_cfg.keel_alpha_init = float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    disc_cfg.keel_alpha_init = (
+        float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    )
     disc_cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
     disc_cfg.attention_implementation = str(model_cfg.attention_implementation)
     disc_cfg.initializer_range = float(model_cfg.initializer_range)
@@ -124,7 +126,9 @@ def build_backbone_configs(
 
     gen_cfg.norm_eps = float(model_cfg.norm_eps)
     gen_cfg.norm_arch = str(model_cfg.norm_arch)
-    gen_cfg.keel_alpha_init = float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    gen_cfg.keel_alpha_init = (
+        float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+    )
     gen_cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
     gen_cfg.attention_implementation = str(model_cfg.attention_implementation)
     gen_cfg.initializer_range = float(model_cfg.initializer_range)

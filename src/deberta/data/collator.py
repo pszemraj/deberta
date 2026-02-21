@@ -60,7 +60,9 @@ class DebertaV3ElectraCollator:
         mask_prob = float(self.cfg.mask_token_prob)
         rand_prob = float(self.cfg.random_token_prob)
         if mask_prob < 0 or rand_prob < 0 or (mask_prob + rand_prob) > 1.0:
-            raise ValueError("Invalid masking probabilities: mask_token_prob + random_token_prob must be <= 1.")
+            raise ValueError(
+                "Invalid masking probabilities: mask_token_prob + random_token_prob must be <= 1."
+            )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         # Let tokenizer handle padding for non-packed datasets.
@@ -82,12 +84,18 @@ class DebertaV3ElectraCollator:
         batch["labels"] = labels
         return batch
 
-    def _mask_tokens(self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _mask_tokens(
+        self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if int(self.cfg.max_ngram) <= 1:
             return self._mask_tokens_bert(input_ids, special_tokens_mask=special_tokens_mask)
-        return self._mask_tokens_ngram(input_ids, special_tokens_mask=special_tokens_mask, max_ngram=int(self.cfg.max_ngram))
+        return self._mask_tokens_ngram(
+            input_ids, special_tokens_mask=special_tokens_mask, max_ngram=int(self.cfg.max_ngram)
+        )
 
-    def _mask_tokens_bert(self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _mask_tokens_bert(
+        self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fast token-level (independent) masking."""
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
@@ -115,7 +123,9 @@ class DebertaV3ElectraCollator:
         random_prob = float(self.cfg.random_token_prob)
 
         # mask_token_indices: of masked positions, which ones become [MASK]
-        mask_token_indices = torch.bernoulli(torch.full(labels.shape, mask_prob, device=labels.device)).bool() & masked_indices
+        mask_token_indices = (
+            torch.bernoulli(torch.full(labels.shape, mask_prob, device=labels.device)).bool() & masked_indices
+        )
         input_ids[mask_token_indices] = int(self.tokenizer.mask_token_id)
 
         # random_token_indices: of remaining masked positions, which ones become random tokens
@@ -124,7 +134,9 @@ class DebertaV3ElectraCollator:
             & masked_indices
             & ~mask_token_indices
         )
-        random_words = torch.randint(low=0, high=int(self.tokenizer.vocab_size), size=labels.shape, device=labels.device)
+        random_words = torch.randint(
+            low=0, high=int(self.tokenizer.vocab_size), size=labels.shape, device=labels.device
+        )
         input_ids[random_token_indices] = random_words[random_token_indices]
 
         # Remaining masked positions keep original token.
@@ -268,7 +280,7 @@ class DebertaV3ElectraCollator:
 
             # Treat tokenizer special tokens (e.g. [PAD]) as hard boundaries even if
             # special_tokens_mask was not provided by the dataset.
-            if tok in getattr(self.tokenizer, 'all_special_tokens', []):
+            if tok in getattr(self.tokenizer, "all_special_tokens", []):
                 prev_i = None
                 continue
 

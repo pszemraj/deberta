@@ -50,7 +50,9 @@ class RotaryEmbedding(nn.Module):
         sin = emb.sin().to(dtype=dtype)
         return RotaryCache(cos=cos, sin=sin)
 
-    def get_cos_sin(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_cos_sin(
+        self, seq_len: int, *, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             self._cache is None
             or self._cache_device != device

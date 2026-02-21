@@ -64,7 +64,9 @@ class ModelConfig:
 
     from_scratch: bool = field(
         default=True,
-        metadata={"help": "If true, initialize models from config (random init). If false, load pretrained weights."},
+        metadata={
+            "help": "If true, initialize models from config (random init). If false, load pretrained weights."
+        },
     )
 
     # -------------------------
@@ -180,7 +182,9 @@ class ModelConfig:
 
     gradient_checkpointing: bool = field(
         default=False,
-        metadata={"help": "Enable activation/gradient checkpointing on both generator and discriminator backbones."},
+        metadata={
+            "help": "Enable activation/gradient checkpointing on both generator and discriminator backbones."
+        },
     )
 
 
@@ -292,7 +296,9 @@ class TrainConfig:
 
     lr_scheduler_type: str = field(
         default="linear",
-        metadata={"help": "Scheduler: linear|cosine|cosine_with_restarts|polynomial|constant|constant_with_warmup"},
+        metadata={
+            "help": "Scheduler: linear|cosine|cosine_with_restarts|polynomial|constant|constant_with_warmup"
+        },
     )
 
     max_grad_norm: float = field(default=1.0, metadata={"help": "Gradient clipping norm. 0 disables."})
@@ -324,7 +330,8 @@ class TrainConfig:
     decoupled_loss_scaling: bool = field(
         default=False,
         metadata={
-            "help": "If true, rescales generator loss to match discriminator loss magnitude (DeBERTa RTD style)."},
+            "help": "If true, rescales generator loss to match discriminator loss magnitude (DeBERTa RTD style)."
+        },
     )
 
     # Logging / eval / save
@@ -334,7 +341,9 @@ class TrainConfig:
 
     save_steps: int = field(default=1_000, metadata={"help": "Save checkpoint every N steps."})
 
-    save_total_limit: int = field(default=3, metadata={"help": "Keep last N checkpoints. 0 disables deletion."})
+    save_total_limit: int = field(
+        default=3, metadata={"help": "Keep last N checkpoints. 0 disables deletion."}
+    )
 
     report_to: str = field(
         default="none",
@@ -346,7 +355,9 @@ class TrainConfig:
 
     dataloader_pin_memory: bool = field(default=True, metadata={"help": "Pin memory in DataLoader."})
 
-    torch_compile: bool = field(default=False, metadata={"help": "Enable torch.compile for the pretraining model."})
+    torch_compile: bool = field(
+        default=False, metadata={"help": "Enable torch.compile for the pretraining model."}
+    )
 
     torch_compile_mode: str = field(
         default="default",
@@ -357,7 +368,9 @@ class TrainConfig:
 
     resume_from_checkpoint: str | None = field(
         default=None,
-        metadata={"help": "Resume from an accelerate checkpoint directory. Use 'auto' to resume the latest checkpoint-* in output_dir."},
+        metadata={
+            "help": "Resume from an accelerate checkpoint directory. Use 'auto' to resume the latest checkpoint-* in output_dir."
+        },
     )
 
     export_hf_final: bool = field(
