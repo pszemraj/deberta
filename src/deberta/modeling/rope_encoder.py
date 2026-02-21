@@ -220,9 +220,14 @@ class DebertaRoPESelfAttention(nn.Module):
             q, k = self.rope.apply(q, k)
 
         attn_mask = None
+        query_keep_heads = None
+        query_keep_tokens = None
         if attention_mask is not None:
             # attention_mask is 1 for tokens, 0 for pad. SDPA expects True = mask.
             attn_mask = attention_mask.eq(0)[:, None, None, :]  # (B,1,1,S) bool
+            # Explicitly zero padded query outputs for robustness on eager/edge paths.
+            query_keep_heads = attention_mask[:, None, :, None].to(dtype=q.dtype)
+            query_keep_tokens = attention_mask[:, :, None].to(dtype=q.dtype)
 
         if self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
             out = F.scaled_dot_product_attention(
@@ -243,9 +248,14 @@ class DebertaRoPESelfAttention(nn.Module):
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn, v)
 
+        if query_keep_heads is not None:
+            out = out * query_keep_heads
+
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
         out = self.out_proj(out)
         out = F.dropout(out, p=self.resid_dropout, training=self.training)
+        if query_keep_tokens is not None:
+            out = out * query_keep_tokens
         return out
 
 

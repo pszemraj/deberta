@@ -72,6 +72,10 @@ class DebertaV3ElectraCollator:
                 "Invalid masking probabilities: mask_token_prob + random_token_prob must be <= 1."
             )
 
+        self._special_token_ids = self._collect_special_token_ids()
+        self._non_special_token_ids_cpu = self._build_non_special_token_ids()
+        self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
+
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         # Let tokenizer handle padding for non-packed datasets.
         pad_kwargs: dict[str, Any] = {
@@ -114,7 +118,7 @@ class DebertaV3ElectraCollator:
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         if special_tokens_mask is None:
-            special_tokens_mask = torch.zeros_like(batch["input_ids"], dtype=torch.bool)
+            special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
         else:
             special_tokens_mask = special_tokens_mask.bool()
 
@@ -139,6 +143,92 @@ class DebertaV3ElectraCollator:
         if self.pad_to_multiple_of is not None and max_len % int(self.pad_to_multiple_of) != 0:
             return True
         return False
+
+    def _collect_special_token_ids(self) -> set[int]:
+        """Collect known tokenizer special token ids.
+
+        :return set[int]: Special token ids.
+        """
+        out: set[int] = set()
+        for sid in getattr(self.tokenizer, "all_special_ids", []):
+            try:
+                out.add(int(sid))
+            except Exception:
+                continue
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            out.add(int(pad_id))
+        return out
+
+    def _build_non_special_token_ids(self) -> torch.Tensor | None:
+        """Build tensor of non-special token ids for random replacement.
+
+        :return torch.Tensor | None: CPU tensor of non-special ids, or None.
+        """
+        vocab_size = int(self.tokenizer.vocab_size)
+        if not self._special_token_ids:
+            return None
+
+        mask = torch.ones(vocab_size, dtype=torch.bool)
+        for sid in self._special_token_ids:
+            if 0 <= int(sid) < vocab_size:
+                mask[int(sid)] = False
+
+        if not bool(mask.any().item()):
+            return None
+        return torch.arange(vocab_size, dtype=torch.long)[mask]
+
+    def _sample_random_words(self, shape: torch.Size | tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Sample random replacement ids, excluding known special ids when possible.
+
+        :param torch.Size | tuple[int, ...] shape: Output tensor shape.
+        :param torch.device device: Target device.
+        :return torch.Tensor: Random token ids.
+        """
+        if self._non_special_token_ids_cpu is None:
+            return torch.randint(low=0, high=int(self.tokenizer.vocab_size), size=shape, device=device)
+
+        key = f"{device.type}:{device.index if device.index is not None else -1}"
+        ids = self._non_special_token_ids_by_device.get(key)
+        if ids is None:
+            ids = self._non_special_token_ids_cpu.to(device=device)
+            self._non_special_token_ids_by_device[key] = ids
+
+        idx = torch.randint(low=0, high=int(ids.numel()), size=shape, device=device)
+        return ids[idx]
+
+    def _sample_one_random_word(self, device: torch.device) -> int:
+        """Sample one random replacement id.
+
+        :param torch.device device: Target device.
+        :return int: Sampled token id.
+        """
+        return int(self._sample_random_words((1,), device=device)[0].item())
+
+    def _infer_special_tokens_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Infer special-token mask when dataset does not provide one.
+
+        :param torch.Tensor input_ids: Batch token ids.
+        :return torch.Tensor: Boolean special-token mask.
+        """
+        inferred = torch.zeros_like(input_ids, dtype=torch.bool)
+
+        if hasattr(self.tokenizer, "get_special_tokens_mask"):
+            try:
+                rows = input_ids.detach().cpu().tolist()
+                masks = [
+                    self.tokenizer.get_special_tokens_mask(row, already_has_special_tokens=True)
+                    for row in rows
+                ]
+                inferred = torch.tensor(masks, dtype=torch.bool, device=input_ids.device)
+            except Exception:
+                pass
+
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            inferred = inferred | input_ids.eq(int(pad_id))
+
+        return inferred
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
@@ -201,9 +291,7 @@ class DebertaV3ElectraCollator:
             & masked_indices
             & ~mask_token_indices
         )
-        random_words = torch.randint(
-            low=0, high=int(self.tokenizer.vocab_size), size=labels.shape, device=labels.device
-        )
+        random_words = self._sample_random_words(labels.shape, device=labels.device)
         input_ids[random_token_indices] = random_words[random_token_indices]
 
         # Remaining masked positions keep original token.
@@ -239,7 +327,6 @@ class DebertaV3ElectraCollator:
         B, S = input_ids.shape
         pad_token_id = self.tokenizer.pad_token_id
         mask_token_id = int(self.tokenizer.mask_token_id)
-        vocab_size = int(self.tokenizer.vocab_size)
 
         # n-gram sampling distribution: p(n) ∝ 1/n
         probs = torch.tensor([1.0 / float(n) for n in range(1, max_ngram + 1)], dtype=torch.float)
@@ -315,7 +402,7 @@ class DebertaV3ElectraCollator:
                 if r < float(self.cfg.mask_token_prob):
                     input_ids[b, idx] = mask_token_id
                 elif r < float(self.cfg.mask_token_prob) + float(self.cfg.random_token_prob):
-                    input_ids[b, idx] = int(torch.randint(low=0, high=vocab_size, size=(1,)).item())
+                    input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
                 else:
                     # Keep original.
                     pass

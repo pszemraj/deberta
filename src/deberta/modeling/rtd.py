@@ -378,15 +378,23 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_logits = self.discriminator_head(disc_hidden)
 
         if attention_mask is None:
-            active = torch.ones_like(input_ids, dtype=torch.bool)
+            pad_id = getattr(self.disc_config, "pad_token_id", None)
+            if pad_id is None:
+                active = torch.ones_like(input_ids, dtype=torch.bool)
+            else:
+                active = input_ids.ne(int(pad_id))
         else:
             active = attention_mask.to(torch.bool)
-        disc_loss = F.binary_cross_entropy_with_logits(disc_logits[active].float(), disc_labels[active])
 
-        # Accuracy for monitoring: threshold at 0
-        with torch.no_grad():
-            pred = (disc_logits[active] > 0).to(torch.float32)
-            disc_acc = (pred == disc_labels[active]).to(torch.float32).mean()
+        if bool(active.any().item()):
+            disc_loss = F.binary_cross_entropy_with_logits(disc_logits[active].float(), disc_labels[active])
+            # Accuracy for monitoring: threshold at 0
+            with torch.no_grad():
+                pred = (disc_logits[active] > 0).to(torch.float32)
+                disc_acc = (pred == disc_labels[active]).to(torch.float32).mean()
+        else:
+            disc_loss = disc_logits.sum() * 0.0
+            disc_acc = disc_logits.sum() * 0.0
 
         # -------------------
         # Total

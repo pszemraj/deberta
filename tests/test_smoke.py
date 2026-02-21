@@ -18,6 +18,7 @@ class DummyTokenizer:
         self.cls_token_id = 1
         self.sep_token_id = 2
         self.mask_token_id = 3
+        self.all_special_ids = [self.pad_token_id, self.cls_token_id, self.sep_token_id, self.mask_token_id]
         self.all_special_tokens = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
         self._id_to_tok = {
             self.pad_token_id: "[PAD]",
@@ -53,6 +54,13 @@ class DummyTokenizer:
                 # SentencePiece-like word boundary marker.
                 out.append("▁" + str(i))
         return out
+
+    def get_special_tokens_mask(
+        self, token_ids_0: list[int], already_has_special_tokens: bool = True
+    ) -> list[int]:
+        del already_has_special_tokens
+        specials = set(self.all_special_ids)
+        return [1 if int(tid) in specials else 0 for tid in token_ids_0]
 
     def pad(
         self,
@@ -208,6 +216,79 @@ def test_collator_generates_attention_mask_for_variable_length_inputs():
     assert (batch["attention_mask"] == 0).any()
 
 
+def test_collator_infers_special_tokens_mask_when_missing():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.9, max_ngram=1))
+
+    # No special_tokens_mask provided: collator should infer specials and avoid masking them.
+    features = [
+        {"input_ids": [tok.cls_token_id, 11, tok.sep_token_id]},
+        {"input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id]},
+    ]
+    batch = coll(features)
+
+    # CLS / SEP / PAD positions are special and should not contribute MLM loss.
+    assert torch.all(batch["labels"][:, 0] == -100)
+    assert torch.all(batch["labels"][batch["input_ids"] == tok.sep_token_id] == -100)
+    assert torch.all(batch["labels"][batch["input_ids"] == tok.pad_token_id] == -100)
+
+
+def test_collator_random_replacement_avoids_special_ids():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.999, mask_token_prob=0.0, random_token_prob=1.0, max_ngram=1),
+    )
+
+    torch.manual_seed(0)
+    input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
+    special = torch.zeros_like(input_ids, dtype=torch.bool)
+
+    masked, labels = coll._mask_tokens_bert(input_ids, special_tokens_mask=special)
+    changed = labels.ne(-100)
+    assert bool(changed.any().item())
+
+    replaced = masked[changed]
+    for sid in tok.all_special_ids:
+        assert not bool((replaced == sid).any().item())
+
+
+def test_self_attention_zeroes_padded_query_outputs():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        attention_implementation="eager",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DebertaRoPESelfAttention(cfg).eval()
+    x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        out = attn(x, attention_mask)
+
+    assert torch.allclose(out[0, 4:, :], torch.zeros_like(out[0, 4:, :]), atol=1e-6)
+    assert torch.allclose(out[1, 5:, :], torch.zeros_like(out[1, 5:, :]), atol=1e-6)
+
+
 def test_pretrainer_forward_smoke():
     """Requires transformers; skipped automatically if not installed."""
 
@@ -314,6 +395,90 @@ def test_rope_model_infers_pad_mask_when_attention_mask_missing():
         out_explicit = model(input_ids=input_ids, attention_mask=explicit_mask).last_hidden_state
 
     torch.testing.assert_close(out_missing, out_explicit, rtol=0.0, atol=0.0)
+
+
+def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    disc_cfg = DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=64,
+        type_vocab_size=0,
+        pad_token_id=0,
+        ffn_type="swiglu",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    gen_cfg = DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=64,
+        type_vocab_size=0,
+        pad_token_id=0,
+        ffn_type="mlp",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+
+    disc = DebertaRoPEModel(disc_cfg)
+    gen = DebertaRoPEModel(gen_cfg)
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=disc,
+        generator_backbone=gen,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        embedding_sharing="gdes",
+    )
+
+    input_ids = torch.tensor(
+        [
+            [1, 7, 8, 2, 0, 0],
+            [1, 9, 10, 11, 2, 0],
+        ],
+        dtype=torch.long,
+    )
+    labels = torch.full_like(input_ids, -100)
+    labels[:, 2] = input_ids[:, 2]
+    labels[:, 3] = input_ids[:, 3]
+    explicit_mask = input_ids.ne(0).long()
+
+    torch.manual_seed(0)
+    out_missing = model(
+        input_ids=input_ids,
+        attention_mask=None,
+        labels=labels,
+        sampling_temperature=1.0,
+        gen_loss_weight=1.0,
+        disc_loss_weight=50.0,
+        decoupled_loss_scaling=False,
+    )
+
+    torch.manual_seed(0)
+    out_explicit = model(
+        input_ids=input_ids,
+        attention_mask=explicit_mask,
+        labels=labels,
+        sampling_temperature=1.0,
+        gen_loss_weight=1.0,
+        disc_loss_weight=50.0,
+        decoupled_loss_scaling=False,
+    )
+
+    torch.testing.assert_close(out_missing.disc_loss, out_explicit.disc_loss, rtol=0.0, atol=0.0)
 
 
 def test_rope_config_rejects_unknown_ffn_type():
