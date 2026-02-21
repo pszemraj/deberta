@@ -4,7 +4,6 @@ import json
 import logging
 import re
 import shutil
-import time
 from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
@@ -141,8 +140,7 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
 
 def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
     while True:
-        for batch in dl:
-            yield batch
+        yield from dl
 
 
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -174,6 +172,29 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
 
     checkpoints.sort(key=lambda x: x[0])
     return checkpoints[-1][1]
+
+
+def _prepare_output_dir(
+    *,
+    output_dir: Path,
+    overwrite_output_dir: bool,
+    resume_from_checkpoint: str | None,
+    is_main_process: bool,
+) -> None:
+    """Prepare output_dir on the main process."""
+    if not is_main_process:
+        return
+
+    if output_dir.exists() and any(output_dir.iterdir()):
+        if overwrite_output_dir:
+            shutil.rmtree(output_dir)
+        elif not resume_from_checkpoint:
+            raise ValueError(
+                f"Output directory exists and is not empty: {output_dir}. "
+                "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
@@ -407,10 +428,15 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     logger.info(f"Accelerate state: {accelerator.state}")
 
-    # Make output dir on main.
+    # Make/validate output dir on main.
     output_dir = Path(train_cfg.output_dir)
+    _prepare_output_dir(
+        output_dir=output_dir,
+        overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
+        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        is_main_process=accelerator.is_main_process,
+    )
     if accelerator.is_main_process:
-        output_dir.mkdir(parents=True, exist_ok=True)
         _json_dump(asdict(model_cfg), output_dir / "model_config.json")
         _json_dump(asdict(data_cfg), output_dir / "data_config.json")
         _json_dump(asdict(train_cfg), output_dir / "train_config.json")
@@ -550,9 +576,6 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     train_iter = _cycle_dataloader(train_loader)
 
-    # Simple rolling stats
-    last_log_time = time.time()
-
     while global_step < int(train_cfg.max_steps):
         batch = next(train_iter)
         batch = _move_batch_to_device(batch, accelerator.device)
@@ -597,10 +620,6 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                     "disc_loss": _mean(out.disc_loss),
                     "disc_acc": _mean(out.disc_accuracy),
                 }
-
-                now = time.time()
-                dt = max(1e-6, now - last_log_time)
-                last_log_time = now
 
                 if accelerator.is_main_process:
                     logger.info(

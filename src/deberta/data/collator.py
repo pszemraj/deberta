@@ -178,7 +178,7 @@ class DebertaV3ElectraCollator:
             spec = special_tokens_mask[b].tolist()
 
             maskable: list[int] = []
-            for i, (tid, is_spec) in enumerate(zip(ids, spec)):
+            for i, (tid, is_spec) in enumerate(zip(ids, spec, strict=True)):
                 if is_spec:
                     continue
                 if pad_token_id is not None and tid == pad_token_id:
@@ -273,7 +273,7 @@ class DebertaV3ElectraCollator:
             # Fallback: treat as continuation if adjacent.
             return True
 
-        for i, (tok, is_spec) in enumerate(zip(tokens, spec)):
+        for i, (tok, is_spec) in enumerate(zip(tokens, spec, strict=True)):
             if is_spec:
                 prev_i = None
                 continue

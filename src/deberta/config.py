@@ -260,6 +260,16 @@ class TrainConfig:
         metadata={"help": "Output directory (checkpoints, logs)."},
     )
 
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true, delete an existing non-empty output_dir before training. "
+                "If false, a non-empty output_dir requires resume_from_checkpoint."
+            )
+        },
+    )
+
     run_name: str | None = field(
         default=None,
         metadata={"help": "Optional run name for experiment trackers."},
