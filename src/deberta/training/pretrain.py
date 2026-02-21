@@ -1,3 +1,5 @@
+"""Training loop and export utilities for DeBERTa v3 RTD pretraining."""
+
 from __future__ import annotations
 
 import json
@@ -23,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging(is_main: bool) -> None:
+    """Configure process-local logging.
+
+    :param bool is_main: True for main process.
+    """
     level = logging.INFO if is_main else logging.WARN
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -32,12 +38,21 @@ def _setup_logging(is_main: bool) -> None:
 
 
 def _json_dump(obj: Any, path: Path) -> None:
+    """Write JSON to disk with stable formatting.
+
+    :param Any obj: Serializable object.
+    :param Path path: Destination path.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
 
 
 def _maybe_enable_tf32(enabled: bool) -> None:
+    """Enable TF32 compute for CUDA matmul/cudnn.
+
+    :param bool enabled: Whether to enable TF32.
+    """
     if not enabled:
         return
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -45,6 +60,10 @@ def _maybe_enable_tf32(enabled: bool) -> None:
 
 
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
+    """Return optimizer kwargs enabling fused AdamW when available.
+
+    :return dict[str, Any]: Optional kwargs for ``torch.optim.AdamW``.
+    """
     # torch.optim.AdamW supports fused=True on CUDA builds.
     try:
         import inspect
@@ -58,11 +77,11 @@ def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
 
 
 def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    """Create AdamW with sensible parameter grouping.
+    """Create AdamW with parameter grouping for RTD training.
 
-    - Splits decay vs no_decay (bias + norm weights)
-    - Optionally uses a separate generator LR (cfg.generator_learning_rate)
-    - Enables fused AdamW if supported on the current CUDA build
+    :param torch.nn.Module model: RTD model.
+    :param TrainConfig cfg: Training configuration.
+    :return torch.optim.Optimizer: Configured AdamW optimizer.
     """
 
     gen_lr = (
@@ -78,6 +97,12 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
     disc_no_decay: list[torch.nn.Parameter] = []
 
     def _is_no_decay(name: str, p: torch.Tensor) -> bool:
+        """Check whether parameter should skip weight decay.
+
+        :param str name: Parameter name.
+        :param torch.Tensor p: Parameter tensor.
+        :return bool: True when parameter belongs to no-decay group.
+        """
         lname = name.lower()
         if lname.endswith(".bias"):
             return True
@@ -89,6 +114,11 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
         return False
 
     def _is_generator(name: str) -> bool:
+        """Check whether parameter belongs to the generator branch.
+
+        :param str name: Parameter name.
+        :return bool: True when parameter is generator-owned.
+        """
         return name.startswith("generator.") or name.startswith("generator_lm_head.")
 
     for name, param in model.named_parameters():
@@ -124,7 +154,13 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
     return opt
 
 
-def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
+def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
+    """Build a Hugging Face learning-rate scheduler.
+
+    :param torch.optim.Optimizer optimizer: Optimizer instance.
+    :param TrainConfig cfg: Training configuration.
+    :return Any: Scheduler object from ``transformers.get_scheduler``.
+    """
     try:
         from transformers import get_scheduler
     except Exception as e:  # pragma: no cover
@@ -139,15 +175,31 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
 
 
 def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
+    """Yield batches forever by cycling through a dataloader.
+
+    :param DataLoader dl: Source dataloader.
+    :return Iterator[dict[str, torch.Tensor]]: Infinite batch iterator.
+    """
     while True:
         yield from dl
 
 
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    """Move all batch tensors onto a device.
+
+    :param dict[str, torch.Tensor] batch: Tensor batch mapping.
+    :param torch.device device: Destination device.
+    :return dict[str, torch.Tensor]: Batch placed on ``device``.
+    """
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
 def _parse_checkpoint_step(path: str) -> int:
+    """Parse integer step suffix from checkpoint path.
+
+    :param str path: Checkpoint directory path.
+    :return int: Parsed step number, or 0 when missing.
+    """
     name = Path(path).name
     m = re.search(r"checkpoint-(\d+)", name)
     if m:
@@ -156,9 +208,10 @@ def _parse_checkpoint_step(path: str) -> int:
 
 
 def _find_latest_checkpoint(output_dir: Path) -> Path | None:
-    """Return the latest checkpoint-* directory in output_dir, or None.
+    """Return latest ``checkpoint-*`` directory under ``output_dir``.
 
-    This is used to support resume_from_checkpoint="auto".
+    :param Path output_dir: Training output directory.
+    :return Path | None: Latest checkpoint path, or ``None`` if absent.
     """
 
     checkpoints: list[tuple[int, Path]] = []
@@ -181,7 +234,13 @@ def _prepare_output_dir(
     resume_from_checkpoint: str | None,
     is_main_process: bool,
 ) -> None:
-    """Prepare output_dir on the main process."""
+    """Prepare output directory with overwrite/resume semantics.
+
+    :param Path output_dir: Target output path.
+    :param bool overwrite_output_dir: Whether to delete existing non-empty path.
+    :param str | None resume_from_checkpoint: Resume setting from config.
+    :param bool is_main_process: Whether current process owns filesystem writes.
+    """
     if not is_main_process:
         return
 
@@ -198,6 +257,11 @@ def _prepare_output_dir(
 
 
 def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
+    """Delete oldest checkpoints beyond ``save_total_limit``.
+
+    :param Path output_dir: Directory containing checkpoint-* folders.
+    :param int save_total_limit: Max number of checkpoints to retain.
+    """
     if save_total_limit <= 0:
         return
 
@@ -227,7 +291,14 @@ def _maybe_tokenize_non_streaming(
     data_cfg: DataConfig,
     is_train: bool,
 ) -> Any:
-    """Tokenize + pack a map-style dataset into fixed-length examples."""
+    """Tokenize and pack non-streaming datasets to fixed-length blocks.
+
+    :param Any raw_ds: Source dataset object.
+    :param Any tokenizer: HF tokenizer.
+    :param DataConfig data_cfg: Data configuration.
+    :param bool is_train: Whether dataset is for training mode.
+    :return Any: Packed dataset object.
+    """
 
     try:
         import datasets
@@ -248,6 +319,11 @@ def _maybe_tokenize_non_streaming(
     sep_id = int(tokenizer.sep_token_id)
 
     def tokenize_fn(examples: dict[str, list[str]]) -> dict[str, Any]:
+        """Tokenize text batch without adding special tokens.
+
+        :param dict[str, list[str]] examples: Batch of dataset examples.
+        :return dict[str, Any]: Tokenized batch.
+        """
         texts = examples[text_key]
         # No special tokens: we will add [CLS]/[SEP] after packing.
         return tokenizer(
@@ -270,6 +346,11 @@ def _maybe_tokenize_non_streaming(
         raise ValueError("max_seq_length must be >= 3")
 
     def group_texts(examples: dict[str, list[list[int]]]) -> dict[str, Any]:
+        """Concatenate tokens and split into fixed-size blocks.
+
+        :param dict[str, list[list[int]]] examples: Tokenized examples batch.
+        :return dict[str, Any]: Packed ``input_ids`` and masks.
+        """
         # Concatenate all texts.
         concatenated: list[int] = []
         for seq in examples["input_ids"]:
@@ -330,6 +411,12 @@ def _export_discriminator_hf(
         loads the checkpoint and consolidates weights with FULL_STATE_DICT on rank0.
 
     This function is intentionally lightweight and is safe to keep enabled by default.
+
+    :param Any accelerator: Accelerate runtime object.
+    :param DebertaV3RTDPretrainer model: Wrapped RTD pretrainer.
+    :param Any tokenizer: Tokenizer to export.
+    :param Path output_dir: Export destination directory.
+    :param str embedding_sharing: Sharing mode used during training.
     """
 
     if not accelerator.is_main_process:
@@ -377,6 +464,10 @@ def _export_discriminator_hf(
         if mode in {"es", "gdes"}:
 
             def merge_embedding(attr: str) -> None:
+                """Merge generator/discriminator embedding weights into export model.
+
+                :param str attr: Embedding attribute name under ``embeddings``.
+                """
                 if not hasattr(export_disc, "embeddings") or not hasattr(export_disc.embeddings, attr):
                     return
                 gen_key = f"embeddings.{attr}.weight"
@@ -414,6 +505,12 @@ def _export_discriminator_hf(
 
 
 def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: TrainConfig) -> None:
+    """Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
+
+    :param ModelConfig model_cfg: Model configuration.
+    :param DataConfig data_cfg: Data configuration.
+    :param TrainConfig train_cfg: Training configuration.
+    """
     from accelerate import Accelerator
     from accelerate.utils import set_seed
 
@@ -608,6 +705,11 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
                 # Reduce scalar metrics across processes.
                 def _mean(x: torch.Tensor) -> float:
+                    """Compute global mean scalar across processes.
+
+                    :param torch.Tensor x: Scalar-like tensor.
+                    :return float: Process-aggregated mean value.
+                    """
                     x = x.detach().float().reshape(1)
                     return accelerator.gather(x).mean().item()
 

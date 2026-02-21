@@ -1,3 +1,5 @@
+"""Streaming dataset packing utilities for fixed-length RTD inputs."""
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -9,6 +11,8 @@ import torch
 
 @dataclass
 class PackedStreamingConfig:
+    """Configuration for packing raw text into fixed-length token blocks."""
+
     text_column_name: str
     max_seq_length: int
     seed: int
@@ -38,6 +42,14 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         process_index: int = 0,
         num_processes: int = 1,
     ) -> None:
+        """Create a streaming packer dataset.
+
+        :param Any hf_dataset: Source HF dataset (usually iterable).
+        :param Any tokenizer: Tokenizer with cls/sep/pad token ids.
+        :param PackedStreamingConfig cfg: Packing configuration.
+        :param int process_index: Current distributed rank index.
+        :param int num_processes: Total distributed process count.
+        """
         super().__init__()
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
@@ -53,6 +65,10 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
             raise ValueError("Tokenizer must define pad_token_id.")
 
     def set_epoch(self, epoch: int) -> None:
+        """Forward epoch to underlying dataset when supported.
+
+        :param int epoch: Training epoch.
+        """
         # Some streaming datasets support set_epoch() for deterministic shuffling.
         if hasattr(self.hf_dataset, "set_epoch"):
             try:
@@ -61,6 +77,11 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 pass
 
     def _shard_dataset_for_worker(self, ds: Any) -> Any:
+        """Shard dataset across processes and dataloader workers.
+
+        :param Any ds: Input dataset object.
+        :return Any: Sharded dataset view.
+        """
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             num_workers = 1
@@ -78,6 +99,10 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         return ds
 
     def _iter_examples(self) -> Iterator[dict[str, Any]]:
+        """Build an iterator over shuffled and sharded examples.
+
+        :return Iterator[dict[str, Any]]: Example iterator.
+        """
         ds = self.hf_dataset
         if self.cfg.shuffle_buffer_size and self.cfg.shuffle_buffer_size > 0 and hasattr(ds, "shuffle"):
             ds = ds.shuffle(buffer_size=self.cfg.shuffle_buffer_size, seed=self.cfg.seed)

@@ -1,3 +1,5 @@
+"""Dataclass-based model, data, and training configuration definitions."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

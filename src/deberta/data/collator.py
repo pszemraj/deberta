@@ -1,3 +1,5 @@
+"""Masking collator implementations used by RTD pretraining."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -46,6 +48,12 @@ class DebertaV3ElectraCollator:
         cfg: MLMConfig,
         pad_to_multiple_of: int | None = None,
     ) -> None:
+        """Initialize collator state.
+
+        :param Any tokenizer: HF tokenizer.
+        :param MLMConfig cfg: Masking configuration.
+        :param int | None pad_to_multiple_of: Optional right-padding multiple.
+        """
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.pad_to_multiple_of = pad_to_multiple_of
@@ -87,6 +95,12 @@ class DebertaV3ElectraCollator:
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch masking strategy based on max_ngram setting.
+
+        :param torch.Tensor input_ids: Input token ids of shape (B, S).
+        :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
+        :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
+        """
         if int(self.cfg.max_ngram) <= 1:
             return self._mask_tokens_bert(input_ids, special_tokens_mask=special_tokens_mask)
         return self._mask_tokens_ngram(
@@ -96,7 +110,12 @@ class DebertaV3ElectraCollator:
     def _mask_tokens_bert(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fast token-level (independent) masking."""
+        """Apply token-level (independent) MLM masking.
+
+        :param torch.Tensor input_ids: Input token ids of shape (B, S).
+        :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
+        :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
+        """
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
 
@@ -156,6 +175,11 @@ class DebertaV3ElectraCollator:
         Implementation notes:
           - We group sub-tokens into "words" using tokenizer token string heuristics.
           - We sample contiguous spans of whole words with an n-gram distribution p(n) ∝ 1/n.
+
+        :param torch.Tensor input_ids: Input token ids of shape (B, S).
+        :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
+        :param int max_ngram: Maximum n-gram width.
+        :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
 
         if input_ids.dtype != torch.long:
@@ -259,6 +283,10 @@ class DebertaV3ElectraCollator:
           - GPT2/RoBERTa BPE continuation: token does NOT start with 'Ġ'
 
         We only group contiguous indices; any special/pad positions act as hard boundaries.
+
+        :param Sequence[int] ids: Token ids for one sequence.
+        :param Sequence[bool] spec: Boolean special-token mask for one sequence.
+        :return list[list[int]]: Contiguous index groups representing words.
         """
 
         tokens = self.tokenizer.convert_ids_to_tokens(list(ids))
@@ -266,6 +294,11 @@ class DebertaV3ElectraCollator:
         prev_i: int | None = None
 
         def _is_continuation(tok: str) -> bool:
+            """Detect whether token text continues the previous word.
+
+            :param str tok: Token string from tokenizer.
+            :return bool: True if token should join previous group.
+            """
             if tok.startswith("##"):
                 return True
             if tok.startswith("▁") or tok.startswith("Ġ"):

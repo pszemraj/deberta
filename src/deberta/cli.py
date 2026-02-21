@@ -1,3 +1,5 @@
+"""CLI entrypoints and config-file loaders for pretraining."""
+
 from __future__ import annotations
 
 import json
@@ -11,7 +13,11 @@ from deberta.training import run_pretraining
 
 
 def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Split a flat dict into model/data/train sub-dicts based on dataclass field names."""
+    """Split flat config keys into model/data/train sections.
+
+    :param dict[str, Any] raw: Flat config mapping.
+    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed model/data/train dicts.
+    """
 
     model_keys = {f.name for f in fields(ModelConfig)}
     data_keys = {f.name for f in fields(DataConfig)}
@@ -41,6 +47,11 @@ def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
 
 
 def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
+    """Load model/data/train dataclasses from a YAML file.
+
+    :param Path path: YAML path.
+    :return tuple[ModelConfig, DataConfig, TrainConfig]: Parsed config dataclasses.
+    """
     try:
         import yaml  # type: ignore
     except Exception as e:  # pragma: no cover
@@ -71,6 +82,11 @@ def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
 
 
 def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
+    """Load model/data/train dataclasses from a JSON file.
+
+    :param Path path: JSON path.
+    :return tuple[ModelConfig, DataConfig, TrainConfig]: Parsed config dataclasses.
+    """
     raw = json.loads(path.read_text())
     if raw is None:
         raw = {}

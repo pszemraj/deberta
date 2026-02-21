@@ -1,3 +1,5 @@
+"""Dataset loading helpers wrapping Hugging Face Datasets APIs."""
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -5,13 +7,18 @@ from typing import Any
 
 
 def _pretty_cfg(cfg: Any) -> str:
+    """Render config object for user-facing error messages.
+
+    :param Any cfg: Config-like object.
+    :return str: Best-effort readable representation.
+    """
     try:
         return str(asdict(cfg))
     except Exception:
         return repr(cfg)
 
 
-def load_hf_dataset(*, cfg: Any, split: str, streaming: bool):
+def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
     """Load a dataset split using 🤗 Datasets.
 
     Supports:
@@ -19,7 +26,10 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool):
       - load_dataset(name)
       - load_dataset('text', data_files=...)
 
-    Returns either a map-style Dataset or an IterableDataset (streaming).
+    :param Any cfg: Data config containing dataset source settings.
+    :param str split: Split name to load.
+    :param bool streaming: Whether to request a streaming dataset.
+    :return Any: Map-style Dataset or streaming IterableDataset.
     """
 
     try:
