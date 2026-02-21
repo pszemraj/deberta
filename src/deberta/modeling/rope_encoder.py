@@ -219,12 +219,17 @@ class DebertaRoPESelfAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope.apply(q, k)
 
-        attn_mask = None
+        sdpa_attn_mask = None
+        eager_attn_mask = None
         query_keep_heads = None
         query_keep_tokens = None
         if attention_mask is not None:
-            # attention_mask is 1 for tokens, 0 for pad. SDPA expects True = mask.
-            attn_mask = attention_mask.eq(0)[:, None, None, :]  # (B,1,1,S) bool
+            # attention_mask is 1 for tokens, 0 for pad.
+            key_keep = attention_mask.to(dtype=torch.bool)
+            # PyTorch SDPA bool masks use True=keep, False=masked.
+            sdpa_attn_mask = key_keep[:, None, None, :]  # (B,1,1,S) bool
+            # Eager path uses masked_fill, so True marks masked positions.
+            eager_attn_mask = ~sdpa_attn_mask
             # Explicitly zero padded query outputs for robustness on eager/edge paths.
             query_keep_heads = attention_mask[:, None, :, None].to(dtype=q.dtype)
             query_keep_tokens = attention_mask[:, :, None].to(dtype=q.dtype)
@@ -234,7 +239,7 @@ class DebertaRoPESelfAttention(nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=attn_mask,
+                attn_mask=sdpa_attn_mask,
                 dropout_p=self.attn_dropout if self.training else 0.0,
                 is_causal=False,
             )
@@ -242,8 +247,8 @@ class DebertaRoPESelfAttention(nn.Module):
             # Eager attention (debug/fallback)
             scale = 1.0 / math.sqrt(self.head_dim)
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, nh, S, S)
-            if attn_mask is not None:
-                scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+            if eager_attn_mask is not None:
+                scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn, v)

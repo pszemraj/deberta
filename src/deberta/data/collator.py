@@ -428,6 +428,16 @@ class DebertaV3ElectraCollator:
         groups: list[list[int]] = []
         prev_i: int | None = None
 
+        special_tokens = set(getattr(self.tokenizer, "all_special_tokens", []))
+        lexical_tokens = [
+            tok
+            for tok, is_spec in zip(tokens, spec, strict=True)
+            if (not is_spec) and tok is not None and tok != "" and tok not in special_tokens
+        ]
+        uses_wordpiece_cont = any(tok.startswith("##") for tok in lexical_tokens)
+        uses_sentencepiece_markers = any(tok.startswith("▁") for tok in lexical_tokens)
+        uses_gpt2_markers = any(tok.startswith("Ġ") for tok in lexical_tokens)
+
         def _is_continuation(tok: str) -> bool:
             """Detect whether token text continues the previous word.
 
@@ -436,10 +446,17 @@ class DebertaV3ElectraCollator:
             """
             if tok.startswith("##"):
                 return True
-            if tok.startswith("▁") or tok.startswith("Ġ"):
+            if uses_sentencepiece_markers:
+                return not tok.startswith("▁")
+            if uses_gpt2_markers:
+                return not tok.startswith("Ġ")
+            # WordPiece tokenizers often emit plain tokens for word starts and
+            # reserve only '##' for continuations.
+            if uses_wordpiece_cont:
                 return False
-            # Fallback: treat as continuation if adjacent.
-            return True
+            # Conservative fallback: if we cannot infer continuation markers,
+            # avoid over-merging unrelated adjacent tokens.
+            return False
 
         for i, (tok, is_spec) in enumerate(zip(tokens, spec, strict=True)):
             if is_spec:
@@ -448,7 +465,7 @@ class DebertaV3ElectraCollator:
 
             # Treat tokenizer special tokens (e.g. [PAD]) as hard boundaries even if
             # special_tokens_mask was not provided by the dataset.
-            if tok in getattr(self.tokenizer, "all_special_tokens", []):
+            if tok in special_tokens:
                 prev_i = None
                 continue
 

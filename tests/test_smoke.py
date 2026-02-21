@@ -166,6 +166,29 @@ def test_ngram_masking_respects_specials():
     assert masked[0, 5].item() == tok.pad_token_id
 
 
+def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
+    class WordPieceLikeTokenizer(DummyTokenizer):
+        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+            table = {
+                self.pad_token_id: "[PAD]",
+                self.cls_token_id: "[CLS]",
+                self.sep_token_id: "[SEP]",
+                self.mask_token_id: "[MASK]",
+                10: "the",
+                11: "cat",
+                12: "sat",
+            }
+            return [table.get(i, f"tok{i}") for i in ids]
+
+    tok = WordPieceLikeTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.5, max_ngram=3))
+
+    ids = [tok.cls_token_id, 10, 11, 12, tok.sep_token_id]
+    spec = [1, 0, 0, 0, 1]
+    groups = coll._build_word_groups(ids, spec)
+    assert groups == [[1], [2], [3]]
+
+
 def test_collator_drops_all_ones_attention_mask():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
@@ -289,6 +312,55 @@ def test_self_attention_zeroes_padded_query_outputs():
     assert torch.allclose(out[1, 5:, :], torch.zeros_like(out[1, 5:, :]), atol=1e-6)
 
 
+def test_self_attention_sdpa_matches_eager_with_padding_mask():
+    import pytest
+    import torch.nn.functional as F
+
+    pytest.importorskip("transformers")
+    if not hasattr(F, "scaled_dot_product_attention"):
+        pytest.skip("torch.nn.functional.scaled_dot_product_attention is not available")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    torch.manual_seed(0)
+    cfg_kwargs = dict(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg_sdpa = DebertaRoPEConfig(attention_implementation="sdpa", **cfg_kwargs)
+    cfg_eager = DebertaRoPEConfig(attention_implementation="eager", **cfg_kwargs)
+
+    attn_sdpa = DebertaRoPESelfAttention(cfg_sdpa).eval()
+    attn_eager = DebertaRoPESelfAttention(cfg_eager).eval()
+    attn_eager.load_state_dict(attn_sdpa.state_dict())
+
+    # Isolate mask behavior from rotary implementation details.
+    attn_sdpa.rope = None
+    attn_eager.rope = None
+
+    x = torch.randn((2, 6, cfg_sdpa.hidden_size), dtype=torch.float32)
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        out_sdpa = attn_sdpa(x, attention_mask)
+        out_eager = attn_eager(x, attention_mask)
+
+    torch.testing.assert_close(out_sdpa, out_eager, rtol=1e-5, atol=1e-6)
+
+
 def test_pretrainer_forward_smoke():
     """Requires transformers; skipped automatically if not installed."""
 
@@ -356,6 +428,52 @@ def test_pretrainer_forward_smoke():
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.disc_accuracy.ndim == 0
+
+
+def test_pretrainer_sampler_avoids_configured_special_ids():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    ).eval()
+
+    logits = torch.full((256, cfg.vocab_size), -10.0, dtype=torch.float32)
+    logits[:, 0] = 20.0
+    logits[:, 1] = 19.0
+    logits[:, 2] = 18.0
+    logits[:, 3] = 17.0
+
+    with torch.no_grad():
+        sampled = model._sample_generator_tokens(logits, sampling_temperature=1.0)
+
+    for sid in (cfg.pad_token_id, cfg.cls_token_id, cfg.sep_token_id, cfg.mask_token_id):
+        assert sid is not None
+        assert not bool((sampled == int(sid)).any().item())
 
 
 def test_rope_model_infers_pad_mask_when_attention_mask_missing():

@@ -242,7 +242,99 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.discriminator_head = RTDHead(disc_config)
 
         self.embedding_sharing = embedding_sharing
+        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids()
+        self._allowed_sample_token_ids_cpu = self._build_allowed_sample_token_ids()
+        self._allowed_sample_token_ids_by_device: dict[str, torch.Tensor] = {}
         self._maybe_patch_discriminator_embeddings()
+
+    def _collect_forbidden_sample_token_ids(self) -> set[int]:
+        """Collect special token ids to exclude from generator replacement sampling.
+
+        :return set[int]: Special token ids bounded to generator vocab range.
+        """
+        out: set[int] = set()
+        vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            return out
+
+        for cfg in (self.gen_config, self.disc_config):
+            for attr in (
+                "pad_token_id",
+                "cls_token_id",
+                "sep_token_id",
+                "mask_token_id",
+                "bos_token_id",
+                "eos_token_id",
+            ):
+                sid = getattr(cfg, attr, None)
+                if sid is None:
+                    continue
+                try:
+                    sid_i = int(sid)
+                except Exception:
+                    continue
+                if 0 <= sid_i < vocab_size:
+                    out.add(sid_i)
+        return out
+
+    def _build_allowed_sample_token_ids(self) -> torch.Tensor | None:
+        """Build allowed generator replacement token ids.
+
+        :return torch.Tensor | None: CPU tensor of sampleable token ids, or None.
+        """
+        if not self._forbidden_sample_token_ids:
+            return None
+
+        vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            return None
+
+        allowed = torch.ones(vocab_size, dtype=torch.bool)
+        for sid in self._forbidden_sample_token_ids:
+            if 0 <= int(sid) < vocab_size:
+                allowed[int(sid)] = False
+
+        if not bool(allowed.any().item()):
+            return None
+        return torch.arange(vocab_size, dtype=torch.long)[allowed]
+
+    def _get_allowed_sample_token_ids(self, device: torch.device) -> torch.Tensor | None:
+        """Get cached allowed token ids on a device.
+
+        :param torch.device device: Device for returned tensor.
+        :return torch.Tensor | None: Device-local allowed ids, or None.
+        """
+        if self._allowed_sample_token_ids_cpu is None:
+            return None
+
+        key = f"{device.type}:{device.index if device.index is not None else -1}"
+        ids = self._allowed_sample_token_ids_by_device.get(key)
+        if ids is None:
+            ids = self._allowed_sample_token_ids_cpu.to(device=device)
+            self._allowed_sample_token_ids_by_device[key] = ids
+        return ids
+
+    def _sample_generator_tokens(self, logits: torch.Tensor, *, sampling_temperature: float) -> torch.Tensor:
+        """Sample generator replacements from logits with optional special-id filtering.
+
+        :param torch.Tensor logits: Generator logits of shape (N, vocab_size).
+        :param float sampling_temperature: Positive sampling temperature.
+        :return torch.Tensor: Sampled token ids of shape (N,).
+        """
+        temp = float(sampling_temperature)
+        if temp <= 0:
+            raise ValueError("sampling_temperature must be > 0")
+
+        logits_f = logits.float()
+        allowed = self._get_allowed_sample_token_ids(logits.device)
+        if allowed is not None:
+            filtered_logits = logits_f.index_select(dim=-1, index=allowed)
+            probs = torch.softmax(filtered_logits / temp, dim=-1)
+            sampled_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            return allowed[sampled_idx]
+
+        probs = torch.softmax(logits_f / temp, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def _maybe_patch_discriminator_embeddings(self) -> None:
         """Patch discriminator embeddings to follow configured sharing mode."""
@@ -347,11 +439,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 
             # Sample replacements from detached logits.
             with torch.no_grad():
-                temp = float(sampling_temperature)
-                if temp <= 0:
-                    raise ValueError("sampling_temperature must be > 0")
-                probs = torch.softmax(gen_logits.float() / temp, dim=-1)
-                sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                sampled = self._sample_generator_tokens(gen_logits, sampling_temperature=sampling_temperature)
 
             corrupted_input_ids = input_ids.clone()
             corrupted_input_ids[masked] = sampled
