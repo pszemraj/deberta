@@ -185,7 +185,7 @@ class RTDHead(nn.Module):
         """
         super().__init__()
         hidden_size = int(config.hidden_size)
-        drop_out = getattr(config, "hidden_dropout_prob", 0.1)
+        drop_out = getattr(config, "hidden_dropout_prob", 0.0)
         self.dropout = nn.Dropout(float(drop_out))
 
         # A small transform helps stability.

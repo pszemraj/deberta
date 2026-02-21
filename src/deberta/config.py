@@ -184,13 +184,23 @@ class ModelConfig:
     )
 
     hidden_dropout_prob: float | None = field(
-        default=None,
-        metadata={"help": "Override hidden dropout prob from config (rope or HF)."},
+        default=0.0,
+        metadata={
+            "help": (
+                "Hidden dropout probability for discriminator/generator configs. "
+                "Default is 0.0. Set null in config to preserve checkpoint-native values."
+            )
+        },
     )
 
     attention_probs_dropout_prob: float | None = field(
-        default=None,
-        metadata={"help": "Override attention dropout prob from config (rope or HF)."},
+        default=0.0,
+        metadata={
+            "help": (
+                "Attention dropout probability for discriminator/generator configs. "
+                "Default is 0.0. Set null in config to preserve checkpoint-native values."
+            )
+        },
     )
 
     # -------------------------

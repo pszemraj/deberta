@@ -295,6 +295,12 @@ def test_train_config_defaults_to_bf16_autocast():
     assert cfg.sdpa_kernel == "auto"
 
 
+def test_model_config_defaults_dropouts_to_zero():
+    cfg = ModelConfig()
+    assert cfg.hidden_dropout_prob == pytest.approx(0.0)
+    assert cfg.attention_probs_dropout_prob == pytest.approx(0.0)
+
+
 def test_normalize_mixed_precision_accepts_bool_and_synonyms():
     assert _normalize_mixed_precision("bf16") == "bf16"
     assert _normalize_mixed_precision("none") == "no"
