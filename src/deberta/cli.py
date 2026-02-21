@@ -368,7 +368,7 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg)
+    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
 
     run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
 

@@ -193,3 +193,20 @@ def test_run_export_fsdp_state_dict_paths(
         assert called["get_model_state_dict"] == 0
         assert called["options_kwargs"] is None
     assert called["unwrap_model"] == 0
+
+
+def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    export_cli._validate_run_metadata_if_present(run_dir)
+
+
+def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps({"config_schema_version": int(export_cli.RUN_CONFIG_SCHEMA_VERSION) + 1}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unsupported run metadata schema"):
+        export_cli._validate_run_metadata_if_present(run_dir)

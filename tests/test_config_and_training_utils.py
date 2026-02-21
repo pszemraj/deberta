@@ -11,6 +11,7 @@ import torch
 import deberta.cli as cli_mod
 from deberta.cli import _load_json, _load_yaml
 from deberta.config import (
+    RUN_CONFIG_SCHEMA_VERSION,
     DataConfig,
     ModelConfig,
     TrainConfig,
@@ -255,6 +256,8 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
         resume_checkpoint=None,
         is_main_process=True,
     )
+    run_meta = json.loads((out / "run_metadata.json").read_text(encoding="utf-8"))
+    assert int(run_meta["config_schema_version"]) == int(RUN_CONFIG_SCHEMA_VERSION)
 
     changed_model = ModelConfig(backbone_type="rope", hidden_size=1024)
     with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
@@ -297,6 +300,38 @@ def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matchin
 
     resumed_train_snapshot = json.loads((out / "train_config.json").read_text(encoding="utf-8"))
     assert resumed_train_snapshot == original_train_snapshot
+
+
+def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    (out / "run_metadata.json").write_text(
+        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION) + 1}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported run metadata schema"):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            resume_checkpoint=str(out / "checkpoint-10"),
+            is_main_process=True,
+        )
 
 
 class _FakeAccelerator:
@@ -725,6 +760,16 @@ def test_validate_data_config_rejects_conflicting_sources():
         )
 
 
+def test_validate_data_config_canonicalizes_non_streaming_shuffle_buffer_size():
+    cfg = DataConfig(
+        dataset_name="HuggingFaceFW/fineweb-edu",
+        streaming=False,
+        shuffle_buffer_size=10_000,
+    )
+    validate_data_config(cfg)
+    assert cfg.shuffle_buffer_size == 1
+
+
 def test_validate_training_workflow_options_rejects_eval_knobs():
     with pytest.raises(ValueError, match="Evaluation workflow is not implemented yet"):
         validate_training_workflow_options(
@@ -744,6 +789,15 @@ def test_validate_training_workflow_options_rejects_flash_only_with_packing():
         validate_training_workflow_options(
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=True),
             train_cfg=TrainConfig(sdpa_kernel="flash_only"),
+        )
+
+
+def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_rope_attention_is_eager():
+    with pytest.raises(ValueError, match="train.sdpa_kernel only affects rope attention"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
+            train_cfg=TrainConfig(sdpa_kernel="flash"),
+            model_cfg=ModelConfig(backbone_type="rope", attention_implementation="eager"),
         )
 
 

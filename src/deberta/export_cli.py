@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from deberta.config import (
+    RUN_CONFIG_SCHEMA_VERSION,
     DataConfig,
     ModelConfig,
     validate_data_config,
@@ -49,6 +50,34 @@ def _infer_run_dir(checkpoint_dir: Path) -> Path:
     # checkpoint_dir = .../checkpoint-XXXX
     # run dir is usually parent.
     return checkpoint_dir.parent
+
+
+def _validate_run_metadata_if_present(run_dir: Path) -> None:
+    """Validate run-metadata schema when a metadata file is present.
+
+    :param Path run_dir: Run directory potentially containing run metadata.
+    :raises ValueError: If metadata schema is malformed or incompatible.
+    """
+    meta_path = run_dir / "run_metadata.json"
+    if not meta_path.exists():
+        return
+    raw = _load_json(meta_path)
+    if "config_schema_version" not in raw:
+        raise ValueError(
+            f"run metadata missing `config_schema_version` at {meta_path}. "
+            "Refusing export with ambiguous config schema."
+        )
+    try:
+        schema_version = int(raw["config_schema_version"])
+    except Exception as e:
+        raise ValueError(
+            f"Invalid config_schema_version in {meta_path}: {raw['config_schema_version']!r}"
+        ) from e
+    if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
+        raise ValueError(
+            f"Unsupported run metadata schema at {meta_path}: {schema_version}. "
+            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
+        )
 
 
 @dataclass
@@ -236,6 +265,7 @@ def run_export(cfg: ExportConfig) -> None:
         raise FileNotFoundError(f"Expected {model_cfg_path} (produced during training)")
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
+    _validate_run_metadata_if_present(run_dir)
 
     model_cfg = ModelConfig(**_load_json(model_cfg_path))
     data_cfg = DataConfig(**_load_json(data_cfg_path))

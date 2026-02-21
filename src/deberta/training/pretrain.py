@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from deberta.config import (
+    RUN_CONFIG_SCHEMA_VERSION,
     DataConfig,
     ModelConfig,
     TrainConfig,
@@ -61,6 +62,44 @@ def _json_load(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"Expected JSON object at {path}, got {type(raw).__name__}.")
     return raw
+
+
+def _build_run_metadata() -> dict[str, Any]:
+    """Build run-metadata payload stored alongside config snapshots.
+
+    :return dict[str, Any]: Metadata mapping.
+    """
+    from deberta import __version__
+
+    return {
+        "config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION),
+        "deberta_version": str(__version__),
+    }
+
+
+def _validate_run_metadata(path: Path) -> None:
+    """Validate on-disk run metadata schema compatibility.
+
+    :param Path path: Metadata file path.
+    :raises ValueError: If metadata is malformed or schema-incompatible.
+    """
+    raw = _json_load(path)
+    if "config_schema_version" not in raw:
+        raise ValueError(
+            f"run metadata missing `config_schema_version` at {path}. "
+            "Refusing resume/export with ambiguous config schema."
+        )
+
+    try:
+        schema_version = int(raw["config_schema_version"])
+    except Exception as e:
+        raise ValueError(f"Invalid config_schema_version in {path}: {raw['config_schema_version']!r}") from e
+
+    if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
+        raise ValueError(
+            f"Unsupported run metadata schema at {path}: {schema_version}. "
+            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
+        )
 
 
 def _resolve_resume_checkpoint(
@@ -112,9 +151,16 @@ def _persist_or_validate_run_configs(
     model_cfg_path = output_dir / "model_config.json"
     data_cfg_path = output_dir / "data_config.json"
     train_cfg_path = output_dir / "train_config.json"
+    run_meta_path = output_dir / "run_metadata.json"
 
     has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
     if resume_checkpoint is not None and has_saved_model_data:
+        if run_meta_path.exists():
+            _validate_run_metadata(run_meta_path)
+        elif is_main_process:
+            # Backfill schema metadata for older runs once compatibility has been checked.
+            _json_dump(_build_run_metadata(), run_meta_path)
+
         saved_model_cfg = ModelConfig(**_json_load(model_cfg_path))
         saved_data_cfg = DataConfig(**_json_load(data_cfg_path))
         validate_model_config(saved_model_cfg)
@@ -138,6 +184,7 @@ def _persist_or_validate_run_configs(
         _json_dump(asdict(model_cfg), model_cfg_path)
         _json_dump(asdict(data_cfg), data_cfg_path)
         _json_dump(asdict(train_cfg), train_cfg_path)
+        _json_dump(_build_run_metadata(), run_meta_path)
 
 
 def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
@@ -888,7 +935,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg)
+    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
 
     force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
         torch_compile=bool(train_cfg.torch_compile),

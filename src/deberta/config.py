@@ -58,6 +58,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
     "microsoft/deberta-v3",
     "microsoft/mdeberta-v3",
 )
+RUN_CONFIG_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -377,7 +378,13 @@ class DataConfig:
 
     shuffle_buffer_size: int = field(
         default=10_000,
-        metadata={"help": "Streaming shuffle buffer size. 0 disables streaming shuffle."},
+        metadata={
+            "help": (
+                "Streaming shuffle buffer size. 0 disables shuffle. "
+                "When data.streaming=false, any positive value is canonicalized to 1 "
+                "(non-streaming datasets only support shuffle off/on)."
+            )
+        },
     )
 
     # Non-streaming preprocessing
@@ -768,6 +775,10 @@ def validate_data_config(cfg: DataConfig) -> None:
         raise ValueError("data.max_seq_length must be >= 8 for pretraining.")
     if int(cfg.shuffle_buffer_size) < 0:
         raise ValueError("data.shuffle_buffer_size must be >= 0.")
+    if not bool(cfg.streaming) and int(cfg.shuffle_buffer_size) > 0:
+        # Non-streaming/map-style datasets expose full-dataset shuffle semantics only.
+        # Canonicalize any positive buffer request to "shuffle enabled" (1).
+        cfg.shuffle_buffer_size = 1
     if int(cfg.preprocessing_num_workers) < 0:
         raise ValueError("data.preprocessing_num_workers must be >= 0.")
     default_preproc_workers = DataConfig().preprocessing_num_workers
@@ -826,11 +837,17 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("train.sampling_temperature must be > 0.")
 
 
-def validate_training_workflow_options(*, data_cfg: DataConfig, train_cfg: TrainConfig) -> None:
+def validate_training_workflow_options(
+    *,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    model_cfg: ModelConfig | None = None,
+) -> None:
     """Validate options tied to workflow support (for example, eval mode availability).
 
     :param DataConfig data_cfg: Data configuration.
     :param TrainConfig train_cfg: Training configuration.
+    :param ModelConfig | None model_cfg: Optional model configuration for cross-surface checks.
     """
     if data_cfg.eval_split is not None or int(train_cfg.eval_steps) > 0:
         raise ValueError(
@@ -851,3 +868,12 @@ def validate_training_workflow_options(*, data_cfg: DataConfig, train_cfg: Train
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
             "with flash-only SDPA kernels. Use train.sdpa_kernel=flash|auto|mem_efficient|math instead."
         )
+
+    if model_cfg is not None:
+        backbone_type = str(model_cfg.backbone_type).strip().lower()
+        attn_impl = str(model_cfg.attention_implementation).strip().lower()
+        if backbone_type == "rope" and attn_impl != "sdpa" and sdpa_policy != "auto":
+            raise ValueError(
+                "train.sdpa_kernel only affects rope attention when model.attention_implementation='sdpa'. "
+                "Set train.sdpa_kernel=auto or switch model.attention_implementation=sdpa."
+            )
