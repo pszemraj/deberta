@@ -12,7 +12,9 @@ from deberta.training.pretrain import (
     _build_optimizer,
     _find_latest_checkpoint,
     _normalize_mixed_precision,
+    _normalize_torch_compile_mode,
     _prepare_output_dir,
+    _should_force_legacy_tf32_for_compile,
 )
 
 
@@ -183,3 +185,23 @@ def test_normalize_mixed_precision_accepts_bool_and_synonyms():
 
     with pytest.raises(ValueError, match="train.mixed_precision must be one of: no\\|bf16"):
         _normalize_mixed_precision("fp16")
+
+
+def test_normalize_torch_compile_mode_accepts_aliases_and_rejects_invalid():
+    assert _normalize_torch_compile_mode("default") == "default"
+    assert _normalize_torch_compile_mode("reduce_overhead") == "reduce-overhead"
+    assert _normalize_torch_compile_mode("max_autotune") == "max-autotune"
+    assert _normalize_torch_compile_mode("max-autotune-no-cudagraphs") == "max-autotune-no-cudagraphs"
+
+    with pytest.raises(ValueError, match="train.torch_compile_mode must be one of"):
+        _normalize_torch_compile_mode("fastest")
+
+
+def test_force_legacy_tf32_for_compile_modes():
+    assert _should_force_legacy_tf32_for_compile(torch_compile=False, compile_mode="max-autotune") is False
+    assert _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="default") is False
+    assert _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="max-autotune") is True
+    assert (
+        _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="max-autotune-no-cudagraphs")
+        is True
+    )

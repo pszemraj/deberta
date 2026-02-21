@@ -383,7 +383,9 @@ class TrainConfig:
 
     torch_compile_mode: str = field(
         default="default",
-        metadata={"help": "torch.compile mode (default|reduce-overhead|max-autotune)."},
+        metadata={
+            "help": "torch.compile mode (default|reduce-overhead|max-autotune|max-autotune-no-cudagraphs)."
+        },
     )
 
     tf32: bool = field(default=True, metadata={"help": "Enable TF32 matmul on Ampere+ GPUs."})

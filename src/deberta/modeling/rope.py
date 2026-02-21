@@ -8,6 +8,19 @@ import torch
 import torch.nn as nn
 
 
+def _is_torch_compiling() -> bool:
+    """Return whether execution is inside a torch.compile graph.
+
+    :return bool: True when currently executing inside torch.compile.
+    """
+    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
+        return False
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate even/odd channels for RoPE application.
 
@@ -81,6 +94,12 @@ class RotaryEmbedding(nn.Module):
         :param torch.dtype dtype: Target dtype.
         :return tuple[torch.Tensor, torch.Tensor]: Cosine and sine tensors.
         """
+        # Avoid mutating module-side cache tensors while tracing/compiling.
+        # This prevents cudagraph storage reuse errors across iterations.
+        if _is_torch_compiling():
+            fresh = self._build_cache(seq_len, device=device, dtype=dtype)
+            return fresh.cos, fresh.sin
+
         if (
             self._cache is None
             or self._cache_device != device

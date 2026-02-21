@@ -222,3 +222,22 @@ def test_pretrainer_forward_smoke():
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.disc_accuracy.ndim == 0
+
+
+def test_rotary_compile_mode_bypasses_stateful_cache(monkeypatch):
+    from deberta.modeling import rope as rope_mod
+
+    rope = rope_mod.RotaryEmbedding(dim=8, base=10_000.0)
+    device = torch.device("cpu")
+
+    monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: True)
+    cos1, sin1 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
+    cos2, sin2 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
+
+    assert rope._cache is None
+    assert cos1.data_ptr() != cos2.data_ptr()
+    assert sin1.data_ptr() != sin2.data_ptr()
+
+    monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: False)
+    _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
+    assert rope._cache is not None

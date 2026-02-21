@@ -69,6 +69,7 @@ Notes:
 - Attention uses **`torch.nn.functional.scaled_dot_product_attention`** (`--attention_implementation sdpa`) and will dispatch to FlashAttention kernels when available.
 - For length generalization, keep `--use_absolute_position_embeddings false` (default).
 - Training defaults to `train.mixed_precision=bf16` (autocast), not full-parameter bf16 casting.
+- Optional compile modes: `--torch_compile true --torch_compile_mode max-autotune-no-cudagraphs` can be a safer fallback on some CUDA stacks.
 
 ---
 

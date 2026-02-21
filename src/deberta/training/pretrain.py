@@ -48,15 +48,138 @@ def _json_dump(obj: Any, path: Path) -> None:
         json.dump(obj, f, indent=2, sort_keys=True)
 
 
-def _maybe_enable_tf32(enabled: bool) -> None:
-    """Enable TF32 compute for CUDA matmul/cudnn.
+def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
+    """Configure TF32 compute policy for CUDA matmul/cudnn.
 
     :param bool enabled: Whether to enable TF32.
+    :param bool force_legacy: Whether to force legacy ``allow_tf32`` flags.
     """
-    if not enabled:
+    if force_legacy:
+        torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+        torch.backends.cudnn.allow_tf32 = bool(enabled)
         return
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+
+    # Prefer the modern fp32_precision API when available (PyTorch 2.9+).
+    # Fallback to allow_tf32 flags on older builds.
+    target = "tf32" if enabled else "ieee"
+    configured = False
+
+    try:
+        if hasattr(torch.backends, "fp32_precision"):
+            torch.backends.fp32_precision = target
+            configured = True
+    except Exception:
+        pass
+
+    try:
+        if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+            torch.backends.cuda.matmul.fp32_precision = target
+            configured = True
+    except Exception:
+        pass
+
+    try:
+        if hasattr(torch.backends.cudnn, "fp32_precision"):
+            torch.backends.cudnn.fp32_precision = target
+            configured = True
+    except Exception:
+        pass
+
+    # Granular cudnn knobs on newer builds.
+    try:
+        if hasattr(torch.backends.cudnn, "conv") and hasattr(torch.backends.cudnn.conv, "fp32_precision"):
+            torch.backends.cudnn.conv.fp32_precision = target
+            configured = True
+        if hasattr(torch.backends.cudnn, "rnn") and hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
+            torch.backends.cudnn.rnn.fp32_precision = target
+            configured = True
+    except Exception:
+        pass
+
+    if configured:
+        return
+
+    # Legacy fallback.
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    torch.backends.cudnn.allow_tf32 = bool(enabled)
+
+
+def _bf16_runtime_sanity_check() -> bool:
+    """Check whether bf16 autocast executes a tiny CUDA matmul.
+
+    :return bool: True when a tiny bf16 autocast path succeeds.
+    """
+    if not torch.cuda.is_available():
+        logger.warning(
+            "bf16 mixed precision requested but CUDA is not available; falling back to full precision."
+        )
+        return False
+    if not torch.cuda.is_bf16_supported():
+        logger.warning(
+            "bf16 mixed precision requested but this CUDA device reports no bf16 support; "
+            "falling back to full precision."
+        )
+        return False
+
+    try:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            a = torch.randn((64, 64), device="cuda", dtype=torch.float32)
+            b = torch.randn((64, 64), device="cuda", dtype=torch.float32)
+            c = a @ b
+            _ = c.sum().item()
+        return True
+    except Exception as e:
+        logger.warning(f"bf16 autocast preflight failed; falling back to full precision. Error: {e}")
+        return False
+
+
+def _normalize_torch_compile_mode(value: Any) -> str:
+    """Normalize torch.compile mode names.
+
+    :param Any value: Raw compile mode value.
+    :return str: Canonical compile mode string.
+    """
+    v = str(value).strip().lower()
+    aliases = {
+        "reduce_overhead": "reduce-overhead",
+        "max_autotune": "max-autotune",
+        "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
+    }
+    mode = aliases.get(v, v)
+
+    allowed = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
+    if mode not in allowed:
+        opts = "|".join(sorted(allowed))
+        raise ValueError(f"train.torch_compile_mode must be one of: {opts}. Got: {value}")
+    return mode
+
+
+def _maybe_cudagraph_mark_step_begin() -> None:
+    """Mark cudagraph step boundaries when the API is available.
+
+    This is a no-op on PyTorch builds that do not expose ``torch.compiler``
+    or ``cudagraph_mark_step_begin``.
+    """
+    try:
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+    except Exception:
+        # Best-effort: keep training running if backend API shape changes.
+        pass
+
+
+def _should_force_legacy_tf32_for_compile(*, torch_compile: bool, compile_mode: str) -> bool:
+    """Return whether TF32 should use legacy flags for compile compatibility.
+
+    :param bool torch_compile: Whether ``torch.compile`` is enabled.
+    :param str compile_mode: Canonical compile mode.
+    :return bool: True when legacy TF32 flags are preferred.
+    """
+    if not torch_compile:
+        return False
+    # On some PyTorch builds, max-autotune paths still query legacy allow_tf32
+    # and can error if only the new fp32_precision API has been configured.
+    return compile_mode.startswith("max-autotune")
 
 
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
@@ -535,6 +658,9 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
     mixed_precision = _normalize_mixed_precision(train_cfg.mixed_precision)
+    compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
+    if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
+        mixed_precision = "no"
     accelerator = Accelerator(
         gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
         log_with=log_with,
@@ -542,7 +668,16 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     )
 
     _setup_logging(accelerator.is_main_process)
-    _maybe_enable_tf32(train_cfg.tf32)
+    force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
+        torch_compile=bool(train_cfg.torch_compile),
+        compile_mode=compile_mode,
+    )
+    if force_legacy_tf32 and accelerator.is_main_process:
+        logger.info(
+            "Using legacy TF32 backend flags for torch.compile max-autotune mode "
+            "to avoid known TF32 API conflicts on some PyTorch builds."
+        )
+    _maybe_enable_tf32(train_cfg.tf32, force_legacy=force_legacy_tf32)
 
     logger.info(f"Accelerate state: {accelerator.state}")
 
@@ -655,12 +790,18 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
 
     # Torch compile (best-effort)
-    if train_cfg.torch_compile and hasattr(torch, "compile"):
+    compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
+    if compile_enabled:
         try:
-            model = torch.compile(model, mode=train_cfg.torch_compile_mode)  # type: ignore[attr-defined]
-            logger.info(f"Enabled torch.compile(mode={train_cfg.torch_compile_mode})")
+            model = torch.compile(model, mode=compile_mode)  # type: ignore[attr-defined]
+            logger.info(f"Enabled torch.compile(mode={compile_mode})")
         except Exception as e:
             logger.warning(f"torch.compile failed, continuing without: {e}")
+            compile_enabled = False
+    elif train_cfg.torch_compile:
+        logger.warning(
+            "torch.compile requested but this torch build does not expose torch.compile; continuing."
+        )
 
     # Trackers
     if train_cfg.report_to != "none":
@@ -697,6 +838,8 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     while global_step < int(train_cfg.max_steps):
         batch = next(train_iter)
         batch = _move_batch_to_device(batch, accelerator.device)
+        if compile_enabled:
+            _maybe_cudagraph_mark_step_begin()
 
         with accelerator.accumulate(model):
             out = model(
