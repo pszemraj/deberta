@@ -327,6 +327,31 @@ def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts(monkeyp
     assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
 
 
+def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts_when_from_scratch_true(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    fake_transformers = _build_hf_fake_transformers_module()
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.1)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
+    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.1)
+    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
+
+
 def test_build_backbone_configs_hf_deberta_applies_nonzero_dropout_overrides(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
 

@@ -157,15 +157,16 @@ def build_backbone_configs(
         else:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
 
-        # Optional dropout overrides (default 0.0 should mean "preserve checkpoint").
-        apply_dropout_overrides = bool(model_cfg.from_scratch) or (
+        # Optional dropout overrides.
+        # Keep 0.0 as "unset" here so default HF checkpoints can keep native values.
+        apply_dropout_overrides = (
             model_cfg.hidden_dropout_prob is not None and float(model_cfg.hidden_dropout_prob) != 0.0
         )
         if apply_dropout_overrides and model_cfg.hidden_dropout_prob is not None:
             disc_cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
             gen_cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
 
-        apply_attention_dropout_overrides = bool(model_cfg.from_scratch) or (
+        apply_attention_dropout_overrides = (
             model_cfg.attention_probs_dropout_prob is not None
             and float(model_cfg.attention_probs_dropout_prob) != 0.0
         )
