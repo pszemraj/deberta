@@ -31,6 +31,8 @@ Key options in `ModelConfig`:
   - these values are applied to both discriminator and generator configs unless explicitly set to `null` in config to preserve checkpoint-native dropout values
 - FFN block:
   - `ffn_type`: `swiglu` (default) or `mlp`
+  - `swiglu_adjust_intermediate` (default `true`) scales `intermediate_size` by `2/3` for scratch RoPE + SwiGLU builds so FFN parameter budget stays comparable to MLP settings
+  - derived generator configs inherit discriminator scaling; explicit `generator_intermediate_size` remains explicit (not auto-rescaled)
   - note: `ffn_type` is applied for `model.from_scratch=true`; pretrained RoPE loads preserve the checkpoint's FFN type unless you provide matching configs.
 - optional activation checkpointing:
   - `gradient_checkpointing`
@@ -64,5 +66,3 @@ If `generator_config_name_or_path` or `generator_model_name_or_path` is set, the
 With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
-
-Deferred model follow-ups are tracked in [`docs/roadmap.md`](roadmap.md).

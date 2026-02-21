@@ -221,6 +221,8 @@ class RTDOutput:
     disc_accuracy: torch.Tensor
     gen_token_count: torch.Tensor
     disc_token_count: torch.Tensor
+    gen_loss_raw: torch.Tensor
+    disc_loss_raw: torch.Tensor
 
 
 class DebertaV3RTDPretrainer(nn.Module):
@@ -562,4 +564,6 @@ class DebertaV3RTDPretrainer(nn.Module):
             disc_accuracy=disc_acc,
             gen_token_count=gen_token_count.detach(),
             disc_token_count=disc_token_count.detach(),
+            gen_loss_raw=gen_loss,
+            disc_loss_raw=disc_loss,
         )

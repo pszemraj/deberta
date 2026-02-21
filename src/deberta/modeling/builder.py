@@ -9,6 +9,15 @@ from deberta.config import ModelConfig, validate_model_config
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 
+def _scaled_swiglu_intermediate_size(value: int) -> int:
+    """Return a SwiGLU intermediate size scaled to MLP-equivalent parameter budget.
+
+    :param int value: Baseline MLP-oriented intermediate size.
+    :return int: Scaled intermediate size for SwiGLU.
+    """
+    return max(1, int(int(value) * (2.0 / 3.0)))
+
+
 def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
     """Derive generator config from discriminator config.
 
@@ -48,6 +57,7 @@ def _apply_rope_config_overrides(
     model_cfg: ModelConfig,
     tokenizer: Any,
     max_position_embeddings: int,
+    adjust_swiglu_intermediate: bool = False,
 ) -> None:
     """Apply shared RoPE config overrides for generator/discriminator configs.
 
@@ -55,6 +65,7 @@ def _apply_rope_config_overrides(
     :param ModelConfig model_cfg: User model configuration.
     :param Any tokenizer: Tokenizer for vocab/pad metadata.
     :param int max_position_embeddings: Sequence length budget.
+    :param bool adjust_swiglu_intermediate: Whether to apply 2/3 intermediate-size scaling for SwiGLU.
     """
     cfg.vocab_size = int(len(tokenizer))
     cfg.pad_token_id = int(tokenizer.pad_token_id or 0)
@@ -73,6 +84,9 @@ def _apply_rope_config_overrides(
     if model_cfg.from_scratch:
         # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
         cfg.ffn_type = str(model_cfg.ffn_type)
+        if bool(adjust_swiglu_intermediate):
+            curr_intermediate = int(cfg.intermediate_size)
+            cfg.intermediate_size = _scaled_swiglu_intermediate_size(curr_intermediate)
     cfg.initializer_range = float(model_cfg.initializer_range)
 
     if model_cfg.hidden_dropout_prob is not None:
@@ -129,15 +143,24 @@ def build_backbone_configs(
     # RoPE backbone
     disc_src = model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
     disc_cfg = DebertaRoPEConfig.from_pretrained(disc_src)
+    should_adjust_swiglu = bool(
+        model_cfg.from_scratch
+        and str(model_cfg.ffn_type).strip().lower() == "swiglu"
+        and bool(model_cfg.swiglu_adjust_intermediate)
+    )
 
     _apply_rope_config_overrides(
         disc_cfg,
         model_cfg=model_cfg,
         tokenizer=tokenizer,
         max_position_embeddings=max_position_embeddings,
+        adjust_swiglu_intermediate=should_adjust_swiglu,
     )
 
     # Generator config
+    has_explicit_generator_src = bool(
+        model_cfg.generator_config_name_or_path or model_cfg.generator_model_name_or_path
+    )
     if model_cfg.generator_config_name_or_path:
         gen_cfg = DebertaRoPEConfig.from_pretrained(model_cfg.generator_config_name_or_path)
     elif model_cfg.generator_model_name_or_path:
@@ -150,6 +173,8 @@ def build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=tokenizer,
         max_position_embeddings=max_position_embeddings,
+        # Derived generator configs inherit discriminator scaling already; avoid double-scaling.
+        adjust_swiglu_intermediate=(should_adjust_swiglu and has_explicit_generator_src),
     )
 
     return disc_cfg, gen_cfg

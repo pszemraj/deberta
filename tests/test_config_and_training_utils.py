@@ -23,6 +23,7 @@ from deberta.config import (
 from deberta.export_cli import _build_export_parser
 from deberta.training.pretrain import (
     _build_optimizer,
+    _count_rtd_tokens_for_batch,
     _find_latest_checkpoint,
     _load_checkpoint_data_progress,
     _normalize_mixed_precision,
@@ -30,6 +31,7 @@ from deberta.training.pretrain import (
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
     _should_force_legacy_tf32_for_compile,
+    _token_weighted_micro_objective,
 )
 
 
@@ -299,6 +301,71 @@ def test_model_config_defaults_dropouts_to_zero():
     cfg = ModelConfig()
     assert cfg.hidden_dropout_prob == pytest.approx(0.0)
     assert cfg.attention_probs_dropout_prob == pytest.approx(0.0)
+
+
+def test_model_config_defaults_to_adjust_swiglu_intermediate():
+    cfg = ModelConfig()
+    assert cfg.swiglu_adjust_intermediate is True
+
+
+def test_train_config_defaults_to_token_weighted_gradient_accumulation():
+    cfg = TrainConfig()
+    assert cfg.token_weighted_gradient_accumulation is True
+
+
+def test_token_weighted_micro_objective_matches_full_batch_normalization():
+    gen_losses = [torch.tensor(0.5), torch.tensor(0.8)]
+    disc_losses = [torch.tensor(0.2), torch.tensor(0.4)]
+    gen_counts = [10.0, 30.0]
+    disc_counts = [24.0, 16.0]
+
+    gen_total = sum(gen_counts)
+    disc_total = sum(disc_counts)
+    gen_w = 1.0
+    disc_w = 50.0
+
+    micro_0 = _token_weighted_micro_objective(
+        gen_loss=gen_losses[0],
+        disc_loss=disc_losses[0],
+        gen_count=gen_counts[0],
+        disc_count=disc_counts[0],
+        gen_window_tokens_per_rank=gen_total,
+        disc_window_tokens_per_rank=disc_total,
+        gen_loss_weight=gen_w,
+        disc_loss_weight=disc_w,
+        decoupled_loss_scaling=False,
+    )
+    micro_1 = _token_weighted_micro_objective(
+        gen_loss=gen_losses[1],
+        disc_loss=disc_losses[1],
+        gen_count=gen_counts[1],
+        disc_count=disc_counts[1],
+        gen_window_tokens_per_rank=gen_total,
+        disc_window_tokens_per_rank=disc_total,
+        gen_loss_weight=gen_w,
+        disc_loss_weight=disc_w,
+        decoupled_loss_scaling=False,
+    )
+
+    combined = micro_0 + micro_1
+    expected = gen_w * (
+        (gen_losses[0] * gen_counts[0] + gen_losses[1] * gen_counts[1]) / gen_total
+    ) + disc_w * ((disc_losses[0] * disc_counts[0] + disc_losses[1] * disc_counts[1]) / disc_total)
+    torch.testing.assert_close(combined, expected)
+
+
+def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():
+    batch = {
+        "input_ids": torch.tensor([[1, 3, 11, 2, 0]], dtype=torch.long),
+        "labels": torch.tensor([[-100, 99, -100, -100, -100]], dtype=torch.long),
+    }
+    gen_count, disc_count = _count_rtd_tokens_for_batch(
+        batch,
+        special_token_ids=(0, 1, 2, 3),
+        pad_token_id=0,
+    )
+    assert gen_count == pytest.approx(1.0)
+    assert disc_count == pytest.approx(2.0)
 
 
 def test_normalize_mixed_precision_accepts_bool_and_synonyms():

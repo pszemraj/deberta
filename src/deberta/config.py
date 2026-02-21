@@ -178,6 +178,16 @@ class ModelConfig:
         },
     )
 
+    swiglu_adjust_intermediate: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When model.from_scratch=true and ffn_type=swiglu, scale intermediate_size by 2/3 "
+                "to keep FFN parameter budget comparable to MLP."
+            )
+        },
+    )
+
     initializer_range: float = field(
         default=0.02,
         metadata={"help": "Weight init std for rope backbone."},
@@ -365,6 +375,16 @@ class TrainConfig:
 
     gradient_accumulation_steps: int = field(
         default=1, metadata={"help": "Accumulate gradients this many steps before optimizer step."}
+    )
+
+    token_weighted_gradient_accumulation: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If true, weight microbatch losses by active-token counts across each accumulation window "
+                "instead of equal microbatch averaging."
+            )
+        },
     )
 
     learning_rate: float = field(default=5e-4, metadata={"help": "Peak learning rate."})
@@ -571,6 +591,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "keel_alpha_learnable",
             "attention_implementation",
             "ffn_type",
+            "swiglu_adjust_intermediate",
             "initializer_range",
         )
         changed = [name for name in rope_only if getattr(cfg, name) != getattr(defaults, name)]

@@ -28,8 +28,9 @@ Exposed controls:
 - `train.disc_loss_weight` (default `50.0`)
 - `train.decoupled_loss_scaling`
 - `train.sampling_temperature`
+- `train.token_weighted_gradient_accumulation` (default `true`)
 
-Per-microbatch loss terms are token-level means; gradient-accumulation windows currently weight microbatches equally.
+Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
 
 ## Numerical Stability
 
@@ -40,5 +41,3 @@ Both generator CE loss and discriminator BCE loss are computed from fp32 logits,
 Vocab logits for all tokens (`batch x seq x vocab`) are expensive with large DeBERTa vocabularies.
 
 This implementation computes generator vocab projection only on masked positions to reduce memory/compute while preserving RTD behavior.
-
-Deferred objective/loss follow-ups are tracked in [`docs/roadmap.md`](roadmap.md).

@@ -362,6 +362,121 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def _compute_disc_active_mask(
+    *,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    special_token_ids: tuple[int, ...],
+    pad_token_id: int | None,
+) -> torch.Tensor:
+    """Compute discriminator-active token mask before model forward.
+
+    This mirrors the RTD discriminator masking semantics while accounting for
+    masked positions that will be replaced before discriminator scoring.
+
+    :param torch.Tensor input_ids: Input token ids.
+    :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
+    :param torch.Tensor | None attention_mask: Optional attention mask.
+    :param tuple[int, ...] special_token_ids: Token ids excluded from discriminator loss.
+    :param int | None pad_token_id: Padding token id.
+    :return torch.Tensor: Boolean active-token mask.
+    """
+    if attention_mask is None:
+        if pad_token_id is None:
+            active = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            active = input_ids.ne(int(pad_token_id))
+    else:
+        mask = attention_mask.to(torch.bool)
+        if mask.ndim == 2:
+            active = mask
+        elif mask.ndim == 3:
+            active = mask.any(dim=-1)
+        elif mask.ndim == 4:
+            active = mask.any(dim=-1)
+            if active.ndim == 3:
+                active = active.any(dim=1)
+        else:
+            raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
+
+    if not special_token_ids:
+        return active
+
+    special = torch.zeros_like(input_ids, dtype=torch.bool)
+    for sid in special_token_ids:
+        special = special | input_ids.eq(int(sid))
+
+    # Masked positions are replaced before discriminator scoring and should not
+    # be excluded solely because their pre-corruption token may be special.
+    masked_positions = labels.ne(-100)
+    special = special & (~masked_positions)
+    return active & (~special)
+
+
+def _count_rtd_tokens_for_batch(
+    batch: dict[str, torch.Tensor],
+    *,
+    special_token_ids: tuple[int, ...],
+    pad_token_id: int | None,
+) -> tuple[float, float]:
+    """Return generator/discriminator active-token counts for one microbatch.
+
+    :param dict[str, torch.Tensor] batch: Microbatch tensors.
+    :param tuple[int, ...] special_token_ids: Token ids excluded from discriminator loss.
+    :param int | None pad_token_id: Padding token id.
+    :return tuple[float, float]: (generator_count, discriminator_count).
+    """
+    labels = batch["labels"]
+    gen_count = float(labels.ne(-100).sum().item())
+    disc_active = _compute_disc_active_mask(
+        input_ids=batch["input_ids"],
+        labels=labels,
+        attention_mask=batch.get("attention_mask"),
+        special_token_ids=special_token_ids,
+        pad_token_id=pad_token_id,
+    )
+    disc_count = float(disc_active.sum().item())
+    return gen_count, disc_count
+
+
+def _token_weighted_micro_objective(
+    *,
+    gen_loss: torch.Tensor,
+    disc_loss: torch.Tensor,
+    gen_count: float,
+    disc_count: float,
+    gen_window_tokens_per_rank: float,
+    disc_window_tokens_per_rank: float,
+    gen_loss_weight: float,
+    disc_loss_weight: float,
+    decoupled_loss_scaling: bool,
+) -> torch.Tensor:
+    """Build token-weighted microbatch objective for one accumulation window.
+
+    :param torch.Tensor gen_loss: Generator loss mean for the microbatch.
+    :param torch.Tensor disc_loss: Discriminator loss mean for the microbatch.
+    :param float gen_count: Generator token count for the microbatch.
+    :param float disc_count: Discriminator token count for the microbatch.
+    :param float gen_window_tokens_per_rank: Mean generator-token total per rank in the accumulation window.
+    :param float disc_window_tokens_per_rank: Mean discriminator-token total per rank in the accumulation window.
+    :param float gen_loss_weight: Generator loss weight.
+    :param float disc_loss_weight: Discriminator loss weight.
+    :param bool decoupled_loss_scaling: Whether to use DeBERTa-style decoupled scaling.
+    :return torch.Tensor: Unscaled microbatch objective contribution.
+    """
+    gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
+    disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
+
+    gen_term = gen_loss
+    if decoupled_loss_scaling:
+        eps = 1e-6
+        alpha = (disc_loss.detach() / (gen_loss.detach() + eps)).clamp(min=0.0, max=1e4)
+        gen_term = alpha * gen_loss
+
+    return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
+
+
 def _parse_checkpoint_step(path: str) -> int:
     """Parse integer step suffix from checkpoint path.
 
@@ -809,6 +924,16 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     model.train()
 
     train_iter = _cycle_dataloader(train_loader)
+    ga_steps = int(train_cfg.gradient_accumulation_steps)
+    token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
+    unwrapped_model = accelerator.unwrap_model(model)
+    special_token_ids = tuple(
+        sorted(int(sid) for sid in getattr(unwrapped_model, "_forbidden_sample_token_ids", set()))
+    )
+    disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
+    if disc_pad_token_id is not None:
+        disc_pad_token_id = int(disc_pad_token_id)
+
     if consumed_micro_batches > 0:
         logger.info(
             "Replaying data iterator by %d micro-batches to align resume data position.",
@@ -818,35 +943,93 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             _ = next(train_iter)
 
     while global_step < int(train_cfg.max_steps):
-        batch = next(train_iter)
-        consumed_micro_batches += 1
-        batch = _move_batch_to_device(batch, accelerator.device)
-        if compile_enabled:
-            _maybe_cudagraph_mark_step_begin()
+        window: list[tuple[dict[str, torch.Tensor], float, float]] = []
+        local_gen_tokens = 0.0
+        local_disc_tokens = 0.0
 
-        with accelerator.accumulate(model):
-            out = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch.get("attention_mask"),
-                labels=batch["labels"],
-                token_type_ids=batch.get("token_type_ids"),
-                sampling_temperature=train_cfg.sampling_temperature,
-                gen_loss_weight=train_cfg.gen_loss_weight,
-                disc_loss_weight=train_cfg.disc_loss_weight,
-                decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
+        for _ in range(ga_steps):
+            batch = next(train_iter)
+            consumed_micro_batches += 1
+            if token_weighted_ga:
+                gen_count, disc_count = _count_rtd_tokens_for_batch(
+                    batch,
+                    special_token_ids=special_token_ids,
+                    pad_token_id=disc_pad_token_id,
+                )
+                local_gen_tokens += gen_count
+                local_disc_tokens += disc_count
+            else:
+                gen_count, disc_count = 0.0, 0.0
+            window.append((batch, gen_count, disc_count))
+
+        if token_weighted_ga:
+            local_totals = torch.tensor(
+                [local_gen_tokens, local_disc_tokens],
+                device=accelerator.device,
+                dtype=torch.float32,
             )
-            loss = out.loss
-            accelerator.backward(loss)
+            # DDP/FSDP gradients are averaged across ranks. Mean token totals per rank
+            # preserve global token-normalized scaling when used with local micro counts.
+            mean_totals = accelerator.reduce(local_totals, reduction="mean")
+            gen_window_tokens_per_rank = max(float(mean_totals[0].item()), 1.0)
+            disc_window_tokens_per_rank = max(float(mean_totals[1].item()), 1.0)
+        else:
+            gen_window_tokens_per_rank = 1.0
+            disc_window_tokens_per_rank = 1.0
 
-            if train_cfg.max_grad_norm and float(train_cfg.max_grad_norm) > 0:
-                accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+        out = None
+        loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+        for batch, gen_count, disc_count in window:
+            batch = _move_batch_to_device(batch, accelerator.device)
+            if compile_enabled:
+                _maybe_cudagraph_mark_step_begin()
+
+            with accelerator.accumulate(model):
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                    labels=batch["labels"],
+                    token_type_ids=batch.get("token_type_ids"),
+                    sampling_temperature=train_cfg.sampling_temperature,
+                    gen_loss_weight=train_cfg.gen_loss_weight,
+                    disc_loss_weight=train_cfg.disc_loss_weight,
+                    decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
+                )
+
+                if token_weighted_ga:
+                    micro_obj = _token_weighted_micro_objective(
+                        gen_loss=out.gen_loss_raw,
+                        disc_loss=out.disc_loss_raw,
+                        gen_count=gen_count,
+                        disc_count=disc_count,
+                        gen_window_tokens_per_rank=gen_window_tokens_per_rank,
+                        disc_window_tokens_per_rank=disc_window_tokens_per_rank,
+                        gen_loss_weight=float(train_cfg.gen_loss_weight),
+                        disc_loss_weight=float(train_cfg.disc_loss_weight),
+                        decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
+                    )
+                    # Accelerator.backward internally divides by ga_steps; rescale to
+                    # preserve token-weighted full-window normalization.
+                    loss = micro_obj * float(ga_steps)
+                    loss_for_metrics = loss_for_metrics + micro_obj.detach()
+                else:
+                    loss = out.loss
+                    loss_for_metrics = out.loss.detach()
+
+                accelerator.backward(loss)
+
+                if train_cfg.max_grad_norm and float(train_cfg.max_grad_norm) > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
         # We count *optimizer* steps (not micro-steps).
         if accelerator.sync_gradients:
+            if out is None:
+                raise RuntimeError("Accumulation window produced no forward pass outputs.")
             global_step += 1
 
             if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
@@ -864,7 +1047,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                 metrics = {
                     "step": global_step,
                     "lr": lr,
-                    "loss": _mean(loss),
+                    "loss": _mean(loss_for_metrics),
                     "gen_loss": _mean(out.gen_loss),
                     "disc_loss": _mean(out.disc_loss),
                     "disc_acc": _mean(out.disc_accuracy),

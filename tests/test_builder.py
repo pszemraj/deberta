@@ -73,6 +73,99 @@ def test_build_backbone_configs_applies_ffn_override_for_scratch_rope(monkeypatc
     assert gen_cfg.ffn_type == "swiglu"
 
 
+def test_build_backbone_configs_adjusts_swiglu_intermediate_for_scratch(monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("transformers")
+
+    def _fake_from_pretrained(cls, src: str):
+        del src
+        return cls(ffn_type="mlp", num_hidden_layers=6, intermediate_size=3072)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+        ffn_type="swiglu",
+        swiglu_adjust_intermediate=True,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.intermediate_size == 2048
+    assert gen_cfg.intermediate_size == 2048
+
+
+def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("transformers")
+
+    def _fake_from_pretrained(cls, src: str):
+        del src
+        return cls(ffn_type="mlp", num_hidden_layers=6, intermediate_size=3072)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+        ffn_type="swiglu",
+        swiglu_adjust_intermediate=False,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.intermediate_size == 3072
+    assert gen_cfg.intermediate_size == 3072
+
+
+def test_build_backbone_configs_respects_explicit_generator_intermediate_with_swiglu_adjust(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    def _fake_from_pretrained(cls, src: str):
+        del src
+        return cls(ffn_type="mlp", num_hidden_layers=6, intermediate_size=3072)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+        ffn_type="swiglu",
+        swiglu_adjust_intermediate=True,
+        generator_intermediate_size=1024,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.intermediate_size == 2048
+    assert gen_cfg.intermediate_size == 1024
+
+
 def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
     monkeypatch: pytest.MonkeyPatch,
 ):
