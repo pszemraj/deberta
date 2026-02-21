@@ -38,6 +38,8 @@ When internal separators are present, the collator emits a pairwise attention ke
 
 Packed block masking keeps `CLS` as a global token (it can attend to all active tokens and all active tokens can attend to it), so pooled `CLS` representations are not restricted to only the first packed document.
 
+This packed pairwise mask is represented as a boolean keep-mask (`True = attend`, `False = block`).
+
 ## Sequential / No-Pack Mode
 
 Set `data.pack_sequences=false` to switch to one-document chunking:

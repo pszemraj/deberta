@@ -1,53 +1,32 @@
 # KEEL: Technical Notes
 
-This document summarizes the KEEL residual topology used optionally by the `rope` backbone.
+This file captures paper-specific KEEL notation used by this repo.
 
 Paper: *Post-LayerNorm Is Back: Stable, ExpressivE, and Deep* (Chen & Wei, 2026) - [arXiv:2601.19895](https://arxiv.org/abs/2601.19895)
 
-For project-level model configuration, see [`docs/model.md`](model.md).
+For project-level configuration and decision guidance (`post` vs `keel`), use [`docs/model.md`](model.md).
 
-## What KEEL Changes
+## Paper Form and Notation
 
-Compared with standard Post-LN residual blocks, KEEL uses a highway-style scaled skip path and an inner normalization before the transform branch.
-
-Reference form (paper):
+KEEL residual form in paper notation:
 
 `x_{l+1} = LN(alpha * x_l + F(LN(x_l)))`
 
-Main intent:
+Notation clarification used in this repo:
 
-- keep Post-LN depth expressivity
-- stabilize gradient flow at larger depth
-
-Important scope note:
-
-- The headline KEEL experiments are decoder-only and very deep.
-- This repo is encoder-focused at moderate depth by default.
-- That is why `post` remains the default here, with `keel` as an explicit deeper-scaling option.
+- `L` denotes total residual sublayers (attention + FFN), not transformer block count.
+- default `alpha` follows the paper's `alpha = L`.
+- for an encoder with `N` transformer blocks, `L = 2N`, so default `alpha = 2 * num_hidden_layers`.
 
 ## Repo Mapping
 
-In this repo KEEL is enabled by:
+KEEL path is enabled with:
 
 - `model.norm_arch: keel`
 
-Related KEEL configuration options (`model.keel_alpha_init`, `model.keel_alpha_learnable`) are documented in [`docs/model.md`](model.md).
+Relevant config knobs:
 
-Default path remains standard Post-norm (`model.norm_arch: post`).
+- `model.keel_alpha_init`
+- `model.keel_alpha_learnable`
 
-## When to Use
-
-For typical encoder depths, `post` is the default and usually sufficient.
-
-Try KEEL when you are increasing depth aggressively and want additional stability margin while keeping a Post-LN style architecture.
-
-Practical decision rule in this repo:
-
-- `norm_arch: post` for standard 12-28 layer encoder pretraining.
-- `norm_arch: keel` when scaling much deeper and/or when optimization stability becomes the bottleneck.
-
-## Scope and Limits
-
-KEEL support here applies to the repo's `rope` backbone implementation.
-
-It does not apply to `backbone_type=hf_deberta_v2` mode.
+Scope: this applies only to the repo's `rope` backbone, not `backbone_type=hf_deberta_v2`.

@@ -82,6 +82,11 @@ If `generator_config_name_or_path` or `generator_model_name_or_path` is set, the
 
 `gdes` is implemented to remain compatible with FSDP2 wrapping.
 
+Operational constraint: embedding sharing adapters bind discriminator embeddings to the
+generator embedding modules present at pretrainer construction time. If you replace
+generator/discriminator embedding modules later (for example during manual model surgery),
+recreate `DebertaV3RTDPretrainer` so sharing adapters are rebound consistently.
+
 ## HF Compatibility Mode Notes
 
 With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.

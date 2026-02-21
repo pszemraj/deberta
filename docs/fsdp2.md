@@ -70,9 +70,11 @@ Use `auto`, `flash`, or `mem_efficient` for packed training runs.
 
 ## Embedding Sharing and FSDP Safety
 
-`embedding_sharing` supports `none|es|gdes`.
+FSDP-safety detail: sharing avoids reusing the same embedding module instance across
+generator/discriminator wrappers.
 
-To stay FSDP-safe, sharing is implemented without reusing module instances across generator/discriminator; it ties weights via lightweight adapters to avoid problematic shared-module wrapping.
+Model-level sharing semantics and constraints (including post-init module replacement
+behavior) are defined in [`docs/model.md`](model.md).
 
 ## Checkpointing and Export
 
