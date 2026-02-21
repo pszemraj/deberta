@@ -21,6 +21,7 @@ from deberta.config import (
     TrainConfig,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_mode,
+    normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
     validate_train_config,
@@ -32,8 +33,8 @@ from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.modeling.export_utils import merge_embeddings_into_export_backbone
-from deberta.modeling.rtd import compute_generator_loss_term
+from deberta.modeling.export_utils import load_intersection_state_dict, merge_embeddings_into_export_backbone
+from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 
 logger = logging.getLogger(__name__)
 
@@ -326,24 +327,6 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
     )
 
 
-def _normalize_mixed_precision(value: Any) -> str:
-    """Normalize mixed precision config values for Accelerate.
-
-    :param Any value: Raw user/config value.
-    :return str: Canonical value (``bf16`` or ``no``).
-    """
-    if isinstance(value, bool):
-        return "bf16" if value else "no"
-
-    v = str(value).strip().lower()
-    if v in {"bf16", "bfloat16", "true", "1", "yes", "y"}:
-        return "bf16"
-    if v in {"no", "none", "false", "0", "off", "n"}:
-        return "no"
-
-    raise ValueError(f"train.mixed_precision must be one of: no|bf16. Got: {value}")
-
-
 def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
     """Yield batches forever by cycling through a dataloader.
 
@@ -409,23 +392,11 @@ def _compute_disc_active_mask(
     :param int | None pad_token_id: Padding token id.
     :return torch.Tensor: Boolean active-token mask.
     """
-    if attention_mask is None:
-        if pad_token_id is None:
-            active = torch.ones_like(input_ids, dtype=torch.bool)
-        else:
-            active = input_ids.ne(int(pad_token_id))
-    else:
-        mask = attention_mask.to(torch.bool)
-        if mask.ndim == 2:
-            active = mask
-        elif mask.ndim == 3:
-            active = mask.any(dim=-1)
-        elif mask.ndim == 4:
-            active = mask.any(dim=-1)
-            if active.ndim == 3:
-                active = active.any(dim=1)
-        else:
-            raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pad_token_id=pad_token_id,
+    )
 
     if not special_token_ids:
         return active
@@ -769,10 +740,8 @@ def _export_discriminator_hf(
         else:
             export_disc = AutoModel.from_config(unwrapped.disc_config)
 
-        # Load as much as possible.
-        export_keys = set(export_disc.state_dict().keys())
-        filtered_disc_sd = {k: v for k, v in disc_sd.items() if k in export_keys}
-        missing = export_disc.load_state_dict(filtered_disc_sd, strict=False)
+        # Load overlap keys only to tolerate training/export module-shape differences.
+        missing = load_intersection_state_dict(export_disc, disc_sd)
         if missing.missing_keys:
             logger.info(
                 f"HF export: missing keys (often expected with tied embeddings): {missing.missing_keys[:5]}..."
@@ -812,7 +781,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
-    mixed_precision = _normalize_mixed_precision(train_cfg.mixed_precision)
+    mixed_precision = normalize_mixed_precision(train_cfg.mixed_precision)
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
         mixed_precision = "no"

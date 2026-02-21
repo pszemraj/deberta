@@ -11,6 +11,17 @@ from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from deberta.config import (
+    _ATTN_IMPL_CHOICES,
+    _BACKBONE_CHOICES,
+    _EMBED_SHARING_CHOICES,
+    _FFN_CHOICES,
+    _LR_SCHEDULER_CHOICES,
+    _NORM_ARCH_CHOICES,
+    _REPORT_TO_CHOICES,
+    _SDPA_KERNEL_ALIASES,
+    _SDPA_KERNEL_CHOICES,
+    _TORCH_COMPILE_MODE_ALIASES,
+    _TORCH_COMPILE_MODE_CHOICES,
     DataConfig,
     ModelConfig,
     TrainConfig,
@@ -186,41 +197,17 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
     group = parser.add_argument_group(group_name)
     type_hints = get_type_hints(cls)
     constrained_choices: dict[str, tuple[str, ...]] = {
-        "backbone_type": ("rope", "hf_deberta_v2"),
-        "norm_arch": ("post", "keel"),
-        "attention_implementation": ("sdpa", "eager"),
-        "ffn_type": ("swiglu", "mlp"),
-        "embedding_sharing": ("none", "es", "gdes"),
-        "report_to": ("none", "wandb", "tensorboard"),
-        "lr_scheduler_type": (
-            "linear",
-            "cosine",
-            "cosine_with_restarts",
-            "polynomial",
-            "constant",
-            "constant_with_warmup",
-        ),
+        "backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
+        "norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
+        "attention_implementation": tuple(sorted(_ATTN_IMPL_CHOICES)),
+        "ffn_type": tuple(sorted(_FFN_CHOICES)),
+        "embedding_sharing": tuple(sorted(_EMBED_SHARING_CHOICES)),
+        "report_to": tuple(sorted(_REPORT_TO_CHOICES)),
+        "lr_scheduler_type": tuple(sorted(_LR_SCHEDULER_CHOICES)),
         # Keep legacy aliases parseable for UX compatibility.
-        "sdpa_kernel": (
-            "auto",
-            "flash",
-            "mem_efficient",
-            "math",
-            "flash_only",
-            "mem",
-            "mem-efficient",
-            "efficient",
-            "flashattention",
-            "flash_attention",
-        ),
-        "torch_compile_mode": (
-            "default",
-            "reduce-overhead",
-            "max-autotune",
-            "max-autotune-no-cudagraphs",
-            "reduce_overhead",
-            "max_autotune",
-            "max_autotune_no_cudagraphs",
+        "sdpa_kernel": tuple(sorted(_SDPA_KERNEL_CHOICES | set(_SDPA_KERNEL_ALIASES.keys()))),
+        "torch_compile_mode": tuple(
+            sorted(_TORCH_COMPILE_MODE_CHOICES | set(_TORCH_COMPILE_MODE_ALIASES.keys()))
         ),
     }
 
@@ -403,8 +390,6 @@ def main(argv: list[str] | None = None) -> None:
         export_cfg = namespace_to_export_config(args)
         run_export(export_cfg)
         return
-
-    raise ValueError(f"Unsupported command: {args.command}")
 
 
 if __name__ == "__main__":

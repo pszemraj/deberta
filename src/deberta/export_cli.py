@@ -21,7 +21,11 @@ from deberta.config import (
 )
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.modeling.export_utils import merge_embeddings_into_export_backbone
+from deberta.modeling.export_utils import (
+    load_intersection_state_dict,
+    merge_embeddings_into_export_backbone,
+    split_pretrainer_state_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,26 +168,6 @@ def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
         rank0_only=bool(ns.rank0_only),
         embedding_sharing=ns.embedding_sharing,
     )
-
-
-def _split_state_dict(
-    full_sd: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Split full RTD state dict into discriminator and generator tensors.
-
-    :param dict[str, torch.Tensor] full_sd: Full state dict.
-    :return tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]: Discriminator and generator dicts.
-    """
-    disc: dict[str, torch.Tensor] = {}
-    gen: dict[str, torch.Tensor] = {}
-
-    for k, v in full_sd.items():
-        if k.startswith("discriminator."):
-            disc[k[len("discriminator.") :]] = v
-        elif k.startswith("generator."):
-            gen[k[len("generator.") :]] = v
-
-    return disc, gen
 
 
 def _build_export_backbone(
@@ -345,7 +329,7 @@ def run_export(cfg: ExportConfig) -> None:
     if not accelerator.is_main_process:
         return
 
-    disc_sd, gen_sd = _split_state_dict(full_sd)
+    disc_sd, gen_sd = split_pretrainer_state_dict(full_sd)
     if not disc_sd and not gen_sd:
         raise RuntimeError(
             "Failed to split discriminator/generator state dicts. "
@@ -385,9 +369,7 @@ def run_export(cfg: ExportConfig) -> None:
 
         # Discriminator
         if export_disc is not None:
-            export_keys = set(export_disc.state_dict().keys())
-            filtered = {k: v for k, v in disc_sd.items() if k in export_keys}
-            export_disc.load_state_dict(filtered, strict=False)
+            load_intersection_state_dict(export_disc, disc_sd)
             if embedding_sharing in {"es", "gdes"}:
                 merge_embeddings_into_export_backbone(
                     export_model=export_disc,
@@ -404,9 +386,7 @@ def run_export(cfg: ExportConfig) -> None:
 
         # Generator
         if export_gen is not None:
-            export_keys = set(export_gen.state_dict().keys())
-            filtered = {k: v for k, v in gen_sd.items() if k in export_keys}
-            export_gen.load_state_dict(filtered, strict=False)
+            load_intersection_state_dict(export_gen, gen_sd)
             export_gen.save_pretrained(
                 str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
             )

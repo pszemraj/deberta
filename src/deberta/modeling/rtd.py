@@ -45,6 +45,37 @@ def compute_generator_loss_term(
     return alpha * gen_loss
 
 
+def attention_mask_to_active_tokens(
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    pad_token_id: int | None,
+) -> torch.Tensor:
+    """Convert optional attention mask variants into a 2D active-token mask.
+
+    :param torch.Tensor input_ids: Input token ids shaped ``(B, S)``.
+    :param torch.Tensor | None attention_mask: Optional 2D/3D/4D attention mask.
+    :param int | None pad_token_id: Optional pad token id when ``attention_mask`` is omitted.
+    :return torch.Tensor: Active-token mask shaped ``(B, S)``.
+    """
+    if attention_mask is None:
+        if pad_token_id is None:
+            return torch.ones_like(input_ids, dtype=torch.bool)
+        return input_ids.ne(int(pad_token_id))
+
+    mask = attention_mask.to(torch.bool)
+    if mask.ndim == 2:
+        return mask
+    if mask.ndim == 3:
+        return mask.any(dim=-1)
+    if mask.ndim == 4:
+        active = mask.any(dim=-1)
+        if active.ndim == 3:
+            active = active.any(dim=1)
+        return active
+    raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
+
+
 class _TiedEmbedding(nn.Module):
     """Embedding that reads weights from a different module.
 
@@ -595,24 +626,11 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_hidden = disc_out.last_hidden_state
         disc_logits = self.discriminator_head(disc_hidden)
 
-        if attention_mask is None:
-            pad_id = getattr(self.disc_config, "pad_token_id", None)
-            if pad_id is None:
-                active = torch.ones_like(input_ids, dtype=torch.bool)
-            else:
-                active = input_ids.ne(int(pad_id))
-        else:
-            mask = attention_mask.to(torch.bool)
-            if mask.ndim == 2:
-                active = mask
-            elif mask.ndim == 3:
-                active = mask.any(dim=-1)
-            elif mask.ndim == 4:
-                active = mask.any(dim=-1)
-                if active.ndim == 3:
-                    active = active.any(dim=1)
-            else:
-                raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
+        active = attention_mask_to_active_tokens(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=getattr(self.disc_config, "pad_token_id", None),
+        )
 
         # Exclude structural specials from discriminator loss, but keep all masked
         # positions active even if the original token id is special.

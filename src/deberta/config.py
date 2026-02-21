@@ -612,6 +612,25 @@ def _normalize_torch_compile_mode(value: str) -> str:
     return _ensure_choice("train.torch_compile_mode", v, _TORCH_COMPILE_MODE_CHOICES)
 
 
+def normalize_mixed_precision(value: object) -> str:
+    """Normalize and validate mixed precision values.
+
+    :param object value: Raw mixed precision value.
+    :return str: Canonical mixed precision mode (``bf16`` or ``no``).
+    """
+    if isinstance(value, bool):
+        mp = "bf16" if bool(value) else "no"
+    else:
+        mp = str(value).strip().lower()
+        mp = _MIXED_PRECISION_ALIASES.get(mp, mp)
+
+    if mp not in _MIXED_PRECISION_CANONICAL:
+        raise ValueError(
+            "train.mixed_precision must be one of: bf16|no (or aliases true|false|yes|no|on|off|1|0)."
+        )
+    return mp
+
+
 def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     """Return whether a model source appears to be an HF DeBERTa v2/v3 checkpoint id.
 
@@ -771,15 +790,7 @@ def validate_train_config(cfg: TrainConfig) -> None:
     cfg.sdpa_kernel = _normalize_sdpa_kernel(cfg.sdpa_kernel)
     cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
 
-    if isinstance(cfg.mixed_precision, bool):
-        cfg.mixed_precision = "bf16" if bool(cfg.mixed_precision) else "no"
-    else:
-        mp = str(cfg.mixed_precision).strip().lower()
-        cfg.mixed_precision = _MIXED_PRECISION_ALIASES.get(mp, mp)
-    if cfg.mixed_precision not in _MIXED_PRECISION_CANONICAL:
-        raise ValueError(
-            "train.mixed_precision must be one of: bf16|no (or aliases true|false|yes|no|on|off|1|0)."
-        )
+    cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
 
     if int(cfg.max_steps) <= 0:
         raise ValueError("train.max_steps must be > 0.")
