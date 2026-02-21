@@ -7,7 +7,9 @@ This **v3.1** update includes:
 - **RoPE** replacing DeBERTa’s *disentangled position bias*  
   → compatible with **PyTorch SDPA / FlashAttention** kernels and better length generalization
 - **Post-Norm topology** retained (encoder-depth friendly), swapping **LayerNorm → RMSNorm**
+- **SwiGLU FFN** (`ffn_type: swiglu`) as the default FFN block for RoPE backbones
 - Optional **KEEL** residual topology via config (`norm_arch: keel`) for extra stability margin
+- **Long-context presets** for 2048 and 4096 sequence lengths
 - **Streaming-first** data pipeline (default), plus `load_from_disk()` and non-streaming `load_dataset()`
 - Optional **DeBERTa-style whole-word n-gram masking** (`mlm_max_ngram > 1`)
 - **FSDP2-safe embedding sharing** (`none | es | gdes`) + a dedicated exporter that consolidates sharded checkpoints
@@ -70,6 +72,24 @@ Notes:
 - For length generalization, keep `--use_absolute_position_embeddings false` (default).
 - Training defaults to `train.mixed_precision=bf16` (autocast), not full-parameter bf16 casting.
 - Optional compile modes: `--torch_compile true --torch_compile_mode max-autotune-no-cudagraphs` can be a safer fallback on some CUDA stacks.
+
+---
+
+## Long Context Presets
+
+Use the provided YAML presets for larger sequence lengths:
+
+```bash
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+  deberta-pretrain configs/pretrain_rope_c4_en_2048.yaml
+```
+
+```bash
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+  deberta-pretrain configs/pretrain_rope_c4_en_4096.yaml
+```
+
+Practical note: the 4096 preset enables `model.gradient_checkpointing: true` and assumes conservative global tokens/step via small per-device batch + high accumulation.
 
 ---
 
@@ -154,7 +174,5 @@ This will:
 
 ## Next steps (not implemented yet)
 
-Planned follow-ups (per discussion):
-- SwiGLU FFN
-- Longer context (2048–4096)
+Planned follow-up:
 - FlashAttention-specific tuning

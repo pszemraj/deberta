@@ -1,6 +1,7 @@
-# Example YAML config for `deberta-pretrain`.
+# RoPE + RMSNorm + SwiGLU, 4096 context.
 # Usage:
-#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain configs/pretrain_rope_c4_en.yaml
+#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+#     deberta-pretrain configs/pretrain_rope_c4_en_4096.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base
@@ -12,13 +13,16 @@ model:
   rotary_pct: 1.0
   use_absolute_position_embeddings: false
 
-  # Norm topology
-  norm_arch: post   # post | keel
+  # Norm + FFN topology
+  norm_arch: post
   norm_eps: 1.0e-6
-  ffn_type: swiglu  # swiglu | mlp
+  ffn_type: swiglu
+
+  # Strongly recommended at 4096.
+  gradient_checkpointing: true
 
   # RTD embedding sharing
-  embedding_sharing: gdes  # none | es | gdes
+  embedding_sharing: gdes
 
   # SDPA/FlashAttention dispatch via PyTorch
   attention_implementation: sdpa
@@ -29,25 +33,24 @@ data:
   train_split: train
   streaming: true
   text_column_name: text
-  max_seq_length: 512
+  max_seq_length: 4096
   shuffle_buffer_size: 10000
 
 train:
-  output_dir: runs/deberta_rope_rtd
+  output_dir: runs/deberta_rope_rtd_4096
   overwrite_output_dir: false
   max_steps: 10000
-  per_device_train_batch_size: 2
-  gradient_accumulation_steps: 16
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 64
 
   # Optim
   learning_rate: 5.0e-4
-  # generator_learning_rate: 2.5e-4   # optional
   weight_decay: 0.01
   warmup_steps: 1000
 
   # Objective
   mlm_probability: 0.15
-  mlm_max_ngram: 1          # set to 3 for DeBERTa-style whole-word n-gram masking
+  mlm_max_ngram: 1
   mask_token_prob: 0.8
   random_token_prob: 0.1
   sampling_temperature: 1.0
@@ -56,6 +59,5 @@ train:
   disc_loss_weight: 50.0
   decoupled_loss_scaling: false
 
-  # Logging
   logging_steps: 25
   report_to: none
