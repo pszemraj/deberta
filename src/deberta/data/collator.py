@@ -53,6 +53,7 @@ class DebertaV3ElectraCollator:
 
         :param Any tokenizer: HF tokenizer.
         :param MLMConfig cfg: Masking configuration.
+        :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
         :param int | None pad_to_multiple_of: Optional right-padding multiple.
         """
         self.tokenizer = tokenizer
