@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debertav3-modernized"
+version = "0.3.1"
+description = "Modernized DeBERTaV3 (RTD/ELECTRA-style) pretraining toolkit built on PyTorch, Transformers, Accelerate, and Datasets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Your Team", email = "ml@example.com"}
+]
+keywords = ["deberta", "deberta-v3", "pretraining", "rtd", "electra", "fsdp2", "accelerate", "transformers"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# NOTE: Keep versions fairly open. The project targets PyTorch 2.9.1+.
+dependencies = [
+  "torch>=2.9.1",
+  "transformers>=4.45.0",
+  "accelerate>=1.6.0",
+  "datasets>=2.18.0",
+  "safetensors>=0.4.5",
+  "tqdm>=4.66.0",
+  "numpy>=1.24.0",
+  "pyyaml>=6.0",
+  "sentencepiece>=0.2.0",
+]
+
+[project.optional-dependencies]
+# Logging
+wandb = ["wandb>=0.17.0"]
+tensorboard = ["tensorboard>=2.16.0"]
+
+# Dev quality-of-life
+# (We intentionally keep this minimal; add what your org uses.)
+dev = [
+  "ruff>=0.6.0",
+  "black>=24.8.0",
+  "mypy>=1.11.0",
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+# Main entry point
+"deberta-pretrain" = "deberta.cli:main"
+"deberta-export" = "deberta.export_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 110
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
