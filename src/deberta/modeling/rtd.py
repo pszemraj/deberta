@@ -83,7 +83,7 @@ class _TiedEmbedding(nn.Module):
         self.bias: torch.nn.Parameter | None
         if add_bias:
             # Bias is a full embedding matrix (same shape as base_weight). This matches DeBERTaV3 gdes behavior.
-            self.bias = nn.Parameter(torch.zeros_like(base_weight, dtype=torch.float32))
+            self.bias = nn.Parameter(torch.zeros_like(base_weight))
         else:
             self.bias = None
 
@@ -553,8 +553,11 @@ class DebertaV3RTDPretrainer(nn.Module):
             else:
                 raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
 
-        # Discriminator should not learn on special tokens.
-        active = active & (~self._special_position_mask(corrupted_input_ids))
+        # Exclude structural specials from discriminator loss, but keep all masked
+        # positions active even if the original token id is special.
+        special_on_original = self._special_position_mask(input_ids)
+        special = special_on_original & (~masked)
+        active = active & (~special)
         disc_token_count = active.to(torch.float32).sum()
 
         if bool(active.any().item()):

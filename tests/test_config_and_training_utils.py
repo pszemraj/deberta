@@ -32,6 +32,7 @@ from deberta.training.pretrain import (
     _prepare_output_dir,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
+    _should_clip_gradients,
     _should_force_legacy_tf32_for_compile,
     _token_weighted_micro_objective,
 )
@@ -390,6 +391,14 @@ def test_finalize_window_metric_loss_passthrough_for_token_weighted_windows():
     total = torch.tensor(1.2345)
     out = _finalize_window_metric_loss(accumulated_loss=total, ga_steps=8, token_weighted_ga=True)
     torch.testing.assert_close(out, total)
+
+
+def test_should_clip_gradients_only_on_sync_steps():
+    assert _should_clip_gradients(sync_gradients=False, max_grad_norm=1.0) is False
+    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=None) is False
+    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=0.0) is False
+    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=-1.0) is False
+    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=1.0) is True
 
 
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():

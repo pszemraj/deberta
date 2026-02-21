@@ -508,6 +508,47 @@ def test_self_attention_has_no_internal_residual_dropout():
     torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
 
 
+def test_self_attention_handles_pairwise_mask_rows_without_keys():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    torch.manual_seed(0)
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        attention_implementation="eager",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DebertaRoPESelfAttention(cfg).eval()
+    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    pair_keep = torch.tensor(
+        [
+            [
+                [1, 1, 0, 0],
+                [0, 0, 0, 0],  # row with no valid keys
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ]
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        out = attn(x, pair_keep)
+
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
+
+
 def test_mlp_has_no_internal_residual_dropout():
     import pytest
 
@@ -827,7 +868,21 @@ def test_tied_embedding_tracks_replaced_base_module_weight():
     torch.testing.assert_close(out_b, expected, rtol=0.0, atol=0.0)
 
 
-def test_rope_model_infers_pad_mask_when_attention_mask_missing():
+def test_tied_embedding_gdes_bias_matches_base_weight_dtype():
+    from deberta.modeling.rtd import _TiedEmbedding
+
+    base = torch.nn.Embedding(16, 8, padding_idx=0).to(dtype=torch.bfloat16)
+    tied = _TiedEmbedding(
+        base_embedding_module=base,
+        padding_idx=0,
+        detach_base=True,
+        add_bias=True,
+    )
+    assert tied.bias is not None
+    assert tied.bias.dtype == base.weight.dtype
+
+
+def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
     import pytest
 
     pytest.importorskip("transformers")
@@ -850,6 +905,15 @@ def test_rope_model_infers_pad_mask_when_attention_mask_missing():
     )
     model = DebertaRoPEModel(cfg).eval()
 
+    class _CaptureEncoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_attention_mask: torch.Tensor | None = None
+
+        def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+            self.seen_attention_mask = attention_mask
+            return x
+
     input_ids = torch.tensor(
         [
             [1, 7, 8, 2, 0, 0],
@@ -857,13 +921,13 @@ def test_rope_model_infers_pad_mask_when_attention_mask_missing():
         ],
         dtype=torch.long,
     )
-    explicit_mask = input_ids.ne(cfg.pad_token_id).long()
+    capture = _CaptureEncoder()
+    model.encoder = capture
 
     with torch.no_grad():
-        out_missing = model(input_ids=input_ids, attention_mask=None).last_hidden_state
-        out_explicit = model(input_ids=input_ids, attention_mask=explicit_mask).last_hidden_state
+        _ = model(input_ids=input_ids, attention_mask=None).last_hidden_state
 
-    torch.testing.assert_close(out_missing, out_explicit, rtol=0.0, atol=0.0)
+    assert capture.seen_attention_mask is None
 
 
 def test_rope_model_accepts_positional_input_ids_call():
@@ -1004,7 +1068,9 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
         decoupled_loss_scaling=False,
     )
 
-    torch.testing.assert_close(out_missing.disc_loss, out_explicit.disc_loss, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        out_missing.disc_token_count, out_explicit.disc_token_count, rtol=0.0, atol=0.0
+    )
 
 
 def test_pretrainer_disc_loss_excludes_special_tokens_from_active_count():
@@ -1061,6 +1127,62 @@ def test_pretrainer_disc_loss_excludes_special_tokens_from_active_count():
     )
     expected_active = ((input_ids != 0) & (input_ids != 1) & (input_ids != 2) & (input_ids != 3)).sum()
     assert int(out.disc_token_count.item()) == int(expected_active.item())
+
+
+def test_pretrainer_disc_active_keeps_masked_positions_even_if_sampled_special(monkeypatch):
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    ).eval()
+
+    input_ids = torch.tensor([[cfg.cls_token_id, 7, 8, cfg.sep_token_id]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, 1] = input_ids[0, 1]
+
+    def _force_special_sample(logits: torch.Tensor, sampling_temperature: float) -> torch.Tensor:
+        del logits, sampling_temperature
+        return torch.tensor([int(cfg.cls_token_id)], dtype=torch.long)
+
+    monkeypatch.setattr(model, "_sample_generator_tokens", _force_special_sample)
+
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=labels,
+            sampling_temperature=1.0,
+            gen_loss_weight=1.0,
+            disc_loss_weight=50.0,
+            decoupled_loss_scaling=False,
+        )
+
+    torch.testing.assert_close(out.disc_token_count, torch.tensor(2.0))
 
 
 def test_rope_config_rejects_unknown_ffn_type():

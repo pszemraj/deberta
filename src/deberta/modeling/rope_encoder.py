@@ -237,11 +237,10 @@ class DebertaRoPESelfAttention(nn.Module):
                 pair_keep = mask
                 query_keep = pair_keep.any(dim=-1)
 
-                # Avoid all-masked query rows to prevent NaNs in eager softmax.
-                row_has_key = query_keep
-                if not bool(row_has_key.all().item()):
-                    eye = torch.eye(seq_len, dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
-                    pair_keep = pair_keep | ((~row_has_key)[:, :, None] & eye)
+                # Guarantee self-attend on the diagonal without host sync; masked query
+                # rows are still zeroed after output projection via query_keep_tokens.
+                eye = torch.eye(seq_len, dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
+                pair_keep = pair_keep | eye
 
                 sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
                 eager_attn_mask = ~sdpa_attn_mask
@@ -520,9 +519,8 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         """Run encoder forward pass.
 
         :param torch.Tensor input_ids: Input token ids.
-        :param torch.Tensor | None attention_mask: Optional attention mask. When omitted, we
-            reconstruct a pad mask from ``input_ids`` only if pad tokens are present; otherwise we
-            keep ``None`` to preserve SDPA flash-friendly unpadded execution.
+        :param torch.Tensor | None attention_mask: Optional attention mask. ``None`` means
+            unpadded input (fast path); callers must pass a mask when padding exists.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
         :param Any kwargs: Unsupported compatibility kwargs.
@@ -534,15 +532,6 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
                 "Unsupported kwargs for DebertaRoPEModel.forward: "
                 f"{unsupported}. Supported args are input_ids, attention_mask, token_type_ids, return_dict."
             )
-
-        if attention_mask is None:
-            pad_id = getattr(self.config, "pad_token_id", None)
-            if pad_id is not None:
-                pad_positions = input_ids.eq(int(pad_id))
-                # Keep the fast path for packed/unpadded batches (mask stays None), but make
-                # omitted-mask calls with padded input_ids semantically correct.
-                if bool(pad_positions.any().item()):
-                    attention_mask = ~pad_positions
 
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         x = self.encoder(x, attention_mask)

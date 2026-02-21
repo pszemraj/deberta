@@ -495,6 +495,20 @@ def _finalize_window_metric_loss(
     return accumulated_loss / float(denom)
 
 
+def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
+    """Return whether gradient clipping should run for this micro-step.
+
+    :param bool sync_gradients: Whether gradients are synchronized this step.
+    :param float | int | None max_grad_norm: Configured clipping norm.
+    :return bool: ``True`` when clipping should be applied.
+    """
+    if not bool(sync_gradients):
+        return False
+    if max_grad_norm is None:
+        return False
+    return float(max_grad_norm) > 0.0
+
+
 def _parse_checkpoint_step(path: str) -> int:
     """Parse integer step suffix from checkpoint path.
 
@@ -1037,7 +1051,10 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
                 accelerator.backward(loss)
 
-                if train_cfg.max_grad_norm and float(train_cfg.max_grad_norm) > 0:
+                if _should_clip_gradients(
+                    sync_gradients=bool(accelerator.sync_gradients),
+                    max_grad_norm=train_cfg.max_grad_norm,
+                ):
                     accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
 
                 optimizer.step()
