@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 import pytest
 
 from deberta.config import ModelConfig
@@ -258,6 +260,75 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
 
     assert disc_cfg.ffn_type == "mlp"
     assert gen_cfg.ffn_type == "swiglu"
+
+
+def _build_hf_fake_transformers_module() -> types.ModuleType:
+    """Build a fake ``transformers`` module for deterministic AutoConfig tests."""
+
+    class _FakeAutoConfig:
+        @classmethod
+        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
+            del src
+            return types.SimpleNamespace(
+                hidden_dropout_prob=0.1,
+                attention_probs_dropout_prob=0.2,
+                num_hidden_layers=6,
+                hidden_size=768,
+                intermediate_size=3072,
+                num_attention_heads=12,
+            )
+
+    module = types.ModuleType("transformers")
+    module.AutoConfig = _FakeAutoConfig
+    return module
+
+
+def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts(monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("transformers")
+
+    fake_transformers = _build_hf_fake_transformers_module()
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        discriminator_model_name_or_path="disc",
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.1)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
+    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.1)
+    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
+
+
+def test_build_backbone_configs_hf_deberta_applies_nonzero_dropout_overrides(monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("transformers")
+
+    fake_transformers = _build_hf_fake_transformers_module()
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        discriminator_model_name_or_path="disc",
+        hidden_dropout_prob=0.5,
+        attention_probs_dropout_prob=0.25,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.5)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.25)
+    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.5)
+    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.25)
 
 
 def test_build_backbone_configs_rejects_invalid_model_options_early():
