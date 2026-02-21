@@ -31,7 +31,9 @@ from deberta.training.pretrain import (
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
     _load_checkpoint_data_progress,
+    _persist_or_validate_run_configs,
     _prepare_output_dir,
+    _resolve_resume_checkpoint,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
     _scale_loss_for_backward,
@@ -218,6 +220,17 @@ def test_find_latest_checkpoint_picks_highest_step(tmp_path: Path):
     assert latest.name == "checkpoint-11"
 
 
+def test_resolve_resume_checkpoint_auto_returns_none_when_no_checkpoint(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    resolved = _resolve_resume_checkpoint(
+        output_dir=out,
+        resume_from_checkpoint="auto",
+        is_main_process=True,
+    )
+    assert resolved is None
+
+
 def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
@@ -225,6 +238,65 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert _load_checkpoint_data_progress(ckpt) is None
     _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123)
     assert _load_checkpoint_data_progress(ckpt) == 123
+
+
+def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    base_model = ModelConfig(backbone_type="rope")
+    base_data = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    base_train = TrainConfig()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=base_model,
+        data_cfg=base_data,
+        train_cfg=base_train,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    changed_model = ModelConfig(backbone_type="rope", hidden_size=1024)
+    with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=changed_model,
+            data_cfg=base_data,
+            train_cfg=base_train,
+            resume_checkpoint=str(out / "checkpoint-10"),
+            is_main_process=True,
+        )
+
+
+def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matching_resume(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=10)
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    original_train_snapshot = json.loads((out / "train_config.json").read_text(encoding="utf-8"))
+
+    changed_train_cfg = TrainConfig(max_steps=20)
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=changed_train_cfg,
+        resume_checkpoint=str(out / "checkpoint-10"),
+        is_main_process=True,
+    )
+
+    resumed_train_snapshot = json.loads((out / "train_config.json").read_text(encoding="utf-8"))
+    assert resumed_train_snapshot == original_train_snapshot
 
 
 class _FakeAccelerator:

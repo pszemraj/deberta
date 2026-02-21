@@ -50,6 +50,96 @@ def _json_dump(obj: Any, path: Path) -> None:
         json.dump(obj, f, indent=2, sort_keys=True)
 
 
+def _json_load(path: Path) -> dict[str, Any]:
+    """Read JSON mapping from disk.
+
+    :param Path path: Source path.
+    :return dict[str, Any]: Parsed mapping.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected JSON object at {path}, got {type(raw).__name__}.")
+    return raw
+
+
+def _resolve_resume_checkpoint(
+    *,
+    output_dir: Path,
+    resume_from_checkpoint: str | None,
+    is_main_process: bool,
+) -> str | None:
+    """Resolve resume checkpoint path, including ``auto`` lookup.
+
+    :param Path output_dir: Training output directory.
+    :param str | None resume_from_checkpoint: User resume setting.
+    :param bool is_main_process: Whether to emit logs.
+    :return str | None: Concrete checkpoint path, or ``None``.
+    """
+    if not resume_from_checkpoint:
+        return None
+
+    if str(resume_from_checkpoint).lower() != "auto":
+        return str(resume_from_checkpoint)
+
+    latest = _find_latest_checkpoint(output_dir)
+    if latest is None:
+        if is_main_process:
+            logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
+        return None
+    return str(latest)
+
+
+def _persist_or_validate_run_configs(
+    *,
+    output_dir: Path,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    resume_checkpoint: str | None,
+    is_main_process: bool,
+) -> None:
+    """Persist new config snapshots or validate existing snapshots on resume.
+
+    :param Path output_dir: Training output directory.
+    :param ModelConfig model_cfg: Current model config.
+    :param DataConfig data_cfg: Current data config.
+    :param TrainConfig train_cfg: Current train config.
+    :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
+    :param bool is_main_process: Whether this process owns writes.
+    :raises ValueError: If resume mode detects incompatible model/data config snapshots.
+    """
+    model_cfg_path = output_dir / "model_config.json"
+    data_cfg_path = output_dir / "data_config.json"
+    train_cfg_path = output_dir / "train_config.json"
+
+    has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
+    if resume_checkpoint is not None and has_saved_model_data:
+        saved_model_cfg = ModelConfig(**_json_load(model_cfg_path))
+        saved_data_cfg = DataConfig(**_json_load(data_cfg_path))
+        validate_model_config(saved_model_cfg)
+        validate_data_config(saved_data_cfg)
+
+        if asdict(saved_model_cfg) != asdict(model_cfg):
+            raise ValueError(
+                "Resume configuration mismatch for model_config.json. "
+                "Refusing to overwrite run metadata with incompatible model settings."
+            )
+        if asdict(saved_data_cfg) != asdict(data_cfg):
+            raise ValueError(
+                "Resume configuration mismatch for data_config.json. "
+                "Refusing to overwrite run metadata with incompatible data settings."
+            )
+        if is_main_process:
+            logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
+        return
+
+    if is_main_process:
+        _json_dump(asdict(model_cfg), model_cfg_path)
+        _json_dump(asdict(data_cfg), data_cfg_path)
+        _json_dump(asdict(train_cfg), train_cfg_path)
+
+
 def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     """Configure TF32 compute policy for CUDA matmul/cudnn.
 
@@ -785,6 +875,8 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
         mixed_precision = "no"
+    # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
+    train_cfg.mixed_precision = mixed_precision
     accelerator = Accelerator(
         gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
         log_with=log_with,
@@ -820,10 +912,19 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=accelerator.is_main_process,
     )
-    if accelerator.is_main_process:
-        _json_dump(asdict(model_cfg), output_dir / "model_config.json")
-        _json_dump(asdict(data_cfg), output_dir / "data_config.json")
-        _json_dump(asdict(train_cfg), output_dir / "train_config.json")
+    ckpt = _resolve_resume_checkpoint(
+        output_dir=output_dir,
+        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        is_main_process=accelerator.is_main_process,
+    )
+    _persist_or_validate_run_configs(
+        output_dir=output_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=ckpt,
+        is_main_process=accelerator.is_main_process,
+    )
 
     accelerator.wait_for_everyone()
 
@@ -938,30 +1039,19 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     # Resume
     global_step = 0
     consumed_micro_batches = 0
-    ckpt = train_cfg.resume_from_checkpoint
     if ckpt:
-        if str(ckpt).lower() == "auto":
-            latest = _find_latest_checkpoint(output_dir)
-            if latest is None:
-                logger.info(
-                    "resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch."
-                )
-                ckpt = None
-            else:
-                ckpt = str(latest)
-        if ckpt:
-            logger.info(f"Resuming from checkpoint: {ckpt}")
-            accelerator.load_state(ckpt)
-            global_step = _parse_checkpoint_step(ckpt)
-            restored = _load_checkpoint_data_progress(Path(ckpt))
-            if restored is None:
-                # Back-compat fallback for older checkpoints without data_state.json.
-                restored = global_step * int(train_cfg.gradient_accumulation_steps)
-                logger.warning(
-                    "Checkpoint missing data_state.json; approximating data replay offset "
-                    f"as global_step * grad_accum = {restored} micro-batches."
-                )
-            consumed_micro_batches = int(restored)
+        logger.info(f"Resuming from checkpoint: {ckpt}")
+        accelerator.load_state(ckpt)
+        global_step = _parse_checkpoint_step(ckpt)
+        restored = _load_checkpoint_data_progress(Path(ckpt))
+        if restored is None:
+            # Back-compat fallback for older checkpoints without data_state.json.
+            restored = global_step * int(train_cfg.gradient_accumulation_steps)
+            logger.warning(
+                "Checkpoint missing data_state.json; approximating data replay offset "
+                f"as global_step * grad_accum = {restored} micro-batches."
+            )
+        consumed_micro_batches = int(restored)
 
     # Training loop
     model.train()
