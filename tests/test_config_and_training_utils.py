@@ -18,6 +18,7 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     validate_data_config,
     validate_model_config,
+    validate_train_config,
     validate_training_workflow_options,
 )
 from deberta.export_cli import _build_export_parser
@@ -314,6 +315,35 @@ def test_model_config_defaults_to_adjust_swiglu_intermediate():
 def test_train_config_defaults_to_token_weighted_gradient_accumulation():
     cfg = TrainConfig()
     assert cfg.token_weighted_gradient_accumulation is True
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("true", "bf16"),
+        ("false", "no"),
+        ("TRUE", "bf16"),
+        ("False", "no"),
+        ("yes", "bf16"),
+        ("no", "no"),
+        ("on", "bf16"),
+        ("off", "no"),
+        ("1", "bf16"),
+        ("0", "no"),
+        ("bfloat16", "bf16"),
+        ("none", "no"),
+    ],
+)
+def test_validate_train_config_accepts_mixed_precision_aliases(raw: str, expected: str):
+    cfg = TrainConfig(mixed_precision=raw)
+    validate_train_config(cfg)
+    assert cfg.mixed_precision == expected
+
+
+def test_validate_train_config_rejects_invalid_mixed_precision():
+    cfg = TrainConfig(mixed_precision="fp16")
+    with pytest.raises(ValueError, match="train.mixed_precision must be one of: bf16\\|no"):
+        validate_train_config(cfg)
 
 
 def test_token_weighted_micro_objective_matches_full_batch_normalization():

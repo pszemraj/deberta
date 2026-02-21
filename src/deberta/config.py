@@ -37,7 +37,22 @@ _TORCH_COMPILE_MODE_ALIASES = {
     "max_autotune": "max-autotune",
     "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
 }
-_MIXED_PRECISION_CHOICES = {"bf16", "bfloat16", "no", "none"}
+_MIXED_PRECISION_CANONICAL = {"bf16", "no"}
+_MIXED_PRECISION_ALIASES = {
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "true": "bf16",
+    "1": "bf16",
+    "yes": "bf16",
+    "y": "bf16",
+    "on": "bf16",
+    "no": "no",
+    "none": "no",
+    "false": "no",
+    "0": "no",
+    "off": "no",
+    "n": "no",
+}
 _HF_DEBERTA_PRETRAINED_PREFIXES = (
     "microsoft/deberta-v2",
     "microsoft/deberta-v3",
@@ -756,13 +771,15 @@ def validate_train_config(cfg: TrainConfig) -> None:
     cfg.sdpa_kernel = _normalize_sdpa_kernel(cfg.sdpa_kernel)
     cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
 
-    mp = cfg.mixed_precision
-    if isinstance(mp, bool):
-        pass
+    if isinstance(cfg.mixed_precision, bool):
+        cfg.mixed_precision = "bf16" if bool(cfg.mixed_precision) else "no"
     else:
-        v = str(mp).strip().lower()
-        if v not in _MIXED_PRECISION_CHOICES:
-            raise ValueError("train.mixed_precision must be one of: bf16|no (or synonyms bfloat16|none).")
+        mp = str(cfg.mixed_precision).strip().lower()
+        cfg.mixed_precision = _MIXED_PRECISION_ALIASES.get(mp, mp)
+    if cfg.mixed_precision not in _MIXED_PRECISION_CANONICAL:
+        raise ValueError(
+            "train.mixed_precision must be one of: bf16|no (or aliases true|false|yes|no|on|off|1|0)."
+        )
 
     if int(cfg.max_steps) <= 0:
         raise ValueError("train.max_steps must be > 0.")
