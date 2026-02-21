@@ -47,6 +47,7 @@ class DebertaV3ElectraCollator:
         tokenizer: Any,
         cfg: MLMConfig,
         packed_sequences: bool = False,
+        block_cross_document_attention: bool = True,
         pad_to_multiple_of: int | None = None,
     ) -> None:
         """Initialize collator state.
@@ -54,12 +55,14 @@ class DebertaV3ElectraCollator:
         :param Any tokenizer: HF tokenizer.
         :param MLMConfig cfg: Masking configuration.
         :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
+        :param bool block_cross_document_attention: Whether to emit 3D doc-block masks for packed inputs.
         :param int | None pad_to_multiple_of: Optional right-padding multiple.
         """
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.pad_to_multiple_of = pad_to_multiple_of
         self._packed_sequences = bool(packed_sequences)
+        self._block_cross_document_attention = bool(block_cross_document_attention)
 
         if self.tokenizer.mask_token_id is None:
             raise ValueError("Tokenizer must define a mask token for MLM masking.")
@@ -120,7 +123,7 @@ class DebertaV3ElectraCollator:
                 special_tokens_mask=special_tokens_mask,
                 attention_mask=batch.get("attention_mask"),
             )
-            if self._packed_sequences
+            if self._packed_sequences and self._block_cross_document_attention
             else None
         )
         if block_mask is not None:
@@ -343,7 +346,12 @@ class DebertaV3ElectraCollator:
         if not bool(internal_sep_positions.any().item()):
             return None
 
-        sep_before = sep_positions.long().cumsum(dim=1) - sep_positions.long()
+        # Collapse contiguous separator runs into one boundary increment so packed
+        # "... [SEP] [SEP] ..." tails do not create phantom empty-document segments.
+        sep_prev = torch.zeros_like(sep_positions)
+        sep_prev[:, 1:] = sep_positions[:, :-1]
+        sep_boundaries = sep_positions & (~sep_prev)
+        sep_before = sep_boundaries.long().cumsum(dim=1) - sep_boundaries.long()
         doc_ids = sep_before + 1
 
         cls_id = getattr(self.tokenizer, "cls_token_id", None)

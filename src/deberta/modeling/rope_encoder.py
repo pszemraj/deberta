@@ -245,10 +245,11 @@ class DebertaRoPESelfAttention(nn.Module):
                 pair_keep = mask
                 query_keep = pair_keep.any(dim=-1)
 
-                # Guarantee self-attend on the diagonal without host sync; masked query
-                # rows are still zeroed after output projection via query_keep_tokens.
-                eye = torch.eye(seq_len, dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
-                pair_keep = pair_keep | eye
+                # Guarantee self-attend on the diagonal while avoiding dense SxS eye
+                # allocation in every attention layer.
+                pair_keep = pair_keep.clone()
+                diag_idx = torch.arange(seq_len, device=pair_keep.device)
+                pair_keep[:, diag_idx, diag_idx] = True
 
                 sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
                 eager_attn_mask = ~sdpa_attn_mask

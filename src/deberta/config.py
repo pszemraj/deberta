@@ -368,6 +368,15 @@ class DataConfig:
             )
         },
     )
+    block_cross_document_attention: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When data.pack_sequences=true, emit 3D pairwise masks that block cross-document attention "
+                "inside packed sequences. Disable to keep packed batches on 2D/no-mask fast paths."
+            )
+        },
+    )
 
     cache_dir: str | None = field(default=None, metadata={"help": "Optional datasets cache dir."})
 
@@ -787,6 +796,9 @@ def validate_data_config(cfg: DataConfig) -> None:
             "data.preprocessing_num_workers is currently unused in the unified packer path. "
             f"Keep the default ({default_preproc_workers}) to avoid inert config."
         )
+    if not bool(cfg.pack_sequences):
+        # Canonicalize inert setting in sequential mode (no packed doc boundaries exist).
+        cfg.block_cross_document_attention = False
 
 
 def validate_train_config(cfg: TrainConfig) -> None:
@@ -862,7 +874,11 @@ def validate_training_workflow_options(
         )
 
     sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
-    if bool(data_cfg.pack_sequences) and sdpa_policy == "flash_only":
+    if (
+        bool(data_cfg.pack_sequences)
+        and bool(data_cfg.block_cross_document_attention)
+        and sdpa_policy == "flash_only"
+    ):
         raise ValueError(
             "train.sdpa_kernel=flash_only is not supported with data.pack_sequences=true. "
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
@@ -876,4 +892,13 @@ def validate_training_workflow_options(
             raise ValueError(
                 "train.sdpa_kernel only affects rope attention when model.attention_implementation='sdpa'. "
                 "Set train.sdpa_kernel=auto or switch model.attention_implementation=sdpa."
+            )
+        if (
+            backbone_type != "rope"
+            and bool(data_cfg.pack_sequences)
+            and bool(data_cfg.block_cross_document_attention)
+        ):
+            raise ValueError(
+                "data.block_cross_document_attention=true is only supported with model.backbone_type='rope'. "
+                "Use data.block_cross_document_attention=false or switch to model.backbone_type='rope'."
             )

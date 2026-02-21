@@ -216,11 +216,13 @@ class MaskedLMHead(nn.Module):
                     f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
                 )
             w = word_embedding_weight
-            if w.dtype != x.dtype:
-                w = w.to(dtype=x.dtype)
             b = self.bias
-            if b.dtype != x.dtype:
-                b = b.to(dtype=x.dtype)
+            # Never cast the full embedding matrix in the hot path. Outside autocast,
+            # align dtypes by casting the much smaller activation tensor instead.
+            if not torch.is_autocast_enabled() and x.dtype != w.dtype:
+                x = x.to(dtype=w.dtype)
+            if b.dtype != w.dtype:
+                b = b.to(dtype=w.dtype)
             return F.linear(x, w, b)
 
         if self.decoder is None:

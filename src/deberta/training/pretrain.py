@@ -394,7 +394,9 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
         :return bool: True when parameter belongs to no-decay group.
         """
         lname = name.lower()
-        if lname.endswith(".bias"):
+        # Keep vector/scalar biases in no-decay; high-rank "bias" tensors (for example
+        # GDES embedding deltas) should follow standard weight-decay behavior.
+        if lname.endswith(".bias") and p.dim() <= 1:
             return True
         if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
             return True
@@ -489,12 +491,14 @@ def _build_training_collator(
     tokenizer: Any,
     train_cfg: TrainConfig,
     packed_sequences: bool,
+    block_cross_document_attention: bool,
 ) -> DebertaV3ElectraCollator:
     """Build the RTD masking collator from train/data config.
 
     :param Any tokenizer: Tokenizer used for dynamic masking.
     :param TrainConfig train_cfg: Training configuration.
     :param bool packed_sequences: Whether dataset packing is enabled.
+    :param bool block_cross_document_attention: Whether packed batches should block cross-document attention.
     :return DebertaV3ElectraCollator: Configured collator.
     """
     return DebertaV3ElectraCollator(
@@ -506,6 +510,7 @@ def _build_training_collator(
             max_ngram=train_cfg.mlm_max_ngram,
         ),
         packed_sequences=bool(packed_sequences),
+        block_cross_document_attention=bool(block_cross_document_attention),
     )
 
 
@@ -1011,6 +1016,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         tokenizer=tokenizer,
         train_cfg=train_cfg,
         packed_sequences=bool(data_cfg.pack_sequences),
+        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
     )
 
     # Dataloader

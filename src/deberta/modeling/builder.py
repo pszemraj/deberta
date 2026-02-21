@@ -9,6 +9,29 @@ from deberta.config import ModelConfig, validate_model_config
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 
+def _apply_tokenizer_special_ids(cfg: Any, tokenizer: Any) -> None:
+    """Copy tokenizer special-token ids onto a config object when available.
+
+    :param Any cfg: Target config object.
+    :param Any tokenizer: Tokenizer source.
+    """
+    for attr in (
+        "pad_token_id",
+        "cls_token_id",
+        "sep_token_id",
+        "mask_token_id",
+        "bos_token_id",
+        "eos_token_id",
+    ):
+        tok_id = getattr(tokenizer, attr, None)
+        if tok_id is None:
+            continue
+        try:
+            setattr(cfg, attr, int(tok_id))
+        except Exception:
+            continue
+
+
 def _scaled_swiglu_intermediate_size(value: int) -> int:
     """Return a SwiGLU intermediate size scaled to MLP-equivalent parameter budget.
 
@@ -74,6 +97,7 @@ def _apply_rope_config_overrides(
     :param bool adjust_swiglu_intermediate: Whether to apply 2/3 intermediate-size scaling for SwiGLU.
     :param bool include_arch_from_model_cfg: Whether to copy architecture dimensions from `model_cfg`.
     """
+    defaults = ModelConfig()
     cfg.vocab_size = int(len(tokenizer))
     if model_cfg.from_scratch and include_arch_from_model_cfg:
         cfg.hidden_size = int(model_cfg.hidden_size)
@@ -81,32 +105,60 @@ def _apply_rope_config_overrides(
         cfg.num_attention_heads = int(model_cfg.num_attention_heads)
         cfg.intermediate_size = int(model_cfg.intermediate_size)
         cfg.hidden_act = str(model_cfg.hidden_act)
-    for attr in ("cls_token_id", "sep_token_id", "mask_token_id", "bos_token_id", "eos_token_id"):
-        tok_id = getattr(tokenizer, attr, None)
-        if tok_id is not None:
-            cfg_val = int(tok_id)
-            setattr(cfg, attr, cfg_val)
-    cfg.pad_token_id = int(tokenizer.pad_token_id or 0)
-    cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
+    _apply_tokenizer_special_ids(cfg, tokenizer)
+    if model_cfg.from_scratch:
+        cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
+    elif model_cfg.max_position_embeddings is not None:
+        # Keep checkpoint-native max positions by default; only override when explicit.
+        cfg.max_position_embeddings = int(model_cfg.max_position_embeddings)
 
-    cfg.rope_theta = float(model_cfg.rope_theta)
-    cfg.rotary_pct = float(model_cfg.rotary_pct)
-    cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
-    cfg.type_vocab_size = int(model_cfg.type_vocab_size)
+    if model_cfg.from_scratch:
+        cfg.rope_theta = float(model_cfg.rope_theta)
+        cfg.rotary_pct = float(model_cfg.rotary_pct)
+        cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
+        cfg.type_vocab_size = int(model_cfg.type_vocab_size)
+        cfg.norm_eps = float(model_cfg.norm_eps)
+        cfg.norm_arch = str(model_cfg.norm_arch)
+        cfg.keel_alpha_init = (
+            float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+        )
+        cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
+    else:
+        # For pretrained RoPE checkpoints, preserve checkpoint architecture unless
+        # user explicitly deviates from ModelConfig defaults.
+        if float(model_cfg.rope_theta) != float(defaults.rope_theta):
+            cfg.rope_theta = float(model_cfg.rope_theta)
+        if float(model_cfg.rotary_pct) != float(defaults.rotary_pct):
+            cfg.rotary_pct = float(model_cfg.rotary_pct)
+        if bool(model_cfg.use_absolute_position_embeddings) != bool(
+            defaults.use_absolute_position_embeddings
+        ):
+            cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
+        if int(model_cfg.type_vocab_size) != int(defaults.type_vocab_size):
+            cfg.type_vocab_size = int(model_cfg.type_vocab_size)
+        if float(model_cfg.norm_eps) != float(defaults.norm_eps):
+            cfg.norm_eps = float(model_cfg.norm_eps)
+        if str(model_cfg.norm_arch) != str(defaults.norm_arch):
+            cfg.norm_arch = str(model_cfg.norm_arch)
+        if model_cfg.keel_alpha_init != defaults.keel_alpha_init:
+            cfg.keel_alpha_init = (
+                float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
+            )
+        if bool(model_cfg.keel_alpha_learnable) != bool(defaults.keel_alpha_learnable):
+            cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
 
-    cfg.norm_eps = float(model_cfg.norm_eps)
-    cfg.norm_arch = str(model_cfg.norm_arch)
-    cfg.keel_alpha_init = float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
-    cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
     cfg.attention_implementation = str(model_cfg.attention_implementation)
     if model_cfg.from_scratch:
-        # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
+        # Scratch RoPE builds fully follow model_cfg architecture knobs.
         cfg.ffn_type = str(model_cfg.ffn_type)
         cfg.use_bias = bool(model_cfg.use_bias)
         if bool(adjust_swiglu_intermediate):
             curr_intermediate = int(cfg.intermediate_size)
             cfg.intermediate_size = _scaled_swiglu_intermediate_size(curr_intermediate)
-    cfg.initializer_range = float(model_cfg.initializer_range)
+        cfg.initializer_range = float(model_cfg.initializer_range)
+    elif float(model_cfg.initializer_range) != float(defaults.initializer_range):
+        # No effect on loaded parameters, but keep explicit metadata override consistent.
+        cfg.initializer_range = float(model_cfg.initializer_range)
 
     apply_dropout_overrides = bool(model_cfg.from_scratch) or (
         model_cfg.hidden_dropout_prob is not None and float(model_cfg.hidden_dropout_prob) != 0.0
@@ -173,6 +225,9 @@ def build_backbone_configs(
         if apply_attention_dropout_overrides and model_cfg.attention_probs_dropout_prob is not None:
             disc_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
             gen_cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
+
+        _apply_tokenizer_special_ids(disc_cfg, tokenizer)
+        _apply_tokenizer_special_ids(gen_cfg, tokenizer)
 
         return disc_cfg, gen_cfg
 
