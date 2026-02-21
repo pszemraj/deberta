@@ -29,6 +29,8 @@ Exposed controls:
 - `train.decoupled_loss_scaling`
 - `train.sampling_temperature`
 
+Per-microbatch loss terms are token-level means; gradient-accumulation windows currently weight microbatches equally.
+
 ## Numerical Stability
 
 Both generator CE loss and discriminator BCE loss are computed from fp32 logits, even when training uses bf16 autocast.
@@ -38,3 +40,7 @@ Both generator CE loss and discriminator BCE loss are computed from fp32 logits,
 Vocab logits for all tokens (`batch x seq x vocab`) are expensive with large DeBERTa vocabularies.
 
 This implementation computes generator vocab projection only on masked positions to reduce memory/compute while preserving RTD behavior.
+
+## Deferred TODOs
+
+- TODO: add optional token-count-weighted gradient accumulation across microbatches for workloads with highly variable active-token counts.

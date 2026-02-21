@@ -100,6 +100,11 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - `configs/` - training and accelerate configs
 - `docs/` - canonical docs by concept
 
+## Deferred TODOs
+
+- TODO: make constrained CLI choice parsing case-insensitive so CLI behavior matches config-file normalization.
+- TODO: improve help output for mutually exclusive boolean flag pairs so default rendering is less ambiguous.
+
 ## Citations
 
 ```bibtex

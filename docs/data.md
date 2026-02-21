@@ -46,11 +46,9 @@ Set `data.pack_sequences=false` to switch to one-document chunking:
 
 ## Non-Streaming Packing
 
-When `streaming=false`, the code tokenizes with `datasets.map` and performs an offline packing path that matches the same output contract used by streaming:
+When `streaming=false`, training still routes through the same iterable packing wrappers (`PackedStreamingDataset` / `SequentialStreamingDataset`) used in streaming mode, but backed by a map-style HF dataset iterator.
 
-- same `[CLS] ... [SEP]` framing
-- same `special_tokens_mask` semantics
-- `attention_mask` omitted when there is no padding
+`_maybe_tokenize_non_streaming` remains in the codebase as a legacy helper and is currently not wired into the active training path.
 
 ## Collator Behavior (Dynamic MLM Masking)
 
@@ -82,3 +80,7 @@ The pipeline keeps this path lean by:
 3. Dropping all-ones `attention_mask` tensors in the collator.
 
 Downstream model code treats missing masks as unpadded (`attention_mask=None`).
+
+## Deferred TODOs
+
+- TODO: decide whether to remove or rewire `_maybe_tokenize_non_streaming` so non-streaming behavior has a single documented path without dormant helper code.

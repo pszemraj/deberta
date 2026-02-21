@@ -62,6 +62,10 @@ Use `train.sdpa_kernel` to set SDPA backend preference:
 
 This is best-effort backend configuration. `flash_only` can fail if hardware or tensor shapes are not flash-compatible.
 
+When `data.pack_sequences=true`, packed batches may emit 3D document-blocking attention masks. Those masks are not compatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
+
+Use `auto`, `flash`, or `mem_efficient` for packed training runs.
+
 ## Embedding Sharing and FSDP Safety
 
 `embedding_sharing` supports `none|es|gdes`.

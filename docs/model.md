@@ -44,6 +44,8 @@ RTD uses separate generator and discriminator backbones.
   - `generator_intermediate_size`
   - `generator_num_attention_heads`
 
+If `generator_config_name_or_path` or `generator_model_name_or_path` is set, the derived-generator sizing knobs above must be unset.
+
 ## Embedding Sharing
 
 `model.embedding_sharing`:
@@ -59,3 +61,7 @@ RTD uses separate generator and discriminator backbones.
 With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
+
+## Deferred TODOs
+
+- TODO: add an explicit `swiglu_adjust_intermediate` option for scratch RoPE builds so SwiGLU-vs-MLP ablations can preserve FFN parameter budget (for example 2/3 intermediate scaling).
