@@ -78,8 +78,9 @@ class DebertaV3ElectraCollator:
             "return_tensors": "pt",
             "pad_to_multiple_of": self.pad_to_multiple_of,
         }
-        # If the dataset does not provide attention_mask, attempt to avoid materializing one.
-        if not any("attention_mask" in f for f in features):
+        # If no padding is needed and the dataset does not provide attention_mask, avoid
+        # materializing an all-ones mask.
+        if not any("attention_mask" in f for f in features) and not self._needs_padding(features):
             pad_kwargs["return_attention_mask"] = False
         try:
             batch = self.tokenizer.pad(features, **pad_kwargs)
@@ -87,6 +88,15 @@ class DebertaV3ElectraCollator:
             # Some minimal tokenizer stubs do not accept return_attention_mask.
             pad_kwargs.pop("return_attention_mask", None)
             batch = self.tokenizer.pad(features, **pad_kwargs)
+
+        # Safety fallback: if tokenizer did not emit an attention mask, infer one from
+        # padded input_ids when pad tokens are present.
+        if "attention_mask" not in batch:
+            pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+            if pad_token_id is not None:
+                attn = batch["input_ids"].ne(int(pad_token_id))
+                if not bool(attn.all().item()):
+                    batch["attention_mask"] = attn.long()
 
         # Packed/unpadded pretraining examples often have all-ones attention masks.
         # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
@@ -113,6 +123,22 @@ class DebertaV3ElectraCollator:
         batch["input_ids"] = input_ids
         batch["labels"] = labels
         return batch
+
+    def _needs_padding(self, features: list[dict[str, Any]]) -> bool:
+        """Check whether tokenizer.pad will add padding.
+
+        :param list[dict[str, Any]] features: Batch feature dicts.
+        :return bool: True when any sequence will be padded.
+        """
+        lengths = [len(f["input_ids"]) for f in features]
+        if not lengths:
+            return False
+        max_len = max(lengths)
+        if any(seq_len != max_len for seq_len in lengths):
+            return True
+        if self.pad_to_multiple_of is not None and max_len % int(self.pad_to_multiple_of) != 0:
+            return True
+        return False
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor

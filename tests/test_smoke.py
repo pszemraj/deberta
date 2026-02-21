@@ -59,6 +59,7 @@ class DummyTokenizer:
         features: list[dict[str, Any]],
         return_tensors: str = "pt",
         pad_to_multiple_of: int | None = None,
+        return_attention_mask: bool = True,
     ):
         # Minimal padding for collator tests.
         max_len = max(len(f["input_ids"]) for f in features)
@@ -81,8 +82,10 @@ class DummyTokenizer:
                 else:
                     raise TypeError(f"Unsupported feature type for {k}: {type(v)}")
 
-        if "attention_mask" not in batch:
-            batch["attention_mask"] = [[1] * len(v) + [0] * (max_len - len(v)) for v in batch["input_ids"]]
+        if "attention_mask" not in batch and return_attention_mask:
+            batch["attention_mask"] = [
+                [0 if tid == self.pad_token_id else 1 for tid in row] for row in batch["input_ids"]
+            ]
 
         if return_tensors == "pt":
             return {k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()}
@@ -184,6 +187,22 @@ def test_collator_keeps_attention_mask_when_padding_present():
         },
     ]
     batch = coll(features)
+    assert "attention_mask" in batch
+    assert batch["attention_mask"].shape == batch["input_ids"].shape
+    assert (batch["attention_mask"] == 0).any()
+
+
+def test_collator_generates_attention_mask_for_variable_length_inputs():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    # No attention_mask in features; tokenizer padding is required.
+    features = [
+        {"input_ids": [tok.cls_token_id, 11, tok.sep_token_id], "special_tokens_mask": [1, 0, 1]},
+        {"input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
+    ]
+    batch = coll(features)
+
     assert "attention_mask" in batch
     assert batch["attention_mask"].shape == batch["input_ids"].shape
     assert (batch["attention_mask"] == 0).any()
