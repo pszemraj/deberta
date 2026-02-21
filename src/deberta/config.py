@@ -135,7 +135,12 @@ class ModelConfig:
 
     ffn_type: str = field(
         default="swiglu",
-        metadata={"help": "FFN block type for rope backbone: 'swiglu' (default) or 'mlp'."},
+        metadata={
+            "help": (
+                "FFN block type for rope backbone: 'swiglu' (default) or 'mlp'. "
+                "Applied when model.from_scratch=true; pretrained rope loads preserve checkpoint ffn_type."
+            )
+        },
     )
 
     initializer_range: float = field(

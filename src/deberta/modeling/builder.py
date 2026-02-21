@@ -110,7 +110,9 @@ def build_backbone_configs(
     )
     disc_cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
     disc_cfg.attention_implementation = str(model_cfg.attention_implementation)
-    disc_cfg.ffn_type = str(model_cfg.ffn_type)
+    if model_cfg.from_scratch:
+        # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
+        disc_cfg.ffn_type = str(model_cfg.ffn_type)
     disc_cfg.initializer_range = float(model_cfg.initializer_range)
 
     # Optional dropout overrides
@@ -144,7 +146,9 @@ def build_backbone_configs(
     )
     gen_cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
     gen_cfg.attention_implementation = str(model_cfg.attention_implementation)
-    gen_cfg.ffn_type = str(model_cfg.ffn_type)
+    if model_cfg.from_scratch:
+        # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
+        gen_cfg.ffn_type = str(model_cfg.ffn_type)
     gen_cfg.initializer_range = float(model_cfg.initializer_range)
 
     if model_cfg.hidden_dropout_prob is not None:

@@ -28,6 +28,7 @@ Key options in `ModelConfig`:
   - `attention_implementation`: `sdpa` (recommended) or `eager`
 - FFN block:
   - `ffn_type`: `swiglu` (default) or `mlp`
+  - note: `ffn_type` is applied for `model.from_scratch=true`; pretrained RoPE loads preserve the checkpoint's FFN type unless you provide matching configs.
 - optional activation checkpointing:
   - `gradient_checkpointing`
 

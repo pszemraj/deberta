@@ -72,9 +72,9 @@ Export from an FSDP2 checkpoint:
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
-  --checkpoint_dir runs/deberta_rope_rtd/checkpoint-10000 \
+  runs/deberta_rope_rtd/checkpoint-10000 \
   --what discriminator \
-  --output_dir runs/deberta_rope_rtd/exported_hf
+  --output-dir runs/deberta_rope_rtd/exported_hf
 ```
 
 ## Documentation

@@ -78,8 +78,8 @@ For reliable artifact export, run `deberta export` after training:
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
-  --checkpoint_dir <RUN_DIR>/checkpoint-<STEP> \
-  --output_dir <RUN_DIR>/exported_hf \
+  <RUN_DIR>/checkpoint-<STEP> \
+  --output-dir <RUN_DIR>/exported_hf \
   --what discriminator
 ```
 
