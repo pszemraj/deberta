@@ -250,8 +250,8 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         help="Run pretraining.",
         description=(
             "Run RTD pretraining from a YAML/JSON config file or from explicit CLI flags. "
-            "Examples: `deberta train configs/pretrain_rope_c4_en.yaml` or "
-            "`deberta train --dataset_name c4 --dataset_config_name en --max_steps 1000`."
+            "Examples: `deberta train configs/pretrain_rope_fineweb_edu.yaml` or "
+            "`deberta train --dataset_name HuggingFaceFW/fineweb-edu --dataset_config_name default --max_steps 1000`."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

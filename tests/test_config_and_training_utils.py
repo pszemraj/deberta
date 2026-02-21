@@ -277,7 +277,7 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
         "\n".join(
             [
                 "data:",
-                "  dataset_name: c4",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
                 "  max_seq_length: 32",
                 "train:",
                 "  max_steps: 5",
@@ -351,7 +351,7 @@ def test_validate_data_config_rejects_conflicting_sources():
         validate_data_config(
             DataConfig(
                 load_from_disk="runs/saved_ds",
-                dataset_name="c4",
+                dataset_name="HuggingFaceFW/fineweb-edu",
                 streaming=False,
             )
         )
@@ -360,13 +360,13 @@ def test_validate_data_config_rejects_conflicting_sources():
 def test_validate_training_workflow_options_rejects_eval_knobs():
     with pytest.raises(ValueError, match="Evaluation workflow is not implemented yet"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="c4", eval_split="validation"),
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", eval_split="validation"),
             train_cfg=TrainConfig(),
         )
 
     with pytest.raises(ValueError, match="currently unused"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="c4"),
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
             train_cfg=TrainConfig(per_device_eval_batch_size=8),
         )
 
@@ -383,9 +383,9 @@ def test_validate_model_config_rejects_rope_only_knobs_in_hf_mode():
 def test_readme_cli_examples_are_parseable():
     parser = cli_mod._build_main_parser()
     examples = [
-        "train configs/pretrain_rope_c4_en.yaml",
-        "train configs/pretrain_rope_c4_en_2048.yaml",
-        "train configs/pretrain_rope_c4_en_4096.yaml",
+        "train configs/pretrain_rope_fineweb_edu.yaml",
+        "train configs/pretrain_rope_fineweb_edu_2048.yaml",
+        "train configs/pretrain_rope_fineweb_edu_4096.yaml",
         (
             "export runs/deberta_rope_rtd/checkpoint-10000 "
             "--what discriminator "

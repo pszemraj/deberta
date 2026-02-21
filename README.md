@@ -53,19 +53,19 @@ Train from YAML (recommended):
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_c4_en.yaml
+  deberta train configs/pretrain_rope_fineweb_edu.yaml
 ```
 
 Long-context presets:
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_c4_en_2048.yaml
+  deberta train configs/pretrain_rope_fineweb_edu_2048.yaml
 ```
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_c4_en_4096.yaml
+  deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
 ```
 
 Export from an FSDP2 checkpoint:
@@ -87,8 +87,8 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 
 ## Configs
 
-- Base pretraining config: [`configs/pretrain_rope_c4_en.yaml`](configs/pretrain_rope_c4_en.yaml)
-- Long context: [`configs/pretrain_rope_c4_en_2048.yaml`](configs/pretrain_rope_c4_en_2048.yaml), [`configs/pretrain_rope_c4_en_4096.yaml`](configs/pretrain_rope_c4_en_4096.yaml)
+- Base pretraining config: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml)
+- Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
 - Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
 

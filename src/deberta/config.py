@@ -242,12 +242,12 @@ class DataConfig:
     # Mutually exclusive-ish inputs; precedence: load_from_disk > dataset_name > data_files
     dataset_name: str | None = field(
         default=None,
-        metadata={"help": "Hugging Face dataset name (e.g., c4, oscar, openwebtext)."},
+        metadata={"help": "Hugging Face dataset name (e.g., HuggingFaceFW/fineweb-edu, oscar, openwebtext)."},
     )
 
     dataset_config_name: str | None = field(
         default=None,
-        metadata={"help": "Dataset config name (e.g., 'en' for c4)."},
+        metadata={"help": "Dataset config name (for example, 'default' for fineweb-edu)."},
     )
 
     data_files: str | None = field(

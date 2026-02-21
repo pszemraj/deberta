@@ -1,7 +1,7 @@
-# RoPE + RMSNorm + SwiGLU, 2048 context.
+# RoPE + RMSNorm + SwiGLU, 4096 context.
 # Usage:
 #   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-#     deberta train configs/pretrain_rope_c4_en_2048.yaml
+#     deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base
@@ -18,6 +18,9 @@ model:
   norm_eps: 1.0e-6
   ffn_type: swiglu
 
+  # Strongly recommended at 4096.
+  gradient_checkpointing: true
+
   # RTD embedding sharing
   embedding_sharing: gdes
 
@@ -25,20 +28,20 @@ model:
   attention_implementation: sdpa
 
 data:
-  dataset_name: c4
-  dataset_config_name: en
+  dataset_name: HuggingFaceFW/fineweb-edu
+  dataset_config_name: default
   train_split: train
   streaming: true
   text_column_name: text
-  max_seq_length: 2048
+  max_seq_length: 4096
   shuffle_buffer_size: 10000
 
 train:
-  output_dir: runs/deberta_rope_rtd_2048
+  output_dir: runs/deberta_rope_rtd_4096
   overwrite_output_dir: false
   max_steps: 10000
   per_device_train_batch_size: 1
-  gradient_accumulation_steps: 32
+  gradient_accumulation_steps: 64
 
   # Optim
   learning_rate: 5.0e-4
