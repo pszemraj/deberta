@@ -38,6 +38,7 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
             [
                 "model:",
                 "  backbone_type: rope",
+                "  ffn_type: swiglu",
                 "data:",
                 "  max_seq_length: 128",
                 "train:",
@@ -47,7 +48,8 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    _, data_nested, train_nested = _load_yaml(nested)
+    model_nested, data_nested, train_nested = _load_yaml(nested)
+    assert model_nested.ffn_type == "swiglu"
     assert data_nested.max_seq_length == 128
     assert train_nested.overwrite_output_dir is True
     assert train_nested.mlm_max_ngram == 3
@@ -78,14 +80,15 @@ def test_load_json_nested_and_flat(tmp_path: Path):
     nested.write_text(
         json.dumps(
             {
-                "model": {"backbone_type": "rope"},
+                "model": {"backbone_type": "rope", "ffn_type": "mlp"},
                 "data": {"max_seq_length": 96},
                 "train": {"generator_learning_rate": 3.0e-4, "disc_loss_weight": 50.0},
             }
         ),
         encoding="utf-8",
     )
-    _, data_nested, train_nested = _load_json(nested)
+    model_nested, data_nested, train_nested = _load_json(nested)
+    assert model_nested.ffn_type == "mlp"
     assert data_nested.max_seq_length == 96
     assert train_nested.generator_learning_rate == pytest.approx(3.0e-4)
     assert train_nested.disc_loss_weight == pytest.approx(50.0)

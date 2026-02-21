@@ -173,6 +173,7 @@ def test_pretrainer_forward_smoke():
         intermediate_size=64,
         max_position_embeddings=64,
         type_vocab_size=0,
+        ffn_type="swiglu",
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
         norm_arch="post",
@@ -185,6 +186,7 @@ def test_pretrainer_forward_smoke():
         intermediate_size=64,
         max_position_embeddings=64,
         type_vocab_size=0,
+        ffn_type="mlp",
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
         norm_arch="post",
@@ -222,6 +224,17 @@ def test_pretrainer_forward_smoke():
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.disc_accuracy.ndim == 0
+
+
+def test_rope_config_rejects_unknown_ffn_type():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+
+    with pytest.raises(ValueError, match="ffn_type must be one of"):
+        _ = DebertaRoPEConfig(ffn_type="glu")
 
 
 def test_rotary_compile_mode_bypasses_stateful_cache(monkeypatch):

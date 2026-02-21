@@ -133,6 +133,11 @@ class ModelConfig:
         metadata={"help": "Attention backend for rope backbone: 'sdpa' (recommended) or 'eager'."},
     )
 
+    ffn_type: str = field(
+        default="swiglu",
+        metadata={"help": "FFN block type for rope backbone: 'swiglu' (default) or 'mlp'."},
+    )
+
     initializer_range: float = field(
         default=0.02,
         metadata={"help": "Weight init std for rope backbone."},

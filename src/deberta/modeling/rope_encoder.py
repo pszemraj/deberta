@@ -35,6 +35,7 @@ class DebertaRoPEConfig(PretrainedConfig):
         num_attention_heads: int = 12,
         intermediate_size: int = 3072,
         hidden_act: str = "gelu",
+        ffn_type: str = "swiglu",
         hidden_dropout_prob: float = 0.1,
         attention_probs_dropout_prob: float = 0.1,
         max_position_embeddings: int = 512,
@@ -59,6 +60,7 @@ class DebertaRoPEConfig(PretrainedConfig):
         :param int num_attention_heads: Number of attention heads.
         :param int intermediate_size: FFN intermediate width.
         :param str hidden_act: FFN activation name.
+        :param str ffn_type: FFN block type (``swiglu`` or ``mlp``).
         :param float hidden_dropout_prob: Hidden dropout probability.
         :param float attention_probs_dropout_prob: Attention dropout probability.
         :param int max_position_embeddings: Maximum supported positions.
@@ -82,6 +84,7 @@ class DebertaRoPEConfig(PretrainedConfig):
         self.num_attention_heads = int(num_attention_heads)
         self.intermediate_size = int(intermediate_size)
         self.hidden_act = str(hidden_act)
+        self.ffn_type = str(ffn_type)
         self.hidden_dropout_prob = float(hidden_dropout_prob)
         self.attention_probs_dropout_prob = float(attention_probs_dropout_prob)
         self.max_position_embeddings = int(max_position_embeddings)
@@ -102,6 +105,8 @@ class DebertaRoPEConfig(PretrainedConfig):
             )
         if self.rotary_pct <= 0.0 or self.rotary_pct > 1.0:
             raise ValueError("rotary_pct must be in (0, 1].")
+        if self.ffn_type not in {"swiglu", "mlp"}:
+            raise ValueError("ffn_type must be one of: swiglu|mlp")
         if self.norm_arch not in {"post", "keel"}:
             raise ValueError("norm_arch must be one of: post|keel")
         if self.attention_implementation not in {"sdpa", "eager"}:
@@ -245,18 +250,35 @@ class DebertaRoPESelfAttention(nn.Module):
 
 
 class DebertaRoPEMLP(nn.Module):
-    """Feed-forward network block used inside each encoder layer."""
+    """Feed-forward block used inside each encoder layer.
+
+    Supported modes:
+      - ``mlp``: Linear -> activation -> Linear
+      - ``swiglu``: fused gate+up projection, SiLU gate, then down projection
+    """
 
     def __init__(self, config: DebertaRoPEConfig) -> None:
-        """Create FFN projections and activation.
+        """Create FFN projections.
 
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.dense_in = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.act = _get_act_fn(config.hidden_act)
-        self.dense_out = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.ffn_type = str(getattr(config, "ffn_type", "swiglu")).lower()
+        if self.ffn_type not in {"swiglu", "mlp"}:
+            raise ValueError(f"Unsupported ffn_type: {self.ffn_type}")
+
+        if self.ffn_type == "swiglu":
+            hidden_size = int(config.hidden_size)
+            intermediate = int(config.intermediate_size)
+            # Fused projection: one matmul for gate+up, one for down projection.
+            self.w12 = nn.Linear(hidden_size, 2 * intermediate, bias=True)
+            self.w3 = nn.Linear(intermediate, hidden_size, bias=True)
+        else:
+            self.dense_in = nn.Linear(int(config.hidden_size), int(config.intermediate_size))
+            self.act = _get_act_fn(config.hidden_act)
+            self.dense_out = nn.Linear(int(config.intermediate_size), int(config.hidden_size))
+
+        self.dropout = nn.Dropout(float(config.hidden_dropout_prob))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply FFN transform.
@@ -264,6 +286,12 @@ class DebertaRoPEMLP(nn.Module):
         :param torch.Tensor x: Input hidden states.
         :return torch.Tensor: Output hidden states.
         """
+        if self.ffn_type == "swiglu":
+            gate, up = self.w12(x).chunk(2, dim=-1)
+            x = self.w3(F.silu(gate) * up)
+            x = self.dropout(x)
+            return x
+
         x = self.dense_in(x)
         x = self.act(x)
         x = self.dense_out(x)
