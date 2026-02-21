@@ -74,13 +74,13 @@ Recommended during training:
 
 - keep `fsdp_state_dict_type: SHARDED_STATE_DICT`
 
-For reliable artifact export, run `deberta-export` after training:
+For reliable artifact export, run `deberta export` after training:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-export \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
   --checkpoint_dir <RUN_DIR>/checkpoint-<STEP> \
   --output_dir <RUN_DIR>/exported_hf \
-  --export_what discriminator
+  --what discriminator
 ```
 
 The exporter consolidates to full state on rank 0 and writes standalone HF artifacts.

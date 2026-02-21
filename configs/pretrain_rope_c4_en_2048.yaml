@@ -1,7 +1,7 @@
 # RoPE + RMSNorm + SwiGLU, 2048 context.
 # Usage:
 #   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-#     deberta-pretrain configs/pretrain_rope_c4_en_2048.yaml
+#     deberta train configs/pretrain_rope_c4_en_2048.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base

@@ -50,9 +50,8 @@ tensorboard = ["tensorboard>=2.16.0"]
 dev = ["ruff>=0.6.0", "black>=24.8.0", "mypy>=1.11.0", "pytest>=8.0.0"]
 
 [project.scripts]
-# Main entry point
-"deberta-pretrain" = "deberta.cli:main"
-"deberta-export" = "deberta.export_cli:main"
+# Unified subcommand-style CLI entrypoint
+"deberta" = "deberta.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

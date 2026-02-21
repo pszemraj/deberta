@@ -1,6 +1,6 @@
-# Example YAML config for `deberta-pretrain`.
+# Example YAML config for `deberta train`.
 # Usage:
-#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain configs/pretrain_rope_c4_en.yaml
+#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta train configs/pretrain_rope_c4_en.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base

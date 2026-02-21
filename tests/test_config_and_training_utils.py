@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 
+import deberta.cli as cli_mod
 from deberta.cli import _load_json, _load_yaml
 from deberta.config import TrainConfig
 from deberta.training.pretrain import (
@@ -221,3 +223,60 @@ def test_normalize_sdpa_kernel_accepts_aliases_and_rejects_invalid():
 
     with pytest.raises(ValueError, match="train.sdpa_kernel must be one of"):
         _normalize_sdpa_kernel("best")
+
+
+def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  max_seq_length: 32",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path), "--max_steps", "7"])
+
+    assert "train_cfg" in seen
+    assert seen["data_cfg"].max_seq_length == 32
+    assert seen["train_cfg"].max_steps == 7
+
+
+def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, Any] = {}
+
+    def _fake_run_export(cfg):
+        seen["cfg"] = cfg
+
+    monkeypatch.setattr(cli_mod, "run_export", _fake_run_export)
+    cli_mod.main(
+        [
+            "export",
+            "runs/demo/checkpoint-10",
+            "--what",
+            "generator",
+            "--output-dir",
+            "runs/demo/exported_hf",
+        ]
+    )
+
+    cfg = seen["cfg"]
+    assert cfg.checkpoint_dir == "runs/demo/checkpoint-10"
+    assert cfg.export_what == "generator"
+    assert cfg.output_dir == "runs/demo/exported_hf"

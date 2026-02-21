@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 from dataclasses import dataclass
@@ -67,6 +68,77 @@ class ExportConfig:
 
     # Override embedding_sharing (normally read from model_config.json)
     embedding_sharing: str | None = None
+
+
+def add_export_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register export CLI arguments on an argparse parser.
+
+    :param argparse.ArgumentParser parser: Target parser.
+    """
+    parser.add_argument(
+        "checkpoint_dir",
+        help="Path to checkpoint-<step> directory saved by training.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for exported artifacts. Defaults to <run_dir>/exported_hf.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Optional run directory containing model_config.json/data_config.json. Defaults to checkpoint parent.",
+    )
+    parser.add_argument(
+        "--what",
+        "--export-what",
+        dest="export_what",
+        default="discriminator",
+        choices=("discriminator", "generator", "both"),
+        help="Which component(s) to export.",
+    )
+    parser.add_argument(
+        "--safe-serialization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use safetensors format when saving HF artifacts.",
+    )
+    parser.add_argument(
+        "--offload-to-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Offload consolidated full state dict to CPU under FSDP export.",
+    )
+    parser.add_argument(
+        "--rank0-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gather full state dict on rank 0 only under FSDP export.",
+    )
+    parser.add_argument(
+        "--embedding-sharing",
+        default=None,
+        choices=("none", "es", "gdes"),
+        help="Override embedding sharing mode. Defaults to training config value.",
+    )
+
+
+def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
+    """Convert parsed argparse namespace into ExportConfig.
+
+    :param argparse.Namespace ns: Parsed arguments.
+    :return ExportConfig: Typed export config.
+    """
+    return ExportConfig(
+        checkpoint_dir=ns.checkpoint_dir,
+        output_dir=ns.output_dir,
+        run_dir=ns.run_dir,
+        export_what=ns.export_what,
+        safe_serialization=bool(ns.safe_serialization),
+        offload_to_cpu=bool(ns.offload_to_cpu),
+        rank0_only=bool(ns.rank0_only),
+        embedding_sharing=ns.embedding_sharing,
+    )
 
 
 def _split_state_dict(
@@ -173,15 +245,15 @@ def _build_export_backbone(
     return disc, gen
 
 
-def main() -> None:
-    """Run checkpoint export CLI flow."""
+def run_export(cfg: ExportConfig) -> None:
+    """Run checkpoint export flow.
+
+    :param ExportConfig cfg: Export configuration.
+    """
     try:
-        from transformers import AutoTokenizer, HfArgumentParser
+        from transformers import AutoTokenizer
     except Exception as e:  # pragma: no cover
         raise RuntimeError("transformers is required.") from e
-
-    parser = HfArgumentParser(ExportConfig)
-    (cfg,) = parser.parse_args_into_dataclasses()
 
     from accelerate import Accelerator
     from accelerate.utils import DistributedType
@@ -327,6 +399,32 @@ def main() -> None:
         json.dump(meta, f, indent=2, sort_keys=True)
 
     logger.info(f"Export complete: {out_dir}")
+
+
+def _build_export_parser(*, prog: str = "deberta export") -> argparse.ArgumentParser:
+    """Build argparse parser for export commands.
+
+    :param str prog: Program name shown in help output.
+    :return argparse.ArgumentParser: Configured parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Consolidate a training checkpoint and export standalone HF artifacts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_export_arguments(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run checkpoint export CLI.
+
+    :param list[str] | None argv: Optional CLI argv (excluding program name).
+    """
+    parser = _build_export_parser()
+    args = parser.parse_args(argv)
+    cfg = namespace_to_export_config(args)
+    run_export(cfg)
 
 
 if __name__ == "__main__":

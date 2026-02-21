@@ -617,7 +617,7 @@ def _export_discriminator_hf(
     Why "best-effort"?
       - Under FSDP2 + SHARDED_STATE_DICT, gathering a full state dict inside the training process
         can fail depending on accelerate/FSDP state-dict configuration.
-      - For a *guaranteed* export from sharded checkpoints, use the `deberta-export` CLI which
+      - For a *guaranteed* export from sharded checkpoints, use `deberta export` which
         loads the checkpoint and consolidates weights with FULL_STATE_DICT on rank0.
 
     This function is intentionally lightweight and is safe to keep enabled by default.
@@ -709,7 +709,7 @@ def _export_discriminator_hf(
     except Exception as e:
         logger.warning(
             "HF export failed (common under FSDP2 + SHARDED_STATE_DICT). "
-            "Use `deberta-export` after training for a guaranteed consolidation+export. "
+            "Use `deberta export` after training for a guaranteed consolidation+export. "
             f"Error: {e}"
         )
 
@@ -880,7 +880,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             "data": asdict(data_cfg),
             "train": asdict(train_cfg),
         }
-        accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-pretrain", config=tracker_cfg)
+        accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-train", config=tracker_cfg)
 
     # Resume
     global_step = 0

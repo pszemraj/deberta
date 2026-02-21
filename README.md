@@ -32,8 +32,8 @@ pip install "git+https://github.com/pszemraj/deberta.git"
 
 `pyproject.toml` defines installable commands:
 
-- `deberta-pretrain` (training)
-- `deberta-export` (checkpoint consolidation/export)
+- `deberta train` (training)
+- `deberta export` (checkpoint consolidation/export)
 
 Use `--help` on each command for full argument docs.
 
@@ -43,27 +43,27 @@ Train from YAML (recommended):
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta-pretrain configs/pretrain_rope_c4_en.yaml
+  deberta train configs/pretrain_rope_c4_en.yaml
 ```
 
 Long-context presets:
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta-pretrain configs/pretrain_rope_c4_en_2048.yaml
+  deberta train configs/pretrain_rope_c4_en_2048.yaml
 ```
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta-pretrain configs/pretrain_rope_c4_en_4096.yaml
+  deberta train configs/pretrain_rope_c4_en_4096.yaml
 ```
 
 Export from an FSDP2 checkpoint:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-export \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
   --checkpoint_dir runs/deberta_rope_rtd/checkpoint-10000 \
-  --export_what discriminator \
+  --what discriminator \
   --output_dir runs/deberta_rope_rtd/exported_hf
 ```
 

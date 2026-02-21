@@ -1,6 +1,6 @@
 # Tiny CPU smoke config.
 # Usage:
-#   deberta-pretrain configs/tiny_cpu_smoke.yaml
+#   deberta train configs/tiny_cpu_smoke.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base

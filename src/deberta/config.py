@@ -417,7 +417,7 @@ class TrainConfig:
         metadata={
             "help": (
                 "Attempt to export a final HF discriminator model into output_dir/final_hf. "
-                "For FSDP2+sharded checkpoints, prefer running `deberta-export` after training."
+                "For FSDP2+sharded checkpoints, prefer running `deberta export` after training."
             )
         },
     )
