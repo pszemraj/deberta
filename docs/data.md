@@ -40,6 +40,11 @@ Packed block masking keeps `CLS` as a global token (it can attend to all active 
 
 This packed pairwise mask is represented as a boolean keep-mask (`True = attend`, `False = block`).
 
+`data.block_cross_document_attention` controls this behavior:
+
+- `true` (default): emit 3D doc-blocking masks for packed batches with internal separators
+- `false`: skip 3D doc-blocking masks (packed batches remain on 2D/no-mask attention paths)
+
 ## Sequential / No-Pack Mode
 
 Set `data.pack_sequences=false` to switch to one-document chunking:
@@ -47,6 +52,7 @@ Set `data.pack_sequences=false` to switch to one-document chunking:
 - no cross-document concatenation
 - long documents are split into multiple one-document chunks
 - useful as a reference mode for validating loss-signal behavior independent of packing
+- `data.block_cross_document_attention` is inert in this mode and is canonicalized to `false`
 
 ## Non-Streaming Packing
 

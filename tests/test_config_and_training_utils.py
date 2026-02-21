@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shlex
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ from deberta.config import (
     validate_training_workflow_options,
 )
 from deberta.export_cli import _build_export_parser
+from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.rtd import compute_generator_loss_term
 from deberta.training.pretrain import (
     _build_optimizer,
@@ -559,8 +562,10 @@ def test_build_training_collator_propagates_packed_sequences_flag():
         tokenizer=_Tokenizer(),
         train_cfg=train_cfg,
         packed_sequences=True,
+        block_cross_document_attention=True,
     )
     assert collator._packed_sequences is True
+    assert collator._block_cross_document_attention is True
 
 
 def test_should_clip_gradients_only_on_sync_steps():
@@ -627,6 +632,35 @@ def test_build_optimizer_marks_scalar_params_as_no_decay():
     assert _group_for(model.discriminator.alpha) == pytest.approx(0.0)
     assert _group_for(model.discriminator_norm.weight) == pytest.approx(0.0)
     assert _group_for(model.generator.weight) == pytest.approx(train_cfg.weight_decay)
+
+
+def test_build_optimizer_applies_decay_to_high_rank_bias_parameters():
+    train_cfg = TrainConfig()
+
+    class _BiasMatrixModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.randn(4, 4))
+
+    class _RegressionModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = torch.nn.Linear(4, 4)
+            self.generator_bias = _BiasMatrixModule()
+            self.generator_lm_head = torch.nn.Linear(4, 4)
+            self.discriminator = torch.nn.Linear(4, 4)
+
+    model = _RegressionModel()
+    opt = _build_optimizer(model, train_cfg)
+
+    def _group_for(param: torch.nn.Parameter) -> float:
+        for g in opt.param_groups:
+            for p in g["params"]:
+                if p is param:
+                    return float(g["weight_decay"])
+        raise AssertionError("Parameter missing from optimizer groups")
+
+    assert _group_for(model.generator_bias.bias) == pytest.approx(train_cfg.weight_decay)
 
 
 def test_normalize_mixed_precision_accepts_bool_and_synonyms():
@@ -770,6 +804,16 @@ def test_validate_data_config_canonicalizes_non_streaming_shuffle_buffer_size():
     assert cfg.shuffle_buffer_size == 1
 
 
+def test_validate_data_config_disables_doc_blocking_when_not_packed():
+    cfg = DataConfig(
+        dataset_name="HuggingFaceFW/fineweb-edu",
+        pack_sequences=False,
+        block_cross_document_attention=True,
+    )
+    validate_data_config(cfg)
+    assert cfg.block_cross_document_attention is False
+
+
 def test_validate_training_workflow_options_rejects_eval_knobs():
     with pytest.raises(ValueError, match="Evaluation workflow is not implemented yet"):
         validate_training_workflow_options(
@@ -792,12 +836,36 @@ def test_validate_training_workflow_options_rejects_flash_only_with_packing():
         )
 
 
+def test_validate_training_workflow_options_allows_flash_only_when_packed_doc_blocking_disabled():
+    validate_training_workflow_options(
+        data_cfg=DataConfig(
+            dataset_name="HuggingFaceFW/fineweb-edu",
+            pack_sequences=True,
+            block_cross_document_attention=False,
+        ),
+        train_cfg=TrainConfig(sdpa_kernel="flash_only"),
+    )
+
+
 def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_rope_attention_is_eager():
     with pytest.raises(ValueError, match="train.sdpa_kernel only affects rope attention"):
         validate_training_workflow_options(
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
             train_cfg=TrainConfig(sdpa_kernel="flash"),
             model_cfg=ModelConfig(backbone_type="rope", attention_implementation="eager"),
+        )
+
+
+def test_validate_training_workflow_options_rejects_hf_backbone_doc_blocking_in_packed_mode():
+    with pytest.raises(ValueError, match="only supported with model.backbone_type='rope'"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(
+                dataset_name="HuggingFaceFW/fineweb-edu",
+                pack_sequences=True,
+                block_cross_document_attention=True,
+            ),
+            train_cfg=TrainConfig(),
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         )
 
 
@@ -818,6 +886,112 @@ def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_gen
     )
     with pytest.raises(ValueError, match="only used when deriving generator config"):
         validate_model_config(cfg)
+
+
+def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeHFConfig:
+        def __init__(self) -> None:
+            self.vocab_size = 64
+            self.hidden_size = 32
+            self.num_hidden_layers = 2
+            self.num_attention_heads = 4
+            self.intermediate_size = 64
+            self.hidden_act = "gelu"
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=lambda _src: _FakeHFConfig())
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    class _Tokenizer:
+        pad_token_id = 0
+        cls_token_id = 1
+        sep_token_id = 2
+        mask_token_id = 3
+        bos_token_id = 4
+        eos_token_id = 5
+
+        def __len__(self) -> int:
+            return 128
+
+    model_cfg = ModelConfig(backbone_type="hf_deberta_v2", from_scratch=True)
+    disc_cfg, gen_cfg = build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_Tokenizer(),
+        max_position_embeddings=128,
+    )
+
+    for cfg in (disc_cfg, gen_cfg):
+        assert getattr(cfg, "pad_token_id", None) == 0
+        assert getattr(cfg, "cls_token_id", None) == 1
+        assert getattr(cfg, "sep_token_id", None) == 2
+        assert getattr(cfg, "mask_token_id", None) == 3
+        assert getattr(cfg, "bos_token_id", None) == 4
+        assert getattr(cfg, "eos_token_id", None) == 5
+
+
+def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+
+    checkpoint_cfg = DebertaRoPEConfig(
+        vocab_size=32000,
+        hidden_size=64,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        intermediate_size=128,
+        hidden_act="gelu",
+        rope_theta=50000.0,
+        rotary_pct=0.5,
+        use_absolute_position_embeddings=True,
+        type_vocab_size=3,
+        norm_arch="keel",
+        norm_eps=1.0e-5,
+        keel_alpha_init=9.0,
+        keel_alpha_learnable=True,
+        ffn_type="mlp",
+        use_bias=True,
+    )
+
+    monkeypatch.setattr(
+        "deberta.modeling.builder.DebertaRoPEConfig.from_pretrained",
+        lambda _src: checkpoint_cfg,
+    )
+
+    class _Tokenizer:
+        pad_token_id = 0
+        cls_token_id = 1
+        sep_token_id = 2
+        mask_token_id = 3
+
+        def __len__(self) -> int:
+            return 32000
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="local-rope-disc",
+        discriminator_config_name_or_path="local-rope-disc",
+    )
+
+    disc_cfg, _ = build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_Tokenizer(),
+        max_position_embeddings=512,
+    )
+
+    assert disc_cfg.rope_theta == pytest.approx(50000.0)
+    assert disc_cfg.rotary_pct == pytest.approx(0.5)
+    assert disc_cfg.use_absolute_position_embeddings is True
+    assert disc_cfg.type_vocab_size == 3
+    assert disc_cfg.norm_arch == "keel"
+    assert disc_cfg.norm_eps == pytest.approx(1.0e-5)
+    assert disc_cfg.keel_alpha_init == pytest.approx(9.0)
+    assert disc_cfg.keel_alpha_learnable is True
+    assert disc_cfg.ffn_type == "mlp"
+    assert disc_cfg.use_bias is True
 
 
 def test_readme_cli_examples_are_parseable():

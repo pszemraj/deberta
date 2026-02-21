@@ -66,7 +66,7 @@ This is best-effort backend configuration. `flash_only` can fail if hardware or 
 
 `train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
 
-When `data.pack_sequences=true`, packed batches may emit 3D document-blocking attention masks. Those masks are not compatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
+When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit 3D document-blocking attention masks. Those masks are not compatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
 
 Use `auto`, `flash`, or `mem_efficient` for packed training runs.
 

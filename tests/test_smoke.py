@@ -222,6 +222,33 @@ def test_collator_builds_document_block_attention_mask_when_packed():
     assert attn[0, 3, 0].item() == 1
 
 
+def test_collator_treats_consecutive_internal_separators_as_single_boundary():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+    )
+
+    # Boundary-aligned packed chunks can produce consecutive separators.
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, tok.sep_token_id, 12, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+        }
+    ]
+    batch = coll(features)
+    attn = batch["attention_mask"]
+    assert attn.ndim == 3
+
+    # Token in doc1 should not attend doc2 token.
+    assert attn[0, 1, 4].item() == 0
+    assert attn[0, 4, 1].item() == 0
+    # Consecutive [SEP] should not create an extra phantom boundary.
+    assert attn[0, 3, 4].item() == 1
+    assert attn[0, 4, 3].item() == 1
+
+
 def test_collator_skips_document_block_attention_mask_for_single_doc_packed_chunk():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(
@@ -887,6 +914,35 @@ def test_masked_lm_head_tied_mode_requires_embedding_weight():
     hidden = torch.randn((2, cfg.hidden_size), dtype=torch.float32)
     with pytest.raises(RuntimeError, match="requires `word_embedding_weight`"):
         _ = head(hidden)
+
+
+def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import MaskedLMHead
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+    )
+    head = MaskedLMHead(cfg, tie_word_embeddings=True)
+    head.transform = torch.nn.Identity()
+
+    hidden = torch.randn((3, cfg.hidden_size), dtype=torch.float64)
+    word_w = torch.randn((cfg.vocab_size, cfg.hidden_size), dtype=torch.float32)
+
+    with torch.no_grad():
+        logits = head(hidden, word_embedding_weight=word_w)
+
+    assert logits.dtype == torch.float32
 
 
 def test_rtd_head_applies_dropout_once_per_forward():
