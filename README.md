@@ -37,7 +37,7 @@ pip install -e '.[wandb]'
 ### 1) YAML config (recommended)
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
   deberta-pretrain configs/pretrain_rope_c4_en.yaml
 ```
 
@@ -53,7 +53,7 @@ See `configs/` for examples.
 Example: stream C4 (English) and train a RoPE+RMSNorm Post-Norm encoder.
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml deberta-pretrain \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain \
   --dataset_name c4 --dataset_config_name en --train_split train --streaming true \
   --tokenizer_name_or_path microsoft/deberta-v3-base \
   --backbone_type rope --from_scratch true \
@@ -90,7 +90,7 @@ Replacement probabilities:
 KEEL is an optional topology you can toggle for extra margin at ~28 layers without switching to Pre-LN:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml deberta-pretrain \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain \
   configs/pretrain_rope_c4_en.yaml \
   # and in the YAML: model.norm_arch: keel
 ```
@@ -107,7 +107,7 @@ If you want to train using the Hugging Face `DebertaV2Model` implementation (ori
 - `configs/fsdp2_hf_deberta_1node.yaml` (wrap class `DebertaV2Layer`)
 
 ```bash
-accelerate launch --config_file configs/fsdp2_hf_deberta_1node.yaml deberta-pretrain \
+accelerate launch --config_file configs/fsdp2_hf_deberta_1node.yaml --no_python deberta-pretrain \
   --dataset_name c4 --dataset_config_name en --train_split train --streaming true \
   --tokenizer_name_or_path microsoft/deberta-v3-base \
   --backbone_type hf_deberta_v2 --from_scratch true \
@@ -128,7 +128,7 @@ Training attempts a best-effort export to `output_dir/final_hf/`, but for **FSDP
 Run with the **same Accelerate config** you trained with:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml deberta-export \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-export \
   --checkpoint_dir runs/deberta_rope_rtd/checkpoint-10000 \
   --export_what discriminator \
   --output_dir runs/deberta_rope_rtd/exported_hf

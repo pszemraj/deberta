@@ -38,7 +38,7 @@ When you save checkpoints with `SHARDED_STATE_DICT`, gathering a full state dict
 Use the dedicated exporter:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml deberta-export \
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-export \
   --checkpoint_dir <RUN_DIR>/checkpoint-<STEP> \
   --output_dir <RUN_DIR>/exported_hf \
   --export_what discriminator
