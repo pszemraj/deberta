@@ -220,7 +220,6 @@ class DebertaRoPESelfAttention(nn.Module):
 
         sdpa_attn_mask = None
         eager_attn_mask = None
-        query_keep_heads = None
         query_keep_tokens = None
         if attention_mask is not None:
             mask = attention_mask.to(dtype=torch.bool)
@@ -239,7 +238,7 @@ class DebertaRoPESelfAttention(nn.Module):
                 query_keep = pair_keep.any(dim=-1)
 
                 # Avoid all-masked query rows to prevent NaNs in eager softmax.
-                row_has_key = pair_keep.any(dim=-1)
+                row_has_key = query_keep
                 if not bool(row_has_key.all().item()):
                     eye = torch.eye(seq_len, dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
                     pair_keep = pair_keep | ((~row_has_key)[:, :, None] & eye)
@@ -251,8 +250,7 @@ class DebertaRoPESelfAttention(nn.Module):
                     "attention_mask must have shape (B,S) or (B,S,S) for DebertaRoPESelfAttention."
                 )
 
-            # Explicitly zero masked query outputs for robustness on eager/edge paths.
-            query_keep_heads = query_keep[:, None, :, None].to(dtype=q.dtype)
+            # Explicitly zero masked query outputs after output projection.
             query_keep_tokens = query_keep[:, :, None].to(dtype=q.dtype)
 
         if self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
@@ -273,9 +271,6 @@ class DebertaRoPESelfAttention(nn.Module):
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn, v)
-
-        if query_keep_heads is not None:
-            out = out * query_keep_heads
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
         out = self.out_proj(out)
@@ -516,7 +511,6 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
 
     def forward(
         self,
-        *,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
@@ -541,10 +535,7 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
                 # Keep the fast path for packed/unpadded batches (mask stays None), but make
                 # omitted-mask calls with padded input_ids semantically correct.
                 if bool(pad_positions.any().item()):
-                    attention_mask = (~pad_positions).to(dtype=torch.long)
-
-        if attention_mask is not None and attention_mask.dtype != torch.long:
-            attention_mask = attention_mask.to(dtype=torch.long)
+                    attention_mask = ~pad_positions
 
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         x = self.encoder(x, attention_mask)

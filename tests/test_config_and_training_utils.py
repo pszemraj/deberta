@@ -24,6 +24,7 @@ from deberta.export_cli import _build_export_parser
 from deberta.training.pretrain import (
     _build_optimizer,
     _count_rtd_tokens_for_batch,
+    _finalize_window_metric_loss,
     _find_latest_checkpoint,
     _load_checkpoint_data_progress,
     _normalize_mixed_precision,
@@ -352,6 +353,18 @@ def test_token_weighted_micro_objective_matches_full_batch_normalization():
         (gen_losses[0] * gen_counts[0] + gen_losses[1] * gen_counts[1]) / gen_total
     ) + disc_w * ((disc_losses[0] * disc_counts[0] + disc_losses[1] * disc_counts[1]) / disc_total)
     torch.testing.assert_close(combined, expected)
+
+
+def test_finalize_window_metric_loss_averages_non_token_weighted_windows():
+    total = torch.tensor(3.0)
+    out = _finalize_window_metric_loss(accumulated_loss=total, ga_steps=3, token_weighted_ga=False)
+    torch.testing.assert_close(out, torch.tensor(1.0))
+
+
+def test_finalize_window_metric_loss_passthrough_for_token_weighted_windows():
+    total = torch.tensor(1.2345)
+    out = _finalize_window_metric_loss(accumulated_loss=total, ga_steps=8, token_weighted_ga=True)
+    torch.testing.assert_close(out, total)
 
 
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():

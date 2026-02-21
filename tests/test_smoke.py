@@ -754,6 +754,29 @@ def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_
         )
 
 
+def test_tied_embedding_tracks_replaced_base_module_weight():
+    from deberta.modeling.rtd import _TiedEmbedding
+
+    base = torch.nn.Embedding(16, 8, padding_idx=0)
+    tied = _TiedEmbedding(
+        base_embedding_module=base,
+        padding_idx=0,
+        detach_base=False,
+        add_bias=False,
+    )
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_a = tied(input_ids)
+        new_weight = torch.randn_like(base.weight)
+        base.weight = torch.nn.Parameter(new_weight)
+        out_b = tied(input_ids)
+
+    assert not torch.allclose(out_a, out_b)
+    expected = torch.nn.functional.embedding(input_ids, new_weight, padding_idx=0)
+    torch.testing.assert_close(out_b, expected, rtol=0.0, atol=0.0)
+
+
 def test_rope_model_infers_pad_mask_when_attention_mask_missing():
     import pytest
 
@@ -791,6 +814,37 @@ def test_rope_model_infers_pad_mask_when_attention_mask_missing():
         out_explicit = model(input_ids=input_ids, attention_mask=explicit_mask).last_hidden_state
 
     torch.testing.assert_close(out_missing, out_explicit, rtol=0.0, atol=0.0)
+
+
+def test_rope_model_accepts_positional_input_ids_call():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaRoPEModel(cfg).eval()
+
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 6), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        out_positional = model(input_ids, attention_mask=attention_mask).last_hidden_state
+        out_keyword = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(out_positional, out_keyword, rtol=0.0, atol=0.0)
 
 
 def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
@@ -961,3 +1015,22 @@ def test_rotary_compile_mode_bypasses_stateful_cache(monkeypatch):
     monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: False)
     _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     assert rope._cache is not None
+
+
+def test_rotary_apply_full_dim_matches_reference():
+    from deberta.modeling.rope import RotaryEmbedding, _rotate_half
+
+    rope = RotaryEmbedding(dim=8, base=10_000.0)
+    q = torch.randn((2, 3, 5, 8), dtype=torch.float32)
+    k = torch.randn((2, 3, 5, 8), dtype=torch.float32)
+
+    q_out, k_out = rope.apply(q, k)
+
+    cos, sin = rope.get_cos_sin(q.shape[-2], device=q.device, dtype=q.dtype)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    q_ref = (q * cos) + (_rotate_half(q) * sin)
+    k_ref = (k * cos) + (_rotate_half(k) * sin)
+
+    torch.testing.assert_close(q_out, q_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(k_out, k_ref, rtol=0.0, atol=0.0)

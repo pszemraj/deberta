@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,7 +29,7 @@ def _get_act_fn(name_or_fn: str | Any) -> Any:
 
 
 class _TiedEmbedding(nn.Module):
-    """Embedding that reads weights from a different module via weakref.
+    """Embedding that reads weights from a different module.
 
     This avoids sharing *module instances* (which can break FSDP2 wrapping), while still allowing:
 
@@ -43,20 +42,24 @@ class _TiedEmbedding(nn.Module):
     def __init__(
         self,
         *,
-        base_weight: torch.nn.Parameter,
+        base_embedding_module: nn.Module,
         padding_idx: int | None,
         detach_base: bool,
         add_bias: bool,
     ) -> None:
         """Create tied-embedding adapter.
 
-        :param torch.nn.Parameter base_weight: Source embedding weight.
+        :param nn.Module base_embedding_module: Source embedding module exposing ``.weight``.
         :param int | None padding_idx: Padding index for embedding lookup.
         :param bool detach_base: Whether to detach base weights.
         :param bool add_bias: Whether to add trainable bias matrix.
         """
         super().__init__()
-        self._base_weight_ref = weakref.ref(base_weight)
+        base_weight = getattr(base_embedding_module, "weight", None)
+        if not isinstance(base_weight, torch.Tensor):
+            raise RuntimeError("base_embedding_module must expose a `.weight` tensor.")
+        # Keep an unregistered strong ref to survive FSDP parameter replacement.
+        object.__setattr__(self, "_base_embedding_module", base_embedding_module)
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
         self.detach_base = bool(detach_base)
 
@@ -73,9 +76,10 @@ class _TiedEmbedding(nn.Module):
         :param torch.Tensor input_ids: Input token ids.
         :return torch.Tensor: Embedded representations.
         """
-        w = self._base_weight_ref()
-        if w is None:
-            raise RuntimeError("Base embedding weight reference is dead.")
+        base_mod = getattr(self, "_base_embedding_module", None)
+        w = getattr(base_mod, "weight", None)
+        if not isinstance(w, torch.Tensor):
+            raise RuntimeError("Base embedding module no longer exposes a `.weight` tensor.")
 
         base_w = w.detach() if self.detach_base else w
         out = F.embedding(input_ids, base_w, padding_idx=self.padding_idx)
@@ -425,7 +429,7 @@ class DebertaV3RTDPretrainer(nn.Module):
                 disc_embeddings,
                 attr,
                 _TiedEmbedding(
-                    base_weight=gen_mod.weight,
+                    base_embedding_module=gen_mod,
                     padding_idx=getattr(disc_mod, "padding_idx", None),
                     detach_base=detach_base,
                     add_bias=add_bias,

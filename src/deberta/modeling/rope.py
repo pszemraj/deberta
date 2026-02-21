@@ -128,6 +128,12 @@ class RotaryEmbedding(nn.Module):
         cos = cos[None, None, :, :]  # (1,1,seq,dim)
         sin = sin[None, None, :, :]
 
+        if self.dim == q.shape[-1]:
+            # Fast path when rotary_pct=1.0: avoid split/cat with empty tails.
+            q_out = (q * cos) + (_rotate_half(q) * sin)
+            k_out = (k * cos) + (_rotate_half(k) * sin)
+            return q_out, k_out
+
         q1, q2 = q[..., : self.dim], q[..., self.dim :]
         k1, k2 = k[..., : self.dim], k[..., self.dim :]
 

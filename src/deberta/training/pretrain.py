@@ -477,6 +477,23 @@ def _token_weighted_micro_objective(
     return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
 
 
+def _finalize_window_metric_loss(
+    *, accumulated_loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool
+) -> torch.Tensor:
+    """Finalize per-window loss metric for logging.
+
+    :param torch.Tensor accumulated_loss: Sum of microbatch metric contributions.
+    :param int ga_steps: Gradient accumulation steps in the window.
+    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
+    :return torch.Tensor: Window-level scalar loss metric.
+    """
+    if token_weighted_ga:
+        # Token-weighted path already accumulates normalized micro objectives.
+        return accumulated_loss
+    denom = max(1, int(ga_steps))
+    return accumulated_loss / float(denom)
+
+
 def _parse_checkpoint_step(path: str) -> int:
     """Parse integer step suffix from checkpoint path.
 
@@ -1015,7 +1032,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                     loss_for_metrics = loss_for_metrics + micro_obj.detach()
                 else:
                     loss = out.loss
-                    loss_for_metrics = out.loss.detach()
+                    loss_for_metrics = loss_for_metrics + out.loss.detach()
 
                 accelerator.backward(loss)
 
@@ -1025,6 +1042,12 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+
+        loss_for_metrics = _finalize_window_metric_loss(
+            accumulated_loss=loss_for_metrics,
+            ga_steps=ga_steps,
+            token_weighted_ga=token_weighted_ga,
+        )
 
         # We count *optimizer* steps (not micro-steps).
         if accelerator.sync_gradients:
