@@ -36,6 +36,7 @@ class DebertaRoPEConfig(PretrainedConfig):
         intermediate_size: int = 3072,
         hidden_act: str = "gelu",
         ffn_type: str = "swiglu",
+        use_bias: bool = False,
         hidden_dropout_prob: float = 0.0,
         attention_probs_dropout_prob: float = 0.0,
         max_position_embeddings: int = 512,
@@ -61,6 +62,7 @@ class DebertaRoPEConfig(PretrainedConfig):
         :param int intermediate_size: FFN intermediate width.
         :param str hidden_act: FFN activation name.
         :param str ffn_type: FFN block type (``swiglu`` or ``mlp``).
+        :param bool use_bias: Whether attention/FFN linear projections include bias.
         :param float hidden_dropout_prob: Hidden dropout probability.
         :param float attention_probs_dropout_prob: Attention dropout probability.
         :param int max_position_embeddings: Maximum supported positions.
@@ -85,6 +87,7 @@ class DebertaRoPEConfig(PretrainedConfig):
         self.intermediate_size = int(intermediate_size)
         self.hidden_act = str(hidden_act)
         self.ffn_type = str(ffn_type)
+        self.use_bias = bool(use_bias)
         self.hidden_dropout_prob = float(hidden_dropout_prob)
         self.attention_probs_dropout_prob = float(attention_probs_dropout_prob)
         self.max_position_embeddings = int(max_position_embeddings)
@@ -191,8 +194,9 @@ class DebertaRoPESelfAttention(nn.Module):
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = self.hidden_size // self.num_heads
 
-        self.qkv = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
-        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        add_bias = bool(getattr(config, "use_bias", False))
+        self.qkv = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=add_bias)
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=add_bias)
 
         self.attn_dropout = float(config.attention_probs_dropout_prob)
         self.attn_impl = str(config.attention_implementation)
@@ -296,16 +300,26 @@ class DebertaRoPEMLP(nn.Module):
         if self.ffn_type not in {"swiglu", "mlp"}:
             raise ValueError(f"Unsupported ffn_type: {self.ffn_type}")
 
+        add_bias = bool(getattr(config, "use_bias", False))
+
         if self.ffn_type == "swiglu":
             hidden_size = int(config.hidden_size)
             intermediate = int(config.intermediate_size)
             # Fused projection: one matmul for gate+up, one for down projection.
-            self.w12 = nn.Linear(hidden_size, 2 * intermediate, bias=True)
-            self.w3 = nn.Linear(intermediate, hidden_size, bias=True)
+            self.w12 = nn.Linear(hidden_size, 2 * intermediate, bias=add_bias)
+            self.w3 = nn.Linear(intermediate, hidden_size, bias=add_bias)
         else:
-            self.dense_in = nn.Linear(int(config.hidden_size), int(config.intermediate_size))
+            self.dense_in = nn.Linear(
+                int(config.hidden_size),
+                int(config.intermediate_size),
+                bias=add_bias,
+            )
             self.act = _get_act_fn(config.hidden_act)
-            self.dense_out = nn.Linear(int(config.intermediate_size), int(config.hidden_size))
+            self.dense_out = nn.Linear(
+                int(config.intermediate_size),
+                int(config.hidden_size),
+                bias=add_bias,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply FFN transform.
@@ -424,7 +438,8 @@ class DebertaRoPEEncoder(nn.Module):
         if config.keel_alpha_init is not None:
             alpha_init = float(config.keel_alpha_init)
         else:
-            # Per user guidance: alpha defaults to 2 * num_layers (number of sublayers).
+            # KEEL paper notation uses L = number of residual sublayers. Our encoder
+            # has 2 residual sublayers per transformer block (attention + FFN).
             alpha_init = float(2 * int(config.num_hidden_layers))
 
         self.layers = nn.ModuleList(
@@ -514,7 +529,6 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         return_dict: bool = True,
-        **kwargs: Any,
     ) -> BaseModelOutput:
         """Run encoder forward pass.
 
@@ -523,16 +537,8 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
             unpadded input (fast path); callers must pass a mask when padding exists.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
-        :param Any kwargs: Unsupported compatibility kwargs.
         :return BaseModelOutput: Last hidden states container.
         """
-        if kwargs:
-            unsupported = ", ".join(sorted(str(k) for k in kwargs.keys()))
-            raise TypeError(
-                "Unsupported kwargs for DebertaRoPEModel.forward: "
-                f"{unsupported}. Supported args are input_ids, attention_mask, token_type_ids, return_dict."
-            )
-
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         x = self.encoder(x, attention_mask)
 

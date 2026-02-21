@@ -38,6 +38,11 @@ _TORCH_COMPILE_MODE_ALIASES = {
     "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
 }
 _MIXED_PRECISION_CHOICES = {"bf16", "bfloat16", "no", "none"}
+_HF_DEBERTA_PRETRAINED_PREFIXES = (
+    "microsoft/deberta-v2",
+    "microsoft/deberta-v3",
+    "microsoft/mdeberta-v3",
+)
 
 
 @dataclass
@@ -153,7 +158,8 @@ class ModelConfig:
         default=None,
         metadata={
             "help": (
-                "KEEL alpha initial value (skip scaling). If unset, defaults to 2*num_hidden_layers for each model."
+                "KEEL alpha initial value (skip scaling). If unset, defaults to "
+                "2*num_hidden_layers (two residual sublayers per transformer block)."
             )
         },
     )
@@ -174,6 +180,16 @@ class ModelConfig:
             "help": (
                 "FFN block type for rope backbone: 'swiglu' (default) or 'mlp'. "
                 "Applied when model.from_scratch=true; pretrained rope loads preserve checkpoint ffn_type."
+            )
+        },
+    )
+
+    use_bias: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether rope attention/FFN linear projections include bias terms. "
+                "Applied when model.from_scratch=true; pretrained rope loads preserve checkpoint setting."
             )
         },
     )
@@ -556,6 +572,16 @@ def _normalize_torch_compile_mode(value: str) -> str:
     return _ensure_choice("train.torch_compile_mode", v, _TORCH_COMPILE_MODE_CHOICES)
 
 
+def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
+    """Return whether a model source appears to be an HF DeBERTa v2/v3 checkpoint id.
+
+    :param str value: Model source string.
+    :return bool: True when source matches known HF DeBERTa hub-id prefixes.
+    """
+    v = str(value).strip().lower()
+    return any(v.startswith(prefix) for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
+
+
 def validate_model_config(cfg: ModelConfig) -> None:
     """Validate model config semantics and normalize constrained values.
 
@@ -591,6 +617,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "keel_alpha_learnable",
             "attention_implementation",
             "ffn_type",
+            "use_bias",
             "swiglu_adjust_intermediate",
             "initializer_range",
         )
@@ -598,6 +625,20 @@ def validate_model_config(cfg: ModelConfig) -> None:
         if changed:
             raise ValueError(
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
+            )
+
+    if cfg.backbone_type == "rope" and not bool(cfg.from_scratch):
+        invalid_sources: list[str] = []
+        for field_name in ("discriminator_model_name_or_path", "generator_model_name_or_path"):
+            src = getattr(cfg, field_name, None)
+            if src and _looks_like_hf_deberta_checkpoint(str(src)):
+                invalid_sources.append(f"{field_name}={src}")
+        if invalid_sources:
+            raise ValueError(
+                "model.from_scratch=false with model.backbone_type='rope' requires DebertaRoPE checkpoints, "
+                "not HF DeBERTa v2/v3 checkpoints. "
+                "Use model.backbone_type='hf_deberta_v2' for HF DeBERTa weights, or keep model.from_scratch=true "
+                "for RoPE model initialization. Invalid sources: " + ", ".join(sorted(invalid_sources))
             )
 
     if cfg.generator_config_name_or_path or cfg.generator_model_name_or_path:

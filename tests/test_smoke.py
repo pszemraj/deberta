@@ -203,16 +203,18 @@ def test_collator_builds_document_block_attention_mask_when_internal_separators_
     assert "attention_mask" in batch
     attn = batch["attention_mask"]
     assert attn.ndim == 3
+    assert attn.dtype == torch.bool
 
     # Doc 1: positions {1,2}; Doc 2: positions {3,4,5}. Cross-doc attention blocked.
     assert attn[0, 1, 3].item() == 0
     assert attn[0, 3, 1].item() == 0
     assert attn[0, 1, 2].item() == 1
     assert attn[0, 3, 5].item() == 1
-    # CLS participates in doc 1 instead of being isolated.
+    # CLS is global in packed mode so it can aggregate across all packed docs.
     assert attn[0, 0, 1].item() == 1
     assert attn[0, 1, 0].item() == 1
-    assert attn[0, 0, 3].item() == 0
+    assert attn[0, 0, 3].item() == 1
+    assert attn[0, 3, 0].item() == 1
 
 
 def test_ngram_masking_respects_specials():
@@ -631,6 +633,42 @@ def test_self_attention_sdpa_matches_eager_with_padding_mask():
     torch.testing.assert_close(out_sdpa, out_eager, rtol=1e-5, atol=1e-6)
 
 
+def test_rope_projections_respect_use_bias_config():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP, DebertaRoPESelfAttention
+
+    base_kwargs = dict(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+
+    cfg_no_bias = DebertaRoPEConfig(use_bias=False, **base_kwargs)
+    attn_no_bias = DebertaRoPESelfAttention(cfg_no_bias)
+    mlp_no_bias = DebertaRoPEMLP(cfg_no_bias)
+    assert attn_no_bias.qkv.bias is None
+    assert attn_no_bias.out_proj.bias is None
+    assert mlp_no_bias.w12.bias is None
+    assert mlp_no_bias.w3.bias is None
+
+    cfg_with_bias = DebertaRoPEConfig(use_bias=True, **base_kwargs)
+    attn_with_bias = DebertaRoPESelfAttention(cfg_with_bias)
+    mlp_with_bias = DebertaRoPEMLP(cfg_with_bias)
+    assert attn_with_bias.qkv.bias is not None
+    assert attn_with_bias.out_proj.bias is not None
+    assert mlp_with_bias.w12.bias is not None
+    assert mlp_with_bias.w3.bias is not None
+
+
 def test_pretrainer_forward_smoke():
     """Requires transformers; skipped automatically if not installed."""
 
@@ -791,6 +829,43 @@ def test_masked_lm_head_tied_mode_requires_embedding_weight():
         _ = head(hidden)
 
 
+def test_rtd_head_applies_dropout_once_per_forward():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import RTDHead
+
+    class _CountingDropout(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return x
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.0,
+    )
+    head = RTDHead(cfg)
+    counting_dropout = _CountingDropout()
+    head.dropout = counting_dropout
+
+    hidden = torch.randn((2, 4, cfg.hidden_size), dtype=torch.float32)
+    _ = head(hidden)
+    assert counting_dropout.calls == 1
+
+
 def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
     import pytest
 
@@ -880,6 +955,56 @@ def test_tied_embedding_gdes_bias_matches_base_weight_dtype():
     )
     assert tied.bias is not None
     assert tied.bias.dtype == base.weight.dtype
+
+
+def test_pretrainer_raises_if_tied_embeddings_become_stale_after_model_surgery():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        pad_token_id=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="es",
+    )
+    model.generator.embeddings.word_embeddings = torch.nn.Embedding(
+        cfg.vocab_size,
+        cfg.hidden_size,
+        padding_idx=cfg.pad_token_id,
+    )
+
+    input_ids = torch.tensor([[1, 7, 8, 2]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, 1] = input_ids[0, 1]
+
+    with pytest.raises(RuntimeError, match="stale tied embeddings"):
+        _ = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=labels,
+            sampling_temperature=1.0,
+            gen_loss_weight=1.0,
+            disc_loss_weight=50.0,
+            decoupled_loss_scaling=False,
+        )
 
 
 def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
@@ -983,7 +1108,7 @@ def test_rope_model_rejects_unknown_forward_kwargs():
     model = DebertaRoPEModel(cfg).eval()
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 6), dtype=torch.long)
 
-    with pytest.raises(TypeError, match="Unsupported kwargs"):
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
         _ = model(input_ids=input_ids, output_hidden_states=True)
 
 

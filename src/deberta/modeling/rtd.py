@@ -53,7 +53,8 @@ class _TiedEmbedding(nn.Module):
       - vanilla sharing (grad flows to base weight) via detach_base=False
       - gdes sharing (grad does NOT flow to base weight) via detach_base=True + trainable bias
 
-    NOTE: We intentionally do not register the base weight as a parameter or buffer.
+    NOTE: We intentionally keep an unregistered *strong* reference to the base module
+    and do not register the base weight as a parameter or buffer.
     """
 
     def __init__(
@@ -227,7 +228,6 @@ class RTDHead(nn.Module):
         x = self.dense(x)
         x = self.act(x)
         x = self.norm(x)
-        x = self.dropout(x)
         logits = self.classifier(x).squeeze(-1)
         return logits
 
@@ -282,6 +282,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids()
         self._allowed_sample_token_ids_cpu = self._build_allowed_sample_token_ids()
         self._allowed_sample_token_ids_by_device: dict[str, torch.Tensor] = {}
+        self._tied_embedding_attrs: tuple[str, ...] = ()
         self._maybe_patch_discriminator_embeddings()
 
     def _collect_forbidden_sample_token_ids(self) -> set[int]:
@@ -410,9 +411,11 @@ class DebertaV3RTDPretrainer(nn.Module):
         if mode not in {"none", "es", "gdes"}:
             raise ValueError("embedding_sharing must be one of: none|es|gdes")
         if mode == "none":
+            self._tied_embedding_attrs = ()
             return
 
-        # We avoid sharing module instances (FSDP2 hazard). We only reference the generator weight via weakref.
+        # We avoid sharing module instances (FSDP2 hazard). Tied adapters keep an
+        # unregistered strong ref to the generator embedding module.
         try:
             gen_embeddings = self.generator.embeddings
             disc_embeddings = self.discriminator.embeddings
@@ -424,6 +427,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         detach_base = mode == "gdes"
         add_bias = mode == "gdes"
+        tied_attrs: list[str] = []
 
         # Helper: tie attribute if present on both
         def tie_attr(attr: str) -> None:
@@ -452,10 +456,47 @@ class DebertaV3RTDPretrainer(nn.Module):
                     add_bias=add_bias,
                 ),
             )
+            tied_attrs.append(attr)
 
         tie_attr("word_embeddings")
         tie_attr("position_embeddings")
         tie_attr("token_type_embeddings")
+        self._tied_embedding_attrs = tuple(tied_attrs)
+
+    def _validate_tied_embedding_bindings(self) -> None:
+        """Ensure tied embedding adapters still point to live generator modules.
+
+        :raises RuntimeError: If generator/discriminator embedding surgery left stale ties.
+        """
+        if not self._tied_embedding_attrs:
+            return
+
+        try:
+            gen_embeddings = self.generator.embeddings
+            disc_embeddings = self.discriminator.embeddings
+        except Exception as e:
+            raise RuntimeError(
+                "Expected generator/discriminator backbones with `.embeddings` modules while validating "
+                "tied embedding adapters."
+            ) from e
+
+        stale: list[str] = []
+        for attr in self._tied_embedding_attrs:
+            gen_mod = getattr(gen_embeddings, attr, None)
+            disc_mod = getattr(disc_embeddings, attr, None)
+            if not isinstance(disc_mod, _TiedEmbedding):
+                stale.append(attr)
+                continue
+            base_mod = getattr(disc_mod, "_base_embedding_module", None)
+            if gen_mod is None or base_mod is None or gen_mod is not base_mod:
+                stale.append(attr)
+
+        if stale:
+            names = ", ".join(sorted(stale))
+            raise RuntimeError(
+                "Detected stale tied embeddings after module replacement for: "
+                f"{names}. Recreate DebertaV3RTDPretrainer to rebind embedding sharing."
+            )
 
     def forward(
         self,
@@ -484,6 +525,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         if labels is None:
             raise ValueError("labels must be provided (MLM labels with -100 for unmasked positions)")
+        self._validate_tied_embedding_bindings()
 
         # -------------------
         # Generator

@@ -117,7 +117,8 @@ class DebertaV3ElectraCollator:
             attention_mask=batch.get("attention_mask"),
         )
         if block_mask is not None:
-            batch["attention_mask"] = block_mask.long()
+            # Keep packed pairwise masks in bool form to avoid pointless int64 expansion.
+            batch["attention_mask"] = block_mask
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
@@ -338,9 +339,12 @@ class DebertaV3ElectraCollator:
         doc_ids = sep_before + 1
 
         cls_id = getattr(self.tokenizer, "cls_token_id", None)
+        cls_positions: torch.Tensor | None = None
         if cls_id is not None:
-            # Keep CLS in document 1 so it can aggregate packed-sequence content.
-            doc_ids = doc_ids.masked_fill(input_ids.eq(int(cls_id)), 1)
+            cls_positions = input_ids.eq(int(cls_id)) & active
+            # Keep CLS in document 1 for base same-doc logic; we then promote CLS to
+            # a global token in the final keep-mask so it can aggregate across packed docs.
+            doc_ids = doc_ids.masked_fill(cls_positions, 1)
         if pad_id is not None:
             doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
 
@@ -348,6 +352,13 @@ class DebertaV3ElectraCollator:
         # metadata and construct block structure lazily on device.
         same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
         keep = same_doc & active[:, :, None] & active[:, None, :]
+
+        # Make CLS global inside packed sequences: CLS can attend to all active tokens,
+        # and all active tokens can attend back to CLS.
+        if cls_positions is not None:
+            cls_query = cls_positions[:, :, None]
+            cls_key = cls_positions[:, None, :]
+            keep = keep | (cls_query & active[:, None, :]) | (active[:, :, None] & cls_key)
 
         # Guarantee at least self-attend for active queries to avoid all-masked rows.
         eye = torch.eye(input_ids.shape[1], dtype=torch.bool, device=input_ids.device).unsqueeze(0)

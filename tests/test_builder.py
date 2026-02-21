@@ -73,6 +73,68 @@ def test_build_backbone_configs_applies_ffn_override_for_scratch_rope(monkeypatc
     assert gen_cfg.ffn_type == "swiglu"
 
 
+def test_build_backbone_configs_applies_use_bias_override_for_scratch_rope(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    def _fake_from_pretrained(cls, src: str):
+        del src
+        return cls(use_bias=True, num_hidden_layers=6)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+        use_bias=False,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.use_bias is False
+    assert gen_cfg.use_bias is False
+
+
+def test_build_backbone_configs_preserves_loaded_use_bias_for_pretrained_rope(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    def _fake_from_pretrained(cls, src: str):
+        del src
+        return cls(use_bias=True, num_hidden_layers=6)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="custom-rope-checkpoint",
+        use_bias=False,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.use_bias is True
+    assert gen_cfg.use_bias is True
+
+
 def test_build_backbone_configs_adjusts_swiglu_intermediate_for_scratch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
 
@@ -207,6 +269,20 @@ def test_build_backbone_configs_rejects_invalid_model_options_early():
         norm_arch="not-valid",
     )
     with pytest.raises(ValueError, match="model.norm_arch must be one of"):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=_DummyTokenizer(),
+            max_position_embeddings=128,
+        )
+
+
+def test_build_backbone_configs_rejects_hf_deberta_sources_for_pretrained_rope():
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="microsoft/deberta-v3-base",
+    )
+    with pytest.raises(ValueError, match="requires DebertaRoPE checkpoints"):
         builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=_DummyTokenizer(),

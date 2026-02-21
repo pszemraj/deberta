@@ -84,6 +84,7 @@ def _apply_rope_config_overrides(
     if model_cfg.from_scratch:
         # Preserve checkpoint-native architecture when loading pretrained RoPE weights.
         cfg.ffn_type = str(model_cfg.ffn_type)
+        cfg.use_bias = bool(model_cfg.use_bias)
         if bool(adjust_swiglu_intermediate):
             curr_intermediate = int(cfg.intermediate_size)
             cfg.intermediate_size = _scaled_swiglu_intermediate_size(curr_intermediate)
@@ -214,7 +215,23 @@ def build_backbones(
         return disc, gen
 
     # from_pretrained path for rope (must point to a DebertaRoPEModel checkpoint)
-    disc = DebertaRoPEModel.from_pretrained(model_cfg.discriminator_model_name_or_path, config=disc_config)
+    try:
+        disc = DebertaRoPEModel.from_pretrained(
+            model_cfg.discriminator_model_name_or_path, config=disc_config
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load discriminator RoPE checkpoint with model.from_scratch=false. "
+            "Ensure model.discriminator_model_name_or_path points to a DebertaRoPE checkpoint "
+            "(not an HF DeBERTa v2/v3 checkpoint)."
+        ) from e
     gen_src = model_cfg.generator_model_name_or_path or model_cfg.discriminator_model_name_or_path
-    gen = DebertaRoPEModel.from_pretrained(gen_src, config=gen_config)
+    try:
+        gen = DebertaRoPEModel.from_pretrained(gen_src, config=gen_config)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load generator RoPE checkpoint with model.from_scratch=false. "
+            "Ensure model.generator_model_name_or_path (or discriminator source) points to "
+            "a DebertaRoPE checkpoint (not an HF DeBERTa v2/v3 checkpoint)."
+        ) from e
     return disc, gen
