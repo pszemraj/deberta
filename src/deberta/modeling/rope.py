@@ -1,3 +1,5 @@
+"""Rotary position embedding utilities."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +9,11 @@ import torch.nn as nn
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate even/odd channels for RoPE application.
+
+    :param torch.Tensor x: Tensor with final dimension as rotary channels.
+    :return torch.Tensor: Rotated tensor.
+    """
     # (.., d) -> (.., d) with even/odd rotation
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
@@ -16,6 +23,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class RotaryCache:
+    """Cosine/sine cache for a specific sequence length/device/dtype."""
+
     cos: torch.Tensor  # (seq, rotary_dim)
     sin: torch.Tensor  # (seq, rotary_dim)
 
@@ -29,6 +38,11 @@ class RotaryEmbedding(nn.Module):
     """
 
     def __init__(self, dim: int, base: float = 10000.0) -> None:
+        """Create rotary embedding helper.
+
+        :param int dim: Rotary dimension (must be even).
+        :param float base: RoPE base theta.
+        """
         super().__init__()
         self.dim = int(dim)
         if self.dim % 2 != 0:
@@ -43,6 +57,13 @@ class RotaryEmbedding(nn.Module):
         self._cache_dtype: torch.dtype | None = None
 
     def _build_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> RotaryCache:
+        """Build cosine/sine cache tensors.
+
+        :param int seq_len: Sequence length.
+        :param torch.device device: Target device.
+        :param torch.dtype dtype: Target dtype.
+        :return RotaryCache: Cache for the requested length/device/dtype.
+        """
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (seq, dim/2)
         emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)  # (seq, dim)
@@ -53,6 +74,13 @@ class RotaryEmbedding(nn.Module):
     def get_cos_sin(
         self, seq_len: int, *, device: torch.device, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get cached cosine/sine tensors for requested sequence length.
+
+        :param int seq_len: Sequence length.
+        :param torch.device device: Target device.
+        :param torch.dtype dtype: Target dtype.
+        :return tuple[torch.Tensor, torch.Tensor]: Cosine and sine tensors.
+        """
         if (
             self._cache is None
             or self._cache_device != device
@@ -69,11 +97,9 @@ class RotaryEmbedding(nn.Module):
     def apply(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply RoPE to q and k.
 
-        Args:
-          q,k: (batch, heads, seq, head_dim)
-
-        Returns:
-          rotated q,k (same shapes)
+        :param torch.Tensor q: Query tensor shaped (batch, heads, seq, head_dim).
+        :param torch.Tensor k: Key tensor shaped (batch, heads, seq, head_dim).
+        :return tuple[torch.Tensor, torch.Tensor]: Rotated query and key tensors.
         """
         seq_len = q.shape[-2]
         device = q.device

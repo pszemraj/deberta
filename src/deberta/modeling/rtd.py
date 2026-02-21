@@ -1,3 +1,5 @@
+"""RTD (ELECTRA-style) pretraining heads and wrapper module."""
+
 from __future__ import annotations
 
 import weakref
@@ -11,7 +13,12 @@ import torch.nn.functional as F
 from deberta.modeling.norm import RMSNorm
 
 
-def _get_act_fn(name_or_fn):
+def _get_act_fn(name_or_fn: str | Any) -> Any:
+    """Resolve activation callable from name or passthrough callable.
+
+    :param str | Any name_or_fn: Activation name or callable.
+    :return Any: Activation callable.
+    """
     try:
         from transformers.activations import ACT2FN
 
@@ -41,6 +48,13 @@ class _TiedEmbedding(nn.Module):
         detach_base: bool,
         add_bias: bool,
     ) -> None:
+        """Create tied-embedding adapter.
+
+        :param torch.nn.Parameter base_weight: Source embedding weight.
+        :param int | None padding_idx: Padding index for embedding lookup.
+        :param bool detach_base: Whether to detach base weights.
+        :param bool add_bias: Whether to add trainable bias matrix.
+        """
         super().__init__()
         self._base_weight_ref = weakref.ref(base_weight)
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
@@ -54,6 +68,11 @@ class _TiedEmbedding(nn.Module):
             self.bias = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Lookup embeddings from tied source weight.
+
+        :param torch.Tensor input_ids: Input token ids.
+        :return torch.Tensor: Embedded representations.
+        """
         w = self._base_weight_ref()
         if w is None:
             raise RuntimeError("Base embedding weight reference is dead.")
@@ -69,7 +88,13 @@ class _TiedEmbedding(nn.Module):
 
 
 class MLMTransform(nn.Module):
+    """Projection-activation-norm transform used by MLM head."""
+
     def __init__(self, config: Any) -> None:
+        """Create MLM transform layers.
+
+        :param Any config: Backbone config.
+        """
         super().__init__()
         hidden_size = int(config.hidden_size)
         self.dense = nn.Linear(hidden_size, hidden_size)
@@ -79,6 +104,11 @@ class MLMTransform(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Transform hidden states before vocab projection.
+
+        :param torch.Tensor hidden_states: Input hidden states.
+        :return torch.Tensor: Transformed hidden states.
+        """
         x = self.dense(hidden_states)
         x = self.act(x)
         x = self.norm(x)
@@ -92,6 +122,11 @@ class MaskedLMHead(nn.Module):
     """
 
     def __init__(self, config: Any, *, tie_word_embeddings: bool = True) -> None:
+        """Create masked language modeling head.
+
+        :param Any config: Backbone config.
+        :param bool tie_word_embeddings: Whether to tie decoder to embeddings.
+        """
         super().__init__()
         self.transform = MLMTransform(config)
         self.vocab_size = int(config.vocab_size)
@@ -106,6 +141,12 @@ class MaskedLMHead(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None
     ) -> torch.Tensor:
+        """Project hidden states to vocabulary logits.
+
+        :param torch.Tensor hidden_states: Input hidden states.
+        :param torch.Tensor | None word_embedding_weight: Optional tied embedding weight.
+        :return torch.Tensor: Vocabulary logits.
+        """
         x = self.transform(hidden_states)
 
         if self.tie_word_embeddings and word_embedding_weight is not None:
@@ -126,6 +167,10 @@ class RTDHead(nn.Module):
     """Discriminator head for replaced-token detection."""
 
     def __init__(self, config: Any) -> None:
+        """Create RTD discriminator head.
+
+        :param Any config: Backbone config.
+        """
         super().__init__()
         hidden_size = int(config.hidden_size)
         drop_out = getattr(config, "hidden_dropout_prob", 0.1)
@@ -140,6 +185,11 @@ class RTDHead(nn.Module):
         self.classifier = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute RTD logits per token position.
+
+        :param torch.Tensor hidden_states: Input hidden states.
+        :return torch.Tensor: RTD logits.
+        """
         x = self.dropout(hidden_states)
         x = self.dense(x)
         x = self.act(x)
@@ -151,6 +201,8 @@ class RTDHead(nn.Module):
 
 @dataclass
 class RTDOutput:
+    """Structured outputs from one RTD forward pass."""
+
     loss: torch.Tensor
     gen_loss: torch.Tensor
     disc_loss: torch.Tensor
@@ -170,6 +222,15 @@ class DebertaV3RTDPretrainer(nn.Module):
         embedding_sharing: str = "gdes",
         tie_generator_word_embeddings: bool = True,
     ) -> None:
+        """Create combined generator+discriminator RTD module.
+
+        :param nn.Module discriminator_backbone: Discriminator encoder backbone.
+        :param nn.Module generator_backbone: Generator encoder backbone.
+        :param Any disc_config: Discriminator config.
+        :param Any gen_config: Generator config.
+        :param str embedding_sharing: Embedding sharing mode.
+        :param bool tie_generator_word_embeddings: Whether to tie generator LM head to embeddings.
+        """
         super().__init__()
         self.disc_config = disc_config
         self.gen_config = gen_config
@@ -184,6 +245,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         self._maybe_patch_discriminator_embeddings()
 
     def _maybe_patch_discriminator_embeddings(self) -> None:
+        """Patch discriminator embeddings to follow configured sharing mode."""
         mode = (self.embedding_sharing or "none").lower()
         if mode not in {"none", "es", "gdes"}:
             raise ValueError("embedding_sharing must be one of: none|es|gdes")
@@ -205,6 +267,10 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         # Helper: tie attribute if present on both
         def tie_attr(attr: str) -> None:
+            """Tie one embedding attribute between generator and discriminator.
+
+            :param str attr: Embedding attribute name.
+            """
             gen_mod = getattr(gen_embeddings, attr, None)
             disc_mod = getattr(disc_embeddings, attr, None)
             if gen_mod is None or disc_mod is None:
@@ -245,12 +311,15 @@ class DebertaV3RTDPretrainer(nn.Module):
     ) -> RTDOutput:
         """Run one ELECTRA-style forward pass.
 
-        Args:
-          input_ids: masked inputs
-          attention_mask: 1 for real tokens, 0 for pad
-          labels: original token ids at masked positions, -100 elsewhere
-
-        Returns RTDOutput with loss and a few diagnostics.
+        :param torch.Tensor input_ids: Masked input ids.
+        :param torch.Tensor attention_mask: Binary mask (1 real token, 0 pad).
+        :param torch.Tensor labels: Original token ids at masked positions, else -100.
+        :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :param float sampling_temperature: Sampling temperature for generator tokens.
+        :param float gen_loss_weight: Generator loss weight.
+        :param float disc_loss_weight: Discriminator loss weight.
+        :param bool decoupled_loss_scaling: Whether to apply decoupled loss scaling.
+        :return RTDOutput: Total loss plus generator/discriminator diagnostics.
         """
 
         if labels is None:

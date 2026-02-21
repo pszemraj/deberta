@@ -1,3 +1,5 @@
+"""Normalization layers used by modernized DeBERTa backbones."""
+
 from __future__ import annotations
 
 import torch
@@ -12,6 +14,12 @@ class RMSNorm(nn.Module):
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6, elementwise_affine: bool = True) -> None:
+        """Create RMSNorm layer.
+
+        :param int hidden_size: Final hidden dimension.
+        :param float eps: Numerical epsilon.
+        :param bool elementwise_affine: Whether to learn multiplicative weight.
+        """
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.eps = float(eps)
@@ -22,6 +30,11 @@ class RMSNorm(nn.Module):
             self.register_parameter("weight", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize activations by root-mean-square magnitude.
+
+        :param torch.Tensor x: Input tensor.
+        :return torch.Tensor: RMS-normalized tensor.
+        """
         # x: (..., hidden)
         # rms = sqrt(mean(x^2))
         dtype = x.dtype

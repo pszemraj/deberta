@@ -1,3 +1,5 @@
+"""Checkpoint consolidation and standalone HF export CLI."""
+
 from __future__ import annotations
 
 import json
@@ -15,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging(is_main: bool) -> None:
+    """Configure process-local logger settings.
+
+    :param bool is_main: True for primary process.
+    """
     level = logging.INFO if is_main else logging.WARN
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -24,11 +30,21 @@ def _setup_logging(is_main: bool) -> None:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
+    """Load JSON mapping from disk.
+
+    :param Path path: JSON path.
+    :return dict[str, Any]: Parsed mapping.
+    """
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
+    """Infer parent run directory from checkpoint path.
+
+    :param Path checkpoint_dir: Checkpoint directory path.
+    :return Path: Parent run directory.
+    """
     # checkpoint_dir = .../checkpoint-XXXX
     # run dir is usually parent.
     return checkpoint_dir.parent
@@ -56,6 +72,11 @@ class ExportConfig:
 def _split_state_dict(
     full_sd: dict[str, torch.Tensor],
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Split full RTD state dict into discriminator and generator tensors.
+
+    :param dict[str, torch.Tensor] full_sd: Full state dict.
+    :return tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]: Discriminator and generator dicts.
+    """
     disc: dict[str, torch.Tensor] = {}
     gen: dict[str, torch.Tensor] = {}
 
@@ -75,6 +96,13 @@ def _merge_embeddings_into_export(
     gen_sd: dict[str, torch.Tensor],
     mode: str,
 ) -> None:
+    """Merge tied embedding weights into an export backbone.
+
+    :param Any export_model: Export backbone model.
+    :param dict[str, torch.Tensor] disc_sd: Discriminator state dict.
+    :param dict[str, torch.Tensor] gen_sd: Generator state dict.
+    :param str mode: Embedding sharing mode.
+    """
     if mode not in {"es", "gdes"}:
         return
 
@@ -82,6 +110,10 @@ def _merge_embeddings_into_export(
         return
 
     def merge_attr(attr: str) -> None:
+        """Merge one embedding attribute.
+
+        :param str attr: Embedding attribute name.
+        """
         if not hasattr(export_model.embeddings, attr):
             return
         gen_w = gen_sd.get(f"embeddings.{attr}.weight")
@@ -106,7 +138,17 @@ def _merge_embeddings_into_export(
     merge_attr("token_type_embeddings")
 
 
-def _build_export_backbone(model_cfg: ModelConfig, disc_config: Any, gen_config: Any, export_what: str):
+def _build_export_backbone(
+    model_cfg: ModelConfig, disc_config: Any, gen_config: Any, export_what: str
+) -> tuple[Any | None, Any | None]:
+    """Build export backbones for requested component(s).
+
+    :param ModelConfig model_cfg: Model config.
+    :param Any disc_config: Discriminator backbone config.
+    :param Any gen_config: Generator backbone config.
+    :param str export_what: Export target (discriminator|generator|both).
+    :return tuple[Any | None, Any | None]: Discriminator and generator export models.
+    """
     bt = (model_cfg.backbone_type or "rope").lower()
     export_what = export_what.lower()
 
@@ -132,6 +174,7 @@ def _build_export_backbone(model_cfg: ModelConfig, disc_config: Any, gen_config:
 
 
 def main() -> None:
+    """Run checkpoint export CLI flow."""
     try:
         from transformers import AutoTokenizer, HfArgumentParser
     except Exception as e:  # pragma: no cover
@@ -284,3 +327,7 @@ def main() -> None:
         json.dump(meta, f, indent=2, sort_keys=True)
 
     logger.info(f"Export complete: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()

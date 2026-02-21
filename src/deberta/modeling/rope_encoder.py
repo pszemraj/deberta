@@ -1,3 +1,5 @@
+"""Modernized RoPE-based encoder backbone for DeBERTa-style models."""
+
 from __future__ import annotations
 
 import math
@@ -49,6 +51,30 @@ class DebertaRoPEConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         **kwargs: Any,
     ) -> None:
+        """Initialize encoder config fields and validate constraints.
+
+        :param int vocab_size: Vocabulary size.
+        :param int hidden_size: Hidden width.
+        :param int num_hidden_layers: Number of encoder layers.
+        :param int num_attention_heads: Number of attention heads.
+        :param int intermediate_size: FFN intermediate width.
+        :param str hidden_act: FFN activation name.
+        :param float hidden_dropout_prob: Hidden dropout probability.
+        :param float attention_probs_dropout_prob: Attention dropout probability.
+        :param int max_position_embeddings: Maximum supported positions.
+        :param int type_vocab_size: Token type vocabulary size.
+        :param int pad_token_id: Padding token id.
+        :param float rope_theta: RoPE base theta.
+        :param float rotary_pct: Fraction of head dim receiving RoPE.
+        :param bool use_absolute_position_embeddings: Whether to add learned absolute positions.
+        :param float norm_eps: RMSNorm epsilon.
+        :param str norm_arch: Residual topology name.
+        :param float | None keel_alpha_init: Optional KEEL alpha init.
+        :param bool keel_alpha_learnable: Whether KEEL alpha is trainable.
+        :param str attention_implementation: Attention backend.
+        :param float initializer_range: Weight initialization std.
+        :param Any kwargs: Extra ``PretrainedConfig`` kwargs.
+        """
         super().__init__(pad_token_id=pad_token_id, **kwargs)
         self.vocab_size = int(vocab_size)
         self.hidden_size = int(hidden_size)
@@ -82,14 +108,25 @@ class DebertaRoPEConfig(PretrainedConfig):
             raise ValueError("attention_implementation must be one of: sdpa|eager")
 
 
-def _get_act_fn(name: str):
+def _get_act_fn(name: str) -> Any:
+    """Resolve activation callable from transformers registry.
+
+    :param str name: Activation function key.
+    :return Any: Activation callable.
+    """
     from transformers.activations import ACT2FN
 
     return ACT2FN[name]
 
 
 class DebertaRoPEEmbeddings(nn.Module):
+    """Embedding stack combining token, optional type/position, norm, and dropout."""
+
     def __init__(self, config: DebertaRoPEConfig) -> None:
+        """Create embedding layers.
+
+        :param DebertaRoPEConfig config: Backbone configuration.
+        """
         super().__init__()
         self.config = config
         self.word_embeddings = nn.Embedding(
@@ -110,6 +147,12 @@ class DebertaRoPEEmbeddings(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input_ids: torch.Tensor, token_type_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Embed token ids and apply normalization/dropout.
+
+        :param torch.Tensor input_ids: Input token ids.
+        :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :return torch.Tensor: Embedded hidden states.
+        """
         bsz, seq_len = input_ids.shape
         x = self.word_embeddings(input_ids)
 
@@ -130,7 +173,13 @@ class DebertaRoPEEmbeddings(nn.Module):
 
 
 class DebertaRoPESelfAttention(nn.Module):
+    """Multi-head self-attention block with optional SDPA backend and RoPE."""
+
     def __init__(self, config: DebertaRoPEConfig) -> None:
+        """Create attention projections and rotary embedding helper.
+
+        :param DebertaRoPEConfig config: Backbone configuration.
+        """
         super().__init__()
         self.config = config
         self.hidden_size = int(config.hidden_size)
@@ -150,6 +199,12 @@ class DebertaRoPESelfAttention(nn.Module):
         self.rope = RotaryEmbedding(rotary_dim, base=float(config.rope_theta)) if rotary_dim > 0 else None
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """Run self-attention.
+
+        :param torch.Tensor x: Input hidden states.
+        :param torch.Tensor | None attention_mask: Binary attention mask.
+        :return torch.Tensor: Attention output states.
+        """
         bsz, seq_len, _ = x.shape
 
         qkv = self.qkv(x)  # (B,S,3H)
@@ -190,7 +245,13 @@ class DebertaRoPESelfAttention(nn.Module):
 
 
 class DebertaRoPEMLP(nn.Module):
+    """Feed-forward network block used inside each encoder layer."""
+
     def __init__(self, config: DebertaRoPEConfig) -> None:
+        """Create FFN projections and activation.
+
+        :param DebertaRoPEConfig config: Backbone configuration.
+        """
         super().__init__()
         self.dense_in = nn.Linear(config.hidden_size, config.intermediate_size)
         self.act = _get_act_fn(config.hidden_act)
@@ -198,6 +259,11 @@ class DebertaRoPEMLP(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply FFN transform.
+
+        :param torch.Tensor x: Input hidden states.
+        :return torch.Tensor: Output hidden states.
+        """
         x = self.dense_in(x)
         x = self.act(x)
         x = self.dense_out(x)
@@ -209,6 +275,11 @@ class _KEELAlpha(nn.Module):
     """Optional learnable scalar alpha for KEEL."""
 
     def __init__(self, init: float, learnable: bool) -> None:
+        """Create KEEL alpha scaling module.
+
+        :param float init: Initial alpha value.
+        :param bool learnable: Whether alpha is a parameter.
+        """
         super().__init__()
         if learnable:
             self.alpha = nn.Parameter(torch.tensor(float(init), dtype=torch.float32))
@@ -217,6 +288,11 @@ class _KEELAlpha(nn.Module):
         self.learnable = bool(learnable)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return alpha cast to the runtime dtype.
+
+        :param torch.Tensor x: Reference tensor for dtype.
+        :return torch.Tensor: Alpha scalar tensor.
+        """
         return self.alpha.to(dtype=x.dtype)
 
 
@@ -229,6 +305,11 @@ class DebertaRoPELayer(nn.Module):
     """
 
     def __init__(self, config: DebertaRoPEConfig, *, alpha_init: float) -> None:
+        """Create one encoder layer.
+
+        :param DebertaRoPEConfig config: Backbone configuration.
+        :param float alpha_init: KEEL alpha initial value.
+        """
         super().__init__()
         self.config = config
         self.norm_arch = str(config.norm_arch)
@@ -252,6 +333,12 @@ class DebertaRoPELayer(nn.Module):
             self.alpha2 = _KEELAlpha(alpha_init, learnable=config.keel_alpha_learnable)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """Run one encoder layer pass.
+
+        :param torch.Tensor x: Input hidden states.
+        :param torch.Tensor | None attention_mask: Binary attention mask.
+        :return torch.Tensor: Output hidden states.
+        """
         if self.norm_arch == "post":
             h = self.attn(x, attention_mask)
             x = self.norm1(x + self.dropout(h))
@@ -271,7 +358,13 @@ class DebertaRoPELayer(nn.Module):
 
 
 class DebertaRoPEEncoder(nn.Module):
+    """Stack of RoPE encoder layers with optional gradient checkpointing."""
+
     def __init__(self, config: DebertaRoPEConfig) -> None:
+        """Create encoder layer stack.
+
+        :param DebertaRoPEConfig config: Backbone configuration.
+        """
         super().__init__()
         self.config = config
 
@@ -287,6 +380,12 @@ class DebertaRoPEEncoder(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """Run all encoder layers.
+
+        :param torch.Tensor x: Input hidden states.
+        :param torch.Tensor | None attention_mask: Binary attention mask.
+        :return torch.Tensor: Output hidden states.
+        """
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(layer, x, attention_mask, use_reentrant=False)
@@ -296,11 +395,17 @@ class DebertaRoPEEncoder(nn.Module):
 
 
 class DebertaRoPEPreTrainedModel(PreTrainedModel):
+    """HF ``PreTrainedModel`` base for RoPE encoder models."""
+
     config_class = DebertaRoPEConfig
     base_model_prefix = "deberta_rope"
     supports_gradient_checkpointing = True
 
     def _init_weights(self, module: nn.Module) -> None:  # pragma: no cover (HF init contracts)
+        """Initialize module weights using config-defined initializer range.
+
+        :param nn.Module module: Module to initialize.
+        """
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
@@ -314,6 +419,11 @@ class DebertaRoPEPreTrainedModel(PreTrainedModel):
                 module.weight.data.fill_(1.0)
 
     def _set_gradient_checkpointing(self, module: nn.Module, value: bool = False) -> None:
+        """Enable or disable checkpointing on compatible encoder modules.
+
+        :param nn.Module module: Candidate module.
+        :param bool value: Desired checkpointing state.
+        """
         if isinstance(module, DebertaRoPEEncoder):
             module.gradient_checkpointing = value
 
@@ -322,15 +432,27 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
     """Encoder-only model returning last_hidden_state."""
 
     def __init__(self, config: DebertaRoPEConfig) -> None:
+        """Create encoder-only model.
+
+        :param DebertaRoPEConfig config: Backbone configuration.
+        """
         super().__init__(config)
         self.embeddings = DebertaRoPEEmbeddings(config)
         self.encoder = DebertaRoPEEncoder(config)
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
+        """Return input word embedding module.
+
+        :return nn.Module: Word embedding module.
+        """
         return self.embeddings.word_embeddings
 
     def set_input_embeddings(self, value: nn.Module) -> None:
+        """Replace input word embedding module.
+
+        :param nn.Module value: New word embedding module.
+        """
         self.embeddings.word_embeddings = value  # type: ignore[assignment]
 
     def forward(
@@ -342,6 +464,15 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         return_dict: bool = True,
         **kwargs: Any,
     ) -> BaseModelOutput:
+        """Run encoder forward pass.
+
+        :param torch.Tensor input_ids: Input token ids.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :param bool return_dict: Whether to return HF output dataclass.
+        :param Any kwargs: Unused compatibility kwargs.
+        :return BaseModelOutput: Last hidden states container.
+        """
         if attention_mask is None:
             attention_mask = input_ids.ne(int(self.config.pad_token_id)).to(dtype=torch.long)
 

@@ -1,3 +1,5 @@
+"""Backbone config/model builders for RoPE and HF DeBERTa variants."""
+
 from __future__ import annotations
 
 import copy
@@ -8,7 +10,12 @@ from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 
 def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
-    """Derive a smaller generator config from a discriminator config."""
+    """Derive generator config from discriminator config.
+
+    :param Any base_cfg: Base discriminator config.
+    :param ModelConfig model_cfg: User model configuration.
+    :return Any: Derived generator config.
+    """
     gen_cfg = copy.deepcopy(base_cfg)
 
     # Default ELECTRA heuristic: fewer layers.
@@ -47,6 +54,11 @@ def build_backbone_configs(
     - For backbone_type='rope': returns DebertaRoPEConfig instances.
 
     Generator config is loaded if specified, otherwise derived from discriminator config.
+
+    :param ModelConfig model_cfg: User model configuration.
+    :param Any tokenizer: Tokenizer used for vocab/pad metadata.
+    :param int max_position_embeddings: Sequence length budget.
+    :return tuple[Any, Any]: Discriminator and generator configs.
     """
     bt = (model_cfg.backbone_type or "rope").lower()
 
@@ -147,7 +159,13 @@ def build_backbones(
     disc_config: Any,
     gen_config: Any,
 ) -> tuple[Any, Any]:
-    """Instantiate discriminator + generator backbones."""
+    """Instantiate discriminator + generator backbones.
+
+    :param ModelConfig model_cfg: User model configuration.
+    :param Any disc_config: Discriminator config object.
+    :param Any gen_config: Generator config object.
+    :return tuple[Any, Any]: Instantiated discriminator and generator modules.
+    """
     bt = (model_cfg.backbone_type or "rope").lower()
 
     if bt == "hf_deberta_v2":
