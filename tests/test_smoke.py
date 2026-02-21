@@ -243,7 +243,8 @@ def test_ngram_masking_fills_shortfall_from_remaining_candidates(monkeypatch: py
     input_ids = torch.tensor([[tok.cls_token_id, 11, 12, 13, 14, tok.sep_token_id]], dtype=torch.long)
     special = torch.tensor([[1, 0, 0, 0, 0, 1]], dtype=torch.bool)
 
-    def fake_randint(low: int, high: int, size):
+    def fake_randint(low: int, high: int, size, **kwargs):
+        del kwargs
         return torch.tensor([0], dtype=torch.long)
 
     def fake_multinomial(input: torch.Tensor, num_samples: int, replacement: bool = False):

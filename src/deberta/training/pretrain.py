@@ -364,6 +364,31 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def _build_training_collator(
+    *,
+    tokenizer: Any,
+    train_cfg: TrainConfig,
+    packed_sequences: bool,
+) -> DebertaV3ElectraCollator:
+    """Build the RTD masking collator from train/data config.
+
+    :param Any tokenizer: Tokenizer used for dynamic masking.
+    :param TrainConfig train_cfg: Training configuration.
+    :param bool packed_sequences: Whether dataset packing is enabled.
+    :return DebertaV3ElectraCollator: Configured collator.
+    """
+    return DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(
+            mlm_probability=train_cfg.mlm_probability,
+            mask_token_prob=train_cfg.mask_token_prob,
+            random_token_prob=train_cfg.random_token_prob,
+            max_ngram=train_cfg.mlm_max_ngram,
+        ),
+        packed_sequences=bool(packed_sequences),
+    )
+
+
 def _compute_disc_active_mask(
     *,
     input_ids: torch.Tensor,
@@ -497,6 +522,23 @@ def _finalize_window_metric_loss(
         return accumulated_loss
     denom = max(1, int(ga_steps))
     return accumulated_loss / float(denom)
+
+
+def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool) -> torch.Tensor:
+    """Prepare microbatch loss for ``Accelerator.backward``.
+
+    Accelerate scales all backward losses by ``1 / gradient_accumulation_steps``.
+    Token-weighted micro objectives are already normalized over the accumulation
+    window, so we cancel that scaling for the token-weighted path only.
+
+    :param torch.Tensor loss: Raw microbatch loss/objective.
+    :param int ga_steps: Gradient accumulation steps.
+    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
+    :return torch.Tensor: Loss to pass into ``accelerator.backward``.
+    """
+    if not token_weighted_ga:
+        return loss
+    return loss * float(max(1, int(ga_steps)))
 
 
 def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
@@ -848,14 +890,10 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         num_processes=accelerator.num_processes,
     )
 
-    collator = DebertaV3ElectraCollator(
+    collator = _build_training_collator(
         tokenizer=tokenizer,
-        cfg=MLMConfig(
-            mlm_probability=train_cfg.mlm_probability,
-            mask_token_prob=train_cfg.mask_token_prob,
-            random_token_prob=train_cfg.random_token_prob,
-            max_ngram=train_cfg.mlm_max_ngram,
-        ),
+        train_cfg=train_cfg,
+        packed_sequences=bool(data_cfg.pack_sequences),
     )
 
     # Dataloader
@@ -1055,7 +1093,12 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                     loss = out.loss
                     loss_for_metrics = loss_for_metrics + out.loss.detach()
 
-                accelerator.backward(loss)
+                backward_loss = _scale_loss_for_backward(
+                    loss=loss,
+                    ga_steps=ga_steps,
+                    token_weighted_ga=token_weighted_ga,
+                )
+                accelerator.backward(backward_loss)
 
             if is_sync_step:
                 did_sync_step = True

@@ -25,6 +25,7 @@ from deberta.export_cli import _build_export_parser
 from deberta.modeling.rtd import compute_generator_loss_term
 from deberta.training.pretrain import (
     _build_optimizer,
+    _build_training_collator,
     _count_rtd_tokens_for_batch,
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
@@ -33,6 +34,7 @@ from deberta.training.pretrain import (
     _prepare_output_dir,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
+    _scale_loss_for_backward,
     _should_clip_gradients,
     _should_force_legacy_tf32_for_compile,
     _token_weighted_micro_objective,
@@ -421,6 +423,37 @@ def test_finalize_window_metric_loss_passthrough_for_token_weighted_windows():
     total = torch.tensor(1.2345)
     out = _finalize_window_metric_loss(accumulated_loss=total, ga_steps=8, token_weighted_ga=True)
     torch.testing.assert_close(out, total)
+
+
+def test_scale_loss_for_backward_passthrough_when_not_token_weighted():
+    loss = torch.tensor(2.0)
+    out = _scale_loss_for_backward(loss=loss, ga_steps=8, token_weighted_ga=False)
+    torch.testing.assert_close(out, loss)
+
+
+def test_scale_loss_for_backward_cancels_accelerate_ga_division_for_token_weighted():
+    loss = torch.tensor(2.0)
+    out = _scale_loss_for_backward(loss=loss, ga_steps=4, token_weighted_ga=True)
+    torch.testing.assert_close(out, torch.tensor(8.0))
+
+
+def test_build_training_collator_propagates_packed_sequences_flag():
+    class _Tokenizer:
+        mask_token_id = 3
+        pad_token_id = 0
+        vocab_size = 64
+        all_special_ids = [0, 1, 2, 3]
+
+        def tokenize(self, text: str) -> list[str]:
+            return text.split()
+
+    train_cfg = TrainConfig(mlm_probability=0.2, mlm_max_ngram=2)
+    collator = _build_training_collator(
+        tokenizer=_Tokenizer(),
+        train_cfg=train_cfg,
+        packed_sequences=True,
+    )
+    assert collator._packed_sequences is True
 
 
 def test_should_clip_gradients_only_on_sync_steps():

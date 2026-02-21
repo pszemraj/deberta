@@ -13,6 +13,11 @@ class _DummyTokenizer:
     """Tokenizer stub for backbone-config unit tests."""
 
     pad_token_id = 0
+    cls_token_id = 1
+    sep_token_id = 2
+    mask_token_id = 3
+    bos_token_id = 4
+    eos_token_id = 5
 
     def __len__(self) -> int:
         return 128
@@ -166,6 +171,67 @@ def test_build_backbone_configs_adjusts_swiglu_intermediate_for_scratch(monkeypa
 
     assert disc_cfg.intermediate_size == 2048
     assert gen_cfg.intermediate_size == 2048
+
+
+def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    called = {"count": 0}
+
+    def _raise_if_called(cls, src: str):
+        del cls
+        del src
+        called["count"] += 1
+        raise AssertionError("from_pretrained should not be called when model.from_scratch=true")
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_raise_if_called),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+    )
+    _ = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert called["count"] == 0
+
+
+def test_build_backbone_configs_propagates_tokenizer_special_ids_for_rope():
+    pytest.importorskip("transformers")
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+    )
+    tokenizer = _DummyTokenizer()
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=128,
+    )
+
+    for attr in (
+        "pad_token_id",
+        "cls_token_id",
+        "sep_token_id",
+        "mask_token_id",
+        "bos_token_id",
+        "eos_token_id",
+    ):
+        expected = int(getattr(tokenizer, attr))
+        assert int(getattr(disc_cfg, attr)) == expected
+        assert int(getattr(gen_cfg, attr)) == expected
 
 
 def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monkeypatch: pytest.MonkeyPatch):
