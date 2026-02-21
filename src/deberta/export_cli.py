@@ -294,26 +294,31 @@ def run_export(cfg: ExportConfig) -> None:
     accelerator.load_state(str(checkpoint_dir))
     accelerator.wait_for_everyone()
 
-    # Consolidate FULL_STATE_DICT on rank0 if FSDP is enabled.
+    # Consolidate FULL_STATE_DICT on rank0 if possible when FSDP is enabled.
     full_sd: dict[str, torch.Tensor]
     if accelerator.distributed_type == DistributedType.FSDP:
         try:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("torch.distributed.fsdp is required for FSDP export") from e
+            is_fsdp_instance = isinstance(model, FSDP)
+        except Exception:
+            is_fsdp_instance = False
 
-        if not isinstance(model, FSDP):
-            raise RuntimeError(
-                "Expected the prepared model to be an FSDP instance. "
-                "Make sure you are launching with the same accelerate FSDP config used for training."
+        if is_fsdp_instance:
+            cfg_full = FullStateDictConfig(
+                offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
             )
-
-        cfg_full = FullStateDictConfig(
-            offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
-        )
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
-            full_sd = model.state_dict()
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
+                full_sd = model.state_dict()
+        else:
+            # FSDP2 and newer backends expose sharded checkpoint metadata via Accelerate.
+            # Falling back to accelerator.get_state_dict keeps export working without forcing
+            # a Torch FSDP instance check that breaks FSDP2 execution paths.
+            if not hasattr(accelerator, "get_state_dict"):
+                raise RuntimeError(
+                    "accelerator.get_state_dict() is required for FSDP export on non-torch FSDP engines."
+                )
+            full_sd = accelerator.get_state_dict(model)
     else:
         # Non-FSDP: unwrap DDP etc.
         full_sd = accelerator.unwrap_model(model).state_dict()

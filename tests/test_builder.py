@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+
 import pytest
 
 from deberta.config import ModelConfig
@@ -195,6 +196,26 @@ def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monke
 
     assert disc_cfg.intermediate_size == 3072
     assert gen_cfg.intermediate_size == 3072
+
+
+def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
+    pytest.importorskip("transformers")
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        discriminator_model_name_or_path="disc",
+        ffn_type="swiglu",
+        intermediate_size=4096,
+        swiglu_adjust_intermediate=True,
+    )
+    disc_cfg, _ = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=_DummyTokenizer(),
+        max_position_embeddings=128,
+    )
+
+    assert disc_cfg.intermediate_size == 2816
 
 
 def test_build_backbone_configs_respects_explicit_generator_intermediate_with_swiglu_adjust(

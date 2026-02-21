@@ -415,6 +415,50 @@ def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discrimina
     assert disc_count == pytest.approx(2.0)
 
 
+def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
+    from deberta.training.pretrain import _compute_disc_active_mask
+
+    mask = _compute_disc_active_mask(
+        input_ids=torch.tensor([[1, 11, 2, 13, 0]], dtype=torch.long),
+        labels=torch.tensor([[-100, 99, -100, 77, -100]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long),
+        special_token_ids=(1, 2, 0),
+        pad_token_id=0,
+    )
+
+    expected = torch.tensor([[False, True, False, True, False]], dtype=torch.bool)
+    assert torch.equal(mask, expected)
+
+
+def test_build_optimizer_marks_scalar_params_as_no_decay():
+    train_cfg = TrainConfig()
+
+    class _RegressionModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = torch.nn.Linear(4, 4)
+            self.generator.alpha = torch.nn.Parameter(torch.tensor(1.0))
+            self.generator_lm_head = torch.nn.Linear(4, 4)
+            self.discriminator = torch.nn.Linear(4, 4)
+            self.discriminator.alpha = torch.nn.Parameter(torch.tensor(2.0))
+            self.discriminator_norm = torch.nn.LayerNorm(4)
+
+    model = _RegressionModel()
+    opt = _build_optimizer(model, train_cfg)
+
+    def _group_for(param: torch.nn.Parameter) -> float:
+        for g in opt.param_groups:
+            for p in g["params"]:
+                if p is param:
+                    return float(g["weight_decay"])
+        raise AssertionError("Parameter missing from optimizer groups")
+
+    assert _group_for(model.generator.alpha) == pytest.approx(0.0)
+    assert _group_for(model.discriminator.alpha) == pytest.approx(0.0)
+    assert _group_for(model.discriminator_norm.weight) == pytest.approx(0.0)
+    assert _group_for(model.generator.weight) == pytest.approx(train_cfg.weight_decay)
+
+
 def test_normalize_mixed_precision_accepts_bool_and_synonyms():
     assert _normalize_mixed_precision("bf16") == "bf16"
     assert _normalize_mixed_precision("none") == "no"

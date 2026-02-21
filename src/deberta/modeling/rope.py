@@ -50,19 +50,21 @@ class RotaryEmbedding(nn.Module):
     - Extends cache on demand for longer sequence lengths (length generalization).
     """
 
-    def __init__(self, dim: int, base: float = 10000.0) -> None:
+    def __init__(self, dim: int, base: float = 10000.0, full_dim: int | None = None) -> None:
         """Create rotary embedding helper.
 
         :param int dim: Rotary dimension (must be even).
         :param float base: RoPE base theta.
+        :param int | None full_dim: Optional full head-dimension for frequency spacing.
         """
         super().__init__()
         self.dim = int(dim)
         if self.dim % 2 != 0:
             raise ValueError(f"Rotary dim must be even, got {self.dim}")
         self.base = float(base)
+        denom = int(full_dim) if full_dim is not None else self.dim
 
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / float(denom)))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self._cache: RotaryCache | None = None

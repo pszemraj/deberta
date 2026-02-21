@@ -46,6 +46,7 @@ class DebertaV3ElectraCollator:
         *,
         tokenizer: Any,
         cfg: MLMConfig,
+        packed_sequences: bool = False,
         pad_to_multiple_of: int | None = None,
     ) -> None:
         """Initialize collator state.
@@ -57,6 +58,7 @@ class DebertaV3ElectraCollator:
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.pad_to_multiple_of = pad_to_multiple_of
+        self._packed_sequences = bool(packed_sequences)
 
         if self.tokenizer.mask_token_id is None:
             raise ValueError("Tokenizer must define a mask token for MLM masking.")
@@ -111,10 +113,14 @@ class DebertaV3ElectraCollator:
         else:
             special_tokens_mask = special_tokens_mask.bool()
 
-        block_mask = self._build_document_attention_mask(
-            input_ids=batch["input_ids"],
-            special_tokens_mask=special_tokens_mask,
-            attention_mask=batch.get("attention_mask"),
+        block_mask = (
+            self._build_document_attention_mask(
+                input_ids=batch["input_ids"],
+                special_tokens_mask=special_tokens_mask,
+                attention_mask=batch.get("attention_mask"),
+            )
+            if self._packed_sequences
+            else None
         )
         if block_mask is not None:
             # Keep packed pairwise masks in bool form to avoid pointless int64 expansion.
@@ -321,11 +327,6 @@ class DebertaV3ElectraCollator:
         sep_id = int(sep_id)
 
         sep_positions = input_ids.eq(sep_id) & special_tokens_mask
-        # Need at least two separator tokens ([... internal ...] + final [SEP])
-        # to indicate packed multi-document content.
-        has_internal = sep_positions.sum(dim=1).gt(1)
-        if not bool(has_internal.any().item()):
-            return None
 
         pad_id = getattr(self.tokenizer, "pad_token_id", None)
         if attention_mask is not None and attention_mask.ndim == 2:
@@ -541,6 +542,16 @@ class DebertaV3ElectraCollator:
 
             if not masked:
                 continue
+
+            if len(masked) < num_to_mask:
+                remaining_candidates = [idx for idx in maskable_set if idx not in masked_set]
+                if remaining_candidates:
+                    missing = num_to_mask - len(masked)
+                    fill = torch.randperm(len(remaining_candidates))[:missing].tolist()
+                    for idx in (remaining_candidates[i] for i in fill):
+                        if idx not in masked_set:
+                            masked.append(idx)
+                            masked_set.add(idx)
 
             # Apply replacements.
             for idx in masked:

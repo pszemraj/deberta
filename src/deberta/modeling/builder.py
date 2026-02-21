@@ -15,7 +15,12 @@ def _scaled_swiglu_intermediate_size(value: int) -> int:
     :param int value: Baseline MLP-oriented intermediate size.
     :return int: Scaled intermediate size for SwiGLU.
     """
-    return max(1, int(int(value) * (2.0 / 3.0)))
+    multiple_of = 128
+    raw = max(1, int(int(value) * (2.0 / 3.0)))
+    remainder = raw % multiple_of
+    if remainder == 0:
+        return raw
+    return raw + (multiple_of - remainder)
 
 
 def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
@@ -58,6 +63,7 @@ def _apply_rope_config_overrides(
     tokenizer: Any,
     max_position_embeddings: int,
     adjust_swiglu_intermediate: bool = False,
+    include_arch_from_model_cfg: bool = True,
 ) -> None:
     """Apply shared RoPE config overrides for generator/discriminator configs.
 
@@ -66,8 +72,20 @@ def _apply_rope_config_overrides(
     :param Any tokenizer: Tokenizer for vocab/pad metadata.
     :param int max_position_embeddings: Sequence length budget.
     :param bool adjust_swiglu_intermediate: Whether to apply 2/3 intermediate-size scaling for SwiGLU.
+    :param bool include_arch_from_model_cfg: Whether to copy architecture dimensions from `model_cfg`.
     """
     cfg.vocab_size = int(len(tokenizer))
+    if model_cfg.from_scratch and include_arch_from_model_cfg:
+        cfg.hidden_size = int(model_cfg.hidden_size)
+        cfg.num_hidden_layers = int(model_cfg.num_hidden_layers)
+        cfg.num_attention_heads = int(model_cfg.num_attention_heads)
+        cfg.intermediate_size = int(model_cfg.intermediate_size)
+        cfg.hidden_act = str(model_cfg.hidden_act)
+    for attr in ("cls_token_id", "sep_token_id", "mask_token_id", "bos_token_id", "eos_token_id"):
+        tok_id = getattr(tokenizer, attr, None)
+        if tok_id is not None:
+            cfg_val = int(tok_id)
+            setattr(cfg, attr, cfg_val)
     cfg.pad_token_id = int(tokenizer.pad_token_id or 0)
     cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
 
@@ -158,8 +176,17 @@ def build_backbone_configs(
         return disc_cfg, gen_cfg
 
     # RoPE backbone
-    disc_src = model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
-    disc_cfg = DebertaRoPEConfig.from_pretrained(disc_src)
+    if model_cfg.from_scratch:
+        disc_cfg = DebertaRoPEConfig(
+            hidden_size=model_cfg.hidden_size,
+            num_hidden_layers=model_cfg.num_hidden_layers,
+            num_attention_heads=model_cfg.num_attention_heads,
+            intermediate_size=model_cfg.intermediate_size,
+            hidden_act=model_cfg.hidden_act,
+        )
+    else:
+        disc_src = model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
+        disc_cfg = DebertaRoPEConfig.from_pretrained(disc_src)
     should_adjust_swiglu = bool(
         model_cfg.from_scratch
         and str(model_cfg.ffn_type).strip().lower() == "swiglu"
@@ -190,8 +217,10 @@ def build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=tokenizer,
         max_position_embeddings=max_position_embeddings,
-        # Derived generator configs inherit discriminator scaling already; avoid double-scaling.
+        # Explicit generator configs should honor model_cfg overrides, while derived configs should
+        # preserve discriminator-derived architecture settings.
         adjust_swiglu_intermediate=(should_adjust_swiglu and has_explicit_generator_src),
+        include_arch_from_model_cfg=has_explicit_generator_src,
     )
 
     return disc_cfg, gen_cfg

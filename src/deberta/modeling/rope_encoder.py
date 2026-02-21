@@ -204,7 +204,11 @@ class DebertaRoPESelfAttention(nn.Module):
         rotary_dim = int(self.head_dim * float(config.rotary_pct))
         rotary_dim = rotary_dim - (rotary_dim % 2)  # ensure even
         self.rotary_dim = rotary_dim
-        self.rope = RotaryEmbedding(rotary_dim, base=float(config.rope_theta)) if rotary_dim > 0 else None
+        self.rope = (
+            RotaryEmbedding(rotary_dim, base=float(config.rope_theta), full_dim=self.head_dim)
+            if rotary_dim > 0
+            else None
+        )
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
         """Run self-attention.

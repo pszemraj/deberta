@@ -114,6 +114,31 @@ class ModelConfig:
     # -------------------------
     # Modernized 'rope' backbone knobs
     # -------------------------
+    hidden_size: int = field(
+        default=768,
+        metadata={"help": "RoPE model hidden size."},
+    )
+
+    num_hidden_layers: int = field(
+        default=12,
+        metadata={"help": "RoPE model layer depth."},
+    )
+
+    num_attention_heads: int = field(
+        default=12,
+        metadata={"help": "RoPE model attention head count."},
+    )
+
+    intermediate_size: int = field(
+        default=3072,
+        metadata={"help": "RoPE model intermediate FFN size before optional SwigLU adjustment."},
+    )
+
+    hidden_act: str = field(
+        default="gelu",
+        metadata={"help": "RoPE model hidden activation function name."},
+    )
+
     rope_theta: float = field(
         default=10000.0,
         metadata={"help": "RoPE base theta."},
@@ -606,6 +631,11 @@ def validate_model_config(cfg: ModelConfig) -> None:
     if cfg.backbone_type == "hf_deberta_v2":
         defaults = ModelConfig()
         rope_only = (
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "intermediate_size",
+            "hidden_act",
             "rope_theta",
             "rotary_pct",
             "use_absolute_position_embeddings",
@@ -657,6 +687,18 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "model.generator_config_name_or_path or model.generator_model_name_or_path is provided: "
                 + ", ".join(sorted(derived_only))
             )
+
+    if cfg.backbone_type == "rope":
+        if int(cfg.hidden_size) <= 0:
+            raise ValueError("model.hidden_size must be > 0.")
+        if int(cfg.num_hidden_layers) <= 0:
+            raise ValueError("model.num_hidden_layers must be > 0.")
+        if int(cfg.num_attention_heads) <= 0:
+            raise ValueError("model.num_attention_heads must be > 0.")
+        if int(cfg.intermediate_size) <= 0:
+            raise ValueError("model.intermediate_size must be > 0.")
+        if int(cfg.hidden_size) % int(cfg.num_attention_heads) != 0:
+            raise ValueError("model.hidden_size must be divisible by model.num_attention_heads.")
 
 
 def validate_data_config(cfg: DataConfig) -> None:

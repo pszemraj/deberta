@@ -282,7 +282,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids()
         self._allowed_sample_token_ids_cpu = self._build_allowed_sample_token_ids()
         self._allowed_sample_token_ids_by_device: dict[str, torch.Tensor] = {}
+        self._forbidden_sample_token_ids_by_device: dict[str, torch.Tensor] = {}
         self._tied_embedding_attrs: tuple[str, ...] = ()
+        self._tied_embedding_bindings_validated = False
         self._maybe_patch_discriminator_embeddings()
 
     def _collect_forbidden_sample_token_ids(self) -> set[int]:
@@ -400,10 +402,17 @@ class DebertaV3RTDPretrainer(nn.Module):
         """
         if not self._forbidden_sample_token_ids:
             return torch.zeros_like(input_ids, dtype=torch.bool)
-        out = torch.zeros_like(input_ids, dtype=torch.bool)
-        for sid in self._forbidden_sample_token_ids:
-            out = out | input_ids.eq(int(sid))
-        return out
+        key = (
+            f"{input_ids.device.type}:{input_ids.device.index if input_ids.device.index is not None else -1}"
+        )
+        forbidden = self._forbidden_sample_token_ids_by_device.get(key)
+        if forbidden is None:
+            forbidden = torch.tensor(
+                sorted(int(sid) for sid in self._forbidden_sample_token_ids),
+                device=input_ids.device,
+            )
+            self._forbidden_sample_token_ids_by_device[key] = forbidden
+        return torch.isin(input_ids, forbidden)
 
     def _maybe_patch_discriminator_embeddings(self) -> None:
         """Patch discriminator embeddings to follow configured sharing mode."""
@@ -488,7 +497,15 @@ class DebertaV3RTDPretrainer(nn.Module):
                 stale.append(attr)
                 continue
             base_mod = getattr(disc_mod, "_base_embedding_module", None)
-            if gen_mod is None or base_mod is None or gen_mod is not base_mod:
+            if gen_mod is None or base_mod is None:
+                stale.append(attr)
+                continue
+            gen_weight = getattr(gen_mod, "weight", None)
+            base_weight = getattr(base_mod, "weight", None)
+            if not isinstance(gen_weight, torch.Tensor) or not isinstance(base_weight, torch.Tensor):
+                stale.append(attr)
+                continue
+            if gen_weight.data_ptr() != base_weight.data_ptr():
                 stale.append(attr)
 
         if stale:
@@ -525,7 +542,9 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         if labels is None:
             raise ValueError("labels must be provided (MLM labels with -100 for unmasked positions)")
-        self._validate_tied_embedding_bindings()
+        if not self._tied_embedding_bindings_validated:
+            self._validate_tied_embedding_bindings()
+            self._tied_embedding_bindings_validated = True
 
         # -------------------
         # Generator

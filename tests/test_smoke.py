@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import torch
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
@@ -189,9 +190,13 @@ def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
         assert sum(1 for tid in mids if tid == tok.sep_token_id) <= 1
 
 
-def test_collator_builds_document_block_attention_mask_when_internal_separators_exist():
+def test_collator_builds_document_block_attention_mask_when_packed():
     tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+    )
 
     features = [
         {
@@ -215,6 +220,42 @@ def test_collator_builds_document_block_attention_mask_when_internal_separators_
     assert attn[0, 1, 0].item() == 1
     assert attn[0, 0, 3].item() == 1
     assert attn[0, 3, 0].item() == 1
+
+
+def test_collator_build_drops_document_mask_when_not_packed():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+        }
+    ]
+    batch = coll(features)
+    assert "attention_mask" not in batch
+
+
+def test_ngram_masking_fills_shortfall_from_remaining_candidates(monkeypatch: pytest.MonkeyPatch):
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.75, max_ngram=3))
+
+    input_ids = torch.tensor([[tok.cls_token_id, 11, 12, 13, 14, tok.sep_token_id]], dtype=torch.long)
+    special = torch.tensor([[1, 0, 0, 0, 0, 1]], dtype=torch.bool)
+
+    def fake_randint(low: int, high: int, size):
+        return torch.tensor([0], dtype=torch.long)
+
+    def fake_multinomial(input: torch.Tensor, num_samples: int, replacement: bool = False):
+        return torch.tensor([0], dtype=torch.long)
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+    monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+
+    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+
+    # With 4 maskable positions and 75% target ratio, fallback should reach 3 masked positions.
+    assert int(labels.ne(-100).sum().item()) == 3
 
 
 def test_ngram_masking_respects_specials():
@@ -1357,6 +1398,27 @@ def test_rotary_apply_full_dim_matches_reference():
 
     torch.testing.assert_close(q_out, q_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(k_out, k_ref, rtol=0.0, atol=0.0)
+
+
+def test_rotary_embedding_uses_full_head_dim_for_partial_rope_pct():
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    cfg = DebertaRoPEConfig(
+        hidden_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=256,
+        hidden_act="gelu",
+        rotary_pct=0.5,
+    )
+    attn = DebertaRoPESelfAttention(cfg)
+    rope = attn.rope
+    assert rope is not None
+
+    # expected frequencies for the 32-wide head (not 16-wide rotary subspace)
+    dim = torch.arange(0, 16, 2).float()
+    expected = 1.0 / (10000.0 ** (dim / 32))
+    torch.testing.assert_close(rope.inv_freq, expected)
 
 
 def test_rmsnorm_matches_reference_division_form():

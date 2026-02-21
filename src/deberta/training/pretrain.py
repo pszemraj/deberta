@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -259,8 +260,8 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
             return True
         if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
             return True
-        # 1D params are almost always norm scales / biases
-        if p.dim() == 1:
+        # Scalars and 1D params are typically excluded from decay.
+        if p.dim() <= 1:
             return True
         return False
 
@@ -404,9 +405,12 @@ def _compute_disc_active_mask(
     if not special_token_ids:
         return active
 
-    special = torch.zeros_like(input_ids, dtype=torch.bool)
-    for sid in special_token_ids:
-        special = special | input_ids.eq(int(sid))
+    special = torch.isin(
+        input_ids,
+        torch.tensor(
+            sorted(int(sid) for sid in special_token_ids), device=input_ids.device, dtype=input_ids.dtype
+        ),
+    )
 
     # Masked positions are replaced before discriminator scoring and should not
     # be excluded solely because their pre-corruption token may be special.
@@ -1011,13 +1015,17 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
         out = None
         loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+        did_sync_step = False
 
-        for batch, gen_count, disc_count in window:
+        for step_idx, (batch, gen_count, disc_count) in enumerate(window):
             batch = _move_batch_to_device(batch, accelerator.device)
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()
 
-            with accelerator.accumulate(model):
+            is_sync_step = step_idx == (ga_steps - 1)
+            sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
+
+            with sync_ctx:
                 out = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch.get("attention_mask"),
@@ -1041,9 +1049,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                         disc_loss_weight=float(train_cfg.disc_loss_weight),
                         decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
                     )
-                    # Accelerator.backward internally divides by ga_steps; rescale to
-                    # preserve token-weighted full-window normalization.
-                    loss = micro_obj * float(ga_steps)
+                    loss = micro_obj
                     loss_for_metrics = loss_for_metrics + micro_obj.detach()
                 else:
                     loss = out.loss
@@ -1051,8 +1057,10 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
                 accelerator.backward(loss)
 
+            if is_sync_step:
+                did_sync_step = True
                 if _should_clip_gradients(
-                    sync_gradients=bool(accelerator.sync_gradients),
+                    sync_gradients=True,
                     max_grad_norm=train_cfg.max_grad_norm,
                 ):
                     accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
@@ -1061,6 +1069,9 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+        if not did_sync_step:
+            raise RuntimeError("Accumulation window produced no synchronized optimization step.")
+
         loss_for_metrics = _finalize_window_metric_loss(
             accumulated_loss=loss_for_metrics,
             ga_steps=ga_steps,
@@ -1068,7 +1079,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         )
 
         # We count *optimizer* steps (not micro-steps).
-        if accelerator.sync_gradients:
+        if did_sync_step:
             if out is None:
                 raise RuntimeError("Accumulation window produced no forward pass outputs.")
             global_step += 1
