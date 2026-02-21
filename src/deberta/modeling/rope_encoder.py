@@ -195,7 +195,6 @@ class DebertaRoPESelfAttention(nn.Module):
         self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
 
         self.attn_dropout = float(config.attention_probs_dropout_prob)
-        self.resid_dropout = float(config.hidden_dropout_prob)
         self.attn_impl = str(config.attention_implementation)
 
         rotary_dim = int(self.head_dim * float(config.rotary_pct))
@@ -280,7 +279,6 @@ class DebertaRoPESelfAttention(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
         out = self.out_proj(out)
-        out = F.dropout(out, p=self.resid_dropout, training=self.training)
         if query_keep_tokens is not None:
             out = out * query_keep_tokens
         return out
@@ -315,8 +313,6 @@ class DebertaRoPEMLP(nn.Module):
             self.act = _get_act_fn(config.hidden_act)
             self.dense_out = nn.Linear(int(config.intermediate_size), int(config.hidden_size))
 
-        self.dropout = nn.Dropout(float(config.hidden_dropout_prob))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply FFN transform.
 
@@ -326,13 +322,11 @@ class DebertaRoPEMLP(nn.Module):
         if self.ffn_type == "swiglu":
             gate, up = self.w12(x).chunk(2, dim=-1)
             x = self.w3(F.silu(gate) * up)
-            x = self.dropout(x)
             return x
 
         x = self.dense_in(x)
         x = self.act(x)
         x = self.dense_out(x)
-        x = self.dropout(x)
         return x
 
 

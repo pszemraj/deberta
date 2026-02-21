@@ -318,6 +318,29 @@ def test_collator_generates_attention_mask_for_variable_length_inputs():
     assert (batch["attention_mask"] == 0).any()
 
 
+def test_collator_handles_mixed_attention_mask_keys():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    with_mask = {
+        "input_ids": [tok.cls_token_id, 11, tok.sep_token_id],
+        "attention_mask": [1, 1, 1],
+        "special_tokens_mask": [1, 0, 1],
+    }
+    without_mask = {
+        "input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id],
+        "special_tokens_mask": [1, 0, 0, 1],
+    }
+
+    batch_a = coll([with_mask, without_mask])
+    batch_b = coll([without_mask, with_mask])
+
+    for batch in (batch_a, batch_b):
+        assert "attention_mask" in batch
+        assert batch["attention_mask"].shape == batch["input_ids"].shape
+        assert (batch["attention_mask"] == 0).any()
+
+
 def test_collator_infers_special_tokens_mask_when_missing():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.9, max_ngram=1))
@@ -389,6 +412,72 @@ def test_self_attention_zeroes_padded_query_outputs():
 
     assert torch.allclose(out[0, 4:, :], torch.zeros_like(out[0, 4:, :]), atol=1e-6)
     assert torch.allclose(out[1, 5:, :], torch.zeros_like(out[1, 5:, :]), atol=1e-6)
+
+
+def test_self_attention_has_no_internal_residual_dropout():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    torch.manual_seed(0)
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        attention_implementation="eager",
+        hidden_dropout_prob=0.9,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DebertaRoPESelfAttention(cfg)
+    x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.ones((2, 6), dtype=torch.long)
+
+    with torch.no_grad():
+        attn.eval()
+        out_eval = attn(x, attention_mask)
+        attn.train()
+        out_train = attn(x, attention_mask)
+
+    torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
+
+
+def test_mlp_has_no_internal_residual_dropout():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP
+
+    torch.manual_seed(0)
+    for ffn_type in ("mlp", "swiglu"):
+        cfg = DebertaRoPEConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=64,
+            max_position_embeddings=32,
+            type_vocab_size=0,
+            ffn_type=ffn_type,
+            hidden_dropout_prob=0.9,
+            attention_probs_dropout_prob=0.0,
+        )
+        mlp = DebertaRoPEMLP(cfg)
+        x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
+
+        with torch.no_grad():
+            mlp.eval()
+            out_eval = mlp(x)
+            mlp.train()
+            out_train = mlp(x)
+
+        torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
 
 
 def test_self_attention_sdpa_matches_eager_with_padding_mask():
@@ -553,6 +642,105 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
     for sid in (cfg.pad_token_id, cfg.cls_token_id, cfg.sep_token_id, cfg.mask_token_id):
         assert sid is not None
         assert not bool((sampled == int(sid)).any().item())
+
+
+def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import MaskedLMHead
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+    )
+    head = MaskedLMHead(cfg, tie_word_embeddings=True)
+    assert head.decoder is None
+    assert head.bias.shape == (cfg.vocab_size,)
+
+
+def test_masked_lm_head_tied_mode_requires_embedding_weight():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import MaskedLMHead
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+    )
+    head = MaskedLMHead(cfg, tie_word_embeddings=True)
+    hidden = torch.randn((2, cfg.hidden_size), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="requires `word_embedding_weight`"):
+        _ = head(hidden)
+
+
+def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    class _EmbeddingWithoutWeight(torch.nn.Module):
+        def __init__(self, base: torch.nn.Module) -> None:
+            super().__init__()
+            self.base = base
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return self.base(input_ids)
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        pad_token_id=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    generator = DebertaRoPEModel(cfg)
+    generator.embeddings.word_embeddings = _EmbeddingWithoutWeight(generator.embeddings.word_embeddings)
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=generator,
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    )
+    input_ids = torch.tensor([[1, 7, 8, 2]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, 1] = input_ids[0, 1]
+
+    with pytest.raises(RuntimeError, match="word_embeddings must expose a `.weight`"):
+        _ = model(
+            input_ids=input_ids,
+            attention_mask=None,
+            labels=labels,
+            sampling_temperature=1.0,
+            gen_loss_weight=1.0,
+            disc_loss_weight=50.0,
+            decoupled_loss_scaling=False,
+        )
 
 
 def test_rope_model_infers_pad_mask_when_attention_mask_missing():

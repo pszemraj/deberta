@@ -569,6 +569,23 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
             )
 
+    if cfg.generator_config_name_or_path or cfg.generator_model_name_or_path:
+        derived_only = []
+        for name in (
+            "generator_num_hidden_layers",
+            "generator_hidden_size",
+            "generator_intermediate_size",
+            "generator_num_attention_heads",
+        ):
+            if getattr(cfg, name) is not None:
+                derived_only.append(name)
+        if derived_only:
+            raise ValueError(
+                "These options are only used when deriving generator config and must be unset when "
+                "model.generator_config_name_or_path or model.generator_model_name_or_path is provided: "
+                + ", ".join(sorted(derived_only))
+            )
+
 
 def validate_data_config(cfg: DataConfig) -> None:
     """Validate data-source and preprocessing option combinations.
@@ -683,4 +700,12 @@ def validate_training_workflow_options(*, data_cfg: DataConfig, train_cfg: Train
         raise ValueError(
             "train.per_device_eval_batch_size is reserved for future evaluation and is currently unused. "
             f"Keep the default ({default_eval_bs}) while evaluation is disabled."
+        )
+
+    sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
+    if bool(data_cfg.pack_sequences) and sdpa_policy == "flash_only":
+        raise ValueError(
+            "train.sdpa_kernel=flash_only is not supported with data.pack_sequences=true. "
+            "Packed batches may require 3D document-blocking attention masks that are incompatible "
+            "with flash-only SDPA kernels. Use train.sdpa_kernel=flash|auto|mem_efficient|math instead."
         )

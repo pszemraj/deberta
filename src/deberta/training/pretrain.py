@@ -479,6 +479,42 @@ def _save_checkpoint_data_progress(*, checkpoint_dir: Path, consumed_micro_batch
     )
 
 
+def _save_training_checkpoint(
+    *,
+    accelerator: Any,
+    checkpoint_dir: Path,
+    output_dir: Path,
+    consumed_micro_batches: int,
+    save_total_limit: int,
+    log_label: str,
+) -> None:
+    """Save one training checkpoint with collective state-dict write.
+
+    :param Any accelerator: Accelerate runtime object.
+    :param Path checkpoint_dir: Destination checkpoint directory.
+    :param Path output_dir: Parent output directory for checkpoint rotation.
+    :param int consumed_micro_batches: Data progress to persist.
+    :param int save_total_limit: Number of checkpoints to retain.
+    :param str log_label: Logging label for this save.
+    """
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    # save_state can be collective under FSDP sharded checkpointing; all ranks must participate.
+    accelerator.save_state(str(checkpoint_dir))
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        _save_checkpoint_data_progress(
+            checkpoint_dir=checkpoint_dir,
+            consumed_micro_batches=consumed_micro_batches,
+        )
+        _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
+        logger.info(f"Saved {log_label} checkpoint: {checkpoint_dir}")
+
+
 def _prepare_output_dir(
     *,
     output_dir: Path,
@@ -1039,30 +1075,26 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
             # Checkpoint
             if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    ckpt_dir = output_dir / f"checkpoint-{global_step}"
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    accelerator.save_state(str(ckpt_dir))
-                    _save_checkpoint_data_progress(
-                        checkpoint_dir=ckpt_dir,
-                        consumed_micro_batches=consumed_micro_batches,
-                    )
-                    _rotate_checkpoints(output_dir, save_total_limit=int(train_cfg.save_total_limit))
-                    logger.info(f"Saved checkpoint: {ckpt_dir}")
+                ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                _save_training_checkpoint(
+                    accelerator=accelerator,
+                    checkpoint_dir=ckpt_dir,
+                    output_dir=output_dir,
+                    consumed_micro_batches=consumed_micro_batches,
+                    save_total_limit=int(train_cfg.save_total_limit),
+                    log_label="periodic",
+                )
 
     # Final save
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        final_ckpt = output_dir / f"checkpoint-{global_step}"
-        final_ckpt.mkdir(parents=True, exist_ok=True)
-        accelerator.save_state(str(final_ckpt))
-        _save_checkpoint_data_progress(
-            checkpoint_dir=final_ckpt,
-            consumed_micro_batches=consumed_micro_batches,
-        )
-        _rotate_checkpoints(output_dir, save_total_limit=int(train_cfg.save_total_limit))
-        logger.info(f"Saved final checkpoint: {final_ckpt}")
+    final_ckpt = output_dir / f"checkpoint-{global_step}"
+    _save_training_checkpoint(
+        accelerator=accelerator,
+        checkpoint_dir=final_ckpt,
+        output_dir=output_dir,
+        consumed_micro_batches=consumed_micro_batches,
+        save_total_limit=int(train_cfg.save_total_limit),
+        log_label="final",
+    )
 
     # Best-effort HF export
     if train_cfg.export_hf_final:

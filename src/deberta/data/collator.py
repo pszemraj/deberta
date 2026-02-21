@@ -77,6 +77,8 @@ class DebertaV3ElectraCollator:
         self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        features = self._harmonize_optional_attention_masks(features)
+
         # Let tokenizer handle padding for non-packed datasets.
         pad_kwargs: dict[str, Any] = {
             "return_tensors": "pt",
@@ -135,6 +137,25 @@ class DebertaV3ElectraCollator:
         batch["input_ids"] = input_ids
         batch["labels"] = labels
         return batch
+
+    def _harmonize_optional_attention_masks(self, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Ensure optional ``attention_mask`` keys are consistent before tokenizer padding.
+
+        :param list[dict[str, Any]] features: Raw feature dicts.
+        :return list[dict[str, Any]]: Features with harmonized attention-mask keys.
+        """
+        if not features:
+            return features
+        if not any("attention_mask" in f for f in features):
+            return features
+
+        normalized: list[dict[str, Any]] = []
+        for feature in features:
+            item = dict(feature)
+            if "attention_mask" not in item:
+                item["attention_mask"] = [1] * len(item["input_ids"])
+            normalized.append(item)
+        return normalized
 
     def _needs_padding(self, features: list[dict[str, Any]]) -> bool:
         """Check whether tokenizer.pad will add padding.

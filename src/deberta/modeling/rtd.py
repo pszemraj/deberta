@@ -132,11 +132,14 @@ class MaskedLMHead(nn.Module):
         self.vocab_size = int(config.vocab_size)
         self.hidden_size = int(config.hidden_size)
 
-        self.decoder = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
-        self.bias = nn.Parameter(torch.zeros(self.vocab_size))
-        self.decoder.bias = self.bias
-
         self.tie_word_embeddings = bool(tie_word_embeddings)
+        if self.tie_word_embeddings:
+            # Tied mode projects with external embedding weights; keep only output bias.
+            self.decoder = None
+            self.bias = nn.Parameter(torch.zeros(self.vocab_size))
+        else:
+            self.decoder = nn.Linear(self.hidden_size, self.vocab_size, bias=True)
+            self.bias = self.decoder.bias
 
     def forward(
         self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None
@@ -149,17 +152,26 @@ class MaskedLMHead(nn.Module):
         """
         x = self.transform(hidden_states)
 
-        if self.tie_word_embeddings and word_embedding_weight is not None:
-            # Tie only if dimensions match.
-            if word_embedding_weight.shape[1] == x.shape[-1]:
-                w = word_embedding_weight
-                if w.dtype != x.dtype:
-                    w = w.to(dtype=x.dtype)
-                b = self.bias
-                if b.dtype != x.dtype:
-                    b = b.to(dtype=x.dtype)
-                return F.linear(x, w, b)
+        if self.tie_word_embeddings:
+            if word_embedding_weight is None:
+                raise RuntimeError(
+                    "MaskedLMHead requires `word_embedding_weight` when tie_word_embeddings=True."
+                )
+            if word_embedding_weight.shape[1] != x.shape[-1]:
+                raise RuntimeError(
+                    "Tied word_embedding_weight hidden size mismatch: "
+                    f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
+                )
+            w = word_embedding_weight
+            if w.dtype != x.dtype:
+                w = w.to(dtype=x.dtype)
+            b = self.bias
+            if b.dtype != x.dtype:
+                b = b.to(dtype=x.dtype)
+            return F.linear(x, w, b)
 
+        if self.decoder is None:
+            raise RuntimeError("MaskedLMHead decoder is not initialized.")
         return self.decoder(x)
 
 
@@ -338,6 +350,24 @@ class DebertaV3RTDPretrainer(nn.Module):
         probs = torch.softmax(logits_f / temp, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+    def _get_generator_word_embedding_weight(self) -> torch.Tensor:
+        """Return generator token embedding matrix for LM-head tying.
+
+        :return torch.Tensor: Generator word embedding weights.
+        """
+        embeddings = getattr(self.generator, "embeddings", None)
+        if embeddings is None:
+            raise RuntimeError("Generator backbone must expose an `.embeddings` module.")
+
+        word_emb = getattr(embeddings, "word_embeddings", None)
+        if word_emb is None or not hasattr(word_emb, "weight"):
+            raise RuntimeError("Generator word_embeddings must expose a `.weight` tensor for LM-head tying.")
+
+        weight = word_emb.weight
+        if not isinstance(weight, torch.Tensor):
+            raise RuntimeError("Generator word_embeddings.weight must be a torch.Tensor.")
+        return weight
+
     def _special_position_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Build a boolean mask over configured special token ids.
 
@@ -448,7 +478,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         if masked.any():
             masked_hidden = hidden[masked]
             # Compute logits only on masked positions.
-            word_w = self.generator.embeddings.word_embeddings.weight
+            word_w = self._get_generator_word_embedding_weight()
             gen_logits = self.generator_lm_head(masked_hidden, word_embedding_weight=word_w)
             gen_labels = labels[masked]
             gen_loss = F.cross_entropy(gen_logits.float(), gen_labels)

@@ -28,6 +28,7 @@ from deberta.training.pretrain import (
     _normalize_torch_compile_mode,
     _prepare_output_dir,
     _save_checkpoint_data_progress,
+    _save_training_checkpoint,
     _should_force_legacy_tf32_for_compile,
 )
 
@@ -218,6 +219,63 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert _load_checkpoint_data_progress(ckpt) == 123
 
 
+class _FakeAccelerator:
+    def __init__(self, *, is_main_process: bool) -> None:
+        self.is_main_process = bool(is_main_process)
+        self.wait_count = 0
+        self.save_paths: list[str] = []
+
+    def wait_for_everyone(self) -> None:
+        self.wait_count += 1
+
+    def save_state(self, path: str) -> None:
+        self.save_paths.append(path)
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        marker = "main" if self.is_main_process else "worker"
+        (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
+
+
+def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-1"
+    ckpt.mkdir(parents=True, exist_ok=True)
+
+    accel = _FakeAccelerator(is_main_process=False)
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=ckpt,
+        output_dir=out,
+        consumed_micro_batches=7,
+        save_total_limit=3,
+        log_label="periodic",
+    )
+
+    assert accel.save_paths == [str(ckpt)]
+    assert accel.wait_count >= 3
+    assert not (ckpt / "data_state.json").exists()
+
+
+def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-3"
+
+    accel = _FakeAccelerator(is_main_process=True)
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=ckpt,
+        output_dir=out,
+        consumed_micro_batches=42,
+        save_total_limit=3,
+        log_label="final",
+    )
+
+    assert accel.save_paths == [str(ckpt)]
+    assert _load_checkpoint_data_progress(ckpt) == 42
+
+
 def test_build_optimizer_supports_generator_specific_lr():
     model = _TinyRTDLikeModel()
     cfg = TrainConfig(learning_rate=1.0e-3, generator_learning_rate=5.0e-4, weight_decay=0.1)
@@ -382,12 +440,30 @@ def test_validate_training_workflow_options_rejects_eval_knobs():
         )
 
 
+def test_validate_training_workflow_options_rejects_flash_only_with_packing():
+    with pytest.raises(ValueError, match="flash_only is not supported with data.pack_sequences=true"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=True),
+            train_cfg=TrainConfig(sdpa_kernel="flash_only"),
+        )
+
+
 def test_validate_model_config_rejects_rope_only_knobs_in_hf_mode():
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         rope_theta=50_000.0,
     )
     with pytest.raises(ValueError, match="only valid when model.backbone_type='rope'"):
+        validate_model_config(cfg)
+
+
+def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        generator_model_name_or_path="microsoft/deberta-v3-small",
+        generator_hidden_size=256,
+    )
+    with pytest.raises(ValueError, match="only used when deriving generator config"):
         validate_model_config(cfg)
 
 
