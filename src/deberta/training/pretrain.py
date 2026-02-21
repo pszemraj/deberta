@@ -174,6 +174,24 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
     )
 
 
+def _normalize_mixed_precision(value: Any) -> str:
+    """Normalize mixed precision config values for Accelerate.
+
+    :param Any value: Raw user/config value.
+    :return str: Canonical value (``bf16`` or ``no``).
+    """
+    if isinstance(value, bool):
+        return "bf16" if value else "no"
+
+    v = str(value).strip().lower()
+    if v in {"bf16", "bfloat16", "true", "1", "yes", "y"}:
+        return "bf16"
+    if v in {"no", "none", "false", "0", "off", "n"}:
+        return "no"
+
+    raise ValueError(f"train.mixed_precision must be one of: no|bf16. Got: {value}")
+
+
 def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
     """Yield batches forever by cycling through a dataloader.
 
@@ -516,11 +534,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
-    mixed_precision = str(train_cfg.mixed_precision).lower()
-    if mixed_precision == "none":
-        mixed_precision = "no"
-    if mixed_precision not in {"no", "bf16"}:
-        raise ValueError(f"train.mixed_precision must be one of: no|bf16. Got: {train_cfg.mixed_precision}")
+    mixed_precision = _normalize_mixed_precision(train_cfg.mixed_precision)
     accelerator = Accelerator(
         gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
         log_with=log_with,

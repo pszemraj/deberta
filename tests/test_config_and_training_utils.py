@@ -8,7 +8,12 @@ import torch
 
 from deberta.cli import _load_json, _load_yaml
 from deberta.config import TrainConfig
-from deberta.training.pretrain import _build_optimizer, _find_latest_checkpoint, _prepare_output_dir
+from deberta.training.pretrain import (
+    _build_optimizer,
+    _find_latest_checkpoint,
+    _normalize_mixed_precision,
+    _prepare_output_dir,
+)
 
 
 class _TinyRTDLikeModel(torch.nn.Module):
@@ -53,6 +58,7 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
                 "backbone_type: rope",
                 "max_seq_length: 64",
                 "overwrite_output_dir: false",
+                "mixed_precision: no",
                 "mlm_max_ngram: 1",
             ]
         ),
@@ -62,6 +68,7 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
     assert data_flat.max_seq_length == 64
     assert train_flat.overwrite_output_dir is False
     assert train_flat.mlm_max_ngram == 1
+    assert _normalize_mixed_precision(train_flat.mixed_precision) == "no"
 
 
 def test_load_json_nested_and_flat(tmp_path: Path):
@@ -166,3 +173,13 @@ def test_build_optimizer_supports_generator_specific_lr():
 def test_train_config_defaults_to_bf16_autocast():
     cfg = TrainConfig()
     assert cfg.mixed_precision == "bf16"
+
+
+def test_normalize_mixed_precision_accepts_bool_and_synonyms():
+    assert _normalize_mixed_precision("bf16") == "bf16"
+    assert _normalize_mixed_precision("none") == "no"
+    assert _normalize_mixed_precision(False) == "no"
+    assert _normalize_mixed_precision(True) == "bf16"
+
+    with pytest.raises(ValueError, match="train.mixed_precision must be one of: no\\|bf16"):
+        _normalize_mixed_precision("fp16")

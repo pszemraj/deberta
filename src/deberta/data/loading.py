@@ -30,6 +30,9 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
     :param str split: Split name to load.
     :param bool streaming: Whether to request a streaming dataset.
     :return Any: Map-style Dataset or streaming IterableDataset.
+
+    If both ``dataset_name`` and ``data_files`` are set, ``data_files`` are passed through
+    to ``datasets.load_dataset`` for builders that support local files (for example ``text``).
     """
 
     try:
@@ -53,12 +56,19 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
         return ds
 
     if cfg.dataset_name:
+        load_kwargs: dict[str, Any] = {
+            "split": split,
+            "streaming": streaming,
+            "cache_dir": cfg.cache_dir,
+        }
+        if cfg.dataset_config_name:
+            load_kwargs["name"] = cfg.dataset_config_name
+        if cfg.data_files:
+            files = [p.strip() for p in cfg.data_files.split(",") if p.strip()]
+            load_kwargs["data_files"] = files
         return datasets.load_dataset(
             cfg.dataset_name,
-            cfg.dataset_config_name,
-            split=split,
-            streaming=streaming,
-            cache_dir=cfg.cache_dir,
+            **load_kwargs,
         )
 
     if cfg.data_files:
