@@ -258,6 +258,45 @@ def test_pretrainer_forward_smoke():
     assert out.disc_accuracy.ndim == 0
 
 
+def test_rope_model_infers_pad_mask_when_attention_mask_missing():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+
+    torch.manual_seed(0)
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        pad_token_id=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaRoPEModel(cfg).eval()
+
+    input_ids = torch.tensor(
+        [
+            [1, 7, 8, 2, 0, 0],
+            [1, 9, 10, 11, 2, 0],
+        ],
+        dtype=torch.long,
+    )
+    explicit_mask = input_ids.ne(cfg.pad_token_id).long()
+
+    with torch.no_grad():
+        out_missing = model(input_ids=input_ids, attention_mask=None).last_hidden_state
+        out_explicit = model(input_ids=input_ids, attention_mask=explicit_mask).last_hidden_state
+
+    torch.testing.assert_close(out_missing, out_explicit, rtol=0.0, atol=0.0)
+
+
 def test_rope_config_rejects_unknown_ffn_type():
     import pytest
 

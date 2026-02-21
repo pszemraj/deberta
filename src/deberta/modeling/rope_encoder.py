@@ -495,13 +495,23 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         """Run encoder forward pass.
 
         :param torch.Tensor input_ids: Input token ids.
-        :param torch.Tensor | None attention_mask: Optional attention mask. Pass ``None`` for
-            packed/unpadded batches to avoid creating an SDPA mask.
+        :param torch.Tensor | None attention_mask: Optional attention mask. When omitted, we
+            reconstruct a pad mask from ``input_ids`` only if pad tokens are present; otherwise we
+            keep ``None`` to preserve SDPA flash-friendly unpadded execution.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
         :param Any kwargs: Additional compatibility kwargs forwarded by callers.
         :return BaseModelOutput: Last hidden states container.
         """
+        if attention_mask is None:
+            pad_id = getattr(self.config, "pad_token_id", None)
+            if pad_id is not None:
+                pad_positions = input_ids.eq(int(pad_id))
+                # Keep the fast path for packed/unpadded batches (mask stays None), but make
+                # omitted-mask calls with padded input_ids semantically correct.
+                if bool(pad_positions.any().item()):
+                    attention_mask = (~pad_positions).to(dtype=torch.long)
+
         if attention_mask is not None and attention_mask.dtype != torch.long:
             attention_mask = attention_mask.to(dtype=torch.long)
 
