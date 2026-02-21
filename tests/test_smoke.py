@@ -196,6 +196,7 @@ def test_collator_builds_document_block_attention_mask_when_packed():
         tokenizer=tok,
         cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
         packed_sequences=True,
+        block_cross_document_attention=True,
     )
 
     features = [
@@ -215,11 +216,11 @@ def test_collator_builds_document_block_attention_mask_when_packed():
     assert attn[0, 3, 1].item() == 0
     assert attn[0, 1, 2].item() == 1
     assert attn[0, 3, 5].item() == 1
-    # CLS is global in packed mode so it can aggregate across all packed docs.
+    # CLS remains in the first packed document under strict block-diagonal masking.
     assert attn[0, 0, 1].item() == 1
     assert attn[0, 1, 0].item() == 1
-    assert attn[0, 0, 3].item() == 1
-    assert attn[0, 3, 0].item() == 1
+    assert attn[0, 0, 3].item() == 0
+    assert attn[0, 3, 0].item() == 0
 
 
 def test_collator_treats_consecutive_internal_separators_as_single_boundary():
@@ -228,6 +229,7 @@ def test_collator_treats_consecutive_internal_separators_as_single_boundary():
         tokenizer=tok,
         cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
         packed_sequences=True,
+        block_cross_document_attention=True,
     )
 
     # Boundary-aligned packed chunks can produce consecutive separators.
@@ -255,6 +257,7 @@ def test_collator_skips_document_block_attention_mask_for_single_doc_packed_chun
         tokenizer=tok,
         cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
         packed_sequences=True,
+        block_cross_document_attention=True,
     )
 
     features = [
@@ -914,6 +917,26 @@ def test_masked_lm_head_tied_mode_requires_embedding_weight():
     hidden = torch.randn((2, cfg.hidden_size), dtype=torch.float32)
     with pytest.raises(RuntimeError, match="requires `word_embedding_weight`"):
         _ = head(hidden)
+
+
+def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rtd import MLMTransform, RTDHead
+
+    class _Cfg:
+        hidden_size = 16
+        hidden_act = "gelu"
+        hidden_dropout_prob = 0.0
+        layer_norm_eps = 1.0e-5
+        use_rmsnorm_heads = False
+
+    mlm = MLMTransform(_Cfg())
+    rtd = RTDHead(_Cfg())
+    assert isinstance(mlm.norm, torch.nn.LayerNorm)
+    assert isinstance(rtd.norm, torch.nn.LayerNorm)
 
 
 def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():

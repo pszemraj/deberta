@@ -19,6 +19,7 @@ data:
   train_split: train
   streaming: true
   pack_sequences: true
+  block_cross_document_attention: false
   text_column_name: text
   max_seq_length: 128
   shuffle_buffer_size: 1000

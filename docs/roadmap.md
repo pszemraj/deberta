@@ -18,6 +18,7 @@ For implemented behavior, use the concept docs:
 
 - evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts
 - replace collator-time dense document attention mask materialization (`B x S x S`) with a compact doc-boundary representation and on-device block masking to reduce CPU bottlenecks at long context lengths
+- refactor token-weighted GA to avoid whole-window microbatch buffering so large per-batch metadata does not scale host memory linearly with `gradient_accumulation_steps`
 - vectorize whole-word n-gram masking (`mlm_max_ngram > 1`) to remove per-sample Python retry loops that can bottleneck long-context CPU dataloading
 
 ## Runtime/Compile

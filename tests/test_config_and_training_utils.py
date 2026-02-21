@@ -27,11 +27,12 @@ from deberta.config import (
 )
 from deberta.export_cli import _build_export_parser
 from deberta.modeling.builder import build_backbone_configs
-from deberta.modeling.rtd import compute_generator_loss_term
+from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training.pretrain import (
     _build_optimizer,
     _build_training_collator,
     _count_rtd_tokens_for_batch,
+    _export_discriminator_hf,
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
     _load_checkpoint_data_progress,
@@ -394,6 +395,71 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     assert _load_checkpoint_data_progress(ckpt) == 42
 
 
+def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import deberta.training.pretrain as pretrain_mod
+
+    class _Inner(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discriminator = torch.nn.Linear(2, 2)
+            self.generator = torch.nn.Linear(2, 2)
+            self.disc_config = object()
+
+    inner = _Inner()
+
+    class _Wrapped(torch.nn.Module):
+        def __init__(self, wrapped: torch.nn.Module) -> None:
+            super().__init__()
+            self.module = wrapped
+
+    wrapped = _Wrapped(inner)
+    called_targets: list[torch.nn.Module] = []
+
+    class _FakeAccelerator:
+        is_main_process = True
+
+        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+            assert model is wrapped
+            return inner
+
+        def get_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+            called_targets.append(model)
+            return {}
+
+    class _FakeTokenizer:
+        def save_pretrained(self, path: str) -> None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    class _FakeExportModel:
+        def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
+            del safe_serialization
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoModel = types.SimpleNamespace(from_config=lambda _cfg: _FakeExportModel())
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(
+        pretrain_mod,
+        "load_intersection_state_dict",
+        lambda _model, _state: types.SimpleNamespace(missing_keys=[]),
+    )
+    monkeypatch.setattr(
+        pretrain_mod,
+        "merge_embeddings_into_export_backbone",
+        lambda **_kwargs: None,
+    )
+
+    _export_discriminator_hf(
+        accelerator=_FakeAccelerator(),
+        model=wrapped,  # type: ignore[arg-type]
+        tokenizer=_FakeTokenizer(),
+        output_dir=tmp_path / "export",
+        embedding_sharing="none",
+    )
+
+    assert called_targets == [inner.discriminator, inner.generator]
+
+
 def test_build_optimizer_supports_generator_specific_lr():
     model = _TinyRTDLikeModel()
     cfg = TrainConfig(learning_rate=1.0e-3, generator_learning_rate=5.0e-4, weight_decay=0.1)
@@ -417,6 +483,11 @@ def test_model_config_defaults_dropouts_to_zero():
     cfg = ModelConfig()
     assert cfg.hidden_dropout_prob == pytest.approx(0.0)
     assert cfg.attention_probs_dropout_prob == pytest.approx(0.0)
+
+
+def test_data_config_defaults_disable_cross_document_blocking():
+    cfg = DataConfig()
+    assert cfg.block_cross_document_attention is False
 
 
 def test_model_config_defaults_to_adjust_swiglu_intermediate():
@@ -603,6 +674,29 @@ def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
 
     expected = torch.tensor([[False, True, False, True, False]], dtype=torch.bool)
     assert torch.equal(mask, expected)
+
+
+def test_attention_mask_to_active_tokens_uses_pad_contract_for_3d_masks():
+    input_ids = torch.tensor([[11, 12, 0]], dtype=torch.long)
+    # Deliberately make the pad row look active in the pairwise mask to ensure
+    # active-token recovery does not depend on O(S^2) reductions over mask rows.
+    pair_keep = torch.tensor(
+        [
+            [
+                [1, 1, 0],
+                [1, 1, 0],
+                [1, 0, 0],
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=pair_keep,
+        pad_token_id=0,
+    )
+    expected = torch.tensor([[True, True, False]], dtype=torch.bool)
+    assert torch.equal(active, expected)
 
 
 def test_build_optimizer_marks_scalar_params_as_no_decay():
@@ -831,7 +925,11 @@ def test_validate_training_workflow_options_rejects_eval_knobs():
 def test_validate_training_workflow_options_rejects_flash_only_with_packing():
     with pytest.raises(ValueError, match="flash_only is not supported with data.pack_sequences=true"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=True),
+            data_cfg=DataConfig(
+                dataset_name="HuggingFaceFW/fineweb-edu",
+                pack_sequences=True,
+                block_cross_document_attention=True,
+            ),
             train_cfg=TrainConfig(sdpa_kernel="flash_only"),
         )
 
@@ -929,6 +1027,7 @@ def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs(
         assert getattr(cfg, "mask_token_id", None) == 3
         assert getattr(cfg, "bos_token_id", None) == 4
         assert getattr(cfg, "eos_token_id", None) == 5
+        assert getattr(cfg, "use_rmsnorm_heads", None) is False
 
 
 def test_build_backbone_configs_hf_respects_explicit_zero_dropout_overrides(

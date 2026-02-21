@@ -98,4 +98,9 @@ RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.
 
 Packed 3D document-blocking masks are also rope-only. If `data.pack_sequences=true` with HF backbone mode, set `data.block_cross_document_attention=false`.
 
+Pretraining heads follow backbone norm style by config:
+
+- rope mode: RMSNorm heads
+- hf_deberta_v2 mode: LayerNorm heads
+
 When `backbone_type=rope` and `from_scratch=false`, checkpoint sources must be RoPE checkpoints produced from this repo's architecture. Official HF DeBERTa v2/v3 checkpoints are architecturally incompatible with the RoPE backbone.

@@ -232,6 +232,8 @@ def test_build_backbone_configs_propagates_tokenizer_special_ids_for_rope():
         expected = int(getattr(tokenizer, attr))
         assert int(getattr(disc_cfg, attr)) == expected
         assert int(getattr(gen_cfg, attr)) == expected
+    assert bool(getattr(disc_cfg, "use_rmsnorm_heads", False)) is True
+    assert bool(getattr(gen_cfg, "use_rmsnorm_heads", False)) is True
 
 
 def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monkeypatch: pytest.MonkeyPatch):
@@ -380,6 +382,8 @@ def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts(monkeyp
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         discriminator_model_name_or_path="disc",
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -405,6 +409,8 @@ def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts_when_fr
         backbone_type="hf_deberta_v2",
         from_scratch=True,
         discriminator_model_name_or_path="disc",
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,

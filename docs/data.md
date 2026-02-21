@@ -34,16 +34,14 @@ Output fields:
 
 Packed chunks can contain inserted internal `[SEP]` separators. Those positions are marked as special in `special_tokens_mask`, so masking never corrupts those separators.
 
-When internal separators are present, the collator emits a pairwise attention keep-mask (`B x S x S`) that blocks cross-document attention within packed sequences.
-
-Packed block masking keeps `CLS` as a global token (it can attend to all active tokens and all active tokens can attend to it), so pooled `CLS` representations are not restricted to only the first packed document.
+When internal separators are present and `data.block_cross_document_attention=true`, the collator emits a pairwise attention keep-mask (`B x S x S`) that blocks cross-document attention within packed sequences.
 
 This packed pairwise mask is represented as a boolean keep-mask (`True = attend`, `False = block`).
 
 `data.block_cross_document_attention` controls this behavior:
 
-- `true` (default): emit 3D doc-blocking masks for packed batches with internal separators
-- `false`: skip 3D doc-blocking masks (packed batches remain on 2D/no-mask attention paths)
+- `false` (default): skip 3D doc-blocking masks (packed batches remain on 2D/no-mask attention paths)
+- `true`: emit 3D doc-blocking masks for packed batches with internal separators
 
 ## Sequential / No-Pack Mode
 
