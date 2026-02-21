@@ -84,3 +84,4 @@ Downstream model code treats missing masks as unpadded (`attention_mask=None`).
 ## Deferred TODOs
 
 - TODO: decide whether to remove or rewire `_maybe_tokenize_non_streaming` so non-streaming behavior has a single documented path without dormant helper code.
+- TODO: evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts.
