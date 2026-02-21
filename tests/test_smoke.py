@@ -169,6 +169,43 @@ def test_packed_streaming_does_not_emit_separator_only_tail_chunk():
     assert ex["special_tokens_mask"] == [1, 0, 0, 0, 0, 0, 0, 1]
 
 
+def test_packed_streaming_epoch_changes_shuffle_seed():
+    class _ShuffleProbeDataset:
+        def __init__(self) -> None:
+            self.last_seed: int | None = None
+            self._rows = [{"text": "a b c"}]
+
+        def shuffle(self, *, buffer_size: int, seed: int):
+            del buffer_size
+            self.last_seed = int(seed)
+            return self
+
+        def shard(self, *, num_shards: int, index: int):
+            del num_shards
+            del index
+            return self
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    tok = DummyTokenizer(vocab_size=64)
+    probe = _ShuffleProbeDataset()
+    ds = PackedStreamingDataset(
+        hf_dataset=probe,
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(text_column_name="text", max_seq_length=8, seed=7, shuffle_buffer_size=16),
+        process_index=0,
+        num_processes=1,
+    )
+
+    _ = list(ds)
+    assert probe.last_seed == 7
+
+    ds.set_epoch(3)
+    _ = list(ds)
+    assert probe.last_seed == 10
+
+
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a b c d e f g h i"}]
@@ -639,6 +676,47 @@ def test_self_attention_handles_pairwise_mask_rows_without_keys():
 
     assert torch.isfinite(out).all()
     assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
+
+
+def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        attention_implementation="eager",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DebertaRoPESelfAttention(cfg).eval()
+    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    # Last row/col correspond to pad-like token with no valid edges.
+    pair_keep = torch.tensor(
+        [
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 0],
+            ]
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        out = attn(x, pair_keep)
+
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
 
 
 def test_mlp_has_no_internal_residual_dropout():

@@ -32,6 +32,7 @@ from deberta.training.pretrain import (
     _build_optimizer,
     _build_training_collator,
     _count_rtd_tokens_for_batch,
+    _cycle_dataloader,
     _export_discriminator_hf,
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
@@ -393,6 +394,32 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
 
     assert accel.save_paths == [str(ckpt)]
     assert _load_checkpoint_data_progress(ckpt) == 42
+
+
+def test_cycle_dataloader_advances_dataset_epoch_each_pass():
+    class _EpochDataset(torch.utils.data.IterableDataset):
+        def __init__(self) -> None:
+            super().__init__()
+            self.current_epoch = -1
+            self.seen_epochs: list[int] = []
+
+        def set_epoch(self, epoch: int) -> None:
+            self.current_epoch = int(epoch)
+            self.seen_epochs.append(int(epoch))
+
+        def __iter__(self):
+            yield {"epoch": torch.tensor(self.current_epoch, dtype=torch.long)}
+
+    ds = _EpochDataset()
+    dl = torch.utils.data.DataLoader(ds, batch_size=None, num_workers=0)
+    it = _cycle_dataloader(dl)
+
+    e0 = int(next(it)["epoch"].item())
+    e1 = int(next(it)["epoch"].item())
+    e2 = int(next(it)["epoch"].item())
+
+    assert (e0, e1, e2) == (0, 1, 2)
+    assert ds.seen_epochs[:3] == [0, 1, 2]
 
 
 def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

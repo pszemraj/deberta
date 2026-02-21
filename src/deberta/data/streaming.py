@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -56,6 +57,7 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         self.cfg = cfg
         self.process_index = int(process_index)
         self.num_processes = int(num_processes)
+        self._epoch = mp.Value("i", 0)
 
         if not hasattr(tokenizer, "cls_token_id") or tokenizer.cls_token_id is None:
             raise ValueError("Tokenizer must define cls_token_id.")
@@ -69,12 +71,21 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
         :param int epoch: Training epoch.
         """
+        with self._epoch.get_lock():
+            self._epoch.value = int(max(0, epoch))
         # Some streaming datasets support set_epoch() for deterministic shuffling.
         if hasattr(self.hf_dataset, "set_epoch"):
             try:
                 self.hf_dataset.set_epoch(epoch)
             except Exception:
                 pass
+
+    def _current_epoch(self) -> int:
+        """Read current epoch value.
+
+        :return int: Current dataset epoch.
+        """
+        return int(self._epoch.value)
 
     def _shard_dataset_for_worker(self, ds: Any) -> Any:
         """Shard dataset across processes and dataloader workers.
@@ -104,13 +115,15 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         :return Iterator[dict[str, Any]]: Example iterator.
         """
         ds = self.hf_dataset
+        epoch = self._current_epoch()
+        shuffle_seed = int(self.cfg.seed) + int(epoch)
         if self.cfg.shuffle_buffer_size and self.cfg.shuffle_buffer_size > 0 and hasattr(ds, "shuffle"):
             try:
                 # IterableDataset-style shuffle (streaming reservoir shuffle).
-                ds = ds.shuffle(buffer_size=self.cfg.shuffle_buffer_size, seed=self.cfg.seed)
+                ds = ds.shuffle(buffer_size=self.cfg.shuffle_buffer_size, seed=shuffle_seed)
             except TypeError:
                 # Map-style Dataset.shuffle does not accept buffer_size.
-                ds = ds.shuffle(seed=self.cfg.seed)
+                ds = ds.shuffle(seed=shuffle_seed)
         ds = self._shard_dataset_for_worker(ds)
         return iter(ds)
 

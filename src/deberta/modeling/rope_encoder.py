@@ -229,6 +229,7 @@ class DebertaRoPESelfAttention(nn.Module):
         use_sdpa = self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention")
         sdpa_attn_mask = None
         eager_attn_mask = None
+        query_keep: torch.Tensor | None = None
         query_keep_tokens = None
         if attention_mask is not None:
             mask = attention_mask.to(dtype=torch.bool)
@@ -246,12 +247,6 @@ class DebertaRoPESelfAttention(nn.Module):
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
                 pair_keep = mask
                 query_keep = pair_keep.any(dim=-1)
-
-                # Guarantee self-attend on the diagonal while avoiding dense SxS eye
-                # allocation in every attention layer.
-                pair_keep = pair_keep.clone()
-                diag_idx = torch.arange(seq_len, device=pair_keep.device)
-                pair_keep[:, diag_idx, diag_idx] = True
 
                 sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
                 if not use_sdpa:
@@ -279,6 +274,11 @@ class DebertaRoPESelfAttention(nn.Module):
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, nh, S, S)
             if eager_attn_mask is not None:
                 scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
+                if query_keep is not None:
+                    # Avoid NaNs for all-masked query rows in eager mode. Those
+                    # rows are explicitly zeroed after projection via query_keep_tokens.
+                    dead_queries = (~query_keep)[:, None, :, None]
+                    scores = scores.masked_fill(dead_queries, 0.0)
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn, v)

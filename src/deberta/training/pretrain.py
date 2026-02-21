@@ -472,8 +472,17 @@ def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
     :param DataLoader dl: Source dataloader.
     :return Iterator[dict[str, torch.Tensor]]: Infinite batch iterator.
     """
+    epoch = 0
+    dataset = getattr(dl, "dataset", None)
     while True:
+        set_epoch = getattr(dataset, "set_epoch", None)
+        if callable(set_epoch):
+            try:
+                set_epoch(epoch)
+            except Exception:
+                pass
         yield from dl
+        epoch += 1
 
 
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
