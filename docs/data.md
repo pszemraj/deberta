@@ -36,6 +36,8 @@ Packed chunks can contain inserted internal `[SEP]` separators. Those positions 
 
 When internal separators are present, the collator emits a pairwise attention keep-mask (`B x S x S`) that blocks cross-document attention within packed sequences.
 
+Packed block masking keeps `CLS` as a global token (it can attend to all active tokens and all active tokens can attend to it), so pooled `CLS` representations are not restricted to only the first packed document.
+
 ## Sequential / No-Pack Mode
 
 Set `data.pack_sequences=false` to switch to one-document chunking:

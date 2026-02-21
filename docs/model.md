@@ -31,6 +31,7 @@ Key options in `ModelConfig`:
   - these values are applied to both discriminator and generator configs unless explicitly set to `null` in config to preserve checkpoint-native dropout values
 - FFN block:
   - `ffn_type`: `swiglu` (default) or `mlp`
+  - `use_bias`: whether attention/FFN projections use bias (`false` by default for scratch RoPE builds)
   - `swiglu_adjust_intermediate` (default `true`) scales `intermediate_size` by `2/3` for scratch RoPE + SwiGLU builds so FFN parameter budget stays comparable to MLP settings
   - derived generator configs inherit discriminator scaling; explicit `generator_intermediate_size` remains explicit (not auto-rescaled)
   - note: `ffn_type` is applied for `model.from_scratch=true`; pretrained RoPE loads preserve the checkpoint's FFN type unless you provide matching configs.
@@ -54,6 +55,8 @@ How to choose:
 - Treat KEEL as the depth-scaling path, not as a correctness fix required for normal 12-28 layer runs.
 
 For details on KEEL's residual form and paper context, see [`docs/keel-paper-technical-overview.md`](keel-paper-technical-overview.md).
+
+Input embedding RMSNorm is intentionally kept in front of the encoder stack. With RMSNorm-based Post-LN/KEEL blocks this means first-layer input is already normalized, which is a deliberate stability choice in this codebase (not an accidental duplicate LayerNorm artifact).
 
 ## Generator/Discriminator Configuration
 
@@ -84,3 +87,5 @@ If `generator_config_name_or_path` or `generator_model_name_or_path` is set, the
 With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
+
+When `backbone_type=rope` and `from_scratch=false`, checkpoint sources must be RoPE checkpoints produced from this repo's architecture. Official HF DeBERTa v2/v3 checkpoints are architecturally incompatible with the RoPE backbone.

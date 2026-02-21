@@ -50,6 +50,8 @@ Enable with:
 
 If compile fails at runtime, training logs a warning and continues without compile.
 
+Current limitation: RTD generator sampling/corruption uses dynamic operations (`multinomial` + indexed token replacement) that can introduce graph breaks. The project keeps compile support as best-effort and tracks compile-boundary refinement as a follow-up in [`docs/roadmap.md`](roadmap.md).
+
 ## SDPA Kernel Policy
 
 Use `train.sdpa_kernel` to set SDPA backend preference:
