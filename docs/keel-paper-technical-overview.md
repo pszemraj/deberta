@@ -25,10 +25,7 @@ In this repo KEEL is enabled by:
 
 - `model.norm_arch: keel`
 
-Related options:
-
-- `model.keel_alpha_init` (optional explicit alpha)
-- `model.keel_alpha_learnable` (optional learned scalar)
+Related KEEL configuration options (`model.keel_alpha_init`, `model.keel_alpha_learnable`) are documented in [`docs/model.md`](model.md).
 
 Default path remains standard Post-norm (`model.norm_arch: post`).
 

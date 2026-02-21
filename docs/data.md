@@ -79,6 +79,4 @@ The pipeline keeps this path lean by:
 
 Downstream model code treats missing masks as unpadded (`attention_mask=None`).
 
-## Deferred TODOs
-
-- TODO: evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts.
+Deferred data/packing follow-ups are tracked in [`docs/roadmap.md`](roadmap.md).

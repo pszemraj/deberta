@@ -44,6 +44,7 @@ pip install "git+https://github.com/pszemraj/deberta.git"
 
 - `deberta train` (training)
 - `deberta export` (checkpoint consolidation/export)
+- `python -m deberta` (module entrypoint)
 
 Use `--help` on each command for full argument docs.
 
@@ -84,6 +85,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - RTD objective, loss terms, and generator masked-only logits path: [`docs/objective.md`](docs/objective.md)
 - FSDP2 setup, precision/runtime knobs (`bf16` autocast, TF32, `torch.compile`, SDPA policy), and export flow: [`docs/fsdp2.md`](docs/fsdp2.md)
 - KEEL architecture paper notes and rationale: [`docs/keel-paper-technical-overview.md`](docs/keel-paper-technical-overview.md)
+- Deferred/planned follow-ups: [`docs/roadmap.md`](docs/roadmap.md)
 
 ## Configs
 
@@ -99,11 +101,6 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - `src/deberta/export_cli.py` - FSDP-aware exporter
 - `configs/` - training and accelerate configs
 - `docs/` - canonical docs by concept
-
-## Deferred TODOs
-
-- TODO: make constrained CLI choice parsing case-insensitive so CLI behavior matches config-file normalization.
-- TODO: improve help output for mutually exclusive boolean flag pairs so default rendering is less ambiguous.
 
 ## Citations
 
