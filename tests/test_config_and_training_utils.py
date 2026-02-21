@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,15 @@ import torch
 
 import deberta.cli as cli_mod
 from deberta.cli import _load_json, _load_yaml
-from deberta.config import TrainConfig
+from deberta.config import (
+    DataConfig,
+    ModelConfig,
+    TrainConfig,
+    validate_data_config,
+    validate_model_config,
+    validate_training_workflow_options,
+)
+from deberta.export_cli import _build_export_parser
 from deberta.training.pretrain import (
     _build_optimizer,
     _find_latest_checkpoint,
@@ -119,6 +128,39 @@ def test_load_json_unknown_key_raises(tmp_path: Path):
     bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
     with pytest.raises(ValueError, match="Unknown keys in config file"):
         _load_json(bad)
+
+
+def test_load_json_nested_unknown_top_level_key_raises(tmp_path: Path):
+    bad = tmp_path / "bad_nested.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "model": {"backbone_type": "rope"},
+                "unexpected_top_level_key": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
+        _load_json(bad)
+
+
+def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
+    pytest.importorskip("yaml")
+
+    bad = tmp_path / "bad_nested.yaml"
+    bad.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  backbone_type: rope",
+                "unexpected_top_level_key: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
+        _load_yaml(bad)
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
@@ -235,6 +277,7 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
         "\n".join(
             [
                 "data:",
+                "  dataset_name: c4",
                 "  max_seq_length: 32",
                 "train:",
                 "  max_steps: 5",
@@ -280,3 +323,75 @@ def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.Mon
     assert cfg.checkpoint_dir == "runs/demo/checkpoint-10"
     assert cfg.export_what == "generator"
     assert cfg.output_dir == "runs/demo/exported_hf"
+
+
+def test_train_cli_rejects_invalid_constrained_values_at_parse_time():
+    parser = cli_mod._build_main_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["train", "--norm_arch", "invalid"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["train", "--report_to", "invalid"])
+
+
+def test_export_parser_rejects_conflicting_boolean_flags():
+    parser = _build_export_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["runs/demo/checkpoint-10", "--safe-serialization", "--no-safe-serialization"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["runs/demo/checkpoint-10", "--offload-to-cpu", "--no-offload-to-cpu"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["runs/demo/checkpoint-10", "--rank0-only", "--no-rank0-only"])
+
+
+def test_validate_data_config_rejects_conflicting_sources():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        validate_data_config(
+            DataConfig(
+                load_from_disk="runs/saved_ds",
+                dataset_name="c4",
+                streaming=False,
+            )
+        )
+
+
+def test_validate_training_workflow_options_rejects_eval_knobs():
+    with pytest.raises(ValueError, match="Evaluation workflow is not implemented yet"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="c4", eval_split="validation"),
+            train_cfg=TrainConfig(),
+        )
+
+    with pytest.raises(ValueError, match="currently unused"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="c4"),
+            train_cfg=TrainConfig(per_device_eval_batch_size=8),
+        )
+
+
+def test_validate_model_config_rejects_rope_only_knobs_in_hf_mode():
+    cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        rope_theta=50_000.0,
+    )
+    with pytest.raises(ValueError, match="only valid when model.backbone_type='rope'"):
+        validate_model_config(cfg)
+
+
+def test_readme_cli_examples_are_parseable():
+    parser = cli_mod._build_main_parser()
+    examples = [
+        "train configs/pretrain_rope_c4_en.yaml",
+        "train configs/pretrain_rope_c4_en_2048.yaml",
+        "train configs/pretrain_rope_c4_en_4096.yaml",
+        (
+            "export runs/deberta_rope_rtd/checkpoint-10000 "
+            "--what discriminator "
+            "--output-dir runs/deberta_rope_rtd/exported_hf"
+        ),
+    ]
+
+    for cmd in examples:
+        parser.parse_args(shlex.split(cmd))

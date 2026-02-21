@@ -14,7 +14,15 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from deberta.config import DataConfig, ModelConfig, TrainConfig
+from deberta.config import (
+    DataConfig,
+    ModelConfig,
+    TrainConfig,
+    validate_data_config,
+    validate_model_config,
+    validate_train_config,
+    validate_training_workflow_options,
+)
 from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
@@ -737,6 +745,12 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     )
 
     _setup_logging(accelerator.is_main_process)
+    # Validate config contract up-front before side effects (filesystem/network/model loading).
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg)
+
     force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
         torch_compile=bool(train_cfg.torch_compile),
         compile_mode=compile_mode,

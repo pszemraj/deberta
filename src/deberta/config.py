@@ -4,6 +4,41 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+_BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
+_NORM_ARCH_CHOICES = {"post", "keel"}
+_ATTN_IMPL_CHOICES = {"sdpa", "eager"}
+_FFN_CHOICES = {"swiglu", "mlp"}
+_EMBED_SHARING_CHOICES = {"none", "es", "gdes"}
+_REPORT_TO_CHOICES = {"none", "wandb", "tensorboard"}
+_LR_SCHEDULER_CHOICES = {
+    "linear",
+    "cosine",
+    "cosine_with_restarts",
+    "polynomial",
+    "constant",
+    "constant_with_warmup",
+}
+_SDPA_KERNEL_CHOICES = {"auto", "flash", "mem_efficient", "math", "flash_only"}
+_SDPA_KERNEL_ALIASES = {
+    "mem": "mem_efficient",
+    "mem-efficient": "mem_efficient",
+    "efficient": "mem_efficient",
+    "flashattention": "flash",
+    "flash_attention": "flash",
+}
+_TORCH_COMPILE_MODE_CHOICES = {
+    "default",
+    "reduce-overhead",
+    "max-autotune",
+    "max-autotune-no-cudagraphs",
+}
+_TORCH_COMPILE_MODE_ALIASES = {
+    "reduce_overhead": "reduce-overhead",
+    "max_autotune": "max-autotune",
+    "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
+}
+_MIXED_PRECISION_CHOICES = {"bf16", "bfloat16", "no", "none"}
+
 
 @dataclass
 class ModelConfig:
@@ -232,7 +267,10 @@ class DataConfig:
 
     train_split: str = field(default="train", metadata={"help": "Train split name."})
 
-    eval_split: str | None = field(default=None, metadata={"help": "Optional eval split name."})
+    eval_split: str | None = field(
+        default=None,
+        metadata={"help": "Reserved for future evaluation workflow. Currently unsupported."},
+    )
 
     text_column_name: str = field(
         default="text",
@@ -293,7 +331,15 @@ class TrainConfig:
 
     per_device_train_batch_size: int = field(default=4, metadata={"help": "Train batch size per device."})
 
-    per_device_eval_batch_size: int = field(default=4, metadata={"help": "Eval batch size per device."})
+    per_device_eval_batch_size: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Reserved for future evaluation workflow. Currently unused "
+                "(must remain default while eval is disabled)."
+            )
+        },
+    )
 
     gradient_accumulation_steps: int = field(
         default=1, metadata={"help": "Accumulate gradients this many steps before optimizer step."}
@@ -359,7 +405,10 @@ class TrainConfig:
     # Logging / eval / save
     logging_steps: int = field(default=50, metadata={"help": "Log every N optimizer steps."})
 
-    eval_steps: int = field(default=0, metadata={"help": "Run eval every N steps. 0 disables."})
+    eval_steps: int = field(
+        default=0,
+        metadata={"help": "Reserved for future evaluation workflow. Must remain 0."},
+    )
 
     save_steps: int = field(default=1_000, metadata={"help": "Save checkpoint every N steps."})
 
@@ -426,3 +475,194 @@ class TrainConfig:
             )
         },
     )
+
+
+def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
+    """Normalize and validate a string option against allowed choices.
+
+    :param str name: Option name.
+    :param str value: Raw option value.
+    :param set[str] choices: Allowed lower-case values.
+    :return str: Canonical lower-case value.
+    """
+    v = str(value).strip().lower()
+    if v not in choices:
+        allowed = "|".join(sorted(choices))
+        raise ValueError(f"{name} must be one of: {allowed}. Got: {value}")
+    return v
+
+
+def _normalize_sdpa_kernel(value: str) -> str:
+    """Normalize and validate SDPA kernel policy values.
+
+    :param str value: Raw SDPA kernel value.
+    :return str: Canonical lower-case SDPA kernel policy.
+    """
+    v = str(value).strip().lower()
+    v = _SDPA_KERNEL_ALIASES.get(v, v)
+    return _ensure_choice("train.sdpa_kernel", v, _SDPA_KERNEL_CHOICES)
+
+
+def _normalize_torch_compile_mode(value: str) -> str:
+    """Normalize and validate torch.compile mode values.
+
+    :param str value: Raw compile mode value.
+    :return str: Canonical compile mode.
+    """
+    v = str(value).strip().lower()
+    v = _TORCH_COMPILE_MODE_ALIASES.get(v, v)
+    return _ensure_choice("train.torch_compile_mode", v, _TORCH_COMPILE_MODE_CHOICES)
+
+
+def validate_model_config(cfg: ModelConfig) -> None:
+    """Validate model config semantics and normalize constrained values.
+
+    :param ModelConfig cfg: Model configuration.
+    """
+    cfg.backbone_type = _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
+    cfg.norm_arch = _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES)
+    cfg.attention_implementation = _ensure_choice(
+        "model.attention_implementation", cfg.attention_implementation, _ATTN_IMPL_CHOICES
+    )
+    cfg.ffn_type = _ensure_choice("model.ffn_type", cfg.ffn_type, _FFN_CHOICES)
+    cfg.embedding_sharing = _ensure_choice(
+        "model.embedding_sharing", cfg.embedding_sharing, _EMBED_SHARING_CHOICES
+    )
+
+    if cfg.max_position_embeddings is not None and int(cfg.max_position_embeddings) <= 0:
+        raise ValueError("model.max_position_embeddings must be > 0 when provided.")
+    if float(cfg.rotary_pct) <= 0.0 or float(cfg.rotary_pct) > 1.0:
+        raise ValueError("model.rotary_pct must be in (0, 1].")
+
+    # Explicit dependency check: rope-only knobs are invalid in HF-compat mode.
+    if cfg.backbone_type == "hf_deberta_v2":
+        defaults = ModelConfig()
+        rope_only = (
+            "rope_theta",
+            "rotary_pct",
+            "use_absolute_position_embeddings",
+            "max_position_embeddings",
+            "type_vocab_size",
+            "norm_arch",
+            "norm_eps",
+            "keel_alpha_init",
+            "keel_alpha_learnable",
+            "attention_implementation",
+            "ffn_type",
+            "initializer_range",
+        )
+        changed = [name for name in rope_only if getattr(cfg, name) != getattr(defaults, name)]
+        if changed:
+            raise ValueError(
+                "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
+            )
+
+
+def validate_data_config(cfg: DataConfig) -> None:
+    """Validate data-source and preprocessing option combinations.
+
+    :param DataConfig cfg: Data configuration.
+    """
+    if cfg.load_from_disk:
+        if cfg.streaming:
+            raise ValueError(
+                "data.streaming=true is not compatible with data.load_from_disk. Set data.streaming=false."
+            )
+        conflicting = []
+        if cfg.dataset_name:
+            conflicting.append("data.dataset_name")
+        if cfg.data_files:
+            conflicting.append("data.data_files")
+        if cfg.dataset_config_name:
+            conflicting.append("data.dataset_config_name")
+        if conflicting:
+            raise ValueError("data.load_from_disk cannot be combined with: " + ", ".join(sorted(conflicting)))
+
+    if cfg.dataset_config_name and not cfg.dataset_name:
+        raise ValueError("data.dataset_config_name requires data.dataset_name.")
+
+    if not cfg.load_from_disk and not cfg.dataset_name and not cfg.data_files:
+        raise ValueError(
+            "No dataset source configured. Provide one of: data.load_from_disk, "
+            "data.dataset_name, or data.data_files."
+        )
+
+    if int(cfg.max_seq_length) < 8:
+        raise ValueError("data.max_seq_length must be >= 8 for pretraining.")
+    if int(cfg.shuffle_buffer_size) < 0:
+        raise ValueError("data.shuffle_buffer_size must be >= 0.")
+    if int(cfg.preprocessing_num_workers) < 0:
+        raise ValueError("data.preprocessing_num_workers must be >= 0.")
+
+
+def validate_train_config(cfg: TrainConfig) -> None:
+    """Validate train config scalar ranges and constrained options.
+
+    :param TrainConfig cfg: Training configuration.
+    """
+    cfg.report_to = _ensure_choice("train.report_to", cfg.report_to, _REPORT_TO_CHOICES)
+    cfg.lr_scheduler_type = _ensure_choice(
+        "train.lr_scheduler_type", cfg.lr_scheduler_type, _LR_SCHEDULER_CHOICES
+    )
+    cfg.sdpa_kernel = _normalize_sdpa_kernel(cfg.sdpa_kernel)
+    cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
+
+    mp = cfg.mixed_precision
+    if isinstance(mp, bool):
+        pass
+    else:
+        v = str(mp).strip().lower()
+        if v not in _MIXED_PRECISION_CHOICES:
+            raise ValueError("train.mixed_precision must be one of: bf16|no (or synonyms bfloat16|none).")
+
+    if int(cfg.max_steps) <= 0:
+        raise ValueError("train.max_steps must be > 0.")
+    if int(cfg.per_device_train_batch_size) <= 0:
+        raise ValueError("train.per_device_train_batch_size must be > 0.")
+    if int(cfg.per_device_eval_batch_size) <= 0:
+        raise ValueError("train.per_device_eval_batch_size must be > 0.")
+    if int(cfg.gradient_accumulation_steps) <= 0:
+        raise ValueError("train.gradient_accumulation_steps must be > 0.")
+    if int(cfg.warmup_steps) < 0:
+        raise ValueError("train.warmup_steps must be >= 0.")
+    if int(cfg.logging_steps) < 0:
+        raise ValueError("train.logging_steps must be >= 0.")
+    if int(cfg.eval_steps) < 0:
+        raise ValueError("train.eval_steps must be >= 0.")
+    if int(cfg.save_steps) < 0:
+        raise ValueError("train.save_steps must be >= 0.")
+    if int(cfg.save_total_limit) < 0:
+        raise ValueError("train.save_total_limit must be >= 0.")
+
+    mlm = float(cfg.mlm_probability)
+    if mlm <= 0.0 or mlm >= 1.0:
+        raise ValueError("train.mlm_probability must be in (0, 1).")
+    mask_p = float(cfg.mask_token_prob)
+    rand_p = float(cfg.random_token_prob)
+    if mask_p < 0.0 or rand_p < 0.0 or (mask_p + rand_p) > 1.0:
+        raise ValueError(
+            "Invalid masking probabilities: train.mask_token_prob + train.random_token_prob must be <= 1."
+        )
+    if int(cfg.mlm_max_ngram) < 1:
+        raise ValueError("train.mlm_max_ngram must be >= 1.")
+    if float(cfg.sampling_temperature) <= 0.0:
+        raise ValueError("train.sampling_temperature must be > 0.")
+
+
+def validate_training_workflow_options(*, data_cfg: DataConfig, train_cfg: TrainConfig) -> None:
+    """Validate options tied to workflow support (for example, eval mode availability).
+
+    :param DataConfig data_cfg: Data configuration.
+    :param TrainConfig train_cfg: Training configuration.
+    """
+    if data_cfg.eval_split is not None or int(train_cfg.eval_steps) > 0:
+        raise ValueError(
+            "Evaluation workflow is not implemented yet. Set data.eval_split=null and train.eval_steps=0."
+        )
+
+    default_eval_bs = TrainConfig().per_device_eval_batch_size
+    if int(train_cfg.per_device_eval_batch_size) != int(default_eval_bs):
+        raise ValueError(
+            "train.per_device_eval_batch_size is reserved for future evaluation and is currently unused. "
+            f"Keep the default ({default_eval_bs}) while evaluation is disabled."
+        )

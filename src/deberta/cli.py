@@ -10,7 +10,15 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from deberta.config import DataConfig, ModelConfig, TrainConfig
+from deberta.config import (
+    DataConfig,
+    ModelConfig,
+    TrainConfig,
+    validate_data_config,
+    validate_model_config,
+    validate_train_config,
+    validate_training_workflow_options,
+)
 from deberta.export_cli import add_export_arguments, namespace_to_export_config, run_export
 from deberta.training import run_pretraining
 
@@ -69,6 +77,12 @@ def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
         raise ValueError("YAML config must parse to a dict.")
 
     if any(k in raw for k in ("model", "data", "train")):
+        unknown_top = sorted(k for k in raw.keys() if k not in {"model", "data", "train"})
+        if unknown_top:
+            raise ValueError(
+                "Unknown top-level keys in nested YAML config (expected only model/data/train): "
+                + ", ".join(unknown_top)
+            )
         model_dict = raw.get("model", {}) or {}
         data_dict = raw.get("data", {}) or {}
         train_dict = raw.get("train", {}) or {}
@@ -98,6 +112,12 @@ def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
 
     # Support either nested {model:..., data:..., train:...} or flat.
     if any(k in raw for k in ("model", "data", "train")):
+        unknown_top = sorted(k for k in raw.keys() if k not in {"model", "data", "train"})
+        if unknown_top:
+            raise ValueError(
+                "Unknown top-level keys in nested JSON config (expected only model/data/train): "
+                + ", ".join(unknown_top)
+            )
         model_dict = raw.get("model", {}) or {}
         data_dict = raw.get("data", {}) or {}
         train_dict = raw.get("train", {}) or {}
@@ -165,16 +185,57 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
     """
     group = parser.add_argument_group(group_name)
     type_hints = get_type_hints(cls)
+    constrained_choices: dict[str, tuple[str, ...]] = {
+        "backbone_type": ("rope", "hf_deberta_v2"),
+        "norm_arch": ("post", "keel"),
+        "attention_implementation": ("sdpa", "eager"),
+        "ffn_type": ("swiglu", "mlp"),
+        "embedding_sharing": ("none", "es", "gdes"),
+        "report_to": ("none", "wandb", "tensorboard"),
+        "lr_scheduler_type": (
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+            "constant",
+            "constant_with_warmup",
+        ),
+        # Keep legacy aliases parseable for UX compatibility.
+        "sdpa_kernel": (
+            "auto",
+            "flash",
+            "mem_efficient",
+            "math",
+            "flash_only",
+            "mem",
+            "mem-efficient",
+            "efficient",
+            "flashattention",
+            "flash_attention",
+        ),
+        "torch_compile_mode": (
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+            "reduce_overhead",
+            "max_autotune",
+            "max_autotune_no_cudagraphs",
+        ),
+    }
+
     for f in fields(cls):
         help_text = str(f.metadata.get("help", "")) if f.metadata else ""
         default = f.default
         field_type = type_hints.get(f.name, f.type)
+        choices = constrained_choices.get(f.name)
         group.add_argument(
             f"--{f.name}",
             f"--{f.name.replace('_', '-')}",
             dest=f.name,
             default=default,
             type=_argparse_type(field_type),
+            choices=choices,
             help=help_text,
         )
 
@@ -315,6 +376,12 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
         _apply_overrides(train_cfg, ns, provided_flags)
     else:
         model_cfg, data_cfg, train_cfg = _build_train_configs_from_namespace(ns)
+
+    # Validate after config load + CLI overrides so failures are immediate and explicit.
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg)
 
     run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
 

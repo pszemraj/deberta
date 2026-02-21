@@ -5,13 +5,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from deberta.config import DataConfig, ModelConfig
+from deberta.config import (
+    DataConfig,
+    ModelConfig,
+    validate_data_config,
+    validate_model_config,
+)
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 
 logger = logging.getLogger(__name__)
@@ -82,7 +89,10 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Output directory for exported artifacts. Defaults to <run_dir>/exported_hf.",
+        help=(
+            "Output directory for exported artifacts. Defaults to <run_dir>/exported_hf. "
+            "If provided, it must not contain existing files."
+        ),
     )
     parser.add_argument(
         "--run-dir",
@@ -97,24 +107,50 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("discriminator", "generator", "both"),
         help="Which component(s) to export.",
     )
-    parser.add_argument(
+    safe_group = parser.add_mutually_exclusive_group()
+    safe_group.add_argument(
         "--safe-serialization",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        dest="safe_serialization",
+        action="store_true",
         help="Use safetensors format when saving HF artifacts.",
     )
-    parser.add_argument(
+    safe_group.add_argument(
+        "--no-safe-serialization",
+        dest="safe_serialization",
+        action="store_false",
+        help="Disable safetensors format when saving HF artifacts.",
+    )
+    parser.set_defaults(safe_serialization=True)
+
+    offload_group = parser.add_mutually_exclusive_group()
+    offload_group.add_argument(
         "--offload-to-cpu",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        dest="offload_to_cpu",
+        action="store_true",
         help="Offload consolidated full state dict to CPU under FSDP export.",
     )
-    parser.add_argument(
+    offload_group.add_argument(
+        "--no-offload-to-cpu",
+        dest="offload_to_cpu",
+        action="store_false",
+        help="Keep consolidated full state dict on accelerator memory under FSDP export.",
+    )
+    parser.set_defaults(offload_to_cpu=True)
+
+    rank0_group = parser.add_mutually_exclusive_group()
+    rank0_group.add_argument(
         "--rank0-only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        dest="rank0_only",
+        action="store_true",
         help="Gather full state dict on rank 0 only under FSDP export.",
     )
+    rank0_group.add_argument(
+        "--no-rank0-only",
+        dest="rank0_only",
+        action="store_false",
+        help="Gather full state dict on all ranks under FSDP export.",
+    )
+    parser.set_defaults(rank0_only=True)
     parser.add_argument(
         "--embedding-sharing",
         default=None,
@@ -279,6 +315,8 @@ def run_export(cfg: ExportConfig) -> None:
 
     model_cfg = ModelConfig(**_load_json(model_cfg_path))
     data_cfg = DataConfig(**_load_json(data_cfg_path))
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
 
     embedding_sharing = (cfg.embedding_sharing or model_cfg.embedding_sharing or "none").lower()
 
@@ -358,10 +396,17 @@ def run_export(cfg: ExportConfig) -> None:
     export_disc, export_gen = _build_export_backbone(model_cfg, disc_config, gen_config, export_what)
 
     out_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else (run_dir / "exported_hf")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            raise ValueError(f"output_dir exists and is not a directory: {out_dir}")
+        if any(out_dir.iterdir()):
+            raise ValueError(
+                f"output_dir already exists and is not empty: {out_dir}. "
+                "Choose a new --output-dir or clear the directory."
+            )
 
-    # Always export tokenizer at root for convenience
-    tokenizer.save_pretrained(str(out_dir))
+    stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
+    stage_dir.mkdir(parents=True, exist_ok=False)
 
     meta: dict[str, Any] = {
         "checkpoint_dir": str(checkpoint_dir),
@@ -370,35 +415,47 @@ def run_export(cfg: ExportConfig) -> None:
         "backbone_type": model_cfg.backbone_type,
     }
 
-    # Discriminator
-    if export_disc is not None:
-        export_keys = set(export_disc.state_dict().keys())
-        filtered = {k: v for k, v in disc_sd.items() if k in export_keys}
-        export_disc.load_state_dict(filtered, strict=False)
-        if embedding_sharing in {"es", "gdes"}:
-            _merge_embeddings_into_export(
-                export_model=export_disc, disc_sd=disc_sd, gen_sd=gen_sd, mode=embedding_sharing
+    try:
+        # Always export tokenizer at root for convenience
+        tokenizer.save_pretrained(str(stage_dir))
+
+        # Discriminator
+        if export_disc is not None:
+            export_keys = set(export_disc.state_dict().keys())
+            filtered = {k: v for k, v in disc_sd.items() if k in export_keys}
+            export_disc.load_state_dict(filtered, strict=False)
+            if embedding_sharing in {"es", "gdes"}:
+                _merge_embeddings_into_export(
+                    export_model=export_disc, disc_sd=disc_sd, gen_sd=gen_sd, mode=embedding_sharing
+                )
+
+            export_disc.save_pretrained(
+                str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
             )
+            meta["exported_discriminator"] = True
 
-        export_disc.save_pretrained(
-            str(out_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
-        )
-        meta["exported_discriminator"] = True
+        # Generator
+        if export_gen is not None:
+            export_keys = set(export_gen.state_dict().keys())
+            filtered = {k: v for k, v in gen_sd.items() if k in export_keys}
+            export_gen.load_state_dict(filtered, strict=False)
+            export_gen.save_pretrained(
+                str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
+            )
+            meta["exported_generator"] = True
 
-    # Generator
-    if export_gen is not None:
-        export_keys = set(export_gen.state_dict().keys())
-        filtered = {k: v for k, v in gen_sd.items() if k in export_keys}
-        export_gen.load_state_dict(filtered, strict=False)
-        export_gen.save_pretrained(
-            str(out_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
-        )
-        meta["exported_generator"] = True
+        with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
 
-    with (out_dir / "export_meta.json").open("w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, sort_keys=True)
-
-    logger.info(f"Export complete: {out_dir}")
+        if out_dir.exists():
+            # At this point we already enforced "empty only".
+            out_dir.rmdir()
+        stage_dir.replace(out_dir)
+        logger.info(f"Export complete: {out_dir}")
+    except Exception:
+        # Cleanup staged partial output so failed exports are re-runnable.
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
 
 
 def _build_export_parser(*, prog: str = "deberta export") -> argparse.ArgumentParser:

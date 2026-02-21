@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from deberta.config import ModelConfig
+from deberta.config import ModelConfig, validate_model_config
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 
@@ -60,6 +60,7 @@ def build_backbone_configs(
     :param int max_position_embeddings: Sequence length budget.
     :return tuple[Any, Any]: Discriminator and generator configs.
     """
+    validate_model_config(model_cfg)
     bt = (model_cfg.backbone_type or "rope").lower()
 
     if bt == "hf_deberta_v2":

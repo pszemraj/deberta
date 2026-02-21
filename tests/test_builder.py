@@ -103,3 +103,19 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
 
     assert disc_cfg.ffn_type == "mlp"
     assert gen_cfg.ffn_type == "swiglu"
+
+
+def test_build_backbone_configs_rejects_invalid_model_options_early():
+    pytest.importorskip("transformers")
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        norm_arch="not-valid",
+    )
+    with pytest.raises(ValueError, match="model.norm_arch must be one of"):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=_DummyTokenizer(),
+            max_position_embeddings=128,
+        )
