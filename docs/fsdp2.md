@@ -64,6 +64,8 @@ Use `train.sdpa_kernel` to set SDPA backend preference:
 
 This is best-effort backend configuration. `flash_only` can fail if hardware or tensor shapes are not flash-compatible.
 
+`train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
+
 When `data.pack_sequences=true`, packed batches may emit 3D document-blocking attention masks. Those masks are not compatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
 
 Use `auto`, `flash`, or `mem_efficient` for packed training runs.
@@ -92,3 +94,5 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 ```
 
 The exporter consolidates to full state on rank 0 and writes standalone HF artifacts.
+
+Run directories now include `run_metadata.json` with a `config_schema_version`. Resume/export validate that schema and fail fast on unknown versions instead of silently proceeding with ambiguous config metadata.

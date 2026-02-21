@@ -52,6 +52,8 @@ Set `data.pack_sequences=false` to switch to one-document chunking:
 
 When `streaming=false`, training still routes through the same iterable packing wrappers (`PackedStreamingDataset` / `SequentialStreamingDataset`) used in streaming mode, but backed by a map-style HF dataset iterator.
 
+`data.shuffle_buffer_size` keeps full buffer semantics only for streaming datasets. In non-streaming mode, shuffle is effectively an off/on toggle and config normalization canonicalizes any positive value to `1` (shuffle enabled).
+
 ## Collator Behavior (Dynamic MLM Masking)
 
 `DebertaV3ElectraCollator` performs dynamic masking at batch time.
