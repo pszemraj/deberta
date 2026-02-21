@@ -1,17 +1,27 @@
-# deberta: Modern Refresh (RTD / ELECTRA-style)
+# deberta: a modern refresh
 
-A PyTorch-first modern refresh of DeBERTa pretraining, focused on DeBERTaV3-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
+A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
+
+---
+
+- [Install](#install)
+- [CLI Entrypoints](#cli-entrypoints)
+- [Quickstart](#quickstart)
+- [Documentation](#documentation)
+- [Configs](#configs)
+- [Repo Layout](#repo-layout)
+- [Citations](#citations)
+
+---
 
 ## Install
-
-This project is GitHub-first and is not published on PyPI.
 
 Clone + editable install:
 
 ```bash
 git clone https://github.com/pszemraj/deberta.git
 cd deberta
-pip install -U pip
+# activate your Python environment first, then:
 pip install -e .
 ```
 
@@ -89,3 +99,16 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - `src/deberta/export_cli.py` - FSDP-aware exporter
 - `configs/` - training and accelerate configs
 - `docs/` - canonical docs by concept
+
+## Citations
+
+```bibtex
+@misc{he2021debertav3,
+      title={DeBERTaV3: Improving DeBERTa using ELECTRA-Style Pre-Training with Gradient-Disentangled Embedding Sharing},
+      author={Pengcheng He and Jianfeng Gao and Weizhu Chen},
+      year={2021},
+      eprint={2111.09543},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
+}
+```
