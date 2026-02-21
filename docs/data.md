@@ -22,6 +22,7 @@ For objective/loss semantics, see [`docs/objective.md`](objective.md). For runti
 - appends an internal document separator (`[SEP]`) between documents
 - packs into chunks of `max_seq_length - 2`
 - wraps each chunk as `[CLS] + chunk + [SEP]` (+ pad when needed)
+- flushes trailing remainder at iterator end (no silent tail-token drop)
 
 Output fields:
 
@@ -32,6 +33,16 @@ Output fields:
 ### Internal `[SEP]` handling
 
 Packed chunks can contain inserted internal `[SEP]` separators. Those positions are marked as special in `special_tokens_mask`, so masking never corrupts those separators.
+
+When internal separators are present, the collator emits a pairwise attention keep-mask (`B x S x S`) that blocks cross-document attention within packed sequences.
+
+## Sequential / No-Pack Mode
+
+Set `data.pack_sequences=false` to switch to one-document chunking:
+
+- no cross-document concatenation
+- long documents are split into multiple one-document chunks
+- useful as a reference mode for validating loss-signal behavior independent of packing
 
 ## Non-Streaming Packing
 

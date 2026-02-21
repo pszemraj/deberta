@@ -22,10 +22,12 @@ from deberta.export_cli import _build_export_parser
 from deberta.training.pretrain import (
     _build_optimizer,
     _find_latest_checkpoint,
+    _load_checkpoint_data_progress,
     _normalize_mixed_precision,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_mode,
     _prepare_output_dir,
+    _save_checkpoint_data_progress,
     _should_force_legacy_tf32_for_compile,
 )
 
@@ -205,6 +207,15 @@ def test_find_latest_checkpoint_picks_highest_step(tmp_path: Path):
     latest = _find_latest_checkpoint(out)
     assert latest is not None
     assert latest.name == "checkpoint-11"
+
+
+def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
+    ckpt = tmp_path / "checkpoint-10"
+    ckpt.mkdir(parents=True, exist_ok=True)
+
+    assert _load_checkpoint_data_progress(ckpt) is None
+    _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123)
+    assert _load_checkpoint_data_progress(ckpt) == 123
 
 
 def test_build_optimizer_supports_generator_specific_lr():

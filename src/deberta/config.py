@@ -282,6 +282,16 @@ class DataConfig:
         metadata={"help": "Use datasets streaming (IterableDataset). Recommended for pretraining."},
     )
 
+    pack_sequences: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If true, concatenate multiple documents into fixed-length packed sequences. "
+                "If false, emit one-document chunks only (reference/no-pack mode)."
+            )
+        },
+    )
+
     cache_dir: str | None = field(default=None, metadata={"help": "Optional datasets cache dir."})
 
     max_seq_length: int = field(
@@ -297,7 +307,9 @@ class DataConfig:
     # Non-streaming preprocessing
     preprocessing_num_workers: int = field(
         default=8,
-        metadata={"help": "Non-streaming tokenization workers."},
+        metadata={
+            "help": "Legacy non-streaming pretokenization workers. Currently unused in unified packer path."
+        },
     )
 
 
@@ -593,6 +605,12 @@ def validate_data_config(cfg: DataConfig) -> None:
         raise ValueError("data.shuffle_buffer_size must be >= 0.")
     if int(cfg.preprocessing_num_workers) < 0:
         raise ValueError("data.preprocessing_num_workers must be >= 0.")
+    default_preproc_workers = DataConfig().preprocessing_num_workers
+    if int(cfg.preprocessing_num_workers) != int(default_preproc_workers):
+        raise ValueError(
+            "data.preprocessing_num_workers is currently unused in the unified packer path. "
+            f"Keep the default ({default_preproc_workers}) to avoid inert config."
+        )
 
 
 def validate_train_config(cfg: TrainConfig) -> None:

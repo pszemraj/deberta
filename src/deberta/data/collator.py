@@ -102,25 +102,33 @@ class DebertaV3ElectraCollator:
                 if not bool(attn.all().item()):
                     batch["attention_mask"] = attn.long()
 
-        # Packed/unpadded pretraining examples often have all-ones attention masks.
-        # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
-        attn = batch.get("attention_mask")
-        if attn is not None:
-            try:
-                if attn.dtype == torch.bool:
-                    all_active = bool(attn.all().item())
-                else:
-                    all_active = bool((attn == 1).all().item())
-                if all_active:
-                    batch.pop("attention_mask", None)
-            except Exception:
-                pass
-
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         if special_tokens_mask is None:
             special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
         else:
             special_tokens_mask = special_tokens_mask.bool()
+
+        block_mask = self._build_document_attention_mask(
+            input_ids=batch["input_ids"],
+            special_tokens_mask=special_tokens_mask,
+            attention_mask=batch.get("attention_mask"),
+        )
+        if block_mask is not None:
+            batch["attention_mask"] = block_mask.long()
+        else:
+            # Packed/unpadded pretraining examples often have all-ones attention masks.
+            # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
+            attn = batch.get("attention_mask")
+            if attn is not None:
+                try:
+                    if attn.dtype == torch.bool:
+                        all_active = bool(attn.all().item())
+                    else:
+                        all_active = bool((attn == 1).all().item())
+                    if all_active:
+                        batch.pop("attention_mask", None)
+                except Exception:
+                    pass
 
         input_ids, labels = self._mask_tokens(batch["input_ids"], special_tokens_mask=special_tokens_mask)
 
@@ -230,6 +238,65 @@ class DebertaV3ElectraCollator:
 
         return inferred
 
+    def _build_document_attention_mask(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        special_tokens_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Build pairwise attention keep-mask that blocks cross-document attention.
+
+        This is only enabled when internal separator tokens are present in a sequence,
+        which indicates packed multi-document input.
+
+        :param torch.Tensor input_ids: Batch token ids of shape (B, S).
+        :param torch.Tensor special_tokens_mask: Boolean special-token mask (B, S).
+        :param torch.Tensor | None attention_mask: Optional 2D active-token mask (B, S).
+        :return torch.Tensor | None: Pairwise keep-mask (B, S, S), or ``None`` when unnecessary.
+        """
+        if input_ids.ndim != 2:
+            return None
+        if special_tokens_mask.ndim != 2 or special_tokens_mask.shape != input_ids.shape:
+            return None
+
+        sep_id = getattr(self.tokenizer, "sep_token_id", None)
+        if sep_id is None or input_ids.shape[1] < 3:
+            return None
+        sep_id = int(sep_id)
+
+        sep_positions = input_ids.eq(sep_id) & special_tokens_mask
+        # Need at least two separator tokens ([... internal ...] + final [SEP])
+        # to indicate packed multi-document content.
+        has_internal = sep_positions.sum(dim=1).gt(1)
+        if not bool(has_internal.any().item()):
+            return None
+
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if attention_mask is not None and attention_mask.ndim == 2:
+            active = attention_mask.to(dtype=torch.bool)
+        elif pad_id is not None:
+            active = input_ids.ne(int(pad_id))
+        else:
+            active = torch.ones_like(input_ids, dtype=torch.bool)
+
+        sep_before = sep_positions.long().cumsum(dim=1) - sep_positions.long()
+        doc_ids = sep_before + 1
+
+        cls_id = getattr(self.tokenizer, "cls_token_id", None)
+        if cls_id is not None:
+            doc_ids = doc_ids.masked_fill(input_ids.eq(int(cls_id)), 0)
+        if pad_id is not None:
+            doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
+
+        same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
+        keep = same_doc & active[:, :, None] & active[:, None, :]
+
+        # Guarantee at least self-attend for active queries to avoid all-masked rows.
+        eye = torch.eye(input_ids.shape[1], dtype=torch.bool, device=input_ids.device).unsqueeze(0)
+        keep = keep | (active[:, :, None] & eye)
+        return keep
+
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -258,41 +325,47 @@ class DebertaV3ElectraCollator:
             input_ids = input_ids.long()
 
         input_ids = input_ids.clone()
-        labels = input_ids.clone()
-
-        # Build mask probability matrix.
-        prob = torch.full(labels.shape, float(self.cfg.mlm_probability), device=labels.device)
-
-        # Never mask special tokens.
-        prob.masked_fill_(special_tokens_mask, 0.0)
-
-        # Never mask padding tokens.
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is not None:
-            prob.masked_fill_(labels.eq(pad_token_id), 0.0)
-
-        masked_indices = torch.bernoulli(prob).bool()
-
-        # Labels: only compute loss on masked tokens.
-        labels[~masked_indices] = -100
+        labels = torch.full_like(input_ids, -100)
 
         mask_prob = float(self.cfg.mask_token_prob)
         random_prob = float(self.cfg.random_token_prob)
+        mlm_prob = float(self.cfg.mlm_probability)
+        pad_token_id = self.tokenizer.pad_token_id
+        mask_token_id = int(self.tokenizer.mask_token_id)
 
-        # mask_token_indices: of masked positions, which ones become [MASK]
-        mask_token_indices = (
-            torch.bernoulli(torch.full(labels.shape, mask_prob, device=labels.device)).bool() & masked_indices
-        )
-        input_ids[mask_token_indices] = int(self.tokenizer.mask_token_id)
+        # Use a fixed budget per sequence (rounded from maskable count) to stabilize
+        # effective masked-token counts across microbatches.
+        B, _ = input_ids.shape
+        for b in range(B):
+            ids = input_ids[b]
+            maskable = ~special_tokens_mask[b]
+            if pad_token_id is not None:
+                maskable = maskable & ids.ne(int(pad_token_id))
 
-        # random_token_indices: of remaining masked positions, which ones become random tokens
-        random_token_indices = (
-            torch.bernoulli(torch.full(labels.shape, random_prob, device=labels.device)).bool()
-            & masked_indices
-            & ~mask_token_indices
-        )
-        random_words = self._sample_random_words(labels.shape, device=labels.device)
-        input_ids[random_token_indices] = random_words[random_token_indices]
+            candidates = torch.nonzero(maskable, as_tuple=False).flatten()
+            if int(candidates.numel()) == 0:
+                continue
+
+            num_to_mask = max(1, int(round(float(candidates.numel()) * mlm_prob)))
+            num_to_mask = min(num_to_mask, int(candidates.numel()))
+
+            choice = torch.randperm(int(candidates.numel()), device=input_ids.device)[:num_to_mask]
+            masked_idx = candidates[choice]
+
+            labels[b, masked_idx] = ids[masked_idx]
+
+            repl_roll = torch.rand((num_to_mask,), device=input_ids.device)
+            mask_sel = repl_roll < mask_prob
+            rand_sel = (repl_roll >= mask_prob) & (repl_roll < (mask_prob + random_prob))
+
+            if bool(mask_sel.any().item()):
+                input_ids[b, masked_idx[mask_sel]] = mask_token_id
+            if bool(rand_sel.any().item()):
+                rand_words = self._sample_random_words(
+                    (int(rand_sel.sum().item()),),
+                    device=input_ids.device,
+                )
+                input_ids[b, masked_idx[rand_sel]] = rand_words
 
         # Remaining masked positions keep original token.
         return input_ids, labels

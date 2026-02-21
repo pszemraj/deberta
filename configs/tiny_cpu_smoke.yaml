@@ -18,6 +18,7 @@ data:
   data_files: ./data/tiny.txt
   train_split: train
   streaming: true
+  pack_sequences: true
   text_column_name: text
   max_seq_length: 128
   shuffle_buffer_size: 1000

@@ -6,7 +6,7 @@ import torch
 
 from deberta.cli import _load_yaml
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
-from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset
+from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
 
 
 class DummyTokenizer:
@@ -140,6 +140,66 @@ def test_packed_streaming_marks_internal_sep_as_special():
             assert stm[i] == 1
 
 
+def test_packed_streaming_flushes_tail_instead_of_dropping():
+    tok = DummyTokenizer(vocab_size=64)
+    hf_dataset = [{"text": "a b"}, {"text": "c d"}, {"text": "e"}]
+
+    ds = PackedStreamingDataset(
+        hf_dataset=hf_dataset,
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(text_column_name="text", max_seq_length=8, seed=0, shuffle_buffer_size=0),
+        process_index=0,
+        num_processes=1,
+    )
+    rows = list(ds)
+    assert len(rows) == 2
+    assert "attention_mask" in rows[1]
+    assert (tok.pad_token_id in rows[1]["input_ids"]) is True
+
+
+def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
+    tok = DummyTokenizer(vocab_size=64)
+    hf_dataset = [{"text": "a b c d e f g h i"}]
+
+    ds = SequentialStreamingDataset(
+        hf_dataset=hf_dataset,
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(text_column_name="text", max_seq_length=8, seed=0, shuffle_buffer_size=0),
+        process_index=0,
+        num_processes=1,
+    )
+    rows = list(ds)
+
+    # 9 lexical tokens with max_seq=8 (block_len=6) => two one-document chunks.
+    assert len(rows) == 2
+    for ex in rows:
+        mids = ex["input_ids"][1:-1]
+        # No cross-document separators in sequential one-document mode.
+        assert sum(1 for tid in mids if tid == tok.sep_token_id) <= 1
+
+
+def test_collator_builds_document_block_attention_mask_when_internal_separators_exist():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+        }
+    ]
+    batch = coll(features)
+    assert "attention_mask" in batch
+    attn = batch["attention_mask"]
+    assert attn.ndim == 3
+
+    # Doc 1: positions {1,2}; Doc 2: positions {3,4,5}. Cross-doc attention blocked.
+    assert attn[0, 1, 3].item() == 0
+    assert attn[0, 3, 1].item() == 0
+    assert attn[0, 1, 2].item() == 1
+    assert attn[0, 3, 5].item() == 1
+
+
 def test_ngram_masking_respects_specials():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.5, max_ngram=3))
@@ -164,6 +224,25 @@ def test_ngram_masking_respects_specials():
     assert masked[0, 0].item() == tok.cls_token_id
     assert masked[0, 3].item() == tok.sep_token_id
     assert masked[0, 5].item() == tok.pad_token_id
+
+
+def test_token_level_masking_uses_fixed_budget_per_sequence():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    input_ids = torch.tensor(
+        [[tok.cls_token_id, 11, 12, 13, 14, 15, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, 0, 0, 0, 0, 0, 1]], dtype=torch.bool)
+
+    counts = []
+    for seed in range(10):
+        torch.manual_seed(seed)
+        _, labels = coll._mask_tokens_bert(input_ids, special_tokens_mask=special)
+        counts.append(int(labels.ne(-100).sum().item()))
+
+    assert set(counts) == {1}
 
 
 def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
@@ -570,8 +649,8 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
         dtype=torch.long,
     )
     labels = torch.full_like(input_ids, -100)
+    labels[:, 1] = input_ids[:, 1]
     labels[:, 2] = input_ids[:, 2]
-    labels[:, 3] = input_ids[:, 3]
     explicit_mask = input_ids.ne(0).long()
 
     torch.manual_seed(0)
@@ -597,6 +676,62 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
     )
 
     torch.testing.assert_close(out_missing.disc_loss, out_explicit.disc_loss, rtol=0.0, atol=0.0)
+
+
+def test_pretrainer_disc_loss_excludes_special_tokens_from_active_count():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    )
+
+    input_ids = torch.tensor(
+        [
+            [1, 7, 8, 2, 0, 0],
+            [1, 9, 10, 11, 2, 0],
+        ],
+        dtype=torch.long,
+    )
+    labels = torch.full_like(input_ids, -100)
+    labels[:, 1] = input_ids[:, 1]
+    labels[:, 2] = input_ids[:, 2]
+
+    out = model(
+        input_ids=input_ids,
+        attention_mask=None,
+        labels=labels,
+        sampling_temperature=1.0,
+        gen_loss_weight=1.0,
+        disc_loss_weight=50.0,
+        decoupled_loss_scaling=False,
+    )
+    expected_active = ((input_ids != 0) & (input_ids != 1) & (input_ids != 2) & (input_ids != 3)).sum()
+    assert int(out.disc_token_count.item()) == int(expected_active.item())
 
 
 def test_rope_config_rejects_unknown_ffn_type():

@@ -224,15 +224,37 @@ class DebertaRoPESelfAttention(nn.Module):
         query_keep_heads = None
         query_keep_tokens = None
         if attention_mask is not None:
-            # attention_mask is 1 for tokens, 0 for pad.
-            key_keep = attention_mask.to(dtype=torch.bool)
-            # PyTorch SDPA bool masks use True=keep, False=masked.
-            sdpa_attn_mask = key_keep[:, None, None, :]  # (B,1,1,S) bool
-            # Eager path uses masked_fill, so True marks masked positions.
-            eager_attn_mask = ~sdpa_attn_mask
-            # Explicitly zero padded query outputs for robustness on eager/edge paths.
-            query_keep_heads = attention_mask[:, None, :, None].to(dtype=q.dtype)
-            query_keep_tokens = attention_mask[:, :, None].to(dtype=q.dtype)
+            mask = attention_mask.to(dtype=torch.bool)
+
+            if mask.ndim == 2:
+                # 2D key mask: attention_mask is 1 for tokens, 0 for pad.
+                key_keep = mask
+                # PyTorch SDPA bool masks use True=keep, False=masked.
+                sdpa_attn_mask = key_keep[:, None, None, :]  # (B,1,1,S) bool
+                # Eager path uses masked_fill, so True marks masked positions.
+                eager_attn_mask = ~sdpa_attn_mask
+                query_keep = key_keep
+            elif mask.ndim == 3:
+                # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
+                pair_keep = mask
+                query_keep = pair_keep.any(dim=-1)
+
+                # Avoid all-masked query rows to prevent NaNs in eager softmax.
+                row_has_key = pair_keep.any(dim=-1)
+                if not bool(row_has_key.all().item()):
+                    eye = torch.eye(seq_len, dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
+                    pair_keep = pair_keep | ((~row_has_key)[:, :, None] & eye)
+
+                sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
+                eager_attn_mask = ~sdpa_attn_mask
+            else:
+                raise ValueError(
+                    "attention_mask must have shape (B,S) or (B,S,S) for DebertaRoPESelfAttention."
+                )
+
+            # Explicitly zero masked query outputs for robustness on eager/edge paths.
+            query_keep_heads = query_keep[:, None, :, None].to(dtype=q.dtype)
+            query_keep_tokens = query_keep[:, :, None].to(dtype=q.dtype)
 
         if self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
             out = F.scaled_dot_product_attention(

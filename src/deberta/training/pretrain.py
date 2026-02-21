@@ -23,7 +23,7 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset
+from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset, SequentialStreamingDataset
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
@@ -448,6 +448,37 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     return checkpoints[-1][1]
 
 
+def _load_checkpoint_data_progress(checkpoint_dir: Path) -> int | None:
+    """Load persisted data progress for resume alignment.
+
+    :param Path checkpoint_dir: Checkpoint directory.
+    :return int | None: Consumed micro-batch count, or ``None`` if unavailable.
+    """
+    path = checkpoint_dir / "data_state.json"
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+        val = raw.get("consumed_micro_batches", None)
+        if val is None:
+            return None
+        return max(0, int(val))
+    except Exception:
+        return None
+
+
+def _save_checkpoint_data_progress(*, checkpoint_dir: Path, consumed_micro_batches: int) -> None:
+    """Persist data iterator progress next to a checkpoint.
+
+    :param Path checkpoint_dir: Checkpoint directory.
+    :param int consumed_micro_batches: Number of consumed micro-batches.
+    """
+    _json_dump(
+        {"consumed_micro_batches": int(max(0, consumed_micro_batches))},
+        checkpoint_dir / "data_state.json",
+    )
+
+
 def _prepare_output_dir(
     *,
     output_dir: Path,
@@ -798,23 +829,19 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     # Data
     raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
 
-    if data_cfg.streaming:
-        train_dataset = PackedStreamingDataset(
-            hf_dataset=raw_train,
-            tokenizer=tokenizer,
-            cfg=PackedStreamingConfig(
-                text_column_name=data_cfg.text_column_name,
-                max_seq_length=data_cfg.max_seq_length,
-                seed=train_cfg.seed,
-                shuffle_buffer_size=data_cfg.shuffle_buffer_size,
-            ),
-            process_index=accelerator.process_index,
-            num_processes=accelerator.num_processes,
-        )
-    else:
-        train_dataset = _maybe_tokenize_non_streaming(
-            raw_ds=raw_train, tokenizer=tokenizer, data_cfg=data_cfg, is_train=True
-        )
+    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
+    train_dataset = dataset_cls(
+        hf_dataset=raw_train,
+        tokenizer=tokenizer,
+        cfg=PackedStreamingConfig(
+            text_column_name=data_cfg.text_column_name,
+            max_seq_length=data_cfg.max_seq_length,
+            seed=train_cfg.seed,
+            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
+        ),
+        process_index=accelerator.process_index,
+        num_processes=accelerator.num_processes,
+    )
 
     collator = DebertaV3ElectraCollator(
         tokenizer=tokenizer,
@@ -898,6 +925,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     # Resume
     global_step = 0
+    consumed_micro_batches = 0
     ckpt = train_cfg.resume_from_checkpoint
     if ckpt:
         if str(ckpt).lower() == "auto":
@@ -913,14 +941,31 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             logger.info(f"Resuming from checkpoint: {ckpt}")
             accelerator.load_state(ckpt)
             global_step = _parse_checkpoint_step(ckpt)
+            restored = _load_checkpoint_data_progress(Path(ckpt))
+            if restored is None:
+                # Back-compat fallback for older checkpoints without data_state.json.
+                restored = global_step * int(train_cfg.gradient_accumulation_steps)
+                logger.warning(
+                    "Checkpoint missing data_state.json; approximating data replay offset "
+                    f"as global_step * grad_accum = {restored} micro-batches."
+                )
+            consumed_micro_batches = int(restored)
 
     # Training loop
     model.train()
 
     train_iter = _cycle_dataloader(train_loader)
+    if consumed_micro_batches > 0:
+        logger.info(
+            "Replaying data iterator by %d micro-batches to align resume data position.",
+            consumed_micro_batches,
+        )
+        for _ in range(consumed_micro_batches):
+            _ = next(train_iter)
 
     while global_step < int(train_cfg.max_steps):
         batch = next(train_iter)
+        consumed_micro_batches += 1
         batch = _move_batch_to_device(batch, accelerator.device)
         if compile_enabled:
             _maybe_cudagraph_mark_step_begin()
@@ -969,6 +1014,8 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                     "gen_loss": _mean(out.gen_loss),
                     "disc_loss": _mean(out.disc_loss),
                     "disc_acc": _mean(out.disc_accuracy),
+                    "gen_tokens": _mean(out.gen_token_count),
+                    "disc_tokens": _mean(out.disc_token_count),
                 }
 
                 if accelerator.is_main_process:
@@ -981,6 +1028,8 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                                 f"gen={metrics['gen_loss']:.4f}",
                                 f"disc={metrics['disc_loss']:.4f}",
                                 f"acc={metrics['disc_acc']:.4f}",
+                                f"gen_tok={metrics['gen_tokens']:.1f}",
+                                f"disc_tok={metrics['disc_tokens']:.1f}",
                             ]
                         )
                     )
@@ -995,6 +1044,10 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                     ckpt_dir = output_dir / f"checkpoint-{global_step}"
                     ckpt_dir.mkdir(parents=True, exist_ok=True)
                     accelerator.save_state(str(ckpt_dir))
+                    _save_checkpoint_data_progress(
+                        checkpoint_dir=ckpt_dir,
+                        consumed_micro_batches=consumed_micro_batches,
+                    )
                     _rotate_checkpoints(output_dir, save_total_limit=int(train_cfg.save_total_limit))
                     logger.info(f"Saved checkpoint: {ckpt_dir}")
 
@@ -1004,6 +1057,10 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         final_ckpt = output_dir / f"checkpoint-{global_step}"
         final_ckpt.mkdir(parents=True, exist_ok=True)
         accelerator.save_state(str(final_ckpt))
+        _save_checkpoint_data_progress(
+            checkpoint_dir=final_ckpt,
+            consumed_micro_batches=consumed_micro_batches,
+        )
         _rotate_checkpoints(output_dir, save_total_limit=int(train_cfg.save_total_limit))
         logger.info(f"Saved final checkpoint: {final_ckpt}")
 

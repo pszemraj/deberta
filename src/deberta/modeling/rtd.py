@@ -207,6 +207,8 @@ class RTDOutput:
     gen_loss: torch.Tensor
     disc_loss: torch.Tensor
     disc_accuracy: torch.Tensor
+    gen_token_count: torch.Tensor
+    disc_token_count: torch.Tensor
 
 
 class DebertaV3RTDPretrainer(nn.Module):
@@ -336,6 +338,19 @@ class DebertaV3RTDPretrainer(nn.Module):
         probs = torch.softmax(logits_f / temp, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+    def _special_position_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Build a boolean mask over configured special token ids.
+
+        :param torch.Tensor input_ids: Token ids shaped (B, S).
+        :return torch.Tensor: True at special-token positions.
+        """
+        if not self._forbidden_sample_token_ids:
+            return torch.zeros_like(input_ids, dtype=torch.bool)
+        out = torch.zeros_like(input_ids, dtype=torch.bool)
+        for sid in self._forbidden_sample_token_ids:
+            out = out | input_ids.eq(int(sid))
+        return out
+
     def _maybe_patch_discriminator_embeddings(self) -> None:
         """Patch discriminator embeddings to follow configured sharing mode."""
         mode = (self.embedding_sharing or "none").lower()
@@ -429,6 +444,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         hidden = gen_out.last_hidden_state
 
         masked = labels.ne(-100)
+        gen_token_count = masked.to(torch.float32).sum()
         if masked.any():
             masked_hidden = hidden[masked]
             # Compute logits only on masked positions.
@@ -472,7 +488,21 @@ class DebertaV3RTDPretrainer(nn.Module):
             else:
                 active = input_ids.ne(int(pad_id))
         else:
-            active = attention_mask.to(torch.bool)
+            mask = attention_mask.to(torch.bool)
+            if mask.ndim == 2:
+                active = mask
+            elif mask.ndim == 3:
+                active = mask.any(dim=-1)
+            elif mask.ndim == 4:
+                active = mask.any(dim=-1)
+                if active.ndim == 3:
+                    active = active.any(dim=1)
+            else:
+                raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
+
+        # Discriminator should not learn on special tokens.
+        active = active & (~self._special_position_mask(corrupted_input_ids))
+        disc_token_count = active.to(torch.float32).sum()
 
         if bool(active.any().item()):
             disc_loss = F.binary_cross_entropy_with_logits(disc_logits[active].float(), disc_labels[active])
@@ -496,5 +526,10 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         total = float(gen_loss_weight) * gen_loss_scaled + float(disc_loss_weight) * disc_loss
         return RTDOutput(
-            loss=total, gen_loss=gen_loss.detach(), disc_loss=disc_loss.detach(), disc_accuracy=disc_acc
+            loss=total,
+            gen_loss=gen_loss.detach(),
+            disc_loss=disc_loss.detach(),
+            disc_accuracy=disc_acc,
+            gen_token_count=gen_token_count.detach(),
+            disc_token_count=disc_token_count.detach(),
         )

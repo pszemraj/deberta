@@ -19,7 +19,7 @@ Each training step follows DeBERTaV3/ELECTRA-style RTD:
 ## Loss Terms
 
 - Generator loss: cross entropy on masked positions only.
-- Discriminator loss: BCE-with-logits on active tokens.
+- Discriminator loss: BCE-with-logits on active non-special tokens.
 - Total loss: `gen_loss_weight * gen_loss + disc_loss_weight * disc_loss`.
 
 Exposed controls:
