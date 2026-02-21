@@ -470,7 +470,7 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
-        :param Any kwargs: Unused compatibility kwargs.
+        :param Any kwargs: Additional compatibility kwargs forwarded by callers.
         :return BaseModelOutput: Last hidden states container.
         """
         if attention_mask is None:

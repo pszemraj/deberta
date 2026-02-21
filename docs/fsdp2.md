@@ -10,7 +10,7 @@ We ship two ready-to-use configs:
   Wrap class: **`DebertaRoPELayer`** (the modern RoPE+RMSNorm backbone, default)
 
 - `configs/fsdp2_hf_deberta_1node.yaml`  
-  Wrap class: **`DebertaV2Layer`** (Hugging Face DeBERTa v2/v3 legacy path)
+  Wrap class: **`DebertaV2Layer`** (Hugging Face DeBERTa v2/v3 compatibility path)
 
 Key settings you generally want:
 
@@ -38,7 +38,7 @@ When you save checkpoints with `SHARDED_STATE_DICT`, gathering a full state dict
 Use the dedicated exporter:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml -m deberta.export_cli \
+accelerate launch --config_file configs/fsdp2_1node.yaml deberta-export \
   --checkpoint_dir <RUN_DIR>/checkpoint-<STEP> \
   --output_dir <RUN_DIR>/exported_hf \
   --export_what discriminator

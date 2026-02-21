@@ -17,7 +17,7 @@ This **v3.1** update includes:
 ## Install
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
 pip install -U pip
@@ -68,6 +68,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml deberta-pretrain \
 Notes:
 - Attention uses **`torch.nn.functional.scaled_dot_product_attention`** (`--attention_implementation sdpa`) and will dispatch to FlashAttention kernels when available.
 - For length generalization, keep `--use_absolute_position_embeddings false` (default).
+- Training defaults to `train.mixed_precision=bf16` (autocast), not full-parameter bf16 casting.
 
 ---
 
@@ -97,7 +98,7 @@ See `docs/keel-paper-technical-overview.md` for a short technical overview and r
 
 ---
 
-## Legacy HF DeBERTa path (optional)
+## HF DeBERTa Compatibility Path (optional)
 
 If you want to train using the Hugging Face `DebertaV2Model` implementation (original disentangled attention), use:
 
@@ -126,7 +127,7 @@ Training attempts a best-effort export to `output_dir/final_hf/`, but for **FSDP
 Run with the **same Accelerate config** you trained with:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml -m deberta.export_cli \
+accelerate launch --config_file configs/fsdp2_1node.yaml deberta-export \
   --checkpoint_dir runs/deberta_rope_rtd/checkpoint-10000 \
   --export_what discriminator \
   --output_dir runs/deberta_rope_rtd/exported_hf

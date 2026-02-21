@@ -44,6 +44,7 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
     assert data_nested.max_seq_length == 128
     assert train_nested.overwrite_output_dir is True
     assert train_nested.mlm_max_ngram == 3
+    assert train_nested.mixed_precision == "bf16"
 
     flat = tmp_path / "flat.yaml"
     flat.write_text(
@@ -160,3 +161,8 @@ def test_build_optimizer_supports_generator_specific_lr():
     # We should have both decay and no-decay groups present.
     wds = {float(g["weight_decay"]) for g in opt.param_groups}
     assert wds == {0.0, 0.1}
+
+
+def test_train_config_defaults_to_bf16_autocast():
+    cfg = TrainConfig()
+    assert cfg.mixed_precision == "bf16"

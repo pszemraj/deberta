@@ -31,4 +31,5 @@ train:
   learning_rate: 1.0e-3
   warmup_steps: 0
   logging_steps: 5
+  mixed_precision: no
   report_to: none

@@ -516,8 +516,15 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
+    mixed_precision = str(train_cfg.mixed_precision).lower()
+    if mixed_precision == "none":
+        mixed_precision = "no"
+    if mixed_precision not in {"no", "bf16"}:
+        raise ValueError(f"train.mixed_precision must be one of: no|bf16. Got: {train_cfg.mixed_precision}")
     accelerator = Accelerator(
-        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps, log_with=log_with
+        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
+        log_with=log_with,
+        mixed_precision=mixed_precision,
     )
 
     _setup_logging(accelerator.is_main_process)

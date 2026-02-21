@@ -15,7 +15,7 @@ class ModelConfig:
          disentangled position bias with RoPE (rotary embeddings) and uses RMSNorm with
          a Post-Norm or KEEL residual topology.
 
-      2) backbone_type="hf_deberta_v2": legacy path that instantiates Hugging Face
+      2) backbone_type="hf_deberta_v2": compatibility path that instantiates Hugging Face
          DebertaV2Model backbones (DeBERTa v2/v3). This keeps the original disentangled
          attention implementation, and does NOT apply RoPE/RMSNorm/KEEL changes.
 
@@ -32,7 +32,7 @@ class ModelConfig:
         default="rope",
         metadata={
             "help": (
-                "Backbone implementation: 'rope' (recommended) or 'hf_deberta_v2' (legacy HF DeBERTa). "
+                "Backbone implementation: 'rope' (recommended) or 'hf_deberta_v2' (HF DeBERTa compatibility mode). "
                 "RoPE/RMSNorm/KEEL only apply to 'rope'."
             )
         },
@@ -360,6 +360,16 @@ class TrainConfig:
     report_to: str = field(
         default="none",
         metadata={"help": "Experiment tracker: none|wandb|tensorboard (accelerate loggers)."},
+    )
+
+    mixed_precision: str = field(
+        default="bf16",
+        metadata={
+            "help": (
+                "Accelerate mixed precision mode (bf16|no). Default is bf16 autocast "
+                "(not full-parameter bf16 casting)."
+            )
+        },
     )
 
     # Performance knobs
