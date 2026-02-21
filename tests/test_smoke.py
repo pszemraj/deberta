@@ -222,6 +222,24 @@ def test_collator_builds_document_block_attention_mask_when_packed():
     assert attn[0, 3, 0].item() == 1
 
 
+def test_collator_skips_document_block_attention_mask_for_single_doc_packed_chunk():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+    )
+
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 0, 1],
+        }
+    ]
+    batch = coll(features)
+    assert "attention_mask" not in batch
+
+
 def test_collator_build_drops_document_mask_when_not_packed():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))

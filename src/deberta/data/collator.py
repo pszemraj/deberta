@@ -337,6 +337,12 @@ class DebertaV3ElectraCollator:
         else:
             active = torch.ones_like(input_ids, dtype=torch.bool)
 
+        # Packed batches that contain only single-document chunks have no internal
+        # separators and do not need a dense pairwise mask.
+        internal_sep_positions = sep_positions[:, 1:-1] & active[:, 1:-1]
+        if not bool(internal_sep_positions.any().item()):
+            return None
+
         sep_before = sep_positions.long().cumsum(dim=1) - sep_positions.long()
         doc_ids = sep_before + 1
 
