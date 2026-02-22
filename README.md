@@ -80,7 +80,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 
 ## Documentation
 
-- Model/backbone config and architecture behavior: [`docs/model.md`](docs/model.md)
+- Model/backbone config and architecture behavior (including load/source resolution contract): [`docs/model.md`](docs/model.md)
 - Data pipeline, packing, and masking behavior: [`docs/data.md`](docs/data.md)
 - RTD objective and loss semantics: [`docs/objective.md`](docs/objective.md)
 - FSDP2/runtime/export behavior: [`docs/fsdp2.md`](docs/fsdp2.md)

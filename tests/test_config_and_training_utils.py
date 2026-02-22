@@ -1013,6 +1013,50 @@ def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_gen
         validate_model_config(cfg)
 
 
+def test_validate_model_config_requires_generator_model_source_for_pretrained_generator_config():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="local-rope-disc",
+        generator_config_name_or_path="local-rope-gen-config",
+        generator_model_name_or_path=None,
+    )
+    with pytest.raises(ValueError, match="requires model.generator_model_name_or_path"):
+        validate_model_config(cfg)
+
+
+def test_validate_model_config_rejects_scratch_rope_knobs_in_pretrained_mode():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="local-rope-disc",
+        rope_theta=50_000.0,
+    )
+    with pytest.raises(ValueError, match="only affect scratch RoPE initialization"):
+        validate_model_config(cfg)
+
+
+def test_validate_model_config_allows_explicit_pretrained_rope_overrides():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_rope_theta=50_000.0,
+        pretrained_norm_arch="keel",
+    )
+    validate_model_config(cfg)
+
+
+def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        pretrained_rope_theta=50_000.0,
+    )
+    with pytest.raises(ValueError, match="apply only when model.from_scratch=false"):
+        validate_model_config(cfg)
+
+
 def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs(
     monkeypatch: pytest.MonkeyPatch,
 ):

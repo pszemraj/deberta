@@ -191,8 +191,10 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
     constrained_choices: dict[str, tuple[str, ...]] = {
         "backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
         "norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
+        "pretrained_norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
         "attention_implementation": tuple(sorted(_ATTN_IMPL_CHOICES)),
         "ffn_type": tuple(sorted(_FFN_CHOICES)),
+        "pretrained_ffn_type": tuple(sorted(_FFN_CHOICES)),
         "embedding_sharing": tuple(sorted(_EMBED_SHARING_CHOICES)),
         "report_to": tuple(sorted(_REPORT_TO_CHOICES)),
         "lr_scheduler_type": tuple(sorted(_LR_SCHEDULER_CHOICES)),

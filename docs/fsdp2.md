@@ -2,7 +2,7 @@
 
 This document is the primary reference for distributed training setup and runtime knobs.
 
-For model/backbone options, see [`docs/model.md`](model.md). For input pipeline behavior, see [`docs/data.md`](data.md). For RTD objective/loss details, see [`docs/objective.md`](objective.md).
+For model/backbone options and load/source-resolution policy, see [`docs/model.md`](model.md) and [`docs/model.md#source-resolution-contract`](model.md#source-resolution-contract). For input pipeline behavior, see [`docs/data.md`](data.md). For RTD objective/loss details, see [`docs/objective.md`](objective.md).
 
 ## Accelerate + FSDP2
 

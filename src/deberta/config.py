@@ -250,6 +250,115 @@ class ModelConfig:
         metadata={"help": "Weight init std for rope backbone."},
     )
 
+    # -------------------------
+    # Explicit overrides for pretrained RoPE loads (model.from_scratch=false).
+    # These are ignored for scratch runs.
+    # -------------------------
+    pretrained_max_position_embeddings: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional max_position_embeddings override applied only when loading pretrained "
+                "RoPE configs (model.from_scratch=false)."
+            )
+        },
+    )
+
+    pretrained_rope_theta: float | None = field(
+        default=None,
+        metadata={
+            "help": ("Optional rope_theta override applied only when loading pretrained RoPE configs.")
+        },
+    )
+
+    pretrained_rotary_pct: float | None = field(
+        default=None,
+        metadata={
+            "help": ("Optional rotary_pct override applied only when loading pretrained RoPE configs.")
+        },
+    )
+
+    pretrained_use_absolute_position_embeddings: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional absolute-position toggle override applied only when loading pretrained "
+                "RoPE configs."
+            )
+        },
+    )
+
+    pretrained_type_vocab_size: int | None = field(
+        default=None,
+        metadata={
+            "help": ("Optional type_vocab_size override applied only when loading pretrained RoPE configs.")
+        },
+    )
+
+    pretrained_norm_arch: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional norm topology override ('post' or 'keel') applied only when loading "
+                "pretrained RoPE configs."
+            )
+        },
+    )
+
+    pretrained_norm_eps: float | None = field(
+        default=None,
+        metadata={
+            "help": ("Optional norm epsilon override applied only when loading pretrained RoPE configs.")
+        },
+    )
+
+    pretrained_keel_alpha_init: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional KEEL alpha initialization override applied only when loading pretrained "
+                "RoPE configs."
+            )
+        },
+    )
+
+    pretrained_keel_alpha_learnable: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional KEEL alpha learnable-flag override applied only when loading pretrained "
+                "RoPE configs."
+            )
+        },
+    )
+
+    pretrained_ffn_type: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional FFN type override ('swiglu' or 'mlp') applied only when loading pretrained "
+                "RoPE configs."
+            )
+        },
+    )
+
+    pretrained_use_bias: bool | None = field(
+        default=None,
+        metadata={
+            "help": ("Optional projection-bias override applied only when loading pretrained RoPE configs.")
+        },
+    )
+
+    pretrained_initializer_range: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional initializer_range metadata override applied only when loading pretrained "
+                "RoPE configs."
+            )
+        },
+    )
+
     hidden_dropout_prob: float | None = field(
         default=None,
         metadata={
@@ -730,11 +839,56 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "use_bias",
             "swiglu_adjust_intermediate",
             "initializer_range",
+            "pretrained_max_position_embeddings",
+            "pretrained_rope_theta",
+            "pretrained_rotary_pct",
+            "pretrained_use_absolute_position_embeddings",
+            "pretrained_type_vocab_size",
+            "pretrained_norm_arch",
+            "pretrained_norm_eps",
+            "pretrained_keel_alpha_init",
+            "pretrained_keel_alpha_learnable",
+            "pretrained_ffn_type",
+            "pretrained_use_bias",
+            "pretrained_initializer_range",
         )
         changed = [name for name in rope_only if getattr(cfg, name) != getattr(defaults, name)]
         if changed:
             raise ValueError(
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
+            )
+
+    if (
+        not bool(cfg.from_scratch)
+        and cfg.generator_config_name_or_path
+        and not cfg.generator_model_name_or_path
+    ):
+        raise ValueError(
+            "model.generator_config_name_or_path requires model.generator_model_name_or_path when "
+            "model.from_scratch=false. Explicit generator configs must pair with explicit generator "
+            "weights; leave both unset to use derived-generator fallback from discriminator weights."
+        )
+
+    pretrained_override_fields = (
+        "pretrained_max_position_embeddings",
+        "pretrained_rope_theta",
+        "pretrained_rotary_pct",
+        "pretrained_use_absolute_position_embeddings",
+        "pretrained_type_vocab_size",
+        "pretrained_norm_arch",
+        "pretrained_norm_eps",
+        "pretrained_keel_alpha_init",
+        "pretrained_keel_alpha_learnable",
+        "pretrained_ffn_type",
+        "pretrained_use_bias",
+        "pretrained_initializer_range",
+    )
+
+    if cfg.backbone_type == "rope" and bool(cfg.from_scratch):
+        set_pretrained = [name for name in pretrained_override_fields if getattr(cfg, name) is not None]
+        if set_pretrained:
+            raise ValueError(
+                "These options apply only when model.from_scratch=false: " + ", ".join(sorted(set_pretrained))
             )
 
     if cfg.backbone_type == "rope" and not bool(cfg.from_scratch):
@@ -749,6 +903,55 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "not HF DeBERTa v2/v3 checkpoints. "
                 "Use model.backbone_type='hf_deberta_v2' for HF DeBERTa weights, or keep model.from_scratch=true "
                 "for RoPE model initialization. Invalid sources: " + ", ".join(sorted(invalid_sources))
+            )
+
+        defaults = ModelConfig()
+        scratch_only_for_rope_pretrained = (
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "intermediate_size",
+            "hidden_act",
+            "rope_theta",
+            "rotary_pct",
+            "use_absolute_position_embeddings",
+            "max_position_embeddings",
+            "type_vocab_size",
+            "norm_arch",
+            "norm_eps",
+            "keel_alpha_init",
+            "keel_alpha_learnable",
+            "ffn_type",
+            "use_bias",
+            "swiglu_adjust_intermediate",
+            "initializer_range",
+        )
+        changed_scratch_only = [
+            name for name in scratch_only_for_rope_pretrained if getattr(cfg, name) != getattr(defaults, name)
+        ]
+        if changed_scratch_only:
+            raise ValueError(
+                "These options only affect scratch RoPE initialization and are not applied when "
+                "model.from_scratch=false. Use explicit pretrained override fields instead "
+                "(model.pretrained_*). Invalid options: " + ", ".join(sorted(changed_scratch_only))
+            )
+
+        if (
+            cfg.pretrained_max_position_embeddings is not None
+            and int(cfg.pretrained_max_position_embeddings) <= 0
+        ):
+            raise ValueError("model.pretrained_max_position_embeddings must be > 0 when provided.")
+        if cfg.pretrained_rotary_pct is not None:
+            pct = float(cfg.pretrained_rotary_pct)
+            if pct <= 0.0 or pct > 1.0:
+                raise ValueError("model.pretrained_rotary_pct must be in (0, 1] when provided.")
+        if cfg.pretrained_norm_arch is not None:
+            cfg.pretrained_norm_arch = _ensure_choice(
+                "model.pretrained_norm_arch", cfg.pretrained_norm_arch, _NORM_ARCH_CHOICES
+            )
+        if cfg.pretrained_ffn_type is not None:
+            cfg.pretrained_ffn_type = _ensure_choice(
+                "model.pretrained_ffn_type", cfg.pretrained_ffn_type, _FFN_CHOICES
             )
 
     if cfg.generator_config_name_or_path or cfg.generator_model_name_or_path:
