@@ -84,7 +84,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - Data pipeline, packing, and masking behavior: [`docs/data.md`](docs/data.md)
 - RTD objective and loss semantics: [`docs/objective.md`](docs/objective.md)
 - FSDP2/runtime/export behavior: [`docs/fsdp2.md`](docs/fsdp2.md)
-- KEEL paper-specific notes: [`docs/keel-paper-technical-overview.md`](docs/keel-paper-technical-overview.md)
+- Normalization strategy (`post` default, `keel` upgrade path): [`docs/norm-strategy.md`](docs/norm-strategy.md)
 - Deferred follow-ups: [`docs/roadmap.md`](docs/roadmap.md)
 
 ## Configs

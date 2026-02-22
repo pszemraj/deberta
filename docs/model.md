@@ -43,23 +43,7 @@ Key options in `ModelConfig`:
 
 ## Norm Architecture Rationale (`norm_arch`)
 
-`model.norm_arch: post` is the default by design, not a legacy leftover.
-
-Why:
-
-- This repo's primary encoder targets are shallow-to-mid depth (roughly 12-28 layers in shipped configs), where standard Post-LN is typically stable at the learning-rate ranges used in this project.
-- Pre-LN became the dominant default because it is easier to optimize at very large depth in decoder-only LLMs. That does not automatically make it the best default for moderate-depth encoders.
-- Empirical and recent literature trends point to stronger layer coupling / depth utilization under Post-LN style blocks, while Pre-LN can show higher layer redundancy as depth increases.
-
-How to choose:
-
-- Use `post` for the standard training recipes in this repo (recommended default).
-- Use `keel` when pushing depth and/or optimization aggressiveness and you want additional stability margin while keeping Post-LN style behavior.
-- Treat KEEL as the depth-scaling path, not as a correctness fix required for normal 12-28 layer runs.
-
-For details on KEEL's residual form and paper context, see [`docs/keel-paper-technical-overview.md`](keel-paper-technical-overview.md).
-
-Input embedding RMSNorm is intentionally kept in front of the encoder stack. With RMSNorm-based Post-LN/KEEL blocks this means first-layer input is already normalized, which is a deliberate stability choice in this codebase (not an accidental duplicate LayerNorm artifact).
+Normalization-policy rationale, equations, and selection guidance are defined in [`docs/norm-strategy.md`](norm-strategy.md).
 
 ## Generator/Discriminator Configuration
 

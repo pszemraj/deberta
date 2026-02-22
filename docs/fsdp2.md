@@ -39,14 +39,7 @@ For `torch.compile` max-autotune modes, legacy TF32 flags may be forced for comp
 
 ## `torch.compile`
 
-Enable with:
-
-- `train.torch_compile=true`
-- `train.torch_compile_mode` in:
-  - `default`
-  - `reduce-overhead`
-  - `max-autotune`
-  - `max-autotune-no-cudagraphs`
+Enable with `train.torch_compile=true` and `train.torch_compile_mode` in `default|reduce-overhead|max-autotune|max-autotune-no-cudagraphs`.
 
 If compile fails at runtime, training logs a warning and continues without compile.
 
