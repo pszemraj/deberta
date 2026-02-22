@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import shlex
@@ -251,11 +252,12 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
 
 
 def test_append_metrics_jsonl_row_appends_rows(tmp_path: Path):
-    metrics_path = tmp_path / "run" / "metrics.jsonl"
+    metrics_path = tmp_path / "run" / "metrics.jsonl.gz"
     _append_metrics_jsonl_row(metrics_path, {"step": 1, "loss": 0.123})
     _append_metrics_jsonl_row(metrics_path, {"step": 2, "crash": True, "crash_type": "KeyboardInterrupt"})
 
-    lines = metrics_path.read_text(encoding="utf-8").splitlines()
+    with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
+        lines = f.read().splitlines()
     assert len(lines) == 2
     row0 = json.loads(lines[0])
     row1 = json.loads(lines[1])
@@ -488,8 +490,9 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     with pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
 
-    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl"
-    rows = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f.read().splitlines()]
     assert rows and rows[-1]["crash"] is True
     assert rows[-1]["crash_type"] == "KeyboardInterrupt"
     assert int(rows[-1]["step"]) == 1

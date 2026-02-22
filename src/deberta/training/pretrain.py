@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import inspect
 import json
 import logging
@@ -68,14 +69,20 @@ def _json_load(path: Path) -> dict[str, Any]:
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
-    """Append one metrics row to JSONL with immediate flush.
+    """Append one metrics row to JSONL(.gz) with immediate flush.
 
-    :param Path path: Metrics JSONL path.
+    :param Path path: Metrics path, typically ``*.jsonl`` or ``*.jsonl.gz``.
     :param dict[str, Any] row: Serializable metrics row.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    if path.suffix == ".gz":
+        with gzip.open(path, "at", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+        return
     with path.open("a", encoding="utf-8", buffering=1) as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.write(line)
         f.flush()
 
 
@@ -1136,7 +1143,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     crash_step: int | None = None
     exit_code = 0
     train_started_at = time.perf_counter()
-    metrics_path = output_dir / "metrics.jsonl"
+    metrics_path = output_dir / "metrics.jsonl.gz"
     wandb_run: Any | None = None
 
     try:
