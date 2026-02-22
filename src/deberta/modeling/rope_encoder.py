@@ -246,7 +246,11 @@ class DebertaRoPESelfAttention(nn.Module):
             elif mask.ndim == 3:
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
                 pair_keep = mask
-                query_keep = pair_keep.any(dim=-1)
+                # Collator-produced pairwise masks guarantee diagonal=True for active
+                # tokens and diagonal=False for inactive/padded queries. Read query
+                # activity from the diagonal (O(B*S)) instead of reducing rows
+                # (O(B*S^2)) in every layer.
+                query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
 
                 sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
                 if not use_sdpa:

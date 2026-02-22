@@ -719,6 +719,50 @@ def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask():
     assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
 
 
+def test_self_attention_uses_pairwise_diagonal_for_query_activity():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        attention_implementation="eager",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DebertaRoPESelfAttention(cfg).eval()
+    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+
+    # Row 3 has an accidental off-diagonal keep bit but diagonal=False.
+    # In packed-mask semantics, query activity is encoded on the diagonal, so
+    # this row must remain inactive and be zeroed after projection.
+    pair_keep = torch.tensor(
+        [
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 0],
+                [1, 0, 0, 0],
+            ]
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        out = attn(x, pair_keep)
+
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
+
+
 def test_mlp_has_no_internal_residual_dropout():
     import pytest
 
