@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -1071,8 +1072,19 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
     if compile_enabled:
         try:
-            model = torch.compile(model, mode=compile_mode)  # type: ignore[attr-defined]
-            logger.info(f"Enabled torch.compile(mode={compile_mode})")
+            compile_kwargs: dict[str, Any] = {"mode": compile_mode}
+            # Prefer dynamic-shape compilation when available to reduce recompiles
+            # from small runtime shape changes (for example masked-token counts).
+            try:
+                compile_params = inspect.signature(torch.compile).parameters  # type: ignore[attr-defined]
+                if "dynamic" in compile_params:
+                    compile_kwargs["dynamic"] = True
+            except Exception:
+                pass
+            model = torch.compile(model, **compile_kwargs)  # type: ignore[attr-defined]
+            logger.info(
+                "Enabled torch.compile(" + ", ".join(f"{k}={v}" for k, v in compile_kwargs.items()) + ")"
+            )
         except Exception as e:
             logger.warning(f"torch.compile failed, continuing without: {e}")
             compile_enabled = False

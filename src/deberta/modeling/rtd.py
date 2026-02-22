@@ -651,15 +651,19 @@ class DebertaV3RTDPretrainer(nn.Module):
         active = active & (~special)
         disc_token_count = active.to(torch.float32).sum()
 
-        if bool(active.any().item()):
-            disc_loss = F.binary_cross_entropy_with_logits(disc_logits[active].float(), disc_labels[active])
-            # Accuracy for monitoring: threshold at 0
-            with torch.no_grad():
-                pred = (disc_logits[active] > 0).to(torch.float32)
-                disc_acc = (pred == disc_labels[active]).to(torch.float32).mean()
-        else:
-            disc_loss = disc_logits.sum() * 0.0
-            disc_acc = disc_logits.sum() * 0.0
+        # Keep this path tensor-only (no .item()/Python branching) to avoid
+        # torch.compile graph breaks when active-token counts vary across steps.
+        active_f = active.to(dtype=torch.float32)
+        active_denom = active_f.sum().clamp_min(1.0)
+        disc_loss_per_token = F.binary_cross_entropy_with_logits(
+            disc_logits.float(), disc_labels, reduction="none"
+        )
+        disc_loss = (disc_loss_per_token * active_f).sum() / active_denom
+        # Accuracy for monitoring: threshold at 0.
+        with torch.no_grad():
+            pred = (disc_logits > 0).to(torch.float32)
+            correct = (pred == disc_labels).to(torch.float32)
+            disc_acc = (correct * active_f).sum() / active_denom
 
         # -------------------
         # Total
