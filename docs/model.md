@@ -27,8 +27,9 @@ Key options in `ModelConfig`:
 - attention:
   - `attention_implementation`: `sdpa` (recommended) or `eager`
 - dropout:
-  - `hidden_dropout_prob` and `attention_probs_dropout_prob` default to `0.0`
-  - these values are applied to both discriminator and generator configs unless explicitly set to `null` in config to preserve checkpoint-native dropout values
+  - `hidden_dropout_prob` and `attention_probs_dropout_prob` default to `null` (no override)
+  - set a numeric value (including `0.0`) to explicitly override discriminator/generator dropout
+  - leaving them `null` preserves checkpoint-native dropout values for pretrained loads
 - pretrained RoPE loading (`from_scratch=false`):
   - checkpoint-native architecture fields are preserved by default (`rope_theta`, `rotary_pct`, `norm_arch`, KEEL knobs, etc.)
   - non-default `ModelConfig` values are treated as explicit overrides

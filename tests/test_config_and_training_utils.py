@@ -506,10 +506,10 @@ def test_train_config_defaults_to_bf16_autocast():
     assert cfg.sdpa_kernel == "auto"
 
 
-def test_model_config_defaults_dropouts_to_zero():
+def test_model_config_defaults_leave_dropout_overrides_unset():
     cfg = ModelConfig()
-    assert cfg.hidden_dropout_prob == pytest.approx(0.0)
-    assert cfg.attention_probs_dropout_prob == pytest.approx(0.0)
+    assert cfg.hidden_dropout_prob is None
+    assert cfg.attention_probs_dropout_prob is None
 
 
 def test_data_config_defaults_disable_cross_document_blocking():
@@ -1079,6 +1079,8 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
         keel_alpha_learnable=True,
         ffn_type="mlp",
         use_bias=True,
+        hidden_dropout_prob=0.3,
+        attention_probs_dropout_prob=0.4,
     )
 
     monkeypatch.setattr(
@@ -1118,6 +1120,8 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
     assert disc_cfg.keel_alpha_learnable is True
     assert disc_cfg.ffn_type == "mlp"
     assert disc_cfg.use_bias is True
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.3)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.4)
 
 
 def test_readme_cli_examples_are_parseable():

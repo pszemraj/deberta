@@ -372,6 +372,9 @@ def _build_hf_fake_transformers_module() -> types.ModuleType:
     return module
 
 
+_USE_MODEL_DEFAULT = object()
+
+
 @pytest.mark.parametrize(
     (
         "from_scratch",
@@ -381,6 +384,8 @@ def _build_hf_fake_transformers_module() -> types.ModuleType:
         "expected_attn",
     ),
     [
+        (False, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.1, 0.2),
+        (True, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.1, 0.2),
         (False, None, None, 0.1, 0.2),
         (True, None, None, 0.1, 0.2),
         (False, 0.5, 0.25, 0.5, 0.25),
@@ -390,8 +395,8 @@ def _build_hf_fake_transformers_module() -> types.ModuleType:
 def test_build_backbone_configs_hf_deberta_dropout_overrides(
     monkeypatch: pytest.MonkeyPatch,
     from_scratch: bool,
-    hidden_dropout_prob: float | None,
-    attention_probs_dropout_prob: float | None,
+    hidden_dropout_prob: float | None | object,
+    attention_probs_dropout_prob: float | None | object,
     expected_hidden: float,
     expected_attn: float,
 ):
@@ -400,13 +405,17 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     fake_transformers = _build_hf_fake_transformers_module()
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    model_cfg = ModelConfig(
+    model_kwargs: dict[str, object] = dict(
         backbone_type="hf_deberta_v2",
         from_scratch=from_scratch,
         discriminator_model_name_or_path="disc",
-        hidden_dropout_prob=hidden_dropout_prob,
-        attention_probs_dropout_prob=attention_probs_dropout_prob,
     )
+    if hidden_dropout_prob is not _USE_MODEL_DEFAULT:
+        model_kwargs["hidden_dropout_prob"] = hidden_dropout_prob
+    if attention_probs_dropout_prob is not _USE_MODEL_DEFAULT:
+        model_kwargs["attention_probs_dropout_prob"] = attention_probs_dropout_prob
+
+    model_cfg = ModelConfig(**model_kwargs)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=_DummyTokenizer(),
