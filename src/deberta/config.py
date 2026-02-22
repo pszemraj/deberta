@@ -648,6 +648,33 @@ def normalize_mixed_precision(value: object) -> str:
     return mp
 
 
+def validate_run_metadata_schema(raw: dict[str, object], *, source: str) -> None:
+    """Validate run-metadata schema compatibility.
+
+    :param dict[str, object] raw: Parsed run metadata payload.
+    :param str source: Human-readable source location for errors.
+    :raises ValueError: If schema metadata is missing or incompatible.
+    """
+    if "config_schema_version" not in raw:
+        raise ValueError(
+            f"run metadata missing `config_schema_version` at {source}. "
+            "Refusing resume/export with ambiguous config schema."
+        )
+
+    try:
+        schema_version = int(raw["config_schema_version"])
+    except Exception as e:
+        raise ValueError(
+            f"Invalid config_schema_version in {source}: {raw['config_schema_version']!r}"
+        ) from e
+
+    if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
+        raise ValueError(
+            f"Unsupported run metadata schema at {source}: {schema_version}. "
+            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
+        )
+
+
 def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     """Return whether a model source appears to be an HF DeBERTa v2/v3 checkpoint id.
 

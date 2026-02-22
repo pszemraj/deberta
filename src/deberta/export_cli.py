@@ -14,11 +14,11 @@ from typing import Any
 import torch
 
 from deberta.config import (
-    RUN_CONFIG_SCHEMA_VERSION,
     DataConfig,
     ModelConfig,
     validate_data_config,
     validate_model_config,
+    validate_run_metadata_schema,
 )
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
@@ -62,22 +62,7 @@ def _validate_run_metadata_if_present(run_dir: Path) -> None:
     if not meta_path.exists():
         return
     raw = _load_json(meta_path)
-    if "config_schema_version" not in raw:
-        raise ValueError(
-            f"run metadata missing `config_schema_version` at {meta_path}. "
-            "Refusing export with ambiguous config schema."
-        )
-    try:
-        schema_version = int(raw["config_schema_version"])
-    except Exception as e:
-        raise ValueError(
-            f"Invalid config_schema_version in {meta_path}: {raw['config_schema_version']!r}"
-        ) from e
-    if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
-        raise ValueError(
-            f"Unsupported run metadata schema at {meta_path}: {schema_version}. "
-            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
-        )
+    validate_run_metadata_schema(raw, source=str(meta_path))
 
 
 @dataclass

@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import deberta.export_cli as export_cli
+from deberta.config import RUN_CONFIG_SCHEMA_VERSION
 
 
 class _FakeTokenizer:
@@ -205,7 +206,7 @@ def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "run_metadata.json").write_text(
-        json.dumps({"config_schema_version": int(export_cli.RUN_CONFIG_SCHEMA_VERSION) + 1}),
+        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION) + 1}),
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unsupported run metadata schema"):

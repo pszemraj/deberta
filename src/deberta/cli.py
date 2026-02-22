@@ -87,24 +87,7 @@ def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
     if not isinstance(raw, dict):
         raise ValueError("YAML config must parse to a dict.")
 
-    if any(k in raw for k in ("model", "data", "train")):
-        unknown_top = sorted(k for k in raw.keys() if k not in {"model", "data", "train"})
-        if unknown_top:
-            raise ValueError(
-                "Unknown top-level keys in nested YAML config (expected only model/data/train): "
-                + ", ".join(unknown_top)
-            )
-        model_dict = raw.get("model", {}) or {}
-        data_dict = raw.get("data", {}) or {}
-        train_dict = raw.get("train", {}) or {}
-        if (
-            not isinstance(model_dict, dict)
-            or not isinstance(data_dict, dict)
-            or not isinstance(train_dict, dict)
-        ):
-            raise ValueError("YAML config sections model/data/train must be dicts.")
-    else:
-        model_dict, data_dict, train_dict = _split_flat_dict(raw)
+    model_dict, data_dict, train_dict = _split_nested_or_flat_sections(raw, format_name="YAML")
 
     return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
 
@@ -120,14 +103,25 @@ def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("JSON config must parse to a dict.")
+    model_dict, data_dict, train_dict = _split_nested_or_flat_sections(raw, format_name="JSON")
+    return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
 
-    # Support either nested {model:..., data:..., train:...} or flat.
+
+def _split_nested_or_flat_sections(
+    raw: dict[str, Any], *, format_name: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Split nested/flat config mappings into model/data/train sections.
+
+    :param dict[str, Any] raw: Parsed config mapping.
+    :param str format_name: Human-readable format label (e.g., JSON/YAML).
+    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Section dictionaries.
+    """
     if any(k in raw for k in ("model", "data", "train")):
         unknown_top = sorted(k for k in raw.keys() if k not in {"model", "data", "train"})
         if unknown_top:
             raise ValueError(
-                "Unknown top-level keys in nested JSON config (expected only model/data/train): "
-                + ", ".join(unknown_top)
+                f"Unknown top-level keys in nested {format_name} config "
+                f"(expected only model/data/train): {', '.join(unknown_top)}"
             )
         model_dict = raw.get("model", {}) or {}
         data_dict = raw.get("data", {}) or {}
@@ -137,12 +131,10 @@ def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
             or not isinstance(data_dict, dict)
             or not isinstance(train_dict, dict)
         ):
-            raise ValueError("JSON config sections model/data/train must be dicts.")
-        return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
+            raise ValueError(f"{format_name} config sections model/data/train must be dicts.")
+        return model_dict, data_dict, train_dict
 
-    # Back-compat: try flat json format by splitting keys.
-    model_dict, data_dict, train_dict = _split_flat_dict(raw)
-    return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
+    return _split_flat_dict(raw)
 
 
 def _parse_bool(value: str) -> bool:

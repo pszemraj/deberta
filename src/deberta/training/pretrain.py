@@ -25,6 +25,7 @@ from deberta.config import (
     normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
+    validate_run_metadata_schema,
     validate_train_config,
     validate_training_workflow_options,
 )
@@ -84,22 +85,7 @@ def _validate_run_metadata(path: Path) -> None:
     :raises ValueError: If metadata is malformed or schema-incompatible.
     """
     raw = _json_load(path)
-    if "config_schema_version" not in raw:
-        raise ValueError(
-            f"run metadata missing `config_schema_version` at {path}. "
-            "Refusing resume/export with ambiguous config schema."
-        )
-
-    try:
-        schema_version = int(raw["config_schema_version"])
-    except Exception as e:
-        raise ValueError(f"Invalid config_schema_version in {path}: {raw['config_schema_version']!r}") from e
-
-    if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
-        raise ValueError(
-            f"Unsupported run metadata schema at {path}: {schema_version}. "
-            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
-        )
+    validate_run_metadata_schema(raw, source=str(path))
 
 
 def _resolve_resume_checkpoint(

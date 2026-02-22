@@ -372,33 +372,28 @@ def _build_hf_fake_transformers_module() -> types.ModuleType:
     return module
 
 
-def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-
-    fake_transformers = _build_hf_fake_transformers_module()
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    model_cfg = ModelConfig(
-        backbone_type="hf_deberta_v2",
-        from_scratch=False,
-        discriminator_model_name_or_path="disc",
-        hidden_dropout_prob=None,
-        attention_probs_dropout_prob=None,
-    )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
-        max_position_embeddings=128,
-    )
-
-    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.1)
-    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
-    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.1)
-    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
-
-
-def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts_when_from_scratch_true(
+@pytest.mark.parametrize(
+    (
+        "from_scratch",
+        "hidden_dropout_prob",
+        "attention_probs_dropout_prob",
+        "expected_hidden",
+        "expected_attn",
+    ),
+    [
+        (False, None, None, 0.1, 0.2),
+        (True, None, None, 0.1, 0.2),
+        (False, 0.5, 0.25, 0.5, 0.25),
+        (True, 0.0, 0.0, 0.0, 0.0),
+    ],
+)
+def test_build_backbone_configs_hf_deberta_dropout_overrides(
     monkeypatch: pytest.MonkeyPatch,
+    from_scratch: bool,
+    hidden_dropout_prob: float | None,
+    attention_probs_dropout_prob: float | None,
+    expected_hidden: float,
+    expected_attn: float,
 ):
     pytest.importorskip("transformers")
 
@@ -407,10 +402,10 @@ def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts_when_fr
 
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
-        from_scratch=True,
+        from_scratch=from_scratch,
         discriminator_model_name_or_path="disc",
-        hidden_dropout_prob=None,
-        attention_probs_dropout_prob=None,
+        hidden_dropout_prob=hidden_dropout_prob,
+        attention_probs_dropout_prob=attention_probs_dropout_prob,
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -418,35 +413,10 @@ def test_build_backbone_configs_hf_deberta_preserves_checkpoint_dropouts_when_fr
         max_position_embeddings=128,
     )
 
-    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.1)
-    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
-    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.1)
-    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.2)
-
-
-def test_build_backbone_configs_hf_deberta_applies_nonzero_dropout_overrides(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-
-    fake_transformers = _build_hf_fake_transformers_module()
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    model_cfg = ModelConfig(
-        backbone_type="hf_deberta_v2",
-        from_scratch=False,
-        discriminator_model_name_or_path="disc",
-        hidden_dropout_prob=0.5,
-        attention_probs_dropout_prob=0.25,
-    )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
-        max_position_embeddings=128,
-    )
-
-    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.5)
-    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.25)
-    assert gen_cfg.hidden_dropout_prob == pytest.approx(0.5)
-    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(0.25)
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(expected_hidden)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(expected_attn)
+    assert gen_cfg.hidden_dropout_prob == pytest.approx(expected_hidden)
+    assert gen_cfg.attention_probs_dropout_prob == pytest.approx(expected_attn)
 
 
 def test_build_backbone_configs_rejects_invalid_model_options_early():
