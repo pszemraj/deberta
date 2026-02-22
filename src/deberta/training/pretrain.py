@@ -7,8 +7,9 @@ import json
 import logging
 import re
 import shutil
+import time
 from collections.abc import Iterator
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,40 @@ def _json_load(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"Expected JSON object at {path}, got {type(raw).__name__}.")
     return raw
+
+
+def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
+    """Append one metrics row to JSONL with immediate flush.
+
+    :param Path path: Metrics JSONL path.
+    :param dict[str, Any] row: Serializable metrics row.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", buffering=1) as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def _flush_loggers() -> None:
+    """Flush all configured logger handlers best-effort.
+
+    :return None: None.
+    """
+    root = logging.getLogger()
+    logger_objs: list[logging.Logger] = [root]
+    for obj in logging.Logger.manager.loggerDict.values():
+        if isinstance(obj, logging.Logger):
+            logger_objs.append(obj)
+
+    seen_handlers: set[int] = set()
+    for log_obj in logger_objs:
+        for handler in log_obj.handlers:
+            hid = id(handler)
+            if hid in seen_handlers:
+                continue
+            seen_handlers.add(hid)
+            with suppress(Exception):
+                handler.flush()
 
 
 def _build_run_metadata() -> dict[str, Any]:
@@ -1093,240 +1128,324 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             "torch.compile requested but this torch build does not expose torch.compile; continuing."
         )
 
-    # Trackers
-    if train_cfg.report_to != "none":
-        tracker_cfg = {
-            "model": asdict(model_cfg),
-            "data": asdict(data_cfg),
-            "train": asdict(train_cfg),
-        }
-        accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-train", config=tracker_cfg)
-
-    # Resume
     global_step = 0
     consumed_micro_batches = 0
-    if ckpt:
-        logger.info(f"Resuming from checkpoint: {ckpt}")
-        accelerator.load_state(ckpt)
-        global_step = _parse_checkpoint_step(ckpt)
-        restored = _load_checkpoint_data_progress(Path(ckpt))
-        if restored is None:
-            # Back-compat fallback for older checkpoints without data_state.json.
-            restored = global_step * int(train_cfg.gradient_accumulation_steps)
-            logger.warning(
-                "Checkpoint missing data_state.json; approximating data replay offset "
-                f"as global_step * grad_accum = {restored} micro-batches."
-            )
-        consumed_micro_batches = int(restored)
+    last_saved_step = 0
+    crash_type: str | None = None
+    crash_reason: str | None = None
+    crash_step: int | None = None
+    exit_code = 0
+    train_started_at = time.perf_counter()
+    metrics_path = output_dir / "metrics.jsonl"
+    wandb_run: Any | None = None
 
-    # Training loop
-    model.train()
+    try:
+        # Trackers
+        if train_cfg.report_to != "none":
+            tracker_cfg = {
+                "model": asdict(model_cfg),
+                "data": asdict(data_cfg),
+                "train": asdict(train_cfg),
+            }
+            accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-train", config=tracker_cfg)
+            if str(train_cfg.report_to).lower() == "wandb":
+                with suppress(Exception):
+                    wandb_run = accelerator.get_tracker("wandb", unwrap=True)
 
-    train_iter = _cycle_dataloader(train_loader)
-    ga_steps = int(train_cfg.gradient_accumulation_steps)
-    token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
-    unwrapped_model = accelerator.unwrap_model(model)
-    special_token_ids = tuple(
-        sorted(int(sid) for sid in getattr(unwrapped_model, "_forbidden_sample_token_ids", set()))
-    )
-    disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
-    if disc_pad_token_id is not None:
-        disc_pad_token_id = int(disc_pad_token_id)
+        # Resume
+        if ckpt:
+            logger.info(f"Resuming from checkpoint: {ckpt}")
+            accelerator.load_state(ckpt)
+            global_step = _parse_checkpoint_step(ckpt)
+            last_saved_step = global_step
+            restored = _load_checkpoint_data_progress(Path(ckpt))
+            if restored is None:
+                # Back-compat fallback for older checkpoints without data_state.json.
+                restored = global_step * int(train_cfg.gradient_accumulation_steps)
+                logger.warning(
+                    "Checkpoint missing data_state.json; approximating data replay offset "
+                    f"as global_step * grad_accum = {restored} micro-batches."
+                )
+            consumed_micro_batches = int(restored)
 
-    if consumed_micro_batches > 0:
-        logger.info(
-            "Replaying data iterator by %d micro-batches to align resume data position.",
-            consumed_micro_batches,
+        # Training loop
+        model.train()
+
+        train_iter = _cycle_dataloader(train_loader)
+        ga_steps = int(train_cfg.gradient_accumulation_steps)
+        token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
+        unwrapped_model = accelerator.unwrap_model(model)
+        special_token_ids = tuple(
+            sorted(int(sid) for sid in getattr(unwrapped_model, "_forbidden_sample_token_ids", set()))
         )
-        for _ in range(consumed_micro_batches):
-            _ = next(train_iter)
+        disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
+        if disc_pad_token_id is not None:
+            disc_pad_token_id = int(disc_pad_token_id)
 
-    while global_step < int(train_cfg.max_steps):
-        window: list[tuple[dict[str, torch.Tensor], float, float]] = []
-        local_gen_tokens = 0.0
-        local_disc_tokens = 0.0
-
-        for _ in range(ga_steps):
-            batch = next(train_iter)
-            consumed_micro_batches += 1
-            if token_weighted_ga:
-                gen_count, disc_count = _count_rtd_tokens_for_batch(
-                    batch,
-                    special_token_ids=special_token_ids,
-                    pad_token_id=disc_pad_token_id,
-                )
-                local_gen_tokens += gen_count
-                local_disc_tokens += disc_count
-            else:
-                gen_count, disc_count = 0.0, 0.0
-            window.append((batch, gen_count, disc_count))
-
-        if token_weighted_ga:
-            local_totals = torch.tensor(
-                [local_gen_tokens, local_disc_tokens],
-                device=accelerator.device,
-                dtype=torch.float32,
+        if consumed_micro_batches > 0:
+            logger.info(
+                "Replaying data iterator by %d micro-batches to align resume data position.",
+                consumed_micro_batches,
             )
-            # DDP/FSDP gradients are averaged across ranks. Mean token totals per rank
-            # preserve global token-normalized scaling when used with local micro counts.
-            mean_totals = accelerator.reduce(local_totals, reduction="mean")
-            gen_window_tokens_per_rank = max(float(mean_totals[0].item()), 1.0)
-            disc_window_tokens_per_rank = max(float(mean_totals[1].item()), 1.0)
-        else:
-            gen_window_tokens_per_rank = 1.0
-            disc_window_tokens_per_rank = 1.0
+            for _ in range(consumed_micro_batches):
+                _ = next(train_iter)
 
-        out = None
-        loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
-        did_sync_step = False
+        while global_step < int(train_cfg.max_steps):
+            window: list[tuple[dict[str, torch.Tensor], float, float]] = []
+            local_gen_tokens = 0.0
+            local_disc_tokens = 0.0
 
-        for step_idx, (batch, gen_count, disc_count) in enumerate(window):
-            batch = _move_batch_to_device(batch, accelerator.device)
-            if compile_enabled:
-                _maybe_cudagraph_mark_step_begin()
-
-            is_sync_step = step_idx == (ga_steps - 1)
-            sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
-
-            with sync_ctx:
-                out = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch.get("attention_mask"),
-                    labels=batch["labels"],
-                    token_type_ids=batch.get("token_type_ids"),
-                    sampling_temperature=train_cfg.sampling_temperature,
-                    gen_loss_weight=train_cfg.gen_loss_weight,
-                    disc_loss_weight=train_cfg.disc_loss_weight,
-                    decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
-                )
-
+            for _ in range(ga_steps):
+                batch = next(train_iter)
+                consumed_micro_batches += 1
                 if token_weighted_ga:
-                    micro_obj = _token_weighted_micro_objective(
-                        gen_loss=out.gen_loss_raw,
-                        disc_loss=out.disc_loss_raw,
-                        gen_count=gen_count,
-                        disc_count=disc_count,
-                        gen_window_tokens_per_rank=gen_window_tokens_per_rank,
-                        disc_window_tokens_per_rank=disc_window_tokens_per_rank,
-                        gen_loss_weight=float(train_cfg.gen_loss_weight),
-                        disc_loss_weight=float(train_cfg.disc_loss_weight),
-                        decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
+                    gen_count, disc_count = _count_rtd_tokens_for_batch(
+                        batch,
+                        special_token_ids=special_token_ids,
+                        pad_token_id=disc_pad_token_id,
                     )
-                    loss = micro_obj
-                    loss_for_metrics = loss_for_metrics + micro_obj.detach()
+                    local_gen_tokens += gen_count
+                    local_disc_tokens += disc_count
                 else:
-                    loss = out.loss
-                    loss_for_metrics = loss_for_metrics + out.loss.detach()
+                    gen_count, disc_count = 0.0, 0.0
+                window.append((batch, gen_count, disc_count))
 
-                backward_loss = _scale_loss_for_backward(
-                    loss=loss,
-                    ga_steps=ga_steps,
-                    token_weighted_ga=token_weighted_ga,
+            if token_weighted_ga:
+                local_totals = torch.tensor(
+                    [local_gen_tokens, local_disc_tokens],
+                    device=accelerator.device,
+                    dtype=torch.float32,
                 )
-                accelerator.backward(backward_loss)
+                # DDP/FSDP gradients are averaged across ranks. Mean token totals per rank
+                # preserve global token-normalized scaling when used with local micro counts.
+                mean_totals = accelerator.reduce(local_totals, reduction="mean")
+                gen_window_tokens_per_rank = max(float(mean_totals[0].item()), 1.0)
+                disc_window_tokens_per_rank = max(float(mean_totals[1].item()), 1.0)
+            else:
+                gen_window_tokens_per_rank = 1.0
+                disc_window_tokens_per_rank = 1.0
 
-            if is_sync_step:
-                did_sync_step = True
-                if _should_clip_gradients(
-                    sync_gradients=True,
-                    max_grad_norm=train_cfg.max_grad_norm,
-                ):
-                    accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+            out = None
+            loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            did_sync_step = False
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            for step_idx, (batch, gen_count, disc_count) in enumerate(window):
+                batch = _move_batch_to_device(batch, accelerator.device)
+                if compile_enabled:
+                    _maybe_cudagraph_mark_step_begin()
 
-        if not did_sync_step:
-            raise RuntimeError("Accumulation window produced no synchronized optimization step.")
+                is_sync_step = step_idx == (ga_steps - 1)
+                sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
 
-        loss_for_metrics = _finalize_window_metric_loss(
-            accumulated_loss=loss_for_metrics,
-            ga_steps=ga_steps,
-            token_weighted_ga=token_weighted_ga,
-        )
-
-        # We count *optimizer* steps (not micro-steps).
-        if did_sync_step:
-            if out is None:
-                raise RuntimeError("Accumulation window produced no forward pass outputs.")
-            global_step += 1
-
-            if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
-                # Reduce scalar metrics across processes.
-                def _mean(x: torch.Tensor) -> float:
-                    """Compute global mean scalar across processes.
-
-                    :param torch.Tensor x: Scalar-like tensor.
-                    :return float: Process-aggregated mean value.
-                    """
-                    x = x.detach().float().reshape(1)
-                    return accelerator.gather(x).mean().item()
-
-                lr = lr_scheduler.get_last_lr()[0] if hasattr(lr_scheduler, "get_last_lr") else float("nan")
-                metrics = {
-                    "step": global_step,
-                    "lr": lr,
-                    "loss": _mean(loss_for_metrics),
-                    "gen_loss": _mean(out.gen_loss),
-                    "disc_loss": _mean(out.disc_loss),
-                    "disc_acc": _mean(out.disc_accuracy),
-                    "gen_tokens": _mean(out.gen_token_count),
-                    "disc_tokens": _mean(out.disc_token_count),
-                }
-
-                if accelerator.is_main_process:
-                    logger.info(
-                        " | ".join(
-                            [
-                                f"step={metrics['step']}",
-                                f"lr={metrics['lr']:.3e}",
-                                f"loss={metrics['loss']:.4f}",
-                                f"gen={metrics['gen_loss']:.4f}",
-                                f"disc={metrics['disc_loss']:.4f}",
-                                f"acc={metrics['disc_acc']:.4f}",
-                                f"gen_tok={metrics['gen_tokens']:.1f}",
-                                f"disc_tok={metrics['disc_tokens']:.1f}",
-                            ]
-                        )
+                with sync_ctx:
+                    out = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch.get("attention_mask"),
+                        labels=batch["labels"],
+                        token_type_ids=batch.get("token_type_ids"),
+                        sampling_temperature=train_cfg.sampling_temperature,
+                        gen_loss_weight=train_cfg.gen_loss_weight,
+                        disc_loss_weight=train_cfg.disc_loss_weight,
+                        decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
                     )
 
-                if train_cfg.report_to != "none":
-                    accelerator.log({k: v for k, v in metrics.items() if k != "step"}, step=global_step)
+                    if token_weighted_ga:
+                        micro_obj = _token_weighted_micro_objective(
+                            gen_loss=out.gen_loss_raw,
+                            disc_loss=out.disc_loss_raw,
+                            gen_count=gen_count,
+                            disc_count=disc_count,
+                            gen_window_tokens_per_rank=gen_window_tokens_per_rank,
+                            disc_window_tokens_per_rank=disc_window_tokens_per_rank,
+                            gen_loss_weight=float(train_cfg.gen_loss_weight),
+                            disc_loss_weight=float(train_cfg.disc_loss_weight),
+                            decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
+                        )
+                        loss = micro_obj
+                        loss_for_metrics = loss_for_metrics + micro_obj.detach()
+                    else:
+                        loss = out.loss
+                        loss_for_metrics = loss_for_metrics + out.loss.detach()
 
-            # Checkpoint
-            if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                    backward_loss = _scale_loss_for_backward(
+                        loss=loss,
+                        ga_steps=ga_steps,
+                        token_weighted_ga=token_weighted_ga,
+                    )
+                    accelerator.backward(backward_loss)
+
+                if is_sync_step:
+                    did_sync_step = True
+                    if _should_clip_gradients(
+                        sync_gradients=True,
+                        max_grad_norm=train_cfg.max_grad_norm,
+                    ):
+                        accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+            if not did_sync_step:
+                raise RuntimeError("Accumulation window produced no synchronized optimization step.")
+
+            loss_for_metrics = _finalize_window_metric_loss(
+                accumulated_loss=loss_for_metrics,
+                ga_steps=ga_steps,
+                token_weighted_ga=token_weighted_ga,
+            )
+
+            # We count *optimizer* steps (not micro-steps).
+            if did_sync_step:
+                if out is None:
+                    raise RuntimeError("Accumulation window produced no forward pass outputs.")
+                global_step += 1
+
+                if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
+                    # Reduce scalar metrics across processes.
+                    def _mean(x: torch.Tensor) -> float:
+                        """Compute global mean scalar across processes.
+
+                        :param torch.Tensor x: Scalar-like tensor.
+                        :return float: Process-aggregated mean value.
+                        """
+                        x = x.detach().float().reshape(1)
+                        return accelerator.gather(x).mean().item()
+
+                    lr = (
+                        lr_scheduler.get_last_lr()[0]
+                        if hasattr(lr_scheduler, "get_last_lr")
+                        else float("nan")
+                    )
+                    metrics = {
+                        "step": global_step,
+                        "lr": lr,
+                        "loss": _mean(loss_for_metrics),
+                        "gen_loss": _mean(out.gen_loss),
+                        "disc_loss": _mean(out.disc_loss),
+                        "disc_acc": _mean(out.disc_accuracy),
+                        "gen_tokens": _mean(out.gen_token_count),
+                        "disc_tokens": _mean(out.disc_token_count),
+                    }
+
+                    if accelerator.is_main_process:
+                        logger.info(
+                            " | ".join(
+                                [
+                                    f"step={metrics['step']}",
+                                    f"lr={metrics['lr']:.3e}",
+                                    f"loss={metrics['loss']:.4f}",
+                                    f"gen={metrics['gen_loss']:.4f}",
+                                    f"disc={metrics['disc_loss']:.4f}",
+                                    f"acc={metrics['disc_acc']:.4f}",
+                                    f"gen_tok={metrics['gen_tokens']:.1f}",
+                                    f"disc_tok={metrics['disc_tokens']:.1f}",
+                                ]
+                            )
+                        )
+
+                    if train_cfg.report_to != "none":
+                        accelerator.log({k: v for k, v in metrics.items() if k != "step"}, step=global_step)
+
+                # Checkpoint
+                if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
+                    ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                    _save_training_checkpoint(
+                        accelerator=accelerator,
+                        checkpoint_dir=ckpt_dir,
+                        output_dir=output_dir,
+                        consumed_micro_batches=consumed_micro_batches,
+                        save_total_limit=int(train_cfg.save_total_limit),
+                        log_label="periodic",
+                    )
+                    last_saved_step = global_step
+
+        # Best-effort HF export
+        if train_cfg.export_hf_final:
+            accelerator.wait_for_everyone()
+            _export_discriminator_hf(
+                accelerator=accelerator,
+                model=model,
+                tokenizer=tokenizer,
+                output_dir=output_dir / "final_hf",
+                embedding_sharing=model_cfg.embedding_sharing,
+            )
+
+    except KeyboardInterrupt as exc:
+        exit_code = 130
+        crash_type = type(exc).__name__
+        crash_reason = str(exc) or "Interrupted by user (CTRL+C)"
+        crash_step = int(global_step)
+        logger.warning("Training interrupted at step %s", crash_step)
+        raise
+    except Exception as exc:
+        exit_code = 1
+        crash_type = type(exc).__name__
+        crash_reason = str(exc)
+        crash_step = int(global_step)
+        logger.exception("Training crashed at step %s", crash_step)
+        raise
+    finally:
+        # Attempt a final checkpoint if we progressed and this exact step wasn't already saved.
+        final_step = int(global_step)
+        should_try_crash_save = (crash_reason is None) or int(getattr(accelerator, "num_processes", 1)) == 1
+        if final_step > 0 and final_step != int(last_saved_step) and should_try_crash_save:
+            with suppress(Exception):
+                final_ckpt = output_dir / f"checkpoint-{final_step}"
                 _save_training_checkpoint(
                     accelerator=accelerator,
-                    checkpoint_dir=ckpt_dir,
+                    checkpoint_dir=final_ckpt,
                     output_dir=output_dir,
                     consumed_micro_batches=consumed_micro_batches,
                     save_total_limit=int(train_cfg.save_total_limit),
-                    log_label="periodic",
+                    log_label="final",
                 )
+                last_saved_step = final_step
+        elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:
+            logger.warning(
+                "Skipping crash-time final checkpoint save on distributed run "
+                "(num_processes=%s) to avoid potential collective deadlocks after failure.",
+                getattr(accelerator, "num_processes", "unknown"),
+            )
 
-    # Final save
-    final_ckpt = output_dir / f"checkpoint-{global_step}"
-    _save_training_checkpoint(
-        accelerator=accelerator,
-        checkpoint_dir=final_ckpt,
-        output_dir=output_dir,
-        consumed_micro_batches=consumed_micro_batches,
-        save_total_limit=int(train_cfg.save_total_limit),
-        log_label="final",
-    )
+        if crash_reason is not None:
+            crash_row = {
+                "step": int(crash_step if crash_step is not None else global_step),
+                "crash": True,
+                "crash_type": crash_type,
+                "crash_reason": crash_reason,
+                "wall_time_s": float(time.perf_counter() - train_started_at),
+            }
+            if accelerator.is_main_process:
+                with suppress(Exception):
+                    _append_metrics_jsonl_row(metrics_path, crash_row)
+                if train_cfg.report_to != "none":
+                    with suppress(Exception):
+                        accelerator.log(
+                            {k: v for k, v in crash_row.items() if k != "step"},
+                            step=int(crash_row["step"]),
+                        )
+                if wandb_run is not None:
+                    with suppress(Exception):
+                        wandb_run.log(
+                            {
+                                "crash": True,
+                                "crash_type": crash_type,
+                                "crash_reason": crash_reason,
+                            },
+                            step=int(crash_row["step"]),
+                        )
 
-    # Best-effort HF export
-    if train_cfg.export_hf_final:
-        accelerator.wait_for_everyone()
-        _export_discriminator_hf(
-            accelerator=accelerator,
-            model=model,
-            tokenizer=tokenizer,
-            output_dir=output_dir / "final_hf",
-            embedding_sharing=model_cfg.embedding_sharing,
-        )
+        if train_cfg.report_to != "none":
+            if wandb_run is not None:
+                with suppress(Exception):
+                    if crash_reason is not None:
+                        wandb_run.summary["crashed"] = True
+                        wandb_run.summary["crash_type"] = crash_type
+                        wandb_run.summary["crash_reason"] = crash_reason
+                    wandb_run.finish(exit_code=exit_code)
+            else:
+                with suppress(Exception):
+                    accelerator.end_training()
 
-    if train_cfg.report_to != "none":
-        accelerator.end_training()
+        _flush_loggers()

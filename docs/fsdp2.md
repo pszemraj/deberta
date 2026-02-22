@@ -45,6 +45,18 @@ If compile fails at runtime, training logs a warning and continues without compi
 
 Current limitation: RTD generator sampling/corruption uses dynamic operations (`multinomial` + indexed token replacement) that can introduce graph breaks. The project keeps compile support as best-effort and tracks compile-boundary refinement as a follow-up in [`docs/roadmap.md`](roadmap.md).
 
+## Interruption and Crash Handling
+
+`deberta train` now uses a crash-safe shutdown path:
+
+- `KeyboardInterrupt` (CTRL+C) and other uncaught exceptions are logged with crash type/reason and step.
+- Main process appends a crash marker row to `<output_dir>/metrics.jsonl`.
+- If trackers are enabled, crash fields are logged to the tracker step; for W&B runs, crash summary fields are also set before finish.
+- A best-effort final checkpoint save is attempted if training progressed and that step was not already saved.
+- Tracker shutdown and logger flush happen in a `finally` block so logs/artifacts are flushed even on failure.
+
+For distributed failures, crash-time final-save can be skipped to avoid collective deadlocks after backend failure.
+
 ## SDPA Kernel Policy
 
 Use `train.sdpa_kernel` to set SDPA backend preference:
