@@ -35,8 +35,10 @@ class DebertaRoPEConfig(PretrainedConfig):
         num_attention_heads: int = 12,
         intermediate_size: int = 3072,
         hidden_act: str = "gelu",
-        hidden_dropout_prob: float = 0.1,
-        attention_probs_dropout_prob: float = 0.1,
+        ffn_type: str = "swiglu",
+        use_bias: bool = False,
+        hidden_dropout_prob: float = 0.0,
+        attention_probs_dropout_prob: float = 0.0,
         max_position_embeddings: int = 512,
         type_vocab_size: int = 2,
         pad_token_id: int = 0,
@@ -59,6 +61,8 @@ class DebertaRoPEConfig(PretrainedConfig):
         :param int num_attention_heads: Number of attention heads.
         :param int intermediate_size: FFN intermediate width.
         :param str hidden_act: FFN activation name.
+        :param str ffn_type: FFN block type (``swiglu`` or ``mlp``).
+        :param bool use_bias: Whether attention/FFN linear projections include bias.
         :param float hidden_dropout_prob: Hidden dropout probability.
         :param float attention_probs_dropout_prob: Attention dropout probability.
         :param int max_position_embeddings: Maximum supported positions.
@@ -82,6 +86,8 @@ class DebertaRoPEConfig(PretrainedConfig):
         self.num_attention_heads = int(num_attention_heads)
         self.intermediate_size = int(intermediate_size)
         self.hidden_act = str(hidden_act)
+        self.ffn_type = str(ffn_type)
+        self.use_bias = bool(use_bias)
         self.hidden_dropout_prob = float(hidden_dropout_prob)
         self.attention_probs_dropout_prob = float(attention_probs_dropout_prob)
         self.max_position_embeddings = int(max_position_embeddings)
@@ -102,6 +108,8 @@ class DebertaRoPEConfig(PretrainedConfig):
             )
         if self.rotary_pct <= 0.0 or self.rotary_pct > 1.0:
             raise ValueError("rotary_pct must be in (0, 1].")
+        if self.ffn_type not in {"swiglu", "mlp"}:
+            raise ValueError("ffn_type must be one of: swiglu|mlp")
         if self.norm_arch not in {"post", "keel"}:
             raise ValueError("norm_arch must be one of: post|keel")
         if self.attention_implementation not in {"sdpa", "eager"}:
@@ -186,17 +194,21 @@ class DebertaRoPESelfAttention(nn.Module):
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = self.hidden_size // self.num_heads
 
-        self.qkv = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
-        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        add_bias = bool(getattr(config, "use_bias", False))
+        self.qkv = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=add_bias)
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=add_bias)
 
         self.attn_dropout = float(config.attention_probs_dropout_prob)
-        self.resid_dropout = float(config.hidden_dropout_prob)
         self.attn_impl = str(config.attention_implementation)
 
         rotary_dim = int(self.head_dim * float(config.rotary_pct))
         rotary_dim = rotary_dim - (rotary_dim % 2)  # ensure even
         self.rotary_dim = rotary_dim
-        self.rope = RotaryEmbedding(rotary_dim, base=float(config.rope_theta)) if rotary_dim > 0 else None
+        self.rope = (
+            RotaryEmbedding(rotary_dim, base=float(config.rope_theta), full_dim=self.head_dim)
+            if rotary_dim > 0
+            else None
+        )
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
         """Run self-attention.
@@ -214,17 +226,49 @@ class DebertaRoPESelfAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope.apply(q, k)
 
-        attn_mask = None
+        use_sdpa = self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention")
+        sdpa_attn_mask = None
+        eager_attn_mask = None
+        query_keep: torch.Tensor | None = None
+        query_keep_tokens = None
         if attention_mask is not None:
-            # attention_mask is 1 for tokens, 0 for pad. SDPA expects True = mask.
-            attn_mask = attention_mask.eq(0)[:, None, None, :]  # (B,1,1,S) bool
+            mask = attention_mask.to(dtype=torch.bool)
 
-        if self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
+            if mask.ndim == 2:
+                # 2D key mask: attention_mask is 1 for tokens, 0 for pad.
+                key_keep = mask
+                # PyTorch SDPA bool masks use True=keep, False=masked.
+                sdpa_attn_mask = key_keep[:, None, None, :]  # (B,1,1,S) bool
+                # Eager path uses masked_fill, so True marks masked positions.
+                if not use_sdpa:
+                    eager_attn_mask = ~sdpa_attn_mask
+                query_keep = key_keep
+            elif mask.ndim == 3:
+                # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
+                pair_keep = mask
+                # Collator-produced pairwise masks guarantee diagonal=True for active
+                # tokens and diagonal=False for inactive/padded queries. Read query
+                # activity from the diagonal (O(B*S)) instead of reducing rows
+                # (O(B*S^2)) in every layer.
+                query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
+
+                sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
+                if not use_sdpa:
+                    eager_attn_mask = ~sdpa_attn_mask
+            else:
+                raise ValueError(
+                    "attention_mask must have shape (B,S) or (B,S,S) for DebertaRoPESelfAttention."
+                )
+
+            # Explicitly zero masked query outputs after output projection.
+            query_keep_tokens = query_keep[:, :, None].to(dtype=q.dtype)
+
+        if use_sdpa:
             out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=attn_mask,
+                attn_mask=sdpa_attn_mask,
                 dropout_p=self.attn_dropout if self.training else 0.0,
                 is_causal=False,
             )
@@ -232,31 +276,62 @@ class DebertaRoPESelfAttention(nn.Module):
             # Eager attention (debug/fallback)
             scale = 1.0 / math.sqrt(self.head_dim)
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, nh, S, S)
-            if attn_mask is not None:
-                scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+            if eager_attn_mask is not None:
+                scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
+                if query_keep is not None:
+                    # Avoid NaNs for all-masked query rows in eager mode. Those
+                    # rows are explicitly zeroed after projection via query_keep_tokens.
+                    dead_queries = (~query_keep)[:, None, :, None]
+                    scores = scores.masked_fill(dead_queries, 0.0)
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn, v)
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
         out = self.out_proj(out)
-        out = F.dropout(out, p=self.resid_dropout, training=self.training)
+        if query_keep_tokens is not None:
+            out = out * query_keep_tokens
         return out
 
 
 class DebertaRoPEMLP(nn.Module):
-    """Feed-forward network block used inside each encoder layer."""
+    """Feed-forward block used inside each encoder layer.
+
+    Supported modes:
+      - ``mlp``: Linear -> activation -> Linear
+      - ``swiglu``: fused gate+up projection, SiLU gate, then down projection
+    """
 
     def __init__(self, config: DebertaRoPEConfig) -> None:
-        """Create FFN projections and activation.
+        """Create FFN projections.
 
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.dense_in = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.act = _get_act_fn(config.hidden_act)
-        self.dense_out = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.ffn_type = str(getattr(config, "ffn_type", "swiglu")).lower()
+        if self.ffn_type not in {"swiglu", "mlp"}:
+            raise ValueError(f"Unsupported ffn_type: {self.ffn_type}")
+
+        add_bias = bool(getattr(config, "use_bias", False))
+
+        if self.ffn_type == "swiglu":
+            hidden_size = int(config.hidden_size)
+            intermediate = int(config.intermediate_size)
+            # Fused projection: one matmul for gate+up, one for down projection.
+            self.w12 = nn.Linear(hidden_size, 2 * intermediate, bias=add_bias)
+            self.w3 = nn.Linear(intermediate, hidden_size, bias=add_bias)
+        else:
+            self.dense_in = nn.Linear(
+                int(config.hidden_size),
+                int(config.intermediate_size),
+                bias=add_bias,
+            )
+            self.act = _get_act_fn(config.hidden_act)
+            self.dense_out = nn.Linear(
+                int(config.intermediate_size),
+                int(config.hidden_size),
+                bias=add_bias,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply FFN transform.
@@ -264,10 +339,14 @@ class DebertaRoPEMLP(nn.Module):
         :param torch.Tensor x: Input hidden states.
         :return torch.Tensor: Output hidden states.
         """
+        if self.ffn_type == "swiglu":
+            gate, up = self.w12(x).chunk(2, dim=-1)
+            x = self.w3(F.silu(gate) * up)
+            return x
+
         x = self.dense_in(x)
         x = self.act(x)
         x = self.dense_out(x)
-        x = self.dropout(x)
         return x
 
 
@@ -371,7 +450,8 @@ class DebertaRoPEEncoder(nn.Module):
         if config.keel_alpha_init is not None:
             alpha_init = float(config.keel_alpha_init)
         else:
-            # Per user guidance: alpha defaults to 2 * num_layers (number of sublayers).
+            # KEEL paper notation uses L = number of residual sublayers. Our encoder
+            # has 2 residual sublayers per transformer block (attention + FFN).
             alpha_init = float(2 * int(config.num_hidden_layers))
 
         self.layers = nn.ModuleList(
@@ -457,25 +537,20 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
 
     def forward(
         self,
-        *,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         return_dict: bool = True,
-        **kwargs: Any,
     ) -> BaseModelOutput:
         """Run encoder forward pass.
 
         :param torch.Tensor input_ids: Input token ids.
-        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None attention_mask: Optional attention mask. ``None`` means
+            unpadded input (fast path); callers must pass a mask when padding exists.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
         :param bool return_dict: Whether to return HF output dataclass.
-        :param Any kwargs: Additional compatibility kwargs forwarded by callers.
         :return BaseModelOutput: Last hidden states container.
         """
-        if attention_mask is None:
-            attention_mask = input_ids.ne(int(self.config.pad_token_id)).to(dtype=torch.long)
-
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         x = self.encoder(x, attention_mask)
 

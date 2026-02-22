@@ -2,31 +2,33 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from deberta.config import DataConfig, ModelConfig
+from deberta.config import (
+    DataConfig,
+    ModelConfig,
+    validate_data_config,
+    validate_model_config,
+    validate_run_metadata_schema,
+)
+from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling.export_utils import (
+    load_intersection_state_dict,
+    merge_embeddings_into_export_backbone,
+    split_pretrainer_state_dict,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_logging(is_main: bool) -> None:
-    """Configure process-local logger settings.
-
-    :param bool is_main: True for primary process.
-    """
-    level = logging.INFO if is_main else logging.WARN
-    logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=level,
-    )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -50,6 +52,19 @@ def _infer_run_dir(checkpoint_dir: Path) -> Path:
     return checkpoint_dir.parent
 
 
+def _validate_run_metadata_if_present(run_dir: Path) -> None:
+    """Validate run-metadata schema when a metadata file is present.
+
+    :param Path run_dir: Run directory potentially containing run metadata.
+    :raises ValueError: If metadata schema is malformed or incompatible.
+    """
+    meta_path = run_dir / "run_metadata.json"
+    if not meta_path.exists():
+        return
+    raw = _load_json(meta_path)
+    validate_run_metadata_schema(raw, source=str(meta_path))
+
+
 @dataclass
 class ExportConfig:
     """Arguments for the consolidation/export tool."""
@@ -69,73 +84,104 @@ class ExportConfig:
     embedding_sharing: str | None = None
 
 
-def _split_state_dict(
-    full_sd: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Split full RTD state dict into discriminator and generator tensors.
+def add_export_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register export CLI arguments on an argparse parser.
 
-    :param dict[str, torch.Tensor] full_sd: Full state dict.
-    :return tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]: Discriminator and generator dicts.
+    :param argparse.ArgumentParser parser: Target parser.
     """
-    disc: dict[str, torch.Tensor] = {}
-    gen: dict[str, torch.Tensor] = {}
+    parser.add_argument(
+        "checkpoint_dir",
+        help="Path to checkpoint-<step> directory saved by training.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Output directory for exported artifacts. Defaults to <run_dir>/exported_hf. "
+            "If provided, it must not contain existing files."
+        ),
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Optional run directory containing model_config.json/data_config.json. Defaults to checkpoint parent.",
+    )
+    parser.add_argument(
+        "--what",
+        "--export-what",
+        dest="export_what",
+        default="discriminator",
+        choices=("discriminator", "generator", "both"),
+        help="Which component(s) to export.",
+    )
+    safe_group = parser.add_mutually_exclusive_group()
+    safe_group.add_argument(
+        "--safe-serialization",
+        dest="safe_serialization",
+        action="store_true",
+        help="Use safetensors format when saving HF artifacts.",
+    )
+    safe_group.add_argument(
+        "--no-safe-serialization",
+        dest="safe_serialization",
+        action="store_false",
+        help="Disable safetensors format when saving HF artifacts.",
+    )
+    parser.set_defaults(safe_serialization=True)
 
-    for k, v in full_sd.items():
-        if k.startswith("discriminator."):
-            disc[k[len("discriminator.") :]] = v
-        elif k.startswith("generator."):
-            gen[k[len("generator.") :]] = v
+    offload_group = parser.add_mutually_exclusive_group()
+    offload_group.add_argument(
+        "--offload-to-cpu",
+        dest="offload_to_cpu",
+        action="store_true",
+        help="Offload consolidated full state dict to CPU under FSDP export.",
+    )
+    offload_group.add_argument(
+        "--no-offload-to-cpu",
+        dest="offload_to_cpu",
+        action="store_false",
+        help="Keep consolidated full state dict on accelerator memory under FSDP export.",
+    )
+    parser.set_defaults(offload_to_cpu=True)
 
-    return disc, gen
+    rank0_group = parser.add_mutually_exclusive_group()
+    rank0_group.add_argument(
+        "--rank0-only",
+        dest="rank0_only",
+        action="store_true",
+        help="Gather full state dict on rank 0 only under FSDP export.",
+    )
+    rank0_group.add_argument(
+        "--no-rank0-only",
+        dest="rank0_only",
+        action="store_false",
+        help="Gather full state dict on all ranks under FSDP export.",
+    )
+    parser.set_defaults(rank0_only=True)
+    parser.add_argument(
+        "--embedding-sharing",
+        default=None,
+        choices=("none", "es", "gdes"),
+        help="Override embedding sharing mode. Defaults to training config value.",
+    )
 
 
-def _merge_embeddings_into_export(
-    *,
-    export_model: Any,
-    disc_sd: dict[str, torch.Tensor],
-    gen_sd: dict[str, torch.Tensor],
-    mode: str,
-) -> None:
-    """Merge tied embedding weights into an export backbone.
+def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
+    """Convert parsed argparse namespace into ExportConfig.
 
-    :param Any export_model: Export backbone model.
-    :param dict[str, torch.Tensor] disc_sd: Discriminator state dict.
-    :param dict[str, torch.Tensor] gen_sd: Generator state dict.
-    :param str mode: Embedding sharing mode.
+    :param argparse.Namespace ns: Parsed arguments.
+    :return ExportConfig: Typed export config.
     """
-    if mode not in {"es", "gdes"}:
-        return
-
-    if not hasattr(export_model, "embeddings"):
-        return
-
-    def merge_attr(attr: str) -> None:
-        """Merge one embedding attribute.
-
-        :param str attr: Embedding attribute name.
-        """
-        if not hasattr(export_model.embeddings, attr):
-            return
-        gen_w = gen_sd.get(f"embeddings.{attr}.weight")
-        if gen_w is None:
-            return
-
-        if mode == "es":
-            merged = gen_w
-        else:
-            bias = disc_sd.get(f"embeddings.{attr}.bias")
-            if bias is None:
-                raise RuntimeError(f"Missing discriminator bias for embeddings.{attr}.bias (gdes)")
-            # Merge in fp32 for numerical stability, then cast at the end.
-            merged = gen_w.detach().float() + bias.detach().float()
-
-        emb_mod = getattr(export_model.embeddings, attr)
-        if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
-            emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
-
-    merge_attr("word_embeddings")
-    merge_attr("position_embeddings")
-    merge_attr("token_type_embeddings")
+    return ExportConfig(
+        checkpoint_dir=ns.checkpoint_dir,
+        output_dir=ns.output_dir,
+        run_dir=ns.run_dir,
+        export_what=ns.export_what,
+        safe_serialization=bool(ns.safe_serialization),
+        offload_to_cpu=bool(ns.offload_to_cpu),
+        rank0_only=bool(ns.rank0_only),
+        embedding_sharing=ns.embedding_sharing,
+    )
 
 
 def _build_export_backbone(
@@ -173,21 +219,21 @@ def _build_export_backbone(
     return disc, gen
 
 
-def main() -> None:
-    """Run checkpoint export CLI flow."""
+def run_export(cfg: ExportConfig) -> None:
+    """Run checkpoint export flow.
+
+    :param ExportConfig cfg: Export configuration.
+    """
     try:
-        from transformers import AutoTokenizer, HfArgumentParser
+        from transformers import AutoTokenizer
     except Exception as e:  # pragma: no cover
         raise RuntimeError("transformers is required.") from e
-
-    parser = HfArgumentParser(ExportConfig)
-    (cfg,) = parser.parse_args_into_dataclasses()
 
     from accelerate import Accelerator
     from accelerate.utils import DistributedType
 
     accelerator = Accelerator()
-    _setup_logging(accelerator.is_main_process)
+    setup_process_logging(accelerator.is_main_process)
 
     checkpoint_dir = Path(cfg.checkpoint_dir).expanduser().resolve()
     if not checkpoint_dir.exists():
@@ -204,9 +250,12 @@ def main() -> None:
         raise FileNotFoundError(f"Expected {model_cfg_path} (produced during training)")
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
+    _validate_run_metadata_if_present(run_dir)
 
     model_cfg = ModelConfig(**_load_json(model_cfg_path))
     data_cfg = DataConfig(**_load_json(data_cfg_path))
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
 
     embedding_sharing = (cfg.embedding_sharing or model_cfg.embedding_sharing or "none").lower()
 
@@ -244,26 +293,50 @@ def main() -> None:
     accelerator.load_state(str(checkpoint_dir))
     accelerator.wait_for_everyone()
 
-    # Consolidate FULL_STATE_DICT on rank0 if FSDP is enabled.
+    # Consolidate FULL_STATE_DICT when FSDP is enabled.
     full_sd: dict[str, torch.Tensor]
     if accelerator.distributed_type == DistributedType.FSDP:
-        try:
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("torch.distributed.fsdp is required for FSDP export") from e
+        if bool(getattr(accelerator, "is_fsdp2", False)):
+            try:
+                from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+            except Exception as e:
+                if not hasattr(accelerator, "get_state_dict"):
+                    raise RuntimeError(
+                        "accelerator.get_state_dict() is required for FSDP2 export when "
+                        "torch.distributed.checkpoint state-dict APIs are unavailable."
+                    ) from e
+                full_sd = accelerator.get_state_dict(model)
+            else:
+                # Map CLI knobs to FSDP2 state-dict options.
+                # - rank0_only=True  -> rank0 materializes full state and broadcasts tensor payloads.
+                # - rank0_only=False -> all ranks materialize full state.
+                opts = StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=bool(cfg.offload_to_cpu),
+                    broadcast_from_rank0=bool(cfg.rank0_only),
+                )
+                full_sd = get_model_state_dict(model, options=opts)
+        else:
+            try:
+                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        if not isinstance(model, FSDP):
-            raise RuntimeError(
-                "Expected the prepared model to be an FSDP instance. "
-                "Make sure you are launching with the same accelerate FSDP config used for training."
-            )
+                is_fsdp_instance = isinstance(model, FSDP)
+            except Exception:
+                is_fsdp_instance = False
 
-        cfg_full = FullStateDictConfig(
-            offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
-        )
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
-            full_sd = model.state_dict()
+            if is_fsdp_instance:
+                cfg_full = FullStateDictConfig(
+                    offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
+                )
+                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
+                    full_sd = model.state_dict()
+            else:
+                if not hasattr(accelerator, "get_state_dict"):
+                    raise RuntimeError(
+                        "accelerator.get_state_dict() is required for FSDP export on non-torch FSDP engines."
+                    )
+                full_sd = accelerator.get_state_dict(model)
     else:
         # Non-FSDP: unwrap DDP etc.
         full_sd = accelerator.unwrap_model(model).state_dict()
@@ -271,7 +344,7 @@ def main() -> None:
     if not accelerator.is_main_process:
         return
 
-    disc_sd, gen_sd = _split_state_dict(full_sd)
+    disc_sd, gen_sd = split_pretrainer_state_dict(full_sd)
     if not disc_sd and not gen_sd:
         raise RuntimeError(
             "Failed to split discriminator/generator state dicts. "
@@ -286,10 +359,17 @@ def main() -> None:
     export_disc, export_gen = _build_export_backbone(model_cfg, disc_config, gen_config, export_what)
 
     out_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else (run_dir / "exported_hf")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            raise ValueError(f"output_dir exists and is not a directory: {out_dir}")
+        if any(out_dir.iterdir()):
+            raise ValueError(
+                f"output_dir already exists and is not empty: {out_dir}. "
+                "Choose a new --output-dir or clear the directory."
+            )
 
-    # Always export tokenizer at root for convenience
-    tokenizer.save_pretrained(str(out_dir))
+    stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
+    stage_dir.mkdir(parents=True, exist_ok=False)
 
     meta: dict[str, Any] = {
         "checkpoint_dir": str(checkpoint_dir),
@@ -298,35 +378,73 @@ def main() -> None:
         "backbone_type": model_cfg.backbone_type,
     }
 
-    # Discriminator
-    if export_disc is not None:
-        export_keys = set(export_disc.state_dict().keys())
-        filtered = {k: v for k, v in disc_sd.items() if k in export_keys}
-        export_disc.load_state_dict(filtered, strict=False)
-        if embedding_sharing in {"es", "gdes"}:
-            _merge_embeddings_into_export(
-                export_model=export_disc, disc_sd=disc_sd, gen_sd=gen_sd, mode=embedding_sharing
+    try:
+        # Always export tokenizer at root for convenience
+        tokenizer.save_pretrained(str(stage_dir))
+
+        # Discriminator
+        if export_disc is not None:
+            load_intersection_state_dict(export_disc, disc_sd)
+            if embedding_sharing in {"es", "gdes"}:
+                merge_embeddings_into_export_backbone(
+                    export_model=export_disc,
+                    disc_sd=disc_sd,
+                    gen_sd=gen_sd,
+                    mode=embedding_sharing,
+                    fp32_accumulate=True,
+                )
+
+            export_disc.save_pretrained(
+                str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
             )
+            meta["exported_discriminator"] = True
 
-        export_disc.save_pretrained(
-            str(out_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
-        )
-        meta["exported_discriminator"] = True
+        # Generator
+        if export_gen is not None:
+            load_intersection_state_dict(export_gen, gen_sd)
+            export_gen.save_pretrained(
+                str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
+            )
+            meta["exported_generator"] = True
 
-    # Generator
-    if export_gen is not None:
-        export_keys = set(export_gen.state_dict().keys())
-        filtered = {k: v for k, v in gen_sd.items() if k in export_keys}
-        export_gen.load_state_dict(filtered, strict=False)
-        export_gen.save_pretrained(
-            str(out_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
-        )
-        meta["exported_generator"] = True
+        with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
 
-    with (out_dir / "export_meta.json").open("w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, sort_keys=True)
+        if out_dir.exists():
+            # At this point we already enforced "empty only".
+            out_dir.rmdir()
+        stage_dir.replace(out_dir)
+        logger.info(f"Export complete: {out_dir}")
+    except Exception:
+        # Cleanup staged partial output so failed exports are re-runnable.
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
 
-    logger.info(f"Export complete: {out_dir}")
+
+def _build_export_parser(*, prog: str = "deberta export") -> argparse.ArgumentParser:
+    """Build argparse parser for export commands.
+
+    :param str prog: Program name shown in help output.
+    :return argparse.ArgumentParser: Configured parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Consolidate a training checkpoint and export standalone HF artifacts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_export_arguments(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run checkpoint export CLI.
+
+    :param list[str] | None argv: Optional CLI argv (excluding program name).
+    """
+    parser = _build_export_parser()
+    args = parser.parse_args(argv)
+    cfg = namespace_to_export_config(args)
+    run_export(cfg)
 
 
 if __name__ == "__main__":

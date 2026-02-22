@@ -1,42 +1,96 @@
-# Data pipeline
+# Data Pipeline
 
-This codebase is **streaming-first** for pretraining.
+This document is the primary reference for dataset ingestion, packing, and masking behavior.
 
-## Streaming path (default)
+For objective/loss semantics, see [`docs/objective.md`](objective.md). For model/backbone constraints, see [`docs/model.md`](model.md). For runtime and FSDP2/precision controls, see [`docs/fsdp2.md`](fsdp2.md).
 
-When `data.streaming=true`, we use Hugging Face Datasets in streaming mode and wrap it in a small packing iterator:
+## Dataset Source Selection
 
-- tokenizes each document with `add_special_tokens=False`
-- appends a `[SEP]` separator **between documents**
-- packs tokens into fixed-length blocks of `max_seq_length`
-- emits examples shaped like:
+`DataConfig` supports three input modes (checked in this order):
 
-```python
-{
-  "input_ids":          [CLS] + chunk + [SEP] + pad,
-  "attention_mask":     1s for real tokens, 0s for pad,
-  "special_tokens_mask": 1 for CLS/SEP/PAD tokens, 0 otherwise,
-}
-```
+1. `load_from_disk` (non-streaming only)
+2. `dataset_name` (+ optional `dataset_config_name` and `data_files`)
+3. `data_files` (uses the `text` dataset builder)
 
-### Important detail: internal `[SEP]` tokens
+`streaming=true` is the default and recommended for pretraining.
 
-Because the packer inserts `[SEP]` tokens inside `chunk` (to separate documents), we **mark those internal `[SEP]` tokens as special** in `special_tokens_mask`.
+## Streaming Packing (Default)
 
-This prevents the MLM masking collator from masking them, which would otherwise degrade training.
+`PackedStreamingDataset` consumes raw text and emits fixed-length packed examples:
 
-## Non-streaming paths
+- tokenizes documents with `add_special_tokens=False`
+- appends an internal document separator (`[SEP]`) between documents
+- packs into chunks of `max_seq_length - 2`
+- wraps each chunk as `[CLS] + chunk + [SEP]` (+ pad when needed)
+- flushes trailing remainder at iterator end (no silent tail-token drop)
 
-If you set `data.streaming=false`, we fall back to standard `datasets.load_dataset()` or `load_from_disk()` and then perform an offline packing step that produces the same example structure as the streaming path.
+Output fields:
 
-## Masking
+- `input_ids` (always)
+- `special_tokens_mask` (always)
+- `attention_mask` (only when padding exists)
 
-Masking is applied *dynamically* in the collator (not precomputed):
+### Internal `[SEP]` handling
 
-- token-level masking (fast): `train.mlm_max_ngram = 1`
-- DeBERTa-style whole-word n-gram masking: `train.mlm_max_ngram > 1`
+Packed chunks can contain inserted internal `[SEP]` separators. Those positions are marked as special in `special_tokens_mask`, so masking never corrupts those separators.
 
-The labels follow HF convention:
+`data.block_cross_document_attention` controls whether packed batches use strict pairwise document-blocking:
 
-- `labels[i] = original_token_id` for masked positions
-- `labels[i] = -100` for all other positions
+- `false` (default): skip 3D doc-blocking masks (packed batches remain on 2D/no-mask attention paths)
+- `true`: emit 3D doc-blocking masks for packed batches with internal separators
+
+### Pairwise Mask Contract (`block_cross_document_attention=true`)
+
+- mask type/shape: boolean keep-mask `(B, S, S)` where `True=attend`, `False=block`
+- emission condition: only emitted when packed chunks contain internal separators; single-document packed chunks keep `attention_mask=None`
+- query activity encoding: diagonal `True` marks active queries, diagonal `False` marks inactive/padded queries
+- document boundary behavior: CLS stays in document 1 (no global cross-document CLS channel)
+- consumers: rope attention and RTD token-activity accounting use this contract; keep `data.block_cross_document_attention=false` when strict doc-blocking is unnecessary
+
+## Sequential / No-Pack Mode
+
+Set `data.pack_sequences=false` to switch to one-document chunking:
+
+- no cross-document concatenation
+- long documents are split into multiple one-document chunks
+- useful as a reference mode for validating loss-signal behavior independent of packing
+- `data.block_cross_document_attention` is inert in this mode and is canonicalized to `false`
+
+## Non-Streaming Packing
+
+When `streaming=false`, training still routes through the same iterable packing wrappers (`PackedStreamingDataset` / `SequentialStreamingDataset`) used in streaming mode, but backed by a map-style HF dataset iterator.
+
+`data.shuffle_buffer_size` keeps full buffer semantics only for streaming datasets. In non-streaming mode, shuffle is effectively an off/on toggle and config normalization canonicalizes any positive value to `1` (shuffle enabled).
+
+## Collator Behavior (Dynamic MLM Masking)
+
+`DebertaV3ElectraCollator` performs dynamic masking at batch time.
+
+Masking modes:
+
+- token-level masking: `train.mlm_max_ngram = 1` (default)
+- whole-word n-gram masking: `train.mlm_max_ngram > 1`
+
+Replacement probabilities are controlled by:
+
+- `train.mask_token_prob`
+- `train.random_token_prob`
+
+Labels follow standard HF MLM semantics:
+
+- masked positions: original token id
+- unmasked positions: `-100`
+
+## Attention Mask Optimization for SDPA/Flash
+
+For packed, fixed-length, unpadded batches, explicit all-ones masks are redundant.
+
+The pipeline keeps this path lean by:
+
+1. Not emitting `attention_mask` in packed dataset outputs when no padding exists.
+2. Asking tokenizer padding to skip mask materialization when possible.
+3. Dropping all-ones `attention_mask` tensors in the collator.
+
+Downstream model code treats missing masks as unpadded (`attention_mask=None`).
+
+Deferred data/packing follow-ups are tracked in [`docs/roadmap.md`](roadmap.md).

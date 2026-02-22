@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -29,8 +30,8 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
     Output examples are dicts with:
       - input_ids: List[int]
-      - attention_mask: List[int]
       - special_tokens_mask: List[int]
+      - attention_mask: List[int] (only emitted when padding is present)
     """
 
     def __init__(
@@ -56,6 +57,7 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         self.cfg = cfg
         self.process_index = int(process_index)
         self.num_processes = int(num_processes)
+        self._epoch = mp.Value("i", 0)
 
         if not hasattr(tokenizer, "cls_token_id") or tokenizer.cls_token_id is None:
             raise ValueError("Tokenizer must define cls_token_id.")
@@ -69,12 +71,21 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
         :param int epoch: Training epoch.
         """
+        with self._epoch.get_lock():
+            self._epoch.value = int(max(0, epoch))
         # Some streaming datasets support set_epoch() for deterministic shuffling.
         if hasattr(self.hf_dataset, "set_epoch"):
             try:
                 self.hf_dataset.set_epoch(epoch)
             except Exception:
                 pass
+
+    def _current_epoch(self) -> int:
+        """Read current epoch value.
+
+        :return int: Current dataset epoch.
+        """
+        return int(self._epoch.value)
 
     def _shard_dataset_for_worker(self, ds: Any) -> Any:
         """Shard dataset across processes and dataloader workers.
@@ -104,75 +115,137 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         :return Iterator[dict[str, Any]]: Example iterator.
         """
         ds = self.hf_dataset
+        epoch = self._current_epoch()
+        shuffle_seed = int(self.cfg.seed) + int(epoch)
         if self.cfg.shuffle_buffer_size and self.cfg.shuffle_buffer_size > 0 and hasattr(ds, "shuffle"):
-            ds = ds.shuffle(buffer_size=self.cfg.shuffle_buffer_size, seed=self.cfg.seed)
+            try:
+                # IterableDataset-style shuffle (streaming reservoir shuffle).
+                ds = ds.shuffle(buffer_size=self.cfg.shuffle_buffer_size, seed=shuffle_seed)
+            except TypeError:
+                # Map-style Dataset.shuffle does not accept buffer_size.
+                ds = ds.shuffle(seed=shuffle_seed)
         ds = self._shard_dataset_for_worker(ds)
         return iter(ds)
+
+    def _normalize_raw_text(self, ex: dict[str, Any]) -> str:
+        """Extract and normalize one raw text example.
+
+        :param dict[str, Any] ex: Example mapping.
+        :return str: Normalized text string.
+        """
+        text_key = self.cfg.text_column_name
+        raw = ex.get(text_key, None)
+        if raw is None:
+            raise KeyError(f"Text column '{text_key}' not found. Available keys: {list(ex.keys())}")
+
+        if isinstance(raw, (list, tuple)):
+            raw = "\n".join([str(x) for x in raw])
+        else:
+            raw = str(raw)
+        return raw
+
+    def _tokenize_text(self, raw: str) -> list[int]:
+        """Tokenize text into ids without injecting specials.
+
+        :param str raw: Input text.
+        :return list[int]: Token ids.
+        """
+        if not raw.strip():
+            return []
+
+        tokenized = self.tokenizer(
+            raw,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        ids = tokenized.get("input_ids", [])
+        return [int(x) for x in ids]
+
+    def _build_example_from_chunk(self, *, chunk: list[int], max_seq: int) -> dict[str, Any]:
+        """Build one fixed-length packed example from a token chunk.
+
+        :param list[int] chunk: Chunk content without outer specials.
+        :param int max_seq: Target sequence length.
+        :return dict[str, Any]: Packed example.
+        """
+        cls_id = int(self.tokenizer.cls_token_id)
+        sep_id = int(self.tokenizer.sep_token_id)
+        pad_id = int(self.tokenizer.pad_token_id)
+
+        input_ids = [cls_id] + chunk + [sep_id]
+        pad_len = max_seq - len(input_ids)
+        if pad_len > 0:
+            input_ids.extend([pad_id] * pad_len)
+
+        # Mark all separator tokens (including internal separators), CLS, and padding as special.
+        special_ids = {cls_id, sep_id, pad_id}
+        chunk_special = [1 if t in special_ids else 0 for t in chunk]
+        special_tokens_mask = [1] + chunk_special + [1] + [1] * pad_len
+
+        ex_out = {
+            "input_ids": input_ids,
+            "special_tokens_mask": special_tokens_mask,
+        }
+        if pad_len > 0:
+            ex_out["attention_mask"] = [1] * (max_seq - pad_len) + [0] * pad_len
+        return ex_out
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         max_seq = int(self.cfg.max_seq_length)
         if max_seq < 8:
             raise ValueError("max_seq_length is too small for pretraining.")
 
-        cls_id = int(self.tokenizer.cls_token_id)
         sep_id = int(self.tokenizer.sep_token_id)
-        pad_id = int(self.tokenizer.pad_token_id)
-
-        text_key = self.cfg.text_column_name
+        block_len = max_seq - 2
 
         buffer: list[int] = []
         for ex in self._iter_examples():
-            raw = ex.get(text_key, None)
-            if raw is None:
-                # Fail fast: the dataset doesn't have the expected column.
-                raise KeyError(f"Text column '{text_key}' not found. Available keys: {list(ex.keys())}")
-
-            if isinstance(raw, (list, tuple)):
-                # Some datasets store pre-split lines.
-                raw = "\n".join([str(x) for x in raw])
-            else:
-                raw = str(raw)
-
-            if not raw.strip():
-                continue
-
-            tokenized = self.tokenizer(
-                raw,
-                add_special_tokens=False,
-                return_attention_mask=False,
-                return_token_type_ids=False,
-            )
-            ids = tokenized.get("input_ids", [])
+            raw = self._normalize_raw_text(ex)
+            ids = self._tokenize_text(raw)
             if not ids:
                 continue
 
-            buffer.extend([int(x) for x in ids])
+            buffer.extend(ids)
             # Explicit doc separator to reduce cross-doc leakage.
             buffer.append(sep_id)
 
             # Emit fixed-length blocks.
             # We reserve 2 spots for [CLS] and final [SEP].
-            block_len = max_seq - 2
             while len(buffer) >= block_len:
                 chunk = buffer[:block_len]
                 buffer = buffer[block_len:]
+                yield self._build_example_from_chunk(chunk=chunk, max_seq=max_seq)
 
-                input_ids = [cls_id] + chunk + [sep_id]
-                attention_mask = [1] * len(input_ids)
+        # Flush trailing remainder instead of silently dropping it.
+        #
+        # We append one explicit document separator after each document, so the final
+        # buffer commonly ends with SEP. Emitting that SEP-only tail would produce a
+        # degenerate [CLS, SEP, SEP, PAD...] example with no training signal.
+        if buffer and buffer[-1] == sep_id:
+            buffer = buffer[:-1]
+        if buffer:
+            yield self._build_example_from_chunk(chunk=buffer[:block_len], max_seq=max_seq)
 
-                pad_len = max_seq - len(input_ids)
-                if pad_len > 0:
-                    input_ids.extend([pad_id] * pad_len)
-                    attention_mask.extend([0] * pad_len)
 
-                # Mask specials + pad as special to prevent MLM masking.
-                # Note: chunk may contain internal [SEP] doc separators; mark them special too.
-                special_ids = {cls_id, sep_id, pad_id}
-                chunk_special = [1 if t in special_ids else 0 for t in chunk]
-                special_tokens_mask = [1] + chunk_special + [1] + [1] * pad_len
+class SequentialStreamingDataset(PackedStreamingDataset):
+    """One-document-per-sequence dataset (reference mode without cross-document packing)."""
 
-                yield {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "special_tokens_mask": special_tokens_mask,
-                }
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        max_seq = int(self.cfg.max_seq_length)
+        if max_seq < 8:
+            raise ValueError("max_seq_length is too small for pretraining.")
+        block_len = max_seq - 2
+
+        for ex in self._iter_examples():
+            raw = self._normalize_raw_text(ex)
+            ids = self._tokenize_text(raw)
+            if not ids:
+                continue
+
+            # Split long documents into consecutive one-document chunks.
+            for i in range(0, len(ids), block_len):
+                chunk = ids[i : i + block_len]
+                if not chunk:
+                    continue
+                yield self._build_example_from_chunk(chunk=chunk, max_seq=max_seq)

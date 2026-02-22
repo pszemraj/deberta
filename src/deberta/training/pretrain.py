@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,27 +15,30 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from deberta.config import DataConfig, ModelConfig, TrainConfig
-from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset
+from deberta.config import (
+    RUN_CONFIG_SCHEMA_VERSION,
+    DataConfig,
+    ModelConfig,
+    TrainConfig,
+    _normalize_sdpa_kernel,
+    _normalize_torch_compile_mode,
+    normalize_mixed_precision,
+    validate_data_config,
+    validate_model_config,
+    validate_run_metadata_schema,
+    validate_train_config,
+    validate_training_workflow_options,
+)
+from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset, SequentialStreamingDataset
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
+from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling.export_utils import load_intersection_state_dict, merge_embeddings_into_export_backbone
+from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_logging(is_main: bool) -> None:
-    """Configure process-local logging.
-
-    :param bool is_main: True for main process.
-    """
-    level = logging.INFO if is_main else logging.WARN
-    logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=level,
-    )
 
 
 def _json_dump(obj: Any, path: Path) -> None:
@@ -46,6 +50,127 @@ def _json_dump(obj: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
+
+
+def _json_load(path: Path) -> dict[str, Any]:
+    """Read JSON mapping from disk.
+
+    :param Path path: Source path.
+    :return dict[str, Any]: Parsed mapping.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected JSON object at {path}, got {type(raw).__name__}.")
+    return raw
+
+
+def _build_run_metadata() -> dict[str, Any]:
+    """Build run-metadata payload stored alongside config snapshots.
+
+    :return dict[str, Any]: Metadata mapping.
+    """
+    from deberta import __version__
+
+    return {
+        "config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION),
+        "deberta_version": str(__version__),
+    }
+
+
+def _validate_run_metadata(path: Path) -> None:
+    """Validate on-disk run metadata schema compatibility.
+
+    :param Path path: Metadata file path.
+    :raises ValueError: If metadata is malformed or schema-incompatible.
+    """
+    raw = _json_load(path)
+    validate_run_metadata_schema(raw, source=str(path))
+
+
+def _resolve_resume_checkpoint(
+    *,
+    output_dir: Path,
+    resume_from_checkpoint: str | None,
+    is_main_process: bool,
+) -> str | None:
+    """Resolve resume checkpoint path, including ``auto`` lookup.
+
+    :param Path output_dir: Training output directory.
+    :param str | None resume_from_checkpoint: User resume setting.
+    :param bool is_main_process: Whether to emit logs.
+    :return str | None: Concrete checkpoint path, or ``None``.
+    """
+    if not resume_from_checkpoint:
+        return None
+
+    if str(resume_from_checkpoint).lower() != "auto":
+        return str(resume_from_checkpoint)
+
+    latest = _find_latest_checkpoint(output_dir)
+    if latest is None:
+        if is_main_process:
+            logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
+        return None
+    return str(latest)
+
+
+def _persist_or_validate_run_configs(
+    *,
+    output_dir: Path,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    resume_checkpoint: str | None,
+    is_main_process: bool,
+) -> None:
+    """Persist new config snapshots or validate existing snapshots on resume.
+
+    :param Path output_dir: Training output directory.
+    :param ModelConfig model_cfg: Current model config.
+    :param DataConfig data_cfg: Current data config.
+    :param TrainConfig train_cfg: Current train config.
+    :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
+    :param bool is_main_process: Whether this process owns writes.
+    :raises ValueError: If resume mode detects incompatible model/data config snapshots.
+    """
+    model_cfg_path = output_dir / "model_config.json"
+    data_cfg_path = output_dir / "data_config.json"
+    train_cfg_path = output_dir / "train_config.json"
+    run_meta_path = output_dir / "run_metadata.json"
+
+    has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
+    if resume_checkpoint is not None and has_saved_model_data:
+        if run_meta_path.exists():
+            _validate_run_metadata(run_meta_path)
+        elif is_main_process:
+            # Backfill schema metadata for older runs once compatibility has been checked.
+            _json_dump(_build_run_metadata(), run_meta_path)
+
+        saved_model_cfg = ModelConfig(**_json_load(model_cfg_path))
+        saved_data_cfg = DataConfig(**_json_load(data_cfg_path))
+        validate_model_config(saved_model_cfg)
+        validate_data_config(saved_data_cfg)
+
+        if asdict(saved_model_cfg) != asdict(model_cfg):
+            raise ValueError(
+                "Resume configuration mismatch for model_config.json. "
+                "Refusing to overwrite run metadata with incompatible model settings."
+            )
+        if asdict(saved_data_cfg) != asdict(data_cfg):
+            raise ValueError(
+                "Resume configuration mismatch for data_config.json. "
+                "Refusing to overwrite run metadata with incompatible data settings."
+            )
+        if is_main_process:
+            logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
+        return
+
+    if is_main_process:
+        _json_dump(asdict(model_cfg), model_cfg_path)
+        _json_dump(asdict(data_cfg), data_cfg_path)
+        _json_dump(asdict(train_cfg), train_cfg_path)
+        _json_dump(_build_run_metadata(), run_meta_path)
 
 
 def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
@@ -104,6 +229,55 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     torch.backends.cudnn.allow_tf32 = bool(enabled)
 
 
+def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
+    """Configure PyTorch SDPA backend toggles on CUDA.
+
+    :param str policy: SDPA kernel policy.
+    :param bool is_main: Whether current process should emit logs.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    policy = _normalize_sdpa_kernel(policy)
+
+    enable_flash = True
+    enable_mem_efficient = True
+    enable_math = True
+
+    if policy == "flash_only":
+        enable_mem_efficient = False
+        enable_math = False
+    elif policy == "mem_efficient":
+        enable_flash = False
+    elif policy == "math":
+        enable_flash = False
+        enable_mem_efficient = False
+
+    try:
+        cuda_backend = getattr(torch.backends, "cuda", None)
+        if cuda_backend is not None:
+            for name, enabled in (
+                ("enable_flash_sdp", enable_flash),
+                ("enable_mem_efficient_sdp", enable_mem_efficient),
+                ("enable_math_sdp", enable_math),
+            ):
+                fn = getattr(cuda_backend, name, None)
+                if callable(fn):
+                    fn(bool(enabled))
+    except Exception:
+        # Best-effort only; do not fail training if this backend API changes.
+        pass
+
+    if is_main:
+        logger.info(
+            "SDPA kernel policy=%s (requested flash=%s, mem_efficient=%s, math=%s).",
+            policy,
+            enable_flash,
+            enable_mem_efficient,
+            enable_math,
+        )
+
+
 def _bf16_runtime_sanity_check() -> bool:
     """Check whether bf16 autocast executes a tiny CUDA matmul.
 
@@ -131,27 +305,6 @@ def _bf16_runtime_sanity_check() -> bool:
     except Exception as e:
         logger.warning(f"bf16 autocast preflight failed; falling back to full precision. Error: {e}")
         return False
-
-
-def _normalize_torch_compile_mode(value: Any) -> str:
-    """Normalize torch.compile mode names.
-
-    :param Any value: Raw compile mode value.
-    :return str: Canonical compile mode string.
-    """
-    v = str(value).strip().lower()
-    aliases = {
-        "reduce_overhead": "reduce-overhead",
-        "max_autotune": "max-autotune",
-        "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
-    }
-    mode = aliases.get(v, v)
-
-    allowed = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
-    if mode not in allowed:
-        opts = "|".join(sorted(allowed))
-        raise ValueError(f"train.torch_compile_mode must be one of: {opts}. Got: {value}")
-    return mode
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:
@@ -227,12 +380,14 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
         :return bool: True when parameter belongs to no-decay group.
         """
         lname = name.lower()
-        if lname.endswith(".bias"):
+        # Keep vector/scalar biases in no-decay; high-rank "bias" tensors (for example
+        # GDES embedding deltas) should follow standard weight-decay behavior.
+        if lname.endswith(".bias") and p.dim() <= 1:
             return True
         if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
             return True
-        # 1D params are almost always norm scales / biases
-        if p.dim() == 1:
+        # Scalars and 1D params are typically excluded from decay.
+        if p.dim() <= 1:
             return True
         return False
 
@@ -297,32 +452,23 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
     )
 
 
-def _normalize_mixed_precision(value: Any) -> str:
-    """Normalize mixed precision config values for Accelerate.
-
-    :param Any value: Raw user/config value.
-    :return str: Canonical value (``bf16`` or ``no``).
-    """
-    if isinstance(value, bool):
-        return "bf16" if value else "no"
-
-    v = str(value).strip().lower()
-    if v in {"bf16", "bfloat16", "true", "1", "yes", "y"}:
-        return "bf16"
-    if v in {"no", "none", "false", "0", "off", "n"}:
-        return "no"
-
-    raise ValueError(f"train.mixed_precision must be one of: no|bf16. Got: {value}")
-
-
 def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
     """Yield batches forever by cycling through a dataloader.
 
     :param DataLoader dl: Source dataloader.
     :return Iterator[dict[str, torch.Tensor]]: Infinite batch iterator.
     """
+    epoch = 0
+    dataset = getattr(dl, "dataset", None)
     while True:
+        set_epoch = getattr(dataset, "set_epoch", None)
+        if callable(set_epoch):
+            try:
+                set_epoch(epoch)
+            except Exception:
+                pass
         yield from dl
+        epoch += 1
 
 
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -333,6 +479,188 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
     :return dict[str, torch.Tensor]: Batch placed on ``device``.
     """
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+
+def _build_training_collator(
+    *,
+    tokenizer: Any,
+    train_cfg: TrainConfig,
+    packed_sequences: bool,
+    block_cross_document_attention: bool,
+) -> DebertaV3ElectraCollator:
+    """Build the RTD masking collator from train/data config.
+
+    :param Any tokenizer: Tokenizer used for dynamic masking.
+    :param TrainConfig train_cfg: Training configuration.
+    :param bool packed_sequences: Whether dataset packing is enabled.
+    :param bool block_cross_document_attention: Whether packed batches should block cross-document attention.
+    :return DebertaV3ElectraCollator: Configured collator.
+    """
+    return DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(
+            mlm_probability=train_cfg.mlm_probability,
+            mask_token_prob=train_cfg.mask_token_prob,
+            random_token_prob=train_cfg.random_token_prob,
+            max_ngram=train_cfg.mlm_max_ngram,
+        ),
+        packed_sequences=bool(packed_sequences),
+        block_cross_document_attention=bool(block_cross_document_attention),
+    )
+
+
+def _compute_disc_active_mask(
+    *,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    special_token_ids: tuple[int, ...],
+    pad_token_id: int | None,
+) -> torch.Tensor:
+    """Compute discriminator-active token mask before model forward.
+
+    This mirrors the RTD discriminator masking semantics while accounting for
+    masked positions that will be replaced before discriminator scoring.
+
+    :param torch.Tensor input_ids: Input token ids.
+    :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
+    :param torch.Tensor | None attention_mask: Optional attention mask.
+    :param tuple[int, ...] special_token_ids: Token ids excluded from discriminator loss.
+    :param int | None pad_token_id: Padding token id.
+    :return torch.Tensor: Boolean active-token mask.
+    """
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pad_token_id=pad_token_id,
+    )
+
+    if not special_token_ids:
+        return active
+
+    special = torch.isin(
+        input_ids,
+        torch.tensor(
+            sorted(int(sid) for sid in special_token_ids), device=input_ids.device, dtype=input_ids.dtype
+        ),
+    )
+
+    # Masked positions are replaced before discriminator scoring and should not
+    # be excluded solely because their pre-corruption token may be special.
+    masked_positions = labels.ne(-100)
+    special = special & (~masked_positions)
+    return active & (~special)
+
+
+def _count_rtd_tokens_for_batch(
+    batch: dict[str, torch.Tensor],
+    *,
+    special_token_ids: tuple[int, ...],
+    pad_token_id: int | None,
+) -> tuple[float, float]:
+    """Return generator/discriminator active-token counts for one microbatch.
+
+    :param dict[str, torch.Tensor] batch: Microbatch tensors.
+    :param tuple[int, ...] special_token_ids: Token ids excluded from discriminator loss.
+    :param int | None pad_token_id: Padding token id.
+    :return tuple[float, float]: (generator_count, discriminator_count).
+    """
+    labels = batch["labels"]
+    gen_count = float(labels.ne(-100).sum().item())
+    disc_active = _compute_disc_active_mask(
+        input_ids=batch["input_ids"],
+        labels=labels,
+        attention_mask=batch.get("attention_mask"),
+        special_token_ids=special_token_ids,
+        pad_token_id=pad_token_id,
+    )
+    disc_count = float(disc_active.sum().item())
+    return gen_count, disc_count
+
+
+def _token_weighted_micro_objective(
+    *,
+    gen_loss: torch.Tensor,
+    disc_loss: torch.Tensor,
+    gen_count: float,
+    disc_count: float,
+    gen_window_tokens_per_rank: float,
+    disc_window_tokens_per_rank: float,
+    gen_loss_weight: float,
+    disc_loss_weight: float,
+    decoupled_loss_scaling: bool,
+) -> torch.Tensor:
+    """Build token-weighted microbatch objective for one accumulation window.
+
+    :param torch.Tensor gen_loss: Generator loss mean for the microbatch.
+    :param torch.Tensor disc_loss: Discriminator loss mean for the microbatch.
+    :param float gen_count: Generator token count for the microbatch.
+    :param float disc_count: Discriminator token count for the microbatch.
+    :param float gen_window_tokens_per_rank: Mean generator-token total per rank in the accumulation window.
+    :param float disc_window_tokens_per_rank: Mean discriminator-token total per rank in the accumulation window.
+    :param float gen_loss_weight: Generator loss weight.
+    :param float disc_loss_weight: Discriminator loss weight.
+    :param bool decoupled_loss_scaling: Whether to use DeBERTa-style decoupled scaling.
+    :return torch.Tensor: Unscaled microbatch objective contribution.
+    """
+    gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
+    disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
+
+    gen_term = compute_generator_loss_term(
+        gen_loss=gen_loss,
+        disc_loss=disc_loss,
+        decoupled_loss_scaling=bool(decoupled_loss_scaling),
+    )
+
+    return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
+
+
+def _finalize_window_metric_loss(
+    *, accumulated_loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool
+) -> torch.Tensor:
+    """Finalize per-window loss metric for logging.
+
+    :param torch.Tensor accumulated_loss: Sum of microbatch metric contributions.
+    :param int ga_steps: Gradient accumulation steps in the window.
+    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
+    :return torch.Tensor: Window-level scalar loss metric.
+    """
+    if token_weighted_ga:
+        # Token-weighted path already accumulates normalized micro objectives.
+        return accumulated_loss
+    denom = max(1, int(ga_steps))
+    return accumulated_loss / float(denom)
+
+
+def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool) -> torch.Tensor:
+    """Prepare microbatch loss for ``Accelerator.backward``.
+
+    Accelerate scales all backward losses by ``1 / gradient_accumulation_steps``.
+    Token-weighted micro objectives are already normalized over the accumulation
+    window, so we cancel that scaling for the token-weighted path only.
+
+    :param torch.Tensor loss: Raw microbatch loss/objective.
+    :param int ga_steps: Gradient accumulation steps.
+    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
+    :return torch.Tensor: Loss to pass into ``accelerator.backward``.
+    """
+    if not token_weighted_ga:
+        return loss
+    return loss * float(max(1, int(ga_steps)))
+
+
+def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
+    """Return whether gradient clipping should run for this micro-step.
+
+    :param bool sync_gradients: Whether gradients are synchronized this step.
+    :param float | int | None max_grad_norm: Configured clipping norm.
+    :return bool: ``True`` when clipping should be applied.
+    """
+    if not bool(sync_gradients):
+        return False
+    if max_grad_norm is None:
+        return False
+    return float(max_grad_norm) > 0.0
 
 
 def _parse_checkpoint_step(path: str) -> int:
@@ -366,6 +694,73 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
 
     checkpoints.sort(key=lambda x: x[0])
     return checkpoints[-1][1]
+
+
+def _load_checkpoint_data_progress(checkpoint_dir: Path) -> int | None:
+    """Load persisted data progress for resume alignment.
+
+    :param Path checkpoint_dir: Checkpoint directory.
+    :return int | None: Consumed micro-batch count, or ``None`` if unavailable.
+    """
+    path = checkpoint_dir / "data_state.json"
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+        val = raw.get("consumed_micro_batches", None)
+        if val is None:
+            return None
+        return max(0, int(val))
+    except Exception:
+        return None
+
+
+def _save_checkpoint_data_progress(*, checkpoint_dir: Path, consumed_micro_batches: int) -> None:
+    """Persist data iterator progress next to a checkpoint.
+
+    :param Path checkpoint_dir: Checkpoint directory.
+    :param int consumed_micro_batches: Number of consumed micro-batches.
+    """
+    _json_dump(
+        {"consumed_micro_batches": int(max(0, consumed_micro_batches))},
+        checkpoint_dir / "data_state.json",
+    )
+
+
+def _save_training_checkpoint(
+    *,
+    accelerator: Any,
+    checkpoint_dir: Path,
+    output_dir: Path,
+    consumed_micro_batches: int,
+    save_total_limit: int,
+    log_label: str,
+) -> None:
+    """Save one training checkpoint with collective state-dict write.
+
+    :param Any accelerator: Accelerate runtime object.
+    :param Path checkpoint_dir: Destination checkpoint directory.
+    :param Path output_dir: Parent output directory for checkpoint rotation.
+    :param int consumed_micro_batches: Data progress to persist.
+    :param int save_total_limit: Number of checkpoints to retain.
+    :param str log_label: Logging label for this save.
+    """
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    # save_state can be collective under FSDP sharded checkpointing; all ranks must participate.
+    accelerator.save_state(str(checkpoint_dir))
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        _save_checkpoint_data_progress(
+            checkpoint_dir=checkpoint_dir,
+            consumed_micro_batches=consumed_micro_batches,
+        )
+        _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
+        logger.info(f"Saved {log_label} checkpoint: {checkpoint_dir}")
 
 
 def _prepare_output_dir(
@@ -425,116 +820,6 @@ def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
             logger.warning(f"Failed to delete checkpoint {p}: {e}")
 
 
-def _maybe_tokenize_non_streaming(
-    *,
-    raw_ds: Any,
-    tokenizer: Any,
-    data_cfg: DataConfig,
-    is_train: bool,
-) -> Any:
-    """Tokenize and pack non-streaming datasets to fixed-length blocks.
-
-    :param Any raw_ds: Source dataset object.
-    :param Any tokenizer: HF tokenizer.
-    :param DataConfig data_cfg: Data configuration.
-    :param bool is_train: Whether dataset is for training mode.
-    :return Any: Packed dataset object.
-    """
-
-    try:
-        import datasets
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("datasets is required.") from e
-
-    if not isinstance(raw_ds, datasets.Dataset):
-        # Already iterable or dict; caller should handle.
-        return raw_ds
-
-    text_key = data_cfg.text_column_name
-    if text_key not in raw_ds.column_names:
-        raise KeyError(f"Text column '{text_key}' not found. Available: {raw_ds.column_names}")
-
-    remove_columns = [c for c in raw_ds.column_names if c != text_key]
-
-    cls_id = int(tokenizer.cls_token_id)
-    sep_id = int(tokenizer.sep_token_id)
-
-    def tokenize_fn(examples: dict[str, list[str]]) -> dict[str, Any]:
-        """Tokenize text batch without adding special tokens.
-
-        :param dict[str, list[str]] examples: Batch of dataset examples.
-        :return dict[str, Any]: Tokenized batch.
-        """
-        texts = examples[text_key]
-        # No special tokens: we will add [CLS]/[SEP] after packing.
-        return tokenizer(
-            texts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )
-
-    tokenized = raw_ds.map(
-        tokenize_fn,
-        batched=True,
-        num_proc=int(data_cfg.preprocessing_num_workers),
-        remove_columns=remove_columns,
-        desc="Tokenizing",
-    )
-
-    block_len = int(data_cfg.max_seq_length) - 2
-    if block_len <= 0:
-        raise ValueError("max_seq_length must be >= 3")
-
-    def group_texts(examples: dict[str, list[list[int]]]) -> dict[str, Any]:
-        """Concatenate tokens and split into fixed-size blocks.
-
-        :param dict[str, list[list[int]]] examples: Tokenized examples batch.
-        :return dict[str, Any]: Packed ``input_ids`` and masks.
-        """
-        # Concatenate all texts.
-        concatenated: list[int] = []
-        for seq in examples["input_ids"]:
-            concatenated.extend(seq)
-            concatenated.append(sep_id)
-
-        total_length = len(concatenated)
-        total_length = (total_length // block_len) * block_len
-        if total_length == 0:
-            return {"input_ids": [], "attention_mask": [], "special_tokens_mask": []}
-
-        input_ids = []
-        attention_mask = []
-        special_tokens_mask = []
-
-        for i in range(0, total_length, block_len):
-            chunk = concatenated[i : i + block_len]
-            ids = [cls_id] + chunk + [sep_id]
-            input_ids.append(ids)
-            attention_mask.append([1] * len(ids))
-            chunk_special = [1 if (t == sep_id or t == cls_id) else 0 for t in chunk]
-            special_tokens_mask.append([1] + chunk_special + [1])
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "special_tokens_mask": special_tokens_mask,
-        }
-
-    packed = tokenized.map(
-        group_texts,
-        batched=True,
-        num_proc=int(data_cfg.preprocessing_num_workers),
-        remove_columns=tokenized.column_names,
-        desc="Packing",
-    )
-
-    # Drop empty rows (can happen for small datasets)
-    packed = packed.filter(lambda x: len(x["input_ids"]) == data_cfg.max_seq_length)
-
-    return packed
-
-
 def _export_discriminator_hf(
     *,
     accelerator: Any,
@@ -548,7 +833,7 @@ def _export_discriminator_hf(
     Why "best-effort"?
       - Under FSDP2 + SHARDED_STATE_DICT, gathering a full state dict inside the training process
         can fail depending on accelerate/FSDP state-dict configuration.
-      - For a *guaranteed* export from sharded checkpoints, use the `deberta-export` CLI which
+      - For a *guaranteed* export from sharded checkpoints, use `deberta export` which
         loads the checkpoint and consolidates weights with FULL_STATE_DICT on rank0.
 
     This function is intentionally lightweight and is safe to keep enabled by default.
@@ -581,8 +866,14 @@ def _export_discriminator_hf(
         unwrapped = accelerator.unwrap_model(model)
 
         # Try to gather state dicts via accelerator (preferred for distributed).
-        disc_sd = accelerator.get_state_dict(model.discriminator)
-        gen_sd = accelerator.get_state_dict(model.generator)
+        disc_mod = getattr(unwrapped, "discriminator", None)
+        gen_mod = getattr(unwrapped, "generator", None)
+        if disc_mod is None or gen_mod is None:
+            raise RuntimeError(
+                "Unwrapped RTD model must expose discriminator and generator modules for export."
+            )
+        disc_sd = accelerator.get_state_dict(disc_mod)
+        gen_sd = accelerator.get_state_dict(gen_mod)
 
         # Build a fresh model from config.
         if DebertaRoPEConfig is not None and isinstance(
@@ -592,45 +883,21 @@ def _export_discriminator_hf(
         else:
             export_disc = AutoModel.from_config(unwrapped.disc_config)
 
-        # Load as much as possible.
-        export_keys = set(export_disc.state_dict().keys())
-        filtered_disc_sd = {k: v for k, v in disc_sd.items() if k in export_keys}
-        missing = export_disc.load_state_dict(filtered_disc_sd, strict=False)
+        # Load overlap keys only to tolerate training/export module-shape differences.
+        missing = load_intersection_state_dict(export_disc, disc_sd)
         if missing.missing_keys:
             logger.info(
                 f"HF export: missing keys (often expected with tied embeddings): {missing.missing_keys[:5]}..."
             )
 
         mode = (embedding_sharing or "none").lower()
-        if mode in {"es", "gdes"}:
-
-            def merge_embedding(attr: str) -> None:
-                """Merge generator/discriminator embedding weights into export model.
-
-                :param str attr: Embedding attribute name under ``embeddings``.
-                """
-                if not hasattr(export_disc, "embeddings") or not hasattr(export_disc.embeddings, attr):
-                    return
-                gen_key = f"embeddings.{attr}.weight"
-                gen_w = gen_sd.get(gen_key)
-                if gen_w is None:
-                    return
-
-                if mode == "es":
-                    merged = gen_w
-                else:
-                    bias = disc_sd.get(f"embeddings.{attr}.bias")
-                    if bias is None:
-                        raise RuntimeError(f"discriminator embedding bias not found for '{attr}' (gdes)")
-                    merged = gen_w.to(dtype=bias.dtype) + bias
-
-                emb_mod = getattr(export_disc.embeddings, attr)
-                if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
-                    emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
-
-            merge_embedding("word_embeddings")
-            merge_embedding("position_embeddings")
-            merge_embedding("token_type_embeddings")
+        merge_embeddings_into_export_backbone(
+            export_model=export_disc,
+            disc_sd=disc_sd,
+            gen_sd=gen_sd,
+            mode=mode,
+            fp32_accumulate=False,
+        )
 
         tokenizer.save_pretrained(str(output_dir))
         export_disc.save_pretrained(str(output_dir / "discriminator"), safe_serialization=True)
@@ -640,7 +907,7 @@ def _export_discriminator_hf(
     except Exception as e:
         logger.warning(
             "HF export failed (common under FSDP2 + SHARDED_STATE_DICT). "
-            "Use `deberta-export` after training for a guaranteed consolidation+export. "
+            "Use `deberta export` after training for a guaranteed consolidation+export. "
             f"Error: {e}"
         )
 
@@ -657,17 +924,25 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
-    mixed_precision = _normalize_mixed_precision(train_cfg.mixed_precision)
+    mixed_precision = normalize_mixed_precision(train_cfg.mixed_precision)
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
         mixed_precision = "no"
+    # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
+    train_cfg.mixed_precision = mixed_precision
     accelerator = Accelerator(
         gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
         log_with=log_with,
         mixed_precision=mixed_precision,
     )
 
-    _setup_logging(accelerator.is_main_process)
+    setup_process_logging(accelerator.is_main_process)
+    # Validate config contract up-front before side effects (filesystem/network/model loading).
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+
     force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
         torch_compile=bool(train_cfg.torch_compile),
         compile_mode=compile_mode,
@@ -678,6 +953,7 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             "to avoid known TF32 API conflicts on some PyTorch builds."
         )
     _maybe_enable_tf32(train_cfg.tf32, force_legacy=force_legacy_tf32)
+    _maybe_configure_sdpa_kernels(str(train_cfg.sdpa_kernel), is_main=accelerator.is_main_process)
 
     logger.info(f"Accelerate state: {accelerator.state}")
 
@@ -689,10 +965,19 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=accelerator.is_main_process,
     )
-    if accelerator.is_main_process:
-        _json_dump(asdict(model_cfg), output_dir / "model_config.json")
-        _json_dump(asdict(data_cfg), output_dir / "data_config.json")
-        _json_dump(asdict(train_cfg), output_dir / "train_config.json")
+    ckpt = _resolve_resume_checkpoint(
+        output_dir=output_dir,
+        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        is_main_process=accelerator.is_main_process,
+    )
+    _persist_or_validate_run_configs(
+        output_dir=output_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=ckpt,
+        is_main_process=accelerator.is_main_process,
+    )
 
     accelerator.wait_for_everyone()
 
@@ -714,32 +999,25 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
     # Data
     raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
 
-    if data_cfg.streaming:
-        train_dataset = PackedStreamingDataset(
-            hf_dataset=raw_train,
-            tokenizer=tokenizer,
-            cfg=PackedStreamingConfig(
-                text_column_name=data_cfg.text_column_name,
-                max_seq_length=data_cfg.max_seq_length,
-                seed=train_cfg.seed,
-                shuffle_buffer_size=data_cfg.shuffle_buffer_size,
-            ),
-            process_index=accelerator.process_index,
-            num_processes=accelerator.num_processes,
-        )
-    else:
-        train_dataset = _maybe_tokenize_non_streaming(
-            raw_ds=raw_train, tokenizer=tokenizer, data_cfg=data_cfg, is_train=True
-        )
-
-    collator = DebertaV3ElectraCollator(
+    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
+    train_dataset = dataset_cls(
+        hf_dataset=raw_train,
         tokenizer=tokenizer,
-        cfg=MLMConfig(
-            mlm_probability=train_cfg.mlm_probability,
-            mask_token_prob=train_cfg.mask_token_prob,
-            random_token_prob=train_cfg.random_token_prob,
-            max_ngram=train_cfg.mlm_max_ngram,
+        cfg=PackedStreamingConfig(
+            text_column_name=data_cfg.text_column_name,
+            max_seq_length=data_cfg.max_seq_length,
+            seed=train_cfg.seed,
+            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
         ),
+        process_index=accelerator.process_index,
+        num_processes=accelerator.num_processes,
+    )
+
+    collator = _build_training_collator(
+        tokenizer=tokenizer,
+        train_cfg=train_cfg,
+        packed_sequences=bool(data_cfg.pack_sequences),
+        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
     )
 
     # Dataloader
@@ -810,60 +1088,156 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
             "data": asdict(data_cfg),
             "train": asdict(train_cfg),
         }
-        accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-pretrain", config=tracker_cfg)
+        accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-train", config=tracker_cfg)
 
     # Resume
     global_step = 0
-    ckpt = train_cfg.resume_from_checkpoint
+    consumed_micro_batches = 0
     if ckpt:
-        if str(ckpt).lower() == "auto":
-            latest = _find_latest_checkpoint(output_dir)
-            if latest is None:
-                logger.info(
-                    "resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch."
-                )
-                ckpt = None
-            else:
-                ckpt = str(latest)
-        if ckpt:
-            logger.info(f"Resuming from checkpoint: {ckpt}")
-            accelerator.load_state(ckpt)
-            global_step = _parse_checkpoint_step(ckpt)
+        logger.info(f"Resuming from checkpoint: {ckpt}")
+        accelerator.load_state(ckpt)
+        global_step = _parse_checkpoint_step(ckpt)
+        restored = _load_checkpoint_data_progress(Path(ckpt))
+        if restored is None:
+            # Back-compat fallback for older checkpoints without data_state.json.
+            restored = global_step * int(train_cfg.gradient_accumulation_steps)
+            logger.warning(
+                "Checkpoint missing data_state.json; approximating data replay offset "
+                f"as global_step * grad_accum = {restored} micro-batches."
+            )
+        consumed_micro_batches = int(restored)
 
     # Training loop
     model.train()
 
     train_iter = _cycle_dataloader(train_loader)
+    ga_steps = int(train_cfg.gradient_accumulation_steps)
+    token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
+    unwrapped_model = accelerator.unwrap_model(model)
+    special_token_ids = tuple(
+        sorted(int(sid) for sid in getattr(unwrapped_model, "_forbidden_sample_token_ids", set()))
+    )
+    disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
+    if disc_pad_token_id is not None:
+        disc_pad_token_id = int(disc_pad_token_id)
+
+    if consumed_micro_batches > 0:
+        logger.info(
+            "Replaying data iterator by %d micro-batches to align resume data position.",
+            consumed_micro_batches,
+        )
+        for _ in range(consumed_micro_batches):
+            _ = next(train_iter)
 
     while global_step < int(train_cfg.max_steps):
-        batch = next(train_iter)
-        batch = _move_batch_to_device(batch, accelerator.device)
-        if compile_enabled:
-            _maybe_cudagraph_mark_step_begin()
+        window: list[tuple[dict[str, torch.Tensor], float, float]] = []
+        local_gen_tokens = 0.0
+        local_disc_tokens = 0.0
 
-        with accelerator.accumulate(model):
-            out = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-                token_type_ids=batch.get("token_type_ids"),
-                sampling_temperature=train_cfg.sampling_temperature,
-                gen_loss_weight=train_cfg.gen_loss_weight,
-                disc_loss_weight=train_cfg.disc_loss_weight,
-                decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
+        for _ in range(ga_steps):
+            batch = next(train_iter)
+            consumed_micro_batches += 1
+            if token_weighted_ga:
+                gen_count, disc_count = _count_rtd_tokens_for_batch(
+                    batch,
+                    special_token_ids=special_token_ids,
+                    pad_token_id=disc_pad_token_id,
+                )
+                local_gen_tokens += gen_count
+                local_disc_tokens += disc_count
+            else:
+                gen_count, disc_count = 0.0, 0.0
+            window.append((batch, gen_count, disc_count))
+
+        if token_weighted_ga:
+            local_totals = torch.tensor(
+                [local_gen_tokens, local_disc_tokens],
+                device=accelerator.device,
+                dtype=torch.float32,
             )
-            loss = out.loss
-            accelerator.backward(loss)
+            # DDP/FSDP gradients are averaged across ranks. Mean token totals per rank
+            # preserve global token-normalized scaling when used with local micro counts.
+            mean_totals = accelerator.reduce(local_totals, reduction="mean")
+            gen_window_tokens_per_rank = max(float(mean_totals[0].item()), 1.0)
+            disc_window_tokens_per_rank = max(float(mean_totals[1].item()), 1.0)
+        else:
+            gen_window_tokens_per_rank = 1.0
+            disc_window_tokens_per_rank = 1.0
 
-            if train_cfg.max_grad_norm and float(train_cfg.max_grad_norm) > 0:
-                accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+        out = None
+        loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+        did_sync_step = False
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+        for step_idx, (batch, gen_count, disc_count) in enumerate(window):
+            batch = _move_batch_to_device(batch, accelerator.device)
+            if compile_enabled:
+                _maybe_cudagraph_mark_step_begin()
+
+            is_sync_step = step_idx == (ga_steps - 1)
+            sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
+
+            with sync_ctx:
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                    labels=batch["labels"],
+                    token_type_ids=batch.get("token_type_ids"),
+                    sampling_temperature=train_cfg.sampling_temperature,
+                    gen_loss_weight=train_cfg.gen_loss_weight,
+                    disc_loss_weight=train_cfg.disc_loss_weight,
+                    decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
+                )
+
+                if token_weighted_ga:
+                    micro_obj = _token_weighted_micro_objective(
+                        gen_loss=out.gen_loss_raw,
+                        disc_loss=out.disc_loss_raw,
+                        gen_count=gen_count,
+                        disc_count=disc_count,
+                        gen_window_tokens_per_rank=gen_window_tokens_per_rank,
+                        disc_window_tokens_per_rank=disc_window_tokens_per_rank,
+                        gen_loss_weight=float(train_cfg.gen_loss_weight),
+                        disc_loss_weight=float(train_cfg.disc_loss_weight),
+                        decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
+                    )
+                    loss = micro_obj
+                    loss_for_metrics = loss_for_metrics + micro_obj.detach()
+                else:
+                    loss = out.loss
+                    loss_for_metrics = loss_for_metrics + out.loss.detach()
+
+                backward_loss = _scale_loss_for_backward(
+                    loss=loss,
+                    ga_steps=ga_steps,
+                    token_weighted_ga=token_weighted_ga,
+                )
+                accelerator.backward(backward_loss)
+
+            if is_sync_step:
+                did_sync_step = True
+                if _should_clip_gradients(
+                    sync_gradients=True,
+                    max_grad_norm=train_cfg.max_grad_norm,
+                ):
+                    accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        if not did_sync_step:
+            raise RuntimeError("Accumulation window produced no synchronized optimization step.")
+
+        loss_for_metrics = _finalize_window_metric_loss(
+            accumulated_loss=loss_for_metrics,
+            ga_steps=ga_steps,
+            token_weighted_ga=token_weighted_ga,
+        )
 
         # We count *optimizer* steps (not micro-steps).
-        if accelerator.sync_gradients:
+        if did_sync_step:
+            if out is None:
+                raise RuntimeError("Accumulation window produced no forward pass outputs.")
             global_step += 1
 
             if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
@@ -881,10 +1255,12 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                 metrics = {
                     "step": global_step,
                     "lr": lr,
-                    "loss": _mean(loss),
+                    "loss": _mean(loss_for_metrics),
                     "gen_loss": _mean(out.gen_loss),
                     "disc_loss": _mean(out.disc_loss),
                     "disc_acc": _mean(out.disc_accuracy),
+                    "gen_tokens": _mean(out.gen_token_count),
+                    "disc_tokens": _mean(out.disc_token_count),
                 }
 
                 if accelerator.is_main_process:
@@ -897,6 +1273,8 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                                 f"gen={metrics['gen_loss']:.4f}",
                                 f"disc={metrics['disc_loss']:.4f}",
                                 f"acc={metrics['disc_acc']:.4f}",
+                                f"gen_tok={metrics['gen_tokens']:.1f}",
+                                f"disc_tok={metrics['disc_tokens']:.1f}",
                             ]
                         )
                     )
@@ -906,22 +1284,26 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
             # Checkpoint
             if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    ckpt_dir = output_dir / f"checkpoint-{global_step}"
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    accelerator.save_state(str(ckpt_dir))
-                    _rotate_checkpoints(output_dir, save_total_limit=int(train_cfg.save_total_limit))
-                    logger.info(f"Saved checkpoint: {ckpt_dir}")
+                ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                _save_training_checkpoint(
+                    accelerator=accelerator,
+                    checkpoint_dir=ckpt_dir,
+                    output_dir=output_dir,
+                    consumed_micro_batches=consumed_micro_batches,
+                    save_total_limit=int(train_cfg.save_total_limit),
+                    log_label="periodic",
+                )
 
     # Final save
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        final_ckpt = output_dir / f"checkpoint-{global_step}"
-        final_ckpt.mkdir(parents=True, exist_ok=True)
-        accelerator.save_state(str(final_ckpt))
-        _rotate_checkpoints(output_dir, save_total_limit=int(train_cfg.save_total_limit))
-        logger.info(f"Saved final checkpoint: {final_ckpt}")
+    final_ckpt = output_dir / f"checkpoint-{global_step}"
+    _save_training_checkpoint(
+        accelerator=accelerator,
+        checkpoint_dir=final_ckpt,
+        output_dir=output_dir,
+        consumed_micro_batches=consumed_micro_batches,
+        save_total_limit=int(train_cfg.save_total_limit),
+        log_label="final",
+    )
 
     # Best-effort HF export
     if train_cfg.export_hf_final:

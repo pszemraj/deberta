@@ -1,0 +1,68 @@
+# RoPE + RMSNorm + SwiGLU, 4096 context.
+# Usage:
+#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+#     deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
+
+model:
+  tokenizer_name_or_path: microsoft/deberta-v3-base
+  backbone_type: rope
+  from_scratch: true
+
+  # RoPE settings
+  rope_theta: 10000.0
+  rotary_pct: 1.0
+  use_absolute_position_embeddings: false
+
+  # Norm + FFN topology
+  norm_arch: post
+  norm_eps: 1.0e-6
+  ffn_type: swiglu
+
+  # Strongly recommended at 4096.
+  gradient_checkpointing: true
+
+  # RTD embedding sharing
+  embedding_sharing: gdes
+
+  # SDPA/FlashAttention dispatch via PyTorch
+  attention_implementation: sdpa
+
+data:
+  dataset_name: HuggingFaceFW/fineweb-edu
+  dataset_config_name: default
+  train_split: train
+  streaming: true
+  pack_sequences: true
+  block_cross_document_attention: false
+  text_column_name: text
+  max_seq_length: 4096
+  shuffle_buffer_size: 10000
+
+train:
+  output_dir: runs/deberta_rope_rtd_4096
+  overwrite_output_dir: false
+  max_steps: 10000
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 64
+
+  # Optim
+  learning_rate: 5.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+
+  # Objective
+  mlm_probability: 0.15
+  mlm_max_ngram: 1
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  sampling_temperature: 1.0
+
+  gen_loss_weight: 1.0
+  disc_loss_weight: 50.0
+  decoupled_loss_scaling: false
+
+  # SDPA backend preference (best-effort): auto|flash|mem_efficient|math|flash_only
+  sdpa_kernel: flash
+
+  logging_steps: 25
+  report_to: none

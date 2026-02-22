@@ -1,160 +1,116 @@
-# DeBERTaV3 Modernized Pretraining (RTD / ELECTRA-style)
+# deberta: a modern refresh
 
-A **PyTorch 2.9.1+** pretraining toolkit for DeBERTaV3-style **Replaced Token Detection (RTD)** with a modern encoder backbone and first-class **Accelerate + FSDP2** support.
+A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
 
-This **v3.1** update includes:
+---
 
-- **RoPE** replacing DeBERTa’s *disentangled position bias*  
-  → compatible with **PyTorch SDPA / FlashAttention** kernels and better length generalization
-- **Post-Norm topology** retained (encoder-depth friendly), swapping **LayerNorm → RMSNorm**
-- Optional **KEEL** residual topology via config (`norm_arch: keel`) for extra stability margin
-- **Streaming-first** data pipeline (default), plus `load_from_disk()` and non-streaming `load_dataset()`
-- Optional **DeBERTa-style whole-word n-gram masking** (`mlm_max_ngram > 1`)
-- **FSDP2-safe embedding sharing** (`none | es | gdes`) + a dedicated exporter that consolidates sharded checkpoints
+- [Install](#install)
+- [CLI Entrypoints](#cli-entrypoints)
+- [Quickstart](#quickstart)
+- [Documentation](#documentation)
+- [Configs](#configs)
+- [Repo Layout](#repo-layout)
+- [Citations](#citations)
 
 ---
 
 ## Install
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
+Clone + editable install:
 
-pip install -U pip
+```bash
+git clone https://github.com/pszemraj/deberta.git
+cd deberta
+# activate your Python environment first, then:
 pip install -e .
 ```
 
 Optional extras:
 
 ```bash
+pip install -e '.[dev]'
 pip install -e '.[wandb]'
 ```
 
----
+Direct install from GitHub:
+
+```bash
+pip install "git+https://github.com/pszemraj/deberta.git"
+```
+
+## CLI Entrypoints
+
+`pyproject.toml` defines installable commands:
+
+- `deberta train` (training)
+- `deberta export` (checkpoint consolidation/export)
+- `python -m deberta` (module entrypoint)
+
+Use `--help` on each command for full argument docs.
 
 ## Quickstart
 
-### 1) YAML config (recommended)
+Train from YAML (recommended):
 
 ```bash
 accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta-pretrain configs/pretrain_rope_c4_en.yaml
+  deberta train configs/pretrain_rope_fineweb_edu.yaml
 ```
 
-The YAML config format supports either:
-
-- nested sections (`model:`, `data:`, `train:`) — recommended
-- a flat dict with keys from `ModelConfig`, `DataConfig`, `TrainConfig`
-
-See `configs/` for examples.
-
-### 2) CLI flags
-
-Example: stream C4 (English) and train a RoPE+RMSNorm Post-Norm encoder.
+Long-context presets:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain \
-  --dataset_name c4 --dataset_config_name en --train_split train --streaming true \
-  --tokenizer_name_or_path microsoft/deberta-v3-base \
-  --backbone_type rope --from_scratch true \
-  --norm_arch post --rotary_pct 1.0 --rope_theta 10000 \
-  --max_seq_length 512 \
-  --per_device_train_batch_size 2 --gradient_accumulation_steps 16 \
-  --learning_rate 5e-4 --max_steps 10000 \
-  --disc_loss_weight 50.0 \
-  --output_dir runs/deberta_rope_rtd
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+  deberta train configs/pretrain_rope_fineweb_edu_2048.yaml
 ```
-
-Notes:
-- Attention uses **`torch.nn.functional.scaled_dot_product_attention`** (`--attention_implementation sdpa`) and will dispatch to FlashAttention kernels when available.
-- For length generalization, keep `--use_absolute_position_embeddings false` (default).
-- Training defaults to `train.mixed_precision=bf16` (autocast), not full-parameter bf16 casting.
-- Optional compile modes: `--torch_compile true --torch_compile_mode max-autotune-no-cudagraphs` can be a safer fallback on some CUDA stacks.
-
----
-
-## Masking options
-
-- **Token-level masking (fast, default):** `mlm_max_ngram = 1`
-- **Whole-word n-gram masking (closer to DeBERTa):** set `mlm_max_ngram = 3` (or similar)
-
-Replacement probabilities:
-- `mask_token_prob` (default 0.8)
-- `random_token_prob` (default 0.1)
-- remaining probability keeps the original token
-
----
-
-## KEEL mode (optional)
-
-KEEL is an optional topology you can toggle for extra margin at ~28 layers without switching to Pre-LN:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain \
-  configs/pretrain_rope_c4_en.yaml \
-  # and in the YAML: model.norm_arch: keel
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+  deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
 ```
 
-See `docs/keel-paper-technical-overview.md` for a short technical overview and rationale.
-
----
-
-## HF DeBERTa Compatibility Path (optional)
-
-If you want to train using the Hugging Face `DebertaV2Model` implementation (original disentangled attention), use:
-
-- `--backbone_type hf_deberta_v2`
-- `configs/fsdp2_hf_deberta_1node.yaml` (wrap class `DebertaV2Layer`)
+Export from an FSDP2 checkpoint:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_hf_deberta_1node.yaml --no_python deberta-pretrain \
-  --dataset_name c4 --dataset_config_name en --train_split train --streaming true \
-  --tokenizer_name_or_path microsoft/deberta-v3-base \
-  --backbone_type hf_deberta_v2 --from_scratch true \
-  --max_seq_length 512 --max_steps 10000 \
-  --output_dir runs/deberta_hf_deberta_rtd
+accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
+  runs/deberta_rope_rtd/checkpoint-10000 \
+  --what discriminator \
+  --output-dir runs/deberta_rope_rtd/exported_hf
 ```
 
-**Important:** RoPE/RMSNorm/KEEL are **not** applied in `hf_deberta_v2` mode.
+## Documentation
 
----
+- Model/backbone config and architecture behavior (including load/source resolution contract): [`docs/model.md`](docs/model.md)
+- Data pipeline, packing, and masking behavior: [`docs/data.md`](docs/data.md)
+- RTD objective and loss semantics: [`docs/objective.md`](docs/objective.md)
+- FSDP2/runtime/export behavior: [`docs/fsdp2.md`](docs/fsdp2.md)
+- Normalization strategy (`post` default, `keel` upgrade path): [`docs/norm-strategy.md`](docs/norm-strategy.md)
+- Deferred follow-ups: [`docs/roadmap.md`](docs/roadmap.md)
 
-## Exporting from FSDP2 sharded checkpoints
+## Configs
 
-Training attempts a best-effort export to `output_dir/final_hf/`, but for **FSDP2 + SHARDED_STATE_DICT** you should use the dedicated exporter.
+- Base pretraining config: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml)
+- Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
+- CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
+- Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
 
-### Guaranteed consolidation + export (`deberta-export`)
+## Repo Layout
 
-Run with the **same Accelerate config** you trained with:
+- `src/deberta/` - package source
+- `src/deberta/training/pretrain.py` - training loop
+- `src/deberta/export_cli.py` - FSDP-aware exporter
+- `configs/` - training and accelerate configs
+- `docs/` - canonical docs by concept
 
-```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-export \
-  --checkpoint_dir runs/deberta_rope_rtd/checkpoint-10000 \
-  --export_what discriminator \
-  --output_dir runs/deberta_rope_rtd/exported_hf
+## Citations
+
+```bibtex
+@misc{he2021debertav3,
+      title={DeBERTaV3: Improving DeBERTa using ELECTRA-Style Pre-Training with Gradient-Disentangled Embedding Sharing},
+      author={Pengcheng He and Jianfeng Gao and Weizhu Chen},
+      year={2021},
+      eprint={2111.09543},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
+}
 ```
-
-This will:
-1) load the sharded checkpoint,
-2) gather a **FULL_STATE_DICT on rank0**,
-3) merge tied embeddings (`es` / `gdes`) into standalone HF backbones,
-4) write `exported_hf/discriminator/` (and tokenizer at `exported_hf/`).
-
----
-
-## Repo layout
-
-- `src/deberta/` – core package
-- `src/deberta/training/pretrain.py` – training loop
-- `src/deberta/export_cli.py` – consolidation + export tool
-- `configs/` – accelerate configs (FSDP2 examples + YAML training configs)
-- `docs/` – minimal docs for key pieces
-
----
-
-## Next steps (not implemented yet)
-
-Planned follow-ups (per discussion):
-- SwiGLU FFN
-- Longer context (2048–4096)
-- FlashAttention-specific tuning

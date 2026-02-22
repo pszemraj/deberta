@@ -1,6 +1,6 @@
-# Example YAML config for `deberta-pretrain`.
+# Example YAML config for `deberta train`.
 # Usage:
-#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta-pretrain configs/pretrain_rope_c4_en.yaml
+#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta train configs/pretrain_rope_fineweb_edu.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base
@@ -15,6 +15,7 @@ model:
   # Norm topology
   norm_arch: post   # post | keel
   norm_eps: 1.0e-6
+  ffn_type: swiglu  # swiglu | mlp
 
   # RTD embedding sharing
   embedding_sharing: gdes  # none | es | gdes
@@ -23,10 +24,12 @@ model:
   attention_implementation: sdpa
 
 data:
-  dataset_name: c4
-  dataset_config_name: en
+  dataset_name: HuggingFaceFW/fineweb-edu
+  dataset_config_name: default
   train_split: train
   streaming: true
+  pack_sequences: true
+  block_cross_document_attention: false
   text_column_name: text
   max_seq_length: 512
   shuffle_buffer_size: 10000
@@ -54,6 +57,9 @@ train:
   gen_loss_weight: 1.0
   disc_loss_weight: 50.0
   decoupled_loss_scaling: false
+
+  # SDPA backend preference (best-effort): auto|flash|mem_efficient|math|flash_only
+  sdpa_kernel: auto
 
   # Logging
   logging_steps: 25

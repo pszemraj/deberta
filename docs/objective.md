@@ -1,32 +1,43 @@
 # Objective: RTD (Replaced Token Detection)
 
-This code implements the DeBERTaV3 / ELECTRA-style pretraining objective.
+This document is the primary reference for the pretraining objective implemented in this repo.
 
-## Steps
+For data/collator behavior, see [`docs/data.md`](data.md). For distributed/runtime configuration, see [`docs/fsdp2.md`](fsdp2.md).
 
-1. **Mask tokens** in the input sequence (MLM-style).
-2. Run the **generator** (masked LM) to predict masked tokens.
-3. **Sample** replacements from the generator distribution.
-4. Create a corrupted sequence by inserting sampled tokens at masked positions.
-5. Run the **discriminator** on the corrupted sequence.
-6. Train discriminator to predict whether each token is original (0) or replaced (1).
+## RTD Flow
 
-## Loss
+Each training step follows DeBERTaV3/ELECTRA-style RTD:
 
-Total loss:
+1. Apply dynamic MLM masking to input tokens.
+2. Run generator on masked input.
+3. Compute generator logits only at masked positions.
+4. Sample replacements from generator distribution, excluding configured tokenizer special token ids (`pad/cls/sep/mask/bos/eos`).
+5. Create corrupted sequence by inserting sampled tokens at masked positions.
+6. Run discriminator on corrupted sequence.
+7. Train discriminator to predict original (`0`) vs replaced (`1`) per token.
 
-- Generator loss: cross entropy over masked positions.
-- Discriminator loss: BCEWithLogits over all non-padding tokens.
+## Loss Terms
 
-The trainer exposes knobs:
+- Generator loss: cross entropy on masked positions only.
+- Discriminator loss: BCE-with-logits on active non-special tokens.
+- Total loss: `gen_loss_weight * gen_loss + disc_loss_weight * disc_loss`.
 
-- `--disc_loss_weight`
-- `--gen_loss_weight`
-- `--sampling_temperature`
-- `--decoupled_loss_scaling` (scales generator loss to be comparable to discriminator loss)
+Exposed controls:
 
-## Why masked-only logits matters
+- `train.gen_loss_weight`
+- `train.disc_loss_weight` (default `50.0`)
+- `train.decoupled_loss_scaling`
+- `train.sampling_temperature`
+- `train.token_weighted_gradient_accumulation` (default `true`)
 
-DeBERTa-v2/v3 uses a **large vocab** (often 128k). Computing `(batch, seq, vocab)` logits for the generator is extremely memory-heavy.
+Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
 
-We therefore compute generator logits **only at masked token positions**, which keeps compute/memory practical.
+## Numerical Stability
+
+Both generator CE loss and discriminator BCE loss are computed from fp32 logits, even when training uses bf16 autocast.
+
+## Why masked-only generator logits
+
+Vocab logits for all tokens (`batch x seq x vocab`) are expensive with large DeBERTa vocabularies.
+
+This implementation computes generator vocab projection only on masked positions to reduce memory/compute while preserving RTD behavior.
