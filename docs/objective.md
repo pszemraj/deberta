@@ -11,7 +11,7 @@ Each training step follows DeBERTaV3/ELECTRA-style RTD:
 1. Apply dynamic MLM masking to input tokens.
 2. Run generator on masked input.
 3. Compute generator logits only at masked positions.
-4. Sample replacements from generator distribution, excluding configured special token ids when available (`pad/cls/sep/mask/bos/eos`).
+4. Sample replacements from generator distribution, excluding configured tokenizer special token ids (`pad/cls/sep/mask/bos/eos`).
 5. Create corrupted sequence by inserting sampled tokens at masked positions.
 6. Run discriminator on corrupted sequence.
 7. Train discriminator to predict original (`0`) vs replaced (`1`) per token.

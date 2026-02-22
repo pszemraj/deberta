@@ -96,7 +96,7 @@ With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
 
-Packed 3D document-blocking masks are also rope-only. If `data.pack_sequences=true` with HF backbone mode, set `data.block_cross_document_attention=false`.
+Packed 3D document-blocking masks are rope-only. The canonical pairwise-mask contract lives in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue); HF backbone runs must keep `data.block_cross_document_attention=false`.
 
 Pretraining heads follow backbone norm style by config:
 

@@ -66,17 +66,13 @@ This is best-effort backend configuration. `flash_only` can fail if hardware or 
 
 `train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
 
-When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit 3D document-blocking attention masks. Those masks are not compatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
+When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
 
 Use `auto`, `flash`, or `mem_efficient` for packed training runs.
 
 ## Embedding Sharing and FSDP Safety
 
-FSDP-safety detail: sharing avoids reusing the same embedding module instance across
-generator/discriminator wrappers.
-
-Model-level sharing semantics and constraints (including post-init module replacement
-behavior) are defined in [`docs/model.md`](model.md).
+FSDP-safety details and model-level sharing semantics (including post-init module replacement behavior) are defined in [`docs/model.md#embedding-sharing`](model.md#embedding-sharing).
 
 ## Checkpointing and Export
 

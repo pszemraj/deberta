@@ -2,7 +2,7 @@
 
 This document is the primary reference for dataset ingestion, packing, and masking behavior.
 
-For objective/loss semantics, see [`docs/objective.md`](objective.md). For runtime and FSDP2/precision controls, see [`docs/fsdp2.md`](fsdp2.md).
+For objective/loss semantics, see [`docs/objective.md`](objective.md). For model/backbone constraints, see [`docs/model.md`](model.md). For runtime and FSDP2/precision controls, see [`docs/fsdp2.md`](fsdp2.md).
 
 ## Dataset Source Selection
 
@@ -34,14 +34,18 @@ Output fields:
 
 Packed chunks can contain inserted internal `[SEP]` separators. Those positions are marked as special in `special_tokens_mask`, so masking never corrupts those separators.
 
-When internal separators are present and `data.block_cross_document_attention=true`, the collator emits a pairwise attention keep-mask (`B x S x S`) that blocks cross-document attention within packed sequences.
-
-This packed pairwise mask is represented as a boolean keep-mask (`True = attend`, `False = block`).
-
-`data.block_cross_document_attention` controls this behavior:
+`data.block_cross_document_attention` controls whether packed batches use strict pairwise document-blocking:
 
 - `false` (default): skip 3D doc-blocking masks (packed batches remain on 2D/no-mask attention paths)
 - `true`: emit 3D doc-blocking masks for packed batches with internal separators
+
+### Pairwise Mask Contract (`block_cross_document_attention=true`)
+
+- mask type/shape: boolean keep-mask `(B, S, S)` where `True=attend`, `False=block`
+- emission condition: only emitted when packed chunks contain internal separators; single-document packed chunks keep `attention_mask=None`
+- query activity encoding: diagonal `True` marks active queries, diagonal `False` marks inactive/padded queries
+- document boundary behavior: CLS stays in document 1 (no global cross-document CLS channel)
+- consumers: rope attention and RTD token-activity accounting use this contract; keep `data.block_cross_document_attention=false` when strict doc-blocking is unnecessary
 
 ## Sequential / No-Pack Mode
 
