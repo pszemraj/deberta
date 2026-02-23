@@ -337,6 +337,7 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
     :param argparse.Namespace ns: Parsed train args.
     :param list[str] raw_train_argv: Raw argv after `train`.
     """
+    cfg_path: Path | None = None
     if ns.config is not None:
         cfg_path = Path(ns.config).expanduser().resolve()
         if not cfg_path.exists():
@@ -364,7 +365,12 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
     validate_train_config(train_cfg)
     validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
 
-    run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+    run_pretraining(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        config_path=cfg_path,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

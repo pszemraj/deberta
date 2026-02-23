@@ -521,9 +521,14 @@ class DataConfig:
 class TrainConfig:
     """Training-related arguments."""
 
-    output_dir: str = field(
-        default="runs/deberta_pretrain",
-        metadata={"help": "Output directory (checkpoints, logs)."},
+    output_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Output directory (checkpoints, logs). If null/empty, auto-create "
+                "runs/<project_name>/<timestamp>_<config_stem_or_run>."
+            )
+        },
     )
 
     overwrite_output_dir: bool = field(
@@ -536,9 +541,24 @@ class TrainConfig:
         },
     )
 
+    project_name: str = field(
+        default="deberta-train",
+        metadata={
+            "help": (
+                "Tracker project name (for example W&B project) and auto output-dir namespace "
+                "when train.output_dir is null."
+            )
+        },
+    )
+
     run_name: str | None = field(
         default=None,
-        metadata={"help": "Optional run name for experiment trackers."},
+        metadata={
+            "help": (
+                "Optional run name for experiment trackers. When null, defaults to the "
+                "resolved output directory basename."
+            )
+        },
     )
 
     seed: int = field(default=42, metadata={"help": "Random seed."})
@@ -1047,6 +1067,10 @@ def validate_train_config(cfg: TrainConfig) -> None:
     cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
 
     cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
+    if cfg.output_dir is not None and not str(cfg.output_dir).strip():
+        cfg.output_dir = None
+    if not str(cfg.project_name).strip():
+        raise ValueError("train.project_name must be non-empty.")
 
     if int(cfg.max_steps) <= 0:
         raise ValueError("train.max_steps must be > 0.")

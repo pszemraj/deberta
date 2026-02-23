@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from deberta.modeling.export_utils import load_intersection_state_dict, merge_em
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 
 logger = logging.getLogger(__name__)
+_RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _json_dump(obj: Any, path: Path) -> None:
@@ -119,6 +121,82 @@ def _build_run_metadata() -> dict[str, Any]:
         "config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION),
         "deberta_version": str(__version__),
     }
+
+
+def _sanitize_run_label(raw: str) -> str:
+    """Normalize a free-form run label into a compact safe token.
+
+    :param str raw: Raw label.
+    :return str: Sanitized label.
+    """
+    cleaned = _RUN_LABEL_CLEAN_RE.sub("-", str(raw).strip()).strip("._-")
+    return cleaned or "run"
+
+
+def _resolve_output_dir(
+    *,
+    output_dir: str | None,
+    project_name: str,
+    config_path: str | Path | None,
+) -> Path:
+    """Resolve the concrete training output directory.
+
+    :param str | None output_dir: User-configured output directory.
+    :param str project_name: Tracker project namespace.
+    :param str | Path | None config_path: Optional config file path for naming hint.
+    :return Path: Concrete output directory path.
+    """
+    if output_dir is not None and str(output_dir).strip():
+        return Path(str(output_dir))
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name_hint = "run"
+    if config_path is not None:
+        name_hint = Path(config_path).stem or "run"
+    run_name = _sanitize_run_label(name_hint)
+    project = _sanitize_run_label(project_name)
+    return Path("runs") / project / f"{stamp}_{run_name}"
+
+
+def _init_trackers(
+    *,
+    accelerator: Any,
+    project_name: str,
+    tracker_cfg: dict[str, Any],
+    report_to: str,
+    run_name: str,
+) -> None:
+    """Initialize Accelerate trackers with tracker-specific kwargs when available.
+
+    :param Any accelerator: Accelerator instance.
+    :param str project_name: Tracker project name.
+    :param dict[str, Any] tracker_cfg: Tracker configuration payload.
+    :param str report_to: Selected tracker backend.
+    :param str run_name: Effective run name.
+    """
+    call_kwargs: dict[str, Any] = {
+        "project_name": project_name,
+        "config": tracker_cfg,
+    }
+
+    init_kwargs: dict[str, Any] = {}
+    if str(report_to).strip().lower() == "wandb":
+        init_kwargs = {"wandb": {"name": run_name}}
+
+    supports_init_kwargs = False
+    with suppress(Exception):
+        supports_init_kwargs = "init_kwargs" in inspect.signature(accelerator.init_trackers).parameters
+
+    if init_kwargs and supports_init_kwargs:
+        call_kwargs["init_kwargs"] = init_kwargs
+
+    accelerator.init_trackers(**call_kwargs)
+
+    if init_kwargs and not supports_init_kwargs:
+        logger.warning(
+            "Accelerate init_trackers() does not expose init_kwargs; W&B run name "
+            "cannot be set explicitly on this runtime."
+        )
 
 
 def _validate_run_metadata(path: Path) -> None:
@@ -955,12 +1033,19 @@ def _export_discriminator_hf(
         )
 
 
-def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: TrainConfig) -> None:
+def run_pretraining(
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    config_path: str | Path | None = None,
+) -> None:
     """Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
     :param TrainConfig train_cfg: Training configuration.
+    :param str | Path | None config_path: Optional source config path for auto output-dir naming.
     """
     from accelerate import Accelerator
     from accelerate.utils import set_seed
@@ -1000,8 +1085,20 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
 
     logger.info(f"Accelerate state: {accelerator.state}")
 
+    # Resolve output dir before side effects and persist the concrete path in train_cfg.
+    configured_output_dir = train_cfg.output_dir
+    output_dir = _resolve_output_dir(
+        output_dir=train_cfg.output_dir,
+        project_name=train_cfg.project_name,
+        config_path=config_path,
+    )
+    train_cfg.output_dir = str(output_dir)
+    if accelerator.is_main_process and (
+        configured_output_dir is None or not str(configured_output_dir).strip()
+    ):
+        logger.info("train.output_dir unset; auto-selected output_dir=%s", output_dir)
+
     # Make/validate output dir on main.
-    output_dir = Path(train_cfg.output_dir)
     _prepare_output_dir(
         output_dir=output_dir,
         overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
@@ -1154,7 +1251,17 @@ def run_pretraining(*, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: 
                 "data": asdict(data_cfg),
                 "train": asdict(train_cfg),
             }
-            accelerator.init_trackers(project_name=train_cfg.run_name or "deberta-train", config=tracker_cfg)
+            if train_cfg.run_name is not None and str(train_cfg.run_name).strip():
+                tracker_run_name = str(train_cfg.run_name).strip()
+            else:
+                tracker_run_name = output_dir.name
+            _init_trackers(
+                accelerator=accelerator,
+                project_name=str(train_cfg.project_name).strip(),
+                tracker_cfg=tracker_cfg,
+                report_to=str(train_cfg.report_to),
+                run_name=tracker_run_name,
+            )
             if str(train_cfg.report_to).lower() == "wandb":
                 with suppress(Exception):
                     wandb_run = accelerator.get_tracker("wandb", unwrap=True)

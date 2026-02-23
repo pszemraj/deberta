@@ -93,6 +93,8 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
 - Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
+- Ergonomic defaults: when `train.output_dir` is unset, training auto-creates `runs/<project_name>/<timestamp>_<config_stem_or_run>`.
+- W&B default run naming: when `train.report_to=wandb` and `train.run_name` is unset, the run name defaults to the resolved output directory basename.
 
 ## Repo Layout
 

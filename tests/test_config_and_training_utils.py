@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import re
 import shlex
 import sys
 import types
@@ -44,6 +45,7 @@ from deberta.training.pretrain import (
     _load_checkpoint_data_progress,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
+    _resolve_output_dir,
     _resolve_resume_checkpoint,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
@@ -231,6 +233,25 @@ def test_find_latest_checkpoint_picks_highest_step(tmp_path: Path):
     assert latest.name == "checkpoint-11"
 
 
+def test_resolve_output_dir_auto_uses_project_and_config_stem():
+    out = _resolve_output_dir(
+        output_dir=None,
+        project_name="deberta-train",
+        config_path="configs/pretrain_rope_fineweb_edu.yaml",
+    )
+    assert out.parent.name == "deberta-train"
+    assert re.fullmatch(r"\d{8}_\d{6}_pretrain_rope_fineweb_edu", out.name) is not None
+
+
+def test_resolve_output_dir_keeps_explicit_path():
+    out = _resolve_output_dir(
+        output_dir="runs/custom/run-01",
+        project_name="ignored",
+        config_path="configs/pretrain_rope_fineweb_edu.yaml",
+    )
+    assert out == Path("runs/custom/run-01")
+
+
 def test_resolve_resume_checkpoint_auto_returns_none_when_no_checkpoint(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -327,6 +348,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
             self.device = torch.device("cpu")
             self.state = "fake-accelerator"
             self.logged_rows: list[tuple[dict[str, Any], int | None]] = []
+            self.tracker_init_calls: list[dict[str, Any]] = []
             self.ended = False
             self.wandb_run = _FakeWandbRun()
             _FakeAccelerator.last_instance = self
@@ -357,8 +379,19 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
         def gather(self, tensor: torch.Tensor) -> torch.Tensor:
             return tensor
 
-        def init_trackers(self, project_name: str, config: dict[str, Any]) -> None:
-            del project_name, config
+        def init_trackers(
+            self,
+            project_name: str,
+            config: dict[str, Any],
+            init_kwargs: dict[str, Any] | None = None,
+        ) -> None:
+            self.tracker_init_calls.append(
+                {
+                    "project_name": project_name,
+                    "config": dict(config),
+                    "init_kwargs": dict(init_kwargs or {}),
+                }
+            )
 
         def get_tracker(self, name: str, unwrap: bool = True):
             del unwrap
@@ -508,6 +541,10 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.wandb_run.summary["crash_type"] == "KeyboardInterrupt"
     assert accel.wandb_run.finished_exit_code == 130
     assert accel.wandb_run.logged
+    assert accel.tracker_init_calls
+    first_tracker_call = accel.tracker_init_calls[0]
+    assert first_tracker_call["project_name"] == "deberta-train"
+    assert first_tracker_call["init_kwargs"]["wandb"]["name"] == "run"
     assert accel.ended is False
 
 
@@ -1111,10 +1148,11 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
     cli_mod.main(["train", str(cfg_path), "--max_steps", "7"])
@@ -1122,6 +1160,7 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
     assert "train_cfg" in seen
     assert seen["data_cfg"].max_seq_length == 32
     assert seen["train_cfg"].max_steps == 7
+    assert seen["config_path"] == cfg_path
 
 
 def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.MonkeyPatch):
