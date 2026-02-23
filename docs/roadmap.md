@@ -23,7 +23,7 @@ For implemented behavior, use the concept docs:
 
 ## Runtime/Compile
 
-- refine torch.compile boundaries so generator/discriminator backbones can stay compiled while RTD sampling/corruption logic runs eagerly (to avoid dynamic-op graph-break overhead)
+- add selective compile-bisect tooling (for example generator-only vs discriminator-only vs both) with scripted parity checks to isolate compile-specific regressions quickly
 
 ## Model Perf
 

@@ -43,7 +43,13 @@ Enable with `train.torch_compile=true` and `train.torch_compile_mode` in `defaul
 
 If compile fails at runtime, training logs a warning and continues without compile.
 
-Current limitation: RTD generator sampling/corruption uses dynamic operations (`multinomial` + indexed token replacement) that can introduce graph breaks. The project keeps compile support as best-effort and tracks compile-boundary refinement as a follow-up in [`docs/roadmap.md`](roadmap.md).
+Compile scope is intentionally limited to the transformer backbones:
+
+- `generator` backbone is compiled
+- `discriminator` backbone is compiled
+- RTD wrapper glue (sampling/corruption/label construction) remains eager
+
+This avoids compiling dynamic RTD glue patterns (RNG sampling, dynamic index paths, and corruption bookkeeping) while preserving most compile speedups on the dense encoder FLOPs.
 
 ## Interruption and Crash Handling
 
