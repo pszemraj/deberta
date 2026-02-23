@@ -42,6 +42,7 @@ from deberta.training.pretrain import (
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
     _flush_loggers,
+    _init_trackers,
     _load_checkpoint_data_progress,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
@@ -316,6 +317,52 @@ def test_flush_loggers_suppresses_handler_flush_errors() -> None:
 
     assert ok_handler.flush_calls >= 1
     assert bad_handler.flush_calls >= 1
+
+
+def test_init_trackers_passes_wandb_name_with_wrapped_signature() -> None:
+    class _WrappedAccelerator:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def init_trackers(self, *args, **kwargs) -> None:
+            del args
+            self.calls.append(dict(kwargs))
+
+    accel = _WrappedAccelerator()
+    _init_trackers(
+        accelerator=accel,
+        project_name="demo-project",
+        tracker_cfg={"a": 1},
+        report_to="wandb",
+        run_name="demo-run",
+    )
+
+    assert accel.calls
+    first = accel.calls[0]
+    assert first["project_name"] == "demo-project"
+    assert first["init_kwargs"]["wandb"]["name"] == "demo-run"
+
+
+def test_init_trackers_falls_back_without_init_kwargs(caplog: pytest.LogCaptureFixture) -> None:
+    class _LegacyAccelerator:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def init_trackers(self, *, project_name: str, config: dict[str, Any]) -> None:
+            self.calls.append({"project_name": project_name, "config": dict(config)})
+
+    accel = _LegacyAccelerator()
+    with caplog.at_level(logging.WARNING):
+        _init_trackers(
+            accelerator=accel,
+            project_name="demo-project",
+            tracker_cfg={"a": 1},
+            report_to="wandb",
+            run_name="demo-run",
+        )
+
+    assert accel.calls
+    assert "rejected init_kwargs" in caplog.text
 
 
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(

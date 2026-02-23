@@ -183,20 +183,21 @@ def _init_trackers(
     if str(report_to).strip().lower() == "wandb":
         init_kwargs = {"wandb": {"name": run_name}}
 
-    supports_init_kwargs = False
-    with suppress(Exception):
-        supports_init_kwargs = "init_kwargs" in inspect.signature(accelerator.init_trackers).parameters
+    if not init_kwargs:
+        accelerator.init_trackers(**call_kwargs)
+        return
 
-    if init_kwargs and supports_init_kwargs:
-        call_kwargs["init_kwargs"] = init_kwargs
-
-    accelerator.init_trackers(**call_kwargs)
-
-    if init_kwargs and not supports_init_kwargs:
+    try:
+        accelerator.init_trackers(**call_kwargs, init_kwargs=init_kwargs)
+    except TypeError as err:
+        # Some accelerate builds do not accept init_kwargs; retry without it.
+        if "init_kwargs" not in str(err):
+            raise
         logger.warning(
-            "Accelerate init_trackers() does not expose init_kwargs; W&B run name "
+            "Accelerate init_trackers() rejected init_kwargs; W&B run name "
             "cannot be set explicitly on this runtime."
         )
+        accelerator.init_trackers(**call_kwargs)
 
 
 def _validate_run_metadata(path: Path) -> None:
