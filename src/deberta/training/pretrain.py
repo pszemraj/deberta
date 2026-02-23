@@ -158,6 +158,31 @@ def _resolve_output_dir(
     return Path("runs") / project / f"{stamp}_{run_name}"
 
 
+def _unwrap_model_for_runtime(accelerator: Any, model: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap accelerate-wrapped models while tolerating torch.compile internals.
+
+    Some accelerate versions can raise when ``unwrap_model(..., keep_torch_compile=True)``
+    encounters partially compiled module trees. Prefer ``keep_torch_compile=False``
+    when supported.
+
+    :param Any accelerator: Accelerator runtime.
+    :param torch.nn.Module model: Possibly wrapped model.
+    :return torch.nn.Module: Unwrapped model.
+    """
+
+    unwrap = accelerator.unwrap_model
+    with suppress(Exception):
+        return unwrap(model, keep_torch_compile=False)
+    with suppress(Exception):
+        return unwrap(model)
+
+    # Last-resort fallback for wrapper stacks that expose `.module`.
+    candidate = model
+    while hasattr(candidate, "module"):
+        candidate = candidate.module
+    return candidate
+
+
 def _init_trackers(
     *,
     accelerator: Any,
@@ -988,7 +1013,7 @@ def _export_discriminator_hf(
         DebertaRoPEModel = None  # type: ignore
 
     try:
-        unwrapped = accelerator.unwrap_model(model)
+        unwrapped = _unwrap_model_for_runtime(accelerator, model)
 
         # Try to gather state dicts via accelerator (preferred for distributed).
         disc_mod = getattr(unwrapped, "discriminator", None)
@@ -1232,7 +1257,7 @@ def run_pretraining(
             except Exception:
                 pass
 
-            unwrapped = accelerator.unwrap_model(model)
+            unwrapped = _unwrap_model_for_runtime(accelerator, model)
             # Compile only the hot paths.
             unwrapped.generator = torch.compile(unwrapped.generator, **compile_kwargs)  # type: ignore[attr-defined]
             unwrapped.discriminator = torch.compile(unwrapped.discriminator, **compile_kwargs)  # type: ignore[attr-defined]
@@ -1306,7 +1331,7 @@ def run_pretraining(
         train_iter = _cycle_dataloader(train_loader)
         ga_steps = int(train_cfg.gradient_accumulation_steps)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
-        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model = _unwrap_model_for_runtime(accelerator, model)
         # Boolean vocab mask used both by the RTD module and token-weighted GA.
         # Keep a CPU copy for token counting to avoid per-microbatch GPU->CPU transfers
         # before `_move_batch_to_device` runs.
