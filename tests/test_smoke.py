@@ -989,7 +989,11 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
     logits[:, 3] = 17.0
 
     with torch.no_grad():
-        sampled = model._sample_generator_tokens(logits, sampling_temperature=1.0)
+        sampled = model._gumbel_sample(
+            logits,
+            temperature=1.0,
+            forbidden_vocab_mask=model._forbidden_sample_token_mask,
+        )
 
     for sid in (cfg.pad_token_id, cfg.cls_token_id, cfg.sep_token_id, cfg.mask_token_id):
         assert sid is not None
@@ -1551,11 +1555,16 @@ def test_pretrainer_disc_active_keeps_masked_positions_even_if_sampled_special(m
     labels = torch.full_like(input_ids, -100)
     labels[0, 1] = input_ids[0, 1]
 
-    def _force_special_sample(logits: torch.Tensor, sampling_temperature: float) -> torch.Tensor:
-        del logits, sampling_temperature
+    def _force_special_sample(
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        forbidden_vocab_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del logits, temperature, forbidden_vocab_mask
         return torch.tensor([int(cfg.cls_token_id)], dtype=torch.long)
 
-    monkeypatch.setattr(model, "_sample_generator_tokens", _force_special_sample)
+    monkeypatch.setattr(model, "_gumbel_sample", _force_special_sample)
 
     with torch.no_grad():
         out = model(

@@ -636,7 +636,7 @@ def _compute_disc_active_mask(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     attention_mask: torch.Tensor | None,
-    special_token_ids: tuple[int, ...],
+    special_token_mask: torch.Tensor | None,
     pad_token_id: int | None,
 ) -> torch.Tensor:
     """Compute discriminator-active token mask before model forward.
@@ -647,7 +647,7 @@ def _compute_disc_active_mask(
     :param torch.Tensor input_ids: Input token ids.
     :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
     :param torch.Tensor | None attention_mask: Optional attention mask.
-    :param tuple[int, ...] special_token_ids: Token ids excluded from discriminator loss.
+    :param torch.Tensor | None special_token_mask: Boolean vocab mask (V,) with True for special token ids.
     :param int | None pad_token_id: Padding token id.
     :return torch.Tensor: Boolean active-token mask.
     """
@@ -657,15 +657,18 @@ def _compute_disc_active_mask(
         pad_token_id=pad_token_id,
     )
 
-    if not special_token_ids:
+    if (
+        special_token_mask is None
+        or not isinstance(special_token_mask, torch.Tensor)
+        or special_token_mask.numel() == 0
+    ):
         return active
 
-    special = torch.isin(
-        input_ids,
-        torch.tensor(
-            sorted(int(sid) for sid in special_token_ids), device=input_ids.device, dtype=input_ids.dtype
-        ),
-    )
+    # Indexing a boolean vocab mask is substantially cheaper (and compile-friendly)
+    # than per-step torch.isin + device tensor construction.
+    if special_token_mask.device != input_ids.device:
+        special_token_mask = special_token_mask.to(device=input_ids.device)
+    special = special_token_mask[input_ids]
 
     # Masked positions are replaced before discriminator scoring and should not
     # be excluded solely because their pre-corruption token may be special.
@@ -677,13 +680,13 @@ def _compute_disc_active_mask(
 def _count_rtd_tokens_for_batch(
     batch: dict[str, torch.Tensor],
     *,
-    special_token_ids: tuple[int, ...],
+    special_token_mask: torch.Tensor | None,
     pad_token_id: int | None,
 ) -> tuple[float, float]:
     """Return generator/discriminator active-token counts for one microbatch.
 
     :param dict[str, torch.Tensor] batch: Microbatch tensors.
-    :param tuple[int, ...] special_token_ids: Token ids excluded from discriminator loss.
+    :param torch.Tensor | None special_token_mask: Boolean vocab mask (V,) with True for special token ids.
     :param int | None pad_token_id: Padding token id.
     :return tuple[float, float]: (generator_count, discriminator_count).
     """
@@ -693,7 +696,7 @@ def _count_rtd_tokens_for_batch(
         input_ids=batch["input_ids"],
         labels=labels,
         attention_mask=batch.get("attention_mask"),
-        special_token_ids=special_token_ids,
+        special_token_mask=special_token_mask,
         pad_token_id=pad_token_id,
     )
     disc_count = float(disc_active.sum().item())
@@ -1208,22 +1211,36 @@ def run_pretraining(
     # Prepare (wrap for DDP/FSDP etc)
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
 
-    # Torch compile (best-effort)
+    # torch.compile (best-effort)
+    #
+    # Compiling the *entire* RTD wrapper (generator sampling + corruption + discriminator)
+    # is high-risk: it contains dynamic indexing, RNG sampling, and Python-side caching.
+    # Those patterns are frequent sources of graph breaks, cudagraph partitioning, and
+    # (in some PyTorch builds) silent numerical miscompiles.
+    #
+    # The stable + fast approach is to compile only the heavy transformer backbones.
     compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
     if compile_enabled:
         try:
             compile_kwargs: dict[str, Any] = {"mode": compile_mode}
-            # Prefer dynamic-shape compilation when available to reduce recompiles
-            # from small runtime shape changes (for example masked-token counts).
+            # Backbones run with fixed sequence length (packing) and stable shapes.
+            # Prefer static compilation for better perf and fewer guards.
             try:
                 compile_params = inspect.signature(torch.compile).parameters  # type: ignore[attr-defined]
                 if "dynamic" in compile_params:
-                    compile_kwargs["dynamic"] = True
+                    compile_kwargs["dynamic"] = False
             except Exception:
                 pass
-            model = torch.compile(model, **compile_kwargs)  # type: ignore[attr-defined]
+
+            unwrapped = accelerator.unwrap_model(model)
+            # Compile only the hot paths.
+            unwrapped.generator = torch.compile(unwrapped.generator, **compile_kwargs)  # type: ignore[attr-defined]
+            unwrapped.discriminator = torch.compile(unwrapped.discriminator, **compile_kwargs)  # type: ignore[attr-defined]
+
             logger.info(
-                "Enabled torch.compile(" + ", ".join(f"{k}={v}" for k, v in compile_kwargs.items()) + ")"
+                "Enabled torch.compile for generator/discriminator backbones ("
+                + ", ".join(f"{k}={v}" for k, v in compile_kwargs.items())
+                + ")"
             )
         except Exception as e:
             logger.warning(f"torch.compile failed, continuing without: {e}")
@@ -1290,9 +1307,17 @@ def run_pretraining(
         ga_steps = int(train_cfg.gradient_accumulation_steps)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
         unwrapped_model = accelerator.unwrap_model(model)
-        special_token_ids = tuple(
-            sorted(int(sid) for sid in getattr(unwrapped_model, "_forbidden_sample_token_ids", set()))
-        )
+        # Boolean vocab mask used both by the RTD module and token-weighted GA.
+        # Keep a CPU copy for token counting to avoid per-microbatch GPU->CPU transfers
+        # before `_move_batch_to_device` runs.
+        special_token_mask = getattr(unwrapped_model, "_forbidden_sample_token_mask", None)
+        special_token_mask_cpu: torch.Tensor | None
+        if isinstance(special_token_mask, torch.Tensor):
+            special_token_mask_cpu = special_token_mask.detach()
+            if special_token_mask_cpu.device.type != "cpu":
+                special_token_mask_cpu = special_token_mask_cpu.to(device="cpu")
+        else:
+            special_token_mask_cpu = None
         disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
         if disc_pad_token_id is not None:
             disc_pad_token_id = int(disc_pad_token_id)
@@ -1316,7 +1341,7 @@ def run_pretraining(
                 if token_weighted_ga:
                     gen_count, disc_count = _count_rtd_tokens_for_batch(
                         batch,
-                        special_token_ids=special_token_ids,
+                        special_token_mask=special_token_mask_cpu,
                         pad_token_id=disc_pad_token_id,
                     )
                     local_gen_tokens += gen_count
