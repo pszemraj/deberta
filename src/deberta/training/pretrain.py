@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
@@ -45,6 +46,8 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_genera
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_COMPILE_SCOPE_ENV = "DEBERTA_COMPILE_SCOPE"
+_COMPILE_BACKEND_ENV = "DEBERTA_COMPILE_BACKEND"
 
 
 def _json_dump(obj: Any, path: Path) -> None:
@@ -638,6 +641,133 @@ def _should_force_legacy_tf32_for_compile(*, torch_compile: bool, compile_mode: 
     # On some PyTorch builds, max-autotune paths still query legacy allow_tf32
     # and can error if only the new fp32_precision API has been configured.
     return compile_mode.startswith("max-autotune")
+
+
+def _normalize_compile_scope(raw: str | None) -> str:
+    """Normalize internal compile-scope override.
+
+    The public config remains unchanged. This is an internal env override used for
+    diagnostics and temporary mitigation while full-backbone inductor stability is
+    being validated.
+
+    :param str | None raw: Raw scope string from environment.
+    :raises ValueError: If value is unsupported.
+    :return str: Canonical compile scope.
+    """
+    if raw is None:
+        return "auto"
+    value = str(raw).strip().lower().replace("-", "_")
+    if not value:
+        return "auto"
+    aliases = {
+        "both": "backbones",
+        "backbone": "backbones",
+        "full": "backbones",
+        "encoder": "encoder_only",
+        "encoders": "encoder_only",
+        "gen_encoder": "gen_encoder_only",
+        "generator_encoder": "gen_encoder_only",
+        "disc_encoder": "disc_encoder_only",
+        "discriminator_encoder": "disc_encoder_only",
+    }
+    canonical = aliases.get(value, value)
+    allowed = {"auto", "backbones", "encoder_only", "gen_encoder_only", "disc_encoder_only"}
+    if canonical not in allowed:
+        raise ValueError(f"{_COMPILE_SCOPE_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
+    return canonical
+
+
+def _normalize_compile_backend(raw: str | None) -> str:
+    """Normalize internal compile backend override.
+
+    :param str | None raw: Raw backend string from environment.
+    :raises ValueError: If backend is unsupported.
+    :return str: Canonical backend name.
+    """
+    if raw is None:
+        return "inductor"
+    value = str(raw).strip().lower()
+    if not value:
+        return "inductor"
+    aliases = {
+        "aot-eager": "aot_eager",
+    }
+    canonical = aliases.get(value, value)
+    allowed = {"inductor", "aot_eager"}
+    if canonical not in allowed:
+        raise ValueError(f"{_COMPILE_BACKEND_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
+    return canonical
+
+
+def _resolve_compile_scope(
+    *,
+    requested_scope: str,
+    model_cfg: ModelConfig,
+    compile_mode: str,
+    compile_backend: str,
+) -> tuple[str, str | None]:
+    """Resolve effective compile scope with default-mode stability fallback.
+
+    :param str requested_scope: Requested canonical compile scope.
+    :param ModelConfig model_cfg: Model configuration.
+    :param str compile_mode: Canonical torch.compile mode.
+    :param str compile_backend: Compile backend name.
+    :return tuple[str, str | None]: Effective scope and optional reason message.
+    """
+    if requested_scope != "auto":
+        return requested_scope, None
+
+    backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
+    if backbone_type == "hf_deberta_v2" and compile_mode == "default" and compile_backend == "inductor":
+        return (
+            "encoder_only",
+            "auto scope selected encoder-only fallback for hf_deberta_v2 (default+inductor)",
+        )
+    return "backbones", None
+
+
+def _compile_backbones_for_scope(
+    *,
+    unwrapped_model: torch.nn.Module,
+    compile_scope: str,
+    compile_kwargs: dict[str, Any],
+) -> list[str]:
+    """Compile selected generator/discriminator submodules for a requested scope.
+
+    :param torch.nn.Module unwrapped_model: Unwrapped RTD pretrainer model.
+    :param str compile_scope: Effective compile scope.
+    :param dict[str, Any] compile_kwargs: Keyword arguments passed to ``torch.compile``.
+    :raises RuntimeError: If required backbone submodules are missing.
+    :return list[str]: Human-readable list of compiled targets.
+    """
+    generator = getattr(unwrapped_model, "generator", None)
+    discriminator = getattr(unwrapped_model, "discriminator", None)
+    if not isinstance(generator, torch.nn.Module) or not isinstance(discriminator, torch.nn.Module):
+        raise RuntimeError("RTD model must expose generator and discriminator modules for compilation.")
+
+    compiled_targets: list[str] = []
+    if compile_scope == "backbones":
+        unwrapped_model.generator = torch.compile(generator, **compile_kwargs)  # type: ignore[attr-defined]
+        unwrapped_model.discriminator = torch.compile(discriminator, **compile_kwargs)  # type: ignore[attr-defined]
+        return ["generator", "discriminator"]
+
+    if compile_scope in {"encoder_only", "gen_encoder_only"}:
+        gen_encoder = getattr(generator, "encoder", None)
+        if not isinstance(gen_encoder, torch.nn.Module):
+            raise RuntimeError("generator.encoder is required for encoder-only compile scope.")
+        generator.encoder = torch.compile(gen_encoder, **compile_kwargs)  # type: ignore[attr-defined]
+        compiled_targets.append("generator.encoder")
+
+    if compile_scope in {"encoder_only", "disc_encoder_only"}:
+        disc_encoder = getattr(discriminator, "encoder", None)
+        if not isinstance(disc_encoder, torch.nn.Module):
+            raise RuntimeError("discriminator.encoder is required for encoder-only compile scope.")
+        discriminator.encoder = torch.compile(disc_encoder, **compile_kwargs)  # type: ignore[attr-defined]
+        compiled_targets.append("discriminator.encoder")
+
+    if not compiled_targets:
+        raise ValueError(f"Unsupported compile scope: {compile_scope}")
+    return compiled_targets
 
 
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
@@ -1410,7 +1540,18 @@ def run_pretraining(
     compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
     if compile_enabled:
         try:
-            compile_kwargs: dict[str, Any] = {"mode": compile_mode}
+            compile_scope_requested = _normalize_compile_scope(os.environ.get(_COMPILE_SCOPE_ENV))
+            compile_backend = _normalize_compile_backend(os.environ.get(_COMPILE_BACKEND_ENV))
+            compile_scope, scope_reason = _resolve_compile_scope(
+                requested_scope=compile_scope_requested,
+                model_cfg=model_cfg,
+                compile_mode=compile_mode,
+                compile_backend=compile_backend,
+            )
+            if scope_reason:
+                logger.warning(scope_reason)
+
+            compile_kwargs: dict[str, Any] = {"mode": compile_mode, "backend": compile_backend}
             # Backbones run with fixed sequence length (packing) and stable shapes.
             # Prefer static compilation for better perf and fewer guards.
             try:
@@ -1421,14 +1562,18 @@ def run_pretraining(
                 pass
 
             unwrapped = _unwrap_model_for_runtime(accelerator, model)
-            # Compile only the hot paths.
-            unwrapped.generator = torch.compile(unwrapped.generator, **compile_kwargs)  # type: ignore[attr-defined]
-            unwrapped.discriminator = torch.compile(unwrapped.discriminator, **compile_kwargs)  # type: ignore[attr-defined]
+            compiled_targets = _compile_backbones_for_scope(
+                unwrapped_model=unwrapped,
+                compile_scope=compile_scope,
+                compile_kwargs=compile_kwargs,
+            )
 
             logger.info(
-                "Enabled torch.compile for generator/discriminator backbones ("
-                + ", ".join(f"{k}={v}" for k, v in compile_kwargs.items())
-                + ")"
+                "Enabled torch.compile for %s (scope=%s, requested_scope=%s, %s)",
+                ",".join(compiled_targets),
+                compile_scope,
+                compile_scope_requested,
+                ", ".join(f"{k}={v}" for k, v in compile_kwargs.items()),
             )
         except Exception as e:
             logger.warning(f"torch.compile failed, continuing without: {e}")

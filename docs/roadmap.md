@@ -23,7 +23,7 @@ For implemented behavior, use the concept docs:
 
 ## Runtime/Compile
 
-- track and document mode/backend-specific full-backbone compile stability for `hf_deberta_v2`, including `inductor` vs `aot_eager` parity deltas and any required temporary boundary fallbacks
+- upstream a minimal reproducible `hf_deberta_v2` default-mode inductor training-drift case (with `aot_eager` control) and track removal of the temporary auto encoder-only fallback once full-backbone stability is recovered
 
 ## Model Perf
 

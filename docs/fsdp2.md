@@ -43,13 +43,19 @@ Enable with `train.torch_compile=true` and `train.torch_compile_mode` in `defaul
 
 If compile fails at runtime, training logs a warning and continues without compile.
 
-Compile scope is intentionally limited to the transformer backbones:
+RTD wrapper glue (sampling/corruption/label construction) remains eager by design.
 
-- `generator` backbone is compiled
-- `discriminator` backbone is compiled
-- RTD wrapper glue (sampling/corruption/label construction) remains eager
+Default compile scope is resolved internally from `DEBERTA_COMPILE_SCOPE=auto`:
 
-This avoids compiling dynamic RTD glue patterns (RNG sampling, dynamic index paths, and corruption bookkeeping) while preserving most compile speedups on the dense encoder FLOPs.
+- baseline: compile both `generator` and `discriminator` backbones
+- temporary default-mode mitigation: for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles encoder stacks only (`generator.encoder`, `discriminator.encoder`)
+
+This preserves compile on the dominant FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa backbone compile.
+
+Internal debug overrides (no public config change):
+
+- `DEBERTA_COMPILE_SCOPE=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only`
+- `DEBERTA_COMPILE_BACKEND=inductor|aot_eager`
 
 ### Compile Parity Protocol
 

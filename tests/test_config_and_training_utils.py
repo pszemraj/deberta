@@ -44,8 +44,11 @@ from deberta.training.pretrain import (
     _flush_loggers,
     _init_trackers,
     _load_checkpoint_data_progress,
+    _normalize_compile_backend,
+    _normalize_compile_scope,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
+    _resolve_compile_scope,
     _resolve_output_dir,
     _resolve_resume_checkpoint,
     _save_checkpoint_data_progress,
@@ -700,9 +703,10 @@ def test_run_pretraining_compiles_only_generator_and_discriminator(
         module: torch.nn.Module,
         *,
         mode: str = "default",
+        backend: str = "inductor",
         dynamic: bool | None = None,
     ) -> torch.nn.Module:
-        compile_calls.append((module, {"mode": str(mode), "dynamic": dynamic}))
+        compile_calls.append((module, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
         return module
 
     monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
@@ -763,6 +767,8 @@ def test_run_pretraining_compiles_only_generator_and_discriminator(
     assert compile_calls[1][0] is instance.discriminator
     assert compile_calls[0][1]["mode"] == "default"
     assert compile_calls[1][1]["mode"] == "default"
+    assert compile_calls[0][1]["backend"] == "inductor"
+    assert compile_calls[1][1]["backend"] == "inductor"
     assert compile_calls[0][1]["dynamic"] is False
     assert compile_calls[1][1]["dynamic"] is False
 
@@ -1356,6 +1362,67 @@ def test_force_legacy_tf32_for_compile_modes():
         _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="max-autotune-no-cudagraphs")
         is True
     )
+
+
+def test_normalize_compile_scope_accepts_aliases_and_rejects_invalid():
+    assert _normalize_compile_scope(None) == "auto"
+    assert _normalize_compile_scope("") == "auto"
+    assert _normalize_compile_scope("backbone") == "backbones"
+    assert _normalize_compile_scope("full") == "backbones"
+    assert _normalize_compile_scope("encoder") == "encoder_only"
+    assert _normalize_compile_scope("generator_encoder") == "gen_encoder_only"
+    assert _normalize_compile_scope("disc-encoder") == "disc_encoder_only"
+
+    with pytest.raises(ValueError, match="DEBERTA_COMPILE_SCOPE must be one of"):
+        _normalize_compile_scope("all")
+
+
+def test_normalize_compile_backend_accepts_aliases_and_rejects_invalid():
+    assert _normalize_compile_backend(None) == "inductor"
+    assert _normalize_compile_backend("") == "inductor"
+    assert _normalize_compile_backend("inductor") == "inductor"
+    assert _normalize_compile_backend("aot-eager") == "aot_eager"
+
+    with pytest.raises(ValueError, match="DEBERTA_COMPILE_BACKEND must be one of"):
+        _normalize_compile_backend("xla")
+
+
+def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
+    scope, reason = _resolve_compile_scope(
+        requested_scope="auto",
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        compile_mode="default",
+        compile_backend="inductor",
+    )
+    assert scope == "encoder_only"
+    assert reason is not None
+
+    scope, reason = _resolve_compile_scope(
+        requested_scope="auto",
+        model_cfg=ModelConfig(backbone_type="rope"),
+        compile_mode="default",
+        compile_backend="inductor",
+    )
+    assert scope == "backbones"
+    assert reason is None
+
+    scope, reason = _resolve_compile_scope(
+        requested_scope="auto",
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        compile_mode="default",
+        compile_backend="aot_eager",
+    )
+    assert scope == "backbones"
+    assert reason is None
+
+    scope, reason = _resolve_compile_scope(
+        requested_scope="backbones",
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        compile_mode="default",
+        compile_backend="inductor",
+    )
+    assert scope == "backbones"
+    assert reason is None
 
 
 def test_normalize_sdpa_kernel_accepts_aliases_and_rejects_invalid():
