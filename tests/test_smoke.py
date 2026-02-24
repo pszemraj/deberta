@@ -1185,22 +1185,22 @@ def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_
         )
 
 
-def test_tied_embedding_tracks_replaced_base_module_weight():
-    from deberta.modeling.rtd import _TiedEmbedding
+def test_synced_buffer_embedding_tracks_sync_updates():
+    from deberta.modeling.rtd import _SyncedBufferEmbedding
 
-    base = torch.nn.Embedding(16, 8, padding_idx=0)
-    tied = _TiedEmbedding(
-        base_embedding_module=base,
+    init_weight = torch.randn((16, 8), dtype=torch.float32)
+    tied = _SyncedBufferEmbedding(
+        init_weight=init_weight,
         padding_idx=0,
-        detach_base=False,
         add_bias=False,
+        persistent_base=False,
     )
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
 
     with torch.no_grad():
         out_a = tied(input_ids)
-        new_weight = torch.randn_like(base.weight)
-        base.weight = torch.nn.Parameter(new_weight)
+        new_weight = torch.randn_like(init_weight)
+        tied.sync_from(new_weight)
         out_b = tied(input_ids)
 
     assert not torch.allclose(out_a, out_b)
@@ -1208,21 +1208,21 @@ def test_tied_embedding_tracks_replaced_base_module_weight():
     torch.testing.assert_close(out_b, expected, rtol=0.0, atol=0.0)
 
 
-def test_tied_embedding_gdes_bias_matches_base_weight_dtype():
-    from deberta.modeling.rtd import _TiedEmbedding
+def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
+    from deberta.modeling.rtd import _SyncedBufferEmbedding
 
-    base = torch.nn.Embedding(16, 8, padding_idx=0).to(dtype=torch.bfloat16)
-    tied = _TiedEmbedding(
-        base_embedding_module=base,
+    init_weight = torch.randn((16, 8), dtype=torch.bfloat16)
+    tied = _SyncedBufferEmbedding(
+        init_weight=init_weight,
         padding_idx=0,
-        detach_base=True,
         add_bias=True,
+        persistent_base=False,
     )
     assert tied.bias is not None
-    assert tied.bias.dtype == base.weight.dtype
+    assert tied.bias.dtype == init_weight.dtype
 
 
-def test_pretrainer_raises_if_tied_embeddings_become_stale_after_model_surgery():
+def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
     import pytest
 
     pytest.importorskip("transformers")
@@ -1250,17 +1250,23 @@ def test_pretrainer_raises_if_tied_embeddings_become_stale_after_model_surgery()
         gen_config=cfg,
         embedding_sharing="es",
     )
+    shared_weight = model.discriminator.embeddings.word_embeddings.weight
+    assert shared_weight is model.generator.embeddings.word_embeddings.weight
+
     model.generator.embeddings.word_embeddings = torch.nn.Embedding(
         cfg.vocab_size,
         cfg.hidden_size,
         padding_idx=cfg.pad_token_id,
     )
+    # ES aliasing is resolved at init-time; replacing modules post-init does not auto-repatch.
+    assert shared_weight is model.discriminator.embeddings.word_embeddings.weight
+    assert shared_weight is not model.generator.embeddings.word_embeddings.weight
 
     input_ids = torch.tensor([[1, 7, 8, 2]], dtype=torch.long)
     labels = torch.full_like(input_ids, -100)
     labels[0, 1] = input_ids[0, 1]
 
-    with pytest.raises(RuntimeError, match="stale tied embeddings"):
+    with torch.no_grad():
         _ = model(
             input_ids=input_ids,
             attention_mask=torch.ones_like(input_ids),

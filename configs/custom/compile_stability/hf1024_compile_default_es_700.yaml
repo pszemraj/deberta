@@ -1,0 +1,59 @@
+# Compile-debug sweep config: HF DeBERTa-v3 RTD, 1024 ctx, compile mode=default.
+model:
+  tokenizer_name_or_path: BEE-spoke-data/wordpiece-tokenizer-32k-en_code-msp
+  backbone_type: hf_deberta_v2
+  from_scratch: true
+  discriminator_model_name_or_path: microsoft/deberta-v3-base
+  discriminator_config_name_or_path: configs/custom/hf_deberta_v3_base_1024_config.json
+  embedding_sharing: es
+  gradient_checkpointing: false
+
+data:
+  dataset_name: EleutherAI/SmolLM2-1.7B-stage-4-100B
+  dataset_config_name: default
+  train_split: train
+  streaming: true
+  pack_sequences: true
+  block_cross_document_attention: false
+  text_column_name: text
+  max_seq_length: 1024
+  shuffle_buffer_size: 10000
+
+train:
+  output_dir: runs/deberta-compile-stability/hf1024/compile-default-es-700
+  overwrite_output_dir: true
+  project_name: deberta-compile-stability
+  run_name: hf1024-compile-default-es-700
+  max_steps: 700
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 16
+  token_weighted_gradient_accumulation: true
+
+  learning_rate: 5e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  lr_scheduler_type: linear
+
+  mlm_probability: 0.15
+  mlm_max_ngram: 3
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  sampling_temperature: 1.0
+
+  gen_loss_weight: 1.0
+  disc_loss_weight: 50.0
+  decoupled_loss_scaling: false
+
+  logging_steps: 25
+  save_steps: 1000
+  save_total_limit: 5
+
+  report_to: wandb
+  mixed_precision: bf16
+
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  torch_compile: true
+  torch_compile_mode: default
+  tf32: true
+  sdpa_kernel: auto

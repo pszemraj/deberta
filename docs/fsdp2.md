@@ -51,6 +51,25 @@ Compile scope is intentionally limited to the transformer backbones:
 
 This avoids compiling dynamic RTD glue patterns (RNG sampling, dynamic index paths, and corruption bookkeeping) while preserving most compile speedups on the dense encoder FLOPs.
 
+### Compile Parity Protocol
+
+Use `scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the same weights, batch, and RNG state.
+
+- default gate: `--eval` mode (deterministic parity threshold is enforced)
+- optional diagnostic: `--train` mode (informational deltas only)
+- compile bisect scopes: `--scope gen|disc|both|matrix`
+- backend isolation: `--backend inductor|aot_eager`
+
+### Non-Finite Fail-Fast Diagnostics
+
+Training now fails fast on first non-finite scalar/gradient instead of silently continuing.
+
+- checks run before backward (`gen_loss_raw`, `disc_loss_raw`, forward/backward scalar objectives)
+- checks run before optimizer step (global gradient norm)
+- when triggered, a compact debug artifact is written to:
+  - `<output_dir>/debug/nonfinite_step_<STEP>_<TAG>.json`
+  - includes step/lr, compile mode, embedding sharing mode, scalar snapshots, and compact RNG state heads
+
 ## Interruption and Crash Handling
 
 `deberta train` now uses a crash-safe shutdown path:

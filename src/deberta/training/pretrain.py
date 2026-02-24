@@ -6,6 +6,7 @@ import gzip
 import inspect
 import json
 import logging
+import math
 import re
 import shutil
 import time
@@ -466,6 +467,163 @@ def _maybe_cudagraph_mark_step_begin() -> None:
     except Exception:
         # Best-effort: keep training running if backend API shape changes.
         pass
+
+
+def _safe_float_for_json(value: float | int | None) -> float | str | None:
+    """Convert numeric values into JSON-stable scalars.
+
+    :param float | int | None value: Numeric value.
+    :return float | str | None: Finite float, string marker for non-finite, or None.
+    """
+    if value is None:
+        return None
+    out = float(value)
+    if math.isfinite(out):
+        return out
+    if math.isnan(out):
+        return "nan"
+    if out > 0:
+        return "inf"
+    return "-inf"
+
+
+def _tensor_scalar_for_debug(tensor: torch.Tensor | None) -> float | str | None:
+    """Return a compact scalar summary for debug artifacts.
+
+    :param torch.Tensor | None tensor: Tensor to summarize.
+    :return float | str | None: Scalar summary.
+    """
+    if tensor is None:
+        return None
+    with suppress(Exception):
+        return _safe_float_for_json(float(tensor.detach().float().mean().item()))
+    return None
+
+
+def _compact_rng_state_snapshot() -> dict[str, Any]:
+    """Capture compact CPU/CUDA RNG state heads for diagnostics.
+
+    :return dict[str, Any]: Compact RNG metadata.
+    """
+    cpu_state = torch.get_rng_state()
+    payload: dict[str, Any] = {
+        "cpu_len": int(cpu_state.numel()),
+        "cpu_head": cpu_state[:16].tolist(),
+    }
+    if torch.cuda.is_available():
+        cuda_states = torch.cuda.get_rng_state_all()
+        payload["cuda"] = [
+            {
+                "device_index": idx,
+                "len": int(state.numel()),
+                "head": state[:16].tolist(),
+            }
+            for idx, state in enumerate(cuda_states)
+        ]
+    return payload
+
+
+def _global_grad_l2_norm(model: torch.nn.Module) -> float:
+    """Compute global gradient L2 norm over model parameters.
+
+    :param torch.nn.Module model: Model whose gradients are inspected.
+    :return float: Global gradient norm (can be non-finite).
+    """
+    sq_sum = 0.0
+    found = False
+    for param in model.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        found = True
+        g = grad.detach()
+        if g.is_sparse:
+            g = g.coalesce().values()
+        sq_sum += float(g.float().pow(2).sum().item())
+    if not found:
+        return 0.0
+    return float(sq_sum) ** 0.5
+
+
+def _scheduler_current_lr(scheduler: Any) -> float | None:
+    """Read current LR from a scheduler when supported.
+
+    :param Any scheduler: Scheduler-like object.
+    :return float | None: Current LR for the first param group, if available.
+    """
+    if not hasattr(scheduler, "get_last_lr"):
+        return None
+    with suppress(Exception):
+        values = scheduler.get_last_lr()
+        if isinstance(values, (list, tuple)) and len(values) > 0:
+            return float(values[0])
+    return None
+
+
+def _sync_discriminator_embeddings_if_available(model: torch.nn.Module) -> None:
+    """Sync discriminator embedding buffers if the model exposes the hook.
+
+    :param torch.nn.Module model: Unwrapped runtime model.
+    """
+    fn = getattr(model, "sync_discriminator_embeddings_from_generator", None)
+    if callable(fn):
+        with torch.no_grad():
+            fn()
+
+
+def _write_nonfinite_debug_artifact(
+    *,
+    output_dir: Path,
+    step: int,
+    micro_step_idx: int,
+    offending: str,
+    gen_loss_raw: torch.Tensor | None,
+    disc_loss_raw: torch.Tensor | None,
+    forward_loss: torch.Tensor | None,
+    backward_loss: torch.Tensor | None,
+    grad_norm: float | None,
+    lr: float | None,
+    compile_enabled: bool,
+    compile_mode: str,
+    embedding_sharing: str,
+) -> Path:
+    """Write a compact non-finite diagnostics artifact and return its path.
+
+    :param Path output_dir: Run output directory.
+    :param int step: Optimizer step index (1-based intent).
+    :param int micro_step_idx: Micro-step index within accumulation window.
+    :param str offending: Name of first offending tensor/stat.
+    :param torch.Tensor | None gen_loss_raw: Generator raw loss.
+    :param torch.Tensor | None disc_loss_raw: Discriminator raw loss.
+    :param torch.Tensor | None forward_loss: Forward scalar objective.
+    :param torch.Tensor | None backward_loss: Backward scalar objective.
+    :param float | None grad_norm: Global gradient norm.
+    :param float | None lr: Scheduler LR snapshot.
+    :param bool compile_enabled: Whether torch.compile is active.
+    :param str compile_mode: Compile mode string.
+    :param str embedding_sharing: Embedding sharing mode string.
+    :return Path: Written artifact path.
+    """
+    safe_offending = _RUN_LABEL_CLEAN_RE.sub("_", str(offending)).strip("._-") or "nonfinite"
+    path = output_dir / "debug" / f"nonfinite_step_{int(step)}_{safe_offending}.json"
+    payload = {
+        "created_at_utc": datetime.utcnow().isoformat() + "Z",
+        "step": int(step),
+        "micro_step_idx": int(micro_step_idx),
+        "offending": str(offending),
+        "compile_enabled": bool(compile_enabled),
+        "compile_mode": str(compile_mode),
+        "embedding_sharing": str(embedding_sharing),
+        "lr": _safe_float_for_json(lr),
+        "gen_loss_raw": _tensor_scalar_for_debug(gen_loss_raw),
+        "disc_loss_raw": _tensor_scalar_for_debug(disc_loss_raw),
+        "forward_loss": _tensor_scalar_for_debug(forward_loss),
+        "backward_loss": _tensor_scalar_for_debug(backward_loss),
+        "grad_norm": _safe_float_for_json(grad_norm),
+        "rng_state": _compact_rng_state_snapshot(),
+    }
+    _json_dump(payload, path)
+    return path
 
 
 def _should_force_legacy_tf32_for_compile(*, torch_compile: bool, compile_mode: str) -> bool:
@@ -1236,6 +1394,11 @@ def run_pretraining(
     # Prepare (wrap for DDP/FSDP etc)
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
 
+    # GDES embedding sharing uses non-persistent base buffers inside discriminator embeddings.
+    # Those buffers must be initialized/synced from generator weights before any compiled forward runs.
+    with suppress(Exception):
+        _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
+
     # torch.compile (best-effort)
     #
     # Compiling the *entire* RTD wrapper (generator sampling + corruption + discriminator)
@@ -1313,6 +1476,11 @@ def run_pretraining(
         if ckpt:
             logger.info(f"Resuming from checkpoint: {ckpt}")
             accelerator.load_state(ckpt)
+
+            # GDES base buffers are non-persistent and must be refreshed after loading a checkpoint.
+            with suppress(Exception):
+                _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
+
             global_step = _parse_checkpoint_step(ckpt)
             last_saved_step = global_step
             restored = _load_checkpoint_data_progress(Path(ckpt))
@@ -1437,10 +1605,65 @@ def run_pretraining(
                         ga_steps=ga_steps,
                         token_weighted_ga=token_weighted_ga,
                     )
+                    offending: str | None = None
+                    if not torch.isfinite(out.gen_loss_raw.detach()).all():
+                        offending = "gen_loss_raw"
+                    elif not torch.isfinite(out.disc_loss_raw.detach()).all():
+                        offending = "disc_loss_raw"
+                    elif not torch.isfinite(out.loss.detach()).all():
+                        offending = "forward_loss"
+                    elif not torch.isfinite(backward_loss.detach()).all():
+                        offending = "backward_loss"
+
+                    if offending is not None:
+                        lr_now = _scheduler_current_lr(lr_scheduler)
+                        debug_path = _write_nonfinite_debug_artifact(
+                            output_dir=output_dir,
+                            step=int(global_step + 1),
+                            micro_step_idx=int(step_idx),
+                            offending=offending,
+                            gen_loss_raw=out.gen_loss_raw,
+                            disc_loss_raw=out.disc_loss_raw,
+                            forward_loss=out.loss,
+                            backward_loss=backward_loss,
+                            grad_norm=None,
+                            lr=lr_now,
+                            compile_enabled=compile_enabled,
+                            compile_mode=compile_mode,
+                            embedding_sharing=str(model_cfg.embedding_sharing),
+                        )
+                        raise FloatingPointError(
+                            "Non-finite value detected before backward pass "
+                            f"(offending={offending}, step={int(global_step + 1)}, "
+                            f"micro_step={int(step_idx)}). Debug artifact: {debug_path}"
+                        )
                     accelerator.backward(backward_loss)
 
                 if is_sync_step:
                     did_sync_step = True
+                    grad_norm_for_check = _global_grad_l2_norm(model)
+                    if not math.isfinite(float(grad_norm_for_check)):
+                        lr_now = _scheduler_current_lr(lr_scheduler)
+                        debug_path = _write_nonfinite_debug_artifact(
+                            output_dir=output_dir,
+                            step=int(global_step + 1),
+                            micro_step_idx=int(step_idx),
+                            offending="grad_norm",
+                            gen_loss_raw=out.gen_loss_raw if out is not None else None,
+                            disc_loss_raw=out.disc_loss_raw if out is not None else None,
+                            forward_loss=out.loss if out is not None else None,
+                            backward_loss=None,
+                            grad_norm=float(grad_norm_for_check),
+                            lr=lr_now,
+                            compile_enabled=compile_enabled,
+                            compile_mode=compile_mode,
+                            embedding_sharing=str(model_cfg.embedding_sharing),
+                        )
+                        raise FloatingPointError(
+                            "Non-finite gradient norm detected before optimizer step "
+                            f"(step={int(global_step + 1)}). Debug artifact: {debug_path}"
+                        )
+
                     if _should_clip_gradients(
                         sync_gradients=True,
                         max_grad_norm=train_cfg.max_grad_norm,
@@ -1450,6 +1673,11 @@ def run_pretraining(
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # If embedding_sharing=gdes, the discriminator embedding base buffers must track the
+                    # generator embedding weights. Generator embeddings update only on optimizer steps,
+                    # so syncing here is sufficient (and avoids per-microbatch copies).
+                    _sync_discriminator_embeddings_if_available(unwrapped_model)
 
             if not did_sync_step:
                 raise RuntimeError("Accumulation window produced no synchronized optimization step.")

@@ -23,7 +23,7 @@ For implemented behavior, use the concept docs:
 
 ## Runtime/Compile
 
-- add selective compile-bisect tooling (for example generator-only vs discriminator-only vs both) with scripted parity checks to isolate compile-specific regressions quickly
+- track and document mode/backend-specific full-backbone compile stability for `hf_deberta_v2`, including `inductor` vs `aot_eager` parity deltas and any required temporary boundary fallbacks
 
 ## Model Perf
 

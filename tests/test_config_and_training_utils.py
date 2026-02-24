@@ -53,6 +53,7 @@ from deberta.training.pretrain import (
     _scale_loss_for_backward,
     _should_clip_gradients,
     _should_force_legacy_tf32_for_compile,
+    _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
 )
 
@@ -1192,6 +1193,25 @@ def test_should_clip_gradients_only_on_sync_steps():
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=0.0) is False
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=-1.0) is False
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=1.0) is True
+
+
+def test_sync_discriminator_embeddings_if_available_is_noop_without_hook():
+    model = torch.nn.Linear(2, 2)
+    _sync_discriminator_embeddings_if_available(model)
+
+
+def test_sync_discriminator_embeddings_if_available_calls_hook_once():
+    class _Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    model = _Model()
+    _sync_discriminator_embeddings_if_available(model)
+    assert model.calls == 1
 
 
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():
