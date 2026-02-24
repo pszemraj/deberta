@@ -1326,6 +1326,39 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
     assert capture.seen_attention_mask is None
 
 
+def test_native_hf_deberta_v2_forward_smoke():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    model = DebertaV2Model(cfg).eval()
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        out_2d = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        pair_mask = attention_mask[:, :, None] & attention_mask[:, None, :]
+        out_3d = model(input_ids=input_ids, attention_mask=pair_mask).last_hidden_state
+
+    assert out_2d.shape == (2, 8, 32)
+    torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
+
+
 def test_rope_model_accepts_positional_input_ids_call():
     import pytest
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from deberta.config import ModelConfig, validate_model_config
+from deberta.modeling.deberta_v2_native import DebertaV2Model
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 _SPECIAL_ID_ATTRS = (
@@ -618,11 +619,9 @@ def build_backbones(
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
-        from transformers import AutoModel
-
         if model_cfg.from_scratch:
-            disc = AutoModel.from_config(disc_config)
-            gen = AutoModel.from_config(gen_config)
+            disc = DebertaV2Model(disc_config)
+            gen = DebertaV2Model(gen_config)
             return disc, gen
 
         disc_src = resolved.discriminator.weight_source
@@ -631,7 +630,7 @@ def build_backbones(
             raise RuntimeError("Resolved pretrained HF weight source is missing.")
 
         try:
-            disc = AutoModel.from_pretrained(disc_src, config=disc_config)
+            disc = DebertaV2Model.from_pretrained(disc_src, config=disc_config)
         except Exception as e:
             raise RuntimeError(
                 "Failed to load discriminator HF backbone from "
@@ -639,7 +638,7 @@ def build_backbones(
             ) from e
 
         try:
-            gen = AutoModel.from_pretrained(gen_src, config=gen_config)
+            gen = DebertaV2Model.from_pretrained(gen_src, config=gen_config)
         except Exception as e:
             raise RuntimeError(
                 "Failed to load generator HF backbone from "

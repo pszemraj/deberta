@@ -71,9 +71,9 @@ class ModelConfig:
          disentangled position bias with RoPE (rotary embeddings) and uses RMSNorm with
          a Post-Norm or KEEL residual topology.
 
-      2) backbone_type="hf_deberta_v2": compatibility path that instantiates Hugging Face
-         DebertaV2Model backbones (DeBERTa v2/v3). This keeps the original disentangled
-         attention implementation, and does NOT apply RoPE/RMSNorm/KEEL changes.
+      2) backbone_type="hf_deberta_v2": compatibility path using this repo's native
+         DeBERTa-v2/v3-style encoder implementation (disentangled attention + LayerNorm),
+         with configs/weights sourced from HF checkpoints when requested.
 
     For RTD/ELECTRA pretraining, the discriminator config is the primary source; the
     generator config is either provided explicitly or derived from the discriminator.
@@ -89,7 +89,7 @@ class ModelConfig:
         metadata={
             "help": (
                 "Backbone implementation: 'rope' (recommended) or 'hf_deberta_v2' (HF DeBERTa compatibility mode). "
-                "RoPE/RMSNorm/KEEL only apply to 'rope'."
+                "RoPE/RMSNorm/KEEL only apply to 'rope'; hf_deberta_v2 uses the native DeBERTa-v2 stack."
             )
         },
     )

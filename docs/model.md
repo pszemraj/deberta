@@ -9,7 +9,7 @@ For data-path details, see [`docs/data.md`](data.md). For RTD objective/loss beh
 `model.backbone_type` supports:
 
 - `rope` (default): modernized encoder stack in this repo
-- `hf_deberta_v2`: Hugging Face DeBERTa v2/v3 compatibility path
+- `hf_deberta_v2`: native DeBERTa v2/v3-style backbone (HF-compatible config/weight path)
 
 ## Source Resolution Contract
 
@@ -130,7 +130,8 @@ recreate `DebertaV3RTDPretrainer` so sharing adapters are rebound consistently.
 
 ## HF Compatibility Mode Notes
 
-With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.
+With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 implementation.
+HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`) for compatibility.
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
 
