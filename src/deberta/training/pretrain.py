@@ -718,6 +718,9 @@ def _resolve_compile_scope(
         return requested_scope, None
 
     backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
+    # Empirically, full-backbone inductor compile on HF DeBERTa v2 defaults can drift
+    # during train-mode updates. Auto scope keeps compile on the dominant encoder FLOPs
+    # while leaving embedding modules eager (including GDES sync mutation points).
     if backbone_type == "hf_deberta_v2" and compile_mode == "default" and compile_backend == "inductor":
         return (
             "encoder_only",
