@@ -29,6 +29,13 @@ Runtime behavior:
 - if CUDA bf16 is unavailable or a tiny bf16 preflight matmul fails, training falls back to full precision (`no`)
 - `train.mixed_precision` accepts `bf16` or `no`
 
+## Run Directory and Tracker Naming
+
+Runtime defaults are config-driven:
+
+- if `train.output_dir` is unset, training auto-creates `runs/<project_name>/<timestamp>_<config_stem_or_run>`
+- if `train.report_to=wandb` and `train.run_name` is unset, run naming defaults to the resolved output directory basename
+
 ## TF32 Policy
 
 `train.tf32=true` by default.
@@ -56,7 +63,8 @@ Compile behavior is configured directly via train/model config:
 
 - `train.torch_compile_scope=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|ffn_only|gen_ffn_only|disc_ffn_only`
 - `train.torch_compile_backend=inductor|aot_eager`
-- `model.hf_attention_kernel=dynamic|cached_bmm` (native HF DeBERTa attention experiment path)
+
+Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
 
 ### Compile Parity Protocol
 
@@ -79,6 +87,14 @@ Training now fails fast on first non-finite scalar/gradient instead of silently 
 - when triggered, a compact debug artifact is written to:
   - `<output_dir>/debug/nonfinite_step_<STEP>_<TAG>.json`
   - includes step/lr, compile mode, embedding sharing mode, scalar snapshots, and compact RNG state heads
+
+## Training Metrics Logging
+
+Step logs and tracker metrics prioritize signal over mostly-constant counters.
+
+- primary scalar metrics: `loss`, `gen_loss`, `disc_loss`, `disc_acc`, `lr`
+- throughput/scale metrics: `input_tokens_per_sec`, `input_tokens_seen`
+- noisy low-information counters (for example per-step `gen_tok`/`disc_tok`) are intentionally excluded from periodic logs
 
 ## Interruption and Crash Handling
 

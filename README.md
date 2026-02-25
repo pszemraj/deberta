@@ -2,18 +2,6 @@
 
 A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
 
----
-
-- [Install](#install)
-- [CLI Entrypoints](#cli-entrypoints)
-- [Quickstart](#quickstart)
-- [Documentation](#documentation)
-- [Configs](#configs)
-- [Repo Layout](#repo-layout)
-- [Citations](#citations)
-
----
-
 ## Install
 
 Clone + editable install:
@@ -30,12 +18,6 @@ Optional extras:
 ```bash
 pip install -e '.[dev]'
 pip install -e '.[wandb]'
-```
-
-Direct install from GitHub:
-
-```bash
-pip install "git+https://github.com/pszemraj/deberta.git"
 ```
 
 ## CLI Entrypoints
@@ -57,17 +39,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
   deberta train configs/pretrain_rope_fineweb_edu.yaml
 ```
 
-Long-context presets:
-
-```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_fineweb_edu_2048.yaml
-```
-
-```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
-```
+Long-context and custom debug presets live under [`configs/`](configs/).
 
 Export from an FSDP2 checkpoint:
 
@@ -93,16 +65,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
 - Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
-- Ergonomic defaults: when `train.output_dir` is unset, training auto-creates `runs/<project_name>/<timestamp>_<config_stem_or_run>`.
-- W&B default run naming: when `train.report_to=wandb` and `train.run_name` is unset, the run name defaults to the resolved output directory basename.
-
-## Repo Layout
-
-- `src/deberta/` - package source
-- `src/deberta/training/pretrain.py` - training loop
-- `src/deberta/export_cli.py` - FSDP-aware exporter
-- `configs/` - training and accelerate configs
-- `docs/` - canonical docs by concept
+- Runtime defaults for output dir, tracker run naming, and compile behavior are documented in [`docs/fsdp2.md`](docs/fsdp2.md).
 
 ## Citations
 

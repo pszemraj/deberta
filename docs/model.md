@@ -2,7 +2,7 @@
 
 This document is the primary reference for model/backbone choices in this repo.
 
-For data-path details, see [`docs/data.md`](data.md). For RTD objective/loss behavior, see [`docs/objective.md`](objective.md). For distributed/runtime tuning, see [`docs/fsdp2.md`](fsdp2.md).
+For data-path details, see [`docs/data.md`](data.md). For RTD objective/loss behavior, see [`docs/objective.md`](objective.md). For distributed/runtime tuning (including compile scope resolution), see [`docs/fsdp2.md`](fsdp2.md).
 
 ## Backbone Modes
 
@@ -130,19 +130,22 @@ recreate `DebertaV3RTDPretrainer` so sharing adapters are rebound consistently.
 
 ## HF Compatibility Mode Notes
 
-With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 implementation.
+With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 implementation in
+[`src/deberta/modeling/deberta_v2_native.py`](../src/deberta/modeling/deberta_v2_native.py).
+Training does not instantiate `transformers.DebertaV2Model` directly.
+
 HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`) for compatibility.
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
 
 Packed 3D document-blocking masks are rope-only. The canonical pairwise-mask contract lives in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue); HF backbone runs must keep `data.block_cross_document_attention=false`.
 
-For `torch.compile` default mode with backend `inductor`, runtime auto-scope currently compiles FFN blocks only for native HF DeBERTa (`encoder.layer[*].intermediate/output`) and leaves attention/embeddings eager. Compile scope/backend are configured via `train.torch_compile_scope` and `train.torch_compile_backend`.
-
 Native HF attention kernel is configured via `model.hf_attention_kernel`:
 
 - `dynamic` (default)
 - `cached_bmm` (cached relative-position ids + bmm bias path)
+
+Compile runtime policy for this mode (for example, auto FFN-only fallback in default+inductor) is documented in [`docs/fsdp2.md#torchcompile`](fsdp2.md#torchcompile).
 
 Pretraining heads follow backbone norm style by config:
 
