@@ -1082,6 +1082,22 @@ def _count_rtd_tokens_for_batch(
     return gen_count, disc_count
 
 
+def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
+    """Return non-padding input-token count for one microbatch.
+
+    :param dict[str, torch.Tensor] batch: Microbatch mapping.
+    :return float: Count of active input tokens.
+    """
+    attention_mask = batch.get("attention_mask")
+    if isinstance(attention_mask, torch.Tensor):
+        return float(attention_mask.detach().sum().item())
+
+    input_ids = batch.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        return 0.0
+    return float(input_ids.numel())
+
+
 def _token_weighted_micro_objective(
     *,
     gen_loss: torch.Tensor,
@@ -1734,14 +1750,20 @@ def run_pretraining(
             for _ in range(consumed_micro_batches):
                 _ = next(train_iter)
 
+        local_input_tokens_seen = 0.0
+        local_input_tokens_since_log = 0.0
+        last_log_started_at = time.perf_counter()
+
         while global_step < int(train_cfg.max_steps):
             window: list[tuple[dict[str, torch.Tensor], float, float]] = []
+            local_window_input_tokens = 0.0
             local_gen_tokens = 0.0
             local_disc_tokens = 0.0
 
             for _ in range(ga_steps):
                 batch = next(train_iter)
                 consumed_micro_batches += 1
+                local_window_input_tokens += _count_input_tokens_for_batch(batch)
                 if token_weighted_ga:
                     gen_count, disc_count = _count_rtd_tokens_for_batch(
                         batch,
@@ -1753,6 +1775,9 @@ def run_pretraining(
                 else:
                     gen_count, disc_count = 0.0, 0.0
                 window.append((batch, gen_count, disc_count))
+
+            local_input_tokens_seen += local_window_input_tokens
+            local_input_tokens_since_log += local_window_input_tokens
 
             if token_weighted_ga:
                 local_totals = torch.tensor(
@@ -1916,6 +1941,23 @@ def run_pretraining(
                         x = x.detach().float().reshape(1)
                         return accelerator.gather(x).mean().item()
 
+                    def _sum_local_scalar(x: float) -> float:
+                        """Compute global sum for a local scalar across processes.
+
+                        :param float x: Local scalar value.
+                        :return float: Summed value across all ranks.
+                        """
+                        local = torch.tensor([x], device=accelerator.device, dtype=torch.float64)
+                        return float(accelerator.reduce(local, reduction="sum")[0].item())
+
+                    log_now = time.perf_counter()
+                    elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
+                    global_input_tokens_interval = _sum_local_scalar(local_input_tokens_since_log)
+                    global_input_tokens_seen = _sum_local_scalar(local_input_tokens_seen)
+                    input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
+                    local_input_tokens_since_log = 0.0
+                    last_log_started_at = log_now
+
                     lr = (
                         lr_scheduler.get_last_lr()[0]
                         if hasattr(lr_scheduler, "get_last_lr")
@@ -1928,8 +1970,8 @@ def run_pretraining(
                         "gen_loss": _mean(out.gen_loss),
                         "disc_loss": _mean(out.disc_loss),
                         "disc_acc": _mean(out.disc_accuracy),
-                        "gen_tokens": _mean(out.gen_token_count),
-                        "disc_tokens": _mean(out.disc_token_count),
+                        "input_tokens_per_sec": float(input_tokens_per_sec),
+                        "input_tokens_seen": float(global_input_tokens_seen),
                     }
 
                     if accelerator.is_main_process:
@@ -1942,8 +1984,8 @@ def run_pretraining(
                                     f"gen={metrics['gen_loss']:.4f}",
                                     f"disc={metrics['disc_loss']:.4f}",
                                     f"acc={metrics['disc_acc']:.4f}",
-                                    f"gen_tok={metrics['gen_tokens']:.1f}",
-                                    f"disc_tok={metrics['disc_tokens']:.1f}",
+                                    f"tok/s={metrics['input_tokens_per_sec']:.1f}",
+                                    f"tok_seen={metrics['input_tokens_seen']:.0f}",
                                 ]
                             )
                         )

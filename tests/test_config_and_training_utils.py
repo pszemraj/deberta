@@ -36,6 +36,7 @@ from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
     _build_optimizer,
     _build_training_collator,
+    _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
     _export_discriminator_hf,
@@ -1435,6 +1436,19 @@ def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discrimina
     )
     assert gen_count == pytest.approx(1.0)
     assert disc_count == pytest.approx(2.0)
+
+
+def test_count_input_tokens_for_batch_uses_attention_mask_when_available():
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 0, 0]], dtype=torch.long),
+    }
+    assert _count_input_tokens_for_batch(batch) == pytest.approx(2.0)
+
+
+def test_count_input_tokens_for_batch_falls_back_to_input_size():
+    batch = {"input_ids": torch.tensor([[10, 11, 12], [13, 14, 15]], dtype=torch.long)}
+    assert _count_input_tokens_for_batch(batch) == pytest.approx(6.0)
 
 
 def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
