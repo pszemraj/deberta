@@ -38,6 +38,7 @@ from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
+    _apply_nonfinite_recovery,
     _build_optimizer,
     _build_training_collator,
     _canonical_compile_state_key,
@@ -58,6 +59,7 @@ from deberta.training.pretrain import (
     _resolve_compile_scope,
     _resolve_output_dir,
     _resolve_resume_checkpoint,
+    _sanitize_nonfinite_gradients_,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
     _scale_loss_for_backward,
@@ -1154,8 +1156,7 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
                 disc_loss_raw=t,
             )
 
-    norm_values = iter([float("inf"), 0.5, 0.25])
-    monkeypatch.setattr(pretrain_mod, "_global_grad_l2_norm", lambda _model: float(next(norm_values)))
+    monkeypatch.setattr(pretrain_mod, "_global_grad_l2_norm", lambda _model: float("inf"))
     monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
     monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
@@ -1206,7 +1207,34 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
 
     with caplog.at_level(logging.WARNING):
         pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
-    assert "Skipping optimizer step due non-finite gradient norm" in caplog.text
+    assert "nonfinite_window_skipped=1" in caplog.text
+
+
+def test_sanitize_nonfinite_gradients_replaces_nan_inf_values() -> None:
+    class _Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+
+    model = _Tiny()
+    model.w.grad = torch.tensor([float("nan"), float("inf"), -float("inf")], dtype=torch.float32)
+    replaced = _sanitize_nonfinite_gradients_(model)
+    assert int(replaced) == 3
+    assert model.w.grad is not None
+    assert torch.isfinite(model.w.grad).all()
+    assert torch.equal(model.w.grad, torch.zeros_like(model.w.grad))
+
+
+def test_apply_nonfinite_recovery_scales_lrs_and_resets_state_on_interval() -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    optimizer.state[param] = {"step": 10}
+
+    lr, did_reset = _apply_nonfinite_recovery(optimizer=optimizer, skip_streak=4, lr_floor=1e-6)
+    assert did_reset is True
+    assert lr is not None
+    assert float(lr) <= 5e-4 + 1e-12
+    assert len(optimizer.state) == 0
 
 
 def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):

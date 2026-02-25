@@ -46,7 +46,9 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_genera
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_MAX_NONFINITE_SKIP_STREAK = 8
+_NONFINITE_LR_BACKOFF = 0.5
+_NONFINITE_LR_FLOOR_RATIO = 1e-3
+_NONFINITE_OPT_STATE_RESET_EVERY = 4
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -658,7 +660,8 @@ def _global_grad_l2_norm(model: torch.nn.Module) -> float:
         g = grad.detach()
         if g.is_sparse:
             g = g.coalesce().values()
-        sq_sum += float(g.float().pow(2).sum().item())
+        # Use fp64 accumulation to avoid false +inf norms from fp32 reduction overflow.
+        sq_sum += float(g.double().pow(2).sum().item())
     if not found:
         return 0.0
     return float(sq_sum) ** 0.5
@@ -681,6 +684,73 @@ def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> 
     return local_flag > 0
 
 
+@torch.no_grad()
+def _sanitize_nonfinite_gradients_(model: torch.nn.Module) -> int:
+    """Replace non-finite gradient entries in-place with zeros.
+
+    :param torch.nn.Module model: Model whose gradients are sanitized.
+    :return int: Number of non-finite gradient elements replaced.
+    """
+    replaced = 0
+    for param in model.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        if grad.is_sparse:
+            grad = grad.coalesce()
+            values = grad.values()
+            bad = ~torch.isfinite(values)
+            count = int(bad.sum().item())
+            if count > 0:
+                replaced += count
+                values.masked_fill_(bad, 0.0)
+                param.grad = grad
+            continue
+
+        bad = ~torch.isfinite(grad)
+        count = int(bad.sum().item())
+        if count <= 0:
+            continue
+        replaced += count
+        grad.masked_fill_(bad, 0.0)
+    return replaced
+
+
+def _apply_nonfinite_recovery(
+    *,
+    optimizer: torch.optim.Optimizer,
+    skip_streak: int,
+    lr_floor: float,
+) -> tuple[float | None, bool]:
+    """Apply lightweight recovery after a non-finite window.
+
+    :param torch.optim.Optimizer optimizer: Runtime optimizer.
+    :param int skip_streak: Current consecutive non-finite streak.
+    :param float lr_floor: Minimum LR floor for backoff.
+    :return tuple[float | None, bool]: (minimum group LR after recovery, optimizer_state_reset flag).
+    """
+    min_lr: float | None = None
+    for group in optimizer.param_groups:
+        curr = float(group.get("lr", 0.0))
+        if curr <= 0.0:
+            new_lr = curr
+        else:
+            new_lr = max(curr * float(_NONFINITE_LR_BACKOFF), float(lr_floor))
+        group["lr"] = new_lr
+        if min_lr is None:
+            min_lr = float(new_lr)
+        else:
+            min_lr = min(min_lr, float(new_lr))
+
+    reset_state = False
+    if int(skip_streak) % int(_NONFINITE_OPT_STATE_RESET_EVERY) == 0:
+        with suppress(Exception):
+            optimizer.state.clear()
+            reset_state = True
+
+    return min_lr, reset_state
+
+
 def _scheduler_current_lr(scheduler: Any) -> float | None:
     """Read current LR from a scheduler when supported.
 
@@ -694,6 +764,19 @@ def _scheduler_current_lr(scheduler: Any) -> float | None:
         if isinstance(values, (list, tuple)) and len(values) > 0:
             return float(values[0])
     return None
+
+
+def _optimizer_has_stepped(optimizer: torch.optim.Optimizer) -> bool:
+    """Best-effort check whether optimizer state has been initialized by a step.
+
+    :param torch.optim.Optimizer optimizer: Optimizer to inspect.
+    :return bool: True when optimizer has non-empty state.
+    """
+    with suppress(Exception):
+        state = getattr(optimizer, "state", None)
+        if state is not None:
+            return bool(len(state) > 0)
+    return False
 
 
 def _sync_discriminator_embeddings_if_available(model: torch.nn.Module) -> None:
@@ -1670,6 +1753,12 @@ def run_pretraining(
 
     # Prepare (wrap for DDP/FSDP etc)
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+    positive_group_lrs = [
+        float(group.get("lr", 0.0)) for group in optimizer.param_groups if float(group.get("lr", 0.0)) > 0.0
+    ]
+    nonfinite_lr_floor = (
+        max(min(positive_group_lrs) * float(_NONFINITE_LR_FLOOR_RATIO), 1e-8) if positive_group_lrs else 1e-8
+    )
 
     # GDES embedding sharing uses non-persistent base buffers inside discriminator embeddings.
     # Those buffers must be initialized/synced from generator weights before any compiled forward runs.
@@ -1742,6 +1831,26 @@ def run_pretraining(
     train_started_at = time.perf_counter()
     metrics_path = output_dir / "metrics.jsonl.gz"
     wandb_run: Any | None = None
+    max_tracker_step_logged = 0
+
+    def _log_tracker_metrics(row: dict[str, Any], *, step: int) -> int:
+        """Log tracker metrics with monotonic global step.
+
+        :param dict[str, Any] row: Metrics row.
+        :param int step: Requested step.
+        :return int: Effective step used for logging.
+        """
+        nonlocal max_tracker_step_logged
+        if train_cfg.report_to == "none":
+            return int(step)
+
+        effective_step = int(step)
+        if effective_step < int(max_tracker_step_logged):
+            effective_step = int(max_tracker_step_logged)
+        else:
+            max_tracker_step_logged = int(effective_step)
+        accelerator.log(row, step=effective_step)
+        return int(effective_step)
 
     try:
         # Trackers
@@ -1790,6 +1899,7 @@ def run_pretraining(
                     f"as global_step * grad_accum = {restored} micro-batches."
                 )
             consumed_micro_batches = int(restored)
+            max_tracker_step_logged = max(int(max_tracker_step_logged), int(global_step))
 
         # Training loop
         model.train()
@@ -1869,6 +1979,9 @@ def run_pretraining(
             loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             did_optimizer_step = False
             skipped_window_due_nonfinite = False
+            nonfinite_reason: str | None = None
+            nonfinite_debug_path: Path | None = None
+            nonfinite_sanitized_count = 0
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
@@ -1924,8 +2037,12 @@ def run_pretraining(
                         offending = "backward_loss"
 
                     if offending is not None:
+                        skipped_window_due_nonfinite = True
+                        nonfinite_skip_total += 1
+                        nonfinite_skip_streak += 1
+                        nonfinite_reason = str(offending)
                         lr_now = _scheduler_current_lr(lr_scheduler)
-                        debug_path = _write_nonfinite_debug_artifact(
+                        nonfinite_debug_path = _write_nonfinite_debug_artifact(
                             output_dir=output_dir,
                             step=int(global_step + 1),
                             micro_step_idx=int(step_idx),
@@ -1940,11 +2057,18 @@ def run_pretraining(
                             compile_mode=compile_mode,
                             embedding_sharing=str(model_cfg.embedding_sharing),
                         )
-                        raise FloatingPointError(
-                            "Non-finite value detected before backward pass "
-                            f"(offending={offending}, step={int(global_step + 1)}, "
-                            f"micro_step={int(step_idx)}). Debug artifact: {debug_path}"
+                        logger.warning(
+                            "Skipping accumulation window due non-finite %s "
+                            "(step=%d, micro_step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                            offending,
+                            int(global_step + 1),
+                            int(step_idx),
+                            int(nonfinite_skip_streak),
+                            int(nonfinite_skip_total),
+                            nonfinite_debug_path,
                         )
+                        optimizer.zero_grad(set_to_none=True)
+                        break
                     accelerator.backward(backward_loss)
 
                 if is_sync_step:
@@ -1953,49 +2077,51 @@ def run_pretraining(
                         accelerator=accelerator,
                         grad_norm=float(grad_norm_for_check),
                     ):
-                        skipped_window_due_nonfinite = True
-                        nonfinite_skip_total += 1
-                        nonfinite_skip_streak += 1
-                        lr_now = _scheduler_current_lr(lr_scheduler)
-                        debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=output_dir,
-                            step=int(global_step + 1),
-                            micro_step_idx=int(step_idx),
-                            offending=f"grad_norm_skip_{int(nonfinite_skip_total)}",
-                            gen_loss_raw=out.gen_loss_raw if out is not None else None,
-                            disc_loss_raw=out.disc_loss_raw if out is not None else None,
-                            forward_loss=out.loss if out is not None else None,
-                            backward_loss=None,
+                        sanitized = _sanitize_nonfinite_gradients_(model)
+                        nonfinite_sanitized_count += int(sanitized)
+                        grad_norm_for_check = _global_grad_l2_norm(model)
+                        if not _has_nonfinite_grad_norm_any_rank(
+                            accelerator=accelerator,
                             grad_norm=float(grad_norm_for_check),
-                            lr=lr_now,
-                            compile_enabled=compile_enabled,
-                            compile_mode=compile_mode,
-                            embedding_sharing=str(model_cfg.embedding_sharing),
-                        )
-                        logger.warning(
-                            "Skipping optimizer step due non-finite gradient norm "
-                            "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                            int(global_step + 1),
-                            int(nonfinite_skip_streak),
-                            int(nonfinite_skip_total),
-                            debug_path,
-                        )
-                        if train_cfg.report_to != "none":
-                            accelerator.log(
-                                {
-                                    "nonfinite_skip_total": float(nonfinite_skip_total),
-                                    "nonfinite_skip_streak": float(nonfinite_skip_streak),
-                                },
+                        ):
+                            logger.warning(
+                                "Sanitized %d non-finite gradient elements before optimizer step "
+                                "(step=%d, micro_step=%d); continuing.",
+                                int(sanitized),
+                                int(global_step + 1),
+                                int(step_idx),
+                            )
+                        else:
+                            skipped_window_due_nonfinite = True
+                            nonfinite_skip_total += 1
+                            nonfinite_skip_streak += 1
+                            nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
+                            lr_now = _scheduler_current_lr(lr_scheduler)
+                            nonfinite_debug_path = _write_nonfinite_debug_artifact(
+                                output_dir=output_dir,
                                 step=int(global_step + 1),
+                                micro_step_idx=int(step_idx),
+                                offending=str(nonfinite_reason),
+                                gen_loss_raw=out.gen_loss_raw if out is not None else None,
+                                disc_loss_raw=out.disc_loss_raw if out is not None else None,
+                                forward_loss=out.loss if out is not None else None,
+                                backward_loss=None,
+                                grad_norm=float(grad_norm_for_check),
+                                lr=lr_now,
+                                compile_enabled=compile_enabled,
+                                compile_mode=compile_mode,
+                                embedding_sharing=str(model_cfg.embedding_sharing),
                             )
-                        optimizer.zero_grad(set_to_none=True)
-                        if nonfinite_skip_streak > int(_MAX_NONFINITE_SKIP_STREAK):
-                            raise FloatingPointError(
-                                "Exceeded non-finite gradient skip budget before optimizer step "
-                                f"(step={int(global_step + 1)}, streak={int(nonfinite_skip_streak)}). "
-                                f"Latest debug artifact: {debug_path}"
+                            logger.warning(
+                                "Skipping optimizer step due persistent non-finite gradient norm "
+                                "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                                int(global_step + 1),
+                                int(nonfinite_skip_streak),
+                                int(nonfinite_skip_total),
+                                nonfinite_debug_path,
                             )
-                        continue
+                            optimizer.zero_grad(set_to_none=True)
+                            break
 
                     if _should_clip_gradients(
                         sync_gradients=True,
@@ -2007,49 +2133,51 @@ def run_pretraining(
                             accelerator=accelerator,
                             grad_norm=float(post_clip_grad_norm),
                         ):
-                            skipped_window_due_nonfinite = True
-                            nonfinite_skip_total += 1
-                            nonfinite_skip_streak += 1
-                            lr_now = _scheduler_current_lr(lr_scheduler)
-                            debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=output_dir,
-                                step=int(global_step + 1),
-                                micro_step_idx=int(step_idx),
-                                offending=f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}",
-                                gen_loss_raw=out.gen_loss_raw if out is not None else None,
-                                disc_loss_raw=out.disc_loss_raw if out is not None else None,
-                                forward_loss=out.loss if out is not None else None,
-                                backward_loss=None,
+                            sanitized = _sanitize_nonfinite_gradients_(model)
+                            nonfinite_sanitized_count += int(sanitized)
+                            post_clip_grad_norm = _global_grad_l2_norm(model)
+                            if not _has_nonfinite_grad_norm_any_rank(
+                                accelerator=accelerator,
                                 grad_norm=float(post_clip_grad_norm),
-                                lr=lr_now,
-                                compile_enabled=compile_enabled,
-                                compile_mode=compile_mode,
-                                embedding_sharing=str(model_cfg.embedding_sharing),
-                            )
-                            logger.warning(
-                                "Skipping optimizer step due non-finite post-clip gradient norm "
-                                "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                                int(global_step + 1),
-                                int(nonfinite_skip_streak),
-                                int(nonfinite_skip_total),
-                                debug_path,
-                            )
-                            if train_cfg.report_to != "none":
-                                accelerator.log(
-                                    {
-                                        "nonfinite_skip_total": float(nonfinite_skip_total),
-                                        "nonfinite_skip_streak": float(nonfinite_skip_streak),
-                                    },
+                            ):
+                                logger.warning(
+                                    "Sanitized %d non-finite post-clip gradient elements "
+                                    "(step=%d, micro_step=%d); continuing.",
+                                    int(sanitized),
+                                    int(global_step + 1),
+                                    int(step_idx),
+                                )
+                            else:
+                                skipped_window_due_nonfinite = True
+                                nonfinite_skip_total += 1
+                                nonfinite_skip_streak += 1
+                                nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
+                                lr_now = _scheduler_current_lr(lr_scheduler)
+                                nonfinite_debug_path = _write_nonfinite_debug_artifact(
+                                    output_dir=output_dir,
                                     step=int(global_step + 1),
+                                    micro_step_idx=int(step_idx),
+                                    offending=str(nonfinite_reason),
+                                    gen_loss_raw=out.gen_loss_raw if out is not None else None,
+                                    disc_loss_raw=out.disc_loss_raw if out is not None else None,
+                                    forward_loss=out.loss if out is not None else None,
+                                    backward_loss=None,
+                                    grad_norm=float(post_clip_grad_norm),
+                                    lr=lr_now,
+                                    compile_enabled=compile_enabled,
+                                    compile_mode=compile_mode,
+                                    embedding_sharing=str(model_cfg.embedding_sharing),
                                 )
-                            optimizer.zero_grad(set_to_none=True)
-                            if nonfinite_skip_streak > int(_MAX_NONFINITE_SKIP_STREAK):
-                                raise FloatingPointError(
-                                    "Exceeded non-finite gradient skip budget after gradient clipping "
-                                    f"(step={int(global_step + 1)}, streak={int(nonfinite_skip_streak)}). "
-                                    f"Latest debug artifact: {debug_path}"
+                                logger.warning(
+                                    "Skipping optimizer step due persistent non-finite post-clip gradient norm "
+                                    "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                                    int(global_step + 1),
+                                    int(nonfinite_skip_streak),
+                                    int(nonfinite_skip_total),
+                                    nonfinite_debug_path,
                                 )
-                            continue
+                                optimizer.zero_grad(set_to_none=True)
+                                break
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -2064,6 +2192,56 @@ def run_pretraining(
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
+                    # Recovery path: keep training alive, advance schedule/step, and keep moving.
+                    if _optimizer_has_stepped(optimizer):
+                        with suppress(Exception):
+                            lr_scheduler.step()
+                    recovered_lr, reset_state = _apply_nonfinite_recovery(
+                        optimizer=optimizer,
+                        skip_streak=int(nonfinite_skip_streak),
+                        lr_floor=float(nonfinite_lr_floor),
+                    )
+                    global_step += 1
+                    if train_cfg.report_to != "none":
+                        _log_tracker_metrics(
+                            {
+                                "nonfinite_window_skipped": 1.0,
+                                "nonfinite_skip_total": float(nonfinite_skip_total),
+                                "nonfinite_skip_streak": float(nonfinite_skip_streak),
+                                "nonfinite_sanitized_grad_elems": float(nonfinite_sanitized_count),
+                                "nonfinite_recovery_lr": (
+                                    float(recovered_lr) if recovered_lr is not None else float("nan")
+                                ),
+                                "nonfinite_recovery_optimizer_state_reset": 1.0 if reset_state else 0.0,
+                            },
+                            step=int(global_step),
+                        )
+
+                    if accelerator.is_main_process:
+                        logger.warning(
+                            "step=%d | nonfinite_window_skipped=1 | reason=%s | streak=%d | total_skips=%d | "
+                            "sanitized_grad_elems=%d | recovery_lr=%s | opt_state_reset=%s | debug=%s",
+                            int(global_step),
+                            str(nonfinite_reason or "unknown"),
+                            int(nonfinite_skip_streak),
+                            int(nonfinite_skip_total),
+                            int(nonfinite_sanitized_count),
+                            f"{float(recovered_lr):.3e}" if recovered_lr is not None else "n/a",
+                            bool(reset_state),
+                            str(nonfinite_debug_path) if nonfinite_debug_path is not None else "n/a",
+                        )
+
+                    if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
+                        ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                        _save_training_checkpoint(
+                            accelerator=accelerator,
+                            checkpoint_dir=ckpt_dir,
+                            output_dir=output_dir,
+                            consumed_micro_batches=consumed_micro_batches,
+                            save_total_limit=int(train_cfg.save_total_limit),
+                            log_label="periodic",
+                        )
+                        last_saved_step = global_step
                     continue
                 raise RuntimeError("Accumulation window produced no synchronized optimization step.")
 
@@ -2073,7 +2251,8 @@ def run_pretraining(
                 token_weighted_ga=token_weighted_ga,
             )
 
-            # We count *optimizer* steps (not micro-steps).
+            # We count accumulation windows as global steps (successful optimizer step or
+            # recovered non-finite skip window).
             if did_optimizer_step:
                 if out is None:
                     raise RuntimeError("Accumulation window produced no forward pass outputs.")
@@ -2121,7 +2300,11 @@ def run_pretraining(
                         "disc_acc": _mean(out.disc_accuracy),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
+                        "nonfinite_skip_total": float(nonfinite_skip_total),
+                        "nonfinite_skip_streak": float(nonfinite_skip_streak),
                     }
+                    if int(nonfinite_sanitized_count) > 0:
+                        metrics["nonfinite_sanitized_grad_elems"] = float(nonfinite_sanitized_count)
 
                     if accelerator.is_main_process:
                         logger.info(
@@ -2140,7 +2323,9 @@ def run_pretraining(
                         )
 
                     if train_cfg.report_to != "none":
-                        accelerator.log({k: v for k, v in metrics.items() if k != "step"}, step=global_step)
+                        _log_tracker_metrics(
+                            {k: v for k, v in metrics.items() if k != "step"}, step=global_step
+                        )
 
                 # Checkpoint
                 if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
@@ -2204,8 +2389,11 @@ def run_pretraining(
             )
 
         if crash_reason is not None:
+            crash_log_step = int(
+                max(crash_step if crash_step is not None else global_step, max_tracker_step_logged)
+            )
             crash_row = {
-                "step": int(crash_step if crash_step is not None else global_step),
+                "step": crash_log_step,
                 "crash": True,
                 "crash_type": crash_type,
                 "crash_reason": crash_reason,
@@ -2216,7 +2404,7 @@ def run_pretraining(
                     _append_metrics_jsonl_row(metrics_path, crash_row)
                 if train_cfg.report_to != "none":
                     with suppress(Exception):
-                        accelerator.log(
+                        _log_tracker_metrics(
                             {k: v for k, v in crash_row.items() if k != "step"},
                             step=int(crash_row["step"]),
                         )
