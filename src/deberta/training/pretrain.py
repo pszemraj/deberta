@@ -240,6 +240,147 @@ def _resolve_resume_checkpoint(
     return str(latest)
 
 
+def _canonical_compile_state_key(key: str) -> str:
+    """Return state-dict key with compile wrapper segments normalized.
+
+    :param str key: Raw state-dict key.
+    :return str: Canonical key with ``._orig_mod`` segments removed.
+    """
+    return str(key).replace("._orig_mod", "")
+
+
+def _load_checkpoint_model_state_dict(checkpoint_dir: Path) -> dict[str, torch.Tensor]:
+    """Load model state-dict from an accelerate checkpoint directory.
+
+    :param Path checkpoint_dir: Checkpoint directory containing model weights.
+    :raises RuntimeError: If no model state file is found.
+    :return dict[str, torch.Tensor]: Loaded model state dictionary.
+    """
+    safe_path = checkpoint_dir / "model.safetensors"
+    if safe_path.exists():
+        try:
+            from safetensors.torch import load_file as safetensors_load_file
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"Failed to import safetensors loader for {safe_path}") from exc
+        return dict(safetensors_load_file(str(safe_path), device="cpu"))
+
+    for bin_name in ("model.bin", "pytorch_model.bin"):
+        bin_path = checkpoint_dir / bin_name
+        if bin_path.exists():
+            loaded = torch.load(bin_path, map_location="cpu")
+            if not isinstance(loaded, dict):
+                raise RuntimeError(f"Checkpoint model file does not contain a state dict: {bin_path}")
+            return loaded
+
+    raise RuntimeError(f"No model state file found in checkpoint directory: {checkpoint_dir}")
+
+
+def _load_model_state_with_compile_key_remap(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str, int]:
+    """Load checkpoint weights into ``model`` with compile-wrapper key remapping.
+
+    :param torch.nn.Module model: Target model instance.
+    :param Path checkpoint_dir: Checkpoint directory path.
+    :raises RuntimeError: If canonicalized key sets are incompatible.
+    :return dict[str, int]: Matched/missing/unexpected key counts.
+    """
+    target_state = model.state_dict()
+    checkpoint_state = _load_checkpoint_model_state_dict(checkpoint_dir)
+
+    target_by_canonical: dict[str, str] = {}
+    for key in target_state.keys():
+        canonical = _canonical_compile_state_key(key)
+        prev = target_by_canonical.get(canonical)
+        if prev is not None and prev != key:
+            raise RuntimeError(
+                "Ambiguous target model keys after compile canonicalization: "
+                f"{prev!r} and {key!r} -> {canonical!r}"
+            )
+        target_by_canonical[canonical] = key
+
+    checkpoint_by_canonical: dict[str, tuple[str, torch.Tensor]] = {}
+    for key, value in checkpoint_state.items():
+        canonical = _canonical_compile_state_key(key)
+        prev = checkpoint_by_canonical.get(canonical)
+        if prev is not None and prev[0] != key:
+            raise RuntimeError(
+                "Ambiguous checkpoint keys after compile canonicalization: "
+                f"{prev[0]!r} and {key!r} -> {canonical!r}"
+            )
+        checkpoint_by_canonical[canonical] = (key, value)
+
+    remapped_state: dict[str, torch.Tensor] = {}
+    missing_keys: list[str] = []
+    for canonical, target_key in target_by_canonical.items():
+        source = checkpoint_by_canonical.get(canonical)
+        if source is None:
+            missing_keys.append(target_key)
+            continue
+        remapped_state[target_key] = source[1]
+
+    unexpected_keys = [
+        source_key
+        for canonical, (source_key, _value) in checkpoint_by_canonical.items()
+        if canonical not in target_by_canonical
+    ]
+
+    if missing_keys or unexpected_keys:
+        missing_preview = ", ".join(missing_keys[:8])
+        unexpected_preview = ", ".join(unexpected_keys[:8])
+        raise RuntimeError(
+            "Canonical checkpoint/model key mismatch after compile remap. "
+            f"missing={len(missing_keys)} ({missing_preview}), "
+            f"unexpected={len(unexpected_keys)} ({unexpected_preview})"
+        )
+
+    incompatible = model.load_state_dict(remapped_state, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Model load_state_dict reported incompatibilities after compile remap: "
+            f"missing={incompatible.missing_keys[:8]}, "
+            f"unexpected={incompatible.unexpected_keys[:8]}"
+        )
+
+    return {
+        "matched": len(remapped_state),
+        "missing": 0,
+        "unexpected": 0,
+    }
+
+
+def _load_resume_state_with_compile_fallback(
+    accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
+) -> None:
+    """Load resume state with fallback for ``torch.compile`` wrapper key mismatches.
+
+    :param Any accelerator: Accelerator instance.
+    :param torch.nn.Module model: Potentially wrapped training model.
+    :param str checkpoint_dir: Resume checkpoint directory.
+    :raises RuntimeError: If both normal and fallback load paths fail.
+    :return None: None.
+    """
+    try:
+        accelerator.load_state(checkpoint_dir)
+        return
+    except RuntimeError as err:
+        if "_orig_mod" not in str(err):
+            raise
+
+    logger.warning(
+        "Checkpoint model key mismatch due compile wrappers detected; retrying resume with "
+        "strict=False and canonical key remap."
+    )
+    accelerator.load_state(checkpoint_dir, strict=False)
+    unwrapped = _unwrap_model_for_runtime(accelerator, model)
+    stats = _load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
+    logger.info(
+        "Resume model remap loaded %d tensors from %s (missing=%d, unexpected=%d).",
+        int(stats["matched"]),
+        checkpoint_dir,
+        int(stats["missing"]),
+        int(stats["unexpected"]),
+    )
+
+
 def _persist_or_validate_run_configs(
     *,
     output_dir: Path,
@@ -1608,7 +1749,11 @@ def run_pretraining(
         # Resume
         if ckpt:
             logger.info(f"Resuming from checkpoint: {ckpt}")
-            accelerator.load_state(ckpt)
+            _load_resume_state_with_compile_fallback(
+                accelerator=accelerator,
+                model=model,
+                checkpoint_dir=ckpt,
+            )
 
             # GDES base buffers are non-persistent and must be refreshed after loading a checkpoint.
             with suppress(Exception):

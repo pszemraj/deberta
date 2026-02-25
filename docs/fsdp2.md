@@ -66,6 +66,8 @@ Compile behavior is configured directly via train/model config:
 
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
 
+Resume behavior normalizes compile-wrapper key segments (`._orig_mod`) when needed, so checkpoints can be resumed across different compile scopes (for example, `backbones` -> `ffn_only`) without manual checkpoint surgery.
+
 ### Compile Parity Protocol
 
 Use `scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the same weights, batch, and RNG state.

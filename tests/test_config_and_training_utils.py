@@ -40,6 +40,7 @@ from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
     _build_optimizer,
     _build_training_collator,
+    _canonical_compile_state_key,
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
@@ -49,6 +50,8 @@ from deberta.training.pretrain import (
     _flush_loggers,
     _init_trackers,
     _load_checkpoint_data_progress,
+    _load_model_state_with_compile_key_remap,
+    _load_resume_state_with_compile_fallback,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
     _resolve_compile_scope,
@@ -280,6 +283,79 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert _load_checkpoint_data_progress(ckpt) == 123
 
 
+def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
+    assert _canonical_compile_state_key("generator._orig_mod.encoder.layer.0._orig_mod.weight") == (
+        "generator.encoder.layer.0.weight"
+    )
+
+
+def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mod_keys(
+    tmp_path: Path,
+) -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        model[0].weight.fill_(1.5)
+        model[0].bias.fill_(-0.25)
+
+    original = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    remapped = {key.replace("0.", "0._orig_mod."): value.detach().clone() for key, value in original.items()}
+    torch.save(remapped, checkpoint / "model.bin")
+
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.zero_()
+
+    stats = _load_model_state_with_compile_key_remap(model, checkpoint)
+    assert stats == {"matched": 2, "missing": 0, "unexpected": 0}
+    assert torch.allclose(model[0].weight, original["0.weight"])
+    assert torch.allclose(model[0].bias, original["0.bias"])
+
+
+def test_load_resume_state_with_compile_fallback_retries_strict_false_and_remaps(
+    tmp_path: Path,
+) -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        model[0].weight.fill_(0.75)
+        model[0].bias.fill_(0.5)
+    saved = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    torch.save(
+        {k.replace("0.", "0._orig_mod."): v.clone() for k, v in saved.items()},
+        checkpoint / "model.bin",
+    )
+
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.zero_()
+
+    class _ResumeAccelerator:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def load_state(self, ckpt: str, **kwargs: Any) -> None:
+            self.calls.append((ckpt, dict(kwargs)))
+            if kwargs.get("strict", True):
+                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
+
+        def unwrap_model(self, wrapped: torch.nn.Module) -> torch.nn.Module:
+            return wrapped
+
+    accel = _ResumeAccelerator()
+    _load_resume_state_with_compile_fallback(accel, model, str(checkpoint))
+
+    assert len(accel.calls) == 2
+    assert accel.calls[0][1] == {}
+    assert accel.calls[1][1] == {"strict": False}
+    assert torch.allclose(model[0].weight, saved["0.weight"])
+    assert torch.allclose(model[0].bias, saved["0.bias"])
+
+
 def test_append_metrics_jsonl_row_appends_rows(tmp_path: Path):
     metrics_path = tmp_path / "run" / "metrics.jsonl.gz"
     _append_metrics_jsonl_row(metrics_path, {"step": 1, "loss": 0.123})
@@ -456,8 +532,8 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
         def log(self, row: dict[str, Any], step: int | None = None) -> None:
             self.logged_rows.append((dict(row), step))
 
-        def load_state(self, ckpt: str) -> None:
-            del ckpt
+        def load_state(self, ckpt: str, **kwargs: Any) -> None:
+            del ckpt, kwargs
 
         def end_training(self) -> None:
             self.ended = True
