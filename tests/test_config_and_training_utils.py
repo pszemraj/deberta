@@ -773,7 +773,7 @@ def test_run_pretraining_compiles_only_generator_and_discriminator(
     assert compile_calls[1][1]["dynamic"] is False
 
 
-def test_run_pretraining_hf_deberta_auto_scope_compiles_encoders_only(
+def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import deberta.training.pretrain as pretrain_mod
@@ -846,11 +846,23 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_encoders_only(
         while True:
             yield batch
 
+    class _FakeLayer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attention = torch.nn.Linear(2, 2)
+            self.intermediate = torch.nn.Linear(2, 2)
+            self.output = torch.nn.Linear(2, 2)
+
+    class _FakeEncoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer = torch.nn.ModuleList([_FakeLayer()])
+
     class _FakeBackbone(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.embeddings = torch.nn.Linear(2, 2)
-            self.encoder = torch.nn.Linear(2, 2)
+            self.encoder = _FakeEncoder()
 
     class _FakeRTD(torch.nn.Module):
         last_instance: _FakeRTD | None = None
@@ -943,15 +955,23 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_encoders_only(
 
     instance = _FakeRTD.last_instance
     assert instance is not None
-    assert len(compile_calls) == 2
-    assert compile_calls[0][0] is instance.generator.encoder
-    assert compile_calls[1][0] is instance.discriminator.encoder
+    assert len(compile_calls) == 4
+    assert compile_calls[0][0] is instance.generator.encoder.layer[0].intermediate
+    assert compile_calls[1][0] is instance.generator.encoder.layer[0].output
+    assert compile_calls[2][0] is instance.discriminator.encoder.layer[0].intermediate
+    assert compile_calls[3][0] is instance.discriminator.encoder.layer[0].output
     assert compile_calls[0][1]["mode"] == "default"
     assert compile_calls[1][1]["mode"] == "default"
+    assert compile_calls[2][1]["mode"] == "default"
+    assert compile_calls[3][1]["mode"] == "default"
     assert compile_calls[0][1]["backend"] == "inductor"
     assert compile_calls[1][1]["backend"] == "inductor"
+    assert compile_calls[2][1]["backend"] == "inductor"
+    assert compile_calls[3][1]["backend"] == "inductor"
     assert compile_calls[0][1]["dynamic"] is False
     assert compile_calls[1][1]["dynamic"] is False
+    assert compile_calls[2][1]["dynamic"] is False
+    assert compile_calls[3][1]["dynamic"] is False
 
 
 def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):
@@ -1553,6 +1573,9 @@ def test_normalize_compile_scope_accepts_aliases_and_rejects_invalid():
     assert _normalize_compile_scope("encoder") == "encoder_only"
     assert _normalize_compile_scope("generator_encoder") == "gen_encoder_only"
     assert _normalize_compile_scope("disc-encoder") == "disc_encoder_only"
+    assert _normalize_compile_scope("ffn") == "ffn_only"
+    assert _normalize_compile_scope("generator_ffn") == "gen_ffn_only"
+    assert _normalize_compile_scope("disc_ffn") == "disc_ffn_only"
 
     with pytest.raises(ValueError, match="DEBERTA_COMPILE_SCOPE must be one of"):
         _normalize_compile_scope("all")
@@ -1575,7 +1598,7 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
         compile_mode="default",
         compile_backend="inductor",
     )
-    assert scope == "encoder_only"
+    assert scope == "ffn_only"
     assert reason is not None
 
     scope, reason = _resolve_compile_scope(

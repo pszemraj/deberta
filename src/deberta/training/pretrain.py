@@ -669,9 +669,24 @@ def _normalize_compile_scope(raw: str | None) -> str:
         "generator_encoder": "gen_encoder_only",
         "disc_encoder": "disc_encoder_only",
         "discriminator_encoder": "disc_encoder_only",
+        "ffn": "ffn_only",
+        "ffns": "ffn_only",
+        "gen_ffn": "gen_ffn_only",
+        "generator_ffn": "gen_ffn_only",
+        "disc_ffn": "disc_ffn_only",
+        "discriminator_ffn": "disc_ffn_only",
     }
     canonical = aliases.get(value, value)
-    allowed = {"auto", "backbones", "encoder_only", "gen_encoder_only", "disc_encoder_only"}
+    allowed = {
+        "auto",
+        "backbones",
+        "encoder_only",
+        "gen_encoder_only",
+        "disc_encoder_only",
+        "ffn_only",
+        "gen_ffn_only",
+        "disc_ffn_only",
+    }
     if canonical not in allowed:
         raise ValueError(f"{_COMPILE_SCOPE_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
     return canonical
@@ -719,12 +734,12 @@ def _resolve_compile_scope(
 
     backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
     # Empirically, full-backbone inductor compile on HF DeBERTa v2 defaults can drift
-    # during train-mode updates. Auto scope keeps compile on the dominant encoder FLOPs
-    # while leaving embedding modules eager (including GDES sync mutation points).
+    # during train-mode updates. Auto scope keeps compile on the dominant FFN FLOPs
+    # while leaving attention + embeddings eager.
     if backbone_type == "hf_deberta_v2" and compile_mode == "default" and compile_backend == "inductor":
         return (
-            "encoder_only",
-            "auto scope selected encoder-only fallback for hf_deberta_v2 (default+inductor)",
+            "ffn_only",
+            "auto scope selected FFN-only fallback for hf_deberta_v2 (default+inductor)",
         )
     return "backbones", None
 
@@ -749,6 +764,48 @@ def _compile_backbones_for_scope(
         raise RuntimeError("RTD model must expose generator and discriminator modules for compilation.")
 
     compiled_targets: list[str] = []
+
+    def _compile_encoder_ffn(*, backbone: torch.nn.Module, branch: str) -> None:
+        """Compile FFN blocks (`intermediate` and `output`) in all encoder layers.
+
+        :param torch.nn.Module backbone: Generator/discriminator backbone.
+        :param str branch: Branch label used in compiled target names.
+        :raises RuntimeError: If encoder/layer/FFN modules are missing.
+        """
+
+        encoder = getattr(backbone, "encoder", None)
+        if not isinstance(encoder, torch.nn.Module):
+            raise RuntimeError(f"{branch}.encoder is required for ffn-only compile scope.")
+
+        layers = getattr(encoder, "layer", None)
+        if not isinstance(layers, (torch.nn.ModuleList, list, tuple)):
+            raise RuntimeError(f"{branch}.encoder.layer is required for ffn-only compile scope.")
+        if len(layers) == 0:
+            raise RuntimeError(f"{branch}.encoder.layer is empty; cannot apply ffn-only compile scope.")
+
+        for idx, layer in enumerate(layers):
+            if not isinstance(layer, torch.nn.Module):
+                raise RuntimeError(f"{branch}.encoder.layer[{idx}] is not a torch.nn.Module.")
+            intermediate = getattr(layer, "intermediate", None)
+            output = getattr(layer, "output", None)
+            if not isinstance(intermediate, torch.nn.Module):
+                raise RuntimeError(
+                    f"{branch}.encoder.layer[{idx}].intermediate is required for ffn-only compile scope."
+                )
+            if not isinstance(output, torch.nn.Module):
+                raise RuntimeError(
+                    f"{branch}.encoder.layer[{idx}].output is required for ffn-only compile scope."
+                )
+
+            layer.intermediate = torch.compile(intermediate, **compile_kwargs)  # type: ignore[attr-defined]
+            layer.output = torch.compile(output, **compile_kwargs)  # type: ignore[attr-defined]
+            compiled_targets.extend(
+                [
+                    f"{branch}.encoder.layer[{idx}].intermediate",
+                    f"{branch}.encoder.layer[{idx}].output",
+                ]
+            )
+
     if compile_scope == "backbones":
         unwrapped_model.generator = torch.compile(generator, **compile_kwargs)  # type: ignore[attr-defined]
         unwrapped_model.discriminator = torch.compile(discriminator, **compile_kwargs)  # type: ignore[attr-defined]
@@ -767,6 +824,12 @@ def _compile_backbones_for_scope(
             raise RuntimeError("discriminator.encoder is required for encoder-only compile scope.")
         discriminator.encoder = torch.compile(disc_encoder, **compile_kwargs)  # type: ignore[attr-defined]
         compiled_targets.append("discriminator.encoder")
+
+    if compile_scope in {"ffn_only", "gen_ffn_only"}:
+        _compile_encoder_ffn(backbone=generator, branch="generator")
+
+    if compile_scope in {"ffn_only", "disc_ffn_only"}:
+        _compile_encoder_ffn(backbone=discriminator, branch="discriminator")
 
     if not compiled_targets:
         raise ValueError(f"Unsupported compile scope: {compile_scope}")
