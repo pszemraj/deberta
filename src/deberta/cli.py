@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import types
 from dataclasses import fields
@@ -37,6 +36,7 @@ from deberta.config import (
     validate_training_workflow_options,
 )
 from deberta.export_cli import add_export_arguments, namespace_to_export_config, run_export
+from deberta.io_utils import load_json_mapping
 from deberta.training import run_pretraining
 
 
@@ -104,11 +104,7 @@ def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
     :param Path path: JSON path.
     :return tuple[ModelConfig, DataConfig, TrainConfig]: Parsed config dataclasses.
     """
-    raw = json.loads(path.read_text())
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("JSON config must parse to a dict.")
+    raw = load_json_mapping(path)
     model_dict, data_dict, train_dict = _split_nested_or_flat_sections(raw, format_name="JSON")
     return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
 

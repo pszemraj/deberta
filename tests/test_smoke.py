@@ -1193,7 +1193,6 @@ def test_synced_buffer_embedding_tracks_sync_updates():
         init_weight=init_weight,
         padding_idx=0,
         add_bias=False,
-        persistent_base=False,
     )
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
 
@@ -1216,7 +1215,6 @@ def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
         init_weight=init_weight,
         padding_idx=0,
         add_bias=True,
-        persistent_base=False,
     )
     assert tied.bias is not None
     assert tied.bias.dtype == init_weight.dtype

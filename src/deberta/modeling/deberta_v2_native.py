@@ -14,6 +14,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from deberta.config import _normalize_hf_attention_kernel
+
 try:
     from transformers import DebertaV2Config, PreTrainedModel
     from transformers.activations import ACT2FN
@@ -103,31 +105,6 @@ def build_relative_position(
     return rel_pos.to(torch.long)
 
 
-def _normalize_hf_attn_kernel(raw: str | None) -> str:
-    """Normalize native hf_deberta_v2 attention-kernel config.
-
-    :param str | None raw: Config value.
-    :raises ValueError: If value is unsupported.
-    :return str: Canonical kernel name.
-    """
-
-    if raw is None:
-        return "dynamic"
-    value = str(raw).strip().lower().replace("-", "_")
-    if not value:
-        return "dynamic"
-    aliases = {
-        "default": "dynamic",
-        "cache": "cached_bmm",
-        "cached": "cached_bmm",
-    }
-    canonical = aliases.get(value, value)
-    allowed = {"dynamic", "cached_bmm"}
-    if canonical not in allowed:
-        raise ValueError(f"hf_attention_kernel must be one of {sorted(allowed)}; got {raw!r}.")
-    return canonical
-
-
 class DebertaV2SelfOutput(nn.Module):
     """Self-attention output projection block."""
 
@@ -194,7 +171,7 @@ class DisentangledSelfAttention(nn.Module):
             self.pos_ebd_size = self.position_buckets
 
         self.pos_dropout = nn.Dropout(float(config.hidden_dropout_prob))
-        self.attn_kernel = _normalize_hf_attn_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
+        self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
 
         if self.relative_attention and (not self.share_att_key):
             if "c2p" in self.pos_att_type:
@@ -884,7 +861,7 @@ class DebertaV2Encoder(nn.Module):
         conv_kernel_size = getattr(config, "conv_kernel_size", 0)
         self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
         self.gradient_checkpointing = False
-        self.attn_kernel = _normalize_hf_attn_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
+        self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
         self.register_buffer("_cached_rel_pos", torch.empty(0, 0, dtype=torch.long), persistent=False)
 
     def get_rel_embedding(self) -> torch.Tensor | None:

@@ -411,7 +411,7 @@ def test_resolve_backbone_sources_matrix(
     assert resolved.generator.derived_from_discriminator is expected_gen_derived
 
 
-def test_resolve_backbone_sources_rejects_pretrained_generator_config_without_generator_weights():
+def test_validate_model_config_rejects_pretrained_generator_config_without_generator_weights():
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
@@ -420,7 +420,7 @@ def test_resolve_backbone_sources_rejects_pretrained_generator_config_without_ge
         generator_model_name_or_path=None,
     )
     with pytest.raises(ValueError, match="requires model.generator_model_name_or_path"):
-        _ = builder_mod._resolve_backbone_sources(cfg)
+        builder_mod.validate_model_config(cfg)
 
 
 def test_build_backbone_configs_scratch_explicit_generator_config_is_authoritative(

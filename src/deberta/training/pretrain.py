@@ -38,6 +38,7 @@ from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset, Seque
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
+from deberta.io_utils import dump_json, load_json_mapping
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import load_intersection_state_dict, merge_embeddings_into_export_backbone
@@ -45,30 +46,6 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_genera
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _json_dump(obj: Any, path: Path) -> None:
-    """Write JSON to disk with stable formatting.
-
-    :param Any obj: Serializable object.
-    :param Path path: Destination path.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-
-
-def _json_load(path: Path) -> dict[str, Any]:
-    """Read JSON mapping from disk.
-
-    :param Path path: Source path.
-    :return dict[str, Any]: Parsed mapping.
-    """
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-    if not isinstance(raw, dict):
-        raise ValueError(f"Expected JSON object at {path}, got {type(raw).__name__}.")
-    return raw
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -232,7 +209,7 @@ def _validate_run_metadata(path: Path) -> None:
     :param Path path: Metadata file path.
     :raises ValueError: If metadata is malformed or schema-incompatible.
     """
-    raw = _json_load(path)
+    raw = load_json_mapping(path)
     validate_run_metadata_schema(raw, source=str(path))
 
 
@@ -293,10 +270,10 @@ def _persist_or_validate_run_configs(
             _validate_run_metadata(run_meta_path)
         elif is_main_process:
             # Backfill schema metadata for older runs once compatibility has been checked.
-            _json_dump(_build_run_metadata(), run_meta_path)
+            dump_json(_build_run_metadata(), run_meta_path)
 
-        saved_model_cfg = ModelConfig(**_json_load(model_cfg_path))
-        saved_data_cfg = DataConfig(**_json_load(data_cfg_path))
+        saved_model_cfg = ModelConfig(**load_json_mapping(model_cfg_path))
+        saved_data_cfg = DataConfig(**load_json_mapping(data_cfg_path))
         validate_model_config(saved_model_cfg)
         validate_data_config(saved_data_cfg)
 
@@ -315,10 +292,10 @@ def _persist_or_validate_run_configs(
         return
 
     if is_main_process:
-        _json_dump(asdict(model_cfg), model_cfg_path)
-        _json_dump(asdict(data_cfg), data_cfg_path)
-        _json_dump(asdict(train_cfg), train_cfg_path)
-        _json_dump(_build_run_metadata(), run_meta_path)
+        dump_json(asdict(model_cfg), model_cfg_path)
+        dump_json(asdict(data_cfg), data_cfg_path)
+        dump_json(asdict(train_cfg), train_cfg_path)
+        dump_json(_build_run_metadata(), run_meta_path)
 
 
 def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
@@ -622,7 +599,7 @@ def _write_nonfinite_debug_artifact(
         "grad_norm": _safe_float_for_json(grad_norm),
         "rng_state": _compact_rng_state_snapshot(),
     }
-    _json_dump(payload, path)
+    dump_json(payload, path)
     return path
 
 
@@ -1167,7 +1144,7 @@ def _save_checkpoint_data_progress(*, checkpoint_dir: Path, consumed_micro_batch
     :param Path checkpoint_dir: Checkpoint directory.
     :param int consumed_micro_batches: Number of consumed micro-batches.
     """
-    _json_dump(
+    dump_json(
         {"consumed_micro_batches": int(max(0, consumed_micro_batches))},
         checkpoint_dir / "data_state.json",
     )
@@ -1347,7 +1324,7 @@ def _export_discriminator_hf(
 
         tokenizer.save_pretrained(str(output_dir))
         export_disc.save_pretrained(str(output_dir / "discriminator"), safe_serialization=True)
-        _json_dump({"embedding_sharing": embedding_sharing}, output_dir / "export_meta.json")
+        dump_json({"embedding_sharing": embedding_sharing}, output_dir / "export_meta.json")
         logger.info(f"Exported discriminator to: {output_dir}")
 
     except Exception as e:

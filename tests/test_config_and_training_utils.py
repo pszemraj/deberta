@@ -1779,20 +1779,6 @@ def test_validate_data_config_disables_doc_blocking_when_not_packed():
     assert cfg.block_cross_document_attention is False
 
 
-def test_validate_training_workflow_options_rejects_eval_knobs():
-    with pytest.raises(ValueError, match="Evaluation workflow is not implemented yet"):
-        validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", eval_split="validation"),
-            train_cfg=TrainConfig(),
-        )
-
-    with pytest.raises(ValueError, match="currently unused"):
-        validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(per_device_eval_batch_size=8),
-        )
-
-
 def test_validate_training_workflow_options_rejects_flash_only_with_packing():
     with pytest.raises(ValueError, match="flash_only is not supported with data.pack_sequences=true"):
         validate_training_workflow_options(

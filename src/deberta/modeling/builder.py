@@ -70,16 +70,6 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     bt = (model_cfg.backbone_type or "rope").lower()
     from_scratch = bool(model_cfg.from_scratch)
 
-    has_gen_cfg_src = bool(model_cfg.generator_config_name_or_path)
-    has_gen_model_src = bool(model_cfg.generator_model_name_or_path)
-
-    if not from_scratch and has_gen_cfg_src and not has_gen_model_src:
-        raise ValueError(
-            "model.generator_config_name_or_path requires model.generator_model_name_or_path when "
-            "model.from_scratch=false. Explicit generator configs must pair with explicit generator "
-            "weights; leave both unset to use derived-generator fallback from discriminator weights."
-        )
-
     disc_cfg_source = (
         model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
     )
@@ -616,6 +606,7 @@ def build_backbones(
     :param Any gen_config: Generator config object.
     :return tuple[Any, Any]: Instantiated discriminator and generator modules.
     """
+    validate_model_config(model_cfg)
     bt = (model_cfg.backbone_type or "rope").lower()
     resolved = _resolve_backbone_sources(model_cfg)
 

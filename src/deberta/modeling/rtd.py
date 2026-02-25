@@ -1,45 +1,19 @@
 """RTD (ELECTRA/DeBERTa-v3 style) pretraining heads and wrapper module.
 
-Core objective
---------------
+Objective:
+- Generator MLM cross entropy on masked positions.
+- Discriminator replaced-token detection BCE on active tokens.
 
-- Generator: masked-LM cross entropy on masked positions.
-- Discriminator: replaced-token detection (RTD) binary cross entropy on active tokens.
+Compile boundary:
+- RTD glue stays eager (sampling/corruption/label assembly).
+- Training compiles backbone modules only (configured in training runtime).
 
-Why torch.compile is currently failing
--------------------------------------
-
-Your current codebase compiles the *generator* and *discriminator* backbones.
-That is the right idea. The problem is *embedding sharing*.
-
-The existing GDES/ES implementation patches discriminator embedding modules to
-read generator embedding weights via a Python-side reference. Under torch.compile,
-that cross-module weight read is frequently treated as a captured constant or
-otherwise not tracked correctly, which produces compile-only training pathologies
-(plateau/divergence/crashes) while eager converges.
-
-Fix strategy
-------------
-
-Make the compiled discriminator *self-contained*: it should only read parameters
-and buffers that live inside the discriminator module.
-
-We implement:
-
-- embedding_sharing = "none": no sharing
-- embedding_sharing = "es": share Parameters directly (same nn.Parameter object)
-- embedding_sharing = "gdes": discriminator embeddings = base_buffer + bias
-    where base_buffer is a non-persistent buffer synced from generator weights
-    outside the compiled graph.
-
-Training loop MUST call:
-    model.sync_discriminator_embeddings_from_generator()
-
-- once after loading a checkpoint
-- after each optimizer step
-
-This preserves DeBERTa-v3 GDES semantics (no discriminator grad into generator
-embeddings) and makes torch.compile safe.
+Embedding sharing:
+- ``none``: no sharing.
+- ``es``: direct parameter sharing.
+- ``gdes``: discriminator uses synced base buffers + trainable bias tensors.
+  The training loop must call ``sync_discriminator_embeddings_from_generator()``
+  after checkpoint load and after optimizer steps.
 """
 
 from __future__ import annotations
@@ -144,14 +118,12 @@ class _SyncedBufferEmbedding(nn.Module):
         init_weight: torch.Tensor,
         padding_idx: int | None,
         add_bias: bool,
-        persistent_base: bool = False,
     ) -> None:
         """Initialize synced-buffer embedding used for GDES.
 
         :param torch.Tensor init_weight: Initial embedding matrix used to seed ``base_weight``.
         :param int | None padding_idx: Optional embedding padding index.
         :param bool add_bias: Whether to create a trainable per-token bias matrix.
-        :param bool persistent_base: Whether ``base_weight`` should be written to checkpoints.
         :raises ValueError: If ``init_weight`` is not rank-2.
         :return None: This constructor does not return a value.
         """
@@ -162,7 +134,7 @@ class _SyncedBufferEmbedding(nn.Module):
         self.register_buffer(
             "base_weight",
             init_weight.detach().clone(),
-            persistent=bool(persistent_base),
+            persistent=False,
         )
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
 
@@ -551,7 +523,6 @@ class DebertaV3RTDPretrainer(nn.Module):
                 init_weight=gw,
                 padding_idx=_padding_idx(disc_mod),
                 add_bias=True,
-                persistent_base=False,
             )
             setattr(disc_embeddings, attr, synced)
             self._gdes_synced_embeddings.append((attr, synced, gen_mod))

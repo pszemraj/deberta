@@ -20,6 +20,7 @@ from deberta.config import (
     validate_model_config,
     validate_run_metadata_schema,
 )
+from deberta.io_utils import load_json_mapping
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import (
@@ -29,16 +30,6 @@ from deberta.modeling.export_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    """Load JSON mapping from disk.
-
-    :param Path path: JSON path.
-    :return dict[str, Any]: Parsed mapping.
-    """
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
@@ -61,7 +52,7 @@ def _validate_run_metadata_if_present(run_dir: Path) -> None:
     meta_path = run_dir / "run_metadata.json"
     if not meta_path.exists():
         return
-    raw = _load_json(meta_path)
+    raw = load_json_mapping(meta_path)
     validate_run_metadata_schema(raw, source=str(meta_path))
 
 
@@ -252,8 +243,8 @@ def run_export(cfg: ExportConfig) -> None:
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
     _validate_run_metadata_if_present(run_dir)
 
-    model_cfg = ModelConfig(**_load_json(model_cfg_path))
-    data_cfg = DataConfig(**_load_json(data_cfg_path))
+    model_cfg = ModelConfig(**load_json_mapping(model_cfg_path))
+    data_cfg = DataConfig(**load_json_mapping(data_cfg_path))
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
 

@@ -502,11 +502,6 @@ class DataConfig:
 
     train_split: str = field(default="train", metadata={"help": "Train split name."})
 
-    eval_split: str | None = field(
-        default=None,
-        metadata={"help": "Reserved for future evaluation workflow. Currently unsupported."},
-    )
-
     text_column_name: str = field(
         default="text",
         metadata={"help": "Text column to read from the dataset (for streaming packing)."},
@@ -552,14 +547,6 @@ class DataConfig:
                 "When data.streaming=false, any positive value is canonicalized to 1 "
                 "(non-streaming datasets only support shuffle off/on)."
             )
-        },
-    )
-
-    # Non-streaming preprocessing
-    preprocessing_num_workers: int = field(
-        default=8,
-        metadata={
-            "help": "Legacy non-streaming pretokenization workers. Currently unused in unified packer path."
         },
     )
 
@@ -613,16 +600,6 @@ class TrainConfig:
     max_steps: int = field(default=10_000, metadata={"help": "Total optimizer steps (streaming-friendly)."})
 
     per_device_train_batch_size: int = field(default=4, metadata={"help": "Train batch size per device."})
-
-    per_device_eval_batch_size: int = field(
-        default=4,
-        metadata={
-            "help": (
-                "Reserved for future evaluation workflow. Currently unused "
-                "(must remain default while eval is disabled)."
-            )
-        },
-    )
 
     gradient_accumulation_steps: int = field(
         default=1, metadata={"help": "Accumulate gradients this many steps before optimizer step."}
@@ -697,11 +674,6 @@ class TrainConfig:
 
     # Logging / eval / save
     logging_steps: int = field(default=50, metadata={"help": "Log every N optimizer steps."})
-
-    eval_steps: int = field(
-        default=0,
-        metadata={"help": "Reserved for future evaluation workflow. Must remain 0."},
-    )
 
     save_steps: int = field(default=1_000, metadata={"help": "Save checkpoint every N steps."})
 
@@ -1144,14 +1116,6 @@ def validate_data_config(cfg: DataConfig) -> None:
         # Non-streaming/map-style datasets expose full-dataset shuffle semantics only.
         # Canonicalize any positive buffer request to "shuffle enabled" (1).
         cfg.shuffle_buffer_size = 1
-    if int(cfg.preprocessing_num_workers) < 0:
-        raise ValueError("data.preprocessing_num_workers must be >= 0.")
-    default_preproc_workers = DataConfig().preprocessing_num_workers
-    if int(cfg.preprocessing_num_workers) != int(default_preproc_workers):
-        raise ValueError(
-            "data.preprocessing_num_workers is currently unused in the unified packer path. "
-            f"Keep the default ({default_preproc_workers}) to avoid inert config."
-        )
     if not bool(cfg.pack_sequences):
         # Canonicalize inert setting in sequential mode (no packed doc boundaries exist).
         cfg.block_cross_document_attention = False
@@ -1181,16 +1145,12 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("train.max_steps must be > 0.")
     if int(cfg.per_device_train_batch_size) <= 0:
         raise ValueError("train.per_device_train_batch_size must be > 0.")
-    if int(cfg.per_device_eval_batch_size) <= 0:
-        raise ValueError("train.per_device_eval_batch_size must be > 0.")
     if int(cfg.gradient_accumulation_steps) <= 0:
         raise ValueError("train.gradient_accumulation_steps must be > 0.")
     if int(cfg.warmup_steps) < 0:
         raise ValueError("train.warmup_steps must be >= 0.")
     if int(cfg.logging_steps) < 0:
         raise ValueError("train.logging_steps must be >= 0.")
-    if int(cfg.eval_steps) < 0:
-        raise ValueError("train.eval_steps must be >= 0.")
     if int(cfg.save_steps) < 0:
         raise ValueError("train.save_steps must be >= 0.")
     if int(cfg.save_total_limit) < 0:
@@ -1223,18 +1183,6 @@ def validate_training_workflow_options(
     :param TrainConfig train_cfg: Training configuration.
     :param ModelConfig | None model_cfg: Optional model configuration for cross-surface checks.
     """
-    if data_cfg.eval_split is not None or int(train_cfg.eval_steps) > 0:
-        raise ValueError(
-            "Evaluation workflow is not implemented yet. Set data.eval_split=null and train.eval_steps=0."
-        )
-
-    default_eval_bs = TrainConfig().per_device_eval_batch_size
-    if int(train_cfg.per_device_eval_batch_size) != int(default_eval_bs):
-        raise ValueError(
-            "train.per_device_eval_batch_size is reserved for future evaluation and is currently unused. "
-            f"Keep the default ({default_eval_bs}) while evaluation is disabled."
-        )
-
     sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
     if (
         bool(data_cfg.pack_sequences)
