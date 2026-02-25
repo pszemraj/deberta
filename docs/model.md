@@ -137,6 +137,13 @@ RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.
 
 Packed 3D document-blocking masks are rope-only. The canonical pairwise-mask contract lives in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue); HF backbone runs must keep `data.block_cross_document_attention=false`.
 
+For `torch.compile` default mode with backend `inductor`, runtime auto-scope currently compiles FFN blocks only for native HF DeBERTa (`encoder.layer[*].intermediate/output`) and leaves attention/embeddings eager. Internal overrides for experiments are documented in [`docs/fsdp2.md`](fsdp2.md).
+
+Native HF attention has an internal kernel experiment selector:
+
+- `DEBERTA_HF_ATTN_KERNEL=dynamic` (default)
+- `DEBERTA_HF_ATTN_KERNEL=cached_bmm` (cached relative-position ids + bmm bias path)
+
 Pretraining heads follow backbone norm style by config:
 
 - rope mode: RMSNorm heads

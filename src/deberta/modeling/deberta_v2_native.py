@@ -9,6 +9,7 @@ this repository.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -20,6 +21,8 @@ try:
     from transformers.modeling_outputs import BaseModelOutput
 except Exception as e:  # pragma: no cover
     raise RuntimeError("transformers is required for the hf_deberta_v2 backbone.") from e
+
+_HF_ATTN_KERNEL_ENV = "DEBERTA_HF_ATTN_KERNEL"
 
 
 def _normalize_pos_att_type(raw: Any) -> list[str]:
@@ -103,6 +106,31 @@ def build_relative_position(
     return rel_pos.to(torch.long)
 
 
+def _normalize_hf_attn_kernel(raw: str | None) -> str:
+    """Normalize internal attention-kernel override for native HF DeBERTa.
+
+    :param str | None raw: Environment override value.
+    :raises ValueError: If override value is unsupported.
+    :return str: Canonical kernel name.
+    """
+
+    if raw is None:
+        return "dynamic"
+    value = str(raw).strip().lower().replace("-", "_")
+    if not value:
+        return "dynamic"
+    aliases = {
+        "default": "dynamic",
+        "cache": "cached_bmm",
+        "cached": "cached_bmm",
+    }
+    canonical = aliases.get(value, value)
+    allowed = {"dynamic", "cached_bmm"}
+    if canonical not in allowed:
+        raise ValueError(f"{_HF_ATTN_KERNEL_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
+    return canonical
+
+
 class DebertaV2SelfOutput(nn.Module):
     """Self-attention output projection block."""
 
@@ -169,6 +197,7 @@ class DisentangledSelfAttention(nn.Module):
             self.pos_ebd_size = self.position_buckets
 
         self.pos_dropout = nn.Dropout(float(config.hidden_dropout_prob))
+        self.attn_kernel = _normalize_hf_attn_kernel(os.environ.get(_HF_ATTN_KERNEL_ENV))
 
         if self.relative_attention and (not self.share_att_key):
             if "c2p" in self.pos_att_type:
@@ -259,7 +288,7 @@ class DisentangledSelfAttention(nn.Module):
         projected = projected.view(2 * att_span, self.num_attention_heads, self.attention_head_size)
         return projected.permute(1, 0, 2).contiguous()
 
-    def disentangled_attention_bias(
+    def _disentangled_attention_bias_dynamic(
         self,
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
@@ -267,7 +296,7 @@ class DisentangledSelfAttention(nn.Module):
         rel_embeddings: torch.Tensor,
         scale_factor: int,
     ) -> torch.Tensor:
-        """Compute DeBERTa disentangled positional attention bias.
+        """Compute disentangled positional bias via einsum + gather.
 
         :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
         :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
@@ -317,6 +346,107 @@ class DisentangledSelfAttention(nn.Module):
                 (bsz, nheads, query_len, key_len), device=query_layer.device, dtype=query_layer.dtype
             )
         return score
+
+    def _disentangled_attention_bias_cached_bmm(
+        self,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        relative_pos: torch.Tensor | None,
+        rel_embeddings: torch.Tensor,
+        scale_factor: int,
+    ) -> torch.Tensor:
+        """Compute disentangled positional bias via cached ids + batched matmul.
+
+        :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
+        :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
+        :param torch.Tensor | None relative_pos: Optional relative-position ids.
+        :param torch.Tensor rel_embeddings: Relative embedding table.
+        :param int scale_factor: Attention scale factor.
+        :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
+        """
+
+        bsz, nheads, query_len, _ = query_layer.shape
+        _, _, key_len, _ = key_layer.shape
+        rel_pos = self._normalize_relative_pos(
+            relative_pos,
+            query_len=query_len,
+            key_len=key_len,
+            device=query_layer.device,
+        )
+
+        att_span = int(self.pos_ebd_size)
+        rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
+        score: torch.Tensor | None = None
+
+        if "c2p" in self.pos_att_type:
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)  # (H,2A,D)
+            c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
+
+            q_flat = query_layer.permute(1, 0, 2, 3).reshape(
+                nheads, bsz * query_len, self.attention_head_size
+            )
+            pos_key_t = pos_key_layer.transpose(1, 2).contiguous()  # (H,D,2A)
+            c2p_att = torch.bmm(q_flat, pos_key_t).reshape(nheads, bsz, query_len, 2 * att_span)
+            c2p_att = c2p_att.permute(1, 0, 2, 3).contiguous()  # (B,H,Q,2A)
+
+            c2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)
+            c2p_idx = c2p_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, query_len, key_len)
+            c2p_bias = c2p_att.gather(-1, c2p_idx) / c2p_scale
+            score = c2p_bias if score is None else score + c2p_bias
+
+        if "p2c" in self.pos_att_type:
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)  # (H,2A,D)
+            p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
+
+            k_flat = key_layer.permute(1, 0, 2, 3).reshape(nheads, bsz * key_len, self.attention_head_size)
+            pos_query_t = pos_query_layer.transpose(1, 2).contiguous()  # (H,D,2A)
+            p2c_att = torch.bmm(k_flat, pos_query_t).reshape(nheads, bsz, key_len, 2 * att_span)
+            p2c_att = p2c_att.permute(1, 0, 2, 3).contiguous()  # (B,H,K,2A)
+
+            p2c_idx = (-rel_pos.transpose(0, 1) + att_span).clamp(min=0, max=(2 * att_span) - 1)
+            p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
+            p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
+            score = p2c_bias if score is None else score + p2c_bias
+
+        if score is None:
+            score = torch.zeros(
+                (bsz, nheads, query_len, key_len), device=query_layer.device, dtype=query_layer.dtype
+            )
+        return score
+
+    def disentangled_attention_bias(
+        self,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        relative_pos: torch.Tensor | None,
+        rel_embeddings: torch.Tensor,
+        scale_factor: int,
+    ) -> torch.Tensor:
+        """Compute DeBERTa disentangled positional attention bias.
+
+        :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
+        :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
+        :param torch.Tensor | None relative_pos: Optional relative-position ids.
+        :param torch.Tensor rel_embeddings: Relative embedding table.
+        :param int scale_factor: Attention scale factor.
+        :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
+        """
+
+        if self.attn_kernel == "cached_bmm":
+            return self._disentangled_attention_bias_cached_bmm(
+                query_layer,
+                key_layer,
+                relative_pos,
+                rel_embeddings,
+                scale_factor,
+            )
+        return self._disentangled_attention_bias_dynamic(
+            query_layer,
+            key_layer,
+            relative_pos,
+            rel_embeddings,
+            scale_factor,
+        )
 
     def forward(
         self,
@@ -757,6 +887,8 @@ class DebertaV2Encoder(nn.Module):
         conv_kernel_size = getattr(config, "conv_kernel_size", 0)
         self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
         self.gradient_checkpointing = False
+        self.attn_kernel = _normalize_hf_attn_kernel(os.environ.get(_HF_ATTN_KERNEL_ENV))
+        self.register_buffer("_cached_rel_pos", torch.empty(0, 0, dtype=torch.long), persistent=False)
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         """Return optionally normalized relative embedding table.
@@ -828,6 +960,24 @@ class DebertaV2Encoder(nn.Module):
 
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2]) if query_states is not None else key_len
+
+        if self.attn_kernel == "cached_bmm":
+            cache = self._cached_rel_pos
+            if (
+                cache.ndim != 2
+                or cache.shape[0] != query_len
+                or cache.shape[1] != key_len
+                or cache.device != hidden_states.device
+            ):
+                cache = build_relative_position(
+                    query_len,
+                    key_len,
+                    bucket_size=self.position_buckets,
+                    max_position=self.max_relative_positions,
+                    device=hidden_states.device,
+                )
+                self._cached_rel_pos = cache
+            return cache
 
         return build_relative_position(
             query_len,

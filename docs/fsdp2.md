@@ -48,14 +48,15 @@ RTD wrapper glue (sampling/corruption/label construction) remains eager by desig
 Default compile scope is resolved internally from `DEBERTA_COMPILE_SCOPE=auto`:
 
 - baseline: compile both `generator` and `discriminator` backbones
-- temporary default-mode mitigation: for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles encoder stacks only (`generator.encoder`, `discriminator.encoder`)
+- temporary default-mode mitigation: for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles FFN blocks only (`generator.encoder.layer[*].intermediate/output`, `discriminator.encoder.layer[*].intermediate/output`)
 
-This preserves compile on the dominant FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa backbone compile.
+This preserves compile on dominant MLP FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa attention compile.
 
 Internal debug overrides (no public config change):
 
-- `DEBERTA_COMPILE_SCOPE=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only`
+- `DEBERTA_COMPILE_SCOPE=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|ffn_only|gen_ffn_only|disc_ffn_only`
 - `DEBERTA_COMPILE_BACKEND=inductor|aot_eager`
+- `DEBERTA_HF_ATTN_KERNEL=dynamic|cached_bmm` (native HF DeBERTa attention experiment path)
 
 ### Compile Parity Protocol
 
@@ -65,6 +66,9 @@ Use `scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the
 - optional diagnostic: `--train` mode (informational deltas only)
 - compile bisect scopes: `--scope gen|disc|both|matrix`
 - backend isolation: `--backend inductor|aot_eager`
+
+Use `scratch/hf_attention_inductor_repro.py` for a minimal one-layer train-step repro focused on native HF attention internals.
+Use `scratch/compile_log_summary.py` to convert `wandb/*/files/output.log` into final/min/max/checkpoint/runtime summary tables.
 
 ### Non-Finite Fail-Fast Diagnostics
 

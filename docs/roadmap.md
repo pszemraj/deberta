@@ -23,8 +23,8 @@ For implemented behavior, use the concept docs:
 
 ## Runtime/Compile
 
-- upstream a minimal reproducible `hf_deberta_v2` default-mode inductor training-drift case (with `aot_eager` control) and track removal of the temporary auto encoder-only fallback once full-backbone stability is recovered
-- when re-testing full-backbone compile for GDES, evaluate whether `_SyncedBufferEmbedding.base_weight` should switch from non-persistent buffer to non-trainable `nn.Parameter` for stronger Dynamo mutation tracking
+- run the native HF compile decision matrix (`backbones` control vs `ffn_only` candidate across gdes/none/es, plus 512 NaN gate) and promote/remove fallback based on quality+throughput gates
+- upstream a minimal reproducible native-HF attention inductor drift case using `scratch/hf_attention_inductor_repro.py` with `backend=aot_eager` control and `DEBERTA_HF_ATTN_KERNEL` variants
 - for rope backbone compile hardening, evaluate replacing custom `RMSNorm` with `torch.nn.RMSNorm` and compare convergence/runtime
 - for rope backbone compile hardening, evaluate static/sliced RoPE cache buffers to remove compile-time cache-build branching
 

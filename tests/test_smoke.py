@@ -1359,6 +1359,71 @@ def test_native_hf_deberta_v2_forward_smoke():
     torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
 
 
+def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic(monkeypatch: pytest.MonkeyPatch):
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    torch.manual_seed(123)
+    monkeypatch.setenv("DEBERTA_HF_ATTN_KERNEL", "dynamic")
+    dynamic_model = DebertaV2Model(cfg).eval()
+    snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
+
+    monkeypatch.setenv("DEBERTA_HF_ATTN_KERNEL", "cached_bmm")
+    cached_model = DebertaV2Model(cfg).eval()
+    cached_model.load_state_dict(snapshot, strict=True)
+
+    with torch.no_grad():
+        out_dynamic = dynamic_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        out_cached = cached_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
+
+
+def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_env(monkeypatch: pytest.MonkeyPatch):
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+    )
+
+    monkeypatch.setenv("DEBERTA_HF_ATTN_KERNEL", "bad_kernel")
+    with pytest.raises(ValueError, match="DEBERTA_HF_ATTN_KERNEL must be one of"):
+        _ = DebertaV2Model(cfg)
+
+
 def test_rope_model_accepts_positional_input_ids_call():
     import pytest
 
