@@ -46,6 +46,7 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_genera
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_MAX_NONFINITE_SKIP_STREAK = 8
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -661,6 +662,23 @@ def _global_grad_l2_norm(model: torch.nn.Module) -> float:
     if not found:
         return 0.0
     return float(sq_sum) ** 0.5
+
+
+def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> bool:
+    """Return whether any rank observed a non-finite gradient norm.
+
+    :param Any accelerator: Accelerator-like runtime object.
+    :param float grad_norm: Local gradient L2 norm.
+    :return bool: True when at least one rank reports non-finite norm.
+    """
+    local_flag = 0 if math.isfinite(float(grad_norm)) else 1
+    device = getattr(accelerator, "device", torch.device("cpu"))
+    local = torch.tensor([local_flag], device=device, dtype=torch.int32)
+    with suppress(Exception):
+        reduced = accelerator.reduce(local, reduction="sum")
+        count = int(reduced.reshape(-1)[0].item())
+        return count > 0
+    return local_flag > 0
 
 
 def _scheduler_current_lr(scheduler: Any) -> float | None:
@@ -1715,6 +1733,8 @@ def run_pretraining(
     global_step = 0
     consumed_micro_batches = 0
     last_saved_step = 0
+    nonfinite_skip_total = 0
+    nonfinite_skip_streak = 0
     crash_type: str | None = None
     crash_reason: str | None = None
     crash_step: int | None = None
@@ -1847,7 +1867,8 @@ def run_pretraining(
 
             out = None
             loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
-            did_sync_step = False
+            did_optimizer_step = False
+            skipped_window_due_nonfinite = False
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
@@ -1927,15 +1948,20 @@ def run_pretraining(
                     accelerator.backward(backward_loss)
 
                 if is_sync_step:
-                    did_sync_step = True
                     grad_norm_for_check = _global_grad_l2_norm(model)
-                    if not math.isfinite(float(grad_norm_for_check)):
+                    if _has_nonfinite_grad_norm_any_rank(
+                        accelerator=accelerator,
+                        grad_norm=float(grad_norm_for_check),
+                    ):
+                        skipped_window_due_nonfinite = True
+                        nonfinite_skip_total += 1
+                        nonfinite_skip_streak += 1
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         debug_path = _write_nonfinite_debug_artifact(
                             output_dir=output_dir,
                             step=int(global_step + 1),
                             micro_step_idx=int(step_idx),
-                            offending="grad_norm",
+                            offending=f"grad_norm_skip_{int(nonfinite_skip_total)}",
                             gen_loss_raw=out.gen_loss_raw if out is not None else None,
                             disc_loss_raw=out.disc_loss_raw if out is not None else None,
                             forward_loss=out.loss if out is not None else None,
@@ -1946,27 +1972,99 @@ def run_pretraining(
                             compile_mode=compile_mode,
                             embedding_sharing=str(model_cfg.embedding_sharing),
                         )
-                        raise FloatingPointError(
-                            "Non-finite gradient norm detected before optimizer step "
-                            f"(step={int(global_step + 1)}). Debug artifact: {debug_path}"
+                        logger.warning(
+                            "Skipping optimizer step due non-finite gradient norm "
+                            "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                            int(global_step + 1),
+                            int(nonfinite_skip_streak),
+                            int(nonfinite_skip_total),
+                            debug_path,
                         )
+                        if train_cfg.report_to != "none":
+                            accelerator.log(
+                                {
+                                    "nonfinite_skip_total": float(nonfinite_skip_total),
+                                    "nonfinite_skip_streak": float(nonfinite_skip_streak),
+                                },
+                                step=int(global_step + 1),
+                            )
+                        optimizer.zero_grad(set_to_none=True)
+                        if nonfinite_skip_streak > int(_MAX_NONFINITE_SKIP_STREAK):
+                            raise FloatingPointError(
+                                "Exceeded non-finite gradient skip budget before optimizer step "
+                                f"(step={int(global_step + 1)}, streak={int(nonfinite_skip_streak)}). "
+                                f"Latest debug artifact: {debug_path}"
+                            )
+                        continue
 
                     if _should_clip_gradients(
                         sync_gradients=True,
                         max_grad_norm=train_cfg.max_grad_norm,
                     ):
                         accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+                        post_clip_grad_norm = _global_grad_l2_norm(model)
+                        if _has_nonfinite_grad_norm_any_rank(
+                            accelerator=accelerator,
+                            grad_norm=float(post_clip_grad_norm),
+                        ):
+                            skipped_window_due_nonfinite = True
+                            nonfinite_skip_total += 1
+                            nonfinite_skip_streak += 1
+                            lr_now = _scheduler_current_lr(lr_scheduler)
+                            debug_path = _write_nonfinite_debug_artifact(
+                                output_dir=output_dir,
+                                step=int(global_step + 1),
+                                micro_step_idx=int(step_idx),
+                                offending=f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}",
+                                gen_loss_raw=out.gen_loss_raw if out is not None else None,
+                                disc_loss_raw=out.disc_loss_raw if out is not None else None,
+                                forward_loss=out.loss if out is not None else None,
+                                backward_loss=None,
+                                grad_norm=float(post_clip_grad_norm),
+                                lr=lr_now,
+                                compile_enabled=compile_enabled,
+                                compile_mode=compile_mode,
+                                embedding_sharing=str(model_cfg.embedding_sharing),
+                            )
+                            logger.warning(
+                                "Skipping optimizer step due non-finite post-clip gradient norm "
+                                "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                                int(global_step + 1),
+                                int(nonfinite_skip_streak),
+                                int(nonfinite_skip_total),
+                                debug_path,
+                            )
+                            if train_cfg.report_to != "none":
+                                accelerator.log(
+                                    {
+                                        "nonfinite_skip_total": float(nonfinite_skip_total),
+                                        "nonfinite_skip_streak": float(nonfinite_skip_streak),
+                                    },
+                                    step=int(global_step + 1),
+                                )
+                            optimizer.zero_grad(set_to_none=True)
+                            if nonfinite_skip_streak > int(_MAX_NONFINITE_SKIP_STREAK):
+                                raise FloatingPointError(
+                                    "Exceeded non-finite gradient skip budget after gradient clipping "
+                                    f"(step={int(global_step + 1)}, streak={int(nonfinite_skip_streak)}). "
+                                    f"Latest debug artifact: {debug_path}"
+                                )
+                            continue
 
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    did_optimizer_step = True
+                    nonfinite_skip_streak = 0
 
                     # If embedding_sharing=gdes, the discriminator embedding base buffers must track the
                     # generator embedding weights. Generator embeddings update only on optimizer steps,
                     # so syncing here is sufficient (and avoids per-microbatch copies).
                     _sync_discriminator_embeddings_if_available(unwrapped_model)
 
-            if not did_sync_step:
+            if not did_optimizer_step:
+                if skipped_window_due_nonfinite:
+                    continue
                 raise RuntimeError("Accumulation window produced no synchronized optimization step.")
 
             loss_for_metrics = _finalize_window_metric_loss(
@@ -1976,7 +2074,7 @@ def run_pretraining(
             )
 
             # We count *optimizer* steps (not micro-steps).
-            if did_sync_step:
+            if did_optimizer_step:
                 if out is None:
                     raise RuntimeError("Accumulation window produced no forward pass outputs.")
                 global_step += 1

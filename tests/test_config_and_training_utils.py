@@ -48,6 +48,7 @@ from deberta.training.pretrain import (
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
     _flush_loggers,
+    _has_nonfinite_grad_norm_any_rank,
     _init_trackers,
     _load_checkpoint_data_progress,
     _load_model_state_with_compile_key_remap,
@@ -1052,6 +1053,162 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn_only(
     assert compile_calls[3][1]["dynamic"] is False
 
 
+def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import deberta.training.pretrain as pretrain_mod
+
+    class _FakeAccelerator:
+        def __init__(
+            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
+        ) -> None:
+            del gradient_accumulation_steps, log_with, mixed_precision
+            self.is_main_process = True
+            self.process_index = 0
+            self.num_processes = 1
+            self.device = torch.device("cpu")
+            self.state = "fake-accelerator"
+            self.logged_rows: list[tuple[dict[str, Any], int | None]] = []
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+        def prepare(self, *objs):
+            return objs
+
+        def unwrap_model(self, model):
+            return model
+
+        def no_sync(self, model):
+            del model
+            return nullcontext()
+
+        def backward(self, loss: torch.Tensor) -> None:
+            del loss
+
+        def clip_grad_norm_(self, params, max_norm: float) -> None:
+            del params, max_norm
+
+        def reduce(self, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+            del reduction
+            return tensor
+
+        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+            return tensor
+
+        def log(self, row: dict[str, Any], step: int | None = None) -> None:
+            self.logged_rows.append((dict(row), step))
+
+    fake_accelerate = types.ModuleType("accelerate")
+    fake_accelerate.Accelerator = _FakeAccelerator
+    fake_accelerate_utils = types.ModuleType("accelerate.utils")
+    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
+    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
+
+    class _FakeTokenizer:
+        pad_token_id = 0
+        cls_token_id = 1
+        sep_token_id = 2
+        mask_token_id = 3
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = types.SimpleNamespace(
+        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 3, 9, 2, 0]], dtype=torch.long),
+        "labels": torch.tensor([[-100, 10, -100, -100, -100]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long),
+    }
+
+    def _fake_cycle(_loader):
+        while True:
+            yield batch
+
+    class _FakeRTD(torch.nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            del kwargs
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.generator = torch.nn.Linear(2, 2)
+            self.discriminator = torch.nn.Linear(2, 2)
+            self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
+            self.disc_config = types.SimpleNamespace(pad_token_id=0)
+
+        def forward(self, **kwargs):
+            del kwargs
+            t = self.weight * 0.0 + 1.0
+            return types.SimpleNamespace(
+                loss=t,
+                gen_loss=t.detach(),
+                disc_loss=t.detach(),
+                disc_accuracy=t.detach(),
+                gen_token_count=torch.tensor(1.0),
+                disc_token_count=torch.tensor(1.0),
+                gen_loss_raw=t,
+                disc_loss_raw=t,
+            )
+
+    norm_values = iter([float("inf"), 0.5, 0.25])
+    monkeypatch.setattr(pretrain_mod, "_global_grad_l2_norm", lambda _model: float(next(norm_values)))
+    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
+    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
+    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
+    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
+    monkeypatch.setattr(
+        pretrain_mod,
+        "build_backbone_configs",
+        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        pretrain_mod,
+        "build_backbones",
+        lambda **kwargs: (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
+    )
+    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
+    monkeypatch.setattr(
+        pretrain_mod, "_build_optimizer", lambda model, _cfg: torch.optim.SGD(model.parameters(), lr=0.1)
+    )
+    monkeypatch.setattr(
+        pretrain_mod,
+        "_build_scheduler",
+        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
+    )
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
+    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
+    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
+
+    model_cfg = ModelConfig()
+    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        max_grad_norm=1.0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+    assert "Skipping optimizer step due non-finite gradient norm" in caplog.text
+
+
 def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -1485,6 +1642,20 @@ def test_should_clip_gradients_only_on_sync_steps():
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=0.0) is False
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=-1.0) is False
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=1.0) is True
+
+
+def test_has_nonfinite_grad_norm_any_rank_uses_reduced_flag():
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+
+        def reduce(self, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+            assert reduction == "sum"
+            # Simulate another rank reporting a non-finite norm.
+            return tensor + 1
+
+    accel = _FakeAccelerator()
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is True
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
 
 
 def test_sync_discriminator_embeddings_if_available_is_noop_without_hook():

@@ -80,12 +80,14 @@ Use `scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the
 Use `scratch/hf_attention_inductor_repro.py` for a minimal one-layer train-step repro focused on native HF attention internals.
 Use `scratch/compile_log_summary.py` to convert `wandb/*/files/output.log` into final/min/max/checkpoint/runtime summary tables.
 
-### Non-Finite Fail-Fast Diagnostics
+### Non-Finite Diagnostics
 
-Training now fails fast on first non-finite scalar/gradient instead of silently continuing.
+Training keeps strict scalar checks and bounded retry behavior for gradient overflows.
 
 - checks run before backward (`gen_loss_raw`, `disc_loss_raw`, forward/backward scalar objectives)
-- checks run before optimizer step (global gradient norm)
+- checks run before optimizer step (global gradient norm, and post-clip gradient norm when clipping is enabled)
+- on non-finite gradient norms, the optimizer step is skipped for that accumulation window (grads zeroed) and a warning is logged
+- repeated non-finite gradient windows are capped by an internal streak budget; when exhausted, training raises with diagnostics
 - when triggered, a compact debug artifact is written to:
   - `<output_dir>/debug/nonfinite_step_<STEP>_<TAG>.json`
   - includes step/lr, compile mode, embedding sharing mode, scalar snapshots, and compact RNG state heads
