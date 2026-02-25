@@ -1528,6 +1528,8 @@ def run_pretraining(
     except Exception as e:  # pragma: no cover
         raise RuntimeError("transformers is required.") from e
 
+    # Suppress repeated fast-tokenizer advisory logs that add noise in multi-worker runs.
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
 
     # Sanity
