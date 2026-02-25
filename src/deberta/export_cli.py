@@ -412,27 +412,17 @@ def run_export(cfg: ExportConfig) -> None:
         raise
 
 
-def _build_export_parser(*, prog: str = "deberta export") -> argparse.ArgumentParser:
-    """Build argparse parser for export commands.
-
-    :param str prog: Program name shown in help output.
-    :return argparse.ArgumentParser: Configured parser.
-    """
-    parser = argparse.ArgumentParser(
-        prog=prog,
-        description="Consolidate a training checkpoint and export standalone HF artifacts.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_export_arguments(parser)
-    return parser
-
-
 def main(argv: list[str] | None = None) -> None:
     """Run checkpoint export CLI.
 
     :param list[str] | None argv: Optional CLI argv (excluding program name).
     """
-    parser = _build_export_parser()
+    parser = argparse.ArgumentParser(
+        prog="deberta export",
+        description="Consolidate a training checkpoint and export standalone HF artifacts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_export_arguments(parser)
     args = parser.parse_args(argv)
     cfg = namespace_to_export_config(args)
     run_export(cfg)

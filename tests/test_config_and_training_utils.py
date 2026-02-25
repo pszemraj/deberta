@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
 import logging
@@ -32,7 +33,7 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.export_cli import _build_export_parser
+from deberta.export_cli import add_export_arguments
 from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training.pretrain import (
@@ -1737,7 +1738,8 @@ def test_train_cli_rejects_invalid_constrained_values_at_parse_time():
 
 
 def test_export_parser_rejects_conflicting_boolean_flags():
-    parser = _build_export_parser()
+    parser = argparse.ArgumentParser(prog="deberta export")
+    add_export_arguments(parser)
     with pytest.raises(SystemExit):
         parser.parse_args(["runs/demo/checkpoint-10", "--safe-serialization", "--no-safe-serialization"])
 
