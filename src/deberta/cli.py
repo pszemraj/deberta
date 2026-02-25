@@ -15,13 +15,19 @@ from deberta.config import (
     _BACKBONE_CHOICES,
     _EMBED_SHARING_CHOICES,
     _FFN_CHOICES,
+    _HF_ATTN_KERNEL_ALIASES,
+    _HF_ATTN_KERNEL_CHOICES,
     _LR_SCHEDULER_CHOICES,
     _NORM_ARCH_CHOICES,
     _REPORT_TO_CHOICES,
     _SDPA_KERNEL_ALIASES,
     _SDPA_KERNEL_CHOICES,
+    _TORCH_COMPILE_BACKEND_ALIASES,
+    _TORCH_COMPILE_BACKEND_CHOICES,
     _TORCH_COMPILE_MODE_ALIASES,
     _TORCH_COMPILE_MODE_CHOICES,
+    _TORCH_COMPILE_SCOPE_ALIASES,
+    _TORCH_COMPILE_SCOPE_CHOICES,
     DataConfig,
     ModelConfig,
     TrainConfig,
@@ -195,6 +201,7 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
         "attention_implementation": tuple(sorted(_ATTN_IMPL_CHOICES)),
         "ffn_type": tuple(sorted(_FFN_CHOICES)),
         "pretrained_ffn_type": tuple(sorted(_FFN_CHOICES)),
+        "hf_attention_kernel": tuple(sorted(_HF_ATTN_KERNEL_CHOICES | set(_HF_ATTN_KERNEL_ALIASES.keys()))),
         "embedding_sharing": tuple(sorted(_EMBED_SHARING_CHOICES)),
         "report_to": tuple(sorted(_REPORT_TO_CHOICES)),
         "lr_scheduler_type": tuple(sorted(_LR_SCHEDULER_CHOICES)),
@@ -202,6 +209,12 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
         "sdpa_kernel": tuple(sorted(_SDPA_KERNEL_CHOICES | set(_SDPA_KERNEL_ALIASES.keys()))),
         "torch_compile_mode": tuple(
             sorted(_TORCH_COMPILE_MODE_CHOICES | set(_TORCH_COMPILE_MODE_ALIASES.keys()))
+        ),
+        "torch_compile_scope": tuple(
+            sorted(_TORCH_COMPILE_SCOPE_CHOICES | set(_TORCH_COMPILE_SCOPE_ALIASES.keys()))
+        ),
+        "torch_compile_backend": tuple(
+            sorted(_TORCH_COMPILE_BACKEND_CHOICES | set(_TORCH_COMPILE_BACKEND_ALIASES.keys()))
         ),
     }
 

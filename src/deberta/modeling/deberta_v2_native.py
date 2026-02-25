@@ -9,7 +9,6 @@ this repository.
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import torch
@@ -21,8 +20,6 @@ try:
     from transformers.modeling_outputs import BaseModelOutput
 except Exception as e:  # pragma: no cover
     raise RuntimeError("transformers is required for the hf_deberta_v2 backbone.") from e
-
-_HF_ATTN_KERNEL_ENV = "DEBERTA_HF_ATTN_KERNEL"
 
 
 def _normalize_pos_att_type(raw: Any) -> list[str]:
@@ -107,10 +104,10 @@ def build_relative_position(
 
 
 def _normalize_hf_attn_kernel(raw: str | None) -> str:
-    """Normalize internal attention-kernel override for native HF DeBERTa.
+    """Normalize native hf_deberta_v2 attention-kernel config.
 
-    :param str | None raw: Environment override value.
-    :raises ValueError: If override value is unsupported.
+    :param str | None raw: Config value.
+    :raises ValueError: If value is unsupported.
     :return str: Canonical kernel name.
     """
 
@@ -127,7 +124,7 @@ def _normalize_hf_attn_kernel(raw: str | None) -> str:
     canonical = aliases.get(value, value)
     allowed = {"dynamic", "cached_bmm"}
     if canonical not in allowed:
-        raise ValueError(f"{_HF_ATTN_KERNEL_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
+        raise ValueError(f"hf_attention_kernel must be one of {sorted(allowed)}; got {raw!r}.")
     return canonical
 
 
@@ -197,7 +194,7 @@ class DisentangledSelfAttention(nn.Module):
             self.pos_ebd_size = self.position_buckets
 
         self.pos_dropout = nn.Dropout(float(config.hidden_dropout_prob))
-        self.attn_kernel = _normalize_hf_attn_kernel(os.environ.get(_HF_ATTN_KERNEL_ENV))
+        self.attn_kernel = _normalize_hf_attn_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
 
         if self.relative_attention and (not self.share_att_key):
             if "c2p" in self.pos_att_type:
@@ -887,7 +884,7 @@ class DebertaV2Encoder(nn.Module):
         conv_kernel_size = getattr(config, "conv_kernel_size", 0)
         self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
         self.gradient_checkpointing = False
-        self.attn_kernel = _normalize_hf_attn_kernel(os.environ.get(_HF_ATTN_KERNEL_ENV))
+        self.attn_kernel = _normalize_hf_attn_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
         self.register_buffer("_cached_rel_pos", torch.empty(0, 0, dtype=torch.long), persistent=False)
 
     def get_rel_embedding(self) -> torch.Tensor | None:

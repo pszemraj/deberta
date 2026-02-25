@@ -21,8 +21,11 @@ from deberta.config import (
     DataConfig,
     ModelConfig,
     TrainConfig,
+    _normalize_hf_attention_kernel,
     _normalize_sdpa_kernel,
+    _normalize_torch_compile_backend,
     _normalize_torch_compile_mode,
+    _normalize_torch_compile_scope,
     normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
@@ -45,8 +48,6 @@ from deberta.training.pretrain import (
     _flush_loggers,
     _init_trackers,
     _load_checkpoint_data_progress,
-    _normalize_compile_backend,
-    _normalize_compile_scope,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
     _resolve_compile_scope,
@@ -932,7 +933,6 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn_only(
     monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
     monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
-    monkeypatch.delenv("DEBERTA_COMPILE_SCOPE", raising=False)
 
     model_cfg = ModelConfig(backbone_type="hf_deberta_v2")
     data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
@@ -1285,6 +1285,13 @@ def test_validate_train_config_rejects_invalid_mixed_precision():
         validate_train_config(cfg)
 
 
+def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
+    cfg = TrainConfig(torch_compile_scope="generator_ffn", torch_compile_backend="aot-eager")
+    validate_train_config(cfg)
+    assert cfg.torch_compile_scope == "gen_ffn_only"
+    assert cfg.torch_compile_backend == "aot_eager"
+
+
 def test_token_weighted_micro_objective_matches_full_batch_normalization():
     gen_losses = [torch.tensor(0.5), torch.tensor(0.8)]
     disc_losses = [torch.tensor(0.2), torch.tensor(0.4)]
@@ -1580,29 +1587,35 @@ def test_force_legacy_tf32_for_compile_modes():
 
 
 def test_normalize_compile_scope_accepts_aliases_and_rejects_invalid():
-    assert _normalize_compile_scope(None) == "auto"
-    assert _normalize_compile_scope("") == "auto"
-    assert _normalize_compile_scope("backbone") == "backbones"
-    assert _normalize_compile_scope("full") == "backbones"
-    assert _normalize_compile_scope("encoder") == "encoder_only"
-    assert _normalize_compile_scope("generator_encoder") == "gen_encoder_only"
-    assert _normalize_compile_scope("disc-encoder") == "disc_encoder_only"
-    assert _normalize_compile_scope("ffn") == "ffn_only"
-    assert _normalize_compile_scope("generator_ffn") == "gen_ffn_only"
-    assert _normalize_compile_scope("disc_ffn") == "disc_ffn_only"
+    assert _normalize_torch_compile_scope("auto") == "auto"
+    assert _normalize_torch_compile_scope("backbone") == "backbones"
+    assert _normalize_torch_compile_scope("full") == "backbones"
+    assert _normalize_torch_compile_scope("encoder") == "encoder_only"
+    assert _normalize_torch_compile_scope("generator_encoder") == "gen_encoder_only"
+    assert _normalize_torch_compile_scope("disc-encoder") == "disc_encoder_only"
+    assert _normalize_torch_compile_scope("ffn") == "ffn_only"
+    assert _normalize_torch_compile_scope("generator_ffn") == "gen_ffn_only"
+    assert _normalize_torch_compile_scope("disc_ffn") == "disc_ffn_only"
 
-    with pytest.raises(ValueError, match="DEBERTA_COMPILE_SCOPE must be one of"):
-        _normalize_compile_scope("all")
+    with pytest.raises(ValueError, match="train.torch_compile_scope must be one of"):
+        _normalize_torch_compile_scope("all")
 
 
 def test_normalize_compile_backend_accepts_aliases_and_rejects_invalid():
-    assert _normalize_compile_backend(None) == "inductor"
-    assert _normalize_compile_backend("") == "inductor"
-    assert _normalize_compile_backend("inductor") == "inductor"
-    assert _normalize_compile_backend("aot-eager") == "aot_eager"
+    assert _normalize_torch_compile_backend("inductor") == "inductor"
+    assert _normalize_torch_compile_backend("aot-eager") == "aot_eager"
 
-    with pytest.raises(ValueError, match="DEBERTA_COMPILE_BACKEND must be one of"):
-        _normalize_compile_backend("xla")
+    with pytest.raises(ValueError, match="train.torch_compile_backend must be one of"):
+        _normalize_torch_compile_backend("xla")
+
+
+def test_normalize_hf_attention_kernel_accepts_aliases_and_rejects_invalid():
+    assert _normalize_hf_attention_kernel("dynamic") == "dynamic"
+    assert _normalize_hf_attention_kernel("cache") == "cached_bmm"
+    assert _normalize_hf_attention_kernel("cached-bmm") == "cached_bmm"
+
+    with pytest.raises(ValueError, match="model.hf_attention_kernel must be one of"):
+        _normalize_hf_attention_kernel("einsum")
 
 
 def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
@@ -1831,6 +1844,18 @@ def test_validate_model_config_rejects_rope_only_knobs_in_hf_mode():
         rope_theta=50_000.0,
     )
     with pytest.raises(ValueError, match="only valid when model.backbone_type='rope'"):
+        validate_model_config(cfg)
+
+
+def test_validate_model_config_normalizes_hf_attention_kernel_alias():
+    cfg = ModelConfig(backbone_type="hf_deberta_v2", hf_attention_kernel="cache")
+    validate_model_config(cfg)
+    assert cfg.hf_attention_kernel == "cached_bmm"
+
+
+def test_validate_model_config_rejects_hf_attention_kernel_override_for_rope_backbone():
+    cfg = ModelConfig(backbone_type="rope", hf_attention_kernel="cached_bmm")
+    with pytest.raises(ValueError, match="model.hf_attention_kernel only applies when"):
         validate_model_config(cfg)
 
 

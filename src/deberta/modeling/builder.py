@@ -440,6 +440,7 @@ def _apply_hf_config_normalization(
         from_scratch=bool(model_cfg.from_scratch),
     )
     _apply_dropout_overrides(cfg, model_cfg)
+    cfg.hf_attention_kernel = str(model_cfg.hf_attention_kernel)
     cfg.use_rmsnorm_heads = False
 
 

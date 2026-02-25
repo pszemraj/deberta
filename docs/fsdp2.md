@@ -45,18 +45,18 @@ If compile fails at runtime, training logs a warning and continues without compi
 
 RTD wrapper glue (sampling/corruption/label construction) remains eager by design.
 
-Default compile scope is resolved internally from `DEBERTA_COMPILE_SCOPE=auto`:
+Default compile scope is resolved from `train.torch_compile_scope=auto`:
 
 - baseline: compile both `generator` and `discriminator` backbones
 - temporary default-mode mitigation: for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles FFN blocks only (`generator.encoder.layer[*].intermediate/output`, `discriminator.encoder.layer[*].intermediate/output`)
 
 This preserves compile on dominant MLP FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa attention compile.
 
-Internal debug overrides (no public config change):
+Compile behavior is configured directly via train/model config:
 
-- `DEBERTA_COMPILE_SCOPE=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|ffn_only|gen_ffn_only|disc_ffn_only`
-- `DEBERTA_COMPILE_BACKEND=inductor|aot_eager`
-- `DEBERTA_HF_ATTN_KERNEL=dynamic|cached_bmm` (native HF DeBERTa attention experiment path)
+- `train.torch_compile_scope=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|ffn_only|gen_ffn_only|disc_ffn_only`
+- `train.torch_compile_backend=inductor|aot_eager`
+- `model.hf_attention_kernel=dynamic|cached_bmm` (native HF DeBERTa attention experiment path)
 
 ### Compile Parity Protocol
 

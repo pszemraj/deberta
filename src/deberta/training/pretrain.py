@@ -7,7 +7,6 @@ import inspect
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import time
@@ -46,8 +45,6 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_genera
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_COMPILE_SCOPE_ENV = "DEBERTA_COMPILE_SCOPE"
-_COMPILE_BACKEND_ENV = "DEBERTA_COMPILE_BACKEND"
 
 
 def _json_dump(obj: Any, path: Path) -> None:
@@ -641,77 +638,6 @@ def _should_force_legacy_tf32_for_compile(*, torch_compile: bool, compile_mode: 
     # On some PyTorch builds, max-autotune paths still query legacy allow_tf32
     # and can error if only the new fp32_precision API has been configured.
     return compile_mode.startswith("max-autotune")
-
-
-def _normalize_compile_scope(raw: str | None) -> str:
-    """Normalize internal compile-scope override.
-
-    The public config remains unchanged. This is an internal env override used for
-    diagnostics and temporary mitigation while full-backbone inductor stability is
-    being validated.
-
-    :param str | None raw: Raw scope string from environment.
-    :raises ValueError: If value is unsupported.
-    :return str: Canonical compile scope.
-    """
-    if raw is None:
-        return "auto"
-    value = str(raw).strip().lower().replace("-", "_")
-    if not value:
-        return "auto"
-    aliases = {
-        "both": "backbones",
-        "backbone": "backbones",
-        "full": "backbones",
-        "encoder": "encoder_only",
-        "encoders": "encoder_only",
-        "gen_encoder": "gen_encoder_only",
-        "generator_encoder": "gen_encoder_only",
-        "disc_encoder": "disc_encoder_only",
-        "discriminator_encoder": "disc_encoder_only",
-        "ffn": "ffn_only",
-        "ffns": "ffn_only",
-        "gen_ffn": "gen_ffn_only",
-        "generator_ffn": "gen_ffn_only",
-        "disc_ffn": "disc_ffn_only",
-        "discriminator_ffn": "disc_ffn_only",
-    }
-    canonical = aliases.get(value, value)
-    allowed = {
-        "auto",
-        "backbones",
-        "encoder_only",
-        "gen_encoder_only",
-        "disc_encoder_only",
-        "ffn_only",
-        "gen_ffn_only",
-        "disc_ffn_only",
-    }
-    if canonical not in allowed:
-        raise ValueError(f"{_COMPILE_SCOPE_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
-    return canonical
-
-
-def _normalize_compile_backend(raw: str | None) -> str:
-    """Normalize internal compile backend override.
-
-    :param str | None raw: Raw backend string from environment.
-    :raises ValueError: If backend is unsupported.
-    :return str: Canonical backend name.
-    """
-    if raw is None:
-        return "inductor"
-    value = str(raw).strip().lower()
-    if not value:
-        return "inductor"
-    aliases = {
-        "aot-eager": "aot_eager",
-    }
-    canonical = aliases.get(value, value)
-    allowed = {"inductor", "aot_eager"}
-    if canonical not in allowed:
-        raise ValueError(f"{_COMPILE_BACKEND_ENV} must be one of {sorted(allowed)}; got {raw!r}.")
-    return canonical
 
 
 def _resolve_compile_scope(
@@ -1529,7 +1455,8 @@ def run_pretraining(
         raise RuntimeError("transformers is required.") from e
 
     # Suppress repeated fast-tokenizer advisory logs that add noise in multi-worker runs.
-    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+    with suppress(Exception):
+        logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
 
     # Sanity
@@ -1624,8 +1551,8 @@ def run_pretraining(
     compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
     if compile_enabled:
         try:
-            compile_scope_requested = _normalize_compile_scope(os.environ.get(_COMPILE_SCOPE_ENV))
-            compile_backend = _normalize_compile_backend(os.environ.get(_COMPILE_BACKEND_ENV))
+            compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
+            compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
             compile_scope, scope_reason = _resolve_compile_scope(
                 requested_scope=compile_scope_requested,
                 model_cfg=model_cfg,

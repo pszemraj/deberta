@@ -1359,7 +1359,7 @@ def test_native_hf_deberta_v2_forward_smoke():
     torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
 
 
-def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic(monkeypatch: pytest.MonkeyPatch):
+def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic():
     import pytest
 
     pytest.importorskip("transformers")
@@ -1385,11 +1385,11 @@ def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic(monkeypatch: 
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
     torch.manual_seed(123)
-    monkeypatch.setenv("DEBERTA_HF_ATTN_KERNEL", "dynamic")
+    cfg.hf_attention_kernel = "dynamic"
     dynamic_model = DebertaV2Model(cfg).eval()
     snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
 
-    monkeypatch.setenv("DEBERTA_HF_ATTN_KERNEL", "cached_bmm")
+    cfg.hf_attention_kernel = "cached_bmm"
     cached_model = DebertaV2Model(cfg).eval()
     cached_model.load_state_dict(snapshot, strict=True)
 
@@ -1400,7 +1400,7 @@ def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic(monkeypatch: 
     torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
 
 
-def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_env(monkeypatch: pytest.MonkeyPatch):
+def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
     import pytest
 
     pytest.importorskip("transformers")
@@ -1419,8 +1419,8 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_env(monkeypatch: 
         type_vocab_size=0,
     )
 
-    monkeypatch.setenv("DEBERTA_HF_ATTN_KERNEL", "bad_kernel")
-    with pytest.raises(ValueError, match="DEBERTA_HF_ATTN_KERNEL must be one of"):
+    cfg.hf_attention_kernel = "bad_kernel"
+    with pytest.raises(ValueError, match="hf_attention_kernel must be one of"):
         _ = DebertaV2Model(cfg)
 
 

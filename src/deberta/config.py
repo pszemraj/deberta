@@ -37,6 +37,43 @@ _TORCH_COMPILE_MODE_ALIASES = {
     "max_autotune": "max-autotune",
     "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
 }
+_TORCH_COMPILE_SCOPE_CHOICES = {
+    "auto",
+    "backbones",
+    "encoder_only",
+    "gen_encoder_only",
+    "disc_encoder_only",
+    "ffn_only",
+    "gen_ffn_only",
+    "disc_ffn_only",
+}
+_TORCH_COMPILE_SCOPE_ALIASES = {
+    "both": "backbones",
+    "backbone": "backbones",
+    "full": "backbones",
+    "encoder": "encoder_only",
+    "encoders": "encoder_only",
+    "gen_encoder": "gen_encoder_only",
+    "generator_encoder": "gen_encoder_only",
+    "disc_encoder": "disc_encoder_only",
+    "discriminator_encoder": "disc_encoder_only",
+    "ffn": "ffn_only",
+    "ffns": "ffn_only",
+    "gen_ffn": "gen_ffn_only",
+    "generator_ffn": "gen_ffn_only",
+    "disc_ffn": "disc_ffn_only",
+    "discriminator_ffn": "disc_ffn_only",
+}
+_TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
+_TORCH_COMPILE_BACKEND_ALIASES = {
+    "aot-eager": "aot_eager",
+}
+_HF_ATTN_KERNEL_CHOICES = {"dynamic", "cached_bmm"}
+_HF_ATTN_KERNEL_ALIASES = {
+    "default": "dynamic",
+    "cache": "cached_bmm",
+    "cached": "cached_bmm",
+}
 _MIXED_PRECISION_CANONICAL = {"bf16", "no"}
 _MIXED_PRECISION_ALIASES = {
     "bf16": "bf16",
@@ -90,6 +127,16 @@ class ModelConfig:
             "help": (
                 "Backbone implementation: 'rope' (recommended) or 'hf_deberta_v2' (HF DeBERTa compatibility mode). "
                 "RoPE/RMSNorm/KEEL only apply to 'rope'; hf_deberta_v2 uses the native DeBERTa-v2 stack."
+            )
+        },
+    )
+
+    hf_attention_kernel: str = field(
+        default="dynamic",
+        metadata={
+            "help": (
+                "Native hf_deberta_v2 attention kernel variant (dynamic|cached_bmm). "
+                "Only applies when model.backbone_type=hf_deberta_v2."
             )
         },
     )
@@ -693,6 +740,21 @@ class TrainConfig:
         },
     )
 
+    torch_compile_scope: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "torch.compile scope (auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|"
+                "ffn_only|gen_ffn_only|disc_ffn_only)."
+            )
+        },
+    )
+
+    torch_compile_backend: str = field(
+        default="inductor",
+        metadata={"help": "torch.compile backend (inductor|aot_eager)."},
+    )
+
     tf32: bool = field(default=True, metadata={"help": "Enable TF32 matmul on Ampere+ GPUs."})
 
     sdpa_kernel: str = field(
@@ -760,6 +822,39 @@ def _normalize_torch_compile_mode(value: str) -> str:
     return _ensure_choice("train.torch_compile_mode", v, _TORCH_COMPILE_MODE_CHOICES)
 
 
+def _normalize_torch_compile_scope(value: str) -> str:
+    """Normalize and validate torch.compile scope values.
+
+    :param str value: Raw compile scope value.
+    :return str: Canonical compile scope.
+    """
+    v = str(value).strip().lower().replace("-", "_")
+    v = _TORCH_COMPILE_SCOPE_ALIASES.get(v, v)
+    return _ensure_choice("train.torch_compile_scope", v, _TORCH_COMPILE_SCOPE_CHOICES)
+
+
+def _normalize_torch_compile_backend(value: str) -> str:
+    """Normalize and validate torch.compile backend values.
+
+    :param str value: Raw compile backend value.
+    :return str: Canonical compile backend.
+    """
+    v = str(value).strip().lower().replace("-", "_")
+    v = _TORCH_COMPILE_BACKEND_ALIASES.get(v, v)
+    return _ensure_choice("train.torch_compile_backend", v, _TORCH_COMPILE_BACKEND_CHOICES)
+
+
+def _normalize_hf_attention_kernel(value: str) -> str:
+    """Normalize and validate native hf_deberta_v2 attention-kernel values.
+
+    :param str value: Raw attention-kernel value.
+    :return str: Canonical attention-kernel name.
+    """
+    v = str(value).strip().lower().replace("-", "_")
+    v = _HF_ATTN_KERNEL_ALIASES.get(v, v)
+    return _ensure_choice("model.hf_attention_kernel", v, _HF_ATTN_KERNEL_CHOICES)
+
+
 def normalize_mixed_precision(value: object) -> str:
     """Normalize and validate mixed precision values.
 
@@ -822,6 +917,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
     :param ModelConfig cfg: Model configuration.
     """
     cfg.backbone_type = _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
+    cfg.hf_attention_kernel = _normalize_hf_attention_kernel(cfg.hf_attention_kernel)
     cfg.norm_arch = _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES)
     cfg.attention_implementation = _ensure_choice(
         "model.attention_implementation", cfg.attention_implementation, _ATTN_IMPL_CHOICES
@@ -876,6 +972,13 @@ def validate_model_config(cfg: ModelConfig) -> None:
         if changed:
             raise ValueError(
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
+            )
+    else:
+        default_hf_kernel = ModelConfig().hf_attention_kernel
+        if cfg.hf_attention_kernel != default_hf_kernel:
+            raise ValueError(
+                "model.hf_attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Keep the default value ({default_hf_kernel!r}) for other backbones."
             )
 
     if (
@@ -1065,6 +1168,8 @@ def validate_train_config(cfg: TrainConfig) -> None:
     )
     cfg.sdpa_kernel = _normalize_sdpa_kernel(cfg.sdpa_kernel)
     cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
+    cfg.torch_compile_scope = _normalize_torch_compile_scope(cfg.torch_compile_scope)
+    cfg.torch_compile_backend = _normalize_torch_compile_backend(cfg.torch_compile_backend)
 
     cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
     if cfg.output_dir is not None and not str(cfg.output_dir).strip():
