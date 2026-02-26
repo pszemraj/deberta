@@ -2361,11 +2361,7 @@ def run_pretraining(
                         "disc_acc": _mean(out.disc_accuracy),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
-                        "nonfinite_skip_total": float(nonfinite_skip_total),
-                        "nonfinite_skip_streak": float(nonfinite_skip_streak),
                     }
-                    if int(nonfinite_sanitized_count) > 0:
-                        metrics["nonfinite_sanitized_grad_elems"] = float(nonfinite_sanitized_count)
 
                     if accelerator.is_main_process:
                         logger.info(
