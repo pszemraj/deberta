@@ -59,6 +59,7 @@ from deberta.training.pretrain import (
     _prepare_output_dir,
     _resolve_compile_scope,
     _resolve_output_dir,
+    _resolve_output_dir_for_accelerator,
     _resolve_resume_checkpoint,
     _sanitize_nonfinite_gradients_,
     _save_checkpoint_data_progress,
@@ -266,6 +267,47 @@ def test_resolve_output_dir_keeps_explicit_path():
         config_path="configs/pretrain_rope_fineweb_edu.yaml",
     )
     assert out == Path("runs/custom/run-01")
+
+
+def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
+    class _FakeAccelerator:
+        is_main_process = False
+        num_processes = 8
+
+    called = {"count": 0}
+
+    def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
+        del payload, from_process
+        called["count"] += 1
+
+    out = _resolve_output_dir_for_accelerator(
+        accelerator=_FakeAccelerator(),
+        output_dir="runs/custom/run-02",
+        project_name="ignored",
+        config_path="cfg.yaml",
+        broadcast_fn=_fake_broadcast,
+    )
+    assert out == Path("runs/custom/run-02")
+    assert called["count"] == 0
+
+
+def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
+    class _FakeAccelerator:
+        is_main_process = False
+        num_processes = 2
+
+    def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
+        assert from_process == 0
+        payload[0] = "runs/demo/20260101_010101_shared"
+
+    out = _resolve_output_dir_for_accelerator(
+        accelerator=_FakeAccelerator(),
+        output_dir=None,
+        project_name="demo",
+        config_path="cfg.yaml",
+        broadcast_fn=_fake_broadcast,
+    )
+    assert out == Path("runs/demo/20260101_010101_shared")
 
 
 def test_resolve_resume_checkpoint_auto_returns_none_when_no_checkpoint(tmp_path: Path):
@@ -1876,6 +1918,43 @@ def test_count_input_tokens_for_batch_uses_attention_mask_when_available():
 def test_count_input_tokens_for_batch_falls_back_to_input_size():
     batch = {"input_ids": torch.tensor([[10, 11, 12], [13, 14, 15]], dtype=torch.long)}
     assert _count_input_tokens_for_batch(batch) == pytest.approx(6.0)
+
+
+def test_count_input_tokens_for_batch_uses_token_activity_for_3d_pairwise_mask():
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
+        "attention_mask": torch.tensor(
+            [
+                [
+                    [1, 1, 0, 0],
+                    [1, 1, 0, 0],
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 0],
+                ]
+            ],
+            dtype=torch.long,
+        ),
+    }
+    assert _count_input_tokens_for_batch(batch) == pytest.approx(2.0)
+
+
+def test_count_input_tokens_for_batch_uses_token_activity_for_4d_pairwise_mask():
+    pair_keep = torch.tensor(
+        [
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+            ]
+        ],
+        dtype=torch.long,
+    )
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
+        "attention_mask": pair_keep.unsqueeze(1),
+    }
+    assert _count_input_tokens_for_batch(batch) == pytest.approx(2.0)
 
 
 def test_compute_disc_active_mask_preserves_masked_non_special_tokens():

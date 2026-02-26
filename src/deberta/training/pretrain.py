@@ -139,6 +139,66 @@ def _resolve_output_dir(
     return Path("runs") / project / f"{stamp}_{run_name}"
 
 
+def _resolve_output_dir_for_accelerator(
+    *,
+    accelerator: Any,
+    output_dir: str | None,
+    project_name: str,
+    config_path: str | Path | None,
+    broadcast_fn: Any | None = None,
+) -> Path:
+    """Resolve output_dir with deterministic auto-naming across distributed ranks.
+
+    :param Any accelerator: Accelerator-like runtime exposing ``is_main_process`` and ``num_processes``.
+    :param str | None output_dir: User-configured output directory.
+    :param str project_name: Tracker project namespace.
+    :param str | Path | None config_path: Optional config path used for auto-naming.
+    :param Any | None broadcast_fn: Optional callable compatible with
+        ``accelerate.utils.broadcast_object_list``.
+    :raises RuntimeError: If distributed broadcast fails or returns an empty path.
+    :return Path: Concrete output directory path.
+    """
+    explicit = output_dir is not None and str(output_dir).strip()
+    if explicit:
+        return Path(str(output_dir))
+
+    num_processes = int(getattr(accelerator, "num_processes", 1))
+    if num_processes <= 1:
+        return _resolve_output_dir(
+            output_dir=None,
+            project_name=project_name,
+            config_path=config_path,
+        )
+
+    if broadcast_fn is None:
+        try:
+            from accelerate.utils import broadcast_object_list as broadcast_fn  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Distributed auto output_dir resolution requires accelerate.utils.broadcast_object_list."
+            ) from exc
+
+    shared: list[str | None] = [None]
+    if bool(getattr(accelerator, "is_main_process", False)):
+        shared[0] = str(
+            _resolve_output_dir(
+                output_dir=None,
+                project_name=project_name,
+                config_path=config_path,
+            )
+        )
+
+    try:
+        broadcast_fn(shared, from_process=0)
+    except Exception as exc:
+        raise RuntimeError("Failed to broadcast auto-resolved output_dir across ranks.") from exc
+
+    resolved = shared[0]
+    if resolved is None or not str(resolved).strip():
+        raise RuntimeError("Broadcasted output_dir is empty in distributed auto-output-dir resolution.")
+    return Path(str(resolved))
+
+
 def _unwrap_model_for_runtime(accelerator: Any, model: torch.nn.Module) -> torch.nn.Module:
     """Unwrap accelerate-wrapped models while tolerating torch.compile internals.
 
@@ -1333,10 +1393,23 @@ def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
     :return float: Count of active input tokens.
     """
     attention_mask = batch.get("attention_mask")
-    if isinstance(attention_mask, torch.Tensor):
-        return float(attention_mask.detach().sum().item())
-
     input_ids = batch.get("input_ids")
+    if isinstance(attention_mask, torch.Tensor):
+        if isinstance(input_ids, torch.Tensor):
+            active = attention_mask_to_active_tokens(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=None,
+            )
+            return float(active.detach().sum().item())
+
+        mask = attention_mask.detach().to(dtype=torch.bool)
+        if mask.ndim == 4:
+            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
+        if mask.ndim == 3:
+            mask = torch.diagonal(mask, dim1=-2, dim2=-1)
+        return float(mask.sum().item())
+
     if not isinstance(input_ids, torch.Tensor):
         return 0.0
     return float(input_ids.numel())
@@ -1742,7 +1815,8 @@ def run_pretraining(
 
     # Resolve output dir before side effects and persist the concrete path in train_cfg.
     configured_output_dir = train_cfg.output_dir
-    output_dir = _resolve_output_dir(
+    output_dir = _resolve_output_dir_for_accelerator(
+        accelerator=accelerator,
         output_dir=train_cfg.output_dir,
         project_name=train_cfg.project_name,
         config_path=config_path,
