@@ -101,8 +101,8 @@ def _parse_args() -> ProbeConfig:
     parser.add_argument("--compile-mode", default="default")
     parser.add_argument(
         "--compile-scope",
-        choices=["none", "backbones", "encoder_only", "ffn_only"],
-        default="ffn_only",
+        choices=["none", "backbones", "encoder", "ffn"],
+        default="ffn",
     )
     parser.add_argument("--compile-dynamic", action="store_true")
     parser.add_argument("--bf16", action="store_true")
@@ -218,17 +218,17 @@ def _apply_compile_scope(model: DebertaV3RTDPretrainer, cfg: ProbeConfig) -> Non
         model.discriminator = torch.compile(model.discriminator, **kwargs)  # type: ignore[assignment]
         return
 
-    if cfg.compile_scope == "encoder_only":
+    if cfg.compile_scope == "encoder":
         model.generator.encoder = torch.compile(model.generator.encoder, **kwargs)  # type: ignore[attr-defined]
         model.discriminator.encoder = torch.compile(model.discriminator.encoder, **kwargs)  # type: ignore[attr-defined]
         return
 
-    if cfg.compile_scope == "ffn_only":
+    if cfg.compile_scope == "ffn":
         for branch_name in ("generator", "discriminator"):
             backbone = getattr(model, branch_name)
             layers = getattr(getattr(backbone, "encoder", None), "layer", None)
             if not isinstance(layers, (torch.nn.ModuleList, list, tuple)):
-                raise RuntimeError(f"{branch_name}.encoder.layer missing; cannot apply ffn_only scope.")
+                raise RuntimeError(f"{branch_name}.encoder.layer missing; cannot apply ffn scope.")
             for layer in layers:
                 layer.intermediate = torch.compile(layer.intermediate, **kwargs)  # type: ignore[assignment]
                 layer.output = torch.compile(layer.output, **kwargs)  # type: ignore[assignment]

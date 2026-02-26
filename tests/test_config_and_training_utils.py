@@ -795,7 +795,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.ended is False
 
 
-def test_run_pretraining_compiles_only_generator_and_discriminator(
+def test_run_pretraining_compiles_generator_and_discriminator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import deberta.training.pretrain as pretrain_mod
@@ -971,7 +971,7 @@ def test_run_pretraining_compiles_only_generator_and_discriminator(
     assert compile_calls[1][1]["dynamic"] is False
 
 
-def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn_only(
+def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import deberta.training.pretrain as pretrain_mod
@@ -1719,7 +1719,7 @@ def test_validate_train_config_rejects_invalid_mixed_precision():
 def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
     cfg = TrainConfig(torch_compile_scope="generator_ffn", torch_compile_backend="aot-eager")
     validate_train_config(cfg)
-    assert cfg.torch_compile_scope == "gen_ffn_only"
+    assert cfg.torch_compile_scope == "gen_ffn"
     assert cfg.torch_compile_backend == "aot_eager"
 
 
@@ -1852,7 +1852,7 @@ def test_build_training_collator_propagates_packed_sequences_flag():
     assert collator._block_cross_document_attention is True
 
 
-def test_should_clip_gradients_only_on_sync_steps():
+def test_should_clip_gradients_on_sync_steps():
     assert _should_clip_gradients(sync_gradients=False, max_grad_norm=1.0) is False
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=None) is False
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=0.0) is False
@@ -2091,12 +2091,12 @@ def test_normalize_compile_scope_accepts_aliases_and_rejects_invalid():
     assert _normalize_torch_compile_scope("auto") == "auto"
     assert _normalize_torch_compile_scope("backbone") == "backbones"
     assert _normalize_torch_compile_scope("full") == "backbones"
-    assert _normalize_torch_compile_scope("encoder") == "encoder_only"
-    assert _normalize_torch_compile_scope("generator_encoder") == "gen_encoder_only"
-    assert _normalize_torch_compile_scope("disc-encoder") == "disc_encoder_only"
-    assert _normalize_torch_compile_scope("ffn") == "ffn_only"
-    assert _normalize_torch_compile_scope("generator_ffn") == "gen_ffn_only"
-    assert _normalize_torch_compile_scope("disc_ffn") == "disc_ffn_only"
+    assert _normalize_torch_compile_scope("encoder") == "encoder"
+    assert _normalize_torch_compile_scope("generator_encoder") == "gen_encoder"
+    assert _normalize_torch_compile_scope("disc-encoder") == "disc_encoder"
+    assert _normalize_torch_compile_scope("ffn") == "ffn"
+    assert _normalize_torch_compile_scope("generator_ffn") == "gen_ffn"
+    assert _normalize_torch_compile_scope("disc_ffn") == "disc_ffn"
 
     with pytest.raises(ValueError, match="train.torch_compile_scope must be one of"):
         _normalize_torch_compile_scope("all")
@@ -2145,12 +2145,12 @@ def test_stabilize_hf_compile_attention_mask_adds_missing_mask_for_hf_backbone()
     assert torch.equal(out["attention_mask"], torch.ones_like(batch["input_ids"], dtype=torch.bool))
 
 
-def test_stabilize_hf_compile_attention_mask_keeps_ffn_only_batches_unchanged():
+def test_stabilize_hf_compile_attention_mask_keeps_ffn_batches_unchanged():
     batch = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
     out = _stabilize_hf_compile_attention_mask(
         batch=dict(batch),
         compile_enabled=True,
-        compile_scope="ffn_only",
+        compile_scope="ffn",
         backbone_type="hf_deberta_v2",
     )
     assert "attention_mask" not in out
@@ -2164,7 +2164,7 @@ def test_stabilize_hf_compile_attention_mask_converts_non_bool_mask():
     out = _stabilize_hf_compile_attention_mask(
         batch=batch,
         compile_enabled=True,
-        compile_scope="encoder_only",
+        compile_scope="encoder",
         backbone_type="hf_deberta_v2",
     )
     assert out["attention_mask"].dtype == torch.bool
@@ -2178,7 +2178,7 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
         compile_mode="default",
         compile_backend="inductor",
     )
-    assert scope == "ffn_only"
+    assert scope == "ffn"
     assert reason is not None
 
     scope, reason = _resolve_compile_scope(
@@ -2209,7 +2209,7 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
     assert reason is None
 
 
-def test_full_backbone_hf_inductor_warning_only_for_unstable_combo():
+def test_full_backbone_hf_inductor_warning_for_unstable_combo():
     msg = _full_backbone_hf_inductor_warning(
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         compile_enabled=True,
@@ -2217,13 +2217,13 @@ def test_full_backbone_hf_inductor_warning_only_for_unstable_combo():
         compile_backend="inductor",
     )
     assert msg is not None
-    assert "ffn_only" in msg
+    assert "ffn" in msg
 
     assert (
         _full_backbone_hf_inductor_warning(
             model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
             compile_enabled=True,
-            compile_scope="ffn_only",
+            compile_scope="ffn",
             compile_backend="inductor",
         )
         is None
@@ -2264,7 +2264,6 @@ def test_normalize_sdpa_kernel_accepts_aliases_and_rejects_invalid():
     assert _normalize_sdpa_kernel("flashattention") == "flash"
     assert _normalize_sdpa_kernel("mem-efficient") == "mem_efficient"
     assert _normalize_sdpa_kernel("math") == "math"
-    assert _normalize_sdpa_kernel("flash_only") == "flash"
 
     with pytest.raises(ValueError, match="train.sdpa_kernel must be one of"):
         _normalize_sdpa_kernel("best")
@@ -2437,7 +2436,7 @@ def test_validate_training_workflow_options_rejects_hf_backbone_doc_blocking_in_
         )
 
 
-def test_validate_model_config_rejects_rope_only_knobs_in_hf_mode():
+def test_validate_model_config_rejects_rope_knobs_in_hf_mode():
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         rope_theta=50_000.0,

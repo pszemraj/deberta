@@ -87,19 +87,19 @@ Recommended stable HFv2 compile path:
 - `model.hf_attention_kernel=stable`
 - `train.torch_compile_mode=default`
 - `train.torch_compile_backend=inductor`
-- `train.torch_compile_scope=ffn_only` (or `auto` with the default-mode fallback)
+- `train.torch_compile_scope=ffn` (or `auto` with the default-mode fallback)
 
 Full-backbone HFv2 compile with inductor is currently unstable and not recommended for production pretraining runs. The runtime now emits a warning if this path is requested explicitly.
 
 Compile behavior is configured directly via train/model config:
 
-- `train.torch_compile_scope=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|ffn_only|gen_ffn_only|disc_ffn_only`
+- `train.torch_compile_scope=auto|backbones|encoder|gen_encoder|disc_encoder|ffn|gen_ffn|disc_ffn`
 - `train.torch_compile_backend=inductor|aot_eager`
 
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
 For native HF runs, prefer `model.hf_attention_kernel=stable`.
 
-Resume behavior normalizes compile-wrapper key segments (`._orig_mod`) when needed, so checkpoints can be resumed across different compile scopes (for example, `backbones` -> `ffn_only`) without manual checkpoint surgery.
+Resume behavior normalizes compile-wrapper key segments (`._orig_mod`) when needed, so checkpoints can be resumed across different compile scopes (for example, `backbones` -> `ffn`) without manual checkpoint surgery.
 
 ### Compile Parity Protocol
 
@@ -161,11 +161,11 @@ Use `train.sdpa_kernel` to set SDPA backend preference:
 - `mem_efficient`
 - `math`
 
-`flash` is strict flash-only behavior. If flash attention is not supported for the runtime/device/shape, execution should fail instead of silently falling back.
+`flash` is strict flash behavior. If flash attention is not supported for the runtime/device/shape, execution should fail instead of silently falling back.
 
 `train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
 
-When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
+When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with strict flash SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
 
 Use `auto`, `mem_efficient`, or `math` for packed+doc-block training runs.
 

@@ -37,8 +37,6 @@ _SDPA_KERNEL_ALIASES = {
     "efficient": "mem_efficient",
     "flashattention": "flash",
     "flash_attention": "flash",
-    # Backward-compatible alias; strict flash behavior is configured by canonical "flash".
-    "flash_only": "flash",
 }
 _TORCH_COMPILE_MODE_CHOICES = {
     "default",
@@ -54,29 +52,29 @@ _TORCH_COMPILE_MODE_ALIASES = {
 _TORCH_COMPILE_SCOPE_CHOICES = {
     "auto",
     "backbones",
-    "encoder_only",
-    "gen_encoder_only",
-    "disc_encoder_only",
-    "ffn_only",
-    "gen_ffn_only",
-    "disc_ffn_only",
+    "encoder",
+    "gen_encoder",
+    "disc_encoder",
+    "ffn",
+    "gen_ffn",
+    "disc_ffn",
 }
 _TORCH_COMPILE_SCOPE_ALIASES = {
     "both": "backbones",
     "backbone": "backbones",
     "full": "backbones",
-    "encoder": "encoder_only",
-    "encoders": "encoder_only",
-    "gen_encoder": "gen_encoder_only",
-    "generator_encoder": "gen_encoder_only",
-    "disc_encoder": "disc_encoder_only",
-    "discriminator_encoder": "disc_encoder_only",
-    "ffn": "ffn_only",
-    "ffns": "ffn_only",
-    "gen_ffn": "gen_ffn_only",
-    "generator_ffn": "gen_ffn_only",
-    "disc_ffn": "disc_ffn_only",
-    "discriminator_ffn": "disc_ffn_only",
+    "encoder": "encoder",
+    "encoders": "encoder",
+    "gen_encoder": "gen_encoder",
+    "generator_encoder": "gen_encoder",
+    "disc_encoder": "disc_encoder",
+    "discriminator_encoder": "disc_encoder",
+    "ffn": "ffn",
+    "ffns": "ffn",
+    "gen_ffn": "gen_ffn",
+    "generator_ffn": "gen_ffn",
+    "disc_ffn": "disc_ffn",
+    "discriminator_ffn": "disc_ffn",
 }
 _TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
 _TORCH_COMPILE_BACKEND_ALIASES = {
@@ -747,8 +745,7 @@ class TrainConfig:
         default="auto",
         metadata={
             "help": (
-                "torch.compile scope (auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|"
-                "ffn_only|gen_ffn_only|disc_ffn_only)."
+                "torch.compile scope (auto|backbones|encoder|gen_encoder|disc_encoder|ffn|gen_ffn|disc_ffn)."
             )
         },
     )
@@ -949,7 +946,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
     # Explicit dependency check: rope-only knobs are invalid in HF-compat mode.
     if cfg.backbone_type == "hf_deberta_v2":
         defaults = ModelConfig()
-        rope_only = (
+        rope_knobs = (
             "hidden_size",
             "num_hidden_layers",
             "num_attention_heads",
@@ -982,7 +979,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "pretrained_use_bias",
             "pretrained_initializer_range",
         )
-        changed = [name for name in rope_only if getattr(cfg, name) != getattr(defaults, name)]
+        changed = [name for name in rope_knobs if getattr(cfg, name) != getattr(defaults, name)]
         if changed:
             raise ValueError(
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
@@ -1043,7 +1040,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
             )
 
         defaults = ModelConfig()
-        scratch_only_for_rope_pretrained = (
+        scratch_rope_pretrained_knobs = (
             "hidden_size",
             "num_hidden_layers",
             "num_attention_heads",
@@ -1063,14 +1060,14 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "swiglu_adjust_intermediate",
             "initializer_range",
         )
-        changed_scratch_only = [
-            name for name in scratch_only_for_rope_pretrained if getattr(cfg, name) != getattr(defaults, name)
+        changed_scratch_knobs = [
+            name for name in scratch_rope_pretrained_knobs if getattr(cfg, name) != getattr(defaults, name)
         ]
-        if changed_scratch_only:
+        if changed_scratch_knobs:
             raise ValueError(
                 "These options only affect scratch RoPE initialization and are not applied when "
                 "model.from_scratch=false. Use explicit pretrained override fields instead "
-                "(model.pretrained_*). Invalid options: " + ", ".join(sorted(changed_scratch_only))
+                "(model.pretrained_*). Invalid options: " + ", ".join(sorted(changed_scratch_knobs))
             )
 
         if (
@@ -1092,7 +1089,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
             )
 
     if cfg.generator_config_name_or_path or cfg.generator_model_name_or_path:
-        derived_only = []
+        derived_knobs = []
         for name in (
             "generator_num_hidden_layers",
             "generator_hidden_size",
@@ -1100,12 +1097,12 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "generator_num_attention_heads",
         ):
             if getattr(cfg, name) is not None:
-                derived_only.append(name)
-        if derived_only:
+                derived_knobs.append(name)
+        if derived_knobs:
             raise ValueError(
                 "These options are only used when deriving generator config and must be unset when "
                 "model.generator_config_name_or_path or model.generator_model_name_or_path is provided: "
-                + ", ".join(sorted(derived_only))
+                + ", ".join(sorted(derived_knobs))
             )
 
     if cfg.backbone_type == "rope":
@@ -1237,7 +1234,7 @@ def validate_training_workflow_options(
         raise ValueError(
             "train.sdpa_kernel=flash is not supported with data.pack_sequences=true. "
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
-            "with flash-only SDPA kernels. Use train.sdpa_kernel=auto|mem_efficient|math instead."
+            "with strict flash SDPA kernels. Use train.sdpa_kernel=auto|mem_efficient|math instead."
         )
 
     if model_cfg is not None:

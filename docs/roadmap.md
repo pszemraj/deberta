@@ -23,7 +23,7 @@ For implemented behavior, use the concept docs:
 
 ## Runtime/Compile
 
-- run the native HF compile decision matrix (`backbones` control vs `ffn_only` candidate across gdes/none/es, plus 512 NaN gate) and promote/remove fallback based on quality+throughput gates
+- run the native HF compile decision matrix (`backbones` control vs `ffn` candidate across gdes/none/es, plus 512 NaN gate) and promote/remove fallback based on quality+throughput gates
 - upstream a minimal reproducible native-HF attention inductor drift case using `scratch/hf_attention_inductor_repro.py` with `backend=aot_eager` control and `model.hf_attention_kernel` variants
 - for rope backbone compile hardening, evaluate replacing custom `RMSNorm` with `torch.nn.RMSNorm` and compare convergence/runtime
 - for rope backbone compile hardening, evaluate static/sliced RoPE cache buffers to remove compile-time cache-build branching

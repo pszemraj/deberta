@@ -991,7 +991,7 @@ def _resolve_compile_scope(
     # while leaving attention + embeddings eager.
     if backbone_type == "hf_deberta_v2" and compile_mode == "default" and compile_backend == "inductor":
         return (
-            "ffn_only",
+            "ffn",
             "auto scope selected FFN-only fallback for hf_deberta_v2 (default+inductor)",
         )
     return "backbones", None
@@ -1023,7 +1023,7 @@ def _full_backbone_hf_inductor_warning(
     return (
         "Requested full-backbone torch.compile for hf_deberta_v2 + inductor. "
         "This path is empirically unstable and not recommended for production training. "
-        "Preferred stable path: train.torch_compile_scope=ffn_only, "
+        "Preferred stable path: train.torch_compile_scope=ffn, "
         "model.hf_attention_kernel=stable, train.torch_compile_mode=default."
     )
 
@@ -1095,24 +1095,24 @@ def _compile_backbones_for_scope(
         unwrapped_model.discriminator = torch.compile(discriminator, **compile_kwargs)  # type: ignore[attr-defined]
         return ["generator", "discriminator"]
 
-    if compile_scope in {"encoder_only", "gen_encoder_only"}:
+    if compile_scope in {"encoder", "gen_encoder"}:
         gen_encoder = getattr(generator, "encoder", None)
         if not isinstance(gen_encoder, torch.nn.Module):
             raise RuntimeError("generator.encoder is required for encoder-only compile scope.")
         generator.encoder = torch.compile(gen_encoder, **compile_kwargs)  # type: ignore[attr-defined]
         compiled_targets.append("generator.encoder")
 
-    if compile_scope in {"encoder_only", "disc_encoder_only"}:
+    if compile_scope in {"encoder", "disc_encoder"}:
         disc_encoder = getattr(discriminator, "encoder", None)
         if not isinstance(disc_encoder, torch.nn.Module):
             raise RuntimeError("discriminator.encoder is required for encoder-only compile scope.")
         discriminator.encoder = torch.compile(disc_encoder, **compile_kwargs)  # type: ignore[attr-defined]
         compiled_targets.append("discriminator.encoder")
 
-    if compile_scope in {"ffn_only", "gen_ffn_only"}:
+    if compile_scope in {"ffn", "gen_ffn"}:
         _compile_encoder_ffn(backbone=generator, branch="generator")
 
-    if compile_scope in {"ffn_only", "disc_ffn_only"}:
+    if compile_scope in {"ffn", "disc_ffn"}:
         _compile_encoder_ffn(backbone=discriminator, branch="discriminator")
 
     if not compiled_targets:
@@ -1307,7 +1307,7 @@ def _stabilize_hf_compile_attention_mask(
         return batch
 
     scope = str(compile_scope).strip().lower()
-    if scope not in {"backbones", "encoder_only", "gen_encoder_only", "disc_encoder_only"}:
+    if scope not in {"backbones", "encoder", "gen_encoder", "disc_encoder"}:
         return batch
     if str(backbone_type).strip().lower() != "hf_deberta_v2":
         return batch

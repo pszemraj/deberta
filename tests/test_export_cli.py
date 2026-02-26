@@ -143,7 +143,7 @@ def _install_export_fakes(
 
 
 @pytest.mark.parametrize(
-    ("fsdp2", "provide_torch_state_dict_api", "offload_to_cpu", "rank0_only"),
+    ("fsdp2", "provide_torch_state_dict_api", "offload_to_cpu", "rank0"),
     [
         (False, False, True, True),
         (True, True, False, False),
@@ -155,7 +155,7 @@ def test_run_export_fsdp_state_dict_paths(
     fsdp2: bool,
     provide_torch_state_dict_api: bool,
     offload_to_cpu: bool,
-    rank0_only: bool,
+    rank0: bool,
 ):
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
     called: dict[str, object] = {
@@ -177,7 +177,7 @@ def test_run_export_fsdp_state_dict_paths(
             run_dir=str(run_dir),
             output_dir=str(tmp_path / "exported"),
             offload_to_cpu=offload_to_cpu,
-            rank0_only=rank0_only,
+            rank0=rank0,
         )
     )
 
@@ -187,7 +187,7 @@ def test_run_export_fsdp_state_dict_paths(
         assert called["options_kwargs"] == {
             "full_state_dict": True,
             "cpu_offload": offload_to_cpu,
-            "broadcast_from_rank0": rank0_only,
+            "broadcast_from_rank0": rank0,
         }
     else:
         assert called["get_state_dict"] == 1

@@ -69,7 +69,7 @@ class ExportConfig:
 
     # Memory knobs for FULL_STATE_DICT gather under FSDP
     offload_to_cpu: bool = True
-    rank0_only: bool = True
+    rank0: bool = True
 
     # Override embedding_sharing (normally read from model_config.json)
     embedding_sharing: str | None = None
@@ -138,17 +138,17 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
     rank0_group = parser.add_mutually_exclusive_group()
     rank0_group.add_argument(
         "--rank0-only",
-        dest="rank0_only",
+        dest="rank0",
         action="store_true",
         help="Gather full state dict on rank 0 only under FSDP export.",
     )
     rank0_group.add_argument(
         "--no-rank0-only",
-        dest="rank0_only",
+        dest="rank0",
         action="store_false",
         help="Gather full state dict on all ranks under FSDP export.",
     )
-    parser.set_defaults(rank0_only=True)
+    parser.set_defaults(rank0=True)
     parser.add_argument(
         "--embedding-sharing",
         default=None,
@@ -170,7 +170,7 @@ def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
         export_what=ns.export_what,
         safe_serialization=bool(ns.safe_serialization),
         offload_to_cpu=bool(ns.offload_to_cpu),
-        rank0_only=bool(ns.rank0_only),
+        rank0=bool(ns.rank0),
         embedding_sharing=ns.embedding_sharing,
     )
 
@@ -299,12 +299,12 @@ def run_export(cfg: ExportConfig) -> None:
                 full_sd = accelerator.get_state_dict(model)
             else:
                 # Map CLI knobs to FSDP2 state-dict options.
-                # - rank0_only=True  -> rank0 materializes full state and broadcasts tensor payloads.
-                # - rank0_only=False -> all ranks materialize full state.
+                # - rank0=True  -> rank0 materializes full state and broadcasts tensor payloads.
+                # - rank0=False -> all ranks materialize full state.
                 opts = StateDictOptions(
                     full_state_dict=True,
                     cpu_offload=bool(cfg.offload_to_cpu),
-                    broadcast_from_rank0=bool(cfg.rank0_only),
+                    broadcast_from_rank0=bool(cfg.rank0),
                 )
                 full_sd = get_model_state_dict(model, options=opts)
         else:
@@ -317,9 +317,7 @@ def run_export(cfg: ExportConfig) -> None:
                 is_fsdp_instance = False
 
             if is_fsdp_instance:
-                cfg_full = FullStateDictConfig(
-                    offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
-                )
+                cfg_full = FullStateDictConfig(offload_to_cpu=bool(cfg.offload_to_cpu), rank0=bool(cfg.rank0))
                 with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
                     full_sd = model.state_dict()
             else:

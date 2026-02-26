@@ -145,7 +145,7 @@ def test_packed_streaming_flushes_tail_instead_of_dropping():
     assert (tok.pad_token_id in rows[1]["input_ids"]) is True
 
 
-def test_packed_streaming_does_not_emit_separator_only_tail_chunk():
+def test_packed_streaming_does_not_emit_separator_tail_chunk():
     tok = DummyTokenizer(vocab_size=64)
     # max_seq=8 => block_len=6, so this document fills exactly one block.
     hf_dataset = [{"text": "a b c d e f"}]

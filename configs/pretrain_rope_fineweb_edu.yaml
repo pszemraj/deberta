@@ -61,7 +61,7 @@ train:
   disc_loss_weight: 50.0
   decoupled_loss_scaling: false
 
-  # SDPA backend preference (best-effort): auto|flash|mem_efficient|math|flash_only
+  # SDPA backend preference: auto|flash|mem_efficient|math
   sdpa_kernel: auto
 
   # Logging
