@@ -11,7 +11,7 @@ Compile boundary:
 Embedding sharing:
 - ``none``: no sharing.
 - ``es``: direct parameter sharing.
-- ``gdes``: discriminator uses synced base buffers + trainable bias tensors.
+- ``gdes``: discriminator uses synced non-trainable base weights + trainable bias tensors.
   The training loop must call ``sync_discriminator_embeddings_from_generator()``
   after checkpoint load and after optimizer steps.
 """
@@ -108,7 +108,7 @@ class _SyncedBufferEmbedding(nn.Module):
     Effective output is:
         E(ids) = base_weight[ids] + bias[ids]
 
-    base_weight is a non-persistent buffer synced from generator weights.
+    base_weight is a non-trainable Parameter synced from generator weights.
     bias is a trainable parameter (same shape).
     """
 
@@ -131,10 +131,11 @@ class _SyncedBufferEmbedding(nn.Module):
         if not isinstance(init_weight, torch.Tensor) or init_weight.ndim != 2:
             raise ValueError("init_weight must be a rank-2 tensor")
 
-        self.register_buffer(
-            "base_weight",
+        # Keep base_weight as a Parameter (requires_grad=False) so torch.compile
+        # observes version-counter bumps from sync copy_() updates.
+        self.base_weight = nn.Parameter(
             init_weight.detach().clone(),
-            persistent=False,
+            requires_grad=False,
         )
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
 
@@ -529,7 +530,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 
     @torch.no_grad()
     def sync_discriminator_embeddings_from_generator(self) -> None:
-        """Sync GDES base buffers from generator embedding weights.
+        """Sync GDES base weights from generator embedding weights.
 
         Must be called after each optimizer step and after checkpoint load.
         No-op unless embedding_sharing == 'gdes'.

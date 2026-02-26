@@ -998,11 +998,46 @@ def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
     return {}
 
 
-def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
+def _should_disable_fused_adamw(
+    *,
+    backbone_type: str,
+    compile_enabled: bool,
+    compile_scope: str,
+    mixed_precision: str,
+) -> bool:
+    """Return whether fused AdamW should be disabled for stability.
+
+    :param str backbone_type: Backbone type.
+    :param bool compile_enabled: Whether torch.compile is enabled.
+    :param str compile_scope: Effective compile scope.
+    :param str mixed_precision: Effective mixed precision mode.
+    :return bool: True when fused AdamW should be disabled.
+    """
+    return (
+        str(backbone_type).strip().lower() == "hf_deberta_v2"
+        and bool(compile_enabled)
+        and str(compile_scope).strip().lower() == "backbones"
+        and str(mixed_precision).strip().lower() == "bf16"
+    )
+
+
+def _build_optimizer(
+    model: torch.nn.Module,
+    cfg: TrainConfig,
+    *,
+    backbone_type: str = "",
+    compile_enabled: bool = False,
+    compile_scope: str = "backbones",
+    mixed_precision: str = "no",
+) -> torch.optim.Optimizer:
     """Create AdamW with parameter grouping for RTD training.
 
     :param torch.nn.Module model: RTD model.
     :param TrainConfig cfg: Training configuration.
+    :param str backbone_type: Backbone type used by the runtime model.
+    :param bool compile_enabled: Whether torch.compile is enabled at runtime.
+    :param str compile_scope: Effective torch.compile scope.
+    :param str mixed_precision: Effective mixed-precision mode.
     :return torch.optim.Optimizer: Configured AdamW optimizer.
     """
 
@@ -1068,11 +1103,27 @@ def _build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Op
         groups.append({"params": disc_no_decay, "weight_decay": 0.0, "lr": disc_lr})
 
     fused_kwargs = _maybe_fused_adamw_kwargs()
+    if fused_kwargs and _should_disable_fused_adamw(
+        backbone_type=backbone_type,
+        compile_enabled=compile_enabled,
+        compile_scope=compile_scope,
+        mixed_precision=mixed_precision,
+    ):
+        fused_kwargs = {}
+        logger.warning(
+            "Disabled fused AdamW for hf_deberta_v2 + compile(backbones) + bf16 to reduce non-finite risk."
+        )
+
+    eps = float(cfg.adam_epsilon)
+    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
+        eps = 1e-6
+        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
+
     opt = torch.optim.AdamW(
         groups,
         lr=disc_lr,
         betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
-        eps=float(cfg.adam_epsilon),
+        eps=eps,
         **fused_kwargs,
     )
     return opt
@@ -1614,6 +1665,18 @@ def run_pretraining(
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
     validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
+    compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
+    compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
+    compile_scope = compile_scope_requested
+    compile_scope_reason: str | None = None
+    if compile_enabled:
+        compile_scope, compile_scope_reason = _resolve_compile_scope(
+            requested_scope=compile_scope_requested,
+            model_cfg=model_cfg,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+        )
 
     force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
         torch_compile=bool(train_cfg.torch_compile),
@@ -1748,7 +1811,14 @@ def run_pretraining(
     )
 
     # Optimizer + scheduler
-    optimizer = _build_optimizer(model, train_cfg)
+    optimizer = _build_optimizer(
+        model,
+        train_cfg,
+        backbone_type=str(model_cfg.backbone_type),
+        compile_enabled=compile_enabled,
+        compile_scope=compile_scope,
+        mixed_precision=mixed_precision,
+    )
     lr_scheduler = _build_scheduler(optimizer, train_cfg)
 
     # Prepare (wrap for DDP/FSDP etc)
@@ -1760,8 +1830,8 @@ def run_pretraining(
         max(min(positive_group_lrs) * float(_NONFINITE_LR_FLOOR_RATIO), 1e-8) if positive_group_lrs else 1e-8
     )
 
-    # GDES embedding sharing uses non-persistent base buffers inside discriminator embeddings.
-    # Those buffers must be initialized/synced from generator weights before any compiled forward runs.
+    # GDES embedding sharing uses synced non-trainable base weights inside discriminator embeddings.
+    # Those tensors must be initialized/synced from generator weights before any compiled forward runs.
     with suppress(Exception):
         _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
 
@@ -1773,19 +1843,10 @@ def run_pretraining(
     # (in some PyTorch builds) silent numerical miscompiles.
     #
     # The stable + fast approach is to compile only the heavy transformer backbones.
-    compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
     if compile_enabled:
         try:
-            compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
-            compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
-            compile_scope, scope_reason = _resolve_compile_scope(
-                requested_scope=compile_scope_requested,
-                model_cfg=model_cfg,
-                compile_mode=compile_mode,
-                compile_backend=compile_backend,
-            )
-            if scope_reason:
-                logger.warning(scope_reason)
+            if compile_scope_reason:
+                logger.warning(compile_scope_reason)
 
             compile_kwargs: dict[str, Any] = {"mode": compile_mode, "backend": compile_backend}
             # Backbones run with fixed sequence length (packing) and stable shapes.
@@ -1884,7 +1945,7 @@ def run_pretraining(
                 checkpoint_dir=ckpt,
             )
 
-            # GDES base buffers are non-persistent and must be refreshed after loading a checkpoint.
+            # GDES base weights are non-persistent and must be refreshed after loading a checkpoint.
             with suppress(Exception):
                 _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
 
@@ -2185,7 +2246,7 @@ def run_pretraining(
                     did_optimizer_step = True
                     nonfinite_skip_streak = 0
 
-                    # If embedding_sharing=gdes, the discriminator embedding base buffers must track the
+                    # If embedding_sharing=gdes, the discriminator embedding base weights must track the
                     # generator embedding weights. Generator embeddings update only on optimizer steps,
                     # so syncing here is sufficient (and avoids per-microbatch copies).
                     _sync_discriminator_embeddings_if_available(unwrapped_model)

@@ -625,7 +625,9 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     )
     monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
     monkeypatch.setattr(
-        pretrain_mod, "_build_optimizer", lambda model, _cfg: torch.optim.SGD(model.parameters(), lr=0.1)
+        pretrain_mod,
+        "_build_optimizer",
+        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
     )
     monkeypatch.setattr(
         pretrain_mod,
@@ -810,7 +812,9 @@ def test_run_pretraining_compiles_only_generator_and_discriminator(
     )
     monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
     monkeypatch.setattr(
-        pretrain_mod, "_build_optimizer", lambda model, _cfg: torch.optim.SGD(model.parameters(), lr=0.1)
+        pretrain_mod,
+        "_build_optimizer",
+        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
     )
     monkeypatch.setattr(
         pretrain_mod,
@@ -1002,7 +1006,9 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn_only(
     )
     monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
     monkeypatch.setattr(
-        pretrain_mod, "_build_optimizer", lambda model, _cfg: torch.optim.SGD(model.parameters(), lr=0.1)
+        pretrain_mod,
+        "_build_optimizer",
+        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
     )
     monkeypatch.setattr(
         pretrain_mod,
@@ -1176,7 +1182,9 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
     )
     monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
     monkeypatch.setattr(
-        pretrain_mod, "_build_optimizer", lambda model, _cfg: torch.optim.SGD(model.parameters(), lr=0.1)
+        pretrain_mod,
+        "_build_optimizer",
+        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
     )
     monkeypatch.setattr(
         pretrain_mod,
@@ -1489,6 +1497,55 @@ def test_build_optimizer_supports_generator_specific_lr():
     # We should have both decay and no-decay groups present.
     wds = {float(g["weight_decay"]) for g in opt.param_groups}
     assert wds == {0.0, 0.1}
+
+
+def test_build_optimizer_disables_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
+    import deberta.training.pretrain as pretrain_mod
+
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig()
+
+    monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
+    opt = pretrain_mod._build_optimizer(
+        model,
+        cfg,
+        backbone_type="hf_deberta_v2",
+        compile_enabled=True,
+        compile_scope="backbones",
+        mixed_precision="bf16",
+    )
+
+    assert bool(opt.defaults.get("fused", False)) is False
+
+
+def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: pytest.MonkeyPatch):
+    import deberta.training.pretrain as pretrain_mod
+
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig()
+
+    monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
+    opt = pretrain_mod._build_optimizer(
+        model,
+        cfg,
+        backbone_type="rope",
+        compile_enabled=True,
+        compile_scope="backbones",
+        mixed_precision="bf16",
+    )
+
+    assert bool(opt.defaults.get("fused", False)) is True
+
+
+def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig(adam_epsilon=1e-8)
+
+    opt = _build_optimizer(model, cfg, mixed_precision="bf16")
+    assert float(opt.defaults["eps"]) == pytest.approx(1e-6)
+
+    opt_fp32 = _build_optimizer(model, cfg, mixed_precision="no")
+    assert float(opt_fp32.defaults["eps"]) == pytest.approx(1e-8)
 
 
 def test_train_config_defaults_to_bf16_autocast():
@@ -1889,6 +1946,8 @@ def test_normalize_hf_attention_kernel_accepts_aliases_and_rejects_invalid():
     assert _normalize_hf_attention_kernel("dynamic") == "dynamic"
     assert _normalize_hf_attention_kernel("cache") == "cached_bmm"
     assert _normalize_hf_attention_kernel("cached-bmm") == "cached_bmm"
+    assert _normalize_hf_attention_kernel("safe") == "stable"
+    assert _normalize_hf_attention_kernel("stable") == "stable"
 
     with pytest.raises(ValueError, match="model.hf_attention_kernel must be one of"):
         _normalize_hf_attention_kernel("einsum")
@@ -1930,6 +1989,17 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
     )
     assert scope == "backbones"
     assert reason is None
+
+
+def test_compile_controls_do_not_reference_environment_variables():
+    import inspect
+
+    import deberta.training.pretrain as pretrain_mod
+
+    source = inspect.getsource(pretrain_mod)
+    assert "DEBERTA_COMPILE_SCOPE" not in source
+    assert "DEBERTA_COMPILE_BACKEND" not in source
+    assert "DEBERTA_HF_ATTN_KERNEL" not in source
 
 
 def test_normalize_sdpa_kernel_accepts_aliases_and_rejects_invalid():
@@ -2114,6 +2184,10 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
     cfg = ModelConfig(backbone_type="hf_deberta_v2", hf_attention_kernel="cache")
     validate_model_config(cfg)
     assert cfg.hf_attention_kernel == "cached_bmm"
+
+    cfg = ModelConfig(backbone_type="hf_deberta_v2", hf_attention_kernel="safe")
+    validate_model_config(cfg)
+    assert cfg.hf_attention_kernel == "stable"
 
 
 def test_validate_model_config_rejects_hf_attention_kernel_override_for_rope_backbone():

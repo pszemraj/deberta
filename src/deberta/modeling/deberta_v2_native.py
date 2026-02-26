@@ -406,7 +406,7 @@ class DisentangledSelfAttention(nn.Module):
         :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
         """
 
-        if self.attn_kernel == "cached_bmm":
+        if self.attn_kernel in {"cached_bmm", "stable"}:
             return self._disentangled_attention_bias_cached_bmm(
                 query_layer,
                 key_layer,
@@ -448,6 +448,7 @@ class DisentangledSelfAttention(nn.Module):
         query_layer = self._shape(self.query_proj(query_states))
         key_layer = self._shape(self.key_proj(hidden_states))
         value_layer = self._shape(self.value_proj(hidden_states))
+        model_dtype = hidden_states.dtype
 
         scale_factor = 1
         if "c2p" in self.pos_att_type:
@@ -456,41 +457,47 @@ class DisentangledSelfAttention(nn.Module):
             scale_factor += 1
 
         scale = math.sqrt(float(self.attention_head_size * scale_factor))
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) / scale
+        # Keep score-path numerics in fp32 under compile for improved stability.
+        query_layer_f = query_layer.float()
+        key_layer_f = key_layer.float()
+        value_layer_f = value_layer.float()
+        attention_scores = torch.matmul(query_layer_f, key_layer_f.transpose(-1, -2)) / scale
 
         if self.relative_attention and rel_embeddings is not None:
             rel_embeddings = self.pos_dropout(rel_embeddings)
             rel_att = self.disentangled_attention_bias(
-                query_layer,
-                key_layer,
+                query_layer_f,
+                key_layer_f,
                 relative_pos,
                 rel_embeddings,
                 scale_factor,
             )
-            attention_scores = attention_scores + rel_att.to(dtype=attention_scores.dtype)
+            attention_scores = attention_scores + rel_att.float()
 
         keep_mask = attention_mask.to(dtype=torch.bool)
         if keep_mask.ndim != 4:
             raise ValueError(f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}")
-        attention_scores = attention_scores.masked_fill(~keep_mask, torch.finfo(attention_scores.dtype).min)
+        attention_scores = attention_scores.masked_fill(~keep_mask, -1e4)
 
         # Avoid NaNs for fully-masked query rows by forcing a neutral row prior to softmax,
         # then zeroing these rows in outputs.
         live_queries = keep_mask.any(dim=-1, keepdim=True)
         attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
-        probs = torch.softmax(attention_scores.float(), dim=-1).to(dtype=attention_scores.dtype)
+        probs = torch.softmax(attention_scores, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
         probs = self.dropout(probs)
         probs = probs * live_queries.to(dtype=probs.dtype)
 
-        context_layer = torch.matmul(probs, value_layer)
+        context_layer = torch.matmul(probs, value_layer_f)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         bsz, seq_len, _, _ = context_layer.shape
-        context_layer = context_layer.view(bsz, seq_len, self.all_head_size)
+        context_layer = context_layer.view(bsz, seq_len, self.all_head_size).to(dtype=model_dtype)
+        probs_out = probs.to(dtype=model_dtype)
 
         if not output_attentions:
             return context_layer, None
-        return context_layer, probs
+        return context_layer, probs_out
 
 
 class DebertaV2Attention(nn.Module):
@@ -862,7 +869,30 @@ class DebertaV2Encoder(nn.Module):
         self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
         self.gradient_checkpointing = False
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
-        self.register_buffer("_cached_rel_pos", torch.empty(0, 0, dtype=torch.long), persistent=False)
+        rel_pos_cap = int(getattr(config, "max_position_embeddings", 0))
+        if rel_pos_cap <= 0:
+            rel_pos_cap = max(1, int(self.max_relative_positions))
+        self.register_buffer(
+            "_rel_pos_table",
+            self._build_static_rel_pos_table(rel_pos_cap),
+            persistent=False,
+        )
+
+    def _build_static_rel_pos_table(self, max_len: int) -> torch.Tensor:
+        """Build a reusable relative-position table for compile-stable kernels.
+
+        :param int max_len: Maximum square sequence length for cached slicing.
+        :return torch.Tensor: Relative-position ids with shape ``(max_len, max_len)``.
+        """
+        if not self.relative_attention or max_len <= 0:
+            return torch.empty(0, 0, dtype=torch.long)
+        return build_relative_position(
+            int(max_len),
+            int(max_len),
+            bucket_size=self.position_buckets,
+            max_position=self.max_relative_positions,
+            device=torch.device("cpu"),
+        )
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         """Return optionally normalized relative embedding table.
@@ -935,23 +965,19 @@ class DebertaV2Encoder(nn.Module):
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2]) if query_states is not None else key_len
 
-        if self.attn_kernel == "cached_bmm":
-            cache = self._cached_rel_pos
-            if (
-                cache.ndim != 2
-                or cache.shape[0] != query_len
-                or cache.shape[1] != key_len
-                or cache.device != hidden_states.device
-            ):
-                cache = build_relative_position(
-                    query_len,
-                    key_len,
-                    bucket_size=self.position_buckets,
-                    max_position=self.max_relative_positions,
-                    device=hidden_states.device,
-                )
-                self._cached_rel_pos = cache
-            return cache
+        if self.attn_kernel in {"cached_bmm", "stable"}:
+            table = self._rel_pos_table
+            if table.ndim == 2 and query_len <= int(table.shape[0]) and key_len <= int(table.shape[1]):
+                return table[:query_len, :key_len].to(device=hidden_states.device)
+
+            # Fallback for out-of-range lengths without mutating module state in forward.
+            return build_relative_position(
+                query_len,
+                key_len,
+                bucket_size=self.position_buckets,
+                max_position=self.max_relative_positions,
+                device=hidden_states.device,
+            )
 
         return build_relative_position(
             query_len,

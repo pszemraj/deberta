@@ -65,6 +65,7 @@ Compile behavior is configured directly via train/model config:
 - `train.torch_compile_backend=inductor|aot_eager`
 
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
+For full-backbone compile recovery on native HF runs, prefer `model.hf_attention_kernel=stable`.
 
 Resume behavior normalizes compile-wrapper key segments (`._orig_mod`) when needed, so checkpoints can be resumed across different compile scopes (for example, `backbones` -> `ffn_only`) without manual checkpoint surgery.
 

@@ -1202,9 +1202,39 @@ def test_synced_buffer_embedding_tracks_sync_updates():
         tied.sync_from(new_weight)
         out_b = tied(input_ids)
 
+    assert isinstance(tied.base_weight, torch.nn.Parameter)
+    assert tied.base_weight.requires_grad is False
     assert not torch.allclose(out_a, out_b)
     expected = torch.nn.functional.embedding(input_ids, new_weight, padding_idx=0)
     torch.testing.assert_close(out_b, expected, rtol=0.0, atol=0.0)
+
+
+def test_synced_buffer_embedding_sync_updates_compiled_module():
+    import pytest
+
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile not available")
+
+    from deberta.modeling.rtd import _SyncedBufferEmbedding
+
+    init_weight = torch.randn((16, 8), dtype=torch.float32)
+    tied = _SyncedBufferEmbedding(
+        init_weight=init_weight,
+        padding_idx=0,
+        add_bias=False,
+    )
+    compiled = torch.compile(tied, backend="aot_eager", mode="default", dynamic=False)
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_a = compiled(input_ids)
+        new_weight = torch.randn_like(init_weight)
+        tied.sync_from(new_weight)
+        out_b = compiled(input_ids)
+
+    assert not torch.allclose(out_a, out_b)
+    expected = torch.nn.functional.embedding(input_ids, new_weight, padding_idx=0)
+    torch.testing.assert_close(out_b, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
@@ -1357,7 +1387,7 @@ def test_native_hf_deberta_v2_forward_smoke():
     torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
 
 
-def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic():
+def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
     import pytest
 
     pytest.importorskip("transformers")
@@ -1391,11 +1421,17 @@ def test_native_hf_deberta_v2_cached_bmm_attention_matches_dynamic():
     cached_model = DebertaV2Model(cfg).eval()
     cached_model.load_state_dict(snapshot, strict=True)
 
+    cfg.hf_attention_kernel = "stable"
+    stable_model = DebertaV2Model(cfg).eval()
+    stable_model.load_state_dict(snapshot, strict=True)
+
     with torch.no_grad():
         out_dynamic = dynamic_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         out_cached = cached_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        out_stable = stable_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
     torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
 
 
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
@@ -1420,6 +1456,113 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
     cfg.hf_attention_kernel = "bad_kernel"
     with pytest.raises(ValueError, match="hf_attention_kernel must be one of"):
         _ = DebertaV2Model(cfg)
+
+
+def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = "stable"
+    model = DebertaV2Model(cfg).eval()
+
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    assert torch.isfinite(out).all()
+
+
+def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = "stable"
+    model = DebertaV2Model(cfg).eval()
+
+    torch.manual_seed(7)
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    attention_mask = torch.randint(low=0, high=2, size=input_ids.shape, dtype=torch.long).to(torch.bool)
+
+    with torch.no_grad():
+        out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    assert torch.isfinite(out).all()
+
+
+def test_native_hf_deberta_v2_stable_compile_step_is_finite():
+    import pytest
+
+    pytest.importorskip("transformers")
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile not available")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = "stable"
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    for backend in ("aot_eager", "inductor"):
+        model = DebertaV2Model(cfg).train()
+        compiled = torch.compile(model, backend=backend, mode="default", dynamic=False)
+        out = compiled(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        loss = out.float().mean()
+        loss.backward()
+        grads = [p.grad for p in compiled.parameters() if p.grad is not None]
+        assert grads
+        assert all(torch.isfinite(g).all().item() for g in grads)
 
 
 def test_rope_model_accepts_positional_input_ids_call():

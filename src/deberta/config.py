@@ -68,11 +68,13 @@ _TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
 _TORCH_COMPILE_BACKEND_ALIASES = {
     "aot-eager": "aot_eager",
 }
-_HF_ATTN_KERNEL_CHOICES = {"dynamic", "cached_bmm"}
+_HF_ATTN_KERNEL_CHOICES = {"dynamic", "cached_bmm", "stable"}
 _HF_ATTN_KERNEL_ALIASES = {
     "default": "dynamic",
     "cache": "cached_bmm",
     "cached": "cached_bmm",
+    "safe": "stable",
+    "compile_safe": "stable",
 }
 _MIXED_PRECISION_CANONICAL = {"bf16", "no"}
 _MIXED_PRECISION_ALIASES = {
@@ -135,7 +137,7 @@ class ModelConfig:
         default="dynamic",
         metadata={
             "help": (
-                "Native hf_deberta_v2 attention kernel variant (dynamic|cached_bmm). "
+                "Native hf_deberta_v2 attention kernel variant (dynamic|cached_bmm|stable). "
                 "Only applies when model.backbone_type=hf_deberta_v2."
             )
         },
