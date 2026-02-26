@@ -147,6 +147,7 @@ Native HF attention kernel is configured via `model.hf_attention_kernel`:
 - `stable` (compile-focused cached-bmm path with fp32 score/probability accumulation and static rel-pos table slicing)
 
 Compile runtime policy for this mode (for example, auto FFN-only fallback in default+inductor) is documented in [`docs/fsdp2.md#torchcompile`](fsdp2.md#torchcompile).
+For current stability, prefer FFN-only compile on inductor; full-backbone HFv2+inductor compile is not recommended.
 
 Pretraining heads follow backbone norm style by config:
 

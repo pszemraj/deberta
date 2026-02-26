@@ -50,6 +50,7 @@ from deberta.training.pretrain import (
     _finalize_window_metric_loss,
     _find_latest_checkpoint,
     _flush_loggers,
+    _full_backbone_hf_inductor_warning,
     _has_nonfinite_grad_norm_any_rank,
     _init_trackers,
     _load_checkpoint_data_progress,
@@ -2206,6 +2207,45 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
     )
     assert scope == "backbones"
     assert reason is None
+
+
+def test_full_backbone_hf_inductor_warning_only_for_unstable_combo():
+    msg = _full_backbone_hf_inductor_warning(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        compile_enabled=True,
+        compile_scope="backbones",
+        compile_backend="inductor",
+    )
+    assert msg is not None
+    assert "ffn_only" in msg
+
+    assert (
+        _full_backbone_hf_inductor_warning(
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+            compile_enabled=True,
+            compile_scope="ffn_only",
+            compile_backend="inductor",
+        )
+        is None
+    )
+    assert (
+        _full_backbone_hf_inductor_warning(
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+            compile_enabled=True,
+            compile_scope="backbones",
+            compile_backend="aot_eager",
+        )
+        is None
+    )
+    assert (
+        _full_backbone_hf_inductor_warning(
+            model_cfg=ModelConfig(backbone_type="rope"),
+            compile_enabled=True,
+            compile_scope="backbones",
+            compile_backend="inductor",
+        )
+        is None
+    )
 
 
 def test_compile_controls_do_not_reference_environment_variables():

@@ -82,13 +82,22 @@ Default compile scope is resolved from `train.torch_compile_scope=auto`:
 
 This preserves compile on dominant MLP FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa attention compile.
 
+Recommended stable HFv2 compile path:
+
+- `model.hf_attention_kernel=stable`
+- `train.torch_compile_mode=default`
+- `train.torch_compile_backend=inductor`
+- `train.torch_compile_scope=ffn_only` (or `auto` with the default-mode fallback)
+
+Full-backbone HFv2 compile with inductor is currently unstable and not recommended for production pretraining runs. The runtime now emits a warning if this path is requested explicitly.
+
 Compile behavior is configured directly via train/model config:
 
 - `train.torch_compile_scope=auto|backbones|encoder_only|gen_encoder_only|disc_encoder_only|ffn_only|gen_ffn_only|disc_ffn_only`
 - `train.torch_compile_backend=inductor|aot_eager`
 
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
-For full-backbone compile recovery on native HF runs, prefer `model.hf_attention_kernel=stable`.
+For native HF runs, prefer `model.hf_attention_kernel=stable`.
 
 Resume behavior normalizes compile-wrapper key segments (`._orig_mod`) when needed, so checkpoints can be resumed across different compile scopes (for example, `backbones` -> `ffn_only`) without manual checkpoint surgery.
 

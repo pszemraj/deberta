@@ -997,6 +997,37 @@ def _resolve_compile_scope(
     return "backbones", None
 
 
+def _full_backbone_hf_inductor_warning(
+    *,
+    model_cfg: ModelConfig,
+    compile_enabled: bool,
+    compile_scope: str,
+    compile_backend: str,
+) -> str | None:
+    """Return warning text for empirically unstable HFv2 full-backbone compile requests.
+
+    :param ModelConfig model_cfg: Model configuration.
+    :param bool compile_enabled: Whether compile is active.
+    :param str compile_scope: Effective compile scope.
+    :param str compile_backend: Compile backend.
+    :return str | None: Warning message for unstable configuration, else ``None``.
+    """
+    if not bool(compile_enabled):
+        return None
+    if str(getattr(model_cfg, "backbone_type", "")).strip().lower() != "hf_deberta_v2":
+        return None
+    if str(compile_backend).strip().lower() != "inductor":
+        return None
+    if str(compile_scope).strip().lower() != "backbones":
+        return None
+    return (
+        "Requested full-backbone torch.compile for hf_deberta_v2 + inductor. "
+        "This path is empirically unstable and not recommended for production training. "
+        "Preferred stable path: train.torch_compile_scope=ffn_only, "
+        "model.hf_attention_kernel=stable, train.torch_compile_mode=default."
+    )
+
+
 def _compile_backbones_for_scope(
     *,
     unwrapped_model: torch.nn.Module,
@@ -1839,6 +1870,14 @@ def run_pretraining(
             compile_mode=compile_mode,
             compile_backend=compile_backend,
         )
+        full_backbone_warn = _full_backbone_hf_inductor_warning(
+            model_cfg=model_cfg,
+            compile_enabled=compile_enabled,
+            compile_scope=compile_scope,
+            compile_backend=compile_backend,
+        )
+        if full_backbone_warn is not None and accelerator.is_main_process:
+            logger.warning(full_backbone_warn)
 
     force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
         torch_compile=bool(train_cfg.torch_compile),
