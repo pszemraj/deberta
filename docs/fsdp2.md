@@ -160,15 +160,14 @@ Use `train.sdpa_kernel` to set SDPA backend preference:
 - `flash`
 - `mem_efficient`
 - `math`
-- `flash_only`
 
-This is best-effort backend configuration. `flash_only` can fail if hardware or tensor shapes are not flash-compatible.
+`flash` is strict flash-only behavior. If flash attention is not supported for the runtime/device/shape, execution should fail instead of silently falling back.
 
 `train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
 
-When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash_only` is rejected by config validation for that workflow.
+When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with flash-only SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
 
-Use `auto`, `flash`, or `mem_efficient` for packed training runs.
+Use `auto`, `mem_efficient`, or `math` for packed+doc-block training runs.
 
 ## Embedding Sharing and FSDP Safety
 

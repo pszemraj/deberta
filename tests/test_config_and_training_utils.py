@@ -2264,7 +2264,7 @@ def test_normalize_sdpa_kernel_accepts_aliases_and_rejects_invalid():
     assert _normalize_sdpa_kernel("flashattention") == "flash"
     assert _normalize_sdpa_kernel("mem-efficient") == "mem_efficient"
     assert _normalize_sdpa_kernel("math") == "math"
-    assert _normalize_sdpa_kernel("flash_only") == "flash_only"
+    assert _normalize_sdpa_kernel("flash_only") == "flash"
 
     with pytest.raises(ValueError, match="train.sdpa_kernel must be one of"):
         _normalize_sdpa_kernel("best")
@@ -2383,26 +2383,26 @@ def test_validate_data_config_disables_doc_blocking_when_not_packed():
     assert cfg.block_cross_document_attention is False
 
 
-def test_validate_training_workflow_options_rejects_flash_only_with_packing():
-    with pytest.raises(ValueError, match="flash_only is not supported with data.pack_sequences=true"):
+def test_validate_training_workflow_options_rejects_flash_with_packing():
+    with pytest.raises(ValueError, match="sdpa_kernel=flash is not supported with data.pack_sequences=true"):
         validate_training_workflow_options(
             data_cfg=DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=True,
                 block_cross_document_attention=True,
             ),
-            train_cfg=TrainConfig(sdpa_kernel="flash_only"),
+            train_cfg=TrainConfig(sdpa_kernel="flash"),
         )
 
 
-def test_validate_training_workflow_options_allows_flash_only_when_packed_doc_blocking_disabled():
+def test_validate_training_workflow_options_allows_flash_when_packed_doc_blocking_disabled():
     validate_training_workflow_options(
         data_cfg=DataConfig(
             dataset_name="HuggingFaceFW/fineweb-edu",
             pack_sequences=True,
             block_cross_document_attention=False,
         ),
-        train_cfg=TrainConfig(sdpa_kernel="flash_only"),
+        train_cfg=TrainConfig(sdpa_kernel="flash"),
     )
 
 
@@ -2412,6 +2412,15 @@ def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_ro
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
             train_cfg=TrainConfig(sdpa_kernel="flash"),
             model_cfg=ModelConfig(backbone_type="rope", attention_implementation="eager"),
+        )
+
+
+def test_validate_training_workflow_options_rejects_sdpa_kernel_override_for_non_rope_backbones():
+    with pytest.raises(ValueError, match="only applies when model.backbone_type='rope'"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
+            train_cfg=TrainConfig(sdpa_kernel="flash"),
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         )
 
 

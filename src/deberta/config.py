@@ -30,13 +30,15 @@ _LR_SCHEDULER_CHOICES = {
     "constant",
     "constant_with_warmup",
 }
-_SDPA_KERNEL_CHOICES = {"auto", "flash", "mem_efficient", "math", "flash_only"}
+_SDPA_KERNEL_CHOICES = {"auto", "flash", "mem_efficient", "math"}
 _SDPA_KERNEL_ALIASES = {
     "mem": "mem_efficient",
     "mem-efficient": "mem_efficient",
     "efficient": "mem_efficient",
     "flashattention": "flash",
     "flash_attention": "flash",
+    # Backward-compatible alias; strict flash behavior is configured by canonical "flash".
+    "flash_only": "flash",
 }
 _TORCH_COMPILE_MODE_CHOICES = {
     "default",
@@ -762,8 +764,8 @@ class TrainConfig:
         default="auto",
         metadata={
             "help": (
-                "SDPA kernel policy: auto|flash|mem_efficient|math|flash_only. "
-                "Best-effort preference for PyTorch SDPA backends on CUDA."
+                "SDPA kernel policy: auto|flash|mem_efficient|math. "
+                "On CUDA, flash is strict (no mem_efficient/math fallback)."
             )
         },
     )
@@ -1230,17 +1232,22 @@ def validate_training_workflow_options(
     if (
         bool(data_cfg.pack_sequences)
         and bool(data_cfg.block_cross_document_attention)
-        and sdpa_policy == "flash_only"
+        and sdpa_policy == "flash"
     ):
         raise ValueError(
-            "train.sdpa_kernel=flash_only is not supported with data.pack_sequences=true. "
+            "train.sdpa_kernel=flash is not supported with data.pack_sequences=true. "
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
-            "with flash-only SDPA kernels. Use train.sdpa_kernel=flash|auto|mem_efficient|math instead."
+            "with flash-only SDPA kernels. Use train.sdpa_kernel=auto|mem_efficient|math instead."
         )
 
     if model_cfg is not None:
         backbone_type = str(model_cfg.backbone_type).strip().lower()
         attn_impl = str(model_cfg.attention_implementation).strip().lower()
+        if backbone_type != "rope" and sdpa_policy != "auto":
+            raise ValueError(
+                "train.sdpa_kernel only applies when model.backbone_type='rope' and "
+                "model.attention_implementation='sdpa'. Set train.sdpa_kernel=auto for non-rope backbones."
+            )
         if backbone_type == "rope" and attn_impl != "sdpa" and sdpa_policy != "auto":
             raise ValueError(
                 "train.sdpa_kernel only affects rope attention when model.attention_implementation='sdpa'. "

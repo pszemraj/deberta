@@ -621,7 +621,7 @@ def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
     enable_mem_efficient = True
     enable_math = True
 
-    if policy == "flash_only":
+    if policy == "flash":
         enable_mem_efficient = False
         enable_math = False
     elif policy == "mem_efficient":
