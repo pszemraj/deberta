@@ -68,6 +68,7 @@ from deberta.training.pretrain import (
     _setup_wandb_watch,
     _should_clip_gradients,
     _should_force_legacy_tf32_for_compile,
+    _stabilize_hf_compile_attention_mask,
     _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
 )
@@ -2128,6 +2129,45 @@ def test_normalize_hf_attention_kernel_accepts_aliases_and_rejects_invalid():
 
     with pytest.raises(ValueError, match="model.hf_attention_kernel must be one of"):
         _normalize_hf_attention_kernel("einsum")
+
+
+def test_stabilize_hf_compile_attention_mask_adds_missing_mask_for_hf_backbone():
+    batch = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)}
+    out = _stabilize_hf_compile_attention_mask(
+        batch=batch,
+        compile_enabled=True,
+        compile_scope="backbones",
+        backbone_type="hf_deberta_v2",
+    )
+    assert "attention_mask" in out
+    assert out["attention_mask"].dtype == torch.bool
+    assert torch.equal(out["attention_mask"], torch.ones_like(batch["input_ids"], dtype=torch.bool))
+
+
+def test_stabilize_hf_compile_attention_mask_keeps_ffn_only_batches_unchanged():
+    batch = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out = _stabilize_hf_compile_attention_mask(
+        batch=dict(batch),
+        compile_enabled=True,
+        compile_scope="ffn_only",
+        backbone_type="hf_deberta_v2",
+    )
+    assert "attention_mask" not in out
+
+
+def test_stabilize_hf_compile_attention_mask_converts_non_bool_mask():
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 0]], dtype=torch.long),
+    }
+    out = _stabilize_hf_compile_attention_mask(
+        batch=batch,
+        compile_enabled=True,
+        compile_scope="encoder_only",
+        backbone_type="hf_deberta_v2",
+    )
+    assert out["attention_mask"].dtype == torch.bool
+    assert torch.equal(out["attention_mask"], torch.tensor([[True, True, False]], dtype=torch.bool))
 
 
 def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():

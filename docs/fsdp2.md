@@ -101,6 +101,12 @@ Use `scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the
 - compile bisect scopes: `--scope gen|disc|both|matrix`
 - backend isolation: `--backend inductor|aot_eager`
 
+Use `tools/compile_drift_probe.py` when parity is inconclusive and train-mode drift appears near/after warmup:
+
+- compares eager vs compiled train steps from identical initial weights
+- reports per-step loss delta + compact parameter drift
+- prints best-effort Dynamo counters (`stats` / `recompiles`) for graph-churn diagnosis
+
 Use `scratch/hf_attention_inductor_repro.py` for a minimal one-layer train-step repro focused on native HF attention internals.
 Use `scratch/compile_log_summary.py` to convert `wandb/*/files/output.log` into final/min/max/checkpoint/runtime summary tables.
 
