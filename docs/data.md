@@ -54,13 +54,13 @@ Set `data.pack_sequences=false` to switch to one-document chunking:
 - no cross-document concatenation
 - long documents are split into multiple one-document chunks
 - useful as a reference mode for validating loss-signal behavior independent of packing
-- `data.block_cross_document_attention` is inert in this mode and is canonicalized to `false`
+- `data.block_cross_document_attention=true` is invalid in this mode (validation error)
 
 ## Non-Streaming Packing
 
 When `streaming=false`, training still routes through the same iterable packing wrappers (`PackedStreamingDataset` / `SequentialStreamingDataset`) used in streaming mode, but backed by a map-style HF dataset iterator.
 
-`data.shuffle_buffer_size` keeps full buffer semantics only for streaming datasets. In non-streaming mode, shuffle is effectively an off/on toggle and config normalization canonicalizes any positive value to `1` (shuffle enabled).
+`data.shuffle_buffer_size` keeps full buffer semantics only for streaming datasets. In non-streaming mode, shuffle is effectively an off/on toggle and validation requires `data.shuffle_buffer_size` to be `0` (off) or `1` (on).
 
 ## Collator Behavior (Dynamic MLM Masking)
 

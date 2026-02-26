@@ -58,7 +58,9 @@ from deberta.training.pretrain import (
     _load_resume_state_with_compile_fallback,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
+    _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
+    _resolve_effective_mixed_precision_or_raise,
     _resolve_output_dir,
     _resolve_output_dir_for_accelerator,
     _resolve_resume_checkpoint,
@@ -2067,6 +2069,30 @@ def test_normalize_mixed_precision_accepts_bool_and_synonyms():
         normalize_mixed_precision("fp16")
 
 
+def test_resolve_effective_mixed_precision_or_raise_errors_for_bf16_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import deberta.training.pretrain as pretrain_mod
+
+    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: False)
+    with pytest.raises(RuntimeError, match="mixed_precision=no explicitly"):
+        _resolve_effective_mixed_precision_or_raise("bf16")
+
+    assert _resolve_effective_mixed_precision_or_raise("no") == "no"
+
+
+def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import deberta.training.pretrain as pretrain_mod
+
+    monkeypatch.delattr(pretrain_mod.torch, "compile", raising=False)
+    with pytest.raises(RuntimeError, match="does not expose torch.compile"):
+        _resolve_compile_enabled_or_raise(True)
+
+    assert _resolve_compile_enabled_or_raise(False) is False
+
+
 def test_normalize_torch_compile_mode_accepts_aliases_and_rejects_invalid():
     assert _normalize_torch_compile_mode("default") == "default"
     assert _normalize_torch_compile_mode("reduce_overhead") == "reduce-overhead"
@@ -2362,24 +2388,26 @@ def test_validate_data_config_rejects_conflicting_sources():
         )
 
 
-def test_validate_data_config_canonicalizes_non_streaming_shuffle_buffer_size():
-    cfg = DataConfig(
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        streaming=False,
-        shuffle_buffer_size=10_000,
-    )
-    validate_data_config(cfg)
-    assert cfg.shuffle_buffer_size == 1
+def test_validate_data_config_rejects_non_streaming_shuffle_buffer_above_one():
+    with pytest.raises(ValueError, match="shuffle_buffer_size must be 0 or 1"):
+        validate_data_config(
+            DataConfig(
+                dataset_name="HuggingFaceFW/fineweb-edu",
+                streaming=False,
+                shuffle_buffer_size=10_000,
+            )
+        )
 
 
-def test_validate_data_config_disables_doc_blocking_when_not_packed():
-    cfg = DataConfig(
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        pack_sequences=False,
-        block_cross_document_attention=True,
-    )
-    validate_data_config(cfg)
-    assert cfg.block_cross_document_attention is False
+def test_validate_data_config_rejects_doc_blocking_when_not_packed():
+    with pytest.raises(ValueError, match="requires data.pack_sequences=true"):
+        validate_data_config(
+            DataConfig(
+                dataset_name="HuggingFaceFW/fineweb-edu",
+                pack_sequences=False,
+                block_cross_document_attention=True,
+            )
+        )
 
 
 def test_validate_training_workflow_options_rejects_flash_with_packing():

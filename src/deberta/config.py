@@ -558,7 +558,7 @@ class DataConfig:
         metadata={
             "help": (
                 "Streaming shuffle buffer size. 0 disables shuffle. "
-                "When data.streaming=false, any positive value is canonicalized to 1 "
+                "When data.streaming=false, this must be 0 or 1 "
                 "(non-streaming datasets only support shuffle off/on)."
             )
         },
@@ -1151,13 +1151,13 @@ def validate_data_config(cfg: DataConfig) -> None:
         raise ValueError("data.max_seq_length must be >= 8 for pretraining.")
     if int(cfg.shuffle_buffer_size) < 0:
         raise ValueError("data.shuffle_buffer_size must be >= 0.")
-    if not bool(cfg.streaming) and int(cfg.shuffle_buffer_size) > 0:
-        # Non-streaming/map-style datasets expose full-dataset shuffle semantics only.
-        # Canonicalize any positive buffer request to "shuffle enabled" (1).
-        cfg.shuffle_buffer_size = 1
-    if not bool(cfg.pack_sequences):
-        # Canonicalize inert setting in sequential mode (no packed doc boundaries exist).
-        cfg.block_cross_document_attention = False
+    if not bool(cfg.streaming) and int(cfg.shuffle_buffer_size) not in {0, 1}:
+        raise ValueError(
+            "data.shuffle_buffer_size must be 0 or 1 when data.streaming=false "
+            "(non-streaming datasets only support shuffle off/on)."
+        )
+    if not bool(cfg.pack_sequences) and bool(cfg.block_cross_document_attention):
+        raise ValueError("data.block_cross_document_attention=true requires data.pack_sequences=true.")
 
 
 def validate_train_config(cfg: TrainConfig) -> None:

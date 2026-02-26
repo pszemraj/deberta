@@ -661,15 +661,10 @@ def _bf16_runtime_sanity_check() -> bool:
     :return bool: True when a tiny bf16 autocast path succeeds.
     """
     if not torch.cuda.is_available():
-        logger.warning(
-            "bf16 mixed precision requested but CUDA is not available; falling back to full precision."
-        )
+        logger.error("bf16 mixed precision requested but CUDA is not available.")
         return False
     if not torch.cuda.is_bf16_supported():
-        logger.warning(
-            "bf16 mixed precision requested but this CUDA device reports no bf16 support; "
-            "falling back to full precision."
-        )
+        logger.error("bf16 mixed precision requested but this CUDA device reports no bf16 support.")
         return False
 
     try:
@@ -679,9 +674,41 @@ def _bf16_runtime_sanity_check() -> bool:
             c = a @ b
             _ = c.sum().item()
         return True
-    except Exception as e:
-        logger.warning(f"bf16 autocast preflight failed; falling back to full precision. Error: {e}")
+    except Exception:
+        logger.error("bf16 autocast preflight failed.", exc_info=True)
         return False
+
+
+def _resolve_effective_mixed_precision_or_raise(requested: str) -> str:
+    """Normalize mixed precision and fail fast when bf16 is unavailable.
+
+    :param str requested: User-requested mixed precision mode.
+    :raises RuntimeError: If bf16 is requested but runtime preflight fails.
+    :return str: Effective mixed precision mode.
+    """
+    mixed_precision = normalize_mixed_precision(requested)
+    if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
+        raise RuntimeError(
+            "train.mixed_precision=bf16 requested but bf16 preflight failed. "
+            "Set train.mixed_precision=no explicitly if you want to continue in full precision."
+        )
+    return mixed_precision
+
+
+def _resolve_compile_enabled_or_raise(requested: bool) -> bool:
+    """Return compile-enabled flag, raising when torch.compile is unavailable.
+
+    :param bool requested: Whether compile was requested by config.
+    :raises RuntimeError: If compile was requested but torch.compile is unavailable.
+    :return bool: True when compile should be enabled.
+    """
+    if not bool(requested):
+        return False
+    if not hasattr(torch, "compile"):
+        raise RuntimeError(
+            "train.torch_compile=true requested but this PyTorch build does not expose torch.compile."
+        )
+    return True
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:
@@ -1807,10 +1834,9 @@ def run_pretraining(
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
-    mixed_precision = normalize_mixed_precision(train_cfg.mixed_precision)
+    mixed_precision = _resolve_effective_mixed_precision_or_raise(train_cfg.mixed_precision)
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
-    if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
-        mixed_precision = "no"
+    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
     train_cfg.mixed_precision = mixed_precision
     accelerator = Accelerator(
@@ -1827,7 +1853,6 @@ def run_pretraining(
     validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
     compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
     compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
-    compile_enabled = bool(train_cfg.torch_compile and hasattr(torch, "compile"))
     compile_scope = compile_scope_requested
     compile_scope_reason: str | None = None
     if compile_enabled:
@@ -2004,7 +2029,7 @@ def run_pretraining(
     with suppress(Exception):
         _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
 
-    # torch.compile (best-effort)
+    # torch.compile
     #
     # Compiling the *entire* RTD wrapper (generator sampling + corruption + discriminator)
     # is high-risk: it contains dynamic indexing, RNG sampling, and Python-side caching.
@@ -2042,12 +2067,9 @@ def run_pretraining(
                 ", ".join(f"{k}={v}" for k, v in compile_kwargs.items()),
             )
         except Exception as e:
-            logger.warning(f"torch.compile failed, continuing without: {e}")
-            compile_enabled = False
-    elif train_cfg.torch_compile:
-        logger.warning(
-            "torch.compile requested but this torch build does not expose torch.compile; continuing."
-        )
+            raise RuntimeError(
+                f"torch.compile failed for scope={compile_scope}, mode={compile_mode}, backend={compile_backend}."
+            ) from e
 
     global_step = 0
     consumed_micro_batches = 0
