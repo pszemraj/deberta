@@ -1611,7 +1611,7 @@ def test_build_optimizer_supports_generator_specific_lr():
     assert wds == {0.0, 0.1}
 
 
-def test_build_optimizer_disables_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
+def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
     model = _TinyRTDLikeModel()
@@ -1627,7 +1627,7 @@ def test_build_optimizer_disables_fused_for_hf_backbones_compile_bf16(monkeypatc
         mixed_precision="bf16",
     )
 
-    assert bool(opt.defaults.get("fused", False)) is False
+    assert bool(opt.defaults.get("fused", False)) is True
 
 
 def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: pytest.MonkeyPatch):

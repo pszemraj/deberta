@@ -1137,29 +1137,6 @@ def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
     return {}
 
 
-def _should_disable_fused_adamw(
-    *,
-    backbone_type: str,
-    compile_enabled: bool,
-    compile_scope: str,
-    mixed_precision: str,
-) -> bool:
-    """Return whether fused AdamW should be disabled for stability.
-
-    :param str backbone_type: Backbone type.
-    :param bool compile_enabled: Whether torch.compile is enabled.
-    :param str compile_scope: Effective compile scope.
-    :param str mixed_precision: Effective mixed precision mode.
-    :return bool: True when fused AdamW should be disabled.
-    """
-    return (
-        str(backbone_type).strip().lower() == "hf_deberta_v2"
-        and bool(compile_enabled)
-        and str(compile_scope).strip().lower() == "backbones"
-        and str(mixed_precision).strip().lower() == "bf16"
-    )
-
-
 def _build_optimizer(
     model: torch.nn.Module,
     cfg: TrainConfig,
@@ -1242,16 +1219,6 @@ def _build_optimizer(
         groups.append({"params": disc_no_decay, "weight_decay": 0.0, "lr": disc_lr})
 
     fused_kwargs = _maybe_fused_adamw_kwargs()
-    if fused_kwargs and _should_disable_fused_adamw(
-        backbone_type=backbone_type,
-        compile_enabled=compile_enabled,
-        compile_scope=compile_scope,
-        mixed_precision=mixed_precision,
-    ):
-        fused_kwargs = {}
-        logger.warning(
-            "Disabled fused AdamW for hf_deberta_v2 + compile(backbones) + bf16 to reduce non-finite risk."
-        )
 
     eps = float(cfg.adam_epsilon)
     if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
