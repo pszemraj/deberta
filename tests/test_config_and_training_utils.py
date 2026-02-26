@@ -27,6 +27,7 @@ from deberta.config import (
     _normalize_torch_compile_backend,
     _normalize_torch_compile_mode,
     _normalize_torch_compile_scope,
+    _normalize_wandb_watch,
     normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
@@ -63,6 +64,7 @@ from deberta.training.pretrain import (
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
     _scale_loss_for_backward,
+    _setup_wandb_watch,
     _should_clip_gradients,
     _should_force_legacy_tf32_for_compile,
     _sync_discriminator_embeddings_if_available,
@@ -451,6 +453,66 @@ def test_init_trackers_falls_back_without_init_kwargs(caplog: pytest.LogCaptureF
     assert "rejected init_kwargs" in caplog.text
 
 
+def test_setup_wandb_watch_calls_watch_with_mode_and_frequency() -> None:
+    class _FakeRun:
+        def __init__(self) -> None:
+            self.calls: list[tuple[torch.nn.Module, dict[str, Any]]] = []
+
+        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:
+            self.calls.append((model, dict(kwargs)))
+
+    class _FakeAccelerator:
+        is_main_process = True
+
+        @staticmethod
+        def unwrap_model(model: torch.nn.Module):
+            return model
+
+        @staticmethod
+        def get_tracker(name: str, unwrap: bool = True):
+            del name, unwrap
+            return None
+
+    model = torch.nn.Linear(4, 4)
+    run = _FakeRun()
+    enabled = _setup_wandb_watch(
+        accelerator=_FakeAccelerator(),
+        wandb_run=run,
+        model=model,
+        watch_mode="gradients",
+        watch_log_freq=123,
+    )
+    assert enabled is True
+    assert run.calls
+    watched_model, kwargs = run.calls[0]
+    assert watched_model is model
+    assert kwargs["log"] == "gradients"
+    assert kwargs["log_freq"] == 123
+
+
+def test_setup_wandb_watch_returns_false_when_mode_none() -> None:
+    class _FakeRun:
+        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:  # pragma: no cover
+            del model, kwargs
+            raise AssertionError("watch must not be called when mode=none")
+
+    class _FakeAccelerator:
+        is_main_process = True
+
+        @staticmethod
+        def unwrap_model(model: torch.nn.Module):
+            return model
+
+    enabled = _setup_wandb_watch(
+        accelerator=_FakeAccelerator(),
+        wandb_run=_FakeRun(),
+        model=torch.nn.Linear(2, 2),
+        watch_mode="none",
+        watch_log_freq=100,
+    )
+    assert enabled is False
+
+
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -460,10 +522,14 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
         def __init__(self) -> None:
             self.summary: dict[str, Any] = {}
             self.logged: list[tuple[dict[str, Any], int | None]] = []
+            self.watch_calls: list[tuple[torch.nn.Module, dict[str, Any]]] = []
             self.finished_exit_code: int | None = None
 
         def log(self, row: dict[str, Any], step: int | None = None) -> None:
             self.logged.append((dict(row), step))
+
+        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:
+            self.watch_calls.append((model, dict(kwargs)))
 
         def finish(self, exit_code: int = 0) -> None:
             self.finished_exit_code = int(exit_code)
@@ -676,6 +742,8 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.wandb_run.summary["crash_type"] == "KeyboardInterrupt"
     assert accel.wandb_run.finished_exit_code == 130
     assert accel.wandb_run.logged
+    assert accel.wandb_run.watch_calls
+    assert accel.wandb_run.watch_calls[0][1]["log"] == "gradients"
     assert accel.tracker_init_calls
     first_tracker_call = accel.tracker_init_calls[0]
     assert first_tracker_call["project_name"] == "deberta-train"
@@ -1611,6 +1679,25 @@ def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
     assert cfg.torch_compile_backend == "aot_eager"
 
 
+def test_validate_train_config_normalizes_wandb_watch_aliases():
+    cfg = TrainConfig(wandb_watch="weights", wandb_watch_log_freq=25)
+    validate_train_config(cfg)
+    assert cfg.wandb_watch == "parameters"
+    assert cfg.wandb_watch_log_freq == 25
+
+
+def test_validate_train_config_rejects_invalid_wandb_watch_mode():
+    cfg = TrainConfig(wandb_watch="histogram")
+    with pytest.raises(ValueError, match="train.wandb_watch must be one of"):
+        validate_train_config(cfg)
+
+
+def test_validate_train_config_rejects_non_positive_wandb_watch_log_freq():
+    cfg = TrainConfig(wandb_watch_log_freq=0)
+    with pytest.raises(ValueError, match="train.wandb_watch_log_freq must be >= 1"):
+        validate_train_config(cfg)
+
+
 def test_token_weighted_micro_objective_matches_full_batch_normalization():
     gen_losses = [torch.tensor(0.5), torch.tensor(0.8)]
     disc_losses = [torch.tensor(0.2), torch.tensor(0.4)]
@@ -1940,6 +2027,17 @@ def test_normalize_compile_backend_accepts_aliases_and_rejects_invalid():
 
     with pytest.raises(ValueError, match="train.torch_compile_backend must be one of"):
         _normalize_torch_compile_backend("xla")
+
+
+def test_normalize_wandb_watch_accepts_aliases_and_rejects_invalid():
+    assert _normalize_wandb_watch("gradients") == "gradients"
+    assert _normalize_wandb_watch("grad") == "gradients"
+    assert _normalize_wandb_watch("weights") == "parameters"
+    assert _normalize_wandb_watch("all") == "all"
+    assert _normalize_wandb_watch("off") == "none"
+
+    with pytest.raises(ValueError, match="train.wandb_watch must be one of"):
+        _normalize_wandb_watch("full_histograms")
 
 
 def test_normalize_hf_attention_kernel_accepts_aliases_and_rejects_invalid():

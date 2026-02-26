@@ -206,6 +206,54 @@ def _init_trackers(
         accelerator.init_trackers(**call_kwargs)
 
 
+def _setup_wandb_watch(
+    *,
+    accelerator: Any,
+    wandb_run: Any | None,
+    model: torch.nn.Module,
+    watch_mode: str,
+    watch_log_freq: int,
+) -> bool:
+    """Configure W&B gradient/parameter watching for the active run.
+
+    :param Any accelerator: Accelerator runtime.
+    :param Any | None wandb_run: W&B tracker object, if available.
+    :param torch.nn.Module model: Training model (possibly wrapped).
+    :param str watch_mode: W&B watch mode.
+    :param int watch_log_freq: Watch logging frequency.
+    :return bool: True when watch setup succeeds, else False.
+    """
+    mode = str(watch_mode).strip().lower()
+    if mode == "none":
+        return False
+    if not bool(getattr(accelerator, "is_main_process", True)):
+        return False
+
+    watch_target = _unwrap_model_for_runtime(accelerator, model)
+    freq = max(1, int(watch_log_freq))
+
+    watch_owner = wandb_run
+    watch_fn = getattr(wandb_run, "watch", None) if wandb_run is not None else None
+    if not callable(watch_fn):
+        with suppress(Exception):
+            tracker_obj = accelerator.get_tracker("wandb", unwrap=True)
+            watch_owner = tracker_obj
+            watch_fn = getattr(tracker_obj, "watch", None)
+
+    if not callable(watch_fn):
+        logger.warning("W&B tracker does not expose watch(); skipping model watch setup.")
+        return False
+
+    try:
+        watch_fn(watch_target, log=mode, log_freq=freq)
+    except TypeError:
+        watch_fn(watch_target, log=mode)
+
+    owner_type = type(watch_owner).__name__ if watch_owner is not None else "unknown"
+    logger.info("Enabled W&B watch (mode=%s, log_freq=%d, tracker=%s).", mode, freq, owner_type)
+    return True
+
+
 def _validate_run_metadata(path: Path) -> None:
     """Validate on-disk run metadata schema compatibility.
 
@@ -1935,6 +1983,14 @@ def run_pretraining(
             if str(train_cfg.report_to).lower() == "wandb":
                 with suppress(Exception):
                     wandb_run = accelerator.get_tracker("wandb", unwrap=True)
+                with suppress(Exception):
+                    _setup_wandb_watch(
+                        accelerator=accelerator,
+                        wandb_run=wandb_run,
+                        model=model,
+                        watch_mode=train_cfg.wandb_watch,
+                        watch_log_freq=int(train_cfg.wandb_watch_log_freq),
+                    )
 
         # Resume
         if ckpt:

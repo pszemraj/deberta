@@ -10,6 +10,18 @@ _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
 _FFN_CHOICES = {"swiglu", "mlp"}
 _EMBED_SHARING_CHOICES = {"none", "es", "gdes"}
 _REPORT_TO_CHOICES = {"none", "wandb", "tensorboard"}
+_WANDB_WATCH_CHOICES = {"none", "gradients", "parameters", "all"}
+_WANDB_WATCH_ALIASES = {
+    "off": "none",
+    "disabled": "none",
+    "false": "none",
+    "0": "none",
+    "grad": "gradients",
+    "gradient": "gradients",
+    "weights": "parameters",
+    "params": "parameters",
+    "param": "parameters",
+}
 _LR_SCHEDULER_CHOICES = {
     "linear",
     "cosine",
@@ -688,6 +700,21 @@ class TrainConfig:
         metadata={"help": "Experiment tracker: none|wandb|tensorboard (accelerate loggers)."},
     )
 
+    wandb_watch: str = field(
+        default="gradients",
+        metadata={
+            "help": (
+                "W&B model watch mode when train.report_to=wandb: "
+                "none|gradients|parameters|all. Default gradients."
+            )
+        },
+    )
+
+    wandb_watch_log_freq: int = field(
+        default=100,
+        metadata={"help": "W&B watch logging frequency in optimizer steps (>=1)."},
+    )
+
     mixed_precision: str = field(
         default="bf16",
         metadata={
@@ -816,6 +843,17 @@ def _normalize_torch_compile_backend(value: str) -> str:
     v = str(value).strip().lower().replace("-", "_")
     v = _TORCH_COMPILE_BACKEND_ALIASES.get(v, v)
     return _ensure_choice("train.torch_compile_backend", v, _TORCH_COMPILE_BACKEND_CHOICES)
+
+
+def _normalize_wandb_watch(value: str) -> str:
+    """Normalize and validate W&B watch mode values.
+
+    :param str value: Raw W&B watch mode.
+    :return str: Canonical W&B watch mode.
+    """
+    v = str(value).strip().lower().replace("-", "_")
+    v = _WANDB_WATCH_ALIASES.get(v, v)
+    return _ensure_choice("train.wandb_watch", v, _WANDB_WATCH_CHOICES)
 
 
 def _normalize_hf_attention_kernel(value: str) -> str:
@@ -1136,6 +1174,7 @@ def validate_train_config(cfg: TrainConfig) -> None:
     cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
     cfg.torch_compile_scope = _normalize_torch_compile_scope(cfg.torch_compile_scope)
     cfg.torch_compile_backend = _normalize_torch_compile_backend(cfg.torch_compile_backend)
+    cfg.wandb_watch = _normalize_wandb_watch(cfg.wandb_watch)
 
     cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
     if cfg.output_dir is not None and not str(cfg.output_dir).strip():
@@ -1157,6 +1196,8 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("train.save_steps must be >= 0.")
     if int(cfg.save_total_limit) < 0:
         raise ValueError("train.save_total_limit must be >= 0.")
+    if int(cfg.wandb_watch_log_freq) <= 0:
+        raise ValueError("train.wandb_watch_log_freq must be >= 1.")
 
     mlm = float(cfg.mlm_probability)
     if mlm <= 0.0 or mlm >= 1.0:

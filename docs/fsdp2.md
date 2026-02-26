@@ -36,6 +36,29 @@ Runtime defaults are config-driven:
 - if `train.output_dir` is unset, training auto-creates `runs/<project_name>/<timestamp>_<config_stem_or_run>`
 - if `train.report_to=wandb` and `train.run_name` is unset, run naming defaults to the resolved output directory basename
 
+## W&B Gradients and Weights
+
+When `train.report_to=wandb`, model watch is config-driven and enabled by default for gradients:
+
+- `train.wandb_watch=gradients` (default)
+- `train.wandb_watch_log_freq=100` (default)
+
+Supported watch modes:
+
+- `none`
+- `gradients`
+- `parameters`
+- `all`
+
+Example YAML override for gradients + weights:
+
+```yaml
+train:
+  report_to: wandb
+  wandb_watch: all
+  wandb_watch_log_freq: 200
+```
+
 ## TF32 Policy
 
 `train.tf32=true` by default.
