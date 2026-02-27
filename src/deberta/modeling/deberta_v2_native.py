@@ -888,14 +888,16 @@ class DebertaV2Encoder(nn.Module):
     def get_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
         """Normalize input attention mask to a 4D boolean keep mask.
 
-        :param torch.Tensor attention_mask: Input mask tensor.
-        :return torch.Tensor: Keep mask with shape ``(B,1,S,S)``.
-        """
+        For 2D key-padding masks ``(B, S)`` returns ``(B, 1, 1, S)`` — a broadcast-
+        friendly shape that avoids the O(S²) outer-product expansion.  For 3D
+        pairwise masks ``(B, S, S)`` returns ``(B, 1, S, S)`` as before.
 
+        :param torch.Tensor attention_mask: Input mask tensor.
+        :return torch.Tensor: Keep mask ``(B, 1, 1, S)`` or ``(B, 1, S, S)``.
+        """
         mask = attention_mask.to(dtype=torch.bool)
         if mask.ndim <= 2:
-            keep = mask[:, :, None] & mask[:, None, :]
-            return keep.unsqueeze(1)
+            return mask[:, None, None, :]  # (B,1,1,S) — broadcast across queries
         if mask.ndim == 3:
             return mask.unsqueeze(1)
         if mask.ndim == 4:
@@ -910,7 +912,6 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor attention_mask: Raw attention mask.
         :return torch.Tensor: Token keep mask with shape ``(B,S)``.
         """
-
         mask = attention_mask.to(dtype=torch.bool)
         if mask.ndim <= 2:
             return mask
@@ -918,6 +919,9 @@ class DebertaV2Encoder(nn.Module):
             return torch.diagonal(mask, dim1=-2, dim2=-1)
         if mask.ndim == 4:
             m = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
+            # Broadcast padding masks have shape (B,1,1,S) → (B,1,S) after head squeeze.
+            if m.shape[-2] == 1:
+                return m[:, 0, :]
             return torch.diagonal(m, dim1=-2, dim2=-1)
         raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
 
