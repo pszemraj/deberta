@@ -102,8 +102,6 @@ For native HF runs, prefer `model.hf_attention_kernel=stable`.
 Compile is applied to module `forward` callables (module identity is preserved), so
 new checkpoints keep canonical state-dict keys. Resume still normalizes legacy
 compile-wrapper key segments (`._orig_mod`) when needed for older checkpoints.
-Main-process runtime now shows tqdm progress for both training steps and resume
-data-replay micro-batch alignment.
 
 ### Compile Parity Protocol
 
