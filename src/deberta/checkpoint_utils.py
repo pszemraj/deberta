@@ -128,8 +128,4 @@ def load_model_state_with_compile_key_remap(model: torch.nn.Module, checkpoint_d
             f"unexpected={incompatible.unexpected_keys[:8]}"
         )
 
-    return {
-        "matched": len(remapped_state),
-        "missing": 0,
-        "unexpected": 0,
-    }
+    return {"matched": len(remapped_state)}

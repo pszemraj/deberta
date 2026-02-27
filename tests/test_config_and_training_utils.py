@@ -16,6 +16,10 @@ import pytest
 import torch
 
 import deberta.cli as cli_mod
+from deberta.checkpoint_utils import (
+    canonical_compile_state_key,
+    load_model_state_with_compile_key_remap,
+)
 from deberta.cli import _load_json, _load_yaml
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
@@ -42,7 +46,6 @@ from deberta.training.pretrain import (
     _apply_nonfinite_recovery,
     _build_optimizer,
     _build_training_collator,
-    _canonical_compile_state_key,
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
@@ -54,7 +57,6 @@ from deberta.training.pretrain import (
     _has_nonfinite_grad_norm_any_rank,
     _init_trackers,
     _load_checkpoint_data_progress,
-    _load_model_state_with_compile_key_remap,
     _load_resume_state_with_compile_fallback,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
@@ -336,7 +338,7 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
-    assert _canonical_compile_state_key("generator._orig_mod.encoder.layer.0._orig_mod.weight") == (
+    assert canonical_compile_state_key("generator._orig_mod.encoder.layer.0._orig_mod.weight") == (
         "generator.encoder.layer.0.weight"
     )
 
@@ -360,8 +362,8 @@ def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mo
         model[0].weight.zero_()
         model[0].bias.zero_()
 
-    stats = _load_model_state_with_compile_key_remap(model, checkpoint)
-    assert stats == {"matched": 2, "missing": 0, "unexpected": 0}
+    stats = load_model_state_with_compile_key_remap(model, checkpoint)
+    assert stats == {"matched": 2}
     assert torch.allclose(model[0].weight, original["0.weight"])
     assert torch.allclose(model[0].bias, original["0.bias"])
 

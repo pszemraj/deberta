@@ -259,11 +259,9 @@ def _load_export_state_with_compile_fallback(
     unwrapped = _unwrap_model_for_export_load(accelerator, model)
     stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
     logger.info(
-        "Export model remap loaded %d tensors from %s (missing=%d, unexpected=%d).",
+        "Export model remap loaded %d tensors from %s.",
         int(stats["matched"]),
         checkpoint_dir,
-        int(stats["missing"]),
-        int(stats["unexpected"]),
     )
 
 

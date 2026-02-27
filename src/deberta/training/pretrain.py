@@ -23,9 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from deberta.checkpoint_utils import (
-    canonical_compile_state_key,
     canonicalize_state_dict_keys,
-    load_checkpoint_model_state_dict,
     load_model_state_with_compile_key_remap,
 )
 from deberta.config import (
@@ -494,36 +492,6 @@ def _resolve_resume_checkpoint(
     return str(latest)
 
 
-def _canonical_compile_state_key(key: str) -> str:
-    """Return state-dict key with compile wrapper segments normalized.
-
-    :param str key: Raw state-dict key.
-    :return str: Canonical key with ``._orig_mod`` segments removed.
-    """
-    return canonical_compile_state_key(key)
-
-
-def _load_checkpoint_model_state_dict(checkpoint_dir: Path) -> dict[str, torch.Tensor]:
-    """Load model state-dict from an accelerate checkpoint directory.
-
-    :param Path checkpoint_dir: Checkpoint directory containing model weights.
-    :raises RuntimeError: If no model state file is found.
-    :return dict[str, torch.Tensor]: Loaded model state dictionary.
-    """
-    return load_checkpoint_model_state_dict(checkpoint_dir)
-
-
-def _load_model_state_with_compile_key_remap(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str, int]:
-    """Load checkpoint weights into ``model`` with compile-wrapper key remapping.
-
-    :param torch.nn.Module model: Target model instance.
-    :param Path checkpoint_dir: Checkpoint directory path.
-    :raises RuntimeError: If canonicalized key sets are incompatible.
-    :return dict[str, int]: Matched/missing/unexpected key counts.
-    """
-    return load_model_state_with_compile_key_remap(model, checkpoint_dir)
-
-
 def _load_resume_state_with_compile_fallback(
     accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
 ) -> None:
@@ -548,13 +516,11 @@ def _load_resume_state_with_compile_fallback(
     )
     accelerator.load_state(checkpoint_dir, strict=False)
     unwrapped = _unwrap_model_for_runtime(accelerator, model)
-    stats = _load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
+    stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
     logger.info(
-        "Resume model remap loaded %d tensors from %s (missing=%d, unexpected=%d).",
+        "Resume model remap loaded %d tensors from %s.",
         int(stats["matched"]),
         checkpoint_dir,
-        int(stats["missing"]),
-        int(stats["unexpected"]),
     )
 
 
