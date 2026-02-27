@@ -653,19 +653,19 @@ class DebertaV3RTDPretrainer(nn.Module):
             with torch.no_grad():
                 forbidden_mask = getattr(self, "_forbidden_sample_token_mask", None)
                 sampled = self._gumbel_sample(
-                    gen_logits.detach(),
+                    gen_logits,
                     temperature=sampling_temperature,
                     forbidden_vocab_mask=forbidden_mask,
                 ).to(dtype=input_ids.dtype)
 
-                # Corrupt ids
-                input_flat = input_ids.view(-1)
-                corrupted_flat = input_flat.clone()
-                corrupted_flat.scatter_(0, masked_idx, sampled)
+                # Corrupt ids — functional scatter returns a new tensor (no clone needed).
+                corrupted_flat = input_ids.view(-1).scatter(0, masked_idx, sampled)
                 corrupted_input_ids = corrupted_flat.view_as(input_ids)
 
                 replaced = sampled.ne(masked_labels.to(dtype=sampled.dtype)).to(dtype=torch.float32)
-                disc_labels_flat = torch.zeros_like(input_flat, dtype=torch.float32)
+                disc_labels_flat = torch.zeros(
+                    input_ids.numel(), dtype=torch.float32, device=input_ids.device
+                )
                 disc_labels_flat.scatter_(0, masked_idx, replaced)
                 disc_labels = disc_labels_flat.view_as(input_ids)
 
