@@ -273,12 +273,9 @@ def test_build_doc_block_mask_matches_expected_structure():
     assert mask[0, 0, 5].item() is False
     assert mask[0, 5, 0].item() is False
 
-    # Active positions self-attend (diagonal guarantee).
-    for i in range(5):
+    # All positions self-attend (unconditional diagonal guarantee, including pad).
+    for i in range(6):
         assert mask[0, i, i].item() is True
-
-    # Pad self-attends via diagonal.
-    assert mask[0, 5, 5].item() is False
 
 
 def test_collator_build_drops_document_mask_when_not_packed():

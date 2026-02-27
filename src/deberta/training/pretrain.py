@@ -1382,15 +1382,20 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
 def _build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     """Build a pairwise ``(B, S, S)`` attention keep-mask from document ids on-device.
 
+    Contract: the diagonal is unconditionally True for **all** positions (including
+    pad/dead rows).  This eliminates all-False query rows that cause NaN in SDPA
+    backends, so attention layers do not need per-layer dead-row patching.
+
     :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with 0 for padding.
     :return torch.Tensor: Bool keep-mask ``(B, S, S)``.
     """
     active = doc_ids.ne(0)
     same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
     keep = same_doc & active[:, :, None] & active[:, None, :]
-    # Guarantee at least self-attend for active queries to avoid all-masked rows.
+    # Unconditional diagonal: every position self-attends. Dead/pad row outputs are
+    # zeroed by query_keep_tokens in the attention layer.
     eye = torch.eye(doc_ids.shape[1], dtype=torch.bool, device=doc_ids.device).unsqueeze(0)
-    return keep | (active[:, :, None] & eye)
+    return keep | eye
 
 
 def _stabilize_compile_attention_mask(

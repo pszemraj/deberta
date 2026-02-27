@@ -235,21 +235,12 @@ class DebertaRoPESelfAttention(nn.Module):
                 query_keep = key_keep
             elif mask.ndim == 3:
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
+                # The mask contract guarantees diagonal=True for ALL positions (including
+                # pad/dead rows), so no per-layer dead-row patching is needed.
                 pair_keep = mask
-                # Collator-produced pairwise masks guarantee diagonal=True for active
-                # tokens and diagonal=False for inactive/padded queries. Read query
-                # activity from the diagonal (O(B*S)) instead of reducing rows
-                # (O(B*S^2)) in every layer.
                 query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
 
-                # Dead-query rows (all-False) cause NaN in some SDPA backends.
-                # Make them self-attend so SDPA returns a valid output; the row
-                # is zeroed after projection via query_keep_tokens anyway.
-                dead = ~query_keep  # (B, S)
-                eye = torch.eye(pair_keep.shape[1], dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
-                safe_pair = pair_keep | (dead[:, :, None] & eye)
-
-                sdpa_attn_mask = safe_pair[:, None, :, :]  # (B,1,S,S)
+                sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
                 if not use_sdpa:
                     eager_attn_mask = ~sdpa_attn_mask
             else:
@@ -275,11 +266,6 @@ class DebertaRoPESelfAttention(nn.Module):
             scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale  # (B, nh, S, S)
             if eager_attn_mask is not None:
                 scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
-                if query_keep is not None:
-                    # Avoid NaNs for all-masked query rows in eager mode. Those
-                    # rows are explicitly zeroed after projection via query_keep_tokens.
-                    dead_queries = (~query_keep)[:, None, :, None]
-                    scores = scores.masked_fill(dead_queries, 0.0)
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn.to(dtype=v.dtype), v)
