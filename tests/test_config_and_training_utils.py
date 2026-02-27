@@ -714,8 +714,20 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
         consumed_micro_batches: int,
         save_total_limit: int,
         log_label: str,
+        model: torch.nn.Module | None = None,
+        tokenizer: Any | None = None,
+        embedding_sharing: str = "none",
+        export_hf_checkpoint: bool = False,
     ) -> None:
-        del accelerator, output_dir, save_total_limit
+        del (
+            accelerator,
+            output_dir,
+            save_total_limit,
+            model,
+            tokenizer,
+            embedding_sharing,
+            export_hf_checkpoint,
+        )
         saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
 
     monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
@@ -1507,6 +1519,68 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
 
     assert accel.save_paths == [str(ckpt)]
     assert _load_checkpoint_data_progress(ckpt) == 42
+
+
+def test_save_training_checkpoint_exports_hf_artifacts_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import deberta.training.pretrain as pretrain_mod
+
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-5"
+    accel = _FakeAccelerator(is_main_process=True)
+    calls: list[tuple[Path, str, torch.nn.Module]] = []
+
+    def _fake_export(
+        *,
+        accelerator: Any,
+        model: torch.nn.Module,
+        tokenizer: Any,
+        output_dir: Path,
+        embedding_sharing: str,
+    ) -> None:
+        del tokenizer
+        assert accelerator is accel
+        calls.append((output_dir, str(embedding_sharing), model))
+
+    monkeypatch.setattr(pretrain_mod, "_export_discriminator_hf", _fake_export)
+
+    dummy_model = torch.nn.Linear(2, 2)
+    dummy_tokenizer = object()
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=ckpt,
+        output_dir=out,
+        consumed_micro_batches=8,
+        save_total_limit=3,
+        log_label="periodic",
+        model=dummy_model,
+        tokenizer=dummy_tokenizer,
+        embedding_sharing="gdes",
+        export_hf_checkpoint=True,
+    )
+
+    assert calls == [(ckpt / "hf", "gdes", dummy_model)]
+    assert _load_checkpoint_data_progress(ckpt) == 8
+
+
+def test_save_training_checkpoint_export_requires_model_and_tokenizer(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-2"
+    accel = _FakeAccelerator(is_main_process=True)
+
+    with pytest.raises(ValueError, match="requires model and tokenizer"):
+        _save_training_checkpoint(
+            accelerator=accel,
+            checkpoint_dir=ckpt,
+            output_dir=out,
+            consumed_micro_batches=3,
+            save_total_limit=3,
+            log_label="periodic",
+            export_hf_checkpoint=True,
+        )
 
 
 def test_cycle_dataloader_advances_dataset_epoch_each_pass():

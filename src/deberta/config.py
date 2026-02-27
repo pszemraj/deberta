@@ -784,6 +784,16 @@ class TrainConfig:
         },
     )
 
+    export_hf_checkpoints: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true, attempt to export HF discriminator artifacts into "
+                "checkpoint-<STEP>/hf during periodic/final checkpoint saves."
+            )
+        },
+    )
+
 
 def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
     """Normalize and validate a string option against allowed choices.

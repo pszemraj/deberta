@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 
 from deberta.checkpoint_utils import (
     canonical_compile_state_key,
+    canonicalize_state_dict_keys,
     load_checkpoint_model_state_dict,
     load_model_state_with_compile_key_remap,
 )
@@ -1566,6 +1567,10 @@ def _save_training_checkpoint(
     consumed_micro_batches: int,
     save_total_limit: int,
     log_label: str,
+    model: DebertaV3RTDPretrainer | torch.nn.Module | None = None,
+    tokenizer: Any | None = None,
+    embedding_sharing: str = "none",
+    export_hf_checkpoint: bool = False,
 ) -> None:
     """Save one training checkpoint with collective state-dict write.
 
@@ -1575,6 +1580,10 @@ def _save_training_checkpoint(
     :param int consumed_micro_batches: Data progress to persist.
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
+    :param DebertaV3RTDPretrainer | torch.nn.Module | None model: Runtime model for optional checkpoint HF export.
+    :param Any | None tokenizer: Tokenizer for optional checkpoint HF export.
+    :param str embedding_sharing: Embedding sharing mode.
+    :param bool export_hf_checkpoint: Whether to attempt writing ``checkpoint-*/hf`` artifacts.
     """
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -1586,6 +1595,22 @@ def _save_training_checkpoint(
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
+        if bool(export_hf_checkpoint):
+            if model is None or tokenizer is None:
+                raise ValueError(
+                    "export_hf_checkpoint=true requires model and tokenizer in _save_training_checkpoint()."
+                )
+            try:
+                _export_discriminator_hf(
+                    accelerator=accelerator,
+                    model=model,
+                    tokenizer=tokenizer,
+                    output_dir=checkpoint_dir / "hf",
+                    embedding_sharing=embedding_sharing,
+                )
+            except Exception as exc:
+                logger.warning("Checkpoint HF export failed for %s: %s", checkpoint_dir, exc)
+
         _save_checkpoint_data_progress(
             checkpoint_dir=checkpoint_dir,
             consumed_micro_batches=consumed_micro_batches,
@@ -1703,8 +1728,8 @@ def _export_discriminator_hf(
             raise RuntimeError(
                 "Unwrapped RTD model must expose discriminator and generator modules for export."
             )
-        disc_sd = accelerator.get_state_dict(disc_mod)
-        gen_sd = accelerator.get_state_dict(gen_mod)
+        disc_sd = canonicalize_state_dict_keys(dict(accelerator.get_state_dict(disc_mod)))
+        gen_sd = canonicalize_state_dict_keys(dict(accelerator.get_state_dict(gen_mod)))
 
         # Build a fresh model from config.
         if DebertaRoPEConfig is not None and isinstance(
@@ -2434,6 +2459,10 @@ def run_pretraining(
                             consumed_micro_batches=consumed_micro_batches,
                             save_total_limit=int(train_cfg.save_total_limit),
                             log_label="periodic",
+                            model=model,
+                            tokenizer=tokenizer,
+                            embedding_sharing=model_cfg.embedding_sharing,
+                            export_hf_checkpoint=bool(train_cfg.export_hf_checkpoints),
                         )
                         last_saved_step = global_step
                     continue
@@ -2527,6 +2556,10 @@ def run_pretraining(
                         consumed_micro_batches=consumed_micro_batches,
                         save_total_limit=int(train_cfg.save_total_limit),
                         log_label="periodic",
+                        model=model,
+                        tokenizer=tokenizer,
+                        embedding_sharing=model_cfg.embedding_sharing,
+                        export_hf_checkpoint=bool(train_cfg.export_hf_checkpoints),
                     )
                     last_saved_step = global_step
 
@@ -2569,6 +2602,10 @@ def run_pretraining(
                     consumed_micro_batches=consumed_micro_batches,
                     save_total_limit=int(train_cfg.save_total_limit),
                     log_label="final",
+                    model=model,
+                    tokenizer=tokenizer,
+                    embedding_sharing=model_cfg.embedding_sharing,
+                    export_hf_checkpoint=bool(train_cfg.export_hf_checkpoints),
                 )
                 last_saved_step = final_step
         elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:
