@@ -910,6 +910,11 @@ class DebertaV2Encoder(nn.Module):
     def get_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
         """Normalize input attention mask to a 4D boolean keep mask.
 
+        .. todo:: For unpadded batches (all tokens active), the ``(B,1,S,S)``
+           materialization is unnecessary overhead.  A true no-mask fast path
+           requires refactoring the disentangled attention kernels to accept
+           ``None`` and skip masking internally.
+
         :param torch.Tensor attention_mask: Input mask tensor.
         :return torch.Tensor: Keep mask with shape ``(B,1,S,S)``.
         """
