@@ -77,6 +77,42 @@ def test_packed_streaming_does_not_emit_separator_tail_chunk():
     assert ex["special_tokens_mask"] == [1, 0, 0, 0, 0, 0, 0, 1]
 
 
+def test_packed_streaming_strips_leading_sep_from_chunk():
+    tok = DummyTokenizer(vocab_size=64)
+    # max_seq=8 => block_len=6.
+    # Doc1 has 5 tokens, so buffer after doc1 = [t1..t5, SEP] (len=6).
+    # First chunk = [t1..t5, SEP] — consumed exactly.
+    # Doc2 has 7 tokens, buffer = [t6..t12, SEP] (len=8).
+    # Second chunk = [t6..t11] (len=6), buffer remainder = [t12, SEP].
+    # But we want to test the case where SEP lands at the start of a chunk.
+    # Doc1 with exactly block_len-1=5 tokens: buffer = [t1..t5, SEP] (len=6).
+    # That's one chunk: [t1..t5, SEP]. After _build_example_from_chunk, SEP is
+    # internal and valid.
+    # Better scenario: doc1 has block_len tokens (6). Buffer = [t1..t6, SEP] (7).
+    # chunk1 = buffer[:6] = [t1..t6], buffer = [SEP].
+    # Doc2 has block_len tokens (6). Buffer = [SEP, t7..t12, SEP] (8).
+    # chunk2 = buffer[:6] = [SEP, t7..t11], which starts with SEP — exactly the bug.
+    hf_dataset = [{"text": "a b c d e f"}, {"text": "g h i j k l"}]
+
+    ds = PackedStreamingDataset(
+        hf_dataset=hf_dataset,
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(text_column_name="text", max_seq_length=8, seed=0, shuffle_buffer_size=0),
+        process_index=0,
+        num_processes=1,
+    )
+    rows = list(ds)
+
+    for row in rows:
+        content = row["input_ids"]
+        # After CLS (pos 0), the first content token must not be SEP.
+        assert content[0] == tok.cls_token_id
+        if len(content) > 2:
+            assert content[1] != tok.sep_token_id, (
+                f"Chunk starts with [CLS, SEP, ...]: degenerate empty doc start. ids={content}"
+            )
+
+
 def test_packed_streaming_epoch_changes_shuffle_seed():
     class _ShuffleProbeDataset:
         def __init__(self) -> None:
