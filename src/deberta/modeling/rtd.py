@@ -25,24 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deberta.modeling.activations import get_act_fn
 from deberta.modeling.norm import RMSNorm
-
-
-def _get_act_fn(name_or_fn: str | Any) -> Any:
-    """Resolve an activation function.
-
-    :param str | Any name_or_fn: Activation name understood by ``transformers.ACT2FN`` or a callable.
-    :return Any: Callable activation object (or original value when resolution fails).
-    """
-
-    try:
-        from transformers.activations import ACT2FN
-
-        if isinstance(name_or_fn, str):
-            return ACT2FN[name_or_fn]
-        return name_or_fn
-    except Exception:
-        return name_or_fn
 
 
 def compute_generator_loss_term(
@@ -188,7 +172,7 @@ class MLMTransform(nn.Module):
         super().__init__()
         hidden_size = int(config.hidden_size)
         self.dense = nn.Linear(hidden_size, hidden_size)
-        self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
+        self.act = get_act_fn(getattr(config, "hidden_act", "gelu"))
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", True)):
             self.norm = RMSNorm(hidden_size, eps=eps)
@@ -285,7 +269,7 @@ class RTDHead(nn.Module):
         self.dropout = nn.Dropout(float(drop_out))
 
         self.dense = nn.Linear(hidden_size, hidden_size)
-        self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
+        self.act = get_act_fn(getattr(config, "hidden_act", "gelu"))
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", True)):
             self.norm = RMSNorm(hidden_size, eps=eps)

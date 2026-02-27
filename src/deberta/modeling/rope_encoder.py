@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deberta.modeling.activations import get_act_fn
 from deberta.modeling.norm import RMSNorm
 from deberta.modeling.rope import RotaryEmbedding
 
@@ -114,17 +115,6 @@ class DebertaRoPEConfig(PretrainedConfig):
             raise ValueError("norm_arch must be one of: post|keel")
         if self.attention_implementation not in {"sdpa", "eager"}:
             raise ValueError("attention_implementation must be one of: sdpa|eager")
-
-
-def _get_act_fn(name: str) -> Any:
-    """Resolve activation callable from transformers registry.
-
-    :param str name: Activation function key.
-    :return Any: Activation callable.
-    """
-    from transformers.activations import ACT2FN
-
-    return ACT2FN[name]
 
 
 class DebertaRoPEEmbeddings(nn.Module):
@@ -326,7 +316,7 @@ class DebertaRoPEMLP(nn.Module):
                 int(config.intermediate_size),
                 bias=add_bias,
             )
-            self.act = _get_act_fn(config.hidden_act)
+            self.act = get_act_fn(config.hidden_act)
             self.dense_out = nn.Linear(
                 int(config.intermediate_size),
                 int(config.hidden_size),
