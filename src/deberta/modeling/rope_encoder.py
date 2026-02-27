@@ -263,9 +263,9 @@ class DebertaRoPESelfAttention(nn.Module):
                 is_causal=False,
             )
         else:
-            # Eager attention (debug/fallback)
+            # Eager attention (debug/fallback) — upcast to fp32 for numeric stability.
             scale = 1.0 / math.sqrt(self.head_dim)
-            scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, nh, S, S)
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale  # (B, nh, S, S)
             if eager_attn_mask is not None:
                 scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
                 if query_keep is not None:
@@ -275,7 +275,7 @@ class DebertaRoPESelfAttention(nn.Module):
                     scores = scores.masked_fill(dead_queries, 0.0)
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
-            out = torch.matmul(attn, v)
+            out = torch.matmul(attn.to(dtype=v.dtype), v)
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
         out = self.out_proj(out)
