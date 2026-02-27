@@ -10,7 +10,7 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 ## Data/Packing
 
 - evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts
-- replace collator-time dense document attention mask materialization (`B x S x S`) with a compact doc-boundary representation and on-device block masking to reduce CPU bottlenecks at long context lengths; this also blocks SDPA fused kernels (FlashAttention) in some PyTorch versions since the dense `(B,1,S,S)` expansion is hostile to optimized kernel selection
+- ~~replace collator-time dense document attention mask materialization with compact doc-boundary representation and on-device block masking~~ — **resolved**: collator now emits `doc_ids (B,S)` and the training loop builds the 3D mask on-device; future: evaluate `flex_attention` block-sparse path to avoid dense `(B,S,S)` materialization entirely
 - refactor token-weighted GA to avoid whole-window microbatch buffering so large per-batch metadata does not scale host memory linearly with `gradient_accumulation_steps`
 - replace whole-word n-gram retry-loop masking (`mlm_max_ngram > 1`) with a deterministic linear-time candidate walk (and/or vectorized path) to avoid worst-case per-sample retry spin on long sequences
 

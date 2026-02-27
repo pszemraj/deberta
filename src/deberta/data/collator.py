@@ -117,8 +117,8 @@ class DebertaV3ElectraCollator:
         else:
             special_tokens_mask = special_tokens_mask.bool()
 
-        block_mask = (
-            self._build_document_attention_mask(
+        doc_ids = (
+            self._compute_document_ids(
                 input_ids=batch["input_ids"],
                 special_tokens_mask=special_tokens_mask,
                 attention_mask=batch.get("attention_mask"),
@@ -126,9 +126,8 @@ class DebertaV3ElectraCollator:
             if self._packed_sequences and self._block_cross_document_attention
             else None
         )
-        if block_mask is not None:
-            # Keep packed pairwise masks in bool form to avoid pointless int64 expansion.
-            batch["attention_mask"] = block_mask
+        if doc_ids is not None:
+            batch["doc_ids"] = doc_ids
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
@@ -317,22 +316,24 @@ class DebertaV3ElectraCollator:
             return "gpt2"
         return "none"
 
-    def _build_document_attention_mask(
+    def _compute_document_ids(
         self,
         *,
         input_ids: torch.Tensor,
         special_tokens_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        """Build pairwise attention keep-mask that blocks cross-document attention.
+        """Compute per-token document ids for cross-document attention blocking.
 
-        This is only enabled when internal separator tokens are present in a sequence,
-        which indicates packed multi-document input.
+        Returns a compact ``(B, S)`` long tensor of document ids (1-based for active
+        tokens, 0 for padding) instead of a dense ``(B, S, S)`` pairwise mask.  The
+        pairwise mask is constructed on-device in the training loop to avoid CPU→GPU
+        transfer of O(B*S²) data.
 
         :param torch.Tensor input_ids: Batch token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Boolean special-token mask (B, S).
         :param torch.Tensor | None attention_mask: Optional 2D active-token mask (B, S).
-        :return torch.Tensor | None: Pairwise keep-mask (B, S, S), or ``None`` when unnecessary.
+        :return torch.Tensor | None: Document ids ``(B, S)`` long, or ``None`` when unnecessary.
         """
         if input_ids.ndim != 2:
             return None
@@ -355,7 +356,7 @@ class DebertaV3ElectraCollator:
             active = torch.ones_like(input_ids, dtype=torch.bool)
 
         # Packed batches that contain only single-document chunks have no internal
-        # separators and do not need a dense pairwise mask.
+        # separators and do not need doc-blocking metadata.
         internal_sep_positions = sep_positions[:, 1:-1] & active[:, 1:-1]
         if not bool(internal_sep_positions.any().item()):
             return None
@@ -376,17 +377,7 @@ class DebertaV3ElectraCollator:
         if pad_id is not None:
             doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
 
-        # TODO(roadmap): replace dense (B,S,S) mask materialization with compact doc-boundary
-        # metadata and construct block structure lazily on device.  Dense pairwise masks also
-        # prevent SDPA fused kernels (FlashAttention) from activating in some PyTorch versions.
-        # See docs/roadmap.md "Data/Packing".
-        same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
-        keep = same_doc & active[:, :, None] & active[:, None, :]
-
-        # Guarantee at least self-attend for active queries to avoid all-masked rows.
-        eye = torch.eye(input_ids.shape[1], dtype=torch.bool, device=input_ids.device).unsqueeze(0)
-        keep = keep | (active[:, :, None] & eye)
-        return keep
+        return doc_ids
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor

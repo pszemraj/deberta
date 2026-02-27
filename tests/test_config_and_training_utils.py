@@ -1847,6 +1847,21 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
     )
     assert torch.equal(out2["attention_mask"], mask_3d)
 
+    # RoPE + doc-blocking + compile: doc_ids present → no mask materialized by stabilizer.
+    batch2b = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "doc_ids": torch.tensor([[1, 1, 2]], dtype=torch.long),
+    }
+    out2b = _stabilize_compile_attention_mask(
+        batch=batch2b,
+        compile_enabled=True,
+        compile_scope="encoder",
+        backbone_type="rope",
+        block_cross_document_attention=True,
+    )
+    assert "attention_mask" not in out2b
+    assert "doc_ids" in out2b
+
     # RoPE without doc-blocking: no mask injection.
     batch3 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
     out3 = _stabilize_compile_attention_mask(

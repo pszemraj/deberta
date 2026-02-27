@@ -6,6 +6,7 @@ from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
+from deberta.training.pretrain import _build_doc_block_mask
 
 
 def test_packed_streaming_marks_internal_sep_as_special():
@@ -171,7 +172,7 @@ def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
         assert sum(1 for tid in mids if tid == tok.sep_token_id) <= 1
 
 
-def test_collator_builds_document_block_attention_mask_when_packed():
+def test_collator_emits_document_ids_when_packed():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
@@ -187,21 +188,23 @@ def test_collator_builds_document_block_attention_mask_when_packed():
         }
     ]
     batch = coll(features)
-    assert "attention_mask" in batch
-    attn = batch["attention_mask"]
-    assert attn.ndim == 3
-    assert attn.dtype == torch.bool
 
-    # Doc 1: positions {1,2}; Doc 2: positions {3,4,5}. Cross-doc attention blocked.
-    assert attn[0, 1, 3].item() == 0
-    assert attn[0, 3, 1].item() == 0
-    assert attn[0, 1, 2].item() == 1
-    assert attn[0, 3, 5].item() == 1
-    # CLS remains in the first packed document under strict block-diagonal masking.
-    assert attn[0, 0, 1].item() == 1
-    assert attn[0, 1, 0].item() == 1
-    assert attn[0, 0, 3].item() == 0
-    assert attn[0, 3, 0].item() == 0
+    # Collator now emits compact doc_ids instead of dense (B,S,S) attention_mask.
+    assert "attention_mask" not in batch
+    assert "doc_ids" in batch
+    doc_ids = batch["doc_ids"]
+    assert doc_ids.ndim == 2
+    assert doc_ids.dtype == torch.long
+
+    # CLS (pos 0) is in doc 1.
+    assert doc_ids[0, 0].item() == 1
+    # Positions in first doc share the same id.
+    assert doc_ids[0, 1].item() == doc_ids[0, 2].item()
+    # Positions in second doc share a different id.
+    assert doc_ids[0, 3].item() == doc_ids[0, 4].item()
+    assert doc_ids[0, 3].item() == doc_ids[0, 5].item()
+    # Cross-document ids differ.
+    assert doc_ids[0, 1].item() != doc_ids[0, 3].item()
 
 
 def test_collator_treats_consecutive_internal_separators_as_single_boundary():
@@ -221,18 +224,16 @@ def test_collator_treats_consecutive_internal_separators_as_single_boundary():
         }
     ]
     batch = coll(features)
-    attn = batch["attention_mask"]
-    assert attn.ndim == 3
+    assert "doc_ids" in batch
+    doc_ids = batch["doc_ids"]
 
-    # Token in doc1 should not attend doc2 token.
-    assert attn[0, 1, 4].item() == 0
-    assert attn[0, 4, 1].item() == 0
-    # Consecutive [SEP] should not create an extra phantom boundary.
-    assert attn[0, 3, 4].item() == 1
-    assert attn[0, 4, 3].item() == 1
+    # Token in doc1 should differ from doc2 token.
+    assert doc_ids[0, 1].item() != doc_ids[0, 4].item()
+    # Consecutive [SEP] should not create an extra phantom boundary — pos 3 and 4 share a doc.
+    assert doc_ids[0, 3].item() == doc_ids[0, 4].item()
 
 
-def test_collator_skips_document_block_attention_mask_for_single_doc_packed_chunk():
+def test_collator_skips_document_ids_for_single_doc_packed_chunk():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
@@ -248,7 +249,36 @@ def test_collator_skips_document_block_attention_mask_for_single_doc_packed_chun
         }
     ]
     batch = coll(features)
+    assert "doc_ids" not in batch
     assert "attention_mask" not in batch
+
+
+def test_build_doc_block_mask_matches_expected_structure():
+    # doc_ids: doc1=[1,1,1], doc2=[2,2], pad=[0]
+    doc_ids = torch.tensor([[1, 1, 1, 2, 2, 0]], dtype=torch.long)
+    mask = _build_doc_block_mask(doc_ids)
+    assert mask.shape == (1, 6, 6)
+    assert mask.dtype == torch.bool
+
+    # Same-doc tokens attend each other.
+    assert mask[0, 0, 1].item() is True
+    assert mask[0, 0, 2].item() is True
+    assert mask[0, 3, 4].item() is True
+
+    # Cross-doc tokens do NOT attend each other.
+    assert mask[0, 0, 3].item() is False
+    assert mask[0, 3, 0].item() is False
+
+    # Pad token (pos 5, doc_id=0) does not attend active tokens and vice versa.
+    assert mask[0, 0, 5].item() is False
+    assert mask[0, 5, 0].item() is False
+
+    # Active positions self-attend (diagonal guarantee).
+    for i in range(5):
+        assert mask[0, i, i].item() is True
+
+    # Pad self-attends via diagonal.
+    assert mask[0, 5, 5].item() is False
 
 
 def test_collator_build_drops_document_mask_when_not_packed():

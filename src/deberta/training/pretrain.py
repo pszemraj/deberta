@@ -1379,6 +1379,20 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def _build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
+    """Build a pairwise ``(B, S, S)`` attention keep-mask from document ids on-device.
+
+    :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with 0 for padding.
+    :return torch.Tensor: Bool keep-mask ``(B, S, S)``.
+    """
+    active = doc_ids.ne(0)
+    same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
+    keep = same_doc & active[:, :, None] & active[:, None, :]
+    # Guarantee at least self-attend for active queries to avoid all-masked rows.
+    eye = torch.eye(doc_ids.shape[1], dtype=torch.bool, device=doc_ids.device).unsqueeze(0)
+    return keep | (active[:, :, None] & eye)
+
+
 def _stabilize_compile_attention_mask(
     *,
     batch: dict[str, torch.Tensor],
@@ -1426,6 +1440,9 @@ def _stabilize_compile_attention_mask(
         return batch
 
     if btype == "rope" and block_cross_document_attention:
+        # doc_ids present → mask will be built momentarily in the training loop.
+        if "doc_ids" in batch:
+            return batch
         attn = batch.get("attention_mask")
         if not isinstance(attn, torch.Tensor):
             # Materialize (B, S, S) all-True mask so compile always sees rank-3.
@@ -2380,6 +2397,9 @@ def run_pretraining(
                     backbone_type=str(model_cfg.backbone_type),
                     block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                 )
+                doc_ids = batch.pop("doc_ids", None)
+                if doc_ids is not None:
+                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()
 
