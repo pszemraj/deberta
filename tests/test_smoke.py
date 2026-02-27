@@ -1588,6 +1588,74 @@ def test_native_hf_deberta_v2_stable_compile_step_is_finite():
         assert all(torch.isfinite(g).all().item() for g in grads)
 
 
+def test_native_hf_deberta_v2_forward_with_none_mask():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    model = DebertaV2Model(cfg).eval()
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    all_ones = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        out_none = model(input_ids=input_ids, attention_mask=None).last_hidden_state
+        out_ones = model(input_ids=input_ids, attention_mask=all_ones).last_hidden_state
+
+    assert out_none.shape == (2, 8, 32)
+    assert torch.isfinite(out_none).all()
+    torch.testing.assert_close(out_none, out_ones, rtol=0.0, atol=0.0)
+
+
+def test_native_hf_deberta_v2_none_mask_matches_all_ones_with_relative_attention():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    model = DebertaV2Model(cfg).eval()
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    all_ones = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        out_none = model(input_ids=input_ids, attention_mask=None).last_hidden_state
+        out_ones = model(input_ids=input_ids, attention_mask=all_ones).last_hidden_state
+
+    assert out_none.shape == (2, 8, 32)
+    assert torch.isfinite(out_none).all()
+    torch.testing.assert_close(out_none, out_ones, rtol=0.0, atol=0.0)
+
+
 def test_rope_model_accepts_positional_input_ids_call():
     import pytest
 

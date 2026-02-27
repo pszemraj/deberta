@@ -425,7 +425,7 @@ class DisentangledSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         output_attentions: bool = False,
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
@@ -434,7 +434,7 @@ class DisentangledSelfAttention(nn.Module):
         """Run disentangled self-attention.
 
         :param torch.Tensor hidden_states: Input hidden states.
-        :param torch.Tensor attention_mask: Boolean keep mask with shape ``(B,1,Q,K)``.
+        :param torch.Tensor | None attention_mask: Boolean keep mask ``(B,1,Q,K)`` or ``None`` for unpadded batches.
         :param bool output_attentions: Whether to return attention probabilities.
         :param torch.Tensor | None query_states: Optional query states (for iterative decoding).
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
@@ -474,20 +474,22 @@ class DisentangledSelfAttention(nn.Module):
             )
             attention_scores = attention_scores + rel_att.float()
 
-        keep_mask = attention_mask.to(dtype=torch.bool)
-        if keep_mask.ndim != 4:
-            raise ValueError(f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}")
-        attention_scores = attention_scores.masked_fill(~keep_mask, -1e4)
-
-        # Avoid NaNs for fully-masked query rows by forcing a neutral row prior to softmax,
-        # then zeroing these rows in outputs.
-        live_queries = keep_mask.any(dim=-1, keepdim=True)
-        attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
+        if attention_mask is not None:
+            keep_mask = attention_mask.to(dtype=torch.bool)
+            if keep_mask.ndim != 4:
+                raise ValueError(
+                    f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
+                )
+            attention_scores = attention_scores.masked_fill(~keep_mask, -1e4)
+            live_queries = keep_mask.any(dim=-1, keepdim=True)
+            attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
         probs = torch.softmax(attention_scores, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
         probs = self.dropout(probs)
-        probs = probs * live_queries.to(dtype=probs.dtype)
+
+        if attention_mask is not None:
+            probs = probs * live_queries.to(dtype=probs.dtype)
 
         context_layer = torch.matmul(probs, value_layer_f)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
@@ -515,7 +517,7 @@ class DebertaV2Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         output_attentions: bool = False,
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
@@ -524,7 +526,7 @@ class DebertaV2Attention(nn.Module):
         """Run attention and post-attention projection.
 
         :param torch.Tensor hidden_states: Input hidden states.
-        :param torch.Tensor attention_mask: Boolean keep mask.
+        :param torch.Tensor | None attention_mask: Boolean keep mask or ``None`` for unpadded batches.
         :param bool output_attentions: Whether to return attention probabilities.
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
@@ -619,7 +621,7 @@ class DebertaV2Layer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
@@ -628,7 +630,7 @@ class DebertaV2Layer(nn.Module):
         """Run one transformer layer.
 
         :param torch.Tensor hidden_states: Layer input states.
-        :param torch.Tensor attention_mask: Boolean keep mask.
+        :param torch.Tensor | None attention_mask: Boolean keep mask or ``None`` for unpadded batches.
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
@@ -910,11 +912,6 @@ class DebertaV2Encoder(nn.Module):
     def get_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
         """Normalize input attention mask to a 4D boolean keep mask.
 
-        .. todo:: For unpadded batches (all tokens active), the ``(B,1,S,S)``
-           materialization is unnecessary overhead.  A true no-mask fast path
-           requires refactoring the disentangled attention kernels to accept
-           ``None`` and skip masking internally.
-
         :param torch.Tensor attention_mask: Input mask tensor.
         :return torch.Tensor: Keep mask with shape ``(B,1,S,S)``.
         """
@@ -995,7 +992,7 @@ class DebertaV2Encoder(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         output_hidden_states: bool = True,
         output_attentions: bool = False,
         query_states: torch.Tensor | None = None,
@@ -1008,7 +1005,7 @@ class DebertaV2Encoder(nn.Module):
         """Run the encoder stack.
 
         :param torch.Tensor hidden_states: Input hidden states.
-        :param torch.Tensor attention_mask: Input attention mask.
+        :param torch.Tensor | None attention_mask: Input attention mask or ``None`` for unpadded batches.
         :param bool output_hidden_states: Whether to return hidden states.
         :param bool output_attentions: Whether to return attentions.
         :param torch.Tensor | None query_states: Optional query states.
@@ -1017,8 +1014,12 @@ class DebertaV2Encoder(nn.Module):
         :return BaseModelOutput | tuple: Encoder outputs.
         """
 
-        input_mask = self._input_mask_for_conv(attention_mask)
-        attn_mask = self.get_attention_mask(attention_mask)
+        if attention_mask is not None:
+            input_mask = self._input_mask_for_conv(attention_mask)
+            attn_mask = self.get_attention_mask(attention_mask)
+        else:
+            input_mask = None
+            attn_mask = None
         rel_pos = self.get_rel_pos(hidden_states, query_states=query_states, relative_pos=relative_pos)
         rel_embeddings = self.get_rel_embedding()
 
@@ -1035,7 +1036,7 @@ class DebertaV2Encoder(nn.Module):
 
                 def _custom_forward(
                     hs: torch.Tensor,
-                    am: torch.Tensor,
+                    am: torch.Tensor | None,
                     rp: torch.Tensor | None,
                     re: torch.Tensor | None,
                     layer: DebertaV2Layer = layer_module,
@@ -1043,7 +1044,7 @@ class DebertaV2Encoder(nn.Module):
                     """Checkpoint wrapper for one encoder layer.
 
                     :param torch.Tensor hs: Hidden states.
-                    :param torch.Tensor am: Attention mask.
+                    :param torch.Tensor | None am: Attention mask.
                     :param torch.Tensor | None rp: Relative-position ids.
                     :param torch.Tensor | None re: Relative embedding table.
                     :param DebertaV2Layer layer: Layer instance to execute.
@@ -1238,8 +1239,6 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             input_shape = inputs_embeds.shape[:-1]
             device = inputs_embeds.device
 
-        if attention_mask is None:
-            attention_mask = torch.ones(input_shape, device=device, dtype=torch.bool)
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
