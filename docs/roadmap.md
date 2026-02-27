@@ -1,13 +1,6 @@
 # Roadmap
 
-This file is the single source of truth for deferred documentation-backed follow-ups.
-
-For runtime behavior and contracts, use the concept docs:
-
-- model/backbone: [`docs/model.md`](model.md)
-- data/packing: [`docs/data.md`](data.md)
-- objective/loss: [`docs/objective.md`](objective.md)
-- runtime/FSDP/export: [`docs/fsdp2.md`](fsdp2.md)
+Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objective.md), [runtime](fsdp2.md) for current behavior.
 
 ## CLI and UX
 

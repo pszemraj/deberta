@@ -1,8 +1,6 @@
 # Model Architecture and Config
 
-This document is the primary reference for model/backbone choices in this repo.
-
-For data-path details, see [`docs/data.md`](data.md). For RTD objective/loss behavior, see [`docs/objective.md`](objective.md). For distributed/runtime tuning (including compile scope resolution), see [`docs/fsdp2.md`](fsdp2.md).
+See also: [data pipeline](data.md), [RTD objective](objective.md), [runtime/compile](fsdp2.md).
 
 ## Backbone Modes
 
@@ -96,7 +94,7 @@ Key options in `ModelConfig`:
 
 ## Norm Architecture Rationale (`norm_arch`)
 
-Normalization-policy rationale, equations, and selection guidance are defined in [`docs/norm-strategy.md`](norm-strategy.md).
+Normalization-policy rationale, equations, and selection guidance are in [norm-strategy.md](norm-strategy.md).
 
 ## Generator/Discriminator Configuration
 
@@ -138,7 +136,7 @@ HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`
 
 RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
 
-Packed 3D document-blocking masks are rope-only. The canonical pairwise-mask contract lives in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue); HF backbone runs must keep `data.block_cross_document_attention=false`.
+Packed 3D document-blocking masks are rope-only. The [pairwise mask contract](data.md#pairwise-mask-contract-block_cross_document_attentiontrue) is defined in data.md; HF backbone runs must keep `data.block_cross_document_attention=false`.
 
 Native HF attention kernel is configured via `model.hf_attention_kernel`:
 
@@ -146,9 +144,7 @@ Native HF attention kernel is configured via `model.hf_attention_kernel`:
 - `cached_bmm` (cached relative-position ids + bmm bias path)
 - `stable` (compile-focused cached-bmm path with fp32 score/probability accumulation and static rel-pos table slicing)
 
-Compile runtime policy for this mode (for example, auto FFN-only fallback in default+inductor) is documented in [`docs/fsdp2.md#torchcompile`](fsdp2.md#torchcompile).
-For stable operation, prefer FFN-only compile on inductor; full-backbone
-HFv2+inductor compile is not recommended.
+Compile scope and stability policy for this mode is in [runtime: torch.compile](fsdp2.md#torchcompile).
 
 Pretraining heads follow backbone norm style by config:
 

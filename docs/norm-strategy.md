@@ -1,8 +1,6 @@
 # Normalization Strategy (`post` Default, `keel` Upgrade Path)
 
-This document is the canonical reference for why this repo keeps Post-style normalization as the default and treats KEEL as an opt-in depth-scaling path.
-
-For full model option definitions, see [`docs/model.md`](model.md). For objective/runtime behavior, see [`docs/objective.md`](objective.md) and [`docs/fsdp2.md`](fsdp2.md).
+See also: [model config](model.md), [objective](objective.md), [runtime](fsdp2.md).
 
 ## Implemented Norm Architectures
 

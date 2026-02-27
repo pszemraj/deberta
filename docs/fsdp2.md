@@ -1,8 +1,6 @@
 # FSDP2, Runtime, and Export
 
-This document is the primary reference for distributed training setup and runtime knobs.
-
-For model/backbone options and load/source-resolution policy, see [`docs/model.md`](model.md) and [`docs/model.md#source-resolution-contract`](model.md#source-resolution-contract). For input pipeline behavior, see [`docs/data.md`](data.md). For RTD objective/loss details, see [`docs/objective.md`](objective.md).
+See also: [model/backbone](model.md), [source resolution](model.md#source-resolution-contract), [data pipeline](data.md), [RTD objective](objective.md).
 
 ## Accelerate + FSDP2
 
@@ -99,7 +97,7 @@ Compile behavior is configured directly via train/model config:
 - `train.torch_compile_scope=auto|backbones|encoder|gen_encoder|disc_encoder|ffn|gen_ffn|disc_ffn`
 - `train.torch_compile_backend=inductor|aot_eager`
 
-Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
+Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [HF compatibility mode](model.md#hf-compatibility-mode-notes).
 For native HF runs, prefer `model.hf_attention_kernel=stable`.
 
 Compile is applied to module `forward` callables (module identity is preserved),
@@ -171,13 +169,9 @@ Use `train.sdpa_kernel` to set SDPA backend preference:
 
 `train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
 
-When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with strict flash SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
+When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in the [pairwise mask contract](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with strict flash SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
 
 Use `auto`, `mem_efficient`, or `math` for packed+doc-block training runs.
-
-## Embedding Sharing and FSDP Safety
-
-FSDP-safety details and model-level sharing semantics (including post-init module replacement behavior) are defined in [`docs/model.md#embedding-sharing`](model.md#embedding-sharing).
 
 ## Checkpointing and Export
 
@@ -197,6 +191,10 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 The exporter consolidates to full state on rank 0 and writes standalone HF artifacts.
 Legacy compiled checkpoints that include `._orig_mod` key segments are remapped
 automatically during export, so older wrapper artifacts do not block consolidation.
+
+### In-Training HF Export
+
+`train.export_hf_final=true` (default) attempts a best-effort HF discriminator export into `<output_dir>/final_hf` at the end of training. For FSDP2 + sharded checkpoints, this is a convenience path; prefer running `deberta export` post-training for reliable artifact consolidation.
 
 Run directories include `run_metadata.json` with a `config_schema_version`.
 Resume/export validate that schema and fail fast on unknown versions instead of

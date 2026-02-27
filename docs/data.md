@@ -1,8 +1,6 @@
 # Data Pipeline
 
-This document is the primary reference for dataset ingestion, packing, and masking behavior.
-
-For objective/loss semantics, see [`docs/objective.md`](objective.md). For model/backbone constraints, see [`docs/model.md`](model.md). For runtime and FSDP2/precision controls, see [`docs/fsdp2.md`](fsdp2.md).
+See also: [objective/loss](objective.md), [model/backbone](model.md), [runtime/FSDP2](fsdp2.md).
 
 ## Dataset Source Selection
 
@@ -93,4 +91,4 @@ The pipeline keeps this path lean by:
 
 Downstream model code treats missing masks as unpadded (`attention_mask=None`).
 
-Deferred data/packing follow-ups are tracked in [`docs/roadmap.md`](roadmap.md).
+Deferred data/packing follow-ups are tracked in the [roadmap](roadmap.md).

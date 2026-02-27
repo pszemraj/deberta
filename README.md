@@ -65,7 +65,6 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
 - Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
-- Runtime defaults for output dir, tracker run naming, and compile behavior are documented in [`docs/fsdp2.md`](docs/fsdp2.md).
 
 ## Citations
 
