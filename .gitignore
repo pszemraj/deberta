@@ -217,6 +217,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Local scratch utilities (intentionally untracked)
-scratch/compile_parity_check.py
-scratch/compile_parity_check_gdes_sync.py
-scratch/run_compile_default_matrix.sh
+local-scratch/

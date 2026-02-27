@@ -109,7 +109,7 @@ checkpoints.
 
 ### Compile Parity Protocol
 
-Use `scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the same weights, batch, and RNG state.
+Use `local-scratch/compile_parity_check.py` for eager-vs-compiled parity checks on the same weights, batch, and RNG state.
 
 - default gate: `--eval` mode (deterministic parity threshold is enforced)
 - optional diagnostic: `--train` mode (informational deltas only)
@@ -122,8 +122,8 @@ Use `tools/compile_drift_probe.py` when parity is inconclusive and train-mode dr
 - reports per-step loss delta + compact parameter drift
 - prints best-effort Dynamo counters (`stats` / `recompiles`) for graph-churn diagnosis
 
-Use `scratch/hf_attention_inductor_repro.py` for a minimal one-layer train-step repro focused on native HF attention internals.
-Use `scratch/compile_log_summary.py` to convert `wandb/*/files/output.log` into final/min/max/checkpoint/runtime summary tables.
+Use `local-scratch/hf_attention_inductor_repro.py` for a minimal one-layer train-step repro focused on native HF attention internals.
+Use `local-scratch/compile_log_summary.py` to convert `wandb/*/files/output.log` into final/min/max/checkpoint/runtime summary tables.
 
 ### Non-Finite Diagnostics
 
