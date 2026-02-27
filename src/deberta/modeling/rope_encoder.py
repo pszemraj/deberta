@@ -242,7 +242,14 @@ class DebertaRoPESelfAttention(nn.Module):
                 # (O(B*S^2)) in every layer.
                 query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
 
-                sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
+                # Dead-query rows (all-False) cause NaN in some SDPA backends.
+                # Make them self-attend so SDPA returns a valid output; the row
+                # is zeroed after projection via query_keep_tokens anyway.
+                dead = ~query_keep  # (B, S)
+                eye = torch.eye(pair_keep.shape[1], dtype=torch.bool, device=pair_keep.device).unsqueeze(0)
+                safe_pair = pair_keep | (dead[:, :, None] & eye)
+
+                sdpa_attn_mask = safe_pair[:, None, :, :]  # (B,1,S,S)
                 if not use_sdpa:
                     eager_attn_mask = ~sdpa_attn_mask
             else:

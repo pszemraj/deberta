@@ -623,6 +623,48 @@ def test_self_attention_handles_pairwise_mask_rows_without_keys():
     assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
 
 
+def test_self_attention_sdpa_handles_pairwise_mask_with_dead_rows():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+
+    torch.manual_seed(0)
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        attention_implementation="sdpa",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DebertaRoPESelfAttention(cfg).eval()
+    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    # Row 1 has no valid keys (all-False) — a dead query row.
+    pair_keep = torch.tensor(
+        [
+            [
+                [1, 1, 0, 0],
+                [0, 0, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ]
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        out = attn(x, pair_keep)
+
+    assert torch.isfinite(out).all(), "SDPA produced NaN for dead query row"
+    assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
+
+
 def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask():
     import pytest
 
