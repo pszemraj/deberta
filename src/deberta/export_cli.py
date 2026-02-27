@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from deberta.checkpoint_utils import load_model_state_with_compile_key_remap
+from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, unwrap_compiled_model
 from deberta.config import (
     DataConfig,
     ModelConfig,
@@ -211,29 +211,6 @@ def _build_export_backbone(
     return disc, gen
 
 
-def _unwrap_model_for_export_load(accelerator: Any, model: torch.nn.Module) -> torch.nn.Module:
-    """Unwrap accelerator/compile wrappers for deterministic remap loading.
-
-    :param Any accelerator: Accelerator runtime.
-    :param torch.nn.Module model: Potentially wrapped model.
-    :return torch.nn.Module: Best-effort unwrapped model.
-    """
-    unwrap = accelerator.unwrap_model
-    try:
-        return unwrap(model, keep_torch_compile=False)
-    except Exception:
-        pass
-    try:
-        return unwrap(model)
-    except Exception:
-        pass
-
-    candidate = model
-    while hasattr(candidate, "module"):
-        candidate = candidate.module
-    return candidate
-
-
 def _load_export_state_with_compile_fallback(
     accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
 ) -> None:
@@ -256,7 +233,7 @@ def _load_export_state_with_compile_fallback(
         "strict=False and canonical key remap."
     )
     accelerator.load_state(checkpoint_dir, strict=False)
-    unwrapped = _unwrap_model_for_export_load(accelerator, model)
+    unwrapped = unwrap_compiled_model(accelerator, model)
     stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
     logger.info(
         "Export model remap loaded %d tensors from %s.",

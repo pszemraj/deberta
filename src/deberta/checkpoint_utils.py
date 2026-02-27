@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -129,3 +131,22 @@ def load_model_state_with_compile_key_remap(model: torch.nn.Module, checkpoint_d
         )
 
     return {"matched": len(remapped_state)}
+
+
+def unwrap_compiled_model(accelerator: Any, model: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap accelerate/compile wrappers, tolerating torch.compile internals.
+
+    :param Any accelerator: Accelerator runtime.
+    :param torch.nn.Module model: Possibly wrapped model.
+    :return torch.nn.Module: Best-effort unwrapped model.
+    """
+    unwrap = accelerator.unwrap_model
+    with suppress(Exception):
+        return unwrap(model, keep_torch_compile=False)
+    with suppress(Exception):
+        return unwrap(model)
+
+    candidate = model
+    while hasattr(candidate, "module"):
+        candidate = candidate.module
+    return candidate

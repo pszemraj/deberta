@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 from deberta.checkpoint_utils import (
     canonicalize_state_dict_keys,
     load_model_state_with_compile_key_remap,
+    unwrap_compiled_model,
 )
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
@@ -205,31 +206,6 @@ def _resolve_output_dir_for_accelerator(
     return Path(str(resolved))
 
 
-def _unwrap_model_for_runtime(accelerator: Any, model: torch.nn.Module) -> torch.nn.Module:
-    """Unwrap accelerate-wrapped models while tolerating torch.compile internals.
-
-    Some accelerate versions can raise when ``unwrap_model(..., keep_torch_compile=True)``
-    encounters partially compiled module trees. Prefer ``keep_torch_compile=False``
-    when supported.
-
-    :param Any accelerator: Accelerator runtime.
-    :param torch.nn.Module model: Possibly wrapped model.
-    :return torch.nn.Module: Unwrapped model.
-    """
-
-    unwrap = accelerator.unwrap_model
-    with suppress(Exception):
-        return unwrap(model, keep_torch_compile=False)
-    with suppress(Exception):
-        return unwrap(model)
-
-    # Last-resort fallback for wrapper stacks that expose `.module`.
-    candidate = model
-    while hasattr(candidate, "module"):
-        candidate = candidate.module
-    return candidate
-
-
 def _init_trackers(
     *,
     accelerator: Any,
@@ -295,7 +271,7 @@ def _setup_wandb_watch(
     if not bool(getattr(accelerator, "is_main_process", True)):
         return False
 
-    watch_target = _unwrap_model_for_runtime(accelerator, model)
+    watch_target = unwrap_compiled_model(accelerator, model)
     freq = max(1, int(watch_log_freq))
 
     watch_owner = wandb_run
@@ -515,7 +491,7 @@ def _load_resume_state_with_compile_fallback(
         "strict=False and canonical key remap."
     )
     accelerator.load_state(checkpoint_dir, strict=False)
-    unwrapped = _unwrap_model_for_runtime(accelerator, model)
+    unwrapped = unwrap_compiled_model(accelerator, model)
     stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
     logger.info(
         "Resume model remap loaded %d tensors from %s.",
@@ -1822,7 +1798,7 @@ def _export_discriminator_hf(
         DebertaRoPEModel = None  # type: ignore
 
     try:
-        unwrapped = _unwrap_model_for_runtime(accelerator, model)
+        unwrapped = unwrap_compiled_model(accelerator, model)
 
         # Try to gather state dicts via accelerator (preferred for distributed).
         disc_mod = getattr(unwrapped, "discriminator", None)
@@ -2084,7 +2060,7 @@ def run_pretraining(
     # GDES embedding sharing uses synced non-trainable base weights inside discriminator embeddings.
     # Those tensors must be initialized/synced from generator weights before any compiled forward runs.
     with suppress(Exception):
-        _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
+        _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
 
     # torch.compile
     #
@@ -2109,7 +2085,7 @@ def run_pretraining(
             except Exception:
                 pass
 
-            unwrapped = _unwrap_model_for_runtime(accelerator, model)
+            unwrapped = unwrap_compiled_model(accelerator, model)
             compiled_targets = _compile_backbones_for_scope(
                 unwrapped_model=unwrapped,
                 compile_scope=compile_scope,
@@ -2211,7 +2187,7 @@ def run_pretraining(
 
             # GDES base weights are non-persistent and must be refreshed after loading a checkpoint.
             with suppress(Exception):
-                _sync_discriminator_embeddings_if_available(_unwrap_model_for_runtime(accelerator, model))
+                _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
 
             global_step = _parse_checkpoint_step(ckpt)
             last_saved_step = global_step
@@ -2242,7 +2218,7 @@ def run_pretraining(
         train_iter = _cycle_dataloader(train_loader)
         ga_steps = int(train_cfg.gradient_accumulation_steps)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
-        unwrapped_model = _unwrap_model_for_runtime(accelerator, model)
+        unwrapped_model = unwrap_compiled_model(accelerator, model)
         # Boolean vocab mask used both by the RTD module and token-weighted GA.
         # Keep a CPU copy for token counting to avoid per-microbatch GPU->CPU transfers
         # before `_move_batch_to_device` runs.
