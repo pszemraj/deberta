@@ -201,12 +201,24 @@ class DebertaV3ElectraCollator:
             out.add(int(pad_id))
         return out
 
+    @staticmethod
+    def _effective_vocab_size(tokenizer: Any) -> int:
+        """Return the full tokenizer vocabulary size including added tokens.
+
+        :param Any tokenizer: Tokenizer instance.
+        :return int: Effective vocabulary size.
+        """
+        try:
+            return int(len(tokenizer))
+        except TypeError:
+            return int(tokenizer.vocab_size)
+
     def _build_non_special_token_ids(self) -> torch.Tensor | None:
         """Build tensor of non-special token ids for random replacement.
 
         :return torch.Tensor | None: CPU tensor of non-special ids, or None.
         """
-        vocab_size = int(self.tokenizer.vocab_size)
+        vocab_size = self._effective_vocab_size(self.tokenizer)
         if not self._special_token_ids:
             return None
 
@@ -227,7 +239,9 @@ class DebertaV3ElectraCollator:
         :return torch.Tensor: Random token ids.
         """
         if self._non_special_token_ids_cpu is None:
-            return torch.randint(low=0, high=int(self.tokenizer.vocab_size), size=shape, device=device)
+            return torch.randint(
+                low=0, high=self._effective_vocab_size(self.tokenizer), size=shape, device=device
+            )
 
         key = f"{device.type}:{device.index if device.index is not None else -1}"
         ids = self._non_special_token_ids_by_device.get(key)

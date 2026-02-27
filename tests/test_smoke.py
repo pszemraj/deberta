@@ -476,6 +476,43 @@ def test_collator_random_replacement_avoids_special_ids():
         assert not bool((replaced == sid).any().item())
 
 
+def test_collator_random_replacement_samples_full_vocab_including_added_tokens():
+    """When len(tokenizer) > tokenizer.vocab_size, random replacement must cover the full range."""
+
+    class _ExtendedTokenizer(DummyTokenizer):
+        """Tokenizer stub where len() returns more than vocab_size (simulating added tokens)."""
+
+        def __init__(self) -> None:
+            super().__init__(vocab_size=100)
+            self._added = 10
+
+        def __len__(self) -> int:
+            return self.vocab_size + self._added
+
+    tok = _ExtendedTokenizer()
+    assert len(tok) == 110
+    assert tok.vocab_size == 100
+
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.999, mask_token_prob=0.0, random_token_prob=1.0, max_ngram=1),
+    )
+
+    # Non-special token ids should cover [0, 110) minus specials.
+    assert coll._non_special_token_ids_cpu is not None
+    non_special = coll._non_special_token_ids_cpu
+    assert int(non_special.max().item()) >= 100, "Random replacement should be able to sample added-token IDs"
+
+    # Run actual masking and verify some replacements land in the extended range.
+    torch.manual_seed(42)
+    input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
+    special = torch.zeros_like(input_ids, dtype=torch.bool)
+    masked, labels = coll._mask_tokens_bert(input_ids, special_tokens_mask=special)
+    changed = labels.ne(-100)
+    replaced = masked[changed]
+    assert bool((replaced >= 100).any().item()), "Expected some replacement tokens from the added-token range"
+
+
 def test_self_attention_zeroes_padded_query_outputs():
     import pytest
 
