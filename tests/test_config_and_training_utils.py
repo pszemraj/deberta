@@ -56,6 +56,7 @@ from deberta.training.pretrain import (
     _find_latest_checkpoint,
     _flush_loggers,
     _full_backbone_hf_inductor_warning,
+    _global_grad_l2_norm,
     _has_nonfinite_grad_norm_any_rank,
     _init_trackers,
     _load_checkpoint_data_progress,
@@ -2409,3 +2410,37 @@ def test_persist_run_configs_warns_on_compile_scope_drift_on_resume(tmp_path: Pa
             effective_compile_scope="ffn",
         )
     assert any("compile scope changed on resume" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _global_grad_l2_norm
+# ---------------------------------------------------------------------------
+
+
+def test_global_grad_l2_norm_finite_model():
+    model = torch.nn.Linear(4, 4, bias=False)
+    x = torch.randn(2, 4)
+    loss = model(x).sum()
+    loss.backward()
+    norm = _global_grad_l2_norm(model)
+    assert norm > 0.0
+    assert torch.isfinite(torch.tensor(norm))
+    # Cross-check against torch.nn.utils.clip_grad_norm_ (which returns the norm).
+    ref = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float("inf"))
+    assert abs(norm - float(ref)) < 1e-4
+
+
+def test_global_grad_l2_norm_zero_grad():
+    model = torch.nn.Linear(4, 4, bias=True)
+    model.zero_grad()
+    # Gradients are None after zero_grad with set_to_none=True (default).
+    assert _global_grad_l2_norm(model) == 0.0
+    # Explicitly set grads to zero tensors.
+    for p in model.parameters():
+        p.grad = torch.zeros_like(p)
+    assert _global_grad_l2_norm(model) == 0.0
+
+
+def test_global_grad_l2_norm_no_parameters():
+    model = torch.nn.Module()
+    assert _global_grad_l2_norm(model) == 0.0

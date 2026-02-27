@@ -838,24 +838,25 @@ def _compact_rng_state_snapshot() -> dict[str, Any]:
 def _global_grad_l2_norm(model: torch.nn.Module) -> float:
     """Compute global gradient L2 norm over model parameters.
 
+    Accumulates squared norms on-device and issues a single ``.item()`` sync
+    instead of one per parameter.
+
     :param torch.nn.Module model: Model whose gradients are inspected.
     :return float: Global gradient norm (can be non-finite).
     """
-    sq_sum = 0.0
-    found = False
+    sq_norms: list[torch.Tensor] = []
     for param in model.parameters():
         grad = param.grad
         if grad is None:
             continue
-        found = True
         g = grad.detach()
         if g.is_sparse:
             g = g.coalesce().values()
-        # Use fp64 accumulation to avoid false +inf norms from fp32 reduction overflow.
-        sq_sum += float(g.double().pow(2).sum().item())
-    if not found:
+        sq_norms.append(g.float().pow(2).sum())
+    if not sq_norms:
         return 0.0
-    return float(sq_sum) ** 0.5
+    total = torch.stack(sq_norms).sum()
+    return float(total.sqrt().item())
 
 
 def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> bool:
