@@ -1005,6 +1005,20 @@ def _compile_backbones_for_scope(
 
     compiled_targets: list[str] = []
 
+    def _compile_module_forward(*, module: torch.nn.Module, target: str) -> None:
+        """Compile one module's ``forward`` method in-place.
+
+        Keeping module identity stable avoids ``._orig_mod`` wrapper keys in saved checkpoints.
+
+        :param torch.nn.Module module: Module whose forward should be compiled.
+        :param str target: Human-readable target name for logs.
+        """
+        forward = getattr(module, "forward", None)
+        if not callable(forward):
+            raise RuntimeError(f"{target}.forward is required for compile scope.")
+        module.forward = torch.compile(forward, **compile_kwargs)  # type: ignore[assignment]
+        compiled_targets.append(target)
+
     def _compile_encoder_ffn(*, backbone: torch.nn.Module, branch: str) -> None:
         """Compile FFN blocks (`intermediate` and `output`) in all encoder layers.
 
@@ -1037,33 +1051,25 @@ def _compile_backbones_for_scope(
                     f"{branch}.encoder.layer[{idx}].output is required for ffn-only compile scope."
                 )
 
-            layer.intermediate = torch.compile(intermediate, **compile_kwargs)  # type: ignore[attr-defined]
-            layer.output = torch.compile(output, **compile_kwargs)  # type: ignore[attr-defined]
-            compiled_targets.extend(
-                [
-                    f"{branch}.encoder.layer[{idx}].intermediate",
-                    f"{branch}.encoder.layer[{idx}].output",
-                ]
-            )
+            _compile_module_forward(module=intermediate, target=f"{branch}.encoder.layer[{idx}].intermediate")
+            _compile_module_forward(module=output, target=f"{branch}.encoder.layer[{idx}].output")
 
     if compile_scope == "backbones":
-        unwrapped_model.generator = torch.compile(generator, **compile_kwargs)  # type: ignore[attr-defined]
-        unwrapped_model.discriminator = torch.compile(discriminator, **compile_kwargs)  # type: ignore[attr-defined]
+        _compile_module_forward(module=generator, target="generator")
+        _compile_module_forward(module=discriminator, target="discriminator")
         return ["generator", "discriminator"]
 
     if compile_scope in {"encoder", "gen_encoder"}:
         gen_encoder = getattr(generator, "encoder", None)
         if not isinstance(gen_encoder, torch.nn.Module):
             raise RuntimeError("generator.encoder is required for encoder-only compile scope.")
-        generator.encoder = torch.compile(gen_encoder, **compile_kwargs)  # type: ignore[attr-defined]
-        compiled_targets.append("generator.encoder")
+        _compile_module_forward(module=gen_encoder, target="generator.encoder")
 
     if compile_scope in {"encoder", "disc_encoder"}:
         disc_encoder = getattr(discriminator, "encoder", None)
         if not isinstance(disc_encoder, torch.nn.Module):
             raise RuntimeError("discriminator.encoder is required for encoder-only compile scope.")
-        discriminator.encoder = torch.compile(disc_encoder, **compile_kwargs)  # type: ignore[attr-defined]
-        compiled_targets.append("discriminator.encoder")
+        _compile_module_forward(module=disc_encoder, target="discriminator.encoder")
 
     if compile_scope in {"ffn", "gen_ffn"}:
         _compile_encoder_ffn(backbone=generator, branch="generator")
@@ -1567,10 +1573,6 @@ def _save_training_checkpoint(
     consumed_micro_batches: int,
     save_total_limit: int,
     log_label: str,
-    model: DebertaV3RTDPretrainer | torch.nn.Module | None = None,
-    tokenizer: Any | None = None,
-    embedding_sharing: str = "none",
-    export_hf_checkpoint: bool = False,
 ) -> None:
     """Save one training checkpoint with collective state-dict write.
 
@@ -1580,10 +1582,6 @@ def _save_training_checkpoint(
     :param int consumed_micro_batches: Data progress to persist.
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
-    :param DebertaV3RTDPretrainer | torch.nn.Module | None model: Runtime model for optional checkpoint HF export.
-    :param Any | None tokenizer: Tokenizer for optional checkpoint HF export.
-    :param str embedding_sharing: Embedding sharing mode.
-    :param bool export_hf_checkpoint: Whether to attempt writing ``checkpoint-*/hf`` artifacts.
     """
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -1595,22 +1593,6 @@ def _save_training_checkpoint(
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        if bool(export_hf_checkpoint):
-            if model is None or tokenizer is None:
-                raise ValueError(
-                    "export_hf_checkpoint=true requires model and tokenizer in _save_training_checkpoint()."
-                )
-            try:
-                _export_discriminator_hf(
-                    accelerator=accelerator,
-                    model=model,
-                    tokenizer=tokenizer,
-                    output_dir=checkpoint_dir / "hf",
-                    embedding_sharing=embedding_sharing,
-                )
-            except Exception as exc:
-                logger.warning("Checkpoint HF export failed for %s: %s", checkpoint_dir, exc)
-
         _save_checkpoint_data_progress(
             checkpoint_dir=checkpoint_dir,
             consumed_micro_batches=consumed_micro_batches,
@@ -2459,10 +2441,6 @@ def run_pretraining(
                             consumed_micro_batches=consumed_micro_batches,
                             save_total_limit=int(train_cfg.save_total_limit),
                             log_label="periodic",
-                            model=model,
-                            tokenizer=tokenizer,
-                            embedding_sharing=model_cfg.embedding_sharing,
-                            export_hf_checkpoint=bool(train_cfg.export_hf_checkpoints),
                         )
                         last_saved_step = global_step
                     continue
@@ -2556,10 +2534,6 @@ def run_pretraining(
                         consumed_micro_batches=consumed_micro_batches,
                         save_total_limit=int(train_cfg.save_total_limit),
                         log_label="periodic",
-                        model=model,
-                        tokenizer=tokenizer,
-                        embedding_sharing=model_cfg.embedding_sharing,
-                        export_hf_checkpoint=bool(train_cfg.export_hf_checkpoints),
                     )
                     last_saved_step = global_step
 
@@ -2602,10 +2576,6 @@ def run_pretraining(
                     consumed_micro_batches=consumed_micro_batches,
                     save_total_limit=int(train_cfg.save_total_limit),
                     log_label="final",
-                    model=model,
-                    tokenizer=tokenizer,
-                    embedding_sharing=model_cfg.embedding_sharing,
-                    export_hf_checkpoint=bool(train_cfg.export_hf_checkpoints),
                 )
                 last_saved_step = final_step
         elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:

@@ -99,7 +99,9 @@ Compile behavior is configured directly via train/model config:
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
 For native HF runs, prefer `model.hf_attention_kernel=stable`.
 
-Resume behavior normalizes compile-wrapper key segments (`._orig_mod`) when needed, so checkpoints can be resumed across different compile scopes (for example, `backbones` -> `ffn`) without manual checkpoint surgery.
+Compile is applied to module `forward` callables (module identity is preserved), so
+new checkpoints keep canonical state-dict keys. Resume still normalizes legacy
+compile-wrapper key segments (`._orig_mod`) when needed for older checkpoints.
 
 ### Compile Parity Protocol
 
@@ -189,12 +191,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 ```
 
 The exporter consolidates to full state on rank 0 and writes standalone HF artifacts.
-Compiled checkpoints that include `._orig_mod` key segments are remapped automatically
-during export, so `torch.compile` wrapper artifacts do not block consolidation.
-
-If you want "easy-load" checkpoint artifacts during training, set
-`train.export_hf_checkpoints=true`. Each saved checkpoint writes an additional
-`checkpoint-<STEP>/hf/` discriminator export (tokenizer at `hf/`, model at
-`hf/discriminator/`) on the main process.
+Legacy compiled checkpoints that include `._orig_mod` key segments are remapped
+automatically during export, so older wrapper artifacts do not block consolidation.
 
 Run directories now include `run_metadata.json` with a `config_schema_version`. Resume/export validate that schema and fail fast on unknown versions instead of silently proceeding with ambiguous config metadata.
