@@ -10,7 +10,7 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 ## Data/Packing
 
 - evaluate checkpointing packer worker/buffer state (not just consumed micro-batch count) for stricter resume determinism across worker/process layouts
-- replace collator-time dense document attention mask materialization (`B x S x S`) with a compact doc-boundary representation and on-device block masking to reduce CPU bottlenecks at long context lengths
+- replace collator-time dense document attention mask materialization (`B x S x S`) with a compact doc-boundary representation and on-device block masking to reduce CPU bottlenecks at long context lengths; this also blocks SDPA fused kernels (FlashAttention) in some PyTorch versions since the dense `(B,1,S,S)` expansion is hostile to optimized kernel selection
 - refactor token-weighted GA to avoid whole-window microbatch buffering so large per-batch metadata does not scale host memory linearly with `gradient_accumulation_steps`
 - replace whole-word n-gram retry-loop masking (`mlm_max_ngram > 1`) with a deterministic linear-time candidate walk (and/or vectorized path) to avoid worst-case per-sample retry spin on long sequences
 
@@ -24,3 +24,4 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 ## Model Perf
 
 - investigate active-token-only projection paths for heavily padded 2D batches (skip attention/FFN projection FLOPs on known-dead pad positions rather than zeroing outputs post projection)
+- for HF DeBERTa-v2 backbone: evaluate lazy or on-demand relative-position table construction to avoid O(max_len²) init-time allocation at very large `max_position_embeddings` (currently CPU-only, ~1 MB at 512, but scales quadratically)
