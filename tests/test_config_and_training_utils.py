@@ -1784,7 +1784,7 @@ def test_force_legacy_tf32_for_compile_modes():
 
 
 def test_stabilize_compile_attention_mask_hf_deberta_v2():
-    # Adds missing mask for HF backbone with backbone-level compile scope.
+    # Missing mask stays absent — backbone handles None via no-mask fast path.
     batch1 = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)}
     out1 = _stabilize_compile_attention_mask(
         batch=batch1,
@@ -1792,9 +1792,7 @@ def test_stabilize_compile_attention_mask_hf_deberta_v2():
         compile_scope="backbones",
         backbone_type="hf_deberta_v2",
     )
-    assert "attention_mask" in out1
-    assert out1["attention_mask"].dtype == torch.bool
-    assert torch.equal(out1["attention_mask"], torch.ones_like(batch1["input_ids"], dtype=torch.bool))
+    assert "attention_mask" not in out1
 
     # FFN scope does not inject mask.
     batch2 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}

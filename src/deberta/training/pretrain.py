@@ -1393,7 +1393,9 @@ def _stabilize_compile_attention_mask(
     ``attention_mask`` is sometimes omitted and sometimes present.  This helper
     enforces a stable tensor contract for those scopes.
 
-    For HF DeBERTa-v2: always materializes a 2D bool mask when absent.
+    For HF DeBERTa-v2: normalizes existing masks to bool but does **not**
+    materialize a mask when absent — the backbone's no-mask fast path handles
+    ``None`` directly.
     For RoPE + doc-blocking: materializes a 3D ``(B,S,S)`` all-True bool mask
     when absent so the compiled graph always sees rank-3 input.
 
@@ -1419,10 +1421,7 @@ def _stabilize_compile_attention_mask(
 
     if btype == "hf_deberta_v2":
         attn = batch.get("attention_mask")
-        if not isinstance(attn, torch.Tensor):
-            batch["attention_mask"] = torch.ones_like(input_ids, dtype=torch.bool)
-            return batch
-        if attn.dtype != torch.bool:
+        if isinstance(attn, torch.Tensor) and attn.dtype != torch.bool:
             batch["attention_mask"] = attn.to(dtype=torch.bool)
         return batch
 
