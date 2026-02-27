@@ -871,30 +871,6 @@ class DebertaV2Encoder(nn.Module):
         self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
         self.gradient_checkpointing = False
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
-        rel_pos_cap = int(getattr(config, "max_position_embeddings", 0))
-        if rel_pos_cap <= 0:
-            rel_pos_cap = max(1, int(self.max_relative_positions))
-        self.register_buffer(
-            "_rel_pos_table",
-            self._build_static_rel_pos_table(rel_pos_cap),
-            persistent=False,
-        )
-
-    def _build_static_rel_pos_table(self, max_len: int) -> torch.Tensor:
-        """Build a reusable relative-position table for compile-stable kernels.
-
-        :param int max_len: Maximum square sequence length for cached slicing.
-        :return torch.Tensor: Relative-position ids with shape ``(max_len, max_len)``.
-        """
-        if not self.relative_attention or max_len <= 0:
-            return torch.empty(0, 0, dtype=torch.long)
-        return build_relative_position(
-            int(max_len),
-            int(max_len),
-            bucket_size=self.position_buckets,
-            max_position=self.max_relative_positions,
-            device=torch.device("cpu"),
-        )
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         """Return optionally normalized relative embedding table.
@@ -958,7 +934,6 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor | None relative_pos: Optional precomputed relative positions.
         :return torch.Tensor | None: Relative-position ids or ``None``.
         """
-
         if not self.relative_attention:
             return None
         if relative_pos is not None:
@@ -966,21 +941,6 @@ class DebertaV2Encoder(nn.Module):
 
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2]) if query_states is not None else key_len
-
-        if self.attn_kernel in {"cached_bmm", "stable"}:
-            table = self._rel_pos_table
-            if table.ndim == 2 and query_len <= int(table.shape[0]) and key_len <= int(table.shape[1]):
-                return table[:query_len, :key_len].to(device=hidden_states.device)
-
-            # Fallback for out-of-range lengths without mutating module state in forward.
-            return build_relative_position(
-                query_len,
-                key_len,
-                bucket_size=self.position_buckets,
-                max_position=self.max_relative_positions,
-                device=hidden_states.device,
-            )
-
         return build_relative_position(
             query_len,
             key_len,

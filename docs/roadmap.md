@@ -24,4 +24,4 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 ## Model Perf
 
 - investigate active-token-only projection paths for heavily padded 2D batches (skip attention/FFN projection FLOPs on known-dead pad positions rather than zeroing outputs post projection)
-- for HF DeBERTa-v2 backbone: evaluate lazy or on-demand relative-position table construction to avoid O(max_len²) init-time allocation at very large `max_position_embeddings` (currently CPU-only, ~1 MB at 512, but scales quadratically)
+- ~~for HF DeBERTa-v2 backbone: evaluate lazy or on-demand relative-position table construction to avoid O(max_len²) init-time allocation~~ — **resolved**: removed upfront `_rel_pos_table` buffer; all kernels now call `build_relative_position()` on-device per forward (cheap, compile-safe)
