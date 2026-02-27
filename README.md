@@ -35,7 +35,7 @@ Use `--help` on each command for full argument docs.
 Train from YAML (recommended):
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
   deberta train configs/pretrain_rope_fineweb_edu.yaml
 ```
 
@@ -44,7 +44,7 @@ Long-context and custom debug presets live under [`configs/`](configs/).
 Export from an FSDP2 checkpoint:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
+accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta export \
   runs/deberta_rope_rtd/checkpoint-10000 \
   --what discriminator \
   --output-dir runs/deberta_rope_rtd/exported_hf
@@ -64,7 +64,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - Base pretraining config: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml)
 - Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
-- Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
+- Accelerate/FSDP2: [`configs/accelerate/fsdp2_1node.yaml`](configs/accelerate/fsdp2_1node.yaml), [`configs/accelerate/fsdp2_hf_deberta_1node.yaml`](configs/accelerate/fsdp2_hf_deberta_1node.yaml)
 
 ## Citations
 

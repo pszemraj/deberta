@@ -11,9 +11,9 @@ This project targets PyTorch 2.9.1+ and uses Hugging Face Accelerate with:
 
 Provided configs:
 
-- RoPE backbone: [`configs/fsdp2_1node.yaml`](../configs/fsdp2_1node.yaml)
+- RoPE backbone: [`configs/accelerate/fsdp2_1node.yaml`](../configs/accelerate/fsdp2_1node.yaml)
   - wrap class: `DebertaRoPELayer`
-- HF DeBERTa compatibility path: [`configs/fsdp2_hf_deberta_1node.yaml`](../configs/fsdp2_hf_deberta_1node.yaml)
+- HF DeBERTa compatibility path: [`configs/accelerate/fsdp2_hf_deberta_1node.yaml`](../configs/accelerate/fsdp2_hf_deberta_1node.yaml)
   - wrap class: `DebertaV2Layer`
 
 ## Precision Defaults
@@ -182,7 +182,7 @@ Recommended during training:
 For reliable artifact export, run `deberta export` after training:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
+accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta export \
   <RUN_DIR>/checkpoint-<STEP> \
   --output-dir <RUN_DIR>/exported_hf \
   --what discriminator

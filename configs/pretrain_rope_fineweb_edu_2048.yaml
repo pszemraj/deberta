@@ -1,6 +1,6 @@
 # RoPE + RMSNorm + SwiGLU, 2048 context.
 # Usage:
-#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+#   accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
 #     deberta train configs/pretrain_rope_fineweb_edu_2048.yaml
 
 model:
