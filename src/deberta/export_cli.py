@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from deberta.checkpoint_utils import load_model_state_with_compile_key_remap
 from deberta.config import (
     DataConfig,
     ModelConfig,
@@ -210,6 +211,62 @@ def _build_export_backbone(
     return disc, gen
 
 
+def _unwrap_model_for_export_load(accelerator: Any, model: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap accelerator/compile wrappers for deterministic remap loading.
+
+    :param Any accelerator: Accelerator runtime.
+    :param torch.nn.Module model: Potentially wrapped model.
+    :return torch.nn.Module: Best-effort unwrapped model.
+    """
+    unwrap = accelerator.unwrap_model
+    try:
+        return unwrap(model, keep_torch_compile=False)
+    except Exception:
+        pass
+    try:
+        return unwrap(model)
+    except Exception:
+        pass
+
+    candidate = model
+    while hasattr(candidate, "module"):
+        candidate = candidate.module
+    return candidate
+
+
+def _load_export_state_with_compile_fallback(
+    accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
+) -> None:
+    """Load checkpoint state, retrying with compile-key canonical remapping when needed.
+
+    :param Any accelerator: Accelerator instance.
+    :param torch.nn.Module model: Export model container.
+    :param str checkpoint_dir: Path to checkpoint directory.
+    :raises RuntimeError: If both normal and compile-remap fallback load paths fail.
+    """
+    try:
+        accelerator.load_state(checkpoint_dir)
+        return
+    except RuntimeError as err:
+        if "_orig_mod" not in str(err):
+            raise
+
+    logger.warning(
+        "Checkpoint model key mismatch due compile wrappers detected; retrying export load with "
+        "strict=False and canonical key remap."
+    )
+    accelerator.load_state(checkpoint_dir, strict=False)
+    unwrapped = _unwrap_model_for_export_load(accelerator, model)
+    stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
+    logger.info(
+        "Export model remap loaded %d tensors from %s (missing=%d, unexpected=%d).",
+        int(stats["matched"]),
+        checkpoint_dir,
+        int(stats["missing"]),
+        int(stats["unexpected"]),
+    )
+
+
 def run_export(cfg: ExportConfig) -> None:
     """Run checkpoint export flow.
 
@@ -281,7 +338,7 @@ def run_export(cfg: ExportConfig) -> None:
     model = accelerator.prepare(model)
 
     # Load accelerate checkpoint (FSDP2 SHARDED_STATE_DICT is handled here by accelerate/torch.distributed.checkpoint).
-    accelerator.load_state(str(checkpoint_dir))
+    _load_export_state_with_compile_fallback(accelerator, model, str(checkpoint_dir))
     accelerator.wait_for_everyone()
 
     # Consolidate FULL_STATE_DICT when FSDP is enabled.

@@ -189,5 +189,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 ```
 
 The exporter consolidates to full state on rank 0 and writes standalone HF artifacts.
+Compiled checkpoints that include `._orig_mod` key segments are remapped automatically
+during export, so `torch.compile` wrapper artifacts do not block consolidation.
 
 Run directories now include `run_metadata.json` with a `config_schema_version`. Resume/export validate that schema and fail fast on unknown versions instead of silently proceeding with ambiguous config metadata.

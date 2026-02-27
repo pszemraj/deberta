@@ -68,6 +68,7 @@ def _install_export_fakes(
     called: dict[str, object],
     fsdp2: bool,
     provide_torch_state_dict_api: bool,
+    load_state_orig_mod_mismatch: bool = False,
 ) -> None:
     fake_utils = types.ModuleType("accelerate.utils")
     fake_utils.DistributedType = types.SimpleNamespace(FSDP="FSDP")
@@ -82,7 +83,10 @@ def _install_export_fakes(
         def prepare(self, model):
             return model
 
-        def load_state(self, _checkpoint_dir: str) -> None:
+        def load_state(self, _checkpoint_dir: str, **kwargs: Any) -> None:
+            called["load_state_calls"] = list(called["load_state_calls"]) + [dict(kwargs)]
+            if load_state_orig_mod_mismatch and kwargs.get("strict", True):
+                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
             return None
 
         def wait_for_everyone(self) -> None:
@@ -163,6 +167,7 @@ def test_run_export_fsdp_state_dict_paths(
         "unwrap_model": 0,
         "get_model_state_dict": 0,
         "options_kwargs": None,
+        "load_state_calls": [],
     }
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -194,6 +199,50 @@ def test_run_export_fsdp_state_dict_paths(
         assert called["get_model_state_dict"] == 0
         assert called["options_kwargs"] is None
     assert called["unwrap_model"] == 0
+    assert called["load_state_calls"] == [{}]
+
+
+def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    called: dict[str, object] = {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+        "remap_calls": [],
+    }
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+        load_state_orig_mod_mismatch=True,
+    )
+
+    def _fake_remap(model: torch.nn.Module, checkpoint_dir_for_remap: Path) -> dict[str, int]:
+        called["remap_calls"] = list(called["remap_calls"]) + [(model, checkpoint_dir_for_remap)]
+        return {"matched": 2, "missing": 0, "unexpected": 0}
+
+    monkeypatch.setattr(export_cli, "load_model_state_with_compile_key_remap", _fake_remap)
+
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(tmp_path / "exported"),
+            offload_to_cpu=True,
+            rank0=True,
+        )
+    )
+
+    assert called["load_state_calls"] == [{}, {"strict": False}]
+    assert called["unwrap_model"] == 1
+    remap_calls = list(called["remap_calls"])
+    assert len(remap_calls) == 1
+    assert remap_calls[0][1] == checkpoint_dir
 
 
 def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
