@@ -8,6 +8,7 @@ import re
 import shlex
 import sys
 import types
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -2410,13 +2411,17 @@ def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_ro
         )
 
 
-def test_validate_training_workflow_options_rejects_sdpa_kernel_override_for_non_rope_backbones():
-    with pytest.raises(ValueError, match="only applies when model.backbone_type='rope'"):
+def test_validate_training_workflow_options_warns_sdpa_kernel_override_for_non_rope_backbones():
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
         validate_training_workflow_options(
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
             train_cfg=TrainConfig(sdpa_kernel="flash"),
             model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         )
+    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
+    assert len(user_warnings) >= 1
+    assert "no effect" in str(user_warnings[0].message)
 
 
 def test_validate_training_workflow_options_rejects_hf_backbone_doc_blocking_in_packed_mode():
@@ -2451,10 +2456,14 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
     assert cfg.hf_attention_kernel == "stable"
 
 
-def test_validate_model_config_rejects_hf_attention_kernel_override_for_rope_backbone():
+def test_validate_model_config_warns_hf_attention_kernel_override_for_rope_backbone():
     cfg = ModelConfig(backbone_type="rope", hf_attention_kernel="cached_bmm")
-    with pytest.raises(ValueError, match="model.hf_attention_kernel only applies when"):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
         validate_model_config(cfg)
+    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
+    assert len(user_warnings) >= 1
+    assert "hf_attention_kernel" in str(user_warnings[0].message)
 
 
 def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
@@ -2637,3 +2646,121 @@ def test_readme_cli_examples_are_parseable():
 
     for cmd in examples:
         parser.parse_args(shlex.split(cmd))
+
+
+# ---------------------------------------------------------------------------
+# Inert parameter combination warnings (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cfg_kwargs,expect_warn",
+    [
+        # 1A: rope + non-default hf_attention_kernel → warn
+        ({"backbone_type": "rope", "hf_attention_kernel": "stable"}, True),
+        # 1A: rope + default hf_attention_kernel → no warn
+        ({"backbone_type": "rope", "hf_attention_kernel": "dynamic"}, False),
+        # 1B: post + non-default keel_alpha_init → warn
+        ({"backbone_type": "rope", "norm_arch": "post", "keel_alpha_init": 5.0}, True),
+        # 1B: post + non-default keel_alpha_learnable → warn
+        ({"backbone_type": "rope", "norm_arch": "post", "keel_alpha_learnable": True}, True),
+        # 1B: keel + keel_alpha_init → no warn
+        ({"backbone_type": "rope", "norm_arch": "keel", "keel_alpha_init": 5.0}, False),
+        # 1B: post + default keel params → no warn
+        ({"backbone_type": "rope", "norm_arch": "post"}, False),
+        # 1C: mlp + non-default swiglu_adjust_intermediate → warn
+        ({"backbone_type": "rope", "ffn_type": "mlp", "swiglu_adjust_intermediate": False}, True),
+        # 1C: swiglu + swiglu_adjust_intermediate → no warn
+        ({"backbone_type": "rope", "ffn_type": "swiglu", "swiglu_adjust_intermediate": False}, False),
+        # 1C: mlp + default swiglu_adjust_intermediate → no warn
+        ({"backbone_type": "rope", "ffn_type": "mlp"}, False),
+    ],
+    ids=[
+        "1A-rope-hf_kernel-warn",
+        "1A-rope-hf_kernel-default-nowarn",
+        "1B-post-keel_alpha_init-warn",
+        "1B-post-keel_alpha_learnable-warn",
+        "1B-keel-keel_alpha_init-nowarn",
+        "1B-post-default-nowarn",
+        "1C-mlp-swiglu_adjust-warn",
+        "1C-swiglu-swiglu_adjust-nowarn",
+        "1C-mlp-default-nowarn",
+    ],
+)
+def test_validate_model_config_inert_param_warnings(cfg_kwargs, expect_warn):
+    cfg = ModelConfig(**cfg_kwargs)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        validate_model_config(cfg)
+    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
+    if expect_warn:
+        assert len(user_warnings) >= 1, f"Expected warning for {cfg_kwargs}, got none"
+    else:
+        assert len(user_warnings) == 0, (
+            f"Unexpected warning for {cfg_kwargs}: {[str(x.message) for x in user_warnings]}"
+        )
+
+
+@pytest.mark.parametrize(
+    "cfg_kwargs,expect_warn",
+    [
+        # 1D: compile=false + non-auto scope → warn
+        ({"torch_compile": False, "torch_compile_scope": "backbones"}, True),
+        # 1D: compile=false + auto scope → no warn
+        ({"torch_compile": False, "torch_compile_scope": "auto"}, False),
+        # 1D: compile=true + non-auto scope → no warn
+        ({"torch_compile": True, "torch_compile_scope": "backbones"}, False),
+    ],
+    ids=[
+        "1D-nocompile-scope-warn",
+        "1D-nocompile-auto-nowarn",
+        "1D-compile-scope-nowarn",
+    ],
+)
+def test_validate_train_config_inert_param_warnings(cfg_kwargs, expect_warn):
+    cfg = TrainConfig(**cfg_kwargs)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        validate_train_config(cfg)
+    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
+    if expect_warn:
+        assert len(user_warnings) >= 1, f"Expected warning for {cfg_kwargs}, got none"
+    else:
+        assert len(user_warnings) == 0, (
+            f"Unexpected warning for {cfg_kwargs}: {[str(x.message) for x in user_warnings]}"
+        )
+
+
+@pytest.mark.parametrize(
+    "model_kwargs,train_kwargs,expect_warn",
+    [
+        # 1E: hf_deberta_v2 + non-auto sdpa_kernel → warn
+        ({"backbone_type": "hf_deberta_v2"}, {"sdpa_kernel": "mem_efficient"}, True),
+        # 1E: hf_deberta_v2 + auto sdpa_kernel → no warn
+        ({"backbone_type": "hf_deberta_v2"}, {"sdpa_kernel": "auto"}, False),
+        # 1E: rope + non-auto sdpa_kernel → no warn (rope SDPA is functional)
+        ({"backbone_type": "rope"}, {"sdpa_kernel": "mem_efficient"}, False),
+    ],
+    ids=[
+        "1E-hfv2-sdpa-warn",
+        "1E-hfv2-auto-nowarn",
+        "1E-rope-sdpa-nowarn",
+    ],
+)
+def test_validate_workflow_sdpa_kernel_inert_warning(model_kwargs, train_kwargs, expect_warn):
+    model_cfg = ModelConfig(**model_kwargs)
+    train_cfg = TrainConfig(**train_kwargs)
+    data_cfg = DataConfig(data_files="dummy.txt")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
+    if expect_warn:
+        assert len(user_warnings) >= 1, (
+            f"Expected warning for model={model_kwargs} train={train_kwargs}, got none"
+        )
+    else:
+        assert len(user_warnings) == 0, (
+            f"Unexpected warning for model={model_kwargs} train={train_kwargs}: "
+            f"{[str(x.message) for x in user_warnings]}"
+        )

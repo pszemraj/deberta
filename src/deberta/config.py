@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
@@ -987,9 +988,11 @@ def validate_model_config(cfg: ModelConfig) -> None:
     else:
         default_hf_kernel = ModelConfig().hf_attention_kernel
         if cfg.hf_attention_kernel != default_hf_kernel:
-            raise ValueError(
+            warnings.warn(
                 "model.hf_attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Keep the default value ({default_hf_kernel!r}) for other backbones."
+                f"Current value ({cfg.hf_attention_kernel!r}) has no effect on the rope backbone.",
+                UserWarning,
+                stacklevel=2,
             )
 
     if (
@@ -1117,6 +1120,33 @@ def validate_model_config(cfg: ModelConfig) -> None:
         if int(cfg.hidden_size) % int(cfg.num_attention_heads) != 0:
             raise ValueError("model.hidden_size must be divisible by model.num_attention_heads.")
 
+    # Warn on KEEL params when norm_arch="post" (they only apply when norm_arch="keel").
+    defaults = ModelConfig()
+    if cfg.norm_arch == "post":
+        if cfg.keel_alpha_init is not None and cfg.keel_alpha_init != defaults.keel_alpha_init:
+            warnings.warn(
+                "model.keel_alpha_init has no effect when model.norm_arch='post'. "
+                "Set model.norm_arch='keel' to use KEEL alpha scaling.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if cfg.keel_alpha_learnable != defaults.keel_alpha_learnable:
+            warnings.warn(
+                "model.keel_alpha_learnable has no effect when model.norm_arch='post'. "
+                "Set model.norm_arch='keel' to use learnable KEEL alpha.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    # Warn on swiglu_adjust_intermediate with ffn_type="mlp" (only applies to swiglu).
+    if cfg.ffn_type == "mlp" and cfg.swiglu_adjust_intermediate != defaults.swiglu_adjust_intermediate:
+        warnings.warn(
+            "model.swiglu_adjust_intermediate has no effect when model.ffn_type='mlp'. "
+            "The intermediate size scaling is only applied for ffn_type='swiglu'.",
+            UserWarning,
+            stacklevel=2,
+        )
+
 
 def validate_data_config(cfg: DataConfig) -> None:
     """Validate data-source and preprocessing option combinations.
@@ -1212,6 +1242,15 @@ def validate_train_config(cfg: TrainConfig) -> None:
     if float(cfg.sampling_temperature) <= 0.0:
         raise ValueError("train.sampling_temperature must be > 0.")
 
+    # Warn on torch_compile_scope when torch_compile=false (scope has no effect).
+    if not bool(cfg.torch_compile) and cfg.torch_compile_scope != "auto":
+        warnings.warn(
+            "train.torch_compile_scope has no effect when train.torch_compile=false. "
+            f"Current scope ({cfg.torch_compile_scope!r}) will be ignored.",
+            UserWarning,
+            stacklevel=2,
+        )
+
 
 def validate_training_workflow_options(
     *,
@@ -1241,9 +1280,12 @@ def validate_training_workflow_options(
         backbone_type = str(model_cfg.backbone_type).strip().lower()
         attn_impl = str(model_cfg.attention_implementation).strip().lower()
         if backbone_type != "rope" and sdpa_policy != "auto":
-            raise ValueError(
-                "train.sdpa_kernel only applies when model.backbone_type='rope' and "
-                "model.attention_implementation='sdpa'. Set train.sdpa_kernel=auto for non-rope backbones."
+            warnings.warn(
+                "train.sdpa_kernel has no effect when model.backbone_type='hf_deberta_v2'. "
+                "The HF DeBERTa-v2 disentangled attention uses explicit matmuls, not F.scaled_dot_product_attention. "
+                f"Current value ({train_cfg.sdpa_kernel!r}) will be ignored.",
+                UserWarning,
+                stacklevel=2,
             )
         if backbone_type == "rope" and attn_impl != "sdpa" and sdpa_policy != "auto":
             raise ValueError(
