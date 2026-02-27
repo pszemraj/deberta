@@ -2016,6 +2016,39 @@ def test_validate_training_workflow_options_rejects_hf_backbone_doc_blocking_in_
         )
 
 
+def test_validate_training_workflow_options_rejects_es_with_divergent_gen_lr():
+    with pytest.raises(ValueError, match="embedding_sharing='es'"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+            model_cfg=ModelConfig(embedding_sharing="es"),
+        )
+
+
+def test_validate_training_workflow_options_allows_es_with_matching_gen_lr():
+    # Explicit gen LR matching disc LR — should pass.
+    validate_training_workflow_options(
+        data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=5e-4),
+        model_cfg=ModelConfig(embedding_sharing="es"),
+    )
+    # Inherited gen LR (-1) — should pass.
+    validate_training_workflow_options(
+        data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=-1.0),
+        model_cfg=ModelConfig(embedding_sharing="es"),
+    )
+
+
+def test_validate_training_workflow_options_allows_gdes_with_divergent_gen_lr():
+    # GDES handles separate LR correctly — should not raise.
+    validate_training_workflow_options(
+        data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+        model_cfg=ModelConfig(embedding_sharing="gdes"),
+    )
+
+
 def test_validate_model_config_rejects_rope_knobs_in_hf_mode():
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",

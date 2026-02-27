@@ -1301,3 +1301,13 @@ def validate_training_workflow_options(
                 "data.block_cross_document_attention=true is only supported with model.backbone_type='rope'. "
                 "Use data.block_cross_document_attention=false or switch to model.backbone_type='rope'."
             )
+        embed_sharing = str(model_cfg.embedding_sharing).strip().lower()
+        gen_lr = float(train_cfg.generator_learning_rate)
+        if embed_sharing == "es" and gen_lr > 0 and gen_lr != float(train_cfg.learning_rate):
+            raise ValueError(
+                f"model.embedding_sharing='es' shares embedding parameters between generator and discriminator, "
+                f"but train.generator_learning_rate ({gen_lr}) differs from train.learning_rate "
+                f"({train_cfg.learning_rate}). Shared embeddings would silently use the generator LR. "
+                f"Set generator_learning_rate=-1 (inherit) or match it to learning_rate, "
+                f"or switch to embedding_sharing='gdes'/'none'."
+            )
