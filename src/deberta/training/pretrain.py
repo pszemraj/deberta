@@ -1831,7 +1831,7 @@ def _export_discriminator_hf(
             disc_sd=disc_sd,
             gen_sd=gen_sd,
             mode=mode,
-            fp32_accumulate=False,
+            fp32_accumulate=True,
         )
 
         tokenizer.save_pretrained(str(output_dir))
