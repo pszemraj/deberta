@@ -1161,39 +1161,55 @@ def _compile_backbones_for_scope(
         compiled_targets.append(target)
 
     def _compile_encoder_ffn(*, backbone: torch.nn.Module, branch: str) -> None:
-        """Compile FFN blocks (`intermediate` and `output`) in all encoder layers.
+        """Compile FFN blocks in all encoder layers.
+
+        Supports both HF DeBERTa-v2 (``encoder.layer[i].intermediate``/``.output``)
+        and RoPE (``encoder.layers[i].mlp``) module layouts.
 
         :param torch.nn.Module backbone: Generator/discriminator backbone.
         :param str branch: Branch label used in compiled target names.
         :raises RuntimeError: If encoder/layer/FFN modules are missing.
         """
-
         encoder = getattr(backbone, "encoder", None)
         if not isinstance(encoder, torch.nn.Module):
             raise RuntimeError(f"{branch}.encoder is required for ffn-only compile scope.")
 
+        # Try HF DeBERTa-v2 convention (encoder.layer) then RoPE (encoder.layers).
         layers = getattr(encoder, "layer", None)
+        layers_attr = "layer"
         if not isinstance(layers, (torch.nn.ModuleList, list, tuple)):
-            raise RuntimeError(f"{branch}.encoder.layer is required for ffn-only compile scope.")
+            layers = getattr(encoder, "layers", None)
+            layers_attr = "layers"
+        if not isinstance(layers, (torch.nn.ModuleList, list, tuple)):
+            raise RuntimeError(f"{branch}.encoder.layer/layers is required for ffn-only compile scope.")
         if len(layers) == 0:
-            raise RuntimeError(f"{branch}.encoder.layer is empty; cannot apply ffn-only compile scope.")
+            raise RuntimeError(
+                f"{branch}.encoder.{layers_attr} is empty; cannot apply ffn-only compile scope."
+            )
 
         for idx, layer in enumerate(layers):
             if not isinstance(layer, torch.nn.Module):
-                raise RuntimeError(f"{branch}.encoder.layer[{idx}] is not a torch.nn.Module.")
+                raise RuntimeError(f"{branch}.encoder.{layers_attr}[{idx}] is not a torch.nn.Module.")
+
+            # HF DeBERTa-v2: intermediate + output modules.
             intermediate = getattr(layer, "intermediate", None)
             output = getattr(layer, "output", None)
-            if not isinstance(intermediate, torch.nn.Module):
-                raise RuntimeError(
-                    f"{branch}.encoder.layer[{idx}].intermediate is required for ffn-only compile scope."
-                )
-            if not isinstance(output, torch.nn.Module):
-                raise RuntimeError(
-                    f"{branch}.encoder.layer[{idx}].output is required for ffn-only compile scope."
-                )
+            if isinstance(intermediate, torch.nn.Module) and isinstance(output, torch.nn.Module):
+                pfx = f"{branch}.encoder.{layers_attr}[{idx}]"
+                _compile_module_forward(module=intermediate, target=f"{pfx}.intermediate")
+                _compile_module_forward(module=output, target=f"{pfx}.output")
+                continue
 
-            _compile_module_forward(module=intermediate, target=f"{branch}.encoder.layer[{idx}].intermediate")
-            _compile_module_forward(module=output, target=f"{branch}.encoder.layer[{idx}].output")
+            # RoPE: single mlp module.
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, torch.nn.Module):
+                _compile_module_forward(module=mlp, target=f"{branch}.encoder.{layers_attr}[{idx}].mlp")
+                continue
+
+            raise RuntimeError(
+                f"{branch}.encoder.{layers_attr}[{idx}] has no recognized FFN module "
+                "(expected intermediate+output or mlp)."
+            )
 
     if compile_scope == "backbones":
         _compile_module_forward(module=generator, target="generator")
