@@ -1549,6 +1549,59 @@ def test_attention_mask_to_active_tokens_uses_pad_contract_for_3d_masks():
     assert torch.equal(active, expected)
 
 
+def test_attention_mask_to_active_tokens_uses_diagonal_not_any_for_3d_no_pad():
+    """Without pad_token_id, 3D fallback must use diagonal, not any(dim=-1).
+
+    Construct a mask where off-diagonal keeps in an inactive row make
+    any(dim=-1) return True but the diagonal is False.
+    """
+    input_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+    # Row 2: diagonal=False but has off-diagonal True → any(dim=-1) would wrongly report active.
+    pair_keep = torch.tensor(
+        [
+            [
+                [True, True, False],
+                [True, True, False],
+                [True, False, False],
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=pair_keep,
+        pad_token_id=None,
+    )
+    # Diagonal: [True, True, False]
+    expected = torch.tensor([[True, True, False]], dtype=torch.bool)
+    assert torch.equal(active, expected), f"Expected diagonal-based result {expected}, got {active}"
+
+
+def test_attention_mask_to_active_tokens_uses_diagonal_for_4d_no_pad():
+    """4D fallback without pad_token_id must use diagonal after squeezing heads."""
+    input_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+    # (B=1, H=1, S=3, S=3) — row 2 has off-diagonal True but diagonal False.
+    pair_keep = torch.tensor(
+        [
+            [
+                [
+                    [True, True, False],
+                    [True, True, False],
+                    [True, False, False],
+                ]
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=pair_keep,
+        pad_token_id=None,
+    )
+    expected = torch.tensor([[True, True, False]], dtype=torch.bool)
+    assert torch.equal(active, expected)
+
+
 def test_build_optimizer_marks_scalar_params_as_no_decay():
     train_cfg = TrainConfig()
 
