@@ -61,6 +61,11 @@ _NONFINITE_OPT_STATE_RESET_EVERY = 4
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
     """Append one metrics row to JSONL(.gz) with immediate flush.
 
+    Opens the file per-write rather than keeping a persistent handle.  This is
+    intentional: the function is called only every ``logging_steps`` (not per
+    micro-batch), so the overhead is negligible, and the immediate close
+    guarantees crash-safe writes — important for long pretraining runs.
+
     :param Path path: Metrics path, typically ``*.jsonl`` or ``*.jsonl.gz``.
     :param dict[str, Any] row: Serializable metrics row.
     """
@@ -2267,6 +2272,9 @@ def run_pretraining(
         if disc_pad_token_id is not None:
             disc_pad_token_id = int(disc_pad_token_id)
 
+        # TODO(data-resume): persist dataset iterator state (packing buffer + RNG) for O(1) resume
+        # instead of replaying O(consumed_micro_batches) samples.  Requires serializable snapshot
+        # support in PackedStreamingDataset / SequentialStreamingDataset.
         if consumed_micro_batches > 0:
             if int(global_step) >= int(train_cfg.max_steps):
                 logger.info(
@@ -2561,6 +2569,11 @@ def run_pretraining(
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
                     # Recovery path: keep training alive, advance schedule/step, and keep moving.
+                    # Design: lr_scheduler.step() advances the schedule, then _apply_nonfinite_recovery
+                    # halves the LR for the *next* optimizer step only (single-step transient backoff).
+                    # The subsequent lr_scheduler.step() restores the scheduled LR.  The primary
+                    # persistent recovery mechanism is optimizer state reset every
+                    # _NONFINITE_OPT_STATE_RESET_EVERY consecutive non-finite windows.
                     if _optimizer_has_stepped(optimizer):
                         with suppress(Exception):
                             lr_scheduler.step()
