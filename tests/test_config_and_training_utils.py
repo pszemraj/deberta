@@ -44,6 +44,7 @@ from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
+    _apply_lr_mult,
     _apply_nonfinite_recovery,
     _build_optimizer,
     _build_run_metadata,
@@ -335,9 +336,22 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    assert _load_checkpoint_data_progress(ckpt) is None
-    _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123)
-    assert _load_checkpoint_data_progress(ckpt) == 123
+    consumed, lr_mult = _load_checkpoint_data_progress(ckpt)
+    assert consumed is None
+    assert lr_mult == 1.0
+
+    _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123, lr_mult=0.25)
+    consumed, lr_mult = _load_checkpoint_data_progress(ckpt)
+    assert consumed == 123
+    assert abs(lr_mult - 0.25) < 1e-9
+
+    # Back-compat: old checkpoints without lr_mult default to 1.0.
+    import json
+
+    (ckpt / "data_state.json").write_text(json.dumps({"consumed_micro_batches": 50}))
+    consumed_old, lr_mult_old = _load_checkpoint_data_progress(ckpt)
+    assert consumed_old == 50
+    assert lr_mult_old == 1.0
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
@@ -607,9 +621,16 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     saved_checkpoints: list[tuple[str, int, str]] = []
 
     def _fake_save_checkpoint(
-        *, accelerator, checkpoint_dir, output_dir, consumed_micro_batches, save_total_limit, log_label
+        *,
+        accelerator,
+        checkpoint_dir,
+        output_dir,
+        consumed_micro_batches,
+        save_total_limit,
+        log_label,
+        **kwargs,
     ):
-        del accelerator, output_dir, save_total_limit
+        del accelerator, output_dir, save_total_limit, kwargs
         saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
 
     pretrain_mod = setup_pretraining_mocks(
@@ -897,16 +918,31 @@ def test_sanitize_nonfinite_gradients_replaces_nan_inf_values() -> None:
     assert torch.equal(model.w.grad, torch.zeros_like(model.w.grad))
 
 
-def test_apply_nonfinite_recovery_scales_lrs_and_resets_state_on_interval() -> None:
+def test_apply_nonfinite_recovery_ratchets_lr_mult_and_resets_state_on_interval() -> None:
+    # First nonfinite event: lr_mult should halve (0.5 backoff).
+    new_mult, did_reset = _apply_nonfinite_recovery(lr_mult=1.0, skip_streak=1)
+    assert did_reset is False
+    assert abs(new_mult - 0.5) < 1e-9
+
+    # Second consecutive: ratchets further.
+    new_mult2, _ = _apply_nonfinite_recovery(lr_mult=new_mult, skip_streak=2)
+    assert abs(new_mult2 - 0.25) < 1e-9
+
+    # At streak=4: optimizer state reset triggered.
+    new_mult4, did_reset4 = _apply_nonfinite_recovery(lr_mult=new_mult2, skip_streak=4)
+    assert did_reset4 is True
+    assert new_mult4 >= 0.01  # floor
+
+    # lr_mult cannot go below _NONFINITE_LR_MULT_FLOOR.
+    new_mult_floor, _ = _apply_nonfinite_recovery(lr_mult=0.01, skip_streak=5)
+    assert abs(new_mult_floor - 0.01) < 1e-9
+
+
+def test_apply_lr_mult_scales_all_param_groups() -> None:
     param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
     optimizer = torch.optim.AdamW([param], lr=1e-3)
-    optimizer.state[param] = {"step": 10}
-
-    lr, did_reset = _apply_nonfinite_recovery(optimizer=optimizer, skip_streak=4, lr_floor=1e-6)
-    assert did_reset is True
-    assert lr is not None
-    assert float(lr) <= 5e-4 + 1e-12
-    assert len(optimizer.state) == 0
+    _apply_lr_mult(optimizer, 0.5)
+    assert abs(float(optimizer.param_groups[0]["lr"]) - 5e-4) < 1e-12
 
 
 def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):
@@ -1090,7 +1126,9 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     )
 
     assert accel.save_paths == [str(ckpt)]
-    assert _load_checkpoint_data_progress(ckpt) == 42
+    consumed, lr_mult = _load_checkpoint_data_progress(ckpt)
+    assert consumed == 42
+    assert lr_mult == 1.0
 
 
 def test_cycle_dataloader_advances_dataset_epoch_each_pass():

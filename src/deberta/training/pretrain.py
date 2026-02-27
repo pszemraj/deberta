@@ -54,7 +54,8 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_genera
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _NONFINITE_LR_BACKOFF = 0.5
-_NONFINITE_LR_FLOOR_RATIO = 1e-3
+_NONFINITE_LR_MULT_FLOOR = 0.01  # persistent multiplier floor (1% of scheduled)
+_NONFINITE_LR_MULT_RECOVERY = 1.1  # gradual recovery factor per successful step
 _NONFINITE_OPT_STATE_RESET_EVERY = 4
 
 
@@ -913,39 +914,37 @@ def _sanitize_nonfinite_gradients_(model: torch.nn.Module) -> int:
     return replaced
 
 
-def _apply_nonfinite_recovery(
-    *,
-    optimizer: torch.optim.Optimizer,
-    skip_streak: int,
-    lr_floor: float,
-) -> tuple[float | None, bool]:
-    """Apply lightweight recovery after a non-finite window.
+def _apply_lr_mult(optimizer: torch.optim.Optimizer, lr_mult: float) -> None:
+    """Scale all optimizer param-group LRs by a persistent multiplier.
 
     :param torch.optim.Optimizer optimizer: Runtime optimizer.
-    :param int skip_streak: Current consecutive non-finite streak.
-    :param float lr_floor: Minimum LR floor for backoff.
-    :return tuple[float | None, bool]: (minimum group LR after recovery, optimizer_state_reset flag).
+    :param float lr_mult: Multiplier to apply (typically in (0, 1]).
     """
-    min_lr: float | None = None
     for group in optimizer.param_groups:
-        curr = float(group.get("lr", 0.0))
-        if curr <= 0.0:
-            new_lr = curr
-        else:
-            new_lr = max(curr * float(_NONFINITE_LR_BACKOFF), float(lr_floor))
-        group["lr"] = new_lr
-        if min_lr is None:
-            min_lr = float(new_lr)
-        else:
-            min_lr = min(min_lr, float(new_lr))
+        group["lr"] = float(group["lr"]) * float(lr_mult)
+
+
+def _apply_nonfinite_recovery(
+    *,
+    lr_mult: float,
+    skip_streak: int,
+) -> tuple[float, bool]:
+    """Compute updated persistent LR multiplier after a non-finite window.
+
+    The multiplier ratchets down on each nonfinite event and is applied after
+    every ``lr_scheduler.step()`` so the scheduler cannot overwrite it.
+
+    :param float lr_mult: Current persistent LR multiplier.
+    :param int skip_streak: Current consecutive non-finite streak.
+    :return tuple[float, bool]: (new lr_mult, optimizer_state_reset flag).
+    """
+    new_lr_mult = max(float(lr_mult) * float(_NONFINITE_LR_BACKOFF), float(_NONFINITE_LR_MULT_FLOOR))
 
     reset_state = False
     if int(skip_streak) % int(_NONFINITE_OPT_STATE_RESET_EVERY) == 0:
-        with suppress(Exception):
-            optimizer.state.clear()
-            reset_state = True
+        reset_state = True
 
-    return min_lr, reset_state
+    return new_lr_mult, reset_state
 
 
 def _scheduler_current_lr(scheduler: Any) -> float | None:
@@ -1700,33 +1699,39 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     return checkpoints[-1][1]
 
 
-def _load_checkpoint_data_progress(checkpoint_dir: Path) -> int | None:
-    """Load persisted data progress for resume alignment.
+def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, float]:
+    """Load persisted data progress and LR multiplier for resume alignment.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return int | None: Consumed micro-batch count, or ``None`` if unavailable.
+    :return tuple[int | None, float]: (consumed micro-batch count or None, lr_mult).
     """
     path = checkpoint_dir / "data_state.json"
     if not path.exists():
-        return None
+        return None, 1.0
     try:
         raw = json.loads(path.read_text())
         val = raw.get("consumed_micro_batches", None)
-        if val is None:
-            return None
-        return max(0, int(val))
+        consumed = max(0, int(val)) if val is not None else None
+        lr_mult = float(raw.get("lr_mult", 1.0))
+        return consumed, lr_mult
     except Exception:
-        return None
+        return None, 1.0
 
 
-def _save_checkpoint_data_progress(*, checkpoint_dir: Path, consumed_micro_batches: int) -> None:
-    """Persist data iterator progress next to a checkpoint.
+def _save_checkpoint_data_progress(
+    *, checkpoint_dir: Path, consumed_micro_batches: int, lr_mult: float = 1.0
+) -> None:
+    """Persist data iterator progress and LR multiplier next to a checkpoint.
 
     :param Path checkpoint_dir: Checkpoint directory.
     :param int consumed_micro_batches: Number of consumed micro-batches.
+    :param float lr_mult: Persistent nonfinite recovery LR multiplier.
     """
     dump_json(
-        {"consumed_micro_batches": int(max(0, consumed_micro_batches))},
+        {
+            "consumed_micro_batches": int(max(0, consumed_micro_batches)),
+            "lr_mult": float(lr_mult),
+        },
         checkpoint_dir / "data_state.json",
     )
 
@@ -1739,6 +1744,7 @@ def _save_training_checkpoint(
     consumed_micro_batches: int,
     save_total_limit: int,
     log_label: str,
+    lr_mult: float = 1.0,
 ) -> None:
     """Save one training checkpoint with collective state-dict write.
 
@@ -1748,6 +1754,7 @@ def _save_training_checkpoint(
     :param int consumed_micro_batches: Data progress to persist.
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
+    :param float lr_mult: Persistent nonfinite recovery LR multiplier.
     """
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -1762,6 +1769,7 @@ def _save_training_checkpoint(
         _save_checkpoint_data_progress(
             checkpoint_dir=checkpoint_dir,
             consumed_micro_batches=consumed_micro_batches,
+            lr_mult=float(lr_mult),
         )
         _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
         logger.info(f"Saved {log_label} checkpoint: {checkpoint_dir}")
@@ -2122,12 +2130,6 @@ def run_pretraining(
 
     # Prepare (wrap for DDP/FSDP etc)
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
-    positive_group_lrs = [
-        float(group.get("lr", 0.0)) for group in optimizer.param_groups if float(group.get("lr", 0.0)) > 0.0
-    ]
-    nonfinite_lr_floor = (
-        max(min(positive_group_lrs) * float(_NONFINITE_LR_FLOOR_RATIO), 1e-8) if positive_group_lrs else 1e-8
-    )
 
     # GDES embedding sharing uses synced non-trainable base weights inside discriminator embeddings.
     # Those tensors must be initialized/synced from generator weights before any compiled forward runs.
@@ -2179,6 +2181,7 @@ def run_pretraining(
     global_step = 0
     consumed_micro_batches = 0
     last_saved_step = 0
+    lr_mult = 1.0
     nonfinite_skip_total = 0
     nonfinite_skip_streak = 0
     crash_type: str | None = None
@@ -2263,7 +2266,7 @@ def run_pretraining(
 
             global_step = _parse_checkpoint_step(ckpt)
             last_saved_step = global_step
-            restored = _load_checkpoint_data_progress(Path(ckpt))
+            restored, restored_lr_mult = _load_checkpoint_data_progress(Path(ckpt))
             if restored is None:
                 # Back-compat fallback for older checkpoints without data_state.json.
                 restored = global_step * int(train_cfg.gradient_accumulation_steps)
@@ -2272,6 +2275,7 @@ def run_pretraining(
                     f"as global_step * grad_accum = {restored} micro-batches."
                 )
             consumed_micro_batches = int(restored)
+            lr_mult = float(restored_lr_mult)
             max_tracker_step_logged = max(int(max_tracker_step_logged), int(global_step))
 
         # Training loop
@@ -2595,9 +2599,14 @@ def run_pretraining(
 
                     optimizer.step()
                     lr_scheduler.step()
+                    if lr_mult < 1.0:
+                        _apply_lr_mult(optimizer, lr_mult)
                     optimizer.zero_grad(set_to_none=True)
                     did_optimizer_step = True
                     nonfinite_skip_streak = 0
+                    # Gradually recover lr_mult toward 1.0 on successful steps.
+                    if lr_mult < 1.0:
+                        lr_mult = min(lr_mult * float(_NONFINITE_LR_MULT_RECOVERY), 1.0)
 
                     # If embedding_sharing=gdes, the discriminator embedding base weights must track the
                     # generator embedding weights. Generator embeddings update only on optimizer steps,
@@ -2606,20 +2615,21 @@ def run_pretraining(
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
-                    # Recovery path: keep training alive, advance schedule/step, and keep moving.
-                    # Design: lr_scheduler.step() advances the schedule, then _apply_nonfinite_recovery
-                    # halves the LR for the *next* optimizer step only (single-step transient backoff).
-                    # The subsequent lr_scheduler.step() restores the scheduled LR.  The primary
-                    # persistent recovery mechanism is optimizer state reset every
-                    # _NONFINITE_OPT_STATE_RESET_EVERY consecutive non-finite windows.
+                    # Recovery path: ratchet down persistent lr_mult and optionally reset
+                    # optimizer state.  The scheduler advances normally; lr_mult is applied
+                    # after every lr_scheduler.step() so it cannot be overwritten.
                     if _optimizer_has_stepped(optimizer):
                         with suppress(Exception):
                             lr_scheduler.step()
-                    recovered_lr, reset_state = _apply_nonfinite_recovery(
-                        optimizer=optimizer,
+                    lr_mult, reset_state = _apply_nonfinite_recovery(
+                        lr_mult=lr_mult,
                         skip_streak=int(nonfinite_skip_streak),
-                        lr_floor=float(nonfinite_lr_floor),
                     )
+                    # Apply lr_mult after scheduler step so recovery is persistent.
+                    _apply_lr_mult(optimizer, lr_mult)
+                    if reset_state:
+                        with suppress(Exception):
+                            optimizer.state.clear()
                     global_step += 1
                     if train_progress is not None:
                         train_progress.update(1)
@@ -2630,9 +2640,7 @@ def run_pretraining(
                                 "nonfinite_skip_total": float(nonfinite_skip_total),
                                 "nonfinite_skip_streak": float(nonfinite_skip_streak),
                                 "nonfinite_sanitized_grad_elems": float(nonfinite_sanitized_count),
-                                "nonfinite_recovery_lr": (
-                                    float(recovered_lr) if recovered_lr is not None else float("nan")
-                                ),
+                                "nonfinite_recovery_lr_mult": float(lr_mult),
                                 "nonfinite_recovery_optimizer_state_reset": 1.0 if reset_state else 0.0,
                             },
                             step=int(global_step),
@@ -2641,13 +2649,13 @@ def run_pretraining(
                     if accelerator.is_main_process:
                         logger.warning(
                             "step=%d | nonfinite_window_skipped=1 | reason=%s | streak=%d | total_skips=%d | "
-                            "sanitized_grad_elems=%d | recovery_lr=%s | opt_state_reset=%s | debug=%s",
+                            "sanitized_grad_elems=%d | lr_mult=%.4f | opt_state_reset=%s | debug=%s",
                             int(global_step),
                             str(nonfinite_reason or "unknown"),
                             int(nonfinite_skip_streak),
                             int(nonfinite_skip_total),
                             int(nonfinite_sanitized_count),
-                            f"{float(recovered_lr):.3e}" if recovered_lr is not None else "n/a",
+                            float(lr_mult),
                             bool(reset_state),
                             str(nonfinite_debug_path) if nonfinite_debug_path is not None else "n/a",
                         )
@@ -2661,6 +2669,7 @@ def run_pretraining(
                             consumed_micro_batches=consumed_micro_batches,
                             save_total_limit=int(train_cfg.save_total_limit),
                             log_label="periodic",
+                            lr_mult=lr_mult,
                         )
                         last_saved_step = global_step
                     continue
@@ -2756,6 +2765,7 @@ def run_pretraining(
                         consumed_micro_batches=consumed_micro_batches,
                         save_total_limit=int(train_cfg.save_total_limit),
                         log_label="periodic",
+                        lr_mult=lr_mult,
                     )
                     last_saved_step = global_step
 
@@ -2802,6 +2812,7 @@ def run_pretraining(
                     consumed_micro_batches=consumed_micro_batches,
                     save_total_limit=int(train_cfg.save_total_limit),
                     log_label="final",
+                    lr_mult=lr_mult,
                 )
                 last_saved_step = final_step
         elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:
