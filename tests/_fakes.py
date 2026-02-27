@@ -6,6 +6,8 @@ Subclass or set instance attributes for test-specific variations.
 
 from __future__ import annotations
 
+import sys
+import types as _types
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -210,3 +212,137 @@ class FakeAccelerator:
 
     def end_training(self) -> None:
         self.ended = True
+
+
+class SimpleRTD(torch.nn.Module):
+    """Minimal RTD-like module for ``run_pretraining`` integration tests.
+
+    Provides both ``_forbidden_sample_token_ids`` (set) and
+    ``_forbidden_sample_token_mask`` (tensor) so it works with all code paths.
+    Tracks the last instantiated instance via ``last_instance``.
+    """
+
+    last_instance: SimpleRTD | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__()
+        del kwargs
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.generator = torch.nn.Linear(2, 2)
+        self.discriminator = torch.nn.Linear(2, 2)
+        self._forbidden_sample_token_ids = {0, 1, 2, 3}
+        self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
+        self.disc_config = _types.SimpleNamespace(pad_token_id=0)
+        SimpleRTD.last_instance = self
+
+    def forward(self, **kwargs: Any) -> Any:
+        del kwargs
+        t = self.weight * 0.0 + 1.0
+        return _types.SimpleNamespace(
+            loss=t,
+            gen_loss=t.detach(),
+            disc_loss=t.detach(),
+            disc_accuracy=t.detach(),
+            gen_token_count=torch.tensor(1.0),
+            disc_token_count=torch.tensor(1.0),
+            gen_loss_raw=t,
+            disc_loss_raw=t,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared scaffolding for ``run_pretraining`` integration tests
+# ---------------------------------------------------------------------------
+
+_PRETRAINING_BATCH: dict[str, torch.Tensor] = {
+    "input_ids": torch.tensor([[1, 3, 9, 2, 0]], dtype=torch.long),
+    "labels": torch.tensor([[-100, 10, -100, -100, -100]], dtype=torch.long),
+    "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long),
+}
+
+
+def setup_pretraining_mocks(
+    monkeypatch: Any,
+    *,
+    accelerator_cls: type | None = None,
+    rtd_cls: type | None = None,
+    cycle_fn: Any = None,
+    build_backbones_fn: Any = None,
+    save_checkpoint_fn: Any = None,
+    extra_patches: dict[str, Any] | None = None,
+) -> Any:
+    """Apply monkeypatches for ``run_pretraining`` integration tests.
+
+    :return: The patched ``deberta.training.pretrain`` module.
+    """
+    import deberta.training.pretrain as pretrain_mod
+
+    if accelerator_cls is None:
+        accelerator_cls = FakeAccelerator
+    if rtd_cls is None:
+        rtd_cls = SimpleRTD
+    if build_backbones_fn is None:
+
+        def build_backbones_fn(**kwargs: Any) -> tuple[torch.nn.Module, torch.nn.Module]:
+            del kwargs
+            return (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+
+    if save_checkpoint_fn is None:
+
+        def save_checkpoint_fn(**kwargs: Any) -> None:
+            del kwargs
+
+    batch = _PRETRAINING_BATCH
+
+    if cycle_fn is None:
+
+        def cycle_fn(_loader: Any) -> Any:
+            while True:
+                yield batch
+
+    fake_accelerate = _types.ModuleType("accelerate")
+    fake_accelerate.Accelerator = accelerator_cls
+    fake_accelerate_utils = _types.ModuleType("accelerate.utils")
+    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
+    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
+
+    fake_transformers = _types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = _types.SimpleNamespace(
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
+    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
+    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
+    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
+    monkeypatch.setattr(
+        pretrain_mod,
+        "build_backbone_configs",
+        lambda **kwargs: (_types.SimpleNamespace(pad_token_id=0), _types.SimpleNamespace()),
+    )
+    monkeypatch.setattr(pretrain_mod, "build_backbones", build_backbones_fn)
+    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", rtd_cls)
+    monkeypatch.setattr(
+        pretrain_mod,
+        "_build_optimizer",
+        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    monkeypatch.setattr(
+        pretrain_mod,
+        "_build_scheduler",
+        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
+    )
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", cycle_fn)
+    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
+    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", save_checkpoint_fn)
+
+    if extra_patches:
+        for attr, val in extra_patches.items():
+            monkeypatch.setattr(pretrain_mod, attr, val)
+
+    return pretrain_mod

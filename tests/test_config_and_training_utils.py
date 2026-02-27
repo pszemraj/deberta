@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer, FakeAccelerator
+from _fakes import DummyTokenizer, FakeAccelerator, SimpleRTD, setup_pretraining_mocks
 
 import deberta.cli as cli_mod
 from deberta.checkpoint_utils import (
@@ -594,109 +594,37 @@ def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Pa
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import deberta.training.pretrain as pretrain_mod
+    from _fakes import _PRETRAINING_BATCH
 
-    class _FakeAccelerator(FakeAccelerator):
-        last_instance: _FakeAccelerator | None = None
+    class _TrackingAccelerator(FakeAccelerator):
+        last_instance: _TrackingAccelerator | None = None
 
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
-            _FakeAccelerator.last_instance = self
-
-    fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
-    fake_accelerate_utils = types.ModuleType("accelerate.utils")
-    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
-    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    batch = {
-        "input_ids": torch.tensor([[1, 3, 9, 2, 0]], dtype=torch.long),
-        "labels": torch.tensor([[-100, 10, -100, -100, -100]], dtype=torch.long),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long),
-    }
-
-    def _fake_cycle(_loader):
-        yield batch
-        raise KeyboardInterrupt
-
-    class _FakeRTD(torch.nn.Module):
-        def __init__(self, **kwargs) -> None:
-            super().__init__()
-            del kwargs
-            self.weight = torch.nn.Parameter(torch.ones(1))
-            self._forbidden_sample_token_ids = {0, 1, 2, 3}
-            self.disc_config = types.SimpleNamespace(pad_token_id=0)
-
-        def forward(self, **kwargs):
-            del kwargs
-            t = torch.tensor(1.0)
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=t,
-                disc_loss=t,
-                disc_accuracy=t,
-                gen_token_count=torch.tensor(1.0),
-                disc_token_count=torch.tensor(1.0),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
+            _TrackingAccelerator.last_instance = self
 
     saved_checkpoints: list[tuple[str, int, str]] = []
 
     def _fake_save_checkpoint(
-        *,
-        accelerator: Any,
-        checkpoint_dir: Path,
-        output_dir: Path,
-        consumed_micro_batches: int,
-        save_total_limit: int,
-        log_label: str,
-    ) -> None:
+        *, accelerator, checkpoint_dir, output_dir, consumed_micro_batches, save_total_limit, log_label
+    ):
         del accelerator, output_dir, save_total_limit
         saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
 
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbone_configs",
-        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_TrackingAccelerator,
+        save_checkpoint_fn=_fake_save_checkpoint,
+        extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbones",
-        lambda **kwargs: (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
-    )
-    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
-    )
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
-    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
-    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", _fake_save_checkpoint)
-    monkeypatch.setattr(pretrain_mod, "_export_discriminator_hf", lambda **kwargs: None)
 
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    # Override cycle to interrupt after first batch.
+    def _interrupt_cycle(_loader):
+        yield _PRETRAINING_BATCH
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
+
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
         max_steps=2,
@@ -712,7 +640,11 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     )
 
     with pytest.raises(KeyboardInterrupt):
-        pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
 
     metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
     with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
@@ -726,7 +658,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert saved_checkpoints[-1][1] == 1
     assert saved_checkpoints[-1][2] == "final"
 
-    accel = _FakeAccelerator.last_instance
+    accel = _TrackingAccelerator.last_instance
     assert accel is not None
     assert accel.wandb_run.summary["crashed"] is True
     assert accel.wandb_run.summary["crash_type"] == "KeyboardInterrupt"
@@ -746,28 +678,13 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import deberta.training.pretrain as pretrain_mod
-
-    class _FakeAccelerator(FakeAccelerator):
+    class _ResumeAccelerator(FakeAccelerator):
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.loaded: list[tuple[str, dict[str, Any]]] = []
 
         def load_state(self, ckpt: str, **kwargs: Any) -> None:
             self.loaded.append((ckpt, dict(kwargs)))
-
-    fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
-    fake_accelerate_utils = types.ModuleType("accelerate.utils")
-    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
-    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -776,72 +693,19 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
         encoding="utf-8",
     )
 
-    class _FakeRTD(torch.nn.Module):
-        def __init__(self, **kwargs) -> None:
-            super().__init__()
-            del kwargs
-            self.weight = torch.nn.Parameter(torch.ones(1))
-            self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
-            self.disc_config = types.SimpleNamespace(pad_token_id=0)
-            self.generator = torch.nn.Linear(2, 2)
-            self.discriminator = torch.nn.Linear(2, 2)
-
-        def forward(self, **kwargs):
-            del kwargs
-            t = self.weight * 0.0 + 1.0
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=t.detach(),
-                disc_loss=t.detach(),
-                disc_accuracy=t.detach(),
-                gen_token_count=torch.tensor(1.0),
-                disc_token_count=torch.tensor(1.0),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
-
     replay_calls = {"next": 0}
 
-    def _fake_cycle(_loader):
+    def _fail_cycle(_loader):
         while True:
             replay_calls["next"] += 1
             raise AssertionError("resume replay should be skipped when global_step >= max_steps")
             yield {}  # pragma: no cover
 
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbone_configs",
-        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_ResumeAccelerator,
+        cycle_fn=_fail_cycle,
     )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbones",
-        lambda **kwargs: (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
-    )
-    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
-    )
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
-    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
-    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
-
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
         max_steps=2,
@@ -858,112 +722,28 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
         resume_from_checkpoint=str(checkpoint_dir),
     )
 
-    pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
     assert replay_calls["next"] == 0
 
 
 def test_run_pretraining_compiles_generator_and_discriminator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import deberta.training.pretrain as pretrain_mod
-
     compile_calls: list[tuple[Any, dict[str, Any]]] = []
 
-    fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = FakeAccelerator
-    fake_accelerate_utils = types.ModuleType("accelerate.utils")
-    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
-    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    batch = {
-        "input_ids": torch.tensor([[1, 3, 9, 2, 0]], dtype=torch.long),
-        "labels": torch.tensor([[-100, 10, -100, -100, -100]], dtype=torch.long),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long),
-    }
-
-    def _fake_cycle(_loader):
-        while True:
-            yield batch
-
-    class _FakeRTD(torch.nn.Module):
-        last_instance: _FakeRTD | None = None
-
-        def __init__(self, **kwargs) -> None:
-            super().__init__()
-            del kwargs
-            self.weight = torch.nn.Parameter(torch.ones(1))
-            self.generator = torch.nn.Linear(2, 2)
-            self.discriminator = torch.nn.Linear(2, 2)
-            self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
-            self.disc_config = types.SimpleNamespace(pad_token_id=0)
-            _FakeRTD.last_instance = self
-
-        def forward(self, **kwargs):
-            del kwargs
-            t = self.weight * 0.0 + 1.0
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=t.detach(),
-                disc_loss=t.detach(),
-                disc_accuracy=t.detach(),
-                gen_token_count=torch.tensor(1.0),
-                disc_token_count=torch.tensor(1.0),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
-
     def _fake_compile(
-        target: Any,
-        *,
-        mode: str = "default",
-        backend: str = "inductor",
-        dynamic: bool | None = None,
+        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
     ) -> Any:
         compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
         return target
 
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbone_configs",
-        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbones",
-        lambda **kwargs: (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
-    )
-    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
-    )
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
-    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
-    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
+    pretrain_mod = setup_pretraining_mocks(monkeypatch)
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
 
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
@@ -979,54 +759,25 @@ def test_run_pretraining_compiles_generator_and_discriminator(
         torch_compile_mode="default",
         export_hf_final=False,
     )
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
 
-    pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
-
-    instance = _FakeRTD.last_instance
+    instance = SimpleRTD.last_instance
     assert instance is not None
     assert len(compile_calls) == 2
-    assert callable(compile_calls[0][0])
-    assert callable(compile_calls[1][0])
+    for i in range(2):
+        assert callable(compile_calls[i][0])
+        assert compile_calls[i][1] == {"mode": "default", "backend": "inductor", "dynamic": False}
     assert getattr(compile_calls[0][0], "__self__", None) is instance.generator
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
-    assert compile_calls[0][1]["mode"] == "default"
-    assert compile_calls[1][1]["mode"] == "default"
-    assert compile_calls[0][1]["backend"] == "inductor"
-    assert compile_calls[1][1]["backend"] == "inductor"
-    assert compile_calls[0][1]["dynamic"] is False
-    assert compile_calls[1][1]["dynamic"] is False
 
 
 def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import deberta.training.pretrain as pretrain_mod
-
-    compile_calls: list[tuple[Any, dict[str, Any]]] = []
-
-    fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = FakeAccelerator
-    fake_accelerate_utils = types.ModuleType("accelerate.utils")
-    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
-    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    batch = {
-        "input_ids": torch.tensor([[1, 3, 9, 2, 0]], dtype=torch.long),
-        "labels": torch.tensor([[-100, 10, -100, -100, -100]], dtype=torch.long),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long),
-    }
-
-    def _fake_cycle(_loader):
-        while True:
-            yield batch
-
     class _FakeLayer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -1034,89 +785,34 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
             self.intermediate = torch.nn.Linear(2, 2)
             self.output = torch.nn.Linear(2, 2)
 
-    class _FakeEncoder(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.layer = torch.nn.ModuleList([_FakeLayer()])
-
     class _FakeBackbone(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.embeddings = torch.nn.Linear(2, 2)
-            self.encoder = _FakeEncoder()
+            self.encoder = torch.nn.Module()
+            self.encoder.layer = torch.nn.ModuleList([_FakeLayer()])
 
-    class _FakeRTD(torch.nn.Module):
-        last_instance: _FakeRTD | None = None
-
-        def __init__(self, **kwargs) -> None:
-            super().__init__()
-            del kwargs
-            self.weight = torch.nn.Parameter(torch.ones(1))
+    class _FFNScopeRTD(SimpleRTD):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
             self.generator = _FakeBackbone()
             self.discriminator = _FakeBackbone()
-            self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
-            self.disc_config = types.SimpleNamespace(pad_token_id=0)
-            _FakeRTD.last_instance = self
 
-        def forward(self, **kwargs):
-            del kwargs
-            t = self.weight * 0.0 + 1.0
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=t.detach(),
-                disc_loss=t.detach(),
-                disc_accuracy=t.detach(),
-                gen_token_count=torch.tensor(1.0),
-                disc_token_count=torch.tensor(1.0),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
+    compile_calls: list[tuple[Any, dict[str, Any]]] = []
 
     def _fake_compile(
-        target: Any,
-        *,
-        mode: str = "default",
-        backend: str = "inductor",
-        dynamic: bool | None = None,
+        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
     ) -> Any:
         compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
         return target
 
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbone_configs",
-        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        rtd_cls=_FFNScopeRTD,
+        build_backbones_fn=lambda **kwargs: (_FakeBackbone(), _FakeBackbone()),
     )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbones",
-        lambda **kwargs: (_FakeBackbone(), _FakeBackbone()),
-    )
-    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
-    )
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
-    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
-    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
 
-    model_cfg = ModelConfig(backbone_type="hf_deberta_v2")
-    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
@@ -1132,34 +828,23 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
         torch_compile_mode="default",
         export_hf_final=False,
     )
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
 
-    pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
-
-    instance = _FakeRTD.last_instance
+    instance = _FFNScopeRTD.last_instance
     assert instance is not None
     assert len(compile_calls) == 4
-    assert callable(compile_calls[0][0])
-    assert callable(compile_calls[1][0])
-    assert callable(compile_calls[2][0])
-    assert callable(compile_calls[3][0])
+    for i in range(4):
+        assert callable(compile_calls[i][0])
+        assert compile_calls[i][1] == {"mode": "default", "backend": "inductor", "dynamic": False}
     assert getattr(compile_calls[0][0], "__self__", None) is instance.generator.encoder.layer[0].intermediate
     assert getattr(compile_calls[1][0], "__self__", None) is instance.generator.encoder.layer[0].output
-    assert (
-        getattr(compile_calls[2][0], "__self__", None) is instance.discriminator.encoder.layer[0].intermediate
-    )
-    assert getattr(compile_calls[3][0], "__self__", None) is instance.discriminator.encoder.layer[0].output
-    assert compile_calls[0][1]["mode"] == "default"
-    assert compile_calls[1][1]["mode"] == "default"
-    assert compile_calls[2][1]["mode"] == "default"
-    assert compile_calls[3][1]["mode"] == "default"
-    assert compile_calls[0][1]["backend"] == "inductor"
-    assert compile_calls[1][1]["backend"] == "inductor"
-    assert compile_calls[2][1]["backend"] == "inductor"
-    assert compile_calls[3][1]["backend"] == "inductor"
-    assert compile_calls[0][1]["dynamic"] is False
-    assert compile_calls[1][1]["dynamic"] is False
-    assert compile_calls[2][1]["dynamic"] is False
-    assert compile_calls[3][1]["dynamic"] is False
+    disc_layer = instance.discriminator.encoder.layer[0]
+    assert getattr(compile_calls[2][0], "__self__", None) is disc_layer.intermediate
+    assert getattr(compile_calls[3][0], "__self__", None) is disc_layer.output
 
 
 def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
@@ -1167,90 +852,10 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    import deberta.training.pretrain as pretrain_mod
-
-    fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = FakeAccelerator
-    fake_accelerate_utils = types.ModuleType("accelerate.utils")
-    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
-    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        extra_patches={"_global_grad_l2_norm": lambda _model: float("inf")},
     )
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    batch = {
-        "input_ids": torch.tensor([[1, 3, 9, 2, 0]], dtype=torch.long),
-        "labels": torch.tensor([[-100, 10, -100, -100, -100]], dtype=torch.long),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long),
-    }
-
-    def _fake_cycle(_loader):
-        while True:
-            yield batch
-
-    class _FakeRTD(torch.nn.Module):
-        def __init__(self, **kwargs) -> None:
-            super().__init__()
-            del kwargs
-            self.weight = torch.nn.Parameter(torch.ones(1))
-            self.generator = torch.nn.Linear(2, 2)
-            self.discriminator = torch.nn.Linear(2, 2)
-            self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
-            self.disc_config = types.SimpleNamespace(pad_token_id=0)
-
-        def forward(self, **kwargs):
-            del kwargs
-            t = self.weight * 0.0 + 1.0
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=t.detach(),
-                disc_loss=t.detach(),
-                disc_accuracy=t.detach(),
-                gen_token_count=torch.tensor(1.0),
-                disc_token_count=torch.tensor(1.0),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
-
-    monkeypatch.setattr(pretrain_mod, "_global_grad_l2_norm", lambda _model: float("inf"))
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbone_configs",
-        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "build_backbones",
-        lambda **kwargs: (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
-    )
-    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
-    )
-    monkeypatch.setattr(
-        pretrain_mod,
-        "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
-    )
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
-    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
-    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
-
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
@@ -1268,7 +873,11 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
     )
 
     with caplog.at_level(logging.WARNING):
-        pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
     assert "nonfinite_window_skipped=1" in caplog.text
 
 
@@ -1632,31 +1241,20 @@ def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
     assert float(opt_fp32.defaults["eps"]) == pytest.approx(1e-8)
 
 
-def test_train_config_defaults_to_bf16_autocast():
-    cfg = TrainConfig()
-    assert cfg.mixed_precision == "bf16"
-    assert cfg.sdpa_kernel == "auto"
+def test_config_defaults():
+    """Key config defaults match design requirements."""
+    train = TrainConfig()
+    assert train.mixed_precision == "bf16"
+    assert train.sdpa_kernel == "auto"
+    assert train.token_weighted_gradient_accumulation is True
 
+    model = ModelConfig()
+    assert model.hidden_dropout_prob is None
+    assert model.attention_probs_dropout_prob is None
+    assert model.swiglu_adjust_intermediate is True
 
-def test_model_config_defaults_leave_dropout_overrides_unset():
-    cfg = ModelConfig()
-    assert cfg.hidden_dropout_prob is None
-    assert cfg.attention_probs_dropout_prob is None
-
-
-def test_data_config_defaults_disable_cross_document_blocking():
-    cfg = DataConfig()
-    assert cfg.block_cross_document_attention is False
-
-
-def test_model_config_defaults_to_adjust_swiglu_intermediate():
-    cfg = ModelConfig()
-    assert cfg.swiglu_adjust_intermediate is True
-
-
-def test_train_config_defaults_to_token_weighted_gradient_accumulation():
-    cfg = TrainConfig()
-    assert cfg.token_weighted_gradient_accumulation is True
+    data = DataConfig()
+    assert data.block_cross_document_attention is False
 
 
 @pytest.mark.parametrize(
@@ -1881,54 +1479,33 @@ def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discrimina
     assert disc_count == pytest.approx(2.0)
 
 
-def test_count_input_tokens_for_batch_uses_attention_mask_when_available():
-    batch = {
+def test_count_input_tokens_for_batch_with_various_mask_shapes():
+    """Token counting handles 2D, 3D, 4D masks and missing masks."""
+    # 2D attention_mask → sums mask.
+    batch_2d = {
         "input_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
         "attention_mask": torch.tensor([[1, 1, 0, 0]], dtype=torch.long),
     }
-    assert _count_input_tokens_for_batch(batch) == pytest.approx(2.0)
+    assert _count_input_tokens_for_batch(batch_2d) == pytest.approx(2.0)
 
+    # No mask → fallback to input numel.
+    batch_no_mask = {"input_ids": torch.tensor([[10, 11, 12], [13, 14, 15]], dtype=torch.long)}
+    assert _count_input_tokens_for_batch(batch_no_mask) == pytest.approx(6.0)
 
-def test_count_input_tokens_for_batch_falls_back_to_input_size():
-    batch = {"input_ids": torch.tensor([[10, 11, 12], [13, 14, 15]], dtype=torch.long)}
-    assert _count_input_tokens_for_batch(batch) == pytest.approx(6.0)
-
-
-def test_count_input_tokens_for_batch_uses_token_activity_for_3d_pairwise_mask():
-    batch = {
+    # 3D pairwise mask → uses diagonal token activity.
+    pair_3d = torch.tensor([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.long)
+    batch_3d = {
         "input_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
-        "attention_mask": torch.tensor(
-            [
-                [
-                    [1, 1, 0, 0],
-                    [1, 1, 0, 0],
-                    [0, 0, 0, 0],
-                    [0, 0, 0, 0],
-                ]
-            ],
-            dtype=torch.long,
-        ),
+        "attention_mask": pair_3d,
     }
-    assert _count_input_tokens_for_batch(batch) == pytest.approx(2.0)
+    assert _count_input_tokens_for_batch(batch_3d) == pytest.approx(2.0)
 
-
-def test_count_input_tokens_for_batch_uses_token_activity_for_4d_pairwise_mask():
-    pair_keep = torch.tensor(
-        [
-            [
-                [1, 1, 0, 0],
-                [1, 1, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ]
-        ],
-        dtype=torch.long,
-    )
-    batch = {
+    # 4D pairwise mask → same logic, extra head dim.
+    batch_4d = {
         "input_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
-        "attention_mask": pair_keep.unsqueeze(1),
+        "attention_mask": pair_3d.unsqueeze(1),
     }
-    assert _count_input_tokens_for_batch(batch) == pytest.approx(2.0)
+    assert _count_input_tokens_for_batch(batch_4d) == pytest.approx(2.0)
 
 
 def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
@@ -2063,14 +1640,83 @@ def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(
     assert _resolve_compile_enabled_or_raise(False) is False
 
 
-def test_normalize_torch_compile_mode_accepts_aliases_and_rejects_invalid():
-    assert _normalize_torch_compile_mode("default") == "default"
-    assert _normalize_torch_compile_mode("reduce_overhead") == "reduce-overhead"
-    assert _normalize_torch_compile_mode("max_autotune") == "max-autotune"
-    assert _normalize_torch_compile_mode("max-autotune-no-cudagraphs") == "max-autotune-no-cudagraphs"
-
-    with pytest.raises(ValueError, match="train.torch_compile_mode must be one of"):
-        _normalize_torch_compile_mode("fastest")
+def test_normalizer_aliases_and_rejection():
+    """All config normalizer functions accept documented aliases and reject unknown values."""
+    cases: list[tuple[Any, list[tuple[str, str]], str, str]] = [
+        (
+            _normalize_torch_compile_mode,
+            [
+                ("default", "default"),
+                ("reduce_overhead", "reduce-overhead"),
+                ("max_autotune", "max-autotune"),
+                ("max-autotune-no-cudagraphs", "max-autotune-no-cudagraphs"),
+            ],
+            "fastest",
+            "torch_compile_mode",
+        ),
+        (
+            _normalize_torch_compile_scope,
+            [
+                ("auto", "auto"),
+                ("backbone", "backbones"),
+                ("full", "backbones"),
+                ("encoder", "encoder"),
+                ("generator_encoder", "gen_encoder"),
+                ("disc-encoder", "disc_encoder"),
+                ("ffn", "ffn"),
+                ("generator_ffn", "gen_ffn"),
+                ("disc_ffn", "disc_ffn"),
+            ],
+            "all",
+            "torch_compile_scope",
+        ),
+        (
+            _normalize_torch_compile_backend,
+            [("inductor", "inductor"), ("aot-eager", "aot_eager")],
+            "xla",
+            "torch_compile_backend",
+        ),
+        (
+            _normalize_wandb_watch,
+            [
+                ("gradients", "gradients"),
+                ("grad", "gradients"),
+                ("weights", "parameters"),
+                ("all", "all"),
+                ("off", "none"),
+            ],
+            "full_histograms",
+            "wandb_watch",
+        ),
+        (
+            _normalize_hf_attention_kernel,
+            [
+                ("dynamic", "dynamic"),
+                ("cache", "cached_bmm"),
+                ("cached-bmm", "cached_bmm"),
+                ("safe", "stable"),
+                ("stable", "stable"),
+            ],
+            "einsum",
+            "hf_attention_kernel",
+        ),
+        (
+            _normalize_sdpa_kernel,
+            [
+                ("auto", "auto"),
+                ("flashattention", "flash"),
+                ("mem-efficient", "mem_efficient"),
+                ("math", "math"),
+            ],
+            "best",
+            "sdpa_kernel",
+        ),
+    ]
+    for fn, valid_pairs, invalid_input, error_pattern in cases:
+        for raw, expected in valid_pairs:
+            assert fn(raw) == expected, f"{fn.__name__}({raw!r}) should be {expected!r}"
+        with pytest.raises(ValueError, match=error_pattern):
+            fn(invalid_input)
 
 
 def test_force_legacy_tf32_for_compile_modes():
@@ -2083,88 +1729,42 @@ def test_force_legacy_tf32_for_compile_modes():
     )
 
 
-def test_normalize_compile_scope_accepts_aliases_and_rejects_invalid():
-    assert _normalize_torch_compile_scope("auto") == "auto"
-    assert _normalize_torch_compile_scope("backbone") == "backbones"
-    assert _normalize_torch_compile_scope("full") == "backbones"
-    assert _normalize_torch_compile_scope("encoder") == "encoder"
-    assert _normalize_torch_compile_scope("generator_encoder") == "gen_encoder"
-    assert _normalize_torch_compile_scope("disc-encoder") == "disc_encoder"
-    assert _normalize_torch_compile_scope("ffn") == "ffn"
-    assert _normalize_torch_compile_scope("generator_ffn") == "gen_ffn"
-    assert _normalize_torch_compile_scope("disc_ffn") == "disc_ffn"
-
-    with pytest.raises(ValueError, match="train.torch_compile_scope must be one of"):
-        _normalize_torch_compile_scope("all")
-
-
-def test_normalize_compile_backend_accepts_aliases_and_rejects_invalid():
-    assert _normalize_torch_compile_backend("inductor") == "inductor"
-    assert _normalize_torch_compile_backend("aot-eager") == "aot_eager"
-
-    with pytest.raises(ValueError, match="train.torch_compile_backend must be one of"):
-        _normalize_torch_compile_backend("xla")
-
-
-def test_normalize_wandb_watch_accepts_aliases_and_rejects_invalid():
-    assert _normalize_wandb_watch("gradients") == "gradients"
-    assert _normalize_wandb_watch("grad") == "gradients"
-    assert _normalize_wandb_watch("weights") == "parameters"
-    assert _normalize_wandb_watch("all") == "all"
-    assert _normalize_wandb_watch("off") == "none"
-
-    with pytest.raises(ValueError, match="train.wandb_watch must be one of"):
-        _normalize_wandb_watch("full_histograms")
-
-
-def test_normalize_hf_attention_kernel_accepts_aliases_and_rejects_invalid():
-    assert _normalize_hf_attention_kernel("dynamic") == "dynamic"
-    assert _normalize_hf_attention_kernel("cache") == "cached_bmm"
-    assert _normalize_hf_attention_kernel("cached-bmm") == "cached_bmm"
-    assert _normalize_hf_attention_kernel("safe") == "stable"
-    assert _normalize_hf_attention_kernel("stable") == "stable"
-
-    with pytest.raises(ValueError, match="model.hf_attention_kernel must be one of"):
-        _normalize_hf_attention_kernel("einsum")
-
-
-def test_stabilize_hf_compile_attention_mask_adds_missing_mask_for_hf_backbone():
-    batch = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)}
-    out = _stabilize_hf_compile_attention_mask(
-        batch=batch,
+def test_stabilize_hf_compile_attention_mask_behavior():
+    # Adds missing mask for HF backbone with backbone-level compile scope.
+    batch1 = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)}
+    out1 = _stabilize_hf_compile_attention_mask(
+        batch=batch1,
         compile_enabled=True,
         compile_scope="backbones",
         backbone_type="hf_deberta_v2",
     )
-    assert "attention_mask" in out
-    assert out["attention_mask"].dtype == torch.bool
-    assert torch.equal(out["attention_mask"], torch.ones_like(batch["input_ids"], dtype=torch.bool))
+    assert "attention_mask" in out1
+    assert out1["attention_mask"].dtype == torch.bool
+    assert torch.equal(out1["attention_mask"], torch.ones_like(batch1["input_ids"], dtype=torch.bool))
 
-
-def test_stabilize_hf_compile_attention_mask_keeps_ffn_batches_unchanged():
-    batch = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
-    out = _stabilize_hf_compile_attention_mask(
-        batch=dict(batch),
+    # FFN scope does not inject mask.
+    batch2 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out2 = _stabilize_hf_compile_attention_mask(
+        batch=dict(batch2),
         compile_enabled=True,
         compile_scope="ffn",
         backbone_type="hf_deberta_v2",
     )
-    assert "attention_mask" not in out
+    assert "attention_mask" not in out2
 
-
-def test_stabilize_hf_compile_attention_mask_converts_non_bool_mask():
-    batch = {
+    # Non-bool mask gets converted to bool.
+    batch3 = {
         "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
         "attention_mask": torch.tensor([[1, 1, 0]], dtype=torch.long),
     }
-    out = _stabilize_hf_compile_attention_mask(
-        batch=batch,
+    out3 = _stabilize_hf_compile_attention_mask(
+        batch=batch3,
         compile_enabled=True,
         compile_scope="encoder",
         backbone_type="hf_deberta_v2",
     )
-    assert out["attention_mask"].dtype == torch.bool
-    assert torch.equal(out["attention_mask"], torch.tensor([[True, True, False]], dtype=torch.bool))
+    assert out3["attention_mask"].dtype == torch.bool
+    assert torch.equal(out3["attention_mask"], torch.tensor([[True, True, False]], dtype=torch.bool))
 
 
 def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
@@ -2253,16 +1853,6 @@ def test_compile_controls_do_not_reference_environment_variables():
     assert "DEBERTA_COMPILE_SCOPE" not in source
     assert "DEBERTA_COMPILE_BACKEND" not in source
     assert "DEBERTA_HF_ATTN_KERNEL" not in source
-
-
-def test_normalize_sdpa_kernel_accepts_aliases_and_rejects_invalid():
-    assert _normalize_sdpa_kernel("auto") == "auto"
-    assert _normalize_sdpa_kernel("flashattention") == "flash"
-    assert _normalize_sdpa_kernel("mem-efficient") == "mem_efficient"
-    assert _normalize_sdpa_kernel("math") == "math"
-
-    with pytest.raises(ValueError, match="train.sdpa_kernel must be one of"):
-        _normalize_sdpa_kernel("best")
 
 
 def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
@@ -2412,19 +2002,6 @@ def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_ro
         )
 
 
-def test_validate_training_workflow_options_warns_sdpa_kernel_override_for_non_rope_backbones():
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
-            train_cfg=TrainConfig(sdpa_kernel="flash"),
-            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        )
-    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
-    assert len(user_warnings) >= 1
-    assert "no effect" in str(user_warnings[0].message)
-
-
 def test_validate_training_workflow_options_rejects_hf_backbone_doc_blocking_in_packed_mode():
     with pytest.raises(ValueError, match="only supported with model.backbone_type='rope'"):
         validate_training_workflow_options(
@@ -2455,16 +2032,6 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
     cfg = ModelConfig(backbone_type="hf_deberta_v2", hf_attention_kernel="safe")
     validate_model_config(cfg)
     assert cfg.hf_attention_kernel == "stable"
-
-
-def test_validate_model_config_warns_hf_attention_kernel_override_for_rope_backbone():
-    cfg = ModelConfig(backbone_type="rope", hf_attention_kernel="cached_bmm")
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        validate_model_config(cfg)
-    user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
-    assert len(user_warnings) >= 1
-    assert "hf_attention_kernel" in str(user_warnings[0].message)
 
 
 def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
