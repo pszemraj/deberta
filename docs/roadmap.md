@@ -20,8 +20,10 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 - upstream a minimal reproducible native-HF attention inductor drift case using `local-scratch/hf_attention_inductor_repro.py` with `backend=aot_eager` control and `model.hf_attention_kernel` variants
 - for rope backbone compile hardening, evaluate replacing custom `RMSNorm` with `torch.nn.RMSNorm` and compare convergence/runtime
 - for rope backbone compile hardening, evaluate static/sliced RoPE cache buffers to remove compile-time cache-build branching
+- ~~auto compile scope + doc-blocking mask shape churn~~ — **resolved**: `_resolve_compile_scope` auto-downgrades to FFN when `block_cross_document_attention=True` to avoid alternating None/3D mask shapes under compile
 
 ## Model Perf
 
 - investigate active-token-only projection paths for heavily padded 2D batches (skip attention/FFN projection FLOPs on known-dead pad positions rather than zeroing outputs post projection)
 - ~~for HF DeBERTa-v2 backbone: evaluate lazy or on-demand relative-position table construction to avoid O(max_len²) init-time allocation~~ — **resolved**: removed upfront `_rel_pos_table` buffer; all kernels now call `build_relative_position()` on-device per forward (cheap, compile-safe)
+- ~~HF DeBERTa-v2 2D→(B,1,S,S) padding mask expansion~~ — **resolved**: `get_attention_mask` now returns `(B,1,1,S)` broadcast mask for 2D padding inputs, avoiding O(S²) outer product
