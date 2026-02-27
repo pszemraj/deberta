@@ -8,12 +8,12 @@ import re
 import shlex
 import sys
 import types
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from _fakes import DummyTokenizer, FakeAccelerator
 
 import deberta.cli as cli_mod
 from deberta.checkpoint_utils import (
@@ -594,99 +594,12 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 ) -> None:
     import deberta.training.pretrain as pretrain_mod
 
-    class _FakeWandbRun:
-        def __init__(self) -> None:
-            self.summary: dict[str, Any] = {}
-            self.logged: list[tuple[dict[str, Any], int | None]] = []
-            self.watch_calls: list[tuple[torch.nn.Module, dict[str, Any]]] = []
-            self.saved_paths: list[Path] = []
-            self.finished_exit_code: int | None = None
-
-        def log(self, row: dict[str, Any], step: int | None = None) -> None:
-            self.logged.append((dict(row), step))
-
-        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:
-            self.watch_calls.append((model, dict(kwargs)))
-
-        def save(self, path: str, **kwargs: Any) -> None:
-            del kwargs
-            self.saved_paths.append(Path(path))
-
-        def finish(self, exit_code: int = 0) -> None:
-            self.finished_exit_code = int(exit_code)
-
-    class _FakeAccelerator:
+    class _FakeAccelerator(FakeAccelerator):
         last_instance: _FakeAccelerator | None = None
 
-        def __init__(
-            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
-        ) -> None:
-            del gradient_accumulation_steps, log_with, mixed_precision
-            self.is_main_process = True
-            self.process_index = 0
-            self.num_processes = 1
-            self.device = torch.device("cpu")
-            self.state = "fake-accelerator"
-            self.logged_rows: list[tuple[dict[str, Any], int | None]] = []
-            self.tracker_init_calls: list[dict[str, Any]] = []
-            self.ended = False
-            self.wandb_run = _FakeWandbRun()
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
             _FakeAccelerator.last_instance = self
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def prepare(self, *objs):
-            return objs
-
-        def unwrap_model(self, model):
-            return model
-
-        def no_sync(self, model):
-            del model
-            return nullcontext()
-
-        def backward(self, loss: torch.Tensor) -> None:
-            del loss
-
-        def clip_grad_norm_(self, params, max_norm: float) -> None:
-            del params, max_norm
-
-        def reduce(self, tensor: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-            del reduction
-            return tensor
-
-        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
-
-        def init_trackers(
-            self,
-            project_name: str,
-            config: dict[str, Any],
-            init_kwargs: dict[str, Any] | None = None,
-        ) -> None:
-            self.tracker_init_calls.append(
-                {
-                    "project_name": project_name,
-                    "config": dict(config),
-                    "init_kwargs": dict(init_kwargs or {}),
-                }
-            )
-
-        def get_tracker(self, name: str, unwrap: bool = True):
-            del unwrap
-            if name != "wandb":
-                raise KeyError(name)
-            return self.wandb_run
-
-        def log(self, row: dict[str, Any], step: int | None = None) -> None:
-            self.logged_rows.append((dict(row), step))
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            del ckpt, kwargs
-
-        def end_training(self) -> None:
-            self.ended = True
 
     fake_accelerate = types.ModuleType("accelerate")
     fake_accelerate.Accelerator = _FakeAccelerator
@@ -695,15 +608,9 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
-    class _FakeTokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
@@ -839,43 +746,10 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 ) -> None:
     import deberta.training.pretrain as pretrain_mod
 
-    class _FakeAccelerator:
-        def __init__(
-            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
-        ) -> None:
-            del gradient_accumulation_steps, log_with, mixed_precision
-            self.is_main_process = True
-            self.process_index = 0
-            self.num_processes = 1
-            self.device = torch.device("cpu")
-            self.state = "fake-accelerator"
+    class _FakeAccelerator(FakeAccelerator):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
             self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def prepare(self, *objs):
-            return objs
-
-        def unwrap_model(self, model):
-            return model
-
-        def no_sync(self, model):
-            del model
-            return nullcontext()
-
-        def backward(self, loss: torch.Tensor) -> None:
-            del loss
-
-        def clip_grad_norm_(self, params, max_norm: float) -> None:
-            del params, max_norm
-
-        def reduce(self, tensor: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-            del reduction
-            return tensor
-
-        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
 
         def load_state(self, ckpt: str, **kwargs: Any) -> None:
             self.loaded.append((ckpt, dict(kwargs)))
@@ -887,15 +761,9 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
-    class _FakeTokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
@@ -999,59 +867,16 @@ def test_run_pretraining_compiles_generator_and_discriminator(
 
     compile_calls: list[tuple[Any, dict[str, Any]]] = []
 
-    class _FakeAccelerator:
-        def __init__(
-            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
-        ) -> None:
-            del gradient_accumulation_steps, log_with, mixed_precision
-            self.is_main_process = True
-            self.process_index = 0
-            self.num_processes = 1
-            self.device = torch.device("cpu")
-            self.state = "fake-accelerator"
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def prepare(self, *objs):
-            return objs
-
-        def unwrap_model(self, model):
-            return model
-
-        def no_sync(self, model):
-            del model
-            return nullcontext()
-
-        def backward(self, loss: torch.Tensor) -> None:
-            del loss
-
-        def clip_grad_norm_(self, params, max_norm: float) -> None:
-            del params, max_norm
-
-        def reduce(self, tensor: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-            del reduction
-            return tensor
-
-        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
-
     fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
+    fake_accelerate.Accelerator = FakeAccelerator
     fake_accelerate_utils = types.ModuleType("accelerate.utils")
     fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
-    class _FakeTokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
@@ -1177,59 +1002,16 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
 
     compile_calls: list[tuple[Any, dict[str, Any]]] = []
 
-    class _FakeAccelerator:
-        def __init__(
-            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
-        ) -> None:
-            del gradient_accumulation_steps, log_with, mixed_precision
-            self.is_main_process = True
-            self.process_index = 0
-            self.num_processes = 1
-            self.device = torch.device("cpu")
-            self.state = "fake-accelerator"
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def prepare(self, *objs):
-            return objs
-
-        def unwrap_model(self, model):
-            return model
-
-        def no_sync(self, model):
-            del model
-            return nullcontext()
-
-        def backward(self, loss: torch.Tensor) -> None:
-            del loss
-
-        def clip_grad_norm_(self, params, max_norm: float) -> None:
-            del params, max_norm
-
-        def reduce(self, tensor: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-            del reduction
-            return tensor
-
-        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
-
     fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
+    fake_accelerate.Accelerator = FakeAccelerator
     fake_accelerate_utils = types.ModuleType("accelerate.utils")
     fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
-    class _FakeTokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
@@ -1385,63 +1167,16 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
 ) -> None:
     import deberta.training.pretrain as pretrain_mod
 
-    class _FakeAccelerator:
-        def __init__(
-            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
-        ) -> None:
-            del gradient_accumulation_steps, log_with, mixed_precision
-            self.is_main_process = True
-            self.process_index = 0
-            self.num_processes = 1
-            self.device = torch.device("cpu")
-            self.state = "fake-accelerator"
-            self.logged_rows: list[tuple[dict[str, Any], int | None]] = []
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def prepare(self, *objs):
-            return objs
-
-        def unwrap_model(self, model):
-            return model
-
-        def no_sync(self, model):
-            del model
-            return nullcontext()
-
-        def backward(self, loss: torch.Tensor) -> None:
-            del loss
-
-        def clip_grad_norm_(self, params, max_norm: float) -> None:
-            del params, max_norm
-
-        def reduce(self, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-            del reduction
-            return tensor
-
-        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
-
-        def log(self, row: dict[str, Any], step: int | None = None) -> None:
-            self.logged_rows.append((dict(row), step))
-
     fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
+    fake_accelerate.Accelerator = FakeAccelerator
     fake_accelerate_utils = types.ModuleType("accelerate.utils")
     fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
-    class _FakeTokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
@@ -1803,10 +1538,6 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
             called_targets.append(model)
             return {}
 
-    class _FakeTokenizer:
-        def save_pretrained(self, path: str) -> None:
-            Path(path).mkdir(parents=True, exist_ok=True)
-
     class _FakeExportModel:
         def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
             del safe_serialization
@@ -1829,7 +1560,7 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
     _export_discriminator_hf(
         accelerator=_FakeAccelerator(),
         model=wrapped,  # type: ignore[arg-type]
-        tokenizer=_FakeTokenizer(),
+        tokenizer=DummyTokenizer(),
         output_dir=tmp_path / "export",
         embedding_sharing="none",
     )
