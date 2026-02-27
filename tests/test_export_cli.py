@@ -8,14 +8,10 @@ from typing import Any
 
 import pytest
 import torch
+from _fakes import DummyTokenizer
 
 import deberta.export_cli as export_cli
 from deberta.config import RUN_CONFIG_SCHEMA_VERSION
-
-
-class _FakeTokenizer:
-    def save_pretrained(self, path: str) -> None:
-        Path(path).mkdir(parents=True, exist_ok=True)
 
 
 class _FakeExportBackbone:
@@ -126,7 +122,7 @@ def _install_export_fakes(
 
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     fake_accelerate = types.ModuleType("accelerate")
     fake_accelerate.Accelerator = _FakeAccelerator

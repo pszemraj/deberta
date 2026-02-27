@@ -22,6 +22,8 @@ class DummyTokenizer:
         self.cls_token_id = 1
         self.sep_token_id = 2
         self.mask_token_id = 3
+        self.bos_token_id = 4
+        self.eos_token_id = 5
         self.all_special_ids = [self.pad_token_id, self.cls_token_id, self.sep_token_id, self.mask_token_id]
         self.all_special_tokens = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
         self._id_to_tok = {

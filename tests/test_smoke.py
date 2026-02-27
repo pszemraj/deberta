@@ -1,103 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 import torch
+from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
-
-
-class DummyTokenizer:
-    """Minimal tokenizer stub for unit tests (no network/model downloads)."""
-
-    def __init__(self, vocab_size: int = 128) -> None:
-        self.vocab_size = vocab_size
-        self.pad_token_id = 0
-        self.cls_token_id = 1
-        self.sep_token_id = 2
-        self.mask_token_id = 3
-        self.all_special_ids = [self.pad_token_id, self.cls_token_id, self.sep_token_id, self.mask_token_id]
-        self.all_special_tokens = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
-        self._id_to_tok = {
-            self.pad_token_id: "[PAD]",
-            self.cls_token_id: "[CLS]",
-            self.sep_token_id: "[SEP]",
-            self.mask_token_id: "[MASK]",
-        }
-
-    def __len__(self) -> int:
-        return self.vocab_size
-
-    def __call__(
-        self,
-        text: str,
-        *,
-        add_special_tokens: bool = False,
-        return_attention_mask: bool = False,
-        return_token_type_ids: bool = False,
-    ) -> dict[str, list[int]]:
-        # Cheap whitespace tokenizer. Map each "word" to a stable-ish ID.
-        ids: list[int] = []
-        for w in text.strip().split():
-            # Keep ids away from special range.
-            ids.append(10 + (abs(hash(w)) % (self.vocab_size - 10)))
-        return {"input_ids": ids}
-
-    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-        out: list[str] = []
-        for i in ids:
-            if i in self._id_to_tok:
-                out.append(self._id_to_tok[i])
-            else:
-                # SentencePiece-like word boundary marker.
-                out.append("▁" + str(i))
-        return out
-
-    def get_special_tokens_mask(
-        self, token_ids_0: list[int], already_has_special_tokens: bool = True
-    ) -> list[int]:
-        del already_has_special_tokens
-        specials = set(self.all_special_ids)
-        return [1 if int(tid) in specials else 0 for tid in token_ids_0]
-
-    def pad(
-        self,
-        features: list[dict[str, Any]],
-        return_tensors: str = "pt",
-        pad_to_multiple_of: int | None = None,
-        return_attention_mask: bool = True,
-    ):
-        # Minimal padding for collator tests.
-        max_len = max(len(f["input_ids"]) for f in features)
-        if pad_to_multiple_of is not None:
-            if max_len % pad_to_multiple_of != 0:
-                max_len = ((max_len // pad_to_multiple_of) + 1) * pad_to_multiple_of
-
-        batch: dict[str, list[list[int]]] = {}
-        for k in features[0].keys():
-            batch[k] = []
-        for f in features:
-            for k, v in f.items():
-                if isinstance(v, list):
-                    pad_val = 0
-                    if k == "attention_mask":
-                        pad_val = 0
-                    elif k == "special_tokens_mask":
-                        pad_val = 1
-                    batch[k].append(v + [pad_val] * (max_len - len(v)))
-                else:
-                    raise TypeError(f"Unsupported feature type for {k}: {type(v)}")
-
-        if "attention_mask" not in batch and return_attention_mask:
-            batch["attention_mask"] = [
-                [0 if tid == self.pad_token_id else 1 for tid in row] for row in batch["input_ids"]
-            ]
-
-        if return_tensors == "pt":
-            return {k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()}
-        return batch
 
 
 def test_packed_streaming_marks_internal_sep_as_special():

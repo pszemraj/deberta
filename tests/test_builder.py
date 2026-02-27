@@ -5,23 +5,10 @@ import types
 from typing import Any
 
 import pytest
+from _fakes import DummyTokenizer
 
 from deberta.config import ModelConfig
 from deberta.modeling import builder as builder_mod
-
-
-class _DummyTokenizer:
-    """Tokenizer stub for backbone-config unit tests."""
-
-    pad_token_id = 0
-    cls_token_id = 1
-    sep_token_id = 2
-    mask_token_id = 3
-    bos_token_id = 4
-    eos_token_id = 5
-
-    def __len__(self) -> int:
-        return 50265
 
 
 def test_build_backbone_configs_preserves_loaded_ffn_for_pretrained_rope(monkeypatch: pytest.MonkeyPatch):
@@ -45,7 +32,7 @@ def test_build_backbone_configs_preserves_loaded_ffn_for_pretrained_rope(monkeyp
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -74,7 +61,7 @@ def test_build_backbone_configs_applies_ffn_override_for_scratch_rope(monkeypatc
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -105,7 +92,7 @@ def test_build_backbone_configs_applies_use_bias_override_for_scratch_rope(
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -136,7 +123,7 @@ def test_build_backbone_configs_preserves_loaded_use_bias_for_pretrained_rope(
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -166,7 +153,7 @@ def test_build_backbone_configs_adjusts_swiglu_intermediate_for_scratch(monkeypa
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -200,7 +187,7 @@ def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
     )
     _ = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -215,7 +202,7 @@ def test_build_backbone_configs_propagates_tokenizer_special_ids_for_rope():
         from_scratch=True,
         discriminator_model_name_or_path="disc",
     )
-    tokenizer = _DummyTokenizer()
+    tokenizer = DummyTokenizer(vocab_size=50265)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=tokenizer,
@@ -259,7 +246,7 @@ def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monke
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -280,7 +267,7 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
     )
     disc_cfg, _ = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -312,7 +299,7 @@ def test_build_backbone_configs_respects_explicit_generator_intermediate_with_sw
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -344,7 +331,7 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -460,7 +447,7 @@ def test_build_backbone_configs_scratch_explicit_generator_config_is_authoritati
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -494,7 +481,7 @@ def test_build_backbone_configs_rejects_pretrained_rope_vocab_mismatch(monkeypat
     with pytest.raises(ValueError, match="Tokenizer/checkpoint vocab mismatch for discriminator"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
-            tokenizer=_DummyTokenizer(),
+            tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
 
@@ -520,7 +507,7 @@ def test_build_backbone_configs_rejects_pretrained_rope_special_id_mismatch(monk
     with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
-            tokenizer=_DummyTokenizer(),
+            tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
 
@@ -560,7 +547,7 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -640,7 +627,7 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     model_cfg = ModelConfig(**model_kwargs)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_DummyTokenizer(),
+        tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
@@ -679,7 +666,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch
     with pytest.raises(ValueError, match="Tokenizer/checkpoint vocab mismatch for discriminator"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=cfg,
-            tokenizer=_DummyTokenizer(),
+            tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
 
@@ -714,7 +701,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkey
     with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=cfg,
-            tokenizer=_DummyTokenizer(),
+            tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
 
@@ -876,7 +863,7 @@ def test_build_backbone_configs_rejects_invalid_model_options_early():
     with pytest.raises(ValueError, match="model.norm_arch must be one of"):
         builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
-            tokenizer=_DummyTokenizer(),
+            tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
 
@@ -890,6 +877,6 @@ def test_build_backbone_configs_rejects_hf_deberta_sources_for_pretrained_rope()
     with pytest.raises(ValueError, match="requires DebertaRoPE checkpoints"):
         builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
-            tokenizer=_DummyTokenizer(),
+            tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
