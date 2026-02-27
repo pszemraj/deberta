@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from deberta.checkpoint_utils import (
     canonical_compile_state_key,
@@ -2174,6 +2175,7 @@ def run_pretraining(
     metrics_path = output_dir / "metrics.jsonl.gz"
     wandb_run: Any | None = None
     max_tracker_step_logged = 0
+    train_progress: Any | None = None
 
     def _log_tracker_metrics(row: dict[str, Any], *, step: int) -> int:
         """Log tracker metrics with monotonic global step.
@@ -2260,6 +2262,16 @@ def run_pretraining(
 
         # Training loop
         model.train()
+        if accelerator.is_main_process:
+            train_progress = tqdm(
+                total=int(train_cfg.max_steps),
+                initial=int(global_step),
+                desc="train",
+                unit="step",
+                mininterval=1.0,
+                dynamic_ncols=True,
+                leave=True,
+            )
 
         train_iter = _cycle_dataloader(train_loader)
         ga_steps = int(train_cfg.gradient_accumulation_steps)
@@ -2292,7 +2304,18 @@ def run_pretraining(
                     "Replaying data iterator by %d micro-batches to align resume data position.",
                     consumed_micro_batches,
                 )
-                for _ in range(consumed_micro_batches):
+                replay_iter = range(consumed_micro_batches)
+                if accelerator.is_main_process:
+                    replay_iter = tqdm(
+                        replay_iter,
+                        total=consumed_micro_batches,
+                        desc="resume-replay",
+                        unit="microbatch",
+                        mininterval=1.0,
+                        dynamic_ncols=True,
+                        leave=False,
+                    )
+                for _ in replay_iter:
                     _ = next(train_iter)
 
         local_input_tokens_seen = 0.0
@@ -2572,6 +2595,8 @@ def run_pretraining(
                         lr_floor=float(nonfinite_lr_floor),
                     )
                     global_step += 1
+                    if train_progress is not None:
+                        train_progress.update(1)
                     if train_cfg.report_to != "none":
                         _log_tracker_metrics(
                             {
@@ -2627,6 +2652,8 @@ def run_pretraining(
                 if out is None:
                     raise RuntimeError("Accumulation window produced no forward pass outputs.")
                 global_step += 1
+                if train_progress is not None:
+                    train_progress.update(1)
 
                 if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
                     # Reduce scalar metrics across processes.
@@ -2732,6 +2759,10 @@ def run_pretraining(
         logger.exception("Training crashed at step %s", crash_step)
         raise
     finally:
+        if train_progress is not None:
+            with suppress(Exception):
+                train_progress.close()
+
         # Attempt a final checkpoint if we progressed and this exact step wasn't already saved.
         final_step = int(global_step)
         should_try_crash_save = (crash_reason is None) or int(getattr(accelerator, "num_processes", 1)) == 1
