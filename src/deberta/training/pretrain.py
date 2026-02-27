@@ -15,6 +15,7 @@ from contextlib import nullcontext, suppress
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -330,6 +331,141 @@ def _validate_run_metadata(path: Path) -> None:
     validate_run_metadata_schema(raw, source=str(path))
 
 
+def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
+    """Write a mapping payload to YAML, with JSON fallback if PyYAML is unavailable.
+
+    :param dict[str, Any] payload: Mapping payload.
+    :param Path path: Destination path.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        return
+
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=True, default_flow_style=False, allow_unicode=False)
+
+
+def _resolved_config_payload(
+    *, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: TrainConfig
+) -> dict[str, dict[str, Any]]:
+    """Build resolved nested config payload for YAML snapshots.
+
+    :param ModelConfig model_cfg: Resolved model config.
+    :param DataConfig data_cfg: Resolved data config.
+    :param TrainConfig train_cfg: Resolved train config.
+    :return dict[str, dict[str, Any]]: Nested resolved payload.
+    """
+    return {
+        "model": asdict(model_cfg),
+        "data": asdict(data_cfg),
+        "train": asdict(train_cfg),
+    }
+
+
+def _persist_config_yaml_snapshots(
+    *,
+    output_dir: Path,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    config_path: str | Path | None,
+    is_main_process: bool,
+) -> None:
+    """Persist original/resolved YAML config snapshots in ``output_dir``.
+
+    :param Path output_dir: Training output directory.
+    :param ModelConfig model_cfg: Resolved model config.
+    :param DataConfig data_cfg: Resolved data config.
+    :param TrainConfig train_cfg: Resolved train config.
+    :param str | Path | None config_path: Optional source config file path.
+    :param bool is_main_process: Whether current process owns filesystem writes.
+    """
+    if not bool(is_main_process):
+        return
+
+    resolved_payload = _resolved_config_payload(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+    resolved_path = output_dir / "config_resolved.yaml"
+    _dump_yaml_mapping(resolved_payload, resolved_path)
+
+    original_path = output_dir / "config_original.yaml"
+    if config_path is None:
+        _dump_yaml_mapping(resolved_payload, original_path)
+        return
+
+    source = Path(config_path).expanduser().resolve()
+    if source.exists():
+        original_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        return
+
+    # Backfill with resolved payload when source path is unavailable.
+    _dump_yaml_mapping(resolved_payload, original_path)
+
+
+def _upload_wandb_original_config(
+    *,
+    accelerator: Any,
+    wandb_run: Any | None,
+    config_original_path: Path,
+    run_name: str,
+) -> bool:
+    """Upload ``config_original.yaml`` to W&B using a run-name-specific filename.
+
+    :param Any accelerator: Accelerator runtime.
+    :param Any | None wandb_run: W&B tracker object, if available.
+    :param Path config_original_path: Local config-original snapshot path.
+    :param str run_name: Effective run name.
+    :return bool: True when upload succeeds, else False.
+    """
+    if not bool(getattr(accelerator, "is_main_process", True)):
+        return False
+    if not config_original_path.exists():
+        return False
+
+    owner = wandb_run
+    if owner is None:
+        with suppress(Exception):
+            owner = accelerator.get_tracker("wandb", unwrap=True)
+    if owner is None:
+        return False
+
+    safe_run_name = _sanitize_run_label(run_name)
+    upload_name = f"config_deberta_{safe_run_name}"
+    with TemporaryDirectory(prefix="deberta-wandb-config-") as tmp_dir:
+        staged = Path(tmp_dir) / upload_name
+        staged.write_text(config_original_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        save_fn = getattr(owner, "save", None)
+        if callable(save_fn):
+            try:
+                save_fn(str(staged), base_path=tmp_dir, policy="now")
+            except TypeError:
+                try:
+                    save_fn(str(staged), base_path=tmp_dir)
+                except TypeError:
+                    save_fn(str(staged))
+            logger.info("Uploaded original config to W&B as %s", upload_name)
+            return True
+
+        log_artifact_fn = getattr(owner, "log_artifact", None)
+        if callable(log_artifact_fn):
+            with suppress(Exception):
+                import wandb  # type: ignore
+
+                artifact = wandb.Artifact(name=f"config-{safe_run_name}", type="config")
+                artifact.add_file(str(staged), name=upload_name)
+                log_artifact_fn(artifact)
+                logger.info("Uploaded original config artifact to W&B as %s", upload_name)
+                return True
+
+    logger.warning("W&B tracker does not support save()/log_artifact(); skipping config upload.")
+    return False
+
+
 def _resolve_resume_checkpoint(
     *,
     output_dir: Path,
@@ -428,6 +564,7 @@ def _persist_or_validate_run_configs(
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
     resume_checkpoint: str | None,
+    config_path: str | Path | None = None,
     is_main_process: bool,
 ) -> None:
     """Persist new config snapshots or validate existing snapshots on resume.
@@ -437,6 +574,7 @@ def _persist_or_validate_run_configs(
     :param DataConfig data_cfg: Current data config.
     :param TrainConfig train_cfg: Current train config.
     :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
+    :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
     :raises ValueError: If resume mode detects incompatible model/data config snapshots.
     """
@@ -470,6 +608,14 @@ def _persist_or_validate_run_configs(
             )
         if is_main_process:
             logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
+        _persist_config_yaml_snapshots(
+            output_dir=output_dir,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            config_path=config_path,
+            is_main_process=is_main_process,
+        )
         return
 
     if is_main_process:
@@ -477,6 +623,14 @@ def _persist_or_validate_run_configs(
         dump_json(asdict(data_cfg), data_cfg_path)
         dump_json(asdict(train_cfg), train_cfg_path)
         dump_json(_build_run_metadata(), run_meta_path)
+    _persist_config_yaml_snapshots(
+        output_dir=output_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        config_path=config_path,
+        is_main_process=is_main_process,
+    )
 
 
 def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
@@ -1852,6 +2006,7 @@ def run_pretraining(
         data_cfg=data_cfg,
         train_cfg=train_cfg,
         resume_checkpoint=ckpt,
+        config_path=config_path,
         is_main_process=accelerator.is_main_process,
     )
 
@@ -2062,6 +2217,13 @@ def run_pretraining(
                 with suppress(Exception):
                     wandb_run = accelerator.get_tracker("wandb", unwrap=True)
                 with suppress(Exception):
+                    _upload_wandb_original_config(
+                        accelerator=accelerator,
+                        wandb_run=wandb_run,
+                        config_original_path=output_dir / "config_original.yaml",
+                        run_name=tracker_run_name,
+                    )
+                with suppress(Exception):
                     _setup_wandb_watch(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
@@ -2119,12 +2281,19 @@ def run_pretraining(
             disc_pad_token_id = int(disc_pad_token_id)
 
         if consumed_micro_batches > 0:
-            logger.info(
-                "Replaying data iterator by %d micro-batches to align resume data position.",
-                consumed_micro_batches,
-            )
-            for _ in range(consumed_micro_batches):
-                _ = next(train_iter)
+            if int(global_step) >= int(train_cfg.max_steps):
+                logger.info(
+                    "Resume global_step=%d already reached max_steps=%d; skipping data replay.",
+                    int(global_step),
+                    int(train_cfg.max_steps),
+                )
+            else:
+                logger.info(
+                    "Replaying data iterator by %d micro-batches to align resume data position.",
+                    consumed_micro_batches,
+                )
+                for _ in range(consumed_micro_batches):
+                    _ = next(train_iter)
 
         local_input_tokens_seen = 0.0
         local_input_tokens_since_log = 0.0

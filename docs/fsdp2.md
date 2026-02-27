@@ -195,3 +195,10 @@ Legacy compiled checkpoints that include `._orig_mod` key segments are remapped
 automatically during export, so older wrapper artifacts do not block consolidation.
 
 Run directories now include `run_metadata.json` with a `config_schema_version`. Resume/export validate that schema and fail fast on unknown versions instead of silently proceeding with ambiguous config metadata.
+Run directories also persist:
+
+- `config_original.yaml` (source config snapshot when provided; otherwise current resolved config baseline)
+- `config_resolved.yaml` (fully resolved model/data/train payload used at runtime)
+
+When `train.report_to=wandb`, `config_original.yaml` is uploaded once at startup using
+the filename pattern `config_deberta_<run_name>`.

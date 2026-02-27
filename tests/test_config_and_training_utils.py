@@ -74,6 +74,7 @@ from deberta.training.pretrain import (
     _stabilize_hf_compile_attention_mask,
     _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
+    _upload_wandb_original_config,
 )
 
 
@@ -559,6 +560,33 @@ def test_setup_wandb_watch_returns_false_when_mode_none() -> None:
     assert enabled is False
 
 
+def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Path) -> None:
+    src = tmp_path / "config_original.yaml"
+    src.write_text("train:\n  max_steps: 1\n", encoding="utf-8")
+
+    class _FakeRun:
+        def __init__(self) -> None:
+            self.saved: list[Path] = []
+
+        def save(self, path: str, **kwargs: Any) -> None:
+            del kwargs
+            self.saved.append(Path(path))
+
+    class _FakeAccelerator:
+        is_main_process = True
+
+    run = _FakeRun()
+    uploaded = _upload_wandb_original_config(
+        accelerator=_FakeAccelerator(),
+        wandb_run=run,
+        config_original_path=src,
+        run_name="demo-run",
+    )
+    assert uploaded is True
+    assert run.saved
+    assert run.saved[0].name == "config_deberta_demo-run"
+
+
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -569,6 +597,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
             self.summary: dict[str, Any] = {}
             self.logged: list[tuple[dict[str, Any], int | None]] = []
             self.watch_calls: list[tuple[torch.nn.Module, dict[str, Any]]] = []
+            self.saved_paths: list[Path] = []
             self.finished_exit_code: int | None = None
 
         def log(self, row: dict[str, Any], step: int | None = None) -> None:
@@ -576,6 +605,10 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
         def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:
             self.watch_calls.append((model, dict(kwargs)))
+
+        def save(self, path: str, **kwargs: Any) -> None:
+            del kwargs
+            self.saved_paths.append(Path(path))
 
         def finish(self, exit_code: int = 0) -> None:
             self.finished_exit_code = int(exit_code)
@@ -789,12 +822,172 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.wandb_run.finished_exit_code == 130
     assert accel.wandb_run.logged
     assert accel.wandb_run.watch_calls
+    assert accel.wandb_run.saved_paths
+    assert accel.wandb_run.saved_paths[0].name == "config_deberta_run"
     assert accel.wandb_run.watch_calls[0][1]["log"] == "gradients"
     assert accel.tracker_init_calls
     first_tracker_call = accel.tracker_init_calls[0]
     assert first_tracker_call["project_name"] == "deberta-train"
     assert first_tracker_call["init_kwargs"]["wandb"]["name"] == "run"
     assert accel.ended is False
+
+
+def test_run_pretraining_resume_at_max_steps_skips_data_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import deberta.training.pretrain as pretrain_mod
+
+    class _FakeAccelerator:
+        def __init__(
+            self, *, gradient_accumulation_steps: int, log_with: str | None, mixed_precision: str
+        ) -> None:
+            del gradient_accumulation_steps, log_with, mixed_precision
+            self.is_main_process = True
+            self.process_index = 0
+            self.num_processes = 1
+            self.device = torch.device("cpu")
+            self.state = "fake-accelerator"
+            self.loaded: list[tuple[str, dict[str, Any]]] = []
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+        def prepare(self, *objs):
+            return objs
+
+        def unwrap_model(self, model):
+            return model
+
+        def no_sync(self, model):
+            del model
+            return nullcontext()
+
+        def backward(self, loss: torch.Tensor) -> None:
+            del loss
+
+        def clip_grad_norm_(self, params, max_norm: float) -> None:
+            del params, max_norm
+
+        def reduce(self, tensor: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+            del reduction
+            return tensor
+
+        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+            return tensor
+
+        def load_state(self, ckpt: str, **kwargs: Any) -> None:
+            self.loaded.append((ckpt, dict(kwargs)))
+
+    fake_accelerate = types.ModuleType("accelerate")
+    fake_accelerate.Accelerator = _FakeAccelerator
+    fake_accelerate_utils = types.ModuleType("accelerate.utils")
+    fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
+    monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
+
+    class _FakeTokenizer:
+        pad_token_id = 0
+        cls_token_id = 1
+        sep_token_id = 2
+        mask_token_id = 3
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = types.SimpleNamespace(
+        from_pretrained=lambda *args, **kwargs: _FakeTokenizer()
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    checkpoint_dir = tmp_path / "run" / "checkpoint-2"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 50}),
+        encoding="utf-8",
+    )
+
+    class _FakeRTD(torch.nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            del kwargs
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
+            self.disc_config = types.SimpleNamespace(pad_token_id=0)
+            self.generator = torch.nn.Linear(2, 2)
+            self.discriminator = torch.nn.Linear(2, 2)
+
+        def forward(self, **kwargs):
+            del kwargs
+            t = self.weight * 0.0 + 1.0
+            return types.SimpleNamespace(
+                loss=t,
+                gen_loss=t.detach(),
+                disc_loss=t.detach(),
+                disc_accuracy=t.detach(),
+                gen_token_count=torch.tensor(1.0),
+                disc_token_count=torch.tensor(1.0),
+                gen_loss_raw=t,
+                disc_loss_raw=t,
+            )
+
+    replay_calls = {"next": 0}
+
+    def _fake_cycle(_loader):
+        while True:
+            replay_calls["next"] += 1
+            raise AssertionError("resume replay should be skipped when global_step >= max_steps")
+            yield {}  # pragma: no cover
+
+    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
+    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
+    monkeypatch.setattr(
+        pretrain_mod,
+        "build_backbone_configs",
+        lambda **kwargs: (types.SimpleNamespace(pad_token_id=0), types.SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        pretrain_mod,
+        "build_backbones",
+        lambda **kwargs: (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
+    )
+    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", _FakeRTD)
+    monkeypatch.setattr(
+        pretrain_mod,
+        "_build_optimizer",
+        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    monkeypatch.setattr(
+        pretrain_mod,
+        "_build_scheduler",
+        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
+    )
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _fake_cycle)
+    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
+    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", lambda **kwargs: None)
+
+    model_cfg = ModelConfig()
+    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=2,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+
+    pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+    assert replay_calls["next"] == 0
 
 
 def test_run_pretraining_compiles_generator_and_discriminator(
@@ -1395,6 +1588,40 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
             resume_checkpoint=str(out / "checkpoint-10"),
             is_main_process=True,
         )
+
+
+def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("yaml")
+
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    src_cfg = tmp_path / "source.yaml"
+    src_text = "model:\n  backbone_type: rope\ntrain:\n  max_steps: 7\n"
+    src_cfg.write_text(src_text, encoding="utf-8")
+
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=7)
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        config_path=src_cfg,
+        is_main_process=True,
+    )
+
+    original_path = out / "config_original.yaml"
+    resolved_path = out / "config_resolved.yaml"
+    assert original_path.read_text(encoding="utf-8") == src_text
+    assert resolved_path.exists()
+    loaded_resolved = _load_yaml(resolved_path)
+    assert loaded_resolved[0].backbone_type == model_cfg.backbone_type
+    assert loaded_resolved[1].dataset_name == data_cfg.dataset_name
+    assert loaded_resolved[2].max_steps == train_cfg.max_steps
 
 
 def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matching_resume(tmp_path: Path):
