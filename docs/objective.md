@@ -1,6 +1,6 @@
 # Objective: RTD (Replaced Token Detection)
 
-This document is the primary reference for the pretraining objective implemented in this repo.
+This document is the primary reference for the pretraining objective in this repo.
 
 For data/collator behavior, see [`docs/data.md`](data.md). For distributed/runtime configuration, see [`docs/fsdp2.md`](fsdp2.md).
 

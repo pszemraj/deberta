@@ -61,9 +61,9 @@ Pretrained RoPE loads use explicit override fields only:
 - `pretrained_use_bias`
 - `pretrained_initializer_range`
 
-Legacy implicit behavior is removed:
+Pretrained override behavior is explicit:
 
-- non-default scratch fields (for example `rope_theta`, `ffn_type`, `norm_arch`) are no longer interpreted as pretrained overrides
+- non-default scratch fields (for example `rope_theta`, `ffn_type`, `norm_arch`) are not interpreted as pretrained overrides
 - to override pretrained RoPE configs, use the `pretrained_*` fields above
 
 ## `rope` Backbone Knobs
@@ -121,7 +121,7 @@ In pretrained mode, explicit generator config also requires explicit generator m
 - `es` (vanilla embedding sharing)
 - `gdes` (gradient-disentangled sharing; default)
 
-`gdes` is implemented to remain compatible with FSDP2 wrapping.
+`gdes` remains compatible with FSDP2 wrapping.
 
 Operational constraint: embedding sharing adapters bind discriminator embeddings to the
 generator embedding modules present at pretrainer construction time. If you replace
@@ -147,7 +147,8 @@ Native HF attention kernel is configured via `model.hf_attention_kernel`:
 - `stable` (compile-focused cached-bmm path with fp32 score/probability accumulation and static rel-pos table slicing)
 
 Compile runtime policy for this mode (for example, auto FFN-only fallback in default+inductor) is documented in [`docs/fsdp2.md#torchcompile`](fsdp2.md#torchcompile).
-For current stability, prefer FFN-only compile on inductor; full-backbone HFv2+inductor compile is not recommended.
+For stable operation, prefer FFN-only compile on inductor; full-backbone
+HFv2+inductor compile is not recommended.
 
 Pretraining heads follow backbone norm style by config:
 

@@ -63,9 +63,10 @@ train:
 
 `train.tf32=true` by default.
 
-The training loop prefers modern PyTorch fp32 precision controls when available and falls back to legacy `allow_tf32` flags on older builds.
+The training loop uses `torch.set_float32_matmul_precision` when available and
+falls back to `allow_tf32` flags on older builds.
 
-For `torch.compile` max-autotune modes, legacy TF32 flags may be forced for compatibility.
+For `torch.compile` max-autotune modes, TF32 flags may be forced for compatibility.
 
 ## `torch.compile`
 
@@ -78,7 +79,7 @@ RTD wrapper glue (sampling/corruption/label construction) remains eager by desig
 Default compile scope is resolved from `train.torch_compile_scope=auto`:
 
 - baseline: compile both `generator` and `discriminator` backbones
-- temporary default-mode mitigation: for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles FFN blocks only (`generator.encoder.layer[*].intermediate/output`, `discriminator.encoder.layer[*].intermediate/output`)
+- for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles FFN blocks only (`generator.encoder.layer[*].intermediate/output`, `discriminator.encoder.layer[*].intermediate/output`)
 
 This preserves compile on dominant MLP FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa attention compile.
 
@@ -89,7 +90,9 @@ Recommended stable HFv2 compile path:
 - `train.torch_compile_backend=inductor`
 - `train.torch_compile_scope=ffn` (or `auto` with the default-mode fallback)
 
-Full-backbone HFv2 compile with inductor is currently unstable and not recommended for production pretraining runs. The runtime now emits a warning if this path is requested explicitly.
+Full-backbone HFv2 compile with inductor is not recommended for production
+pretraining runs. The runtime emits a warning if this path is requested
+explicitly.
 
 Compile behavior is configured directly via train/model config:
 
@@ -99,9 +102,10 @@ Compile behavior is configured directly via train/model config:
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [`docs/model.md#hf-compatibility-mode-notes`](model.md#hf-compatibility-mode-notes).
 For native HF runs, prefer `model.hf_attention_kernel=stable`.
 
-Compile is applied to module `forward` callables (module identity is preserved), so
-new checkpoints keep canonical state-dict keys. Resume still normalizes legacy
-compile-wrapper key segments (`._orig_mod`) when needed for older checkpoints.
+Compile is applied to module `forward` callables (module identity is preserved),
+so checkpoints keep canonical state-dict keys. Resume still normalizes
+compile-wrapper key segments (`._orig_mod`) when needed for wrapper-produced
+checkpoints.
 
 ### Compile Parity Protocol
 
@@ -144,7 +148,7 @@ Step logs and tracker metrics prioritize signal over mostly-constant counters.
 
 ## Interruption and Crash Handling
 
-`deberta train` now uses a crash-safe shutdown path:
+`deberta train` uses a crash-safe shutdown path:
 
 - `KeyboardInterrupt` (CTRL+C) and other uncaught exceptions are logged with crash type/reason and step.
 - Main process appends a crash marker row to `<output_dir>/metrics.jsonl.gz`.
@@ -194,7 +198,9 @@ The exporter consolidates to full state on rank 0 and writes standalone HF artif
 Legacy compiled checkpoints that include `._orig_mod` key segments are remapped
 automatically during export, so older wrapper artifacts do not block consolidation.
 
-Run directories now include `run_metadata.json` with a `config_schema_version`. Resume/export validate that schema and fail fast on unknown versions instead of silently proceeding with ambiguous config metadata.
+Run directories include `run_metadata.json` with a `config_schema_version`.
+Resume/export validate that schema and fail fast on unknown versions instead of
+silently proceeding with ambiguous config metadata.
 Run directories also persist:
 
 - `config_original.yaml` (source config snapshot when provided; otherwise current resolved config baseline)

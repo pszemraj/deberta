@@ -2,7 +2,7 @@
 
 This file is the single source of truth for deferred documentation-backed follow-ups.
 
-For implemented behavior, use the concept docs:
+For runtime behavior and contracts, use the concept docs:
 
 - model/backbone: [`docs/model.md`](model.md)
 - data/packing: [`docs/data.md`](data.md)
