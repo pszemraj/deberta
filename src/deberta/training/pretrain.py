@@ -1062,6 +1062,7 @@ def _resolve_compile_scope(
     model_cfg: ModelConfig,
     compile_mode: str,
     compile_backend: str,
+    block_cross_document_attention: bool = False,
 ) -> tuple[str, str | None]:
     """Resolve effective compile scope with default-mode stability fallback.
 
@@ -1069,6 +1070,7 @@ def _resolve_compile_scope(
     :param ModelConfig model_cfg: Model configuration.
     :param str compile_mode: Canonical torch.compile mode.
     :param str compile_backend: Compile backend name.
+    :param bool block_cross_document_attention: Whether doc-blocking is enabled.
     :return tuple[str, str | None]: Effective scope and optional reason message.
     """
     if requested_scope != "auto":
@@ -1082,6 +1084,13 @@ def _resolve_compile_scope(
         return (
             "ffn",
             "auto scope selected FFN-only fallback for hf_deberta_v2 (default+inductor)",
+        )
+    # Doc-blocking batches alternate between None and 3D masks (single-doc vs multi-doc),
+    # causing mask shape churn under compile. Downgrade to FFN-only to avoid recompilation.
+    if bool(block_cross_document_attention) and backbone_type == "rope":
+        return (
+            "ffn",
+            "auto scope selected FFN-only for rope + doc-blocking (mask shape churn under compile)",
         )
     return "backbones", None
 
@@ -1406,17 +1415,14 @@ def _stabilize_compile_attention_mask(
     backbone_type: str,
     block_cross_document_attention: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Canonicalize attention-mask presence/dtype for compiled attention paths.
-
-    Full/encoder compile scopes are sensitive to mask shape/type churn when
-    ``attention_mask`` is sometimes omitted and sometimes present.  This helper
-    enforces a stable tensor contract for those scopes.
+    """Canonicalize attention-mask dtype for compiled attention paths.
 
     For HF DeBERTa-v2: normalizes existing masks to bool but does **not**
     materialize a mask when absent — the backbone's no-mask fast path handles
     ``None`` directly.
-    For RoPE + doc-blocking: materializes a 3D ``(B,S,S)`` all-True bool mask
-    when absent so the compiled graph always sees rank-3 input.
+
+    RoPE + doc-blocking mask shape churn is handled by auto-downgrading compile
+    scope to FFN in ``_resolve_compile_scope`` instead of materializing S² masks.
 
     :param dict[str, torch.Tensor] batch: Device-local batch mapping.
     :param bool compile_enabled: Whether torch.compile is active.
@@ -1442,19 +1448,6 @@ def _stabilize_compile_attention_mask(
         attn = batch.get("attention_mask")
         if isinstance(attn, torch.Tensor) and attn.dtype != torch.bool:
             batch["attention_mask"] = attn.to(dtype=torch.bool)
-        return batch
-
-    if btype == "rope" and block_cross_document_attention:
-        # doc_ids present → mask will be built momentarily in the training loop.
-        if "doc_ids" in batch:
-            return batch
-        attn = batch.get("attention_mask")
-        if not isinstance(attn, torch.Tensor):
-            # Materialize (B, S, S) all-True mask so compile always sees rank-3.
-            seq_len = input_ids.shape[1]
-            batch["attention_mask"] = torch.ones(
-                (input_ids.shape[0], seq_len, seq_len), dtype=torch.bool, device=input_ids.device
-            )
         return batch
 
     return batch
@@ -1969,6 +1962,7 @@ def run_pretraining(
             model_cfg=model_cfg,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
+            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
         )
         full_backbone_warn = _full_backbone_hf_inductor_warning(
             model_cfg=model_cfg,

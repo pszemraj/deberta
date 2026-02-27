@@ -1820,7 +1820,10 @@ def test_stabilize_compile_attention_mask_hf_deberta_v2():
 
 
 def test_stabilize_compile_attention_mask_rope_doc_blocking():
-    # RoPE + doc-blocking + compile: None mask → 3D all-True.
+    # Stabilizer is now a no-op for RoPE — mask shape churn is handled by
+    # _resolve_compile_scope auto-downgrading to FFN instead.
+
+    # RoPE + doc-blocking + compile: no mask materialization.
     batch1 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
     out1 = _stabilize_compile_attention_mask(
         batch=batch1,
@@ -1829,60 +1832,29 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
         backbone_type="rope",
         block_cross_document_attention=True,
     )
-    assert "attention_mask" in out1
-    assert out1["attention_mask"].shape == (1, 3, 3)
-    assert out1["attention_mask"].dtype == torch.bool
-    assert out1["attention_mask"].all()
-
-    # RoPE + doc-blocking + compile: existing 3D mask → kept as-is.
-    mask_3d = torch.ones((1, 3, 3), dtype=torch.bool)
-    mask_3d[0, 2, 0] = False
-    batch2 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long), "attention_mask": mask_3d}
-    out2 = _stabilize_compile_attention_mask(
-        batch=batch2,
-        compile_enabled=True,
-        compile_scope="encoder",
-        backbone_type="rope",
-        block_cross_document_attention=True,
-    )
-    assert torch.equal(out2["attention_mask"], mask_3d)
-
-    # RoPE + doc-blocking + compile: doc_ids present → no mask materialized by stabilizer.
-    batch2b = {
-        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
-        "doc_ids": torch.tensor([[1, 1, 2]], dtype=torch.long),
-    }
-    out2b = _stabilize_compile_attention_mask(
-        batch=batch2b,
-        compile_enabled=True,
-        compile_scope="encoder",
-        backbone_type="rope",
-        block_cross_document_attention=True,
-    )
-    assert "attention_mask" not in out2b
-    assert "doc_ids" in out2b
+    assert "attention_mask" not in out1
 
     # RoPE without doc-blocking: no mask injection.
-    batch3 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
-    out3 = _stabilize_compile_attention_mask(
-        batch=dict(batch3),
+    batch2 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out2 = _stabilize_compile_attention_mask(
+        batch=dict(batch2),
         compile_enabled=True,
         compile_scope="backbones",
         backbone_type="rope",
         block_cross_document_attention=False,
     )
-    assert "attention_mask" not in out3
+    assert "attention_mask" not in out2
 
     # Compile disabled: no mask injection regardless.
-    batch4 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
-    out4 = _stabilize_compile_attention_mask(
-        batch=dict(batch4),
+    batch3 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out3 = _stabilize_compile_attention_mask(
+        batch=dict(batch3),
         compile_enabled=False,
         compile_scope="backbones",
         backbone_type="rope",
         block_cross_document_attention=True,
     )
-    assert "attention_mask" not in out4
+    assert "attention_mask" not in out3
 
 
 def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
@@ -1903,6 +1875,17 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
     )
     assert scope == "backbones"
     assert reason is None
+
+    # RoPE + doc-blocking auto-downgrades to FFN to avoid mask shape churn.
+    scope, reason = _resolve_compile_scope(
+        requested_scope="auto",
+        model_cfg=ModelConfig(backbone_type="rope"),
+        compile_mode="default",
+        compile_backend="inductor",
+        block_cross_document_attention=True,
+    )
+    assert scope == "ffn"
+    assert reason is not None
 
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
