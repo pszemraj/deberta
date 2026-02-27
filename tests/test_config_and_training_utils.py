@@ -76,7 +76,7 @@ from deberta.training.pretrain import (
     _setup_wandb_watch,
     _should_clip_gradients,
     _should_force_legacy_tf32_for_compile,
-    _stabilize_hf_compile_attention_mask,
+    _stabilize_compile_attention_mask,
     _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
     _upload_wandb_original_config,
@@ -1783,10 +1783,10 @@ def test_force_legacy_tf32_for_compile_modes():
     )
 
 
-def test_stabilize_hf_compile_attention_mask_behavior():
+def test_stabilize_compile_attention_mask_hf_deberta_v2():
     # Adds missing mask for HF backbone with backbone-level compile scope.
     batch1 = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)}
-    out1 = _stabilize_hf_compile_attention_mask(
+    out1 = _stabilize_compile_attention_mask(
         batch=batch1,
         compile_enabled=True,
         compile_scope="backbones",
@@ -1798,7 +1798,7 @@ def test_stabilize_hf_compile_attention_mask_behavior():
 
     # FFN scope does not inject mask.
     batch2 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
-    out2 = _stabilize_hf_compile_attention_mask(
+    out2 = _stabilize_compile_attention_mask(
         batch=dict(batch2),
         compile_enabled=True,
         compile_scope="ffn",
@@ -1811,7 +1811,7 @@ def test_stabilize_hf_compile_attention_mask_behavior():
         "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
         "attention_mask": torch.tensor([[1, 1, 0]], dtype=torch.long),
     }
-    out3 = _stabilize_hf_compile_attention_mask(
+    out3 = _stabilize_compile_attention_mask(
         batch=batch3,
         compile_enabled=True,
         compile_scope="encoder",
@@ -1819,6 +1819,57 @@ def test_stabilize_hf_compile_attention_mask_behavior():
     )
     assert out3["attention_mask"].dtype == torch.bool
     assert torch.equal(out3["attention_mask"], torch.tensor([[True, True, False]], dtype=torch.bool))
+
+
+def test_stabilize_compile_attention_mask_rope_doc_blocking():
+    # RoPE + doc-blocking + compile: None mask → 3D all-True.
+    batch1 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out1 = _stabilize_compile_attention_mask(
+        batch=batch1,
+        compile_enabled=True,
+        compile_scope="backbones",
+        backbone_type="rope",
+        block_cross_document_attention=True,
+    )
+    assert "attention_mask" in out1
+    assert out1["attention_mask"].shape == (1, 3, 3)
+    assert out1["attention_mask"].dtype == torch.bool
+    assert out1["attention_mask"].all()
+
+    # RoPE + doc-blocking + compile: existing 3D mask → kept as-is.
+    mask_3d = torch.ones((1, 3, 3), dtype=torch.bool)
+    mask_3d[0, 2, 0] = False
+    batch2 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long), "attention_mask": mask_3d}
+    out2 = _stabilize_compile_attention_mask(
+        batch=batch2,
+        compile_enabled=True,
+        compile_scope="encoder",
+        backbone_type="rope",
+        block_cross_document_attention=True,
+    )
+    assert torch.equal(out2["attention_mask"], mask_3d)
+
+    # RoPE without doc-blocking: no mask injection.
+    batch3 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out3 = _stabilize_compile_attention_mask(
+        batch=dict(batch3),
+        compile_enabled=True,
+        compile_scope="backbones",
+        backbone_type="rope",
+        block_cross_document_attention=False,
+    )
+    assert "attention_mask" not in out3
+
+    # Compile disabled: no mask injection regardless.
+    batch4 = {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+    out4 = _stabilize_compile_attention_mask(
+        batch=dict(batch4),
+        compile_enabled=False,
+        compile_scope="backbones",
+        backbone_type="rope",
+        block_cross_document_attention=True,
+    )
+    assert "attention_mask" not in out4
 
 
 def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():

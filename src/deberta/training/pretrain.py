@@ -1379,23 +1379,29 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def _stabilize_hf_compile_attention_mask(
+def _stabilize_compile_attention_mask(
     *,
     batch: dict[str, torch.Tensor],
     compile_enabled: bool,
     compile_scope: str,
     backbone_type: str,
+    block_cross_document_attention: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Canonicalize attention-mask presence/dtype for HFv2 attention compile paths.
+    """Canonicalize attention-mask presence/dtype for compiled attention paths.
 
-    Full/encoder compile scopes for native HF DeBERTa-v2 are sensitive to shape/type
-    churn when ``attention_mask`` is sometimes omitted and sometimes present.
-    This helper enforces a stable tensor contract for those scopes only.
+    Full/encoder compile scopes are sensitive to mask shape/type churn when
+    ``attention_mask`` is sometimes omitted and sometimes present.  This helper
+    enforces a stable tensor contract for those scopes.
+
+    For HF DeBERTa-v2: always materializes a 2D bool mask when absent.
+    For RoPE + doc-blocking: materializes a 3D ``(B,S,S)`` all-True bool mask
+    when absent so the compiled graph always sees rank-3 input.
 
     :param dict[str, torch.Tensor] batch: Device-local batch mapping.
     :param bool compile_enabled: Whether torch.compile is active.
     :param str compile_scope: Effective compile scope.
     :param str backbone_type: Model backbone type.
+    :param bool block_cross_document_attention: Whether doc-blocking is enabled.
     :return dict[str, torch.Tensor]: Possibly updated batch mapping.
     """
     if not bool(compile_enabled):
@@ -1404,19 +1410,32 @@ def _stabilize_hf_compile_attention_mask(
     scope = str(compile_scope).strip().lower()
     if scope not in {"backbones", "encoder", "gen_encoder", "disc_encoder"}:
         return batch
-    if str(backbone_type).strip().lower() != "hf_deberta_v2":
-        return batch
 
     input_ids = batch.get("input_ids")
     if not isinstance(input_ids, torch.Tensor):
         return batch
 
-    attn = batch.get("attention_mask")
-    if not isinstance(attn, torch.Tensor):
-        batch["attention_mask"] = torch.ones_like(input_ids, dtype=torch.bool)
+    btype = str(backbone_type).strip().lower()
+
+    if btype == "hf_deberta_v2":
+        attn = batch.get("attention_mask")
+        if not isinstance(attn, torch.Tensor):
+            batch["attention_mask"] = torch.ones_like(input_ids, dtype=torch.bool)
+            return batch
+        if attn.dtype != torch.bool:
+            batch["attention_mask"] = attn.to(dtype=torch.bool)
         return batch
-    if attn.dtype != torch.bool:
-        batch["attention_mask"] = attn.to(dtype=torch.bool)
+
+    if btype == "rope" and block_cross_document_attention:
+        attn = batch.get("attention_mask")
+        if not isinstance(attn, torch.Tensor):
+            # Materialize (B, S, S) all-True mask so compile always sees rank-3.
+            seq_len = input_ids.shape[1]
+            batch["attention_mask"] = torch.ones(
+                (input_ids.shape[0], seq_len, seq_len), dtype=torch.bool, device=input_ids.device
+            )
+        return batch
+
     return batch
 
 
@@ -2355,11 +2374,12 @@ def run_pretraining(
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
-                batch = _stabilize_hf_compile_attention_mask(
+                batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
+                    block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                 )
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()
