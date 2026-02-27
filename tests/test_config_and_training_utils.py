@@ -46,6 +46,7 @@ from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
     _apply_nonfinite_recovery,
     _build_optimizer,
+    _build_run_metadata,
     _build_training_collator,
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
@@ -2764,3 +2765,80 @@ def test_validate_workflow_sdpa_kernel_inert_warning(model_kwargs, train_kwargs,
             f"Unexpected warning for model={model_kwargs} train={train_kwargs}: "
             f"{[str(x.message) for x in user_warnings]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Compile scope metadata persistence (Phase 3A)
+# ---------------------------------------------------------------------------
+
+
+def test_build_run_metadata_includes_compile_scope():
+    meta = _build_run_metadata(effective_compile_scope="backbones", compile_scope_reason="auto test")
+    assert meta["effective_compile_scope"] == "backbones"
+    assert meta["compile_scope_reason"] == "auto test"
+    assert "config_schema_version" in meta
+
+
+def test_build_run_metadata_omits_compile_scope_when_none():
+    meta = _build_run_metadata()
+    assert "effective_compile_scope" not in meta
+    assert "compile_scope_reason" not in meta
+
+
+def test_persist_run_configs_writes_compile_scope_to_metadata(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    model_cfg = ModelConfig()
+    data_cfg = DataConfig(data_files="dummy.txt")
+    train_cfg = TrainConfig()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+        effective_compile_scope="ffn",
+        compile_scope_reason="auto scope selected FFN-only",
+    )
+    from deberta.io_utils import load_json_mapping
+
+    meta = load_json_mapping(out / "run_metadata.json")
+    assert meta["effective_compile_scope"] == "ffn"
+    assert meta["compile_scope_reason"] == "auto scope selected FFN-only"
+
+
+def test_persist_run_configs_warns_on_compile_scope_drift_on_resume(tmp_path: Path, caplog):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    model_cfg = ModelConfig()
+    data_cfg = DataConfig(data_files="dummy.txt")
+    train_cfg = TrainConfig()
+
+    # Initial run persists scope=backbones.
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+        effective_compile_scope="backbones",
+    )
+
+    # Simulate a checkpoint directory for resume.
+    ckpt = out / "checkpoint-100"
+    ckpt.mkdir()
+
+    # Resume with different scope should log a warning.
+    with caplog.at_level(logging.WARNING):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            resume_checkpoint=str(ckpt),
+            is_main_process=True,
+            effective_compile_scope="ffn",
+        )
+    assert any("compile scope changed on resume" in r.message.lower() for r in caplog.records)

@@ -98,17 +98,28 @@ def _flush_loggers() -> None:
                 handler.flush()
 
 
-def _build_run_metadata() -> dict[str, Any]:
+def _build_run_metadata(
+    *,
+    effective_compile_scope: str | None = None,
+    compile_scope_reason: str | None = None,
+) -> dict[str, Any]:
     """Build run-metadata payload stored alongside config snapshots.
 
+    :param str | None effective_compile_scope: Resolved compile scope after auto-resolution.
+    :param str | None compile_scope_reason: Reason for scope selection when auto-resolved.
     :return dict[str, Any]: Metadata mapping.
     """
     from deberta import __version__
 
-    return {
+    meta: dict[str, Any] = {
         "config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION),
         "deberta_version": str(__version__),
     }
+    if effective_compile_scope is not None:
+        meta["effective_compile_scope"] = str(effective_compile_scope)
+    if compile_scope_reason is not None:
+        meta["compile_scope_reason"] = str(compile_scope_reason)
+    return meta
 
 
 def _sanitize_run_label(raw: str) -> str:
@@ -509,6 +520,8 @@ def _persist_or_validate_run_configs(
     resume_checkpoint: str | None,
     config_path: str | Path | None = None,
     is_main_process: bool,
+    effective_compile_scope: str | None = None,
+    compile_scope_reason: str | None = None,
 ) -> None:
     """Persist new config snapshots or validate existing snapshots on resume.
 
@@ -519,6 +532,8 @@ def _persist_or_validate_run_configs(
     :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
     :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
+    :param str | None effective_compile_scope: Resolved compile scope for metadata.
+    :param str | None compile_scope_reason: Reason for compile scope selection.
     :raises ValueError: If resume mode detects incompatible model/data config snapshots.
     """
     model_cfg_path = output_dir / "model_config.json"
@@ -526,13 +541,28 @@ def _persist_or_validate_run_configs(
     train_cfg_path = output_dir / "train_config.json"
     run_meta_path = output_dir / "run_metadata.json"
 
+    run_meta = _build_run_metadata(
+        effective_compile_scope=effective_compile_scope,
+        compile_scope_reason=compile_scope_reason,
+    )
+
     has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
     if resume_checkpoint is not None and has_saved_model_data:
         if run_meta_path.exists():
             _validate_run_metadata(run_meta_path)
+            # Check for compile scope drift on resume.
+            if is_main_process and effective_compile_scope is not None:
+                saved_meta = load_json_mapping(run_meta_path)
+                saved_scope = saved_meta.get("effective_compile_scope")
+                if saved_scope is not None and str(saved_scope) != str(effective_compile_scope):
+                    logger.warning(
+                        "Effective compile scope changed on resume: "
+                        f"was {saved_scope!r}, now {effective_compile_scope!r}. "
+                        "This may affect compiled graph caching but is recoverable."
+                    )
         elif is_main_process:
             # Backfill schema metadata for older runs once compatibility has been checked.
-            dump_json(_build_run_metadata(), run_meta_path)
+            dump_json(run_meta, run_meta_path)
 
         saved_model_cfg = ModelConfig(**load_json_mapping(model_cfg_path))
         saved_data_cfg = DataConfig(**load_json_mapping(data_cfg_path))
@@ -565,7 +595,7 @@ def _persist_or_validate_run_configs(
         dump_json(asdict(model_cfg), model_cfg_path)
         dump_json(asdict(data_cfg), data_cfg_path)
         dump_json(asdict(train_cfg), train_cfg_path)
-        dump_json(_build_run_metadata(), run_meta_path)
+        dump_json(run_meta, run_meta_path)
     _persist_config_yaml_snapshots(
         output_dir=output_dir,
         model_cfg=model_cfg,
@@ -1951,6 +1981,8 @@ def run_pretraining(
         resume_checkpoint=ckpt,
         config_path=config_path,
         is_main_process=accelerator.is_main_process,
+        effective_compile_scope=compile_scope if compile_enabled else None,
+        compile_scope_reason=compile_scope_reason,
     )
 
     accelerator.wait_for_everyone()
