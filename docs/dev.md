@@ -13,6 +13,8 @@ Internal implementation notes that are not part of user-facing runtime docs.
 
 ### RoPE backbone
 
+Standard multi-head attention (no disentangled position bias). Position encoded via RoPE rotation on Q/K.
+
 - **No mask (None)**: unpadded/packed batch, no doc-blocking. SDPA receives no mask — fastest path.
 - **2D mask (B,S)**: key-padding mask. SDPA receives `(B,1,1,S)` broadcast via unsqueeze.
 - **3D mask (B,S,S)**: doc-blocking pairwise keep-mask. Built on-device from `doc_ids` by `_build_doc_block_mask()`.
@@ -20,6 +22,8 @@ Internal implementation notes that are not part of user-facing runtime docs.
   - Query activity is read from the diagonal in O(B×S) via `torch.diagonal()`, not from row reduction.
 
 ### HF DeBERTa-v2 backbone
+
+Disentangled attention: adds C2P + P2C relative-position bias to scores via separate `pos_key_proj`/`pos_query_proj` projections. Position encoded via learned relative-position embeddings.
 
 - **No mask (None)**: unpadded batch. Encoder passes `None` to layers — no mask materialized.
 - **2D mask (B,S)**: padding mask. `get_attention_mask()` returns `(B,1,1,S)` broadcast shape (not `(B,1,S,S)` outer product). Avoids O(S²) allocation.

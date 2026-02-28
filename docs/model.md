@@ -2,12 +2,22 @@
 
 See also: [data pipeline](data.md), [RTD objective](objective.md), [runtime/compile](fsdp2.md).
 
-## Backbone Modes
+## Backbone Families
 
-`model.backbone_type` supports:
+`model.backbone_type` supports two architecturally distinct encoder families that share the same RTD pretraining objective and GDES embedding sharing:
 
-- `rope` (default): modernized encoder stack in this repo
-- `hf_deberta_v2`: native DeBERTa v2/v3-style backbone (HF-compatible config/weight path)
+| | `rope` (default) | `hf_deberta_v2` |
+|---|---|---|
+| **Attention** | Standard multi-head (QKV → RoPE → SDPA) | Disentangled (C2C + C2P + P2C relative-position bias) |
+| **Position encoding** | Rotary embeddings (geometric, no learned table) | Learned relative-position embeddings + bucket indices |
+| **Normalization** | RMSNorm | LayerNorm |
+| **FFN** | SwiGLU (default) or MLP | MLP only (GELU) |
+| **Bias** | Configurable (`use_bias`) | Hardcoded per layer |
+| **Pretraining objective** | RTD (ELECTRA-style) + GDES | RTD (ELECTRA-style) + GDES |
+
+The `rope` backbone is a **modern encoder** (comparable to ModernBERT/NeoEncoder architecture) that uses the DeBERTa-v3 RTD pretraining recipe and GDES embedding sharing — it does **not** implement disentangled attention. Position information is encoded geometrically via rotary embeddings in Q/K vectors.
+
+The `hf_deberta_v2` backbone faithfully implements the DeBERTa-v2/v3 architecture including disentangled attention with content-to-position (C2P) and position-to-content (P2C) bias decomposition via separate `pos_key_proj`/`pos_query_proj` projections. This is the path to use when disentangled attention is the research variable.
 
 ## Source Resolution Contract
 
@@ -126,7 +136,7 @@ generator embedding modules present at pretrainer construction time. If you repl
 generator/discriminator embedding modules later (for example during manual model surgery),
 recreate `DebertaV3RTDPretrainer` so sharing adapters are rebound consistently.
 
-## HF Compatibility Mode Notes
+## HF DeBERTa-v2 Backbone
 
 With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 implementation in
 [`src/deberta/modeling/deberta_v2_native.py`](../src/deberta/modeling/deberta_v2_native.py).
@@ -134,15 +144,29 @@ Training does not instantiate `transformers.DebertaV2Model` directly.
 
 HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`) for compatibility.
 
-RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
+### Architectural properties
 
-Packed 3D document-blocking masks are rope-only. The [pairwise mask contract](data.md#pairwise-mask-contract-block_cross_document_attentiontrue) is defined in data.md; HF backbone runs must keep `data.block_cross_document_attention=false`.
+- **Disentangled attention**: decomposes attention scores into content-to-content (C2C), content-to-position (C2P), and position-to-content (P2C) terms via separate `pos_key_proj`/`pos_query_proj` projections
+- **Relative position**: learned embedding table with bucket indices, computed on-device per forward (no upfront O(max_len²) allocation)
+- **Padding masks**: 2D `(B,S)` padding masks stay as `(B,1,1,S)` broadcast — no S² outer product expansion
+- **No-mask fast path**: when `attention_mask=None` (unpadded batches), no mask is materialized
 
-Native HF attention kernel is configured via `model.hf_attention_kernel`:
+### Current limitations vs RoPE path
 
-- `dynamic` (default)
-- `cached_bmm` (cached relative-position ids + bmm bias path)
-- `stable` (compile-focused cached-bmm path with fp32 score/probability accumulation and static rel-pos table slicing)
+- LayerNorm only (no RMSNorm option) — tracked in [roadmap](roadmap.md)
+- MLP FFN only (no SwiGLU option) — tracked in [roadmap](roadmap.md)
+- Bias not configurable — tracked in [roadmap](roadmap.md)
+- `data.block_cross_document_attention` must be `false` (packed 3D doc-blocking masks are rope-only; see [data.md](data.md))
+
+### Attention kernel selection
+
+RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in this mode.
+
+`model.hf_attention_kernel` selects the disentangled attention implementation:
+
+- `dynamic` (default): builds relative-position ids on-device each forward
+- `cached_bmm`: same as dynamic (rel-pos table was removed; this alias is kept for config compatibility)
+- `stable`: compile-focused path with fp32 score/probability accumulation
 
 Compile scope and stability policy for this mode is in [runtime: torch.compile](fsdp2.md#torchcompile).
 
