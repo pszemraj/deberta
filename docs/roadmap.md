@@ -22,6 +22,16 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 - for rope backbone compile hardening, evaluate static/sliced RoPE cache buffers to remove compile-time cache-build branching
 - ~~auto compile scope + doc-blocking mask shape churn~~ — **resolved**: `_resolve_compile_scope` auto-downgrades to FFN when `block_cross_document_attention=True` to avoid alternating None/3D mask shapes under compile
 
+## HF DeBERTa-v2 Modernization
+
+Parity gaps vs the RoPE path that matter for fair head-to-head comparison:
+
+- optional RMSNorm support (currently LayerNorm only) — ~10-15% faster, different convergence profile
+- optional SwiGLU FFN support (currently MLP-only; SwiGLU is ~2/3 the parameters for equivalent capacity)
+- configurable `use_bias` (currently hardcoded per layer; RoPE path defaults to bias-free)
+
+These do not affect disentangled attention or RTD correctness; they are efficiency/parity items.
+
 ## Model Perf
 
 - investigate active-token-only projection paths for heavily padded 2D batches (skip attention/FFN projection FLOPs on known-dead pad positions rather than zeroing outputs post projection)
