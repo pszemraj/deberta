@@ -32,16 +32,29 @@ Use `--help` on each command for full argument docs.
 
 ## Quickstart
 
-Train from YAML (recommended):
+Single-GPU training:
+
+```bash
+deberta train configs/pretrain_rope_fineweb_edu.yaml \
+  --output-dir runs/deberta_rope_single_gpu
+```
+
+Single-GPU export:
+
+```bash
+deberta export runs/deberta_rope_single_gpu/checkpoint-10000 \
+  --what discriminator \
+  --output-dir runs/deberta_rope_single_gpu/exported_hf
+```
+
+FSDP2 parallel training:
 
 ```bash
 accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
   deberta train configs/pretrain_rope_fineweb_edu.yaml
 ```
 
-Long-context and custom debug presets live under [`configs/`](configs/).
-
-Export from an FSDP2 checkpoint:
+FSDP2 parallel export:
 
 ```bash
 accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta export \
@@ -49,6 +62,10 @@ accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python 
   --what discriminator \
   --output-dir runs/deberta_rope_rtd/exported_hf
 ```
+
+Long-context and custom debug presets live under [`configs/`](configs/).
+
+For distributed/FSDP2 runtime behavior and export details, see [`docs/fsdp2.md`](docs/fsdp2.md).
 
 For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.DebertaRoPEModel.from_pretrained(...)`.
 `transformers.AutoModel.from_pretrained(...)` does not currently support `model_type=deberta-rope` out of the box.
