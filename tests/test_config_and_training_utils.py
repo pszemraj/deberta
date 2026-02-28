@@ -1239,6 +1239,7 @@ def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Pa
     _write_export_readme(
         out_dir,
         model_cfg=ModelConfig(backbone_type="rope"),
+        data_cfg=DataConfig(max_seq_length=777),
         train_cfg=TrainConfig(max_steps=100),
         embedding_sharing="gdes",
     )
@@ -1247,6 +1248,7 @@ def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Pa
     assert "DebertaRoPEModel.from_pretrained" in text
     assert 'model = AutoModel.from_pretrained("path/to/this/dir")' not in text
     assert "model_type" in text
+    assert "| Max sequence length | 777 |" in text
 
 
 def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
@@ -1256,6 +1258,7 @@ def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
     _write_export_readme(
         out_dir,
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        data_cfg=DataConfig(max_seq_length=333),
         train_cfg=TrainConfig(max_steps=100),
         embedding_sharing="gdes",
     )
@@ -1263,6 +1266,7 @@ def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
     text = (out_dir / "README.md").read_text(encoding="utf-8")
     assert "AutoModel.from_pretrained" in text
     assert "DebertaRoPEModel.from_pretrained" not in text
+    assert "| Max sequence length | 333 |" in text
 
 
 def test_build_optimizer_supports_generator_specific_lr():

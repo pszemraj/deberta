@@ -1894,6 +1894,7 @@ def _write_export_readme(
     output_dir: Path,
     *,
     model_cfg: Any,
+    data_cfg: Any | None = None,
     train_cfg: Any,
     embedding_sharing: str,
 ) -> None:
@@ -1901,6 +1902,7 @@ def _write_export_readme(
 
     :param Path output_dir: Export destination directory.
     :param Any model_cfg: Model configuration dataclass.
+    :param Any | None data_cfg: Optional data configuration dataclass.
     :param Any train_cfg: Training configuration dataclass.
     :param str embedding_sharing: Embedding sharing mode.
     """
@@ -1908,7 +1910,7 @@ def _write_export_readme(
     hidden = int(getattr(model_cfg, "hidden_size", 0))
     layers = int(getattr(model_cfg, "num_hidden_layers", 0) or 0)
     heads = int(getattr(model_cfg, "num_attention_heads", 0) or 0)
-    seq_len = int(getattr(train_cfg, "max_seq_length", 0) or 0)
+    seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
     if seq_len == 0:
         seq_len = int(getattr(model_cfg, "max_position_embeddings", 0) or 0)
     steps = int(getattr(train_cfg, "max_steps", 0) or 0)
@@ -2002,6 +2004,7 @@ def _export_discriminator_hf(
     output_dir: Path,
     embedding_sharing: str,
     model_cfg: Any = None,
+    data_cfg: Any = None,
     train_cfg: Any = None,
 ) -> None:
     """Best-effort export of a standalone discriminator model.
@@ -2020,6 +2023,7 @@ def _export_discriminator_hf(
     :param Path output_dir: Export destination directory.
     :param str embedding_sharing: Sharing mode used during training.
     :param Any model_cfg: Optional model config for README generation.
+    :param Any data_cfg: Optional data config for README generation.
     :param Any train_cfg: Optional training config for README generation.
     """
 
@@ -2090,6 +2094,7 @@ def _export_discriminator_hf(
             _write_export_readme(
                 output_dir,
                 model_cfg=model_cfg,
+                data_cfg=data_cfg,
                 train_cfg=train_cfg,
                 embedding_sharing=embedding_sharing,
             )
@@ -2963,6 +2968,7 @@ def run_pretraining(
                 output_dir=output_dir / "final_hf",
                 embedding_sharing=model_cfg.embedding_sharing,
                 model_cfg=model_cfg,
+                data_cfg=data_cfg,
                 train_cfg=train_cfg,
             )
 
