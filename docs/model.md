@@ -178,9 +178,9 @@ RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.
 
 `model.hf_attention_kernel` selects the disentangled attention implementation:
 
-- `dynamic` (default): builds relative-position ids on-device each forward
-- `cached_bmm`: same as dynamic (rel-pos table was removed; this alias is kept for config compatibility)
-- `stable`: compile-focused path with fp32 score/probability accumulation
+- `dynamic` (default): computes disentangled bias with the dynamic einsum+gather path
+- `cached_bmm`: computes disentangled bias with a batched-matmul+gather path
+- `stable`: semantic alias for the `cached_bmm` kernel, used by compile-stability presets
 
 Compile scope and stability policy for this mode is in [runtime: torch.compile](fsdp2.md#torchcompile).
 

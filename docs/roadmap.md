@@ -37,3 +37,7 @@ These do not affect disentangled attention or RTD correctness; they are efficien
 - investigate active-token-only projection paths for heavily padded 2D batches (skip attention/FFN projection FLOPs on known-dead pad positions rather than zeroing outputs post projection)
 - ~~for HF DeBERTa-v2 backbone: evaluate lazy or on-demand relative-position table construction to avoid O(max_len²) init-time allocation~~ — **resolved**: removed upfront `_rel_pos_table` buffer; all kernels now call `build_relative_position()` on-device per forward (cheap, compile-safe)
 - ~~HF DeBERTa-v2 2D→(B,1,S,S) padding mask expansion~~ — **resolved**: `get_attention_mask` now returns `(B,1,1,S)` broadcast mask for 2D padding inputs, avoiding O(S²) outer product
+
+## Export Interop
+
+- add a RoPE export codegen path that packages generated modeling/config files plus `auto_map` metadata so `transformers.AutoModel.from_pretrained(...)` works without manual custom-class imports

@@ -24,8 +24,9 @@ This is autocast-based mixed precision, not full-parameter bf16 casting.
 
 Runtime behavior:
 
-- if CUDA bf16 is unavailable or a tiny bf16 preflight matmul fails, training falls back to full precision (`no`)
+- if CUDA bf16 is unavailable or a tiny bf16 preflight matmul fails, training fails fast with an explicit runtime error
 - `train.mixed_precision` accepts `bf16` or `no`
+- to run in full precision, set `train.mixed_precision=no` explicitly
 
 ## Run Directory and Tracker Naming
 
@@ -61,10 +62,28 @@ train:
 
 `train.tf32=true` by default.
 
-The training loop uses `torch.set_float32_matmul_precision` when available and
-falls back to `allow_tf32` flags on older builds.
+The training loop prefers backend fp32-precision controls (`torch.backends.*.fp32_precision`) when available,
+falling back to legacy `allow_tf32` flags on older builds.
 
 For `torch.compile` max-autotune modes, TF32 flags may be forced for compatibility.
+
+## Resume Data Alignment
+
+When resuming from checkpoints, data-iterator alignment is controlled by:
+
+- `train.resume_data_strategy=auto|replay|restart_epoch`
+- `train.resume_replay_max_micro_batches` (used by `auto`)
+
+Behavior:
+
+- `replay`: replays consumed microbatches exactly (deterministic, resume latency scales with replay length)
+- `restart_epoch`: skips replay and starts iterator at `start_epoch=global_step` (O(1) resume, data order may differ)
+- `auto`: replays only when `consumed_micro_batches <= resume_replay_max_micro_batches`; otherwise switches to `restart_epoch`
+
+Checkpoint metadata in `data_state.json` stores:
+
+- `consumed_micro_batches`
+- `lr_mult` (persistent non-finite recovery multiplier)
 
 ## `torch.compile`
 
@@ -97,7 +116,7 @@ Compile behavior is configured directly via train/model config:
 - `train.torch_compile_scope=auto|backbones|encoder|gen_encoder|disc_encoder|ffn|gen_ffn|disc_ffn`
 - `train.torch_compile_backend=inductor|aot_eager`
 
-Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [HF compatibility mode](model.md#hf-compatibility-mode-notes).
+Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [HF DeBERTa-v2 backbone](model.md#hf-deberta-v2-backbone).
 For native HF runs, prefer `model.hf_attention_kernel=stable`.
 
 Compile is applied to module `forward` callables (module identity is preserved),
@@ -192,10 +211,7 @@ The exporter consolidates to full state on rank 0 and writes standalone HF artif
 Legacy compiled checkpoints that include `._orig_mod` key segments are remapped
 automatically during export, so older wrapper artifacts do not block consolidation.
 
-RoPE exports are standalone artifacts but currently require loading with
-`deberta.modeling.rope_encoder.DebertaRoPEModel.from_pretrained(...)`.
-`transformers.AutoModel.from_pretrained(...)` does not yet support `model_type=deberta-rope`
-without custom auto-class registration and packaged modeling code.
+RoPE export loading behavior is documented in [model export interoperability](model.md#export-interoperability-rope).
 
 ### In-Training HF Export
 
