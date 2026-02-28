@@ -469,6 +469,8 @@ def _resolve_resume_checkpoint(
     :param Path output_dir: Training output directory.
     :param str | None resume_from_checkpoint: User resume setting.
     :param bool is_main_process: Whether to emit logs.
+    :raises ValueError: If ``resume_from_checkpoint='auto'`` is requested for a non-empty output
+        directory that does not contain any ``checkpoint-*`` folders.
     :return str | None: Concrete checkpoint path, or ``None``.
     """
     if not resume_from_checkpoint:
@@ -479,6 +481,13 @@ def _resolve_resume_checkpoint(
 
     latest = _find_latest_checkpoint(output_dir)
     if latest is None:
+        has_existing_contents = output_dir.exists() and any(output_dir.iterdir())
+        if has_existing_contents:
+            raise ValueError(
+                "resume_from_checkpoint=auto was requested but no checkpoint-* directories were found in "
+                f"non-empty output_dir={output_dir}. Clean the directory, enable "
+                "train.overwrite_output_dir=true, or provide an explicit checkpoint path."
+            )
         if is_main_process:
             logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
         return None

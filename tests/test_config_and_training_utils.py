@@ -333,6 +333,19 @@ def test_resolve_resume_checkpoint_auto_returns_none_when_no_checkpoint(tmp_path
     assert resolved is None
 
 
+def test_resolve_resume_checkpoint_auto_rejects_non_empty_output_dir_without_checkpoints(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "stale.txt").write_text("leftover", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="resume_from_checkpoint=auto was requested"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint="auto",
+            is_main_process=True,
+        )
+
+
 def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
