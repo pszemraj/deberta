@@ -1928,7 +1928,7 @@ def _export_discriminator_hf(
         )
 
         tokenizer.save_pretrained(str(output_dir))
-        export_disc.save_pretrained(str(output_dir / "discriminator"), safe_serialization=True)
+        export_disc.save_pretrained(str(output_dir), safe_serialization=True)
         dump_json({"embedding_sharing": embedding_sharing}, output_dir / "export_meta.json")
         logger.info(f"Exported discriminator to: {output_dir}")
 
