@@ -481,7 +481,13 @@ class DisentangledSelfAttention(nn.Module):
                     f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
                 )
             attention_scores = attention_scores.masked_fill(~keep_mask, -1e4)
-            live_queries = keep_mask.any(dim=-1, keepdim=True)
+            # For broadcast padding masks (B,1,1,S), query activity equals key activity —
+            # transpose the key dim to get per-query (B,1,S,1).  For pairwise masks
+            # (B,1,S,S), reduce across keys as before.
+            if keep_mask.shape[-2] == 1:
+                live_queries = keep_mask.transpose(-2, -1)  # (B,1,S,1)
+            else:
+                live_queries = keep_mask.any(dim=-1, keepdim=True)  # (B,1,S,1)
             attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
         probs = torch.softmax(attention_scores, dim=-1)
