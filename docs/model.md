@@ -102,6 +102,20 @@ Key options in `ModelConfig`:
 - optional activation checkpointing:
   - `gradient_checkpointing`
 
+### Export Interoperability (RoPE)
+
+RoPE exports are saved with `model_type="deberta-rope"` and currently require this repo's model class:
+
+```python
+from transformers import AutoTokenizer
+from deberta.modeling.rope_encoder import DebertaRoPEModel
+
+model = DebertaRoPEModel.from_pretrained("<export_dir>")
+tokenizer = AutoTokenizer.from_pretrained("<export_dir>")
+```
+
+`transformers.AutoModel.from_pretrained("<export_dir>")` is not currently supported for RoPE exports without custom auto-class registration and packaged modeling code.
+
 ## Norm Architecture Rationale (`norm_arch`)
 
 Normalization-policy rationale, equations, and selection guidance are in [norm-strategy.md](norm-strategy.md).

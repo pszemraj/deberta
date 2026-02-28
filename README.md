@@ -50,6 +50,9 @@ accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python 
   --output-dir runs/deberta_rope_rtd/exported_hf
 ```
 
+For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.DebertaRoPEModel.from_pretrained(...)`.
+`transformers.AutoModel.from_pretrained(...)` does not currently support `model_type=deberta-rope` out of the box.
+
 ## Documentation
 
 - Model/backbone config and architecture behavior (including load/source resolution contract): [`docs/model.md`](docs/model.md)

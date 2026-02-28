@@ -1906,8 +1906,24 @@ def _write_export_readme(
 
     if backbone == "rope":
         arch_desc = "RoPE encoder (RMSNorm, SwiGLU, rotary embeddings)"
+        usage_snippet = """from transformers import AutoTokenizer
+from deberta.modeling.rope_encoder import DebertaRoPEModel
+
+model = DebertaRoPEModel.from_pretrained("path/to/this/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+"""
+        compatibility_note = (
+            "Note: RoPE exports use a custom `model_type` (`deberta-rope`) and are not currently "
+            "loadable via `transformers.AutoModel.from_pretrained(...)` without custom auto-class registration."
+        )
     else:
         arch_desc = "DeBERTa-v2 (disentangled attention, LayerNorm)"
+        usage_snippet = """from transformers import AutoModel, AutoTokenizer
+
+model = AutoModel.from_pretrained("path/to/this/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+"""
+        compatibility_note = ""
 
     readme = f"""---
 library_name: transformers
@@ -1941,11 +1957,9 @@ Pretrained with replaced-token detection (RTD / ELECTRA-style) using
 ## Usage
 
 ```python
-from transformers import AutoModel, AutoTokenizer
-
-model = AutoModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+{usage_snippet}
 ```
+{compatibility_note}
 """
     (output_dir / "README.md").write_text(readme, encoding="utf-8")
 

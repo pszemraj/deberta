@@ -192,6 +192,11 @@ The exporter consolidates to full state on rank 0 and writes standalone HF artif
 Legacy compiled checkpoints that include `._orig_mod` key segments are remapped
 automatically during export, so older wrapper artifacts do not block consolidation.
 
+RoPE exports are standalone artifacts but currently require loading with
+`deberta.modeling.rope_encoder.DebertaRoPEModel.from_pretrained(...)`.
+`transformers.AutoModel.from_pretrained(...)` does not yet support `model_type=deberta-rope`
+without custom auto-class registration and packaged modeling code.
+
 ### In-Training HF Export
 
 `train.export_hf_final=true` (default) attempts a best-effort HF discriminator export into `<output_dir>/final_hf` at the end of training. For FSDP2 + sharded checkpoints, this is a convenience path; prefer running `deberta export` post-training for reliable artifact consolidation.

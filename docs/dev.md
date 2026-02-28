@@ -66,3 +66,7 @@ Future: replace dense `(B,S,S)` with `flex_attention` block-sparse path (see [ro
 ## Metrics Logging
 
 - `_append_metrics_jsonl_row()` opens/closes gzip per write. This is intentional for crash safety — no dangling file handles on interrupt. Overhead is acceptable vs. losing metrics.
+
+## TODOs
+
+- TODO: add an export-time codegen path for RoPE checkpoints that starts from official HF DeBERTa modeling/configuration sources, applies this repo's RoPE/RMSNorm/SwiGLU diffs, and writes generated modeling files into the export directory with `auto_map` metadata so `AutoModel.from_pretrained(...)` can work without manual custom-code setup.

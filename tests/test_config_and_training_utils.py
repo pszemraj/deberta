@@ -81,6 +81,7 @@ from deberta.training.pretrain import (
     _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
     _upload_wandb_original_config,
+    _write_export_readme,
 )
 
 
@@ -1216,6 +1217,39 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
     )
 
     assert called_targets == [inner.discriminator, inner.generator]
+
+
+def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Path):
+    out_dir = tmp_path / "rope-export"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_export_readme(
+        out_dir,
+        model_cfg=ModelConfig(backbone_type="rope"),
+        train_cfg=TrainConfig(max_steps=100),
+        embedding_sharing="gdes",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "DebertaRoPEModel.from_pretrained" in text
+    assert 'model = AutoModel.from_pretrained("path/to/this/dir")' not in text
+    assert "model_type" in text
+
+
+def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
+    out_dir = tmp_path / "hf-export"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_export_readme(
+        out_dir,
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        train_cfg=TrainConfig(max_steps=100),
+        embedding_sharing="gdes",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "AutoModel.from_pretrained" in text
+    assert "DebertaRoPEModel.from_pretrained" not in text
 
 
 def test_build_optimizer_supports_generator_specific_lr():
