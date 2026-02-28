@@ -57,6 +57,8 @@ _NONFINITE_LR_BACKOFF = 0.5
 _NONFINITE_LR_MULT_FLOOR = 0.01  # persistent multiplier floor (1% of scheduled)
 _NONFINITE_LR_MULT_RECOVERY = 1.1  # gradual recovery factor per successful step
 _NONFINITE_OPT_STATE_RESET_EVERY = 4
+_DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
+_DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -1383,13 +1385,18 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
     )
 
 
-def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
+def _cycle_dataloader(
+    dl: DataLoader,
+    *,
+    start_epoch: int = 0,
+) -> Iterator[dict[str, torch.Tensor]]:
     """Yield batches forever by cycling through a dataloader.
 
     :param DataLoader dl: Source dataloader.
+    :param int start_epoch: Initial dataset epoch passed into ``set_epoch`` when available.
     :return Iterator[dict[str, torch.Tensor]]: Infinite batch iterator.
     """
-    epoch = 0
+    epoch = int(start_epoch)
     dataset = getattr(dl, "dataset", None)
     while True:
         set_epoch = getattr(dataset, "set_epoch", None)
@@ -1400,6 +1407,47 @@ def _cycle_dataloader(dl: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
                 pass
         yield from dl
         epoch += 1
+
+
+def _resolve_data_resume_policy(
+    *,
+    train_cfg: Any,
+    consumed_micro_batches: int,
+    global_step: int,
+) -> tuple[int, bool, str]:
+    """Resolve data-iterator resume strategy.
+
+    Returns ``(start_epoch, do_replay, reason)``:
+
+    - ``start_epoch``: Dataset epoch offset used when starting the cyclical dataloader.
+    - ``do_replay``: Whether to replay consumed microbatches.
+    - ``reason``: Human-readable policy decision.
+
+    :param Any train_cfg: Train config object.
+    :param int consumed_micro_batches: Number of consumed microbatches loaded from checkpoint.
+    :param int global_step: Resumed global optimizer step.
+    :return tuple[int, bool, str]: Resolved policy triple.
+    """
+    consumed = max(0, int(consumed_micro_batches))
+    if consumed <= 0:
+        return 0, False, "fresh-start"
+
+    strategy = str(getattr(train_cfg, "resume_data_strategy", "auto") or "auto").strip().lower()
+    max_replay = max(0, int(getattr(train_cfg, "resume_replay_max_micro_batches", 10_000) or 10_000))
+
+    if strategy == "replay":
+        return 0, True, "resume_data_strategy=replay"
+
+    if strategy == "restart_epoch":
+        return int(max(0, global_step)), False, "resume_data_strategy=restart_epoch"
+
+    if consumed <= max_replay:
+        return 0, True, f"resume_data_strategy=auto (replay <= {max_replay})"
+    return (
+        int(max(0, global_step)),
+        False,
+        f"resume_data_strategy=auto (restart_epoch; replay > {max_replay})",
+    )
 
 
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -1413,22 +1461,45 @@ def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) 
 
 
 def _build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-    """Build a pairwise ``(B, S, S)`` attention keep-mask from document ids on-device.
+    """Build a pairwise ``(B, S, S)`` keep-mask from document ids on-device.
 
-    Contract: the diagonal is unconditionally True for **all** positions (including
-    pad/dead rows).  This eliminates all-False query rows that cause NaN in SDPA
-    backends, so attention layers do not need per-layer dead-row patching.
+    Contract:
+
+    - Active tokens (``doc_id != 0``) attend only within the same document.
+    - The diagonal encodes query activity (active ``True``, pad/inactive ``False``).
+    - Inactive/pad queries get a single keep-edge to the CLS key (position 0) so SDPA
+      never sees all-False rows.
 
     :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with 0 for padding.
     :return torch.Tensor: Bool keep-mask ``(B, S, S)``.
     """
-    active = doc_ids.ne(0)
-    same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
+    if doc_ids.ndim != 2:
+        raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
+
+    bsz, seq_len = int(doc_ids.shape[0]), int(doc_ids.shape[1])
+    device = doc_ids.device
+
+    key = (seq_len, str(device.type), int(device.index) if device.index is not None else None)
+    eye = _DOC_BLOCK_EYE_CACHE.get(key)
+    if eye is None or eye.device != device or eye.shape != (seq_len, seq_len):
+        eye = torch.eye(seq_len, dtype=torch.bool, device=device)
+        _DOC_BLOCK_EYE_CACHE[key] = eye
+
+    cls_key = _DOC_BLOCK_CLS_KEY_CACHE.get(key)
+    if cls_key is None or cls_key.device != device or cls_key.shape != (seq_len,):
+        cls_key = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        cls_key[0] = True
+        _DOC_BLOCK_CLS_KEY_CACHE[key] = cls_key
+
+    active = doc_ids.ne(0)  # (B,S)
+    same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])  # (B,S,S)
     keep = same_doc & active[:, :, None] & active[:, None, :]
-    # Unconditional diagonal: every position self-attends. Dead/pad row outputs are
-    # zeroed by query_keep_tokens in the attention layer.
-    eye = torch.eye(doc_ids.shape[1], dtype=torch.bool, device=doc_ids.device).unsqueeze(0)
-    return keep | eye
+    keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
+    keep = (keep & ~eye[None, :, :]) | (eye[None, :, :] & active[:, :, None])
+
+    if int(keep.shape[0]) != bsz:
+        raise RuntimeError("doc-block mask batch dimension mismatch.")
+    return keep
 
 
 def _stabilize_compile_attention_mask(
@@ -2480,7 +2551,12 @@ def run_pretraining(
                 leave=True,
             )
 
-        train_iter = _cycle_dataloader(train_loader)
+        start_epoch, do_replay, resume_policy_reason = _resolve_data_resume_policy(
+            train_cfg=train_cfg,
+            consumed_micro_batches=consumed_micro_batches,
+            global_step=global_step,
+        )
+        train_iter = _cycle_dataloader(train_loader, start_epoch=start_epoch)
         ga_steps = int(train_cfg.gradient_accumulation_steps)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
         unwrapped_model = unwrap_compiled_model(accelerator, model)
@@ -2499,9 +2575,6 @@ def run_pretraining(
         if disc_pad_token_id is not None:
             disc_pad_token_id = int(disc_pad_token_id)
 
-        # TODO(data-resume): persist dataset iterator state (packing buffer + RNG) for O(1) resume
-        # instead of replaying O(consumed_micro_batches) samples.  Requires serializable snapshot
-        # support in PackedStreamingDataset / SequentialStreamingDataset.
         if consumed_micro_batches > 0:
             if int(global_step) >= int(train_cfg.max_steps):
                 logger.info(
@@ -2509,10 +2582,11 @@ def run_pretraining(
                     int(global_step),
                     int(train_cfg.max_steps),
                 )
-            else:
+            elif bool(do_replay):
                 logger.info(
-                    "Replaying data iterator by %d micro-batches to align resume data position.",
-                    consumed_micro_batches,
+                    "Replaying data iterator by %d micro-batches to align resume data position (%s).",
+                    int(consumed_micro_batches),
+                    resume_policy_reason,
                 )
                 replay_iter = range(consumed_micro_batches)
                 if accelerator.is_main_process:
@@ -2527,6 +2601,12 @@ def run_pretraining(
                     )
                 for _ in replay_iter:
                     _ = next(train_iter)
+            else:
+                logger.warning(
+                    "Skipping data replay on resume (%s). "
+                    "Resume becomes O(1) but data order may differ from the pre-crash run.",
+                    resume_policy_reason,
+                )
 
         local_input_tokens_seen = 0.0
         local_input_tokens_since_log = 0.0

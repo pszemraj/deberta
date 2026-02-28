@@ -31,6 +31,7 @@ _LR_SCHEDULER_CHOICES = {
     "constant",
     "constant_with_warmup",
 }
+_RESUME_DATA_STRATEGY_CHOICES = {"auto", "replay", "restart_epoch"}
 _SDPA_KERNEL_CHOICES = {"auto", "flash", "mem_efficient", "math"}
 _SDPA_KERNEL_ALIASES = {
     "mem": "mem_efficient",
@@ -775,6 +776,29 @@ class TrainConfig:
         },
     )
 
+    resume_data_strategy: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "Resume data-iterator alignment policy when resuming from checkpoint: "
+                "auto|replay|restart_epoch. "
+                "'replay' replays consumed microbatches exactly (deterministic but slow), "
+                "'restart_epoch' skips replay and shifts dataset epoch for O(1) resume, "
+                "'auto' replays only when replay cost is below train.resume_replay_max_micro_batches."
+            )
+        },
+    )
+
+    resume_replay_max_micro_batches: int = field(
+        default=10_000,
+        metadata={
+            "help": (
+                "Replay threshold used by train.resume_data_strategy=auto. "
+                "If consumed_micro_batches exceeds this value, resume switches to restart_epoch."
+            )
+        },
+    )
+
     export_hf_final: bool = field(
         default=True,
         metadata={
@@ -1221,6 +1245,11 @@ def validate_train_config(cfg: TrainConfig) -> None:
     cfg.torch_compile_scope = _normalize_torch_compile_scope(cfg.torch_compile_scope)
     cfg.torch_compile_backend = _normalize_torch_compile_backend(cfg.torch_compile_backend)
     cfg.wandb_watch = _normalize_wandb_watch(cfg.wandb_watch)
+    cfg.resume_data_strategy = _ensure_choice(
+        "train.resume_data_strategy",
+        cfg.resume_data_strategy,
+        _RESUME_DATA_STRATEGY_CHOICES,
+    )
 
     cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
     if cfg.output_dir is not None and not str(cfg.output_dir).strip():
@@ -1244,6 +1273,8 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("train.save_total_limit must be >= 0.")
     if int(cfg.wandb_watch_log_freq) <= 0:
         raise ValueError("train.wandb_watch_log_freq must be >= 1.")
+    if int(cfg.resume_replay_max_micro_batches) < 0:
+        raise ValueError("train.resume_replay_max_micro_batches must be >= 0.")
 
     mlm = float(cfg.mlm_probability)
     if mlm <= 0.0 or mlm >= 1.0:

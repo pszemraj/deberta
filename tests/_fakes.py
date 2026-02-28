@@ -296,7 +296,8 @@ def setup_pretraining_mocks(
 
     if cycle_fn is None:
 
-        def cycle_fn(_loader: Any) -> Any:
+        def cycle_fn(_loader: Any, *, start_epoch: int = 0) -> Any:
+            del start_epoch
             while True:
                 yield batch
 

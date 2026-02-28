@@ -66,6 +66,7 @@ from deberta.training.pretrain import (
     _prepare_output_dir,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
+    _resolve_data_resume_policy,
     _resolve_effective_mixed_precision_or_raise,
     _resolve_output_dir,
     _resolve_output_dir_for_accelerator,
@@ -655,7 +656,8 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     )
 
     # Override cycle to interrupt after first batch.
-    def _interrupt_cycle(_loader):
+    def _interrupt_cycle(_loader, *, start_epoch: int = 0):
+        del start_epoch
         yield _PRETRAINING_BATCH
         raise KeyboardInterrupt
 
@@ -731,7 +733,8 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 
     replay_calls = {"next": 0}
 
-    def _fail_cycle(_loader):
+    def _fail_cycle(_loader, *, start_epoch: int = 0):
+        del start_epoch
         while True:
             replay_calls["next"] += 1
             raise AssertionError("resume replay should be skipped when global_step >= max_steps")
@@ -1171,6 +1174,74 @@ def test_cycle_dataloader_advances_dataset_epoch_each_pass():
     assert ds.seen_epochs[:3] == [0, 1, 2]
 
 
+def test_cycle_dataloader_honors_start_epoch_offset():
+    class _EpochDataset(torch.utils.data.IterableDataset):
+        def __init__(self) -> None:
+            super().__init__()
+            self.current_epoch = -1
+            self.seen_epochs: list[int] = []
+
+        def set_epoch(self, epoch: int) -> None:
+            self.current_epoch = int(epoch)
+            self.seen_epochs.append(int(epoch))
+
+        def __iter__(self):
+            yield {"epoch": torch.tensor(self.current_epoch, dtype=torch.long)}
+
+    ds = _EpochDataset()
+    dl = torch.utils.data.DataLoader(ds, batch_size=None, num_workers=0)
+    it = _cycle_dataloader(dl, start_epoch=7)
+
+    e0 = int(next(it)["epoch"].item())
+    e1 = int(next(it)["epoch"].item())
+    assert (e0, e1) == (7, 8)
+    assert ds.seen_epochs[:2] == [7, 8]
+
+
+def test_resolve_data_resume_policy_auto_replays_when_small():
+    cfg = TrainConfig(resume_data_strategy="auto", resume_replay_max_micro_batches=100)
+    start_epoch, do_replay, reason = _resolve_data_resume_policy(
+        train_cfg=cfg,
+        consumed_micro_batches=42,
+        global_step=9,
+    )
+    assert start_epoch == 0
+    assert do_replay is True
+    assert "replay" in reason
+
+
+def test_resolve_data_resume_policy_auto_restarts_epoch_when_large():
+    cfg = TrainConfig(resume_data_strategy="auto", resume_replay_max_micro_batches=10)
+    start_epoch, do_replay, reason = _resolve_data_resume_policy(
+        train_cfg=cfg,
+        consumed_micro_batches=42,
+        global_step=9,
+    )
+    assert start_epoch == 9
+    assert do_replay is False
+    assert "restart_epoch" in reason
+
+
+def test_resolve_data_resume_policy_respects_explicit_strategy():
+    replay_cfg = TrainConfig(resume_data_strategy="replay", resume_replay_max_micro_batches=0)
+    start_epoch_replay, do_replay_replay, _ = _resolve_data_resume_policy(
+        train_cfg=replay_cfg,
+        consumed_micro_batches=999,
+        global_step=3,
+    )
+    assert start_epoch_replay == 0
+    assert do_replay_replay is True
+
+    restart_cfg = TrainConfig(resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=1_000_000)
+    start_epoch_restart, do_replay_restart, _ = _resolve_data_resume_policy(
+        train_cfg=restart_cfg,
+        consumed_micro_batches=12,
+        global_step=17,
+    )
+    assert start_epoch_restart == 17
+    assert do_replay_restart is False
+
+
 def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
@@ -1399,6 +1470,25 @@ def test_validate_train_config_rejects_invalid_wandb_watch_mode():
 def test_validate_train_config_rejects_non_positive_wandb_watch_log_freq():
     cfg = TrainConfig(wandb_watch_log_freq=0)
     with pytest.raises(ValueError, match="train.wandb_watch_log_freq must be >= 1"):
+        validate_train_config(cfg)
+
+
+def test_validate_train_config_accepts_resume_data_strategy_values():
+    cfg = TrainConfig(resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=123)
+    validate_train_config(cfg)
+    assert cfg.resume_data_strategy == "restart_epoch"
+    assert cfg.resume_replay_max_micro_batches == 123
+
+
+def test_validate_train_config_rejects_invalid_resume_data_strategy():
+    cfg = TrainConfig(resume_data_strategy="fast")
+    with pytest.raises(ValueError, match="train.resume_data_strategy must be one of"):
+        validate_train_config(cfg)
+
+
+def test_validate_train_config_rejects_negative_resume_replay_threshold():
+    cfg = TrainConfig(resume_replay_max_micro_batches=-1)
+    with pytest.raises(ValueError, match="train.resume_replay_max_micro_batches must be >= 0"):
         validate_train_config(cfg)
 
 

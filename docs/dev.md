@@ -18,7 +18,8 @@ Standard multi-head attention (no disentangled position bias). Position encoded 
 - **No mask (None)**: unpadded/packed batch, no doc-blocking. SDPA receives no mask — fastest path.
 - **2D mask (B,S)**: key-padding mask. SDPA receives `(B,1,1,S)` broadcast via unsqueeze.
 - **3D mask (B,S,S)**: doc-blocking pairwise keep-mask. Built on-device from `doc_ids` by `_build_doc_block_mask()`.
-  - **Diagonal contract**: unconditionally True for all positions (including pad/dead rows). This prevents NaN in SDPA backends and eliminates per-layer dead-row patching. Dead-row outputs are zeroed by `query_keep_tokens` after projection.
+  - **Diagonal contract**: diagonal encodes query activity (`True` for active, `False` for pad/inactive).
+  - **SDPA safety**: inactive queries get a single keep edge to CLS key so rows are never all-False.
   - Query activity is read from the diagonal in O(B×S) via `torch.diagonal()`, not from row reduction.
 
 ### HF DeBERTa-v2 backbone
@@ -33,7 +34,7 @@ Disentangled attention: adds C2P + P2C relative-position bias to scores via sepa
 
 1. Collator `_compute_document_ids()` returns compact `doc_ids (B,S)` long tensor (1-based for active, 0 for pad). No dense mask on CPU.
 2. Training loop moves `doc_ids` to device with the rest of the batch.
-3. `_build_doc_block_mask(doc_ids)` constructs `(B,S,S)` keep-mask on-device. Unconditional diagonal guarantee.
+3. `_build_doc_block_mask(doc_ids)` constructs `(B,S,S)` keep-mask on-device with diagonal-as-activity + CLS safety edge for inactive rows.
 4. Model receives standard `attention_mask=(B,S,S)` — interface unchanged.
 
 Future: replace dense `(B,S,S)` with `flex_attention` block-sparse path (see [roadmap](roadmap.md)).

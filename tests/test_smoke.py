@@ -269,13 +269,17 @@ def test_build_doc_block_mask_matches_expected_structure():
     assert mask[0, 0, 3].item() is False
     assert mask[0, 3, 0].item() is False
 
-    # Pad token (pos 5, doc_id=0) does not attend active tokens and vice versa.
+    # Active tokens do not attend pad keys.
     assert mask[0, 0, 5].item() is False
-    assert mask[0, 5, 0].item() is False
 
-    # All positions self-attend (unconditional diagonal guarantee, including pad).
-    for i in range(6):
+    # Active tokens self-attend; pad diagonal is inactive.
+    for i in range(5):
         assert mask[0, i, i].item() is True
+    assert mask[0, 5, 5].item() is False
+
+    # SDPA safety: inactive pad query has a single keep-edge to CLS key.
+    assert mask[0, 5, 0].item() is True
+    assert int(mask[0, 5].sum().item()) == 1
 
 
 def test_collator_build_drops_document_mask_when_not_packed():

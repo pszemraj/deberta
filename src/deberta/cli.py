@@ -19,6 +19,7 @@ from deberta.config import (
     _LR_SCHEDULER_CHOICES,
     _NORM_ARCH_CHOICES,
     _REPORT_TO_CHOICES,
+    _RESUME_DATA_STRATEGY_CHOICES,
     _SDPA_KERNEL_ALIASES,
     _SDPA_KERNEL_CHOICES,
     _TORCH_COMPILE_BACKEND_ALIASES,
@@ -212,6 +213,7 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
         "torch_compile_backend": tuple(
             sorted(_TORCH_COMPILE_BACKEND_CHOICES | set(_TORCH_COMPILE_BACKEND_ALIASES.keys()))
         ),
+        "resume_data_strategy": tuple(sorted(_RESUME_DATA_STRATEGY_CHOICES)),
     }
 
     for f in fields(cls):

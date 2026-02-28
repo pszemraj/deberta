@@ -42,6 +42,7 @@ Packed chunks can contain inserted internal `[SEP]` separators. Those positions 
 - mask type/shape: boolean keep-mask `(B, S, S)` where `True=attend`, `False=block`
 - emission condition: only emitted when packed chunks contain internal separators; single-document packed chunks keep `attention_mask=None`
 - query activity encoding: diagonal `True` marks active queries, diagonal `False` marks inactive/padded queries
+- SDPA safety for inactive queries: inactive/padded query rows include a single keep edge to CLS key to avoid all-False rows in backend kernels; outputs remain zeroed via diagonal-based query activity
 - document boundary behavior: CLS stays in document 1 (no global cross-document CLS channel)
 - consumers: rope attention and RTD token-activity accounting use this contract; keep `data.block_cross_document_attention=false` when strict doc-blocking is unnecessary
 
