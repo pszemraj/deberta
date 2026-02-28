@@ -241,6 +241,79 @@ def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
     assert remap_calls[0][1] == checkpoint_dir
 
 
+def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    called: dict[str, object] = {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+    }
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    full_cfg_calls: list[dict[str, bool]] = []
+
+    class _FakeFullStateDictConfig:
+        def __init__(self, *, offload_to_cpu: bool = False, rank0_only: bool = False) -> None:
+            full_cfg_calls.append(
+                {
+                    "offload_to_cpu": bool(offload_to_cpu),
+                    "rank0_only": bool(rank0_only),
+                }
+            )
+
+    class _DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return None
+
+    class _FakeFSDP:
+        @staticmethod
+        def state_dict_type(model, state_dict_type, cfg_full):
+            del model, state_dict_type, cfg_full
+            return _DummyContext()
+
+    class _FakeFSDPModel(_FakeFSDP):
+        def state_dict(self) -> dict[str, torch.Tensor]:
+            return {
+                "discriminator.weight": torch.tensor(1.0),
+                "generator.weight": torch.tensor(2.0),
+            }
+
+    fake_fsdp_mod = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp_mod.FullStateDictConfig = _FakeFullStateDictConfig
+    fake_fsdp_mod.StateDictType = types.SimpleNamespace(FULL_STATE_DICT="FULL_STATE_DICT")
+    fake_fsdp_mod.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp_mod)
+    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _FakeFSDPModel())
+
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(tmp_path / "exported"),
+            offload_to_cpu=True,
+            rank0=False,
+        )
+    )
+
+    assert full_cfg_calls == [{"offload_to_cpu": True, "rank0_only": False}]
+    assert called["get_state_dict"] == 0
+    assert called["load_state_calls"] == [{}]
+
+
 def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

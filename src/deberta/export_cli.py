@@ -349,7 +349,10 @@ def run_export(cfg: ExportConfig) -> None:
                 is_fsdp_instance = False
 
             if is_fsdp_instance:
-                cfg_full = FullStateDictConfig(offload_to_cpu=bool(cfg.offload_to_cpu), rank0=bool(cfg.rank0))
+                cfg_full = FullStateDictConfig(
+                    offload_to_cpu=bool(cfg.offload_to_cpu),
+                    rank0_only=bool(cfg.rank0),
+                )
                 with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
                     full_sd = model.state_dict()
             else:
