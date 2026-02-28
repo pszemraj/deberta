@@ -2262,6 +2262,27 @@ def test_validate_model_config_requires_generator_model_source_for_pretrained_ge
         validate_model_config(cfg)
 
 
+def test_validate_model_config_rejects_pretrained_derived_generator_shape_overrides():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="local-rope-disc",
+        generator_hidden_size=256,
+    )
+    with pytest.raises(ValueError, match="derived generator weights"):
+        validate_model_config(cfg)
+
+
+def test_validate_model_config_allows_pretrained_derived_generator_layer_override():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="local-rope-disc",
+        generator_num_hidden_layers=4,
+    )
+    validate_model_config(cfg)
+
+
 def test_validate_model_config_rejects_scratch_rope_knobs_in_pretrained_mode():
     cfg = ModelConfig(
         backbone_type="rope",

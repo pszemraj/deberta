@@ -1108,6 +1108,23 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 + ", ".join(sorted(derived_knobs))
             )
 
+    if not bool(cfg.from_scratch) and not cfg.generator_model_name_or_path:
+        pretrained_shape_overrides = []
+        for name in (
+            "generator_hidden_size",
+            "generator_intermediate_size",
+            "generator_num_attention_heads",
+        ):
+            if getattr(cfg, name) is not None:
+                pretrained_shape_overrides.append(name)
+        if pretrained_shape_overrides:
+            raise ValueError(
+                "model.from_scratch=false with derived generator weights (generator_model_name_or_path unset) "
+                "cannot use generator shape overrides because generator weights are loaded from the "
+                "discriminator source. Set model.generator_model_name_or_path to an explicit generator "
+                "checkpoint or unset: " + ", ".join(sorted(pretrained_shape_overrides))
+            )
+
     if cfg.backbone_type == "rope":
         if int(cfg.hidden_size) <= 0:
             raise ValueError("model.hidden_size must be > 0.")
