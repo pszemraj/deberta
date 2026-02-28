@@ -598,12 +598,16 @@ def build_backbones(
     model_cfg: ModelConfig,
     disc_config: Any,
     gen_config: Any,
+    load_pretrained_weights: bool = True,
 ) -> tuple[Any, Any]:
     """Instantiate discriminator + generator backbones.
 
     :param ModelConfig model_cfg: User model configuration.
     :param Any disc_config: Discriminator config object.
     :param Any gen_config: Generator config object.
+    :param bool load_pretrained_weights: Whether to load pretrained weights from resolved model sources
+        when ``model.from_scratch=false``. Set ``False`` for resume/export flows that will load from an
+        accelerate checkpoint immediately after instantiation.
     :return tuple[Any, Any]: Instantiated discriminator and generator modules.
     """
     validate_model_config(model_cfg)
@@ -611,7 +615,7 @@ def build_backbones(
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
-        if model_cfg.from_scratch:
+        if model_cfg.from_scratch or not bool(load_pretrained_weights):
             disc = DebertaV2Model(disc_config)
             gen = DebertaV2Model(gen_config)
             return disc, gen
@@ -640,7 +644,7 @@ def build_backbones(
         return disc, gen
 
     # RoPE backbone
-    if model_cfg.from_scratch:
+    if model_cfg.from_scratch or not bool(load_pretrained_weights):
         disc = DebertaRoPEModel(disc_config)
         gen = DebertaRoPEModel(gen_config)
         return disc, gen

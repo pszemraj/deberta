@@ -132,7 +132,13 @@ def _install_export_fakes(
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_utils)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
     monkeypatch.setattr(export_cli, "build_backbone_configs", lambda **kwargs: (object(), object()))
-    monkeypatch.setattr(export_cli, "build_backbones", lambda *args, **kwargs: (object(), object()))
+
+    def _fake_build_backbones(*args: Any, **kwargs: Any) -> tuple[object, object]:
+        del args
+        called["build_backbones_calls"] = list(called.get("build_backbones_calls", [])) + [dict(kwargs)]
+        return object(), object()
+
+    monkeypatch.setattr(export_cli, "build_backbones", _fake_build_backbones)
     monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _FakeRTDModel())
     monkeypatch.setattr(
         export_cli,
@@ -164,6 +170,7 @@ def test_run_export_fsdp_state_dict_paths(
         "get_model_state_dict": 0,
         "options_kwargs": None,
         "load_state_calls": [],
+        "build_backbones_calls": [],
     }
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -194,6 +201,9 @@ def test_run_export_fsdp_state_dict_paths(
         assert called["get_state_dict"] == 1
         assert called["get_model_state_dict"] == 0
         assert called["options_kwargs"] is None
+    build_backbones_calls = list(called["build_backbones_calls"])
+    assert build_backbones_calls
+    assert build_backbones_calls[0]["load_pretrained_weights"] is False
     assert called["unwrap_model"] == 0
     assert called["load_state_calls"] == [{}]
 

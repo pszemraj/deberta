@@ -852,6 +852,107 @@ def test_build_backbones_uses_discriminator_fallback_for_derived_pretrained_hf(
     assert called == ["disc_weights", "disc_weights"]
 
 
+def test_build_backbones_pretrained_rope_can_skip_pretrained_weight_loading(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called = {"count": 0}
+
+    def _raise_if_called(cls, src: str, config: Any):
+        del cls
+        del src
+        del config
+        called["count"] += 1
+        raise AssertionError("from_pretrained should not be called when load_pretrained_weights=false")
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEModel,
+        "from_pretrained",
+        classmethod(_raise_if_called),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        discriminator_model_name_or_path="disc_weights",
+    )
+    disc_cfg = builder_mod.DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+    )
+    gen_cfg = builder_mod.DebertaRoPEConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+    )
+    disc, gen = builder_mod.build_backbones(
+        model_cfg=model_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        load_pretrained_weights=False,
+    )
+
+    assert isinstance(disc, builder_mod.DebertaRoPEModel)
+    assert isinstance(gen, builder_mod.DebertaRoPEModel)
+    assert called["count"] == 0
+
+
+def test_build_backbones_pretrained_hf_can_skip_pretrained_weight_loading(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+    from transformers import DebertaV2Config
+
+    called = {"count": 0}
+
+    def _raise_if_called(cls, src: str, config: Any):
+        del cls
+        del src
+        del config
+        called["count"] += 1
+        raise AssertionError("from_pretrained should not be called when load_pretrained_weights=false")
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Model,
+        "from_pretrained",
+        classmethod(_raise_if_called),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        discriminator_model_name_or_path="disc_weights",
+    )
+    disc_cfg = DebertaV2Config(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+    )
+    gen_cfg = DebertaV2Config(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+    )
+    disc, gen = builder_mod.build_backbones(
+        model_cfg=model_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        load_pretrained_weights=False,
+    )
+
+    assert isinstance(disc, builder_mod.DebertaV2Model)
+    assert isinstance(gen, builder_mod.DebertaV2Model)
+    assert called["count"] == 0
+
+
 def test_build_backbone_configs_rejects_invalid_model_options_early():
     pytest.importorskip("transformers")
 

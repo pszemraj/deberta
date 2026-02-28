@@ -294,7 +294,10 @@ def run_export(cfg: ExportConfig) -> None:
 
     # Build backbones + pretrainer container so accelerate.load_state can restore the exact structure.
     disc_backbone, gen_backbone = build_backbones(
-        model_cfg=model_cfg, disc_config=disc_config, gen_config=gen_config
+        model_cfg=model_cfg,
+        disc_config=disc_config,
+        gen_config=gen_config,
+        load_pretrained_weights=False,
     )
     if model_cfg.gradient_checkpointing:
         if hasattr(disc_backbone, "gradient_checkpointing_enable"):

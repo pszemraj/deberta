@@ -2266,10 +2266,14 @@ def run_pretraining(
     )
 
     # Instantiate backbones
+    # Resume paths should instantiate from config and rely on accelerate checkpoint state
+    # instead of fetching original pretrained model sources again.
+    load_pretrained_backbones = ckpt is None
     disc_backbone, gen_backbone = build_backbones(
         model_cfg=model_cfg,
         disc_config=disc_config,
         gen_config=gen_config,
+        load_pretrained_weights=load_pretrained_backbones,
     )
 
     # Optional grad checkpointing
