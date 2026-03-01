@@ -1546,14 +1546,18 @@ def test_validate_train_config_rejects_invalid_mixed_precision():
 
 
 def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
-    cfg = TrainConfig(torch_compile_scope="generator_ffn", torch_compile_backend="aot-eager")
+    cfg = TrainConfig(
+        torch_compile=True,
+        torch_compile_scope="generator_ffn",
+        torch_compile_backend="aot-eager",
+    )
     validate_train_config(cfg)
     assert cfg.torch_compile_scope == "gen_ffn"
     assert cfg.torch_compile_backend == "aot_eager"
 
 
 def test_validate_train_config_normalizes_wandb_watch_aliases():
-    cfg = TrainConfig(wandb_watch="weights", wandb_watch_log_freq=25)
+    cfg = TrainConfig(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
     validate_train_config(cfg)
     assert cfg.wandb_watch == "parameters"
     assert cfg.wandb_watch_log_freq == 25

@@ -19,6 +19,10 @@ def test_module_entrypoints_invoke_main(
     if require_transformers:
         pytest.importorskip("transformers")
 
+    # runpy warns when a target submodule is already imported; clear only that submodule
+    # to emulate first-run CLI execution without invalidating the top-level package object.
+    if "." in module_name:
+        sys.modules.pop(module_name, None)
     # No required args: if __main__ wiring is correct, argparse exits.
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit):
