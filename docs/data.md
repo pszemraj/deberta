@@ -69,7 +69,11 @@ When `streaming=false`, training still routes through the same iterable packing 
 Masking modes:
 
 - token-level masking: `train.mlm_max_ngram = 1` (default)
-- whole-word n-gram masking: `train.mlm_max_ngram > 1`
+- whole-word n-gram masking: `train.mlm_max_ngram > 1` (best-effort tail fill)
+
+`mlm_max_ngram > 1` primarily masks contiguous whole-word spans. When the bounded n-gram loop cannot
+reach the exact per-sequence mask budget, the collator performs a token-level top-up from remaining
+positions to keep fixed-budget masking behavior.
 
 Replacement probabilities are controlled by:
 

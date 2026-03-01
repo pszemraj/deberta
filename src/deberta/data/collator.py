@@ -557,6 +557,9 @@ class DebertaV3ElectraCollator:
                 continue
 
             if len(masked) < num_to_mask:
+                # Best-effort WWM: if span sampling under-fills budget, top up with
+                # remaining token indices. This preserves fixed-budget masking while
+                # allowing a subword-level tail fill on rare edge cases.
                 remaining_candidates = [idx for idx in maskable_set if idx not in masked_set]
                 if remaining_candidates:
                     missing = num_to_mask - len(masked)
