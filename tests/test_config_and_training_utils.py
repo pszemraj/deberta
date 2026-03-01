@@ -20,6 +20,7 @@ from _fakes import DummyTokenizer, FakeAccelerator, SimpleRTD, setup_pretraining
 import deberta.cli as cli_mod
 from deberta.checkpoint_utils import (
     canonical_compile_state_key,
+    load_checkpoint_model_state_dict,
     load_model_state_with_compile_key_remap,
 )
 from deberta.cli import _load_json, _load_yaml
@@ -481,6 +482,59 @@ def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mo
     assert stats == {"matched": 2}
     assert torch.allclose(model[0].weight, original["0.weight"])
     assert torch.allclose(model[0].bias, original["0.bias"])
+
+
+def test_load_model_state_with_compile_key_remap_supports_fsdp_sharded_checkpoint(
+    tmp_path: Path,
+) -> None:
+    dcp = pytest.importorskip("torch.distributed.checkpoint")
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    checkpoint = tmp_path / "checkpoint-1"
+    shard_dir = checkpoint / "pytorch_model_fsdp_0"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        model[0].weight.fill_(1.25)
+        model[0].bias.fill_(-0.75)
+
+    saved = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    sharded_saved = {k.replace("0.", "0._orig_mod."): v.clone() for k, v in saved.items()}
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
+            category=UserWarning,
+        )
+        dcp.save(
+            state_dict={"model": sharded_saved},
+            checkpoint_id=str(shard_dir),
+            no_dist=True,
+        )
+
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.zero_()
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.",
+            category=UserWarning,
+        )
+        loaded_direct = load_checkpoint_model_state_dict(checkpoint, model_state_template=model.state_dict())
+    assert set(loaded_direct.keys()) == set(sharded_saved.keys())
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.",
+            category=UserWarning,
+        )
+        stats = load_model_state_with_compile_key_remap(model, checkpoint)
+    assert stats == {"matched": 2}
+    assert torch.allclose(model[0].weight, saved["0.weight"])
+    assert torch.allclose(model[0].bias, saved["0.bias"])
 
 
 def test_load_resume_state_with_compile_fallback_retries_strict_false_and_remaps(
