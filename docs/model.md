@@ -1,6 +1,6 @@
 # Model Architecture and Config
 
-See also: [data pipeline](data.md), [RTD objective](objective.md), [runtime/compile](fsdp2.md).
+See also: [replication guide](replication.md), [data pipeline](data.md), [RTD objective](objective.md), [runtime/compile](fsdp2.md).
 
 ## Backbone Families
 

@@ -45,6 +45,12 @@ Preflight validation only (no training side effects):
 deberta train configs/pretrain_rope_fineweb_edu.yaml --dry-run
 ```
 
+Preset-driven DeBERTa-v3-base starter (no config file):
+
+```bash
+deberta train --preset deberta-v3-base
+```
+
 Single-GPU export:
 
 ```bash
@@ -79,6 +85,7 @@ For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.Deber
 ## Documentation
 
 - Model/backbone config and architecture behavior (including load/source resolution contract): [`docs/model.md`](docs/model.md)
+- Strict DeBERTa-v2/v3 replication settings and preset behavior: [`docs/replication.md`](docs/replication.md)
 - Data pipeline, packing, and masking behavior: [`docs/data.md`](docs/data.md)
 - RTD objective and loss semantics: [`docs/objective.md`](docs/objective.md)
 - FSDP2/runtime/export behavior: [`docs/fsdp2.md`](docs/fsdp2.md)

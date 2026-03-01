@@ -2655,6 +2655,67 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
     assert seen["config_path"] == cfg_path
 
 
+def test_main_cli_train_with_config_and_preset_applies_model_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    cfg_path = tmp_path / "train.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "model": {"backbone_type": "rope"},
+                "data": {"dataset_name": "demo-dataset", "max_seq_length": 128},
+                "train": {"max_steps": 11},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path), "--preset", "deberta-v3-base"])
+
+    assert "train_cfg" in seen
+    assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
+    assert seen["data_cfg"].dataset_name == "demo-dataset"
+    assert seen["data_cfg"].max_seq_length == 128
+    assert seen["train_cfg"].max_steps == 11
+    assert seen["config_path"] == cfg_path
+    out = capsys.readouterr().out
+    assert "model-only overrides (config file provided)" in out
+
+
+def test_main_cli_train_preset_without_config_applies_defaults_and_cli_overrides(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", "--preset", "deberta-v3-base", "--max_steps", "123"])
+
+    assert seen["config_path"] is None
+    assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
+    assert seen["model_cfg"].embedding_sharing == "gdes"
+    assert seen["data_cfg"].dataset_name == "HuggingFaceFW/fineweb-edu"
+    assert seen["data_cfg"].dataset_config_name == "default"
+    assert seen["train_cfg"].max_steps == 123
+    assert seen["train_cfg"].report_to == "none"
+    out = capsys.readouterr().out
+    assert "model+data+train defaults (no config file)" in out
+
+
 def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: pytest.MonkeyPatch):
     seen: dict[str, Any] = {}
 
@@ -2699,6 +2760,14 @@ def test_train_parser_accepts_dry_run_flag():
         ["train", "--dataset_name", "HuggingFaceFW/fineweb-edu", "--max_steps", "5", "--dry-run"]
     )
     assert ns.command == "train"
+    assert ns.dry_run is True
+
+
+def test_train_parser_accepts_preset_flag():
+    parser = cli_mod._build_main_parser()
+    ns = parser.parse_args(["train", "--preset", "deberta-v3-base", "--dry-run"])
+    assert ns.command == "train"
+    assert ns.preset == "deberta-v3-base"
     assert ns.dry_run is True
 
 
@@ -3123,6 +3192,7 @@ def test_readme_cli_examples_are_parseable():
         "train configs/pretrain_rope_fineweb_edu.yaml",
         "train configs/pretrain_rope_fineweb_edu_2048.yaml",
         "train configs/pretrain_rope_fineweb_edu_4096.yaml",
+        "train --preset deberta-v3-base --dry-run",
         (
             "export runs/deberta_rope_rtd/checkpoint-10000 "
             "--what discriminator "

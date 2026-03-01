@@ -40,6 +40,38 @@ from deberta.export_cli import add_export_arguments, namespace_to_export_config,
 from deberta.io_utils import load_json_mapping
 from deberta.training import run_pretraining, run_pretraining_dry_run
 
+_TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
+    "deberta-v3-base": {
+        # Paper-faithful architecture path for DeBERTa-v3 experiments.
+        "model": {
+            "backbone_type": "hf_deberta_v2",
+            "tokenizer_name_or_path": "microsoft/deberta-v3-base",
+            "discriminator_model_name_or_path": "microsoft/deberta-v3-base",
+            "generator_model_name_or_path": None,
+            "from_scratch": True,
+            "embedding_sharing": "gdes",
+            "hf_attention_kernel": "dynamic",
+        },
+        # Applied only when no config path is provided.
+        "data": {
+            "dataset_name": "HuggingFaceFW/fineweb-edu",
+            "dataset_config_name": "default",
+            "train_split": "train",
+            "streaming": True,
+            "pack_sequences": True,
+            "block_cross_document_attention": False,
+            "text_column_name": "text",
+            "max_seq_length": 512,
+            "shuffle_buffer_size": 10_000,
+        },
+        # Applied only when no config path is provided.
+        "train": {
+            "max_steps": 500_000,
+            "report_to": "none",
+        },
+    }
+}
+
 
 def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Split flat config keys into model/data/train sections.
@@ -253,6 +285,15 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         help="Optional YAML/JSON config path. CLI flags override matching config keys.",
     )
+    train.add_argument(
+        "--preset",
+        choices=tuple(sorted(_TRAIN_PRESETS.keys())),
+        default=None,
+        help=(
+            "Optional training preset. With a config file, presets only override model fields. "
+            "Without a config file, presets provide model+data+train defaults."
+        ),
+    )
     _add_dataclass_flags(train, ModelConfig, group_name="Model")
     _add_dataclass_flags(train, DataConfig, group_name="Data")
     _add_dataclass_flags(train, TrainConfig, group_name="Train")
@@ -336,6 +377,52 @@ def _apply_overrides(target: Any, source: argparse.Namespace, provided_flags: se
             setattr(target, f.name, getattr(source, f.name))
 
 
+def _apply_mapping_overrides(target: Any, overrides: dict[str, Any]) -> None:
+    """Apply mapping values onto a dataclass object by attribute name.
+
+    :param Any target: Dataclass instance to mutate.
+    :param dict[str, Any] overrides: Attribute/value mapping.
+    :raises ValueError: If an override key does not exist on ``target``.
+    """
+    for key, value in overrides.items():
+        if not hasattr(target, key):
+            raise ValueError(f"Preset override key {key!r} is not a valid field for {type(target).__name__}.")
+        setattr(target, key, value)
+
+
+def _apply_train_preset(
+    *,
+    preset_name: str,
+    cfg_path: Path | None,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+) -> str:
+    """Apply a named train preset and return a human-readable mode label.
+
+    :param str preset_name: Preset name from CLI.
+    :param Path | None cfg_path: Optional config path (None means no config file).
+    :param ModelConfig model_cfg: Model config object to mutate.
+    :param DataConfig data_cfg: Data config object to mutate.
+    :param TrainConfig train_cfg: Train config object to mutate.
+    :raises ValueError: If preset name is unknown.
+    :return str: Mode label for CLI logging.
+    """
+    name = str(preset_name).strip().lower()
+    preset = _TRAIN_PRESETS.get(name)
+    if preset is None:
+        allowed = ", ".join(sorted(_TRAIN_PRESETS.keys()))
+        raise ValueError(f"Unknown train preset: {preset_name!r}. Available presets: {allowed}.")
+
+    _apply_mapping_overrides(model_cfg, dict(preset.get("model", {})))
+    if cfg_path is None:
+        _apply_mapping_overrides(data_cfg, dict(preset.get("data", {})))
+        _apply_mapping_overrides(train_cfg, dict(preset.get("train", {})))
+        return "model+data+train defaults (no config file)"
+
+    return "model-only overrides (config file provided)"
+
+
 def _build_train_configs_from_namespace(
     ns: argparse.Namespace,
 ) -> tuple[ModelConfig, DataConfig, TrainConfig]:
@@ -357,6 +444,7 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
     :param list[str] raw_train_argv: Raw argv after `train`.
     """
     cfg_path: Path | None = None
+    provided_flags = _extract_flag_names(raw_train_argv)
     if ns.config is not None:
         cfg_path = Path(ns.config).expanduser().resolve()
         if not cfg_path.exists():
@@ -370,13 +458,35 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
             model_cfg, data_cfg, train_cfg = _load_json(cfg_path)
         else:
             model_cfg, data_cfg, train_cfg = _load_yaml(cfg_path)
+    else:
+        if ns.preset:
+            model_cfg, data_cfg, train_cfg = ModelConfig(), DataConfig(), TrainConfig()
+        else:
+            model_cfg, data_cfg, train_cfg = _build_train_configs_from_namespace(ns)
 
-        provided_flags = _extract_flag_names(raw_train_argv)
+    if ns.preset:
+        preset_mode = _apply_train_preset(
+            preset_name=str(ns.preset),
+            cfg_path=cfg_path,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+        )
+        if cfg_path is None:
+            print(
+                f"Applying train preset '{ns.preset}': {preset_mode}. "
+                "Explicit CLI flags override preset values."
+            )
+        else:
+            print(
+                f"Applying train preset '{ns.preset}': {preset_mode}. "
+                "Data/train values remain from config unless explicitly overridden via CLI."
+            )
+
+    if ns.config is not None or ns.preset:
         _apply_overrides(model_cfg, ns, provided_flags)
         _apply_overrides(data_cfg, ns, provided_flags)
         _apply_overrides(train_cfg, ns, provided_flags)
-    else:
-        model_cfg, data_cfg, train_cfg = _build_train_configs_from_namespace(ns)
 
     # Validate after config load + CLI overrides so failures are immediate and explicit.
     validate_model_config(model_cfg)
