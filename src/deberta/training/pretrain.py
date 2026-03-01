@@ -8,14 +8,12 @@ import json
 import logging
 import math
 import re
-import shutil
 import time
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -28,18 +26,14 @@ from deberta.checkpoint_utils import (
     unwrap_compiled_model,
 )
 from deberta.config import (
-    RUN_CONFIG_SCHEMA_VERSION,
     DataConfig,
     ModelConfig,
     TrainConfig,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_mode,
-    load_data_config_snapshot,
-    load_model_config_snapshot,
     normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
-    validate_run_metadata_schema,
     validate_train_config,
     validate_training_workflow_options,
 )
@@ -47,11 +41,14 @@ from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset, Seque
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
-from deberta.io_utils import dump_json, load_json_mapping
+from deberta.io_utils import dump_json
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import load_intersection_state_dict, merge_embeddings_into_export_backbone
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
+from deberta.training import run_config as _run_config
+from deberta.training import run_management as _run_management
+from deberta.training import tracker_utils as _tracker_utils
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -61,6 +58,29 @@ _NONFINITE_LR_MULT_RECOVERY = 1.1  # gradual recovery factor per successful step
 _NONFINITE_OPT_STATE_RESET_EVERY = 4
 _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
+
+# Re-exported for compatibility with existing tests/tooling that import private helpers from pretrain.py.
+_find_latest_checkpoint = _run_management._find_latest_checkpoint
+_load_checkpoint_data_progress = _run_management._load_checkpoint_data_progress
+_parse_checkpoint_step = _run_management._parse_checkpoint_step
+_prepare_output_dir = _run_management._prepare_output_dir
+_resolve_output_dir = _run_management._resolve_output_dir
+_resolve_output_dir_for_accelerator = _run_management._resolve_output_dir_for_accelerator
+_resolve_resume_checkpoint = _run_management._resolve_resume_checkpoint
+_rotate_checkpoints = _run_management._rotate_checkpoints
+_sanitize_run_label = _run_management._sanitize_run_label
+_save_checkpoint_data_progress = _run_management._save_checkpoint_data_progress
+_save_training_checkpoint = _run_management._save_training_checkpoint
+_build_run_metadata = _run_config._build_run_metadata
+_dump_yaml_mapping = _run_config._dump_yaml_mapping
+_effective_model_config_for_resume_compare = _run_config._effective_model_config_for_resume_compare
+_persist_config_yaml_snapshots = _run_config._persist_config_yaml_snapshots
+_persist_or_validate_run_configs = _run_config._persist_or_validate_run_configs
+_resolved_config_payload = _run_config._resolved_config_payload
+_validate_run_metadata = _run_config._validate_run_metadata
+_init_trackers = _tracker_utils._init_trackers
+_setup_wandb_watch = _tracker_utils._setup_wandb_watch
+_upload_wandb_original_config = _tracker_utils._upload_wandb_original_config
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -108,443 +128,6 @@ def _flush_loggers() -> None:
                 handler.flush()
 
 
-def _build_run_metadata(
-    *,
-    effective_compile_scope: str | None = None,
-    compile_scope_reason: str | None = None,
-) -> dict[str, Any]:
-    """Build run-metadata payload stored alongside config snapshots.
-
-    :param str | None effective_compile_scope: Resolved compile scope after auto-resolution.
-    :param str | None compile_scope_reason: Reason for scope selection when auto-resolved.
-    :return dict[str, Any]: Metadata mapping.
-    """
-    from deberta import __version__
-
-    meta: dict[str, Any] = {
-        "config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION),
-        "deberta_version": str(__version__),
-    }
-    if effective_compile_scope is not None:
-        meta["effective_compile_scope"] = str(effective_compile_scope)
-    if compile_scope_reason is not None:
-        meta["compile_scope_reason"] = str(compile_scope_reason)
-    return meta
-
-
-def _sanitize_run_label(raw: str) -> str:
-    """Normalize a free-form run label into a compact safe token.
-
-    :param str raw: Raw label.
-    :return str: Sanitized label.
-    """
-    cleaned = _RUN_LABEL_CLEAN_RE.sub("-", str(raw).strip()).strip("._-")
-    return cleaned or "run"
-
-
-def _resolve_output_dir(
-    *,
-    output_dir: str | None,
-    project_name: str,
-    config_path: str | Path | None,
-    run_name: str | None = None,
-) -> Path:
-    """Resolve the concrete training output directory.
-
-    :param str | None output_dir: User-configured output directory.
-    :param str project_name: Tracker project namespace.
-    :param str | Path | None config_path: Optional config file path for naming hint.
-    :param str | None run_name: Optional explicit run-name hint for auto naming.
-    :return Path: Concrete output directory path.
-    """
-    if output_dir is not None and str(output_dir).strip():
-        return Path(str(output_dir))
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name_hint = str(run_name).strip() if run_name is not None else ""
-    if not name_hint and config_path is not None:
-        name_hint = Path(config_path).stem or "run"
-    if not name_hint:
-        name_hint = "run"
-    run_name = _sanitize_run_label(name_hint)
-    project = _sanitize_run_label(project_name)
-    return Path("runs") / project / f"{stamp}_{run_name}"
-
-
-def _resolve_output_dir_for_accelerator(
-    *,
-    accelerator: Any,
-    output_dir: str | None,
-    project_name: str,
-    config_path: str | Path | None,
-    run_name: str | None = None,
-    broadcast_fn: Any | None = None,
-) -> Path:
-    """Resolve output_dir with deterministic auto-naming across distributed ranks.
-
-    :param Any accelerator: Accelerator-like runtime exposing ``is_main_process`` and ``num_processes``.
-    :param str | None output_dir: User-configured output directory.
-    :param str project_name: Tracker project namespace.
-    :param str | Path | None config_path: Optional config path used for auto-naming.
-    :param str | None run_name: Optional explicit run-name hint for auto naming.
-    :param Any | None broadcast_fn: Optional callable compatible with
-        ``accelerate.utils.broadcast_object_list``.
-    :raises RuntimeError: If distributed broadcast fails or returns an empty path.
-    :return Path: Concrete output directory path.
-    """
-    explicit = output_dir is not None and str(output_dir).strip()
-    if explicit:
-        return Path(str(output_dir))
-
-    num_processes = int(getattr(accelerator, "num_processes", 1))
-    if num_processes <= 1:
-        return _resolve_output_dir(
-            output_dir=None,
-            project_name=project_name,
-            config_path=config_path,
-            run_name=run_name,
-        )
-
-    if broadcast_fn is None:
-        try:
-            from accelerate.utils import broadcast_object_list as broadcast_fn  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "Distributed auto output_dir resolution requires accelerate.utils.broadcast_object_list."
-            ) from exc
-
-    shared: list[str | None] = [None]
-    if bool(getattr(accelerator, "is_main_process", False)):
-        shared[0] = str(
-            _resolve_output_dir(
-                output_dir=None,
-                project_name=project_name,
-                config_path=config_path,
-                run_name=run_name,
-            )
-        )
-
-    try:
-        broadcast_fn(shared, from_process=0)
-    except Exception as exc:
-        raise RuntimeError("Failed to broadcast auto-resolved output_dir across ranks.") from exc
-
-    resolved = shared[0]
-    if resolved is None or not str(resolved).strip():
-        raise RuntimeError("Broadcasted output_dir is empty in distributed auto-output-dir resolution.")
-    return Path(str(resolved))
-
-
-def _init_trackers(
-    *,
-    accelerator: Any,
-    project_name: str,
-    tracker_cfg: dict[str, Any],
-    report_to: str,
-    run_name: str,
-) -> None:
-    """Initialize Accelerate trackers with tracker-specific kwargs when available.
-
-    :param Any accelerator: Accelerator instance.
-    :param str project_name: Tracker project name.
-    :param dict[str, Any] tracker_cfg: Tracker configuration payload.
-    :param str report_to: Selected tracker backend.
-    :param str run_name: Effective run name.
-    """
-    call_kwargs: dict[str, Any] = {
-        "project_name": project_name,
-        "config": tracker_cfg,
-    }
-
-    init_kwargs: dict[str, Any] = {}
-    if str(report_to).strip().lower() == "wandb":
-        init_kwargs = {"wandb": {"name": run_name}}
-
-    if not init_kwargs:
-        accelerator.init_trackers(**call_kwargs)
-        return
-
-    try:
-        accelerator.init_trackers(**call_kwargs, init_kwargs=init_kwargs)
-    except TypeError as err:
-        # Some accelerate builds do not accept init_kwargs; retry without it.
-        if "init_kwargs" not in str(err):
-            raise
-        logger.warning(
-            "Accelerate init_trackers() rejected init_kwargs; W&B run name "
-            "cannot be set explicitly on this runtime."
-        )
-        accelerator.init_trackers(**call_kwargs)
-
-
-def _setup_wandb_watch(
-    *,
-    accelerator: Any,
-    wandb_run: Any | None,
-    model: torch.nn.Module,
-    watch_mode: str,
-    watch_log_freq: int,
-) -> bool:
-    """Configure W&B gradient/parameter watching for the active run.
-
-    :param Any accelerator: Accelerator runtime.
-    :param Any | None wandb_run: W&B tracker object, if available.
-    :param torch.nn.Module model: Training model (possibly wrapped).
-    :param str watch_mode: W&B watch mode.
-    :param int watch_log_freq: Watch logging frequency.
-    :return bool: True when watch setup succeeds, else False.
-    """
-    mode = str(watch_mode).strip().lower()
-    if mode == "none":
-        return False
-    if not bool(getattr(accelerator, "is_main_process", True)):
-        return False
-
-    watch_target = unwrap_compiled_model(accelerator, model)
-    freq = max(1, int(watch_log_freq))
-
-    watch_owner = wandb_run
-    watch_fn = getattr(wandb_run, "watch", None) if wandb_run is not None else None
-    if not callable(watch_fn):
-        with suppress(Exception):
-            tracker_obj = accelerator.get_tracker("wandb", unwrap=True)
-            watch_owner = tracker_obj
-            watch_fn = getattr(tracker_obj, "watch", None)
-
-    if not callable(watch_fn):
-        logger.warning("W&B tracker does not expose watch(); skipping model watch setup.")
-        return False
-
-    try:
-        watch_fn(watch_target, log=mode, log_freq=freq)
-    except TypeError:
-        watch_fn(watch_target, log=mode)
-
-    owner_type = type(watch_owner).__name__ if watch_owner is not None else "unknown"
-    logger.info("Enabled W&B watch (mode=%s, log_freq=%d, tracker=%s).", mode, freq, owner_type)
-    return True
-
-
-def _validate_run_metadata(path: Path) -> None:
-    """Validate on-disk run metadata schema compatibility.
-
-    :param Path path: Metadata file path.
-    :raises ValueError: If metadata is malformed or schema-incompatible.
-    """
-    raw = load_json_mapping(path)
-    validate_run_metadata_schema(raw, source=str(path))
-
-
-def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
-    """Write a mapping payload to YAML, with JSON fallback if PyYAML is unavailable.
-
-    :param dict[str, Any] payload: Mapping payload.
-    :param Path path: Destination path.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-            f.write("\n")
-        return
-
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, sort_keys=True, default_flow_style=False, allow_unicode=False)
-
-
-def _resolved_config_payload(
-    *, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: TrainConfig
-) -> dict[str, dict[str, Any]]:
-    """Build resolved nested config payload for YAML snapshots.
-
-    :param ModelConfig model_cfg: Resolved model config.
-    :param DataConfig data_cfg: Resolved data config.
-    :param TrainConfig train_cfg: Resolved train config.
-    :return dict[str, dict[str, Any]]: Nested resolved payload.
-    """
-    return {
-        "model": asdict(model_cfg),
-        "data": asdict(data_cfg),
-        "train": asdict(train_cfg),
-    }
-
-
-def _persist_config_yaml_snapshots(
-    *,
-    output_dir: Path,
-    model_cfg: ModelConfig,
-    data_cfg: DataConfig,
-    train_cfg: TrainConfig,
-    config_path: str | Path | None,
-    is_main_process: bool,
-) -> None:
-    """Persist original/resolved YAML config snapshots in ``output_dir``.
-
-    :param Path output_dir: Training output directory.
-    :param ModelConfig model_cfg: Resolved model config.
-    :param DataConfig data_cfg: Resolved data config.
-    :param TrainConfig train_cfg: Resolved train config.
-    :param str | Path | None config_path: Optional source config file path.
-    :param bool is_main_process: Whether current process owns filesystem writes.
-    """
-    if not bool(is_main_process):
-        return
-
-    resolved_payload = _resolved_config_payload(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
-    resolved_path = output_dir / "config_resolved.yaml"
-    _dump_yaml_mapping(resolved_payload, resolved_path)
-
-    original_path = output_dir / "config_original.yaml"
-    if config_path is None:
-        _dump_yaml_mapping(resolved_payload, original_path)
-        return
-
-    source = Path(config_path).expanduser().resolve()
-    if source.exists():
-        original_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-        return
-
-    # Backfill with resolved payload when source path is unavailable.
-    _dump_yaml_mapping(resolved_payload, original_path)
-
-
-def _upload_wandb_original_config(
-    *,
-    accelerator: Any,
-    wandb_run: Any | None,
-    config_original_path: Path,
-    run_name: str,
-) -> bool:
-    """Upload ``config_original.yaml`` to W&B using a run-name-specific filename.
-
-    :param Any accelerator: Accelerator runtime.
-    :param Any | None wandb_run: W&B tracker object, if available.
-    :param Path config_original_path: Local config-original snapshot path.
-    :param str run_name: Effective run name.
-    :return bool: True when upload succeeds, else False.
-    """
-    if not bool(getattr(accelerator, "is_main_process", True)):
-        return False
-    if not config_original_path.exists():
-        return False
-
-    owner = wandb_run
-    if owner is None:
-        with suppress(Exception):
-            owner = accelerator.get_tracker("wandb", unwrap=True)
-    if owner is None:
-        return False
-
-    safe_run_name = _sanitize_run_label(run_name)
-    upload_name = f"config_deberta_{safe_run_name}"
-    with TemporaryDirectory(prefix="deberta-wandb-config-") as tmp_dir:
-        staged = Path(tmp_dir) / upload_name
-        staged.write_text(config_original_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-        save_fn = getattr(owner, "save", None)
-        if callable(save_fn):
-            try:
-                save_fn(str(staged), base_path=tmp_dir, policy="now")
-            except TypeError:
-                try:
-                    save_fn(str(staged), base_path=tmp_dir)
-                except TypeError:
-                    save_fn(str(staged))
-            logger.info("Uploaded original config to W&B as %s", upload_name)
-            return True
-
-        log_artifact_fn = getattr(owner, "log_artifact", None)
-        if callable(log_artifact_fn):
-            with suppress(Exception):
-                import wandb  # type: ignore
-
-                artifact = wandb.Artifact(name=f"config-{safe_run_name}", type="config")
-                artifact.add_file(str(staged), name=upload_name)
-                log_artifact_fn(artifact)
-                logger.info("Uploaded original config artifact to W&B as %s", upload_name)
-                return True
-
-    logger.warning("W&B tracker does not support save()/log_artifact(); skipping config upload.")
-    return False
-
-
-def _resolve_resume_checkpoint(
-    *,
-    output_dir: Path,
-    resume_from_checkpoint: str | None,
-    is_main_process: bool,
-) -> str | None:
-    """Resolve resume checkpoint path, including ``auto`` lookup.
-
-    :param Path output_dir: Training output directory.
-    :param str | None resume_from_checkpoint: User resume setting.
-    :param bool is_main_process: Whether to emit logs.
-    :raises ValueError: If ``resume_from_checkpoint='auto'`` is requested for a non-empty output
-        directory that does not contain any ``checkpoint-*`` folders.
-    :raises FileNotFoundError: If an explicit resume checkpoint path does not exist.
-    :return str | None: Concrete checkpoint path, or ``None``.
-    """
-    resume_value = str(resume_from_checkpoint).strip() if resume_from_checkpoint is not None else ""
-    if not resume_value:
-        return None
-
-    if resume_value.lower() != "auto":
-        checkpoint_path = Path(resume_value).expanduser()
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                "train.resume_from_checkpoint was provided but the checkpoint path does not exist: "
-                f"{checkpoint_path}"
-            )
-        if not checkpoint_path.is_dir():
-            raise ValueError(
-                "train.resume_from_checkpoint must point to a checkpoint directory. "
-                f"Got a non-directory path: {checkpoint_path}"
-            )
-        return str(checkpoint_path.resolve())
-
-    latest = _find_latest_checkpoint(output_dir)
-    if latest is None:
-        has_existing_contents = output_dir.exists() and any(output_dir.iterdir())
-        if has_existing_contents:
-            raise ValueError(
-                "resume_from_checkpoint=auto was requested but no checkpoint-* directories were found in "
-                f"non-empty output_dir={output_dir}. Clean the directory, enable "
-                "train.overwrite_output_dir=true, or provide an explicit checkpoint path."
-            )
-        if is_main_process:
-            logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
-        return None
-    return str(latest)
-
-
-def _effective_model_config_for_resume_compare(cfg: ModelConfig) -> dict[str, Any]:
-    """Build a normalized model config snapshot for resume compatibility checks.
-
-    Fields that are explicitly documented as inert in the active model mode are normalized to
-    canonical defaults so no-op config churn does not block resume.
-
-    :param ModelConfig cfg: Model config to canonicalize.
-    :return dict[str, Any]: Normalized dict payload suitable for equality checks.
-    """
-    payload = asdict(cfg)
-    defaults = ModelConfig()
-
-    if cfg.backbone_type == "rope":
-        payload["hf_attention_kernel"] = defaults.hf_attention_kernel
-        payload["hf_max_position_embeddings"] = defaults.hf_max_position_embeddings
-
-    if cfg.norm_arch == "post":
-        payload["keel_alpha_init"] = defaults.keel_alpha_init
-        payload["keel_alpha_learnable"] = defaults.keel_alpha_learnable
-
-    if cfg.ffn_type == "mlp":
-        payload["swiglu_adjust_intermediate"] = defaults.swiglu_adjust_intermediate
-
-    return payload
-
-
 def _load_resume_state_with_compile_fallback(
     accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
 ) -> None:
@@ -574,110 +157,6 @@ def _load_resume_state_with_compile_fallback(
         "Resume model remap loaded %d tensors from %s.",
         int(stats["matched"]),
         checkpoint_dir,
-    )
-
-
-def _persist_or_validate_run_configs(
-    *,
-    output_dir: Path,
-    model_cfg: ModelConfig,
-    data_cfg: DataConfig,
-    train_cfg: TrainConfig,
-    resume_checkpoint: str | None,
-    config_path: str | Path | None = None,
-    is_main_process: bool,
-    effective_compile_scope: str | None = None,
-    compile_scope_reason: str | None = None,
-) -> None:
-    """Persist new config snapshots or validate existing snapshots on resume.
-
-    :param Path output_dir: Training output directory.
-    :param ModelConfig model_cfg: Current model config.
-    :param DataConfig data_cfg: Current data config.
-    :param TrainConfig train_cfg: Current train config.
-    :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
-    :param str | Path | None config_path: Optional original config-file path.
-    :param bool is_main_process: Whether this process owns writes.
-    :param str | None effective_compile_scope: Resolved compile scope for metadata.
-    :param str | None compile_scope_reason: Reason for compile scope selection.
-    :raises ValueError: If resume mode detects incompatible model/data config snapshots.
-    """
-    model_cfg_path = output_dir / "model_config.json"
-    data_cfg_path = output_dir / "data_config.json"
-    train_cfg_path = output_dir / "train_config.json"
-    run_meta_path = output_dir / "run_metadata.json"
-
-    run_meta = _build_run_metadata(
-        effective_compile_scope=effective_compile_scope,
-        compile_scope_reason=compile_scope_reason,
-    )
-
-    has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
-    if resume_checkpoint is not None and has_saved_model_data:
-        if run_meta_path.exists():
-            _validate_run_metadata(run_meta_path)
-            # Check for compile scope drift on resume.
-            if is_main_process and effective_compile_scope is not None:
-                saved_meta = load_json_mapping(run_meta_path)
-                saved_scope = saved_meta.get("effective_compile_scope")
-                if saved_scope is not None and str(saved_scope) != str(effective_compile_scope):
-                    logger.warning(
-                        "Effective compile scope changed on resume: "
-                        f"was {saved_scope!r}, now {effective_compile_scope!r}. "
-                        "This may affect compiled graph caching but is recoverable."
-                    )
-        elif is_main_process:
-            # Backfill schema metadata for older runs once compatibility has been checked.
-            dump_json(run_meta, run_meta_path)
-
-        # Pre-stable policy: do not silently coerce legacy snapshot keys during resume.
-        # Snapshots must match current dataclass schemas for correctness/simplicity.
-        saved_model_cfg = load_model_config_snapshot(
-            load_json_mapping(model_cfg_path), source=str(model_cfg_path)
-        )
-        saved_data_cfg = load_data_config_snapshot(
-            load_json_mapping(data_cfg_path), source=str(data_cfg_path)
-        )
-        validate_model_config(saved_model_cfg)
-        validate_data_config(saved_data_cfg)
-
-        # Match on effective model semantics; inert fields are normalized by mode.
-        if _effective_model_config_for_resume_compare(
-            saved_model_cfg
-        ) != _effective_model_config_for_resume_compare(model_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for model_config.json. "
-                "Refusing to overwrite run metadata with incompatible model settings."
-            )
-        if asdict(saved_data_cfg) != asdict(data_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for data_config.json. "
-                "Refusing to overwrite run metadata with incompatible data settings."
-            )
-        if is_main_process:
-            logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
-        _persist_config_yaml_snapshots(
-            output_dir=output_dir,
-            model_cfg=model_cfg,
-            data_cfg=data_cfg,
-            train_cfg=train_cfg,
-            config_path=config_path,
-            is_main_process=is_main_process,
-        )
-        return
-
-    if is_main_process:
-        dump_json(asdict(model_cfg), model_cfg_path)
-        dump_json(asdict(data_cfg), data_cfg_path)
-        dump_json(asdict(train_cfg), train_cfg_path)
-        dump_json(run_meta, run_meta_path)
-    _persist_config_yaml_snapshots(
-        output_dir=output_dir,
-        model_cfg=model_cfg,
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        config_path=config_path,
-        is_main_process=is_main_process,
     )
 
 
@@ -1818,172 +1297,6 @@ def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int |
     if max_grad_norm is None:
         return False
     return float(max_grad_norm) > 0.0
-
-
-def _parse_checkpoint_step(path: str) -> int:
-    """Parse integer step suffix from checkpoint path.
-
-    :param str path: Checkpoint directory path.
-    :return int: Parsed step number, or 0 when missing.
-    """
-    name = Path(path).name
-    m = re.search(r"checkpoint-(\d+)", name)
-    if m:
-        return int(m.group(1))
-    return 0
-
-
-def _find_latest_checkpoint(output_dir: Path) -> Path | None:
-    """Return latest ``checkpoint-*`` directory under ``output_dir``.
-
-    :param Path output_dir: Training output directory.
-    :return Path | None: Latest checkpoint path, or ``None`` if absent.
-    """
-
-    checkpoints: list[tuple[int, Path]] = []
-    for p in output_dir.glob("checkpoint-*"):
-        if p.is_dir():
-            step = _parse_checkpoint_step(str(p))
-            checkpoints.append((step, p))
-
-    if not checkpoints:
-        return None
-
-    checkpoints.sort(key=lambda x: x[0])
-    return checkpoints[-1][1]
-
-
-def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, float]:
-    """Load persisted data progress and LR multiplier for resume alignment.
-
-    :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float]: (consumed micro-batch count or None, lr_mult).
-    """
-    path = checkpoint_dir / "data_state.json"
-    if not path.exists():
-        return None, 1.0
-    try:
-        raw = json.loads(path.read_text())
-        val = raw.get("consumed_micro_batches", None)
-        consumed = max(0, int(val)) if val is not None else None
-        lr_mult = float(raw.get("lr_mult", 1.0))
-        return consumed, lr_mult
-    except Exception:
-        return None, 1.0
-
-
-def _save_checkpoint_data_progress(
-    *, checkpoint_dir: Path, consumed_micro_batches: int, lr_mult: float = 1.0
-) -> None:
-    """Persist data iterator progress and LR multiplier next to a checkpoint.
-
-    :param Path checkpoint_dir: Checkpoint directory.
-    :param int consumed_micro_batches: Number of consumed micro-batches.
-    :param float lr_mult: Persistent nonfinite recovery LR multiplier.
-    """
-    dump_json(
-        {
-            "consumed_micro_batches": int(max(0, consumed_micro_batches)),
-            "lr_mult": float(lr_mult),
-        },
-        checkpoint_dir / "data_state.json",
-    )
-
-
-def _save_training_checkpoint(
-    *,
-    accelerator: Any,
-    checkpoint_dir: Path,
-    output_dir: Path,
-    consumed_micro_batches: int,
-    save_total_limit: int,
-    log_label: str,
-    lr_mult: float = 1.0,
-) -> None:
-    """Save one training checkpoint with collective state-dict write.
-
-    :param Any accelerator: Accelerate runtime object.
-    :param Path checkpoint_dir: Destination checkpoint directory.
-    :param Path output_dir: Parent output directory for checkpoint rotation.
-    :param int consumed_micro_batches: Data progress to persist.
-    :param int save_total_limit: Number of checkpoints to retain.
-    :param str log_label: Logging label for this save.
-    :param float lr_mult: Persistent nonfinite recovery LR multiplier.
-    """
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    accelerator.wait_for_everyone()
-
-    # save_state can be collective under FSDP sharded checkpointing; all ranks must participate.
-    accelerator.save_state(str(checkpoint_dir))
-    accelerator.wait_for_everyone()
-
-    if accelerator.is_main_process:
-        _save_checkpoint_data_progress(
-            checkpoint_dir=checkpoint_dir,
-            consumed_micro_batches=consumed_micro_batches,
-            lr_mult=float(lr_mult),
-        )
-        _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
-        logger.info(f"Saved {log_label} checkpoint: {checkpoint_dir}")
-
-
-def _prepare_output_dir(
-    *,
-    output_dir: Path,
-    overwrite_output_dir: bool,
-    resume_from_checkpoint: str | None,
-    is_main_process: bool,
-) -> None:
-    """Prepare output directory with overwrite/resume semantics.
-
-    :param Path output_dir: Target output path.
-    :param bool overwrite_output_dir: Whether to delete existing non-empty path.
-    :param str | None resume_from_checkpoint: Resume setting from config.
-    :param bool is_main_process: Whether current process owns filesystem writes.
-    """
-    if not is_main_process:
-        return
-
-    if output_dir.exists() and any(output_dir.iterdir()):
-        if overwrite_output_dir:
-            shutil.rmtree(output_dir)
-        elif not resume_from_checkpoint:
-            raise ValueError(
-                f"Output directory exists and is not empty: {output_dir}. "
-                "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
-            )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-
-def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
-    """Delete oldest checkpoints beyond ``save_total_limit``.
-
-    :param Path output_dir: Directory containing checkpoint-* folders.
-    :param int save_total_limit: Max number of checkpoints to retain.
-    """
-    if save_total_limit <= 0:
-        return
-
-    checkpoints = []
-    for p in output_dir.glob("checkpoint-*"):
-        if p.is_dir():
-            step = _parse_checkpoint_step(str(p))
-            checkpoints.append((step, p))
-
-    checkpoints.sort(key=lambda x: x[0])
-    if len(checkpoints) <= save_total_limit:
-        return
-
-    to_delete = checkpoints[: max(0, len(checkpoints) - save_total_limit)]
-    for step, p in to_delete:
-        try:
-            shutil.rmtree(p)
-            logger.info(f"Deleted old checkpoint: {p} (step={step})")
-        except Exception as e:
-            logger.warning(f"Failed to delete checkpoint {p}: {e}")
 
 
 _REPO_URL = "https://github.com/pszemraj/deberta"
