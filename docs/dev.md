@@ -1,6 +1,8 @@
 # Developer Notes
 
 > THIS DOCUMENT IS STANDALONE FOR TRACKING DEV RELATED WORK.
+> DO NOT DELETE THIS FILE OR MERGE ITS CONTENT INTO OTHER DOCS DURING DOCUMENTATION CONSOLIDATION.
+> Keep this file focused on developer/runtime implementation notes and compatibility-break tracking.
 
 ## Pre-release Compatibility Policy
 
