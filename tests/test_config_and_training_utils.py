@@ -9,6 +9,7 @@ import shlex
 import sys
 import types
 import warnings
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +237,20 @@ def test_load_data_config_snapshot_rejects_unknown_legacy_key() -> None:
             {"dataset_name": "HuggingFaceFW/fineweb-edu", "legacy_field": 1},
             source="data_config.json",
         )
+
+
+def test_load_model_config_snapshot_rejects_missing_required_key() -> None:
+    model_raw = asdict(ModelConfig())
+    model_raw.pop("backbone_type")
+    with pytest.raises(ValueError, match="Missing required model_config.json keys"):
+        load_model_config_snapshot(model_raw, source="model_config.json")
+
+
+def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
+    data_raw = asdict(DataConfig())
+    data_raw.pop("dataset_name")
+    with pytest.raises(ValueError, match="Missing required data_config.json keys"):
+        load_data_config_snapshot(data_raw, source="data_config.json")
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
@@ -1234,6 +1249,38 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
             resume_checkpoint=str(out / "checkpoint-10"),
             is_main_process=True,
         )
+
+
+def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_resume(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    run_meta_path = out / "run_metadata.json"
+    run_meta_path.unlink()
+    changed_model = ModelConfig(backbone_type="rope", hidden_size=1024)
+
+    with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=changed_model,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            resume_checkpoint=str(out / "checkpoint-10"),
+            is_main_process=True,
+        )
+    assert not run_meta_path.exists()
 
 
 def test_persist_or_validate_run_configs_allows_resume_when_only_inert_model_fields_change(tmp_path: Path):

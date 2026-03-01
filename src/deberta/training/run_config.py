@@ -208,9 +208,6 @@ def _persist_or_validate_run_configs(
                         f"was {saved_scope!r}, now {effective_compile_scope!r}. "
                         "This may affect compiled graph caching but is recoverable."
                     )
-        elif is_main_process:
-            # Backfill schema metadata for older runs once compatibility has been checked.
-            dump_json(run_meta, run_meta_path)
 
         # Pre-stable policy: do not silently coerce legacy snapshot keys during resume.
         # Snapshots must match current dataclass schemas for correctness/simplicity.
@@ -236,6 +233,9 @@ def _persist_or_validate_run_configs(
                 "Resume configuration mismatch for data_config.json. "
                 "Refusing to overwrite run metadata with incompatible data settings."
             )
+        if is_main_process and not run_meta_path.exists():
+            # Backfill schema metadata for older runs only after compatibility checks pass.
+            dump_json(run_meta, run_meta_path)
         if is_main_process:
             logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
         _persist_config_yaml_snapshots(

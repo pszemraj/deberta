@@ -996,6 +996,13 @@ def _load_snapshot_dataclass(
             "This snapshot was produced by an older pre-release schema; "
             "backward resume/export compatibility is not guaranteed before stable release."
         )
+    missing = sorted(expected_keys - set(raw))
+    if missing:
+        missing_str = ", ".join(missing)
+        raise ValueError(
+            f"Missing required {config_name} keys in {source}: {missing_str}. "
+            "This snapshot does not match the current config schema."
+        )
 
     try:
         return cls(**raw)

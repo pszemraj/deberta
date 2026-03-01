@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import torch
 from _fakes import DummyTokenizer
 
 import deberta.export_cli as export_cli
-from deberta.config import RUN_CONFIG_SCHEMA_VERSION
+from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
 
 
 class _FakeExportBackbone:
@@ -40,17 +41,17 @@ class _FakeRTDModel:
 def _write_run_layout(tmp_path: Path) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
+    model_cfg = ModelConfig(
+        tokenizer_name_or_path="dummy-tokenizer",
+        embedding_sharing="none",
+    )
     (run_dir / "model_config.json").write_text(
-        json.dumps(
-            {
-                "tokenizer_name_or_path": "dummy-tokenizer",
-                "embedding_sharing": "none",
-            }
-        ),
+        json.dumps(asdict(model_cfg)),
         encoding="utf-8",
     )
+    data_cfg = DataConfig(dataset_name="dummy-dataset", max_seq_length=32)
     (run_dir / "data_config.json").write_text(
-        json.dumps({"dataset_name": "dummy-dataset", "max_seq_length": 32}),
+        json.dumps(asdict(data_cfg)),
         encoding="utf-8",
     )
     checkpoint_dir = tmp_path / "checkpoint-10"
