@@ -218,3 +218,6 @@ __marimo__/
 
 # Local scratch utilities (intentionally untracked)
 local-scratch/
+
+# User-local experimental configs (never committed)
+configs/custom/
