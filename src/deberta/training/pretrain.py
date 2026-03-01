@@ -1256,6 +1256,207 @@ def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
     return float(input_ids.numel())
 
 
+def _validate_output_dir_preflight(
+    *,
+    output_dir: Path,
+    overwrite_output_dir: bool,
+    resume_from_checkpoint: str | None,
+) -> None:
+    """Validate output-dir preconditions without mutating filesystem state.
+
+    :param Path output_dir: Resolved output directory.
+    :param bool overwrite_output_dir: Whether training is configured to delete non-empty output_dir.
+    :param str | None resume_from_checkpoint: Resume setting.
+    :raises ValueError: If output-dir settings are contradictory or unsafe.
+    """
+    if bool(overwrite_output_dir) and bool(resume_from_checkpoint):
+        raise ValueError(
+            "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
+            "Overwrite would delete checkpoints before resume. Disable overwrite or unset resume."
+        )
+
+    if (
+        output_dir.exists()
+        and any(output_dir.iterdir())
+        and (not overwrite_output_dir)
+        and (not resume_from_checkpoint)
+    ):
+        raise ValueError(
+            f"Output directory exists and is not empty: {output_dir}. "
+            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+        )
+
+
+def run_pretraining_dry_run(
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run non-destructive preflight checks for `deberta train`.
+
+    This validates configuration contracts and probes core runtime dependencies
+    (tokenizer, dataset access, collator output, model config construction)
+    without starting optimization/training loops.
+
+    :param ModelConfig model_cfg: Model configuration.
+    :param DataConfig data_cfg: Data configuration.
+    :param TrainConfig train_cfg: Training configuration.
+    :param str | Path | None config_path: Optional source config path.
+    :raises RuntimeError: If a preflight stage fails.
+    :return dict[str, Any]: Summary of resolved dry-run checks.
+    """
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+
+    mixed_precision = _resolve_effective_mixed_precision_or_raise(train_cfg.mixed_precision)
+    compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
+    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
+    compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
+    compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
+    compile_scope = compile_scope_requested
+    compile_scope_reason: str | None = None
+    if compile_enabled:
+        compile_scope, compile_scope_reason = _resolve_compile_scope(
+            requested_scope=compile_scope_requested,
+            model_cfg=model_cfg,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        )
+
+    output_dir = _resolve_output_dir(
+        output_dir=train_cfg.output_dir,
+        project_name=train_cfg.project_name,
+        config_path=config_path,
+        run_name=train_cfg.run_name,
+    )
+    _validate_output_dir_preflight(
+        output_dir=output_dir,
+        overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
+        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+    )
+    ckpt = _resolve_resume_checkpoint(
+        output_dir=output_dir,
+        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        is_main_process=True,
+    )
+
+    # Validate run snapshot compatibility in resume mode, without writing files.
+    _persist_or_validate_run_configs(
+        output_dir=output_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=ckpt,
+        config_path=config_path,
+        is_main_process=False,
+        effective_compile_scope=compile_scope if compile_enabled else None,
+        compile_scope_reason=compile_scope_reason,
+    )
+
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("transformers is required for dry-run preflight.") from exc
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load tokenizer from model.tokenizer_name_or_path="
+            f"{model_cfg.tokenizer_name_or_path!r}."
+        ) from exc
+    if tokenizer.pad_token_id is None:
+        raise RuntimeError(
+            "Tokenizer preflight failed: tokenizer.pad_token_id is unset. "
+            "Use a tokenizer with a defined PAD token."
+        )
+
+    try:
+        raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load dataset for dry-run preflight. Check data.dataset_name/data_files/load_from_disk, "
+            "split, and network/auth settings."
+        ) from exc
+
+    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
+    train_dataset = dataset_cls(
+        hf_dataset=raw_train,
+        tokenizer=tokenizer,
+        cfg=PackedStreamingConfig(
+            text_column_name=data_cfg.text_column_name,
+            max_seq_length=data_cfg.max_seq_length,
+            seed=train_cfg.seed,
+            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
+        ),
+        process_index=0,
+        num_processes=1,
+    )
+    collator = _build_training_collator(
+        tokenizer=tokenizer,
+        train_cfg=train_cfg,
+        packed_sequences=bool(data_cfg.pack_sequences),
+        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+    )
+
+    example_iter = iter(train_dataset)
+    try:
+        sample = next(example_iter)
+    except StopIteration as exc:
+        raise RuntimeError(
+            "Dataset preflight produced zero examples. Check text column, split, and tokenization inputs."
+        ) from exc
+
+    try:
+        batch = collator([sample])
+    except Exception as exc:
+        raise RuntimeError("Collator preflight failed while building a sample batch.") from exc
+
+    input_ids = batch.get("input_ids")
+    labels = batch.get("labels")
+    if not isinstance(input_ids, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        raise RuntimeError(
+            "Collator preflight failed: expected tensor fields 'input_ids' and 'labels' in sample batch."
+        )
+    if input_ids.ndim != 2 or labels.ndim != 2:
+        raise RuntimeError(
+            "Collator preflight failed: expected 2D [B,S] tensors for input_ids/labels, "
+            f"got shapes input_ids={tuple(input_ids.shape)}, labels={tuple(labels.shape)}."
+        )
+    active_tokens = _count_input_tokens_for_batch(batch)
+    if active_tokens <= 0:
+        raise RuntimeError("Sample batch preflight failed: active token count is zero.")
+
+    try:
+        disc_config, gen_config = build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=tokenizer,
+            max_position_embeddings=int(data_cfg.max_seq_length),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Backbone config preflight failed. Check model/backbone/tokenizer settings and vocab alignment options."
+        ) from exc
+
+    return {
+        "status": "ok",
+        "output_dir": str(output_dir),
+        "resume_checkpoint": str(ckpt) if ckpt is not None else None,
+        "effective_compile_scope": str(compile_scope) if compile_enabled else None,
+        "mixed_precision": str(mixed_precision),
+        "sample_batch_shape": tuple(int(x) for x in input_ids.shape),
+        "sample_active_tokens": float(active_tokens),
+        "tokenizer_vocab_size": int(len(tokenizer)),
+        "discriminator_vocab_size": int(disc_config.vocab_size),
+        "generator_vocab_size": int(gen_config.vocab_size),
+    }
+
+
 def _token_weighted_micro_objective(
     *,
     gen_loss: torch.Tensor,

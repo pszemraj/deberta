@@ -39,6 +39,12 @@ deberta train configs/pretrain_rope_fineweb_edu.yaml \
   --output-dir runs/deberta_rope_single_gpu
 ```
 
+Preflight validation only (no training side effects):
+
+```bash
+deberta train configs/pretrain_rope_fineweb_edu.yaml --dry-run
+```
+
 Single-GPU export:
 
 ```bash

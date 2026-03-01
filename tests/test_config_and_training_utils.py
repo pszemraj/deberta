@@ -89,6 +89,7 @@ from deberta.training.pretrain import (
     _token_weighted_micro_objective,
     _upload_wandb_original_config,
     _write_export_readme,
+    run_pretraining_dry_run,
 )
 
 
@@ -2654,6 +2655,53 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
     assert seen["config_path"] == cfg_path
 
 
+def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("run_pretraining should not be called for --dry-run")
+
+    def _fake_dry_run(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+        return {
+            "output_dir": "runs/demo",
+            "resume_checkpoint": None,
+            "effective_compile_scope": "ffn",
+            "sample_batch_shape": (1, 8),
+            "sample_active_tokens": 8.0,
+            "tokenizer_vocab_size": 32000,
+        }
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    monkeypatch.setattr(cli_mod, "run_pretraining_dry_run", _fake_dry_run)
+
+    cli_mod.main(
+        [
+            "train",
+            "--dataset_name",
+            "HuggingFaceFW/fineweb-edu",
+            "--max_steps",
+            "5",
+            "--dry-run",
+        ]
+    )
+    assert "train_cfg" in seen
+    assert int(seen["train_cfg"].max_steps) == 5
+
+
+def test_train_parser_accepts_dry_run_flag():
+    parser = cli_mod._build_main_parser()
+    ns = parser.parse_args(
+        ["train", "--dataset_name", "HuggingFaceFW/fineweb-edu", "--max_steps", "5", "--dry-run"]
+    )
+    assert ns.command == "train"
+    assert ns.dry_run is True
+
+
 def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.MonkeyPatch):
     seen: dict[str, Any] = {}
 
@@ -2708,6 +2756,30 @@ def test_validate_data_config_rejects_conflicting_sources():
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 streaming=False,
             )
+        )
+
+
+def test_validate_train_config_rejects_overwrite_with_resume_conflict():
+    with pytest.raises(ValueError, match="cannot be combined with train.resume_from_checkpoint"):
+        validate_train_config(
+            TrainConfig(
+                overwrite_output_dir=True,
+                resume_from_checkpoint="auto",
+            )
+        )
+
+
+def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Path):
+    out_dir = tmp_path / "run"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "marker.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Output directory exists and is not empty"):
+        run_pretraining_dry_run(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=TrainConfig(output_dir=str(out_dir), overwrite_output_dir=False, max_steps=5),
+            config_path=None,
         )
 
 

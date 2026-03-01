@@ -38,7 +38,7 @@ from deberta.config import (
 )
 from deberta.export_cli import add_export_arguments, namespace_to_export_config, run_export
 from deberta.io_utils import load_json_mapping
-from deberta.training import run_pretraining
+from deberta.training import run_pretraining, run_pretraining_dry_run
 
 
 def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -256,6 +256,14 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     _add_dataclass_flags(train, ModelConfig, group_name="Model")
     _add_dataclass_flags(train, DataConfig, group_name="Data")
     _add_dataclass_flags(train, TrainConfig, group_name="Train")
+    train.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run non-destructive preflight checks (config validation, output/resume checks, "
+            "tokenizer+dataset+collator probe, backbone-config build) and exit without training."
+        ),
+    )
 
 
 def _build_export_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -375,6 +383,25 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
     validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+
+    if bool(getattr(ns, "dry_run", False)):
+        report = run_pretraining_dry_run(
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            config_path=cfg_path,
+        )
+        summary = (
+            "Dry-run preflight OK: "
+            f"output_dir={report['output_dir']}, "
+            f"resume_checkpoint={report['resume_checkpoint']}, "
+            f"effective_compile_scope={report['effective_compile_scope']}, "
+            f"sample_batch_shape={report['sample_batch_shape']}, "
+            f"sample_active_tokens={report['sample_active_tokens']}, "
+            f"tokenizer_vocab_size={report['tokenizer_vocab_size']}."
+        )
+        print(summary)
+        return
 
     run_pretraining(
         model_cfg=model_cfg,

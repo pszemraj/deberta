@@ -1373,6 +1373,11 @@ def validate_train_config(cfg: TrainConfig) -> None:
         cfg.output_dir = None
     if not str(cfg.project_name).strip():
         raise ValueError("train.project_name must be non-empty.")
+    if bool(cfg.overwrite_output_dir) and bool(cfg.resume_from_checkpoint):
+        raise ValueError(
+            "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
+            "Overwrite would delete checkpoints before resume."
+        )
 
     if int(cfg.max_steps) <= 0:
         raise ValueError("train.max_steps must be > 0.")
