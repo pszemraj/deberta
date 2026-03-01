@@ -1044,7 +1044,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
 
 
-def test_run_pretraining_warns_and_tracks_zero_token_weighted_windows(
+def test_run_pretraining_warns_and_excludes_zero_token_weighted_metrics_from_trackers_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     class _TrackingAccelerator(FakeAccelerator):
@@ -1106,10 +1106,174 @@ def test_run_pretraining_warns_and_tracks_zero_token_weighted_windows(
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
     metrics = step_rows[-1]
-    assert metrics["zero_gen_window_total"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert metrics["zero_disc_window_total"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert metrics["zero_gen_window_since_log"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert metrics["zero_disc_window_since_log"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert "zero_gen_window_total" not in metrics
+    assert "zero_disc_window_total" not in metrics
+    assert "zero_gen_window_since_log" not in metrics
+    assert "zero_disc_window_since_log" not in metrics
+
+    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    assert not metrics_path.exists()
+
+
+def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_debug_metrics_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TrackingAccelerator(FakeAccelerator):
+        last_instance: _TrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            _TrackingAccelerator.last_instance = self
+
+    class _ScalarLossRTD(SimpleRTD):
+        def forward(self, **kwargs: Any) -> Any:
+            del kwargs
+            t = self.weight.sum() * 0.0 + 1.0
+            return types.SimpleNamespace(
+                loss=t,
+                gen_loss=t.detach(),
+                disc_loss=t.detach(),
+                disc_accuracy=t.detach(),
+                gen_token_count=torch.tensor(1.0),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(1.0),
+                gen_loss_raw=t,
+                disc_loss_raw=t,
+            )
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_TrackingAccelerator,
+        rtd_cls=_ScalarLossRTD,
+        extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="tensorboard",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=True,
+        debug_metrics=True,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    accel = _TrackingAccelerator.last_instance
+    assert accel is not None
+    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+    assert step_rows
+    metrics = step_rows[-1]
+    assert "zero_gen_window_total" not in metrics
+    assert "zero_disc_window_total" not in metrics
+    assert "zero_gen_window_since_log" not in metrics
+    assert "zero_disc_window_since_log" not in metrics
+
+    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    assert metrics_path.exists()
+    with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f.read().splitlines()]
+    assert rows
+    debug_rows = [row for row in rows if bool(row.get("debug_metrics"))]
+    assert debug_rows
+    last = debug_rows[-1]
+    assert int(last["step"]) == 1
+    assert last["debug_metrics_source_env"] is False
+    assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+
+
+def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_deberta_debug_env_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TrackingAccelerator(FakeAccelerator):
+        last_instance: _TrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            _TrackingAccelerator.last_instance = self
+
+    class _ScalarLossRTD(SimpleRTD):
+        def forward(self, **kwargs: Any) -> Any:
+            del kwargs
+            t = self.weight.sum() * 0.0 + 1.0
+            return types.SimpleNamespace(
+                loss=t,
+                gen_loss=t.detach(),
+                disc_loss=t.detach(),
+                disc_accuracy=t.detach(),
+                gen_token_count=torch.tensor(1.0),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(1.0),
+                gen_loss_raw=t,
+                disc_loss_raw=t,
+            )
+
+    monkeypatch.setenv("DEBERTA_DEBUG", "1")
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_TrackingAccelerator,
+        rtd_cls=_ScalarLossRTD,
+        extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="tensorboard",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=True,
+        debug_metrics=False,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    accel = _TrackingAccelerator.last_instance
+    assert accel is not None
+    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+    assert step_rows
+    metrics = step_rows[-1]
+    assert "zero_gen_window_total" not in metrics
+    assert "zero_disc_window_total" not in metrics
+    assert "zero_gen_window_since_log" not in metrics
+    assert "zero_disc_window_since_log" not in metrics
+
+    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    assert metrics_path.exists()
+    with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f.read().splitlines()]
+    assert rows
+    debug_rows = [row for row in rows if bool(row.get("debug_metrics"))]
+    assert debug_rows
+    last = debug_rows[-1]
+    assert int(last["step"]) == 1
+    assert last["debug_metrics_source_env"] is True
+    assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
 
 
 def test_run_pretraining_compiles_generator_and_discriminator(

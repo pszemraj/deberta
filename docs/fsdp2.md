@@ -164,6 +164,8 @@ Step logs and tracker metrics prioritize signal over mostly-constant counters.
 - primary scalar metrics: `loss`, `gen_loss`, `disc_loss`, `disc_acc`, `lr`
 - throughput/scale metrics: `input_tokens_per_sec`, `input_tokens_seen`
 - noisy low-information counters (for example per-step `gen_tok`/`disc_tok`) are intentionally excluded from periodic logs
+- token-weighted GA zero-window counters (`zero_*`) are never sent to trackers/W&B; they are written only to
+  `<output_dir>/metrics.jsonl.gz` when either `train.debug_metrics=true` or `DEBERTA_DEBUG=1`
 
 ## Interruption and Crash Handling
 
