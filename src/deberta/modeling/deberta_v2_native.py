@@ -771,7 +771,10 @@ class DebertaV2Embeddings(nn.Module):
             else:
                 m = m[:, 0]
         if m.ndim == 3:
-            m = torch.diagonal(m, dim1=-2, dim2=-1)
+            if m.shape[-2] == 1:
+                m = m[:, 0, :]
+            else:
+                m = torch.diagonal(m, dim1=-2, dim2=-1)
         if m.ndim != 2:
             raise ValueError(f"mask must be rank-2/3/4 for embeddings; got rank={m.ndim}")
         if m.shape[-1] != seq_len:

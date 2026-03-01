@@ -836,6 +836,83 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     assert replay_calls["next"] == 0
 
 
+def test_run_pretraining_logs_window_averaged_rtd_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TrackingAccelerator(FakeAccelerator):
+        last_instance: _TrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            _TrackingAccelerator.last_instance = self
+
+    class _WindowMetricRTD(SimpleRTD):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._call_idx = 0
+
+        def forward(self, **kwargs: Any) -> Any:
+            del kwargs
+            self._call_idx += 1
+            t = self.weight * 0.0 + 1.0
+            if self._call_idx % 2 == 1:
+                gen_loss, disc_loss, disc_acc = 1.0, 10.0, 0.2
+                gen_tokens, disc_tokens, disc_pos = 1.0, 10.0, 7.0
+            else:
+                gen_loss, disc_loss, disc_acc = 9.0, 2.0, 0.8
+                gen_tokens, disc_tokens, disc_pos = 9.0, 2.0, 1.0
+            return types.SimpleNamespace(
+                loss=t,
+                gen_loss=torch.tensor(gen_loss, dtype=torch.float32),
+                disc_loss=torch.tensor(disc_loss, dtype=torch.float32),
+                disc_accuracy=torch.tensor(disc_acc, dtype=torch.float32),
+                gen_token_count=torch.tensor(gen_tokens, dtype=torch.float32),
+                disc_token_count=torch.tensor(disc_tokens, dtype=torch.float32),
+                disc_positive_count=torch.tensor(disc_pos, dtype=torch.float32),
+                gen_loss_raw=t,
+                disc_loss_raw=t,
+            )
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_TrackingAccelerator,
+        rtd_cls=_WindowMetricRTD,
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="tensorboard",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    accel = _TrackingAccelerator.last_instance
+    assert accel is not None
+    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+    assert step_rows
+    metrics = step_rows[-1]
+    assert metrics["gen_loss"] == pytest.approx(8.2, rel=0.0, abs=1e-6)
+    assert metrics["disc_loss"] == pytest.approx(104.0 / 12.0, rel=0.0, abs=1e-6)
+    assert metrics["disc_acc"] == pytest.approx(0.3, rel=0.0, abs=1e-6)
+    assert metrics["gen_token_count"] == pytest.approx(10.0, rel=0.0, abs=1e-6)
+    assert metrics["disc_token_count"] == pytest.approx(12.0, rel=0.0, abs=1e-6)
+    assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
+
+
 def test_run_pretraining_compiles_generator_and_discriminator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1880,6 +1957,19 @@ def test_attention_mask_to_active_tokens_uses_diagonal_for_4d_no_pad():
         pad_token_id=None,
     )
     expected = torch.tensor([[True, True, False]], dtype=torch.bool)
+    assert torch.equal(active, expected)
+
+
+def test_attention_mask_to_active_tokens_handles_4d_broadcast_no_pad():
+    input_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    # Broadcast keep mask shape (B,1,1,S).
+    broadcast_keep = torch.tensor([[[[True, True, False, False]]]], dtype=torch.bool)
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=broadcast_keep,
+        pad_token_id=None,
+    )
+    expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
     assert torch.equal(active, expected)
 
 

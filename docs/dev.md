@@ -92,3 +92,4 @@ Future: replace dense `(B,S,S)` path with `flex_attention` block-sparse path (se
 ## TODOs
 
 - Add an export-time codegen path for RoPE checkpoints that starts from official HF DeBERTa modeling/configuration sources, applies this repo's RoPE/RMSNorm/SwiGLU diffs, and writes generated modeling files into the export directory with `auto_map` metadata so `AutoModel.from_pretrained(...)` can work without manual custom-code setup.
+- Evaluate optional SDPA/flash-compatible attention kernels for `model.backbone_type=hf_deberta_v2` so this path can benefit from the same kernel-policy controls used by RoPE runs.

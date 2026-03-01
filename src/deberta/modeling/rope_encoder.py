@@ -235,8 +235,9 @@ class DebertaRoPESelfAttention(nn.Module):
                 query_keep = key_keep
             elif mask.ndim == 3:
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
-                # The mask contract guarantees diagonal=True for ALL positions (including
-                # pad/dead rows), so no per-layer dead-row patching is needed.
+                # Diagonal encodes query activity: active rows are True, inactive/pad rows
+                # are False. Inactive rows still carry a single keep edge to CLS to avoid
+                # all-False SDPA rows.
                 pair_keep = mask
                 query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
 

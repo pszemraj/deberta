@@ -1689,8 +1689,10 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(1, 8), dtype=torch.long)
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=mask_2d).last_hidden_state
+        out_broadcast = model(input_ids=input_ids, attention_mask=attn_mask_4d).last_hidden_state
     assert out.shape == (1, 8, 32)
     assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, out_broadcast, rtol=0.0, atol=0.0)
 
     # Broadcast mask must produce identical output to the old dense (B,1,S,S) expansion.
     mask_dense = (mask_2d.bool()[:, :, None] & mask_2d.bool()[:, None, :]).unsqueeze(1)

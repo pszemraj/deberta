@@ -245,6 +245,7 @@ class SimpleRTD(torch.nn.Module):
             disc_accuracy=t.detach(),
             gen_token_count=torch.tensor(1.0),
             disc_token_count=torch.tensor(1.0),
+            disc_positive_count=torch.tensor(1.0),
             gen_loss_raw=t,
             disc_loss_raw=t,
         )

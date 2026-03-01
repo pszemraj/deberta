@@ -82,6 +82,8 @@ def attention_mask_to_active_tokens(
         if pad_token_id is not None:
             return input_ids.ne(int(pad_token_id))
         squeezed = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
+        if squeezed.shape[-2] == 1:
+            return squeezed[:, 0, :]
         return torch.diagonal(squeezed, dim1=-2, dim2=-1)
     raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
 
@@ -300,6 +302,7 @@ class RTDOutput:
     disc_accuracy: torch.Tensor
     gen_token_count: torch.Tensor
     disc_token_count: torch.Tensor
+    disc_positive_count: torch.Tensor
     gen_loss_raw: torch.Tensor
     disc_loss_raw: torch.Tensor
 
@@ -703,6 +706,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         disc_pred = disc_logits.gt(0)
         disc_true = disc_labels.gt(0.5)
+        disc_positive_count = (disc_true.to(dtype=torch.float32) * disc_active_f).sum()
         correct = (disc_pred == disc_true).to(dtype=torch.float32) * disc_active_f
         disc_acc = correct.sum() / disc_denom
 
@@ -720,6 +724,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             disc_accuracy=disc_acc.detach(),
             gen_token_count=gen_token_count.detach(),
             disc_token_count=disc_token_count.detach(),
+            disc_positive_count=disc_positive_count.detach(),
             gen_loss_raw=gen_loss,
             disc_loss_raw=disc_loss,
         )

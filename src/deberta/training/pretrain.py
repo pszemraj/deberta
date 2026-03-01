@@ -2026,6 +2026,12 @@ def run_pretraining(
 
             out = None
             loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            gen_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            disc_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            disc_acc_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            gen_token_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            disc_token_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            disc_positive_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             did_optimizer_step = False
             skipped_window_due_nonfinite = False
             nonfinite_reason: str | None = None
@@ -2128,6 +2134,16 @@ def run_pretraining(
                         )
                         optimizer.zero_grad(set_to_none=True)
                         break
+                    micro_gen_tokens = out.gen_token_count.detach().float()
+                    micro_disc_tokens = out.disc_token_count.detach().float()
+                    gen_token_count_window = gen_token_count_window + micro_gen_tokens
+                    disc_token_count_window = disc_token_count_window + micro_disc_tokens
+                    disc_positive_count_window = (
+                        disc_positive_count_window + out.disc_positive_count.detach().float()
+                    )
+                    gen_loss_num = gen_loss_num + out.gen_loss.detach().float() * micro_gen_tokens
+                    disc_loss_num = disc_loss_num + out.disc_loss.detach().float() * micro_disc_tokens
+                    disc_acc_num = disc_acc_num + out.disc_accuracy.detach().float() * micro_disc_tokens
                     accelerator.backward(backward_loss)
 
                 if is_sync_step:
@@ -2364,13 +2380,49 @@ def run_pretraining(
                         if hasattr(lr_scheduler, "get_last_lr")
                         else float("nan")
                     )
+                    weighted_metrics = torch.stack(
+                        [
+                            gen_loss_num,
+                            gen_token_count_window,
+                            disc_loss_num,
+                            disc_acc_num,
+                            disc_token_count_window,
+                            disc_positive_count_window,
+                        ]
+                    )
+                    weighted_metrics = accelerator.reduce(weighted_metrics, reduction="sum")
+                    global_gen_loss_num = float(weighted_metrics[0].item())
+                    global_gen_tokens = float(weighted_metrics[1].item())
+                    global_disc_loss_num = float(weighted_metrics[2].item())
+                    global_disc_acc_num = float(weighted_metrics[3].item())
+                    global_disc_tokens = float(weighted_metrics[4].item())
+                    global_disc_positive = float(weighted_metrics[5].item())
+                    gen_loss_window = (
+                        global_gen_loss_num / global_gen_tokens if global_gen_tokens > 0.0 else float("nan")
+                    )
+                    disc_loss_window = (
+                        global_disc_loss_num / global_disc_tokens
+                        if global_disc_tokens > 0.0
+                        else float("nan")
+                    )
+                    disc_acc_window = (
+                        global_disc_acc_num / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
+                    )
+                    disc_pos_frac = (
+                        global_disc_positive / global_disc_tokens
+                        if global_disc_tokens > 0.0
+                        else float("nan")
+                    )
                     metrics = {
                         "step": global_step,
                         "lr": lr,
                         "loss": _mean(loss_for_metrics),
-                        "gen_loss": _mean(out.gen_loss),
-                        "disc_loss": _mean(out.disc_loss),
-                        "disc_acc": _mean(out.disc_accuracy),
+                        "gen_loss": float(gen_loss_window),
+                        "disc_loss": float(disc_loss_window),
+                        "disc_acc": float(disc_acc_window),
+                        "gen_token_count": float(global_gen_tokens),
+                        "disc_token_count": float(global_disc_tokens),
+                        "disc_pos_frac": float(disc_pos_frac),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
                     }
