@@ -787,6 +787,48 @@ def _compile_backbones_for_scope(
     return compiled_targets
 
 
+def _dtype_for_mixed_precision(mode: str) -> torch.dtype:
+    """Map configured mixed-precision mode to runtime compute dtype.
+
+    :param str mode: Effective mixed-precision mode.
+    :return torch.dtype: Expected activation dtype used in forward passes.
+    """
+    normalized = str(mode).strip().lower()
+    if normalized == "bf16":
+        return torch.bfloat16
+    if normalized in {"fp16", "float16"}:
+        return torch.float16
+    return torch.float32
+
+
+def _prefill_rotary_caches_for_compile(
+    *,
+    model: torch.nn.Module,
+    seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> int:
+    """Prefill rotary caches on all RoPE attention modules before compile.
+
+    :param torch.nn.Module model: Unwrapped RTD model.
+    :param int seq_len: Maximum runtime sequence length.
+    :param torch.device device: Runtime device.
+    :param torch.dtype dtype: Runtime compute dtype.
+    :return int: Number of rotary modules prefilled.
+    """
+    if int(seq_len) <= 0:
+        return 0
+
+    prefilled = 0
+    for module in model.modules():
+        rope = getattr(module, "rope", None)
+        prefill = getattr(rope, "prefill_cache", None)
+        if callable(prefill):
+            prefill(int(seq_len), device=device, dtype=dtype)
+            prefilled += 1
+    return prefilled
+
+
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
     """Return optimizer kwargs enabling fused AdamW when available.
 
@@ -1808,6 +1850,20 @@ def run_pretraining(
                 pass
 
             unwrapped = unwrap_compiled_model(accelerator, model)
+            compile_scope_key = str(compile_scope).strip().lower()
+            if compile_scope_key in {"backbones", "encoder", "gen_encoder", "disc_encoder"}:
+                prefilled_rotary = _prefill_rotary_caches_for_compile(
+                    model=unwrapped,
+                    seq_len=int(data_cfg.max_seq_length),
+                    device=torch.device(getattr(accelerator, "device", torch.device("cpu"))),
+                    dtype=_dtype_for_mixed_precision(mixed_precision),
+                )
+                if prefilled_rotary > 0:
+                    logger.info(
+                        "Prefilled rotary caches for %d module(s) at seq_len=%d before torch.compile.",
+                        int(prefilled_rotary),
+                        int(data_cfg.max_seq_length),
+                    )
             compiled_targets = _compile_backbones_for_scope(
                 unwrapped_model=unwrapped,
                 compile_scope=compile_scope,

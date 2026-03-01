@@ -2007,19 +2007,24 @@ def test_rope_config_rejects_unknown_ffn_type():
         _ = DebertaRoPEConfig(ffn_type="glu")
 
 
-def test_rotary_compile_mode_bypasses_stateful_cache(monkeypatch):
+def test_rotary_compile_mode_requires_prefilled_cache(monkeypatch):
     from deberta.modeling import rope as rope_mod
 
     rope = rope_mod.RotaryEmbedding(dim=8, base=10_000.0)
     device = torch.device("cpu")
 
     monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: True)
+    with pytest.raises(RuntimeError, match="not prefilled"):
+        _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
+
+    rope.prefill_cache(8, device=device, dtype=torch.float32)
     cos1, sin1 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     cos2, sin2 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
+    assert cos1.data_ptr() == cos2.data_ptr()
+    assert sin1.data_ptr() == sin2.data_ptr()
 
-    assert rope._cache is None
-    assert cos1.data_ptr() != cos2.data_ptr()
-    assert sin1.data_ptr() != sin2.data_ptr()
+    with pytest.raises(RuntimeError, match="too short"):
+        _ = rope.get_cos_sin(9, device=device, dtype=torch.float32)
 
     monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: False)
     _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)

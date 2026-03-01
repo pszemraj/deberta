@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deberta.modeling.activations import get_act_fn
+from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.norm import RMSNorm
 
 
@@ -68,7 +69,7 @@ def attention_mask_to_active_tokens(
             return torch.ones_like(input_ids, dtype=torch.bool)
         return input_ids.ne(int(pad_token_id))
 
-    mask = attention_mask.to(torch.bool)
+    mask = normalize_keep_mask(attention_mask)
     if mask.ndim == 2:
         return mask
     if mask.ndim == 3:

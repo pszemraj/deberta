@@ -71,6 +71,21 @@ class RotaryEmbedding(nn.Module):
         self._cache_device: torch.device | None = None
         self._cache_dtype: torch.dtype | None = None
 
+    def prefill_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> None:
+        """Prefill module-local cache for compile-safe slice-only access.
+
+        :param int seq_len: Maximum sequence length to cache.
+        :param torch.device device: Target device.
+        :param torch.dtype dtype: Target dtype.
+        :raises ValueError: If ``seq_len`` is not positive.
+        :return None: This method mutates module cache state.
+        """
+        if int(seq_len) <= 0:
+            raise ValueError(f"seq_len must be > 0 for rotary cache prefill, got {seq_len}.")
+        self._cache = self._build_cache(int(seq_len), device=device, dtype=dtype)
+        self._cache_device = device
+        self._cache_dtype = dtype
+
     def _build_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> RotaryCache:
         """Build cosine/sine cache tensors.
 
@@ -96,11 +111,21 @@ class RotaryEmbedding(nn.Module):
         :param torch.dtype dtype: Target dtype.
         :return tuple[torch.Tensor, torch.Tensor]: Cosine and sine tensors.
         """
-        # Avoid mutating module-side cache tensors while tracing/compiling.
-        # This prevents cudagraph storage reuse errors across iterations.
+        # Under compile, this must be a pure slice over an already-prefilled
+        # module cache to avoid per-step allocations and storage mutation.
         if _is_torch_compiling():
-            fresh = self._build_cache(seq_len, device=device, dtype=dtype)
-            return fresh.cos, fresh.sin
+            if self._cache is None or self._cache_device != device or self._cache_dtype != dtype:
+                raise RuntimeError(
+                    "Rotary cache is not prefilled for compiled execution. "
+                    "Call RotaryEmbedding.prefill_cache(max_seq_len, device, dtype) before torch.compile."
+                )
+            if self._cache.cos.shape[0] < seq_len:
+                raise RuntimeError(
+                    "Compiled rotary cache is too short for requested sequence length: "
+                    f"cached={int(self._cache.cos.shape[0])}, requested={int(seq_len)}. "
+                    "Prefill cache with the maximum runtime sequence length before compile."
+                )
+            return self._cache.cos[:seq_len], self._cache.sin[:seq_len]
 
         if (
             self._cache is None

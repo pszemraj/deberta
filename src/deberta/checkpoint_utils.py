@@ -132,9 +132,10 @@ def canonical_compile_state_key(key: str) -> str:
     """Return a canonical state-dict key with compile wrappers removed.
 
     :param str key: Raw state-dict key.
-    :return str: Canonical key where ``._orig_mod`` segments are removed.
+    :return str: Canonical key where ``_orig_mod`` path segments are removed.
     """
-    return str(key).replace("._orig_mod", "")
+    parts = [part for part in str(key).split(".") if part and part != "_orig_mod"]
+    return ".".join(parts)
 
 
 def canonicalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

@@ -112,6 +112,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
     "microsoft/deberta-v3",
     "microsoft/mdeberta-v3",
 )
+_DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
 RUN_CONFIG_SCHEMA_VERSION = 2
@@ -1331,6 +1332,20 @@ def validate_data_config(cfg: DataConfig) -> None:
         )
     if not bool(cfg.pack_sequences) and bool(cfg.block_cross_document_attention):
         raise ValueError("data.block_cross_document_attention=true requires data.pack_sequences=true.")
+    if (
+        bool(cfg.pack_sequences)
+        and bool(cfg.block_cross_document_attention)
+        and int(cfg.max_seq_length) > int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)
+    ):
+        warnings.warn(
+            "data.block_cross_document_attention builds dense O(S^2) pairwise masks. "
+            f"Configured data.max_seq_length={int(cfg.max_seq_length)} may be expensive; "
+            f"consider reducing sequence length or disabling data.block_cross_document_attention "
+            f"until sparse/segment-aware attention support lands (warning threshold: "
+            f"{int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)}).",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def validate_train_config(cfg: TrainConfig) -> None:

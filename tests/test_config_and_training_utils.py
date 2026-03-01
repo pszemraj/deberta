@@ -45,6 +45,7 @@ from deberta.config import (
 )
 from deberta.export_cli import add_export_arguments
 from deberta.modeling.builder import build_backbone_configs
+from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
@@ -457,6 +458,9 @@ def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
     assert canonical_compile_state_key("generator._orig_mod.encoder.layer.0._orig_mod.weight") == (
         "generator.encoder.layer.0.weight"
     )
+    assert canonical_compile_state_key("_orig_mod.generator._orig_mod.encoder.weight") == (
+        "generator.encoder.weight"
+    )
 
 
 def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mod_keys(
@@ -472,6 +476,31 @@ def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mo
 
     original = {k: v.detach().clone() for k, v in model.state_dict().items()}
     remapped = {key.replace("0.", "0._orig_mod."): value.detach().clone() for key, value in original.items()}
+    torch.save(remapped, checkpoint / "model.bin")
+
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.zero_()
+
+    stats = load_model_state_with_compile_key_remap(model, checkpoint)
+    assert stats == {"matched": 2}
+    assert torch.allclose(model[0].weight, original["0.weight"])
+    assert torch.allclose(model[0].bias, original["0.bias"])
+
+
+def test_load_model_state_with_compile_key_remap_matches_top_level_orig_mod_keys(
+    tmp_path: Path,
+) -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        model[0].weight.fill_(0.5)
+        model[0].bias.fill_(0.125)
+
+    original = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    remapped = {f"_orig_mod.{key}": value.detach().clone() for key, value in original.items()}
     torch.save(remapped, checkpoint / "model.bin")
 
     with torch.no_grad():
@@ -2130,6 +2159,21 @@ def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_3d_
     assert torch.equal(active, expected)
 
 
+def test_normalize_keep_mask_rejects_floating_masks() -> None:
+    with pytest.raises(ValueError, match="Floating-point masks are ambiguous"):
+        _ = normalize_keep_mask(torch.tensor([[0.0, -1.0]], dtype=torch.float32))
+
+
+def test_attention_mask_to_active_tokens_rejects_floating_masks() -> None:
+    input_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+    with pytest.raises(ValueError, match="Floating-point masks are ambiguous"):
+        _ = attention_mask_to_active_tokens(
+            input_ids=input_ids,
+            attention_mask=torch.tensor([[0.0, -1.0, 0.0]], dtype=torch.float32),
+            pad_token_id=None,
+        )
+
+
 def test_attention_mask_to_active_tokens_uses_diagonal_not_any_for_3d_no_pad():
     """Without pad_token_id, 3D fallback must use diagonal, not any(dim=-1).
 
@@ -2685,6 +2729,18 @@ def test_validate_data_config_rejects_doc_blocking_when_not_packed():
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=False,
                 block_cross_document_attention=True,
+            )
+        )
+
+
+def test_validate_data_config_warns_on_long_context_dense_doc_blocking():
+    with pytest.warns(UserWarning, match="dense O\\(S\\^2\\) pairwise masks"):
+        validate_data_config(
+            DataConfig(
+                dataset_name="HuggingFaceFW/fineweb-edu",
+                pack_sequences=True,
+                block_cross_document_attention=True,
+                max_seq_length=4096,
             )
         )
 

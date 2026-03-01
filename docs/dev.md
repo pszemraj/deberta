@@ -42,6 +42,7 @@ Standard multi-head attention (no disentangled position bias). Position encoded 
 - 3D mask (`B,S,S`): doc-blocking pairwise keep-mask. Built on-device from `doc_ids` by `_build_doc_block_mask()`.
   - Diagonal contract: diagonal encodes query activity (`True` for active, `False` for pad/inactive).
   - SDPA safety: inactive queries get one keep edge to CLS key so rows are never all-`False`.
+- Floating-point attention masks are rejected at runtime. Callers must pass bool/integer keep masks to avoid ambiguous semantics (`0/1` keep masks vs additive `0/-inf` masks).
 
 ### HF DeBERTa-v2 backbone
 
@@ -69,6 +70,7 @@ Future: replace dense `(B,S,S)` path with `flex_attention` block-sparse path (se
 - FFN-only compile targets:
   - HF DeBERTa-v2: `encoder.layer[i].intermediate` and `.output`
   - RoPE: `encoder.layers[i].mlp`
+- When compile scope includes RoPE attention (`backbones`/`encoder`), rotary cos/sin caches are prefilled before `torch.compile` and compiled forwards use slice-only access. Missing/undersized compile-time caches now fail fast.
 
 ## Nonfinite Recovery
 
@@ -125,6 +127,10 @@ Full pipeline audit covering forward pass faithfulness, loss computation, attent
 9. **Flash SDPA + doc-blocking incompatibility** — Enforced by config validation (`validate_training_workflow_options`), not runtime assertion. If validation is bypassed, PyTorch's SDPA dispatch would silently fall back to a non-flash kernel.
 10. **KEEL topology has no separate final output norm** — The last layer's `outer_norm2` serves this role. If KEEL is meant to match pure pre-norm + final-norm behavior exactly, a dedicated final norm would be needed. Current behavior is internally consistent.
 11. **Adam epsilon silently raised to 1e-6 under bf16** — `_build_optimizer()` overrides `adam_epsilon < 1e-6` to `1e-6` for bf16 stability. Logged but could surprise hyperparameter sweeps targeting very small epsilon values.
+12. **Dense doc-blocking is O(S^2)** — `_build_doc_block_mask()` materializes `(B,S,S)` keep masks. Config validation now warns when `data.pack_sequences=true`, `data.block_cross_document_attention=true`, and `data.max_seq_length > 2048`, but this remains expensive for long contexts.
+13. **N-gram masking implementation is Python-heavy** — `_mask_tokens_ngram()` still relies on per-sample token-string conversion and loop-based span assembly. Correctness is acceptable, but throughput can become dataloader-bound at scale.
+14. **Grad-norm telemetry computes full-model norms every sync step** — this is intentional for now to maximize non-finite detection, but it adds per-step overhead and should become configurable once default stability policy is finalized.
+15. **`suppress(Exception)` usage is intentionally broad in non-critical paths** — useful for crash-safe logging/cleanup, but a follow-up pass should narrow exception scopes and add explicit one-shot warnings where silent fallback is still too opaque.
 
 ## HF DeBERTa-v2 Modernization Plan (PyTorch 2.9.1+)
 
@@ -173,3 +179,7 @@ Goal: improve HFv2 throughput/memory while keeping DeBERTa-v2 disentangled atten
 ## TODOs
 
 - Add an export-time codegen path for RoPE checkpoints that starts from official HF DeBERTa modeling/configuration sources, applies this repo's RoPE/RMSNorm/SwiGLU diffs, and writes generated modeling files into the export directory with `auto_map` metadata so `AutoModel.from_pretrained(...)` can work without manual custom-code setup.
+- Implement segment-aware/sparse doc-blocking (or FlexAttention varlen equivalent) so packed long-context runs do not require dense `(B,S,S)` masks.
+- Vectorize n-gram masking setup by replacing per-batch `convert_ids_to_tokens()` calls with precomputed continuation-token metadata.
+- Add configurable grad-norm/check cadence (`always`, `on_clip`, `every_n_steps`) with default preserving current safety-first behavior.
+- Audit `suppress(Exception)` callsites and narrow to expected exception types in resume/export correctness paths; keep best-effort behavior only for optional telemetry/cleanup.

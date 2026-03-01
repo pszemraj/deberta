@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from deberta.config import _normalize_hf_attention_kernel
+from deberta.modeling.mask_utils import normalize_keep_mask
 
 try:
     from transformers import DebertaV2Config, PreTrainedModel
@@ -475,7 +476,7 @@ class DisentangledSelfAttention(nn.Module):
             attention_scores = attention_scores + rel_att.float()
 
         if attention_mask is not None:
-            keep_mask = attention_mask.to(dtype=torch.bool)
+            keep_mask = normalize_keep_mask(attention_mask)
             if keep_mask.ndim != 4:
                 raise ValueError(
                     f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
@@ -700,7 +701,7 @@ class ConvLayer(nn.Module):
         out = self.conv(hidden_states.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
 
         if input_mask is not None:
-            keep = input_mask.to(dtype=torch.bool)
+            keep = normalize_keep_mask(input_mask, name="input_mask")
             out = out.masked_fill(~keep.unsqueeze(-1), 0)
 
         out = ACT2FN[self.conv_act](self.dropout(out))
@@ -779,7 +780,7 @@ class DebertaV2Embeddings(nn.Module):
             raise ValueError(f"mask must be rank-2/3/4 for embeddings; got rank={m.ndim}")
         if m.shape[-1] != seq_len:
             m = m[:, :seq_len]
-        return m.to(dtype=torch.bool)
+        return normalize_keep_mask(m)
 
     def forward(
         self,
@@ -904,7 +905,7 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor attention_mask: Input mask tensor.
         :return torch.Tensor: Keep mask ``(B, 1, 1, S)`` or ``(B, 1, S, S)``.
         """
-        mask = attention_mask.to(dtype=torch.bool)
+        mask = normalize_keep_mask(attention_mask)
         if mask.ndim <= 2:
             return mask[:, None, None, :]  # (B,1,1,S) — broadcast across queries
         if mask.ndim == 3:
@@ -921,7 +922,7 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor attention_mask: Raw attention mask.
         :return torch.Tensor: Token keep mask with shape ``(B,S)``.
         """
-        mask = attention_mask.to(dtype=torch.bool)
+        mask = normalize_keep_mask(attention_mask)
         if mask.ndim <= 2:
             return mask
         if mask.ndim == 3:

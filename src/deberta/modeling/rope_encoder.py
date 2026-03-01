@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deberta.modeling.activations import get_act_fn
+from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.norm import RMSNorm
 from deberta.modeling.rope import RotaryEmbedding
 
@@ -222,7 +223,7 @@ class DebertaRoPESelfAttention(nn.Module):
         query_keep: torch.Tensor | None = None
         query_keep_tokens = None
         if attention_mask is not None:
-            mask = attention_mask.to(dtype=torch.bool)
+            mask = normalize_keep_mask(attention_mask)
 
             if mask.ndim == 2:
                 # 2D key mask: attention_mask is 1 for tokens, 0 for pad.
