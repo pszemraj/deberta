@@ -89,7 +89,50 @@ Future: replace dense `(B,S,S)` path with `flex_attention` block-sparse path (se
 
 - `_append_metrics_jsonl_row()` opens/closes gzip per write for crash safety.
 
+## HF DeBERTa-v2 Modernization Plan (PyTorch 2.9.1+)
+
+The branch history already records failed attempts to run full-backbone inductor compile on native HFv2 (`75b4812`, `3878736`, `9d46654`, `829b6ad`) and the current stable fallback (`auto -> ffn`).
+
+Goal: improve HFv2 throughput/memory while keeping DeBERTa-v2 disentangled attention semantics and the v3 RTD+GDES training objective unchanged.
+
+### Phase 0: Baseline + Gates
+
+- [ ] Keep `tools/compile_drift_probe.py` as the mandatory stability gate for any HFv2 compile/kernel change and add fixed presets for `ffn`, `encoder`, and `backbones`.
+- [ ] Add a repeatable HFv2 vs RoPE train-step throughput harness (single-GPU synthetic + one real config slice) and record baseline tokens/sec + peak memory in CI artifacts.
+- [ ] Define hard gates before merge:
+  - no train-mode catastrophic drift vs eager baseline in probe runs
+  - no non-finite spike regression in short RTD training runs
+  - measurable speedup and memory reduction on HFv2 path
+
+### Phase 1: Safe Compile Expansion (No Attention Compile)
+
+- [ ] Keep default `train.torch_compile_scope=auto -> ffn` for HFv2 until all gates pass.
+- [ ] Add an explicit HFv2-safe scope that compiles only non-attention blocks (FFN + selected head/projection modules), leaving `DisentangledSelfAttention` eager.
+- [ ] Add scope-level tests that prove routing is deterministic and rejects unsupported combinations.
+
+### Phase 2: Eager Attention Modernization (Architecture-Preserving)
+
+- [ ] Add a fused QKV projection fast path for the common `query_states is hidden_states` case to reduce projection kernel launches.
+- [ ] Cache relative-position gather indices by `(query_len, key_len, device)` for cached kernels to reduce per-step index construction overhead.
+- [ ] Introduce a numerics policy for HFv2 attention:
+  - default: stable mixed path (matmul in runtime dtype, bias/softmax accumulation in fp32)
+  - fallback: full fp32 score path for pathological runs
+- [ ] Benchmark `dynamic`, `cached_bmm`, and `stable` under the same harness and keep only variants that pass drift + performance gates.
+
+### Phase 3: SDPA-Class Backend Exploration (Opt-In)
+
+- [ ] Prototype a PyTorch 2.9.1+ `flex_attention` backend for HFv2 that preserves C2P/P2C bias semantics exactly.
+- [ ] Keep the backend experimental and opt-in (`model.hf_attention_kernel=flex_experimental`) until parity and drift gates are green.
+- [ ] Validate parity against current stable kernel with fixed-seed forward/backward checks before any training run.
+
+### Phase 4: Rollout Criteria
+
+- [ ] Promote new backend/scope defaults only after:
+  - compile drift probe remains stable across warmup + post-warmup windows
+  - end-to-end RTD loss curves match baseline behavior (no late divergence regime shift)
+  - HFv2 recovers a meaningful portion of the current gap to RoPE on 512/1024 contexts
+- [ ] Keep fallback controls documented and tested (`hf_attention_kernel=stable`, `torch_compile_scope=ffn`) for immediate rollback.
+
 ## TODOs
 
 - Add an export-time codegen path for RoPE checkpoints that starts from official HF DeBERTa modeling/configuration sources, applies this repo's RoPE/RMSNorm/SwiGLU diffs, and writes generated modeling files into the export directory with `auto_map` metadata so `AutoModel.from_pretrained(...)` can work without manual custom-code setup.
-- Evaluate optional SDPA/flash-compatible attention kernels for `model.backbone_type=hf_deberta_v2` so this path can benefit from the same kernel-policy controls used by RoPE runs.
