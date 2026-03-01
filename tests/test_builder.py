@@ -622,6 +622,124 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     assert gen_cfg.attention_probs_dropout_prob == pytest.approx(expected_attn)
 
 
+def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():
+    pytest.importorskip("transformers")
+
+    tokenizer = DummyTokenizer(vocab_size=500)
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        tokenizer_allow_vocab_resize=True,
+        tokenizer_vocab_multiple=128,
+    )
+
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=128,
+    )
+
+    assert len(tokenizer) == 512
+    assert int(disc_cfg.vocab_size) == 512
+    assert int(gen_cfg.vocab_size) == 512
+
+
+def test_build_backbone_configs_scratch_rejects_vocab_growth_without_resize_permission():
+    pytest.importorskip("transformers")
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=True,
+        tokenizer_allow_vocab_resize=False,
+        tokenizer_vocab_target=640,
+    )
+    with pytest.raises(ValueError, match="tokenizer_allow_vocab_resize=false"):
+        _ = builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=500),
+            max_position_embeddings=128,
+        )
+
+
+def test_build_backbone_configs_pretrained_hf_can_auto_grow_tokenizer_to_config_vocab(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    class _FakeAutoConfig:
+        @classmethod
+        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
+            del src
+            return types.SimpleNamespace(
+                vocab_size=512,
+                hidden_dropout_prob=0.1,
+                attention_probs_dropout_prob=0.2,
+                num_hidden_layers=6,
+                hidden_size=768,
+                intermediate_size=3072,
+                num_attention_heads=12,
+            )
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = _FakeAutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    tokenizer = DummyTokenizer(vocab_size=500)
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        discriminator_model_name_or_path="disc",
+        tokenizer_allow_vocab_resize=True,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=128,
+    )
+
+    assert len(tokenizer) == 512
+    assert int(disc_cfg.vocab_size) == 512
+    assert int(gen_cfg.vocab_size) == 512
+
+
+def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_exceeds_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    class _FakeAutoConfig:
+        @classmethod
+        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
+            del src
+            return types.SimpleNamespace(
+                vocab_size=500,
+                hidden_dropout_prob=0.1,
+                attention_probs_dropout_prob=0.2,
+                num_hidden_layers=6,
+                hidden_size=768,
+                intermediate_size=3072,
+                num_attention_heads=12,
+            )
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = _FakeAutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        discriminator_model_name_or_path="disc",
+        tokenizer_allow_vocab_resize=True,
+        tokenizer_vocab_multiple=128,
+    )
+    with pytest.raises(ValueError, match="tokenizer_vocab_multiple"):
+        _ = builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=489),
+            max_position_embeddings=128,
+        )
+
+
 def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
 

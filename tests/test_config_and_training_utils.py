@@ -2539,6 +2539,18 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
     assert cfg.hf_attention_kernel == "stable"
 
 
+def test_validate_model_config_rejects_non_positive_tokenizer_vocab_multiple():
+    cfg = ModelConfig(tokenizer_vocab_multiple=0)
+    with pytest.raises(ValueError, match="tokenizer_vocab_multiple"):
+        validate_model_config(cfg)
+
+
+def test_validate_model_config_rejects_non_positive_tokenizer_vocab_target():
+    cfg = ModelConfig(tokenizer_vocab_target=0)
+    with pytest.raises(ValueError, match="tokenizer_vocab_target"):
+        validate_model_config(cfg)
+
+
 def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
     cfg = ModelConfig(
         backbone_type="rope",

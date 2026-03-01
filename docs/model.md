@@ -51,6 +51,11 @@ Generator-source rule:
 
 - scratch mode (`from_scratch=true`): config `vocab_size` and special token ids are aligned to the tokenizer
 - pretrained mode (`from_scratch=false`): config/tokenizer vocabulary and special ids are validated; mismatches fail fast
+- optional vocab controls:
+  - `model.tokenizer_allow_vocab_resize=true` enables tokenizer growth via `add_tokens(...)`
+  - `model.tokenizer_vocab_target=<N>` requests a minimum tokenizer/model vocab size (`N`)
+  - `model.tokenizer_vocab_multiple=<M>` rounds resolved vocab up to multiple `M` (`1` disables)
+- placeholder growth tokens use the inert pattern `<|deberta_extra_token_{idx}|>`
 
 ## Pretrained RoPE Overrides (`from_scratch=false`)
 

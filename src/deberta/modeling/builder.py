@@ -19,6 +19,7 @@ _SPECIAL_ID_ATTRS = (
     "eos_token_id",
 )
 _COMPONENT_KIND = Literal["discriminator", "generator"]
+_EXTRA_TOKEN_TEMPLATE = "<|deberta_extra_token_{idx}|>"
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,126 @@ def _tokenizer_vocab_size(tokenizer: Any) -> int:
         return int(len(tokenizer))
     except Exception as e:
         raise ValueError("Tokenizer must support len(tokenizer) for vocab-size alignment.") from e
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """Round ``value`` up to ``multiple``.
+
+    :param int value: Input value.
+    :param int multiple: Positive multiple.
+    :return int: Rounded value.
+    """
+    if multiple <= 1:
+        return int(value)
+    remainder = int(value) % int(multiple)
+    if remainder == 0:
+        return int(value)
+    return int(value) + (int(multiple) - remainder)
+
+
+def _resize_tokenizer_to_vocab_size(
+    *,
+    tokenizer: Any,
+    target_size: int,
+    component: _COMPONENT_KIND,
+    allow_resize: bool,
+) -> None:
+    """Grow tokenizer vocabulary to ``target_size`` by adding inert placeholder tokens.
+
+    :param Any tokenizer: Tokenizer instance.
+    :param int target_size: Desired tokenizer vocabulary size.
+    :param str component: Component name for diagnostics.
+    :param bool allow_resize: Whether tokenizer growth is permitted.
+    :raises ValueError: If growth is required but not permitted/available.
+    :raises RuntimeError: If tokenizer growth does not reach the requested size.
+    """
+    current = _tokenizer_vocab_size(tokenizer)
+    if int(target_size) <= int(current):
+        return
+    if not bool(allow_resize):
+        raise ValueError(
+            f"{component} tokenizer vocab ({current}) is smaller than required size ({target_size}), "
+            "but model.tokenizer_allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
+        )
+
+    add_tokens = getattr(tokenizer, "add_tokens", None)
+    if not callable(add_tokens):
+        raise ValueError(
+            f"{component} tokenizer does not support add_tokens(...), cannot grow vocab from "
+            f"{current} to {target_size}."
+        )
+
+    needed = int(target_size) - int(current)
+    extra_tokens = [_EXTRA_TOKEN_TEMPLATE.format(idx=idx) for idx in range(int(current), int(target_size))]
+    added = int(add_tokens(extra_tokens, special_tokens=False))
+    final_size = _tokenizer_vocab_size(tokenizer)
+    if added != needed or final_size != int(target_size):
+        raise RuntimeError(
+            f"Failed to grow {component} tokenizer vocab: needed={needed}, added={added}, "
+            f"final_size={final_size}, target={int(target_size)}."
+        )
+
+
+def _resolve_required_tokenizer_vocab_size(
+    *,
+    current_size: int,
+    model_cfg: ModelConfig,
+    from_scratch: bool,
+    component: _COMPONENT_KIND,
+    config_vocab_size: int | None = None,
+) -> int:
+    """Resolve required tokenizer size from config controls.
+
+    :param int current_size: Current tokenizer size.
+    :param ModelConfig model_cfg: Runtime model config.
+    :param bool from_scratch: Whether run builds backbones from scratch.
+    :param str component: Component name for diagnostics.
+    :param int | None config_vocab_size: Existing config vocab size for pretrained validation.
+    :raises ValueError: If requested size constraints are invalid.
+    :return int: Required tokenizer size.
+    """
+    requested_target = (
+        int(model_cfg.tokenizer_vocab_target) if model_cfg.tokenizer_vocab_target is not None else None
+    )
+    multiple = int(model_cfg.tokenizer_vocab_multiple)
+    desired = int(current_size)
+
+    if requested_target is not None:
+        if requested_target < int(current_size):
+            raise ValueError(
+                f"model.tokenizer_vocab_target ({requested_target}) is smaller than tokenizer size "
+                f"({current_size}) for {component}; shrinking tokenizer vocab is not supported."
+            )
+        desired = max(desired, int(requested_target))
+
+    if not bool(from_scratch):
+        if config_vocab_size is None:
+            raise ValueError(f"{component} config vocab_size is required in pretrained mode.")
+        cfg_vocab = int(config_vocab_size)
+        if int(current_size) > cfg_vocab:
+            raise ValueError(
+                f"Tokenizer/checkpoint vocab mismatch for {component}: tokenizer={int(current_size)}, "
+                f"config={cfg_vocab}. Use a matching tokenizer or checkpoint."
+            )
+        # Optional convenience path: when resize is enabled and no explicit target is provided,
+        # align tokenizer length to checkpoint vocab_size.
+        if requested_target is None and bool(model_cfg.tokenizer_allow_vocab_resize):
+            desired = max(desired, cfg_vocab)
+        if desired > cfg_vocab:
+            raise ValueError(
+                f"Requested tokenizer vocab for {component} ({desired}) exceeds checkpoint config "
+                f"vocab_size ({cfg_vocab})."
+            )
+
+    desired = _round_up_to_multiple(desired, multiple)
+    if not bool(from_scratch):
+        cfg_vocab = int(config_vocab_size)
+        if desired > cfg_vocab:
+            raise ValueError(
+                f"model.tokenizer_vocab_multiple={multiple} rounds {component} tokenizer size to {desired}, "
+                f"which exceeds checkpoint config vocab_size ({cfg_vocab})."
+            )
+    return int(desired)
 
 
 def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSources:
@@ -189,7 +310,7 @@ def _align_or_validate_tokenizer_contract(
     tokenizer: Any,
     *,
     component: _COMPONENT_KIND,
-    from_scratch: bool,
+    model_cfg: ModelConfig,
 ) -> None:
     """Apply tokenizer/config contract policy.
 
@@ -199,10 +320,25 @@ def _align_or_validate_tokenizer_contract(
     :param Any cfg: Target config object.
     :param Any tokenizer: Tokenizer source.
     :param str component: Component name for error messaging.
-    :param bool from_scratch: Whether this run uses random initialization.
+    :param ModelConfig model_cfg: Runtime model configuration.
     """
+    from_scratch = bool(model_cfg.from_scratch)
     tok_vocab = _tokenizer_vocab_size(tokenizer)
+
     if from_scratch:
+        required_vocab = _resolve_required_tokenizer_vocab_size(
+            current_size=tok_vocab,
+            model_cfg=model_cfg,
+            from_scratch=True,
+            component=component,
+        )
+        _resize_tokenizer_to_vocab_size(
+            tokenizer=tokenizer,
+            target_size=required_vocab,
+            component=component,
+            allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+        )
+        tok_vocab = _tokenizer_vocab_size(tokenizer)
         cfg.vocab_size = tok_vocab
         _apply_tokenizer_special_ids(cfg, tokenizer)
         return
@@ -212,9 +348,24 @@ def _align_or_validate_tokenizer_contract(
         raise ValueError(
             f"{component} config is missing vocab_size; cannot validate tokenizer/checkpoint compatibility."
         )
-    if int(cfg_vocab) != tok_vocab:
+    required_vocab = _resolve_required_tokenizer_vocab_size(
+        current_size=tok_vocab,
+        model_cfg=model_cfg,
+        from_scratch=False,
+        component=component,
+        config_vocab_size=int(cfg_vocab),
+    )
+    _resize_tokenizer_to_vocab_size(
+        tokenizer=tokenizer,
+        target_size=required_vocab,
+        component=component,
+        allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+    )
+    tok_vocab = _tokenizer_vocab_size(tokenizer)
+
+    if int(cfg_vocab) != int(tok_vocab):
         raise ValueError(
-            f"Tokenizer/checkpoint vocab mismatch for {component}: tokenizer={tok_vocab}, "
+            f"Tokenizer/checkpoint vocab mismatch for {component}: tokenizer={int(tok_vocab)}, "
             f"config={int(cfg_vocab)}. Use a matching tokenizer or checkpoint."
         )
     _validate_or_fill_special_ids_from_tokenizer(cfg, tokenizer, component=component)
@@ -403,7 +554,7 @@ def _apply_hf_config_normalization(
         cfg,
         tokenizer,
         component=component,
-        from_scratch=bool(model_cfg.from_scratch),
+        model_cfg=model_cfg,
     )
     if model_cfg.hf_max_position_embeddings is not None:
         cfg.max_position_embeddings = int(model_cfg.hf_max_position_embeddings)
@@ -463,7 +614,7 @@ def _apply_rope_config_normalization(
         cfg,
         tokenizer,
         component=component,
-        from_scratch=bool(model_cfg.from_scratch),
+        model_cfg=model_cfg,
     )
     _validate_required_max_positions(
         cfg,

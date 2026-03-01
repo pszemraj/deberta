@@ -102,6 +102,23 @@ class DummyTokenizer:
             return {k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()}
         return batch
 
+    def add_tokens(self, new_tokens: list[str], special_tokens: bool = False) -> int:
+        """Grow vocab by adding non-special placeholder tokens.
+
+        :param list[str] new_tokens: Tokens to add.
+        :param bool special_tokens: Unused flag kept for HF tokenizer compatibility.
+        :return int: Number of tokens added.
+        """
+        del special_tokens
+        added = 0
+        for token in new_tokens:
+            if token in self._id_to_tok.values():
+                continue
+            self._id_to_tok[self.vocab_size] = str(token)
+            self.vocab_size += 1
+            added += 1
+        return int(added)
+
     def save_pretrained(self, path: str) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
 

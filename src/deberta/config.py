@@ -140,6 +140,37 @@ class ModelConfig:
         metadata={"help": "Tokenizer name or local path."},
     )
 
+    tokenizer_allow_vocab_resize: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow runtime tokenizer vocabulary growth via tokenizer.add_tokens(...) when "
+                "vocab alignment controls require a larger size."
+            )
+        },
+    )
+
+    tokenizer_vocab_target: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional target tokenizer/model vocab size. When set, runtime validates that "
+                "len(tokenizer) <= target and can add inert placeholder tokens (if enabled) "
+                "to reach this size."
+            )
+        },
+    )
+
+    tokenizer_vocab_multiple: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Round resolved tokenizer vocab size up to this multiple (for tensor-core-friendly "
+                "embedding dimensions). Use 1 to disable."
+            )
+        },
+    )
+
     backbone_type: str = field(
         default="rope",
         metadata={
@@ -1025,6 +1056,10 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError("model.max_position_embeddings must be > 0 when provided.")
     if float(cfg.rotary_pct) <= 0.0 or float(cfg.rotary_pct) > 1.0:
         raise ValueError("model.rotary_pct must be in (0, 1].")
+    if int(cfg.tokenizer_vocab_multiple) <= 0:
+        raise ValueError("model.tokenizer_vocab_multiple must be >= 1.")
+    if cfg.tokenizer_vocab_target is not None and int(cfg.tokenizer_vocab_target) <= 0:
+        raise ValueError("model.tokenizer_vocab_target must be > 0 when provided.")
 
     # Explicit dependency check: rope-only knobs are invalid in HF-compat mode.
     if cfg.backbone_type == "hf_deberta_v2":
