@@ -89,6 +89,43 @@ Future: replace dense `(B,S,S)` path with `flex_attention` block-sparse path (se
 
 - `_append_metrics_jsonl_row()` opens/closes gzip per write for crash safety.
 
+## Correctness Audit Notes
+
+Full pipeline audit covering forward pass faithfulness, loss computation, attention masks, numerical stability, data pipeline, config fidelity, and checkpoint roundtrip. No critical or high-severity issues found.
+
+### RTD Objective Correctness (verified)
+
+- Generator loss: restricted to masked positions only; CLS/SEP/PAD excluded via `special_tokens_mask` + `maskable` filter in collator.
+- Discriminator loss: computed over ALL active non-special non-pad tokens (not just replaced ones) — the classic ELECTRA-bug does not apply here.
+- Edge case: when the generator samples the original token, discriminator label is correctly 0 (not replaced).
+- Sampling: Gumbel-max stochastic sampling, not argmax — corruption is non-trivial.
+- Gradient isolation: `torch.no_grad()` wraps sampling/corruption/label construction; discriminator cannot backprop through generator sampling.
+- GDES: `base_weight` is `requires_grad=False`, sync uses `.detach()` + `.copy_()` under `@torch.no_grad()`, runs after `optimizer.step()`.
+- Loss precision: both `gen_logits.float()` and `disc_logits.float()` enforce fp32 for CE/BCE.
+
+### Numerical Stability (verified)
+
+- RMSNorm: eps=1e-6, computation upcast to fp32 internally ([`modeling/norm.py`](../src/deberta/modeling/norm.py)).
+- HFv2 LayerNorm: eps=1e-7 (HF default), safe because `nn.LayerNorm` CUDA kernel upcasts internally.
+- Both backbones upcast Q/K to fp32 before attention score computation (HFv2 disentangled and RoPE eager paths).
+- RoPE SDPA path: delegates precision to PyTorch fused kernels.
+- Gradient checkpointing: at full-layer boundaries only, no fused-op bisection.
+- No embedding scaling applied in either backbone — no double-scaling risk.
+
+### Known Limitations / Deferred Improvements
+
+1. **Resume data replay is approximate, not exact** — `PackedStreamingDataset.buffer` (partial document tokens) is not checkpointed. After resume + replay, the internal packing buffer starts empty, causing slight data order divergence at the resume boundary. The `restart_epoch` strategy diverges completely by design.
+2. **Nonfinite recovery streak not checkpointed** — `nonfinite_skip_streak` and `nonfinite_skip_total` reset to 0 on resume. If training was mid-recovery (e.g., streak=3 of 4 before optimizer state reset), the streak restarts. `lr_mult` IS checkpointed (the more important state).
+3. **`train_config.json` not validated on resume** — `_persist_or_validate_run_configs()` validates model and data configs but intentionally skips train config, allowing hyperparameter changes between runs. Architecture-adjacent training params (`gradient_accumulation_steps`, `mixed_precision`) can change silently.
+4. **N-gram masking fallback fill is subword-level** — When the n-gram budget loop does not reach `num_to_mask`, the tail fill samples individual subword positions (not whole-word groups). Unlikely to matter in practice but technically breaks strict whole-word masking for the tail fill.
+5. **Export uses `strict=False` loading** — `load_intersection_state_dict()` in [`export_utils.py`](../src/deberta/modeling/export_utils.py) filters source keys to model keys and loads with `strict=False`. A checkpoint with silently renamed/missing backbone keys would produce a partially loaded export model without error.
+6. **Nonfinite recovery constants not configurable** — `_NONFINITE_LR_BACKOFF`, `_NONFINITE_LR_MULT_FLOOR`, `_NONFINITE_LR_MULT_RECOVERY`, `_NONFINITE_OPT_STATE_RESET_EVERY` are module-level constants in [`pretrain.py`](../src/deberta/training/pretrain.py), not exposed via YAML.
+7. **`_EXPORT_CONFIG_STRIP_KEYS` duplicated** — Identical lists in [`export_cli.py`](../src/deberta/export_cli.py) and [`pretrain.py`](../src/deberta/training/pretrain.py). Should be consolidated to a single source of truth.
+8. **HFv2 attention mask fill value is `-1e4`** — Deliberate stability choice (avoids `inf * 0 = NaN` in gradients). Safe for typical sequence lengths; RoPE's `torch.finfo(dtype).min` approach is more robust but both are correct.
+9. **Flash SDPA + doc-blocking incompatibility** — Enforced by config validation (`validate_training_workflow_options`), not runtime assertion. If validation is bypassed, PyTorch's SDPA dispatch would silently fall back to a non-flash kernel.
+10. **KEEL topology has no separate final output norm** — The last layer's `outer_norm2` serves this role. If KEEL is meant to match pure pre-norm + final-norm behavior exactly, a dedicated final norm would be needed. Current behavior is internally consistent.
+11. **Adam epsilon silently raised to 1e-6 under bf16** — `_build_optimizer()` overrides `adam_epsilon < 1e-6` to `1e-6` for bf16 stability. Logged but could surprise hyperparameter sweeps targeting very small epsilon values.
+
 ## HF DeBERTa-v2 Modernization Plan (PyTorch 2.9.1+)
 
 The branch history already records failed attempts to run full-backbone inductor compile on native HFv2 (`75b4812`, `3878736`, `9d46654`, `829b6ad`) and the current stable fallback (`auto -> ffn`).
