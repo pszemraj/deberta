@@ -58,6 +58,26 @@ def _validate_run_metadata_if_present(run_dir: Path) -> None:
     validate_run_metadata_schema(raw, source=str(meta_path))
 
 
+def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path:
+    """Resolve and preflight-validate export output directory.
+
+    :param str | None output_dir: Requested output directory override.
+    :param Path run_dir: Run directory used for default output location.
+    :raises ValueError: If path exists as a non-directory or as a non-empty directory.
+    :return Path: Resolved output path.
+    """
+    resolved = Path(output_dir).expanduser().resolve() if output_dir else (run_dir / "exported_hf")
+    if resolved.exists():
+        if not resolved.is_dir():
+            raise ValueError(f"output_dir exists and is not a directory: {resolved}")
+        if any(resolved.iterdir()):
+            raise ValueError(
+                f"output_dir already exists and is not empty: {resolved}. "
+                "Choose a new --output-dir or clear the directory."
+            )
+    return resolved
+
+
 @dataclass
 class ExportConfig:
     """Arguments for the consolidation/export tool."""
@@ -266,6 +286,7 @@ def run_export(cfg: ExportConfig) -> None:
     run_dir = Path(cfg.run_dir).expanduser().resolve() if cfg.run_dir else _infer_run_dir(checkpoint_dir)
     if not run_dir.exists():
         raise FileNotFoundError(f"run_dir not found: {run_dir}")
+    out_dir = _resolve_export_output_dir(output_dir=cfg.output_dir, run_dir=run_dir)
 
     model_cfg_path = run_dir / "model_config.json"
     data_cfg_path = run_dir / "data_config.json"
@@ -387,16 +408,6 @@ def run_export(cfg: ExportConfig) -> None:
         raise ValueError("export_what must be discriminator|generator|both")
 
     export_disc, export_gen = _build_export_backbone(model_cfg, disc_config, gen_config, export_what)
-
-    out_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else (run_dir / "exported_hf")
-    if out_dir.exists():
-        if not out_dir.is_dir():
-            raise ValueError(f"output_dir exists and is not a directory: {out_dir}")
-        if any(out_dir.iterdir()):
-            raise ValueError(
-                f"output_dir already exists and is not empty: {out_dir}. "
-                "Choose a new --output-dir or clear the directory."
-            )
 
     stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
     stage_dir.mkdir(parents=True, exist_ok=False)
