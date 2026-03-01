@@ -22,8 +22,11 @@ KEEL-style update follows the paper form (with RMSNorm in this codebase):
 Repo parameterization:
 
 - `L` means total residual sublayers (attention + FFN), so `L = 2 * num_hidden_layers`
-- default `keel_alpha_init` is `L` (that is, `2 * num_hidden_layers`) when unset
-- `keel_alpha_learnable=true` makes each sub-layer alpha trainable
+- paper-faithful default: `keel_alpha_init` is `L` (that is, `2 * num_hidden_layers`) when unset, with
+  `keel_alpha_learnable=false` so alpha is fixed
+- implementation detail: attention and FFN each have their own alpha slot (`alpha1`, `alpha2`) initialized
+  to the same value; this is equivalent to paper behavior when `keel_alpha_learnable=false`
+- optional extension: `keel_alpha_learnable=true` makes each sub-layer alpha trainable
 
 Primary paper: *Post-LayerNorm Is Back: Stable, ExpressivE, and Deep* (Chen & Wei, 2026), [arXiv:2601.19895](https://arxiv.org/abs/2601.19895).
 

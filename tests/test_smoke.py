@@ -1767,6 +1767,86 @@ def test_rope_model_accepts_positional_input_ids_call():
     torch.testing.assert_close(out_positional, out_keyword, rtol=0.0, atol=0.0)
 
 
+def test_rope_keel_default_alpha_matches_paper_contract():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEEncoder
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="keel",
+        keel_alpha_init=None,
+        keel_alpha_learnable=False,
+    )
+    encoder = DebertaRoPEEncoder(cfg).eval()
+    expected_alpha = float(2 * int(cfg.num_hidden_layers))
+
+    for layer in encoder.layers:
+        assert float(layer.alpha1.alpha.item()) == pytest.approx(expected_alpha)
+        assert float(layer.alpha2.alpha.item()) == pytest.approx(expected_alpha)
+        assert not isinstance(layer.alpha1.alpha, torch.nn.Parameter)
+        assert not isinstance(layer.alpha2.alpha, torch.nn.Parameter)
+
+
+def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPELayer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="keel",
+        keel_alpha_init=1.0,
+        keel_alpha_learnable=True,
+    )
+    layer = DebertaRoPELayer(cfg, alpha_init=1.0).eval()
+
+    assert isinstance(layer.alpha1.alpha, torch.nn.Parameter)
+    assert isinstance(layer.alpha2.alpha, torch.nn.Parameter)
+    assert layer.alpha1.alpha.data_ptr() != layer.alpha2.alpha.data_ptr()
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 32)
+    attention_mask = torch.ones(2, 8, dtype=torch.bool)
+
+    with torch.no_grad():
+        layer.alpha1.alpha.fill_(0.0)
+        layer.alpha2.alpha.fill_(0.0)
+        out_00 = layer(x, attention_mask)
+
+        layer.alpha1.alpha.fill_(5.0)
+        layer.alpha2.alpha.fill_(0.0)
+        out_50 = layer(x, attention_mask)
+
+        layer.alpha1.alpha.fill_(0.0)
+        layer.alpha2.alpha.fill_(5.0)
+        out_05 = layer(x, attention_mask)
+
+    assert not torch.allclose(out_00, out_50)
+    assert not torch.allclose(out_00, out_05)
+    assert not torch.allclose(out_50, out_05)
+
+
 def test_rope_model_rejects_unknown_forward_kwargs():
     import pytest
 
