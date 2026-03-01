@@ -83,6 +83,7 @@ def attention_mask_to_active_tokens(
             return input_ids.ne(int(pad_token_id))
         squeezed = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
         if squeezed.shape[-2] == 1:
+            # Broadcast path: (B,1,1,S) -> (B,1,S), keep full per-token activity mask.
             return squeezed[:, 0, :]
         return torch.diagonal(squeezed, dim1=-2, dim2=-1)
     raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")

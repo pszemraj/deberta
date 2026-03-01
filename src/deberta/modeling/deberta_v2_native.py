@@ -772,6 +772,7 @@ class DebertaV2Embeddings(nn.Module):
                 m = m[:, 0]
         if m.ndim == 3:
             if m.shape[-2] == 1:
+                # Broadcast padding mask path: (B,1,1,S) -> (B,1,S), keep full sequence axis.
                 m = m[:, 0, :]
             else:
                 m = torch.diagonal(m, dim1=-2, dim2=-1)
