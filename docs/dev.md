@@ -16,6 +16,7 @@ Until this repo has a stable release, backward compatibility is not required. Pr
 - Persisted `model_config.json` / `data_config.json` snapshots are parsed with strict key validation. Unknown legacy keys now fail with a clear error instead of being silently coerced: [`src/deberta/config.py`](../src/deberta/config.py)
   - `load_model_config_snapshot(...)`
   - `load_data_config_snapshot(...)`
+- Removed external `*_config_name_or_path` indirection for backbone configs. Architecture/config sourcing now uses `*_model_name_or_path` plus explicit `model.hf_max_position_embeddings` for HF context overrides: [`src/deberta/config.py`](../src/deberta/config.py), [`src/deberta/modeling/builder.py`](../src/deberta/modeling/builder.py)
 - Resume path uses strict snapshot loaders before comparing runtime configs: [`src/deberta/training/pretrain.py`](../src/deberta/training/pretrain.py)
   - `_persist_or_validate_run_configs(...)`
 - Export path uses the same strict snapshot loaders: [`src/deberta/export_cli.py`](../src/deberta/export_cli.py)

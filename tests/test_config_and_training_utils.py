@@ -2375,16 +2375,22 @@ def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_gen
         validate_model_config(cfg)
 
 
-def test_validate_model_config_requires_generator_model_source_for_pretrained_generator_config():
+def test_validate_model_config_rejects_hf_max_position_embeddings_for_rope():
     cfg = ModelConfig(
         backbone_type="rope",
-        from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
-        generator_config_name_or_path="local-rope-gen-config",
-        generator_model_name_or_path=None,
+        hf_max_position_embeddings=1024,
     )
-    with pytest.raises(ValueError, match="requires model.generator_model_name_or_path"):
+    with pytest.warns(UserWarning, match="hf_max_position_embeddings only applies"):
         validate_model_config(cfg)
+
+
+def test_validate_model_config_allows_hf_max_position_embeddings_in_hf_scratch_mode():
+    cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=True,
+        hf_max_position_embeddings=1024,
+    )
+    validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_pretrained_derived_generator_shape_overrides():
@@ -2528,7 +2534,6 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
         backbone_type="rope",
         from_scratch=False,
         discriminator_model_name_or_path="local-rope-disc",
-        discriminator_config_name_or_path="local-rope-disc",
     )
 
     disc_cfg, _ = build_backbone_configs(

@@ -326,7 +326,6 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
         backbone_type="rope",
         from_scratch=False,
         discriminator_model_name_or_path="disc",
-        generator_config_name_or_path="gen",
         generator_model_name_or_path="gen",
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
@@ -343,7 +342,6 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
     (
         "backbone_type",
         "from_scratch",
-        "generator_config_name_or_path",
         "generator_model_name_or_path",
         "expected_disc_cfg_src",
         "expected_disc_weight_src",
@@ -352,29 +350,18 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
         "expected_gen_derived",
     ),
     [
-        ("rope", True, None, None, None, None, None, None, True),
-        ("rope", True, "gen_cfg", None, None, None, "gen_cfg", None, False),
-        ("rope", False, None, None, "disc", "disc", None, "disc", True),
-        ("rope", False, None, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
-        (
-            "rope",
-            False,
-            "gen_cfg",
-            "gen_model",
-            "disc",
-            "disc",
-            "gen_cfg",
-            "gen_model",
-            False,
-        ),
-        ("hf_deberta_v2", True, None, None, "disc", None, None, None, True),
-        ("hf_deberta_v2", False, None, None, "disc", "disc", None, "disc", True),
+        ("rope", True, None, None, None, None, None, True),
+        ("rope", True, "gen_model", None, None, "gen_model", None, False),
+        ("rope", False, None, "disc", "disc", None, "disc", True),
+        ("rope", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
+        ("hf_deberta_v2", True, None, "disc", None, None, None, True),
+        ("hf_deberta_v2", False, None, "disc", "disc", None, "disc", True),
+        ("hf_deberta_v2", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
     ],
 )
 def test_resolve_backbone_sources_matrix(
     backbone_type: str,
     from_scratch: bool,
-    generator_config_name_or_path: str | None,
     generator_model_name_or_path: str | None,
     expected_disc_cfg_src: str | None,
     expected_disc_weight_src: str | None,
@@ -386,7 +373,6 @@ def test_resolve_backbone_sources_matrix(
         backbone_type=backbone_type,
         from_scratch=from_scratch,
         discriminator_model_name_or_path="disc",
-        generator_config_name_or_path=generator_config_name_or_path,
         generator_model_name_or_path=generator_model_name_or_path,
     )
     resolved = builder_mod._resolve_backbone_sources(cfg)
@@ -398,25 +384,24 @@ def test_resolve_backbone_sources_matrix(
     assert resolved.generator.derived_from_discriminator is expected_gen_derived
 
 
-def test_validate_model_config_rejects_pretrained_generator_config_without_generator_weights():
+def test_validate_model_config_rejects_hf_max_position_embeddings_in_pretrained_mode():
     cfg = ModelConfig(
-        backbone_type="rope",
+        backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
-        generator_config_name_or_path="local-rope-gen-config",
-        generator_model_name_or_path=None,
+        discriminator_model_name_or_path="microsoft/deberta-v3-base",
+        hf_max_position_embeddings=1024,
     )
-    with pytest.raises(ValueError, match="requires model.generator_model_name_or_path"):
+    with pytest.raises(ValueError, match="only supported when model.from_scratch=true"):
         builder_mod.validate_model_config(cfg)
 
 
-def test_build_backbone_configs_scratch_explicit_generator_config_is_authoritative(
+def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritative(
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
 
     def _fake_from_pretrained(cls, src: str):
-        if src == "gen_cfg":
+        if src == "gen_model":
             return cls(
                 vocab_size=50265,
                 hidden_size=384,
@@ -438,7 +423,7 @@ def test_build_backbone_configs_scratch_explicit_generator_config_is_authoritati
         backbone_type="rope",
         from_scratch=True,
         discriminator_model_name_or_path="disc",
-        generator_config_name_or_path="gen_cfg",
+        generator_model_name_or_path="gen_model",
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,

@@ -30,9 +30,9 @@ Builder behavior is intentionally deterministic and split into two phases:
 
 | Mode | Discriminator config | Generator config |
 |---|---|---|
-| `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.generator_config_name_or_path` / `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
-| `backbone_type=rope`, `from_scratch=false` | `model.discriminator_config_name_or_path` else `model.discriminator_model_name_or_path` | explicit generator config/model source if set; otherwise derived from discriminator config |
-| `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | `model.discriminator_config_name_or_path` else `model.discriminator_model_name_or_path` | explicit generator config/model source if set; otherwise derived from discriminator config |
+| `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
+| `backbone_type=rope`, `from_scratch=false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
+| `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
 
 ### Weight Sources
 
@@ -42,10 +42,10 @@ Builder behavior is intentionally deterministic and split into two phases:
 | `from_scratch=false` + explicit generator model source | `model.discriminator_model_name_or_path` | `model.generator_model_name_or_path` |
 | `from_scratch=false` + no generator source (derived generator exception) | `model.discriminator_model_name_or_path` | discriminator fallback (`model.discriminator_model_name_or_path`) |
 
-Strict pairing rule in pretrained mode:
+Generator-source rule:
 
-- if `model.generator_config_name_or_path` is set, `model.generator_model_name_or_path` must also be set
-- cross-component fallback is only allowed for the derived-generator mode (both generator source fields unset)
+- set `model.generator_model_name_or_path` to use explicit generator config+weights from that source
+- leave it unset to use derived-generator fallback from discriminator source
 
 ### Tokenizer Compatibility Policy
 
@@ -132,8 +132,7 @@ RTD uses separate generator and discriminator backbones.
   - `generator_intermediate_size`
   - `generator_num_attention_heads`
 
-If `generator_config_name_or_path` or `generator_model_name_or_path` is set, the derived-generator sizing knobs above must be unset.
-In pretrained mode, explicit generator config also requires explicit generator model weights (strict pairing).
+If `generator_model_name_or_path` is set, the derived-generator sizing knobs above must be unset.
 
 ## Embedding Sharing
 
@@ -157,6 +156,9 @@ With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 imp
 Training does not instantiate `transformers.DebertaV2Model` directly.
 
 HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`) for compatibility.
+
+Context length for this mode should be configured directly in YAML with
+`model.hf_max_position_embeddings` (supported when `model.from_scratch=true`).
 
 ### Architectural properties
 

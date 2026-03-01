@@ -70,9 +70,7 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     bt = (model_cfg.backbone_type or "rope").lower()
     from_scratch = bool(model_cfg.from_scratch)
 
-    disc_cfg_source = (
-        model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
-    )
+    disc_cfg_source = model_cfg.discriminator_model_name_or_path
     if bt == "rope" and from_scratch:
         discriminator = _ResolvedComponentSources(
             component="discriminator",
@@ -86,27 +84,14 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
         discriminator = _ResolvedComponentSources(
             component="discriminator",
             config_source=disc_cfg_source,
-            config_origin=(
-                "discriminator_config_name_or_path"
-                if model_cfg.discriminator_config_name_or_path
-                else "discriminator_model_name_or_path"
-            ),
+            config_origin="discriminator_model_name_or_path",
             weight_source=(None if from_scratch else model_cfg.discriminator_model_name_or_path),
             weight_origin=("scratch" if from_scratch else "discriminator_model_name_or_path"),
             derived_from_discriminator=False,
         )
 
     if from_scratch:
-        if model_cfg.generator_config_name_or_path:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.generator_config_name_or_path,
-                config_origin="generator_config_name_or_path",
-                weight_source=None,
-                weight_origin="scratch",
-                derived_from_discriminator=False,
-            )
-        elif model_cfg.generator_model_name_or_path:
+        if model_cfg.generator_model_name_or_path:
             generator = _ResolvedComponentSources(
                 component="generator",
                 config_source=model_cfg.generator_model_name_or_path,
@@ -125,16 +110,7 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 derived_from_discriminator=True,
             )
     else:
-        if model_cfg.generator_config_name_or_path and model_cfg.generator_model_name_or_path:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.generator_config_name_or_path,
-                config_origin="generator_config_name_or_path",
-                weight_source=model_cfg.generator_model_name_or_path,
-                weight_origin="generator_model_name_or_path",
-                derived_from_discriminator=False,
-            )
-        elif model_cfg.generator_model_name_or_path:
+        if model_cfg.generator_model_name_or_path:
             generator = _ResolvedComponentSources(
                 component="generator",
                 config_source=model_cfg.generator_model_name_or_path,
@@ -429,6 +405,8 @@ def _apply_hf_config_normalization(
         component=component,
         from_scratch=bool(model_cfg.from_scratch),
     )
+    if model_cfg.hf_max_position_embeddings is not None:
+        cfg.max_position_embeddings = int(model_cfg.hf_max_position_embeddings)
     _apply_dropout_overrides(cfg, model_cfg)
     cfg.hf_attention_kernel = str(model_cfg.hf_attention_kernel)
     cfg.use_rmsnorm_heads = False

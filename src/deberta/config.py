@@ -165,8 +165,8 @@ class ModelConfig:
         default="microsoft/deberta-v3-base",
         metadata={
             "help": (
-                "HF model name or path for the discriminator. Used to fetch a config (and weights if from_scratch=false) "
-                "unless discriminator_config_name_or_path is provided."
+                "HF model name or path for the discriminator. Used to fetch config "
+                "(and weights if from_scratch=false)."
             )
         },
     )
@@ -176,14 +176,14 @@ class ModelConfig:
         metadata={"help": "Optional HF model name/path for generator (config and weights)."},
     )
 
-    discriminator_config_name_or_path: str | None = field(
+    hf_max_position_embeddings: int | None = field(
         default=None,
-        metadata={"help": "Optional config name/path (JSON or directory) for discriminator."},
-    )
-
-    generator_config_name_or_path: str | None = field(
-        default=None,
-        metadata={"help": "Optional config name/path (JSON or directory) for generator."},
+        metadata={
+            "help": (
+                "Optional max_position_embeddings override for hf_deberta_v2 configs. "
+                "Use this instead of external edited JSON configs."
+            )
+        },
     )
 
     from_scratch: bool = field(
@@ -1029,6 +1029,13 @@ def validate_model_config(cfg: ModelConfig) -> None:
     # Explicit dependency check: rope-only knobs are invalid in HF-compat mode.
     if cfg.backbone_type == "hf_deberta_v2":
         defaults = ModelConfig()
+        if cfg.hf_max_position_embeddings is not None and int(cfg.hf_max_position_embeddings) <= 0:
+            raise ValueError("model.hf_max_position_embeddings must be > 0 when provided.")
+        if cfg.hf_max_position_embeddings is not None and not bool(cfg.from_scratch):
+            raise ValueError(
+                "model.hf_max_position_embeddings is only supported when model.from_scratch=true for "
+                "hf_deberta_v2 runs."
+            )
         rope_knobs = (
             "hidden_size",
             "num_hidden_layers",
@@ -1076,17 +1083,13 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 UserWarning,
                 stacklevel=2,
             )
-
-    if (
-        not bool(cfg.from_scratch)
-        and cfg.generator_config_name_or_path
-        and not cfg.generator_model_name_or_path
-    ):
-        raise ValueError(
-            "model.generator_config_name_or_path requires model.generator_model_name_or_path when "
-            "model.from_scratch=false. Explicit generator configs must pair with explicit generator "
-            "weights; leave both unset to use derived-generator fallback from discriminator weights."
-        )
+        if cfg.hf_max_position_embeddings is not None:
+            warnings.warn(
+                "model.hf_max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf_max_position_embeddings!r}) has no effect on the rope backbone.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     pretrained_override_fields = (
         "pretrained_max_position_embeddings",
@@ -1173,7 +1176,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "model.pretrained_ffn_type", cfg.pretrained_ffn_type, _FFN_CHOICES
             )
 
-    if cfg.generator_config_name_or_path or cfg.generator_model_name_or_path:
+    if cfg.generator_model_name_or_path:
         derived_knobs = []
         for name in (
             "generator_num_hidden_layers",
@@ -1186,8 +1189,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
         if derived_knobs:
             raise ValueError(
                 "These options are only used when deriving generator config and must be unset when "
-                "model.generator_config_name_or_path or model.generator_model_name_or_path is provided: "
-                + ", ".join(sorted(derived_knobs))
+                "model.generator_model_name_or_path is provided: " + ", ".join(sorted(derived_knobs))
             )
 
     if not bool(cfg.from_scratch) and not cfg.generator_model_name_or_path:
