@@ -17,14 +17,20 @@ from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
 
 class _FakeExportBackbone:
     def __init__(self) -> None:
-        self._weights: dict[str, torch.Tensor] = {}
+        self._weights: dict[str, torch.Tensor] = {"weight": torch.tensor(0.0)}
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return self._weights
 
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> None:
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> Any:
         del strict
-        self._weights.update(state_dict)
+        model_keys = set(self._weights.keys())
+        source_keys = set(state_dict.keys())
+        missing = sorted(model_keys - source_keys)
+        unexpected = sorted(source_keys - model_keys)
+        for key in model_keys & source_keys:
+            self._weights[key] = state_dict[key]
+        return types.SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
 
     def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -325,6 +331,88 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
     assert called["load_state_calls"] == [{}]
 
 
+def test_run_export_fails_on_partial_backbone_load_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    called: dict[str, object] = {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+        "build_backbones_calls": [],
+    }
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    class _BrokenBackbone(_FakeExportBackbone):
+        def __init__(self) -> None:
+            self._weights = {"other_weight": torch.tensor(0.0)}
+
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
+    )
+
+    with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+        export_cli.run_export(
+            export_cli.ExportConfig(
+                checkpoint_dir=str(checkpoint_dir),
+                run_dir=str(run_dir),
+                output_dir=str(tmp_path / "exported"),
+                export_what="discriminator",
+            )
+        )
+
+
+def test_run_export_allows_partial_backbone_load_with_opt_in_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    called: dict[str, object] = {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+        "build_backbones_calls": [],
+    }
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    class _BrokenBackbone(_FakeExportBackbone):
+        def __init__(self) -> None:
+            self._weights = {"other_weight": torch.tensor(0.0)}
+
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="discriminator",
+            allow_partial_export=True,
+        )
+    )
+    assert (out_dir / "discriminator").exists()
+
+
 def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -441,3 +529,19 @@ def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path)
     )
     with pytest.raises(ValueError, match="Unsupported run metadata schema"):
         export_cli._validate_run_metadata_if_present(run_dir)
+
+
+def test_namespace_to_export_config_maps_allow_partial_export() -> None:
+    ns = types.SimpleNamespace(
+        checkpoint_dir="/tmp/checkpoint-1",
+        output_dir="/tmp/exported",
+        run_dir="/tmp/run",
+        export_what="discriminator",
+        safe_serialization=True,
+        offload_to_cpu=True,
+        rank0=True,
+        embedding_sharing=None,
+        allow_partial_export=True,
+    )
+    cfg = export_cli.namespace_to_export_config(ns)
+    assert cfg.allow_partial_export is True

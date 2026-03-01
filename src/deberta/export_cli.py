@@ -125,6 +125,7 @@ class ExportConfig:
 
     # Override embedding_sharing (normally read from model_config.json)
     embedding_sharing: str | None = None
+    allow_partial_export: bool = False
 
 
 def add_export_arguments(parser: argparse.ArgumentParser) -> None:
@@ -207,6 +208,14 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("none", "es", "gdes"),
         help="Override embedding sharing mode. Defaults to training config value.",
     )
+    parser.add_argument(
+        "--allow-partial-export",
+        action="store_true",
+        help=(
+            "Allow partial backbone state loads when exporting. "
+            "By default export fails on any missing/unexpected backbone keys."
+        ),
+    )
 
 
 def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
@@ -224,6 +233,7 @@ def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
         offload_to_cpu=bool(ns.offload_to_cpu),
         rank0=bool(ns.rank0),
         embedding_sharing=ns.embedding_sharing,
+        allow_partial_export=bool(getattr(ns, "allow_partial_export", False)),
     )
 
 
@@ -335,6 +345,7 @@ def run_export(cfg: ExportConfig) -> None:
     validate_data_config(data_cfg)
 
     embedding_sharing = (cfg.embedding_sharing or model_cfg.embedding_sharing or "none").lower()
+    strict_export_load = not bool(cfg.allow_partial_export)
 
     # Tokenizer (needed for configs, and we also export it)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
@@ -455,7 +466,22 @@ def run_export(cfg: ExportConfig) -> None:
 
         # Discriminator
         if export_disc is not None:
-            load_intersection_state_dict(export_disc, disc_sd)
+            incompat_disc = load_intersection_state_dict(
+                export_disc,
+                disc_sd,
+                strict=strict_export_load,
+                context="export.discriminator",
+            )
+            if not strict_export_load:
+                missing = list(getattr(incompat_disc, "missing_keys", []))
+                unexpected = list(getattr(incompat_disc, "unexpected_keys", []))
+                if missing or unexpected:
+                    logger.warning(
+                        "Discriminator export loaded partial state due --allow-partial-export: "
+                        "missing=%d unexpected=%d",
+                        len(missing),
+                        len(unexpected),
+                    )
             if embedding_sharing in {"es", "gdes"}:
                 merge_embeddings_into_export_backbone(
                     export_model=export_disc,
@@ -473,7 +499,22 @@ def run_export(cfg: ExportConfig) -> None:
 
         # Generator
         if export_gen is not None:
-            load_intersection_state_dict(export_gen, gen_sd)
+            incompat_gen = load_intersection_state_dict(
+                export_gen,
+                gen_sd,
+                strict=strict_export_load,
+                context="export.generator",
+            )
+            if not strict_export_load:
+                missing = list(getattr(incompat_gen, "missing_keys", []))
+                unexpected = list(getattr(incompat_gen, "unexpected_keys", []))
+                if missing or unexpected:
+                    logger.warning(
+                        "Generator export loaded partial state due --allow-partial-export: "
+                        "missing=%d unexpected=%d",
+                        len(missing),
+                        len(unexpected),
+                    )
             export_gen.save_pretrained(
                 str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
             )
