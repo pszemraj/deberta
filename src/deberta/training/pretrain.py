@@ -1251,6 +1251,22 @@ def _token_weighted_micro_objective(
     return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
 
 
+def _resolve_window_token_denominators(
+    *, gen_window_tokens_per_rank_raw: float, disc_window_tokens_per_rank_raw: float
+) -> tuple[float, float, bool, bool]:
+    """Resolve safe per-window token denominators for token-weighted GA.
+
+    :param float gen_window_tokens_per_rank_raw: Raw mean generator-token count per rank for the window.
+    :param float disc_window_tokens_per_rank_raw: Raw mean discriminator-token count per rank for the window.
+    :return tuple[float, float, bool, bool]: ``(gen_denom, disc_denom, gen_is_zero, disc_is_zero)``.
+    """
+    gen_zero = float(gen_window_tokens_per_rank_raw) <= 0.0
+    disc_zero = float(disc_window_tokens_per_rank_raw) <= 0.0
+    gen_denom = max(float(gen_window_tokens_per_rank_raw), 1.0)
+    disc_denom = max(float(disc_window_tokens_per_rank_raw), 1.0)
+    return float(gen_denom), float(disc_denom), bool(gen_zero), bool(disc_zero)
+
+
 def _finalize_window_metric_loss(
     *, accumulated_loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool
 ) -> torch.Tensor:
@@ -1983,6 +1999,10 @@ def run_pretraining(
         local_input_tokens_seen = 0.0
         local_input_tokens_since_log = 0.0
         last_log_started_at = time.perf_counter()
+        zero_gen_window_total = 0
+        zero_disc_window_total = 0
+        zero_gen_window_since_log = 0
+        zero_disc_window_since_log = 0
 
         while global_step < int(train_cfg.max_steps):
             window: list[tuple[dict[str, torch.Tensor], float, float]] = []
@@ -2018,8 +2038,34 @@ def run_pretraining(
                 # DDP/FSDP gradients are averaged across ranks. Mean token totals per rank
                 # preserve global token-normalized scaling when used with local micro counts.
                 mean_totals = accelerator.reduce(local_totals, reduction="mean")
-                gen_window_tokens_per_rank = max(float(mean_totals[0].item()), 1.0)
-                disc_window_tokens_per_rank = max(float(mean_totals[1].item()), 1.0)
+                raw_gen_window_tokens_per_rank = float(mean_totals[0].item())
+                raw_disc_window_tokens_per_rank = float(mean_totals[1].item())
+                (
+                    gen_window_tokens_per_rank,
+                    disc_window_tokens_per_rank,
+                    gen_window_zero_tokens,
+                    disc_window_zero_tokens,
+                ) = _resolve_window_token_denominators(
+                    gen_window_tokens_per_rank_raw=raw_gen_window_tokens_per_rank,
+                    disc_window_tokens_per_rank_raw=raw_disc_window_tokens_per_rank,
+                )
+                if gen_window_zero_tokens:
+                    zero_gen_window_total += 1
+                    zero_gen_window_since_log += 1
+                if disc_window_zero_tokens:
+                    zero_disc_window_total += 1
+                    zero_disc_window_since_log += 1
+                if accelerator.is_main_process and (gen_window_zero_tokens or disc_window_zero_tokens):
+                    logger.warning(
+                        "Token-weighted GA window has zero effective tokens "
+                        "(next_step=%d, gen_zero=%s, disc_zero=%s, gen_raw=%.1f, disc_raw=%.1f); "
+                        "corresponding loss term is zero-weighted for this window.",
+                        int(global_step + 1),
+                        bool(gen_window_zero_tokens),
+                        bool(disc_window_zero_tokens),
+                        float(raw_gen_window_tokens_per_rank),
+                        float(raw_disc_window_tokens_per_rank),
+                    )
             else:
                 gen_window_tokens_per_rank = 1.0
                 disc_window_tokens_per_rank = 1.0
@@ -2423,9 +2469,15 @@ def run_pretraining(
                         "gen_token_count": float(global_gen_tokens),
                         "disc_token_count": float(global_disc_tokens),
                         "disc_pos_frac": float(disc_pos_frac),
+                        "zero_gen_window_total": float(zero_gen_window_total),
+                        "zero_disc_window_total": float(zero_disc_window_total),
+                        "zero_gen_window_since_log": float(zero_gen_window_since_log),
+                        "zero_disc_window_since_log": float(zero_disc_window_since_log),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
                     }
+                    zero_gen_window_since_log = 0
+                    zero_disc_window_since_log = 0
 
                     if accelerator.is_main_process:
                         logger.info(

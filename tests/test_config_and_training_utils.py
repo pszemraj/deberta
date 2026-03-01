@@ -73,6 +73,7 @@ from deberta.training.pretrain import (
     _resolve_output_dir,
     _resolve_output_dir_for_accelerator,
     _resolve_resume_checkpoint,
+    _resolve_window_token_denominators,
     _sanitize_nonfinite_gradients_,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
@@ -913,6 +914,74 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
 
 
+def test_run_pretraining_warns_and_tracks_zero_token_weighted_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _TrackingAccelerator(FakeAccelerator):
+        last_instance: _TrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            _TrackingAccelerator.last_instance = self
+
+    class _ScalarLossRTD(SimpleRTD):
+        def forward(self, **kwargs: Any) -> Any:
+            del kwargs
+            t = self.weight.sum() * 0.0 + 1.0
+            return types.SimpleNamespace(
+                loss=t,
+                gen_loss=t.detach(),
+                disc_loss=t.detach(),
+                disc_accuracy=t.detach(),
+                gen_token_count=torch.tensor(1.0),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(1.0),
+                gen_loss_raw=t,
+                disc_loss_raw=t,
+            )
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_TrackingAccelerator,
+        rtd_cls=_ScalarLossRTD,
+        extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="tensorboard",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=True,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
+
+    assert any("Token-weighted GA window has zero effective tokens" in rec.message for rec in caplog.records)
+
+    accel = _TrackingAccelerator.last_instance
+    assert accel is not None
+    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+    assert step_rows
+    metrics = step_rows[-1]
+    assert metrics["zero_gen_window_total"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert metrics["zero_disc_window_total"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert metrics["zero_gen_window_since_log"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert metrics["zero_disc_window_since_log"] == pytest.approx(1.0, rel=0.0, abs=1e-6)
+
+
 def test_run_pretraining_compiles_generator_and_discriminator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1710,6 +1779,26 @@ def test_token_weighted_micro_objective_matches_full_batch_normalization():
         (gen_losses[0] * gen_counts[0] + gen_losses[1] * gen_counts[1]) / gen_total
     ) + disc_w * ((disc_losses[0] * disc_counts[0] + disc_losses[1] * disc_counts[1]) / disc_total)
     torch.testing.assert_close(combined, expected)
+
+
+def test_resolve_window_token_denominators_clamps_and_flags_zero_windows():
+    gen_denom, disc_denom, gen_zero, disc_zero = _resolve_window_token_denominators(
+        gen_window_tokens_per_rank_raw=8.0,
+        disc_window_tokens_per_rank_raw=3.0,
+    )
+    assert gen_denom == pytest.approx(8.0)
+    assert disc_denom == pytest.approx(3.0)
+    assert gen_zero is False
+    assert disc_zero is False
+
+    gen_denom, disc_denom, gen_zero, disc_zero = _resolve_window_token_denominators(
+        gen_window_tokens_per_rank_raw=0.0,
+        disc_window_tokens_per_rank_raw=-2.0,
+    )
+    assert gen_denom == pytest.approx(1.0)
+    assert disc_denom == pytest.approx(1.0)
+    assert gen_zero is True
+    assert disc_zero is True
 
 
 def test_compute_generator_loss_term_matches_decoupled_formula():
