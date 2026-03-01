@@ -33,6 +33,8 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     _normalize_torch_compile_scope,
     _normalize_wandb_watch,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
     normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
@@ -217,6 +219,22 @@ def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
         _load_yaml(bad)
+
+
+def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
+    with pytest.raises(ValueError, match="Unsupported model_config.json keys"):
+        load_model_config_snapshot(
+            {"backbone_type": "rope", "legacy_field": 1},
+            source="model_config.json",
+        )
+
+
+def test_load_data_config_snapshot_rejects_unknown_legacy_key() -> None:
+    with pytest.raises(ValueError, match="Unsupported data_config.json keys"):
+        load_data_config_snapshot(
+            {"dataset_name": "HuggingFaceFW/fineweb-edu", "legacy_field": 1},
+            source="data_config.json",
+        )
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):

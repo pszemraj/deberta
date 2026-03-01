@@ -15,8 +15,9 @@ import torch
 
 from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, unwrap_compiled_model
 from deberta.config import (
-    DataConfig,
     ModelConfig,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
     validate_data_config,
     validate_model_config,
     validate_run_metadata_schema,
@@ -275,8 +276,10 @@ def run_export(cfg: ExportConfig) -> None:
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
     _validate_run_metadata_if_present(run_dir)
 
-    model_cfg = ModelConfig(**load_json_mapping(model_cfg_path))
-    data_cfg = DataConfig(**load_json_mapping(data_cfg_path))
+    # Pre-stable policy: export does not coerce legacy snapshot keys.
+    # Stored configs must match current dataclass schemas.
+    model_cfg = load_model_config_snapshot(load_json_mapping(model_cfg_path), source=str(model_cfg_path))
+    data_cfg = load_data_config_snapshot(load_json_mapping(data_cfg_path), source=str(data_cfg_path))
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
 

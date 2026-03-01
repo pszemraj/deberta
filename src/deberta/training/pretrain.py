@@ -34,6 +34,8 @@ from deberta.config import (
     TrainConfig,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_mode,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
     normalize_mixed_precision,
     validate_data_config,
     validate_model_config,
@@ -581,8 +583,14 @@ def _persist_or_validate_run_configs(
             # Backfill schema metadata for older runs once compatibility has been checked.
             dump_json(run_meta, run_meta_path)
 
-        saved_model_cfg = ModelConfig(**load_json_mapping(model_cfg_path))
-        saved_data_cfg = DataConfig(**load_json_mapping(data_cfg_path))
+        # Pre-stable policy: do not silently coerce legacy snapshot keys during resume.
+        # Snapshots must match current dataclass schemas for correctness/simplicity.
+        saved_model_cfg = load_model_config_snapshot(
+            load_json_mapping(model_cfg_path), source=str(model_cfg_path)
+        )
+        saved_data_cfg = load_data_config_snapshot(
+            load_json_mapping(data_cfg_path), source=str(data_cfg_path)
+        )
         validate_model_config(saved_model_cfg)
         validate_data_config(saved_data_cfg)
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from typing import TypeVar
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _NORM_ARCH_CHOICES = {"post", "keel"}
@@ -111,7 +112,9 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
     "microsoft/deberta-v3",
     "microsoft/mdeberta-v3",
 )
-RUN_CONFIG_SCHEMA_VERSION = 1
+# Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
+# Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
+RUN_CONFIG_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -933,8 +936,63 @@ def validate_run_metadata_schema(raw: dict[str, object], *, source: str) -> None
     if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
         raise ValueError(
             f"Unsupported run metadata schema at {source}: {schema_version}. "
-            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
+            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}. "
+            "Backward resume/export compatibility is not guaranteed before stable release."
         )
+
+
+_SnapshotConfigT = TypeVar("_SnapshotConfigT", "ModelConfig", "DataConfig")
+
+
+def _load_snapshot_dataclass(
+    raw: dict[str, object], *, cls: type[_SnapshotConfigT], source: str, config_name: str
+) -> _SnapshotConfigT:
+    """Construct a config dataclass from a persisted snapshot with strict key checks.
+
+    :param dict[str, object] raw: Raw persisted JSON mapping.
+    :param type[_SnapshotConfigT] cls: Target dataclass type.
+    :param str source: Snapshot source path for errors.
+    :param str config_name: Human label used in error messages.
+    :raises ValueError: If unknown keys are present or dataclass construction fails.
+    :return _SnapshotConfigT: Parsed dataclass instance.
+    """
+    expected_keys = {f.name for f in fields(cls)}
+    unknown = sorted(set(raw) - expected_keys)
+    if unknown:
+        unknown_str = ", ".join(unknown)
+        raise ValueError(
+            f"Unsupported {config_name} keys in {source}: {unknown_str}. "
+            "This snapshot was produced by an older pre-release schema; "
+            "backward resume/export compatibility is not guaranteed before stable release."
+        )
+
+    try:
+        return cls(**raw)
+    except TypeError as e:
+        raise ValueError(
+            f"Failed to parse {config_name} at {source}. "
+            "The persisted config schema does not match this code version."
+        ) from e
+
+
+def load_model_config_snapshot(raw: dict[str, object], *, source: str) -> ModelConfig:
+    """Parse persisted ``model_config.json`` into ``ModelConfig``.
+
+    :param dict[str, object] raw: Raw model config mapping.
+    :param str source: Source path for error messages.
+    :return ModelConfig: Parsed model configuration.
+    """
+    return _load_snapshot_dataclass(raw, cls=ModelConfig, source=source, config_name="model_config.json")
+
+
+def load_data_config_snapshot(raw: dict[str, object], *, source: str) -> DataConfig:
+    """Parse persisted ``data_config.json`` into ``DataConfig``.
+
+    :param dict[str, object] raw: Raw data config mapping.
+    :param str source: Source path for error messages.
+    :return DataConfig: Parsed data configuration.
+    """
+    return _load_snapshot_dataclass(raw, cls=DataConfig, source=source, config_name="data_config.json")
 
 
 def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
