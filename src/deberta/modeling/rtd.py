@@ -72,20 +72,21 @@ def attention_mask_to_active_tokens(
     if mask.ndim == 2:
         return mask
     if mask.ndim == 3:
-        # Packed pairwise masks encode doc constraints, not padding identity.
+        # Diagonal encodes per-token query activity for pairwise masks.
+        active = torch.diagonal(mask, dim1=-2, dim2=-1)
         if pad_token_id is not None:
-            return input_ids.ne(int(pad_token_id))
-        # Diagonal encodes per-token activity (O(B*S)) — consistent with the
-        # collator contract and RoPE attention's query_keep extraction.
-        return torch.diagonal(mask, dim1=-2, dim2=-1)
+            active = active & input_ids.ne(int(pad_token_id))
+        return active
     if mask.ndim == 4:
-        if pad_token_id is not None:
-            return input_ids.ne(int(pad_token_id))
         squeezed = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
         if squeezed.shape[-2] == 1:
             # Broadcast path: (B,1,1,S) -> (B,1,S), keep full per-token activity mask.
-            return squeezed[:, 0, :]
-        return torch.diagonal(squeezed, dim1=-2, dim2=-1)
+            active = squeezed[:, 0, :]
+        else:
+            active = torch.diagonal(squeezed, dim1=-2, dim2=-1)
+        if pad_token_id is not None:
+            active = active & input_ids.ne(int(pad_token_id))
+        return active
     raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
 
 

@@ -85,6 +85,8 @@ Checkpoint metadata in `data_state.json` stores:
 - `consumed_micro_batches`
 - `lr_mult` (persistent non-finite recovery multiplier)
 
+Resume fails fast when this file is missing; approximate replay offsets are not used.
+
 ## `torch.compile`
 
 Enable with `train.torch_compile=true` and `train.torch_compile_mode` in `default|reduce-overhead|max-autotune|max-autotune-no-cudagraphs`.

@@ -491,7 +491,6 @@ class DisentangledSelfAttention(nn.Module):
             attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
         probs = torch.softmax(attention_scores, dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
         probs = self.dropout(probs)
 
         if attention_mask is not None:

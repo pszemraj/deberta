@@ -837,6 +837,37 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     assert replay_calls["next"] == 0
 
 
+def test_run_pretraining_resume_requires_data_state_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_dir = tmp_path / "run" / "checkpoint-2"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    pretrain_mod = setup_pretraining_mocks(monkeypatch)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=3,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+
+    with pytest.raises(RuntimeError, match="requires data_state.json"):
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
+
+
 def test_run_pretraining_logs_window_averaged_rtd_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1973,16 +2004,18 @@ def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
     assert torch.equal(mask, expected)
 
 
-def test_attention_mask_to_active_tokens_uses_pad_contract_for_3d_masks():
-    input_ids = torch.tensor([[11, 12, 0]], dtype=torch.long)
-    # Deliberately make the pad row look active in the pairwise mask to ensure
-    # active-token recovery does not depend on O(S^2) reductions over mask rows.
+def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_3d_masks():
+    input_ids = torch.tensor([[11, 12, 13, 0]], dtype=torch.long)
+    # Row 2 has diagonal=False but off-diagonal keep=True. Active-token recovery
+    # must respect diagonal activity even when pad_token_id is available.
+    # Row 3 is explicit pad and must remain inactive.
     pair_keep = torch.tensor(
         [
             [
-                [1, 1, 0],
-                [1, 1, 0],
-                [1, 0, 0],
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [1, 0, 0, 0],
+                [1, 0, 0, 0],
             ]
         ],
         dtype=torch.bool,
@@ -1992,7 +2025,7 @@ def test_attention_mask_to_active_tokens_uses_pad_contract_for_3d_masks():
         attention_mask=pair_keep,
         pad_token_id=0,
     )
-    expected = torch.tensor([[True, True, False]], dtype=torch.bool)
+    expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
     assert torch.equal(active, expected)
 
 
@@ -2057,6 +2090,30 @@ def test_attention_mask_to_active_tokens_handles_4d_broadcast_no_pad():
         input_ids=input_ids,
         attention_mask=broadcast_keep,
         pad_token_id=None,
+    )
+    expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+    assert torch.equal(active, expected)
+
+
+def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_4d_masks():
+    input_ids = torch.tensor([[10, 11, 12, 0]], dtype=torch.long)
+    pair_keep = torch.tensor(
+        [
+            [
+                [
+                    [True, True, False, False],
+                    [True, True, False, False],
+                    [True, False, False, False],
+                    [True, False, False, False],
+                ]
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=pair_keep,
+        pad_token_id=0,
     )
     expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
     assert torch.equal(active, expected)

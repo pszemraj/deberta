@@ -1916,11 +1916,10 @@ def run_pretraining(
             last_saved_step = global_step
             restored, restored_lr_mult = _load_checkpoint_data_progress(Path(ckpt))
             if restored is None:
-                # Back-compat fallback for older checkpoints without data_state.json.
-                restored = global_step * int(train_cfg.gradient_accumulation_steps)
-                logger.warning(
-                    "Checkpoint missing data_state.json; approximating data replay offset "
-                    f"as global_step * grad_accum = {restored} micro-batches."
+                raise RuntimeError(
+                    "Checkpoint resume requires data_state.json with consumed_micro_batches metadata. "
+                    f"Missing file for checkpoint '{ckpt}'. Resume from a checkpoint created by this "
+                    "code version or start a new run."
                 )
             consumed_micro_batches = int(restored)
             lr_mult = float(restored_lr_mult)
