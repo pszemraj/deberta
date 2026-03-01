@@ -1350,14 +1350,48 @@ def validate_train_config(cfg: TrainConfig) -> None:
     if float(cfg.sampling_temperature) <= 0.0:
         raise ValueError("train.sampling_temperature must be > 0.")
 
-    # Warn on torch_compile_scope when torch_compile=false (scope has no effect).
-    if not bool(cfg.torch_compile) and cfg.torch_compile_scope != "auto":
-        warnings.warn(
-            "train.torch_compile_scope has no effect when train.torch_compile=false. "
-            f"Current scope ({cfg.torch_compile_scope!r}) will be ignored.",
-            UserWarning,
-            stacklevel=2,
-        )
+    defaults = TrainConfig()
+
+    # Warn when compile-specific knobs are configured while compile is disabled.
+    if not bool(cfg.torch_compile):
+        if cfg.torch_compile_scope != defaults.torch_compile_scope:
+            warnings.warn(
+                "train.torch_compile_scope has no effect when train.torch_compile=false. "
+                f"Current scope ({cfg.torch_compile_scope!r}) will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if cfg.torch_compile_mode != defaults.torch_compile_mode:
+            warnings.warn(
+                "train.torch_compile_mode has no effect when train.torch_compile=false. "
+                f"Current mode ({cfg.torch_compile_mode!r}) will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if cfg.torch_compile_backend != defaults.torch_compile_backend:
+            warnings.warn(
+                "train.torch_compile_backend has no effect when train.torch_compile=false. "
+                f"Current backend ({cfg.torch_compile_backend!r}) will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    if cfg.report_to != "wandb":
+        if cfg.wandb_watch != defaults.wandb_watch:
+            warnings.warn(
+                "train.wandb_watch only applies when train.report_to='wandb'. "
+                f"Current report_to ({cfg.report_to!r}) will ignore watch mode {cfg.wandb_watch!r}.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if int(cfg.wandb_watch_log_freq) != int(defaults.wandb_watch_log_freq):
+            warnings.warn(
+                "train.wandb_watch_log_freq only applies when train.report_to='wandb'. "
+                f"Current report_to ({cfg.report_to!r}) will ignore watch frequency "
+                f"{int(cfg.wandb_watch_log_freq)}.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 def validate_training_workflow_options(

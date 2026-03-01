@@ -291,6 +291,17 @@ def test_resolve_output_dir_auto_uses_project_and_config_stem():
     assert re.fullmatch(r"\d{8}_\d{6}_pretrain_rope_fineweb_edu", out.name) is not None
 
 
+def test_resolve_output_dir_auto_prefers_run_name():
+    out = _resolve_output_dir(
+        output_dir=None,
+        project_name="deberta-train",
+        config_path="configs/pretrain_rope_fineweb_edu.yaml",
+        run_name="my run",
+    )
+    assert out.parent.name == "deberta-train"
+    assert re.fullmatch(r"\d{8}_\d{6}_my-run", out.name) is not None
+
+
 def test_resolve_output_dir_keeps_explicit_path():
     out = _resolve_output_dir(
         output_dir="runs/custom/run-01",
@@ -363,6 +374,44 @@ def test_resolve_resume_checkpoint_auto_rejects_non_empty_output_dir_without_che
             resume_from_checkpoint="auto",
             is_main_process=True,
         )
+
+
+def test_resolve_resume_checkpoint_rejects_missing_explicit_path(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    missing = out / "checkpoint-missing"
+    with pytest.raises(FileNotFoundError, match="checkpoint path does not exist"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint=str(missing),
+            is_main_process=True,
+        )
+
+
+def test_resolve_resume_checkpoint_rejects_non_directory_explicit_path(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    marker = out / "not-a-dir.txt"
+    marker.write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="must point to a checkpoint directory"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint=str(marker),
+            is_main_process=True,
+        )
+
+
+def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-2"
+    ckpt.mkdir()
+    resolved = _resolve_resume_checkpoint(
+        output_dir=out,
+        resume_from_checkpoint=str(ckpt),
+        is_main_process=True,
+    )
+    assert resolved == str(ckpt.resolve())
 
 
 def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
@@ -1008,6 +1057,37 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
             resume_checkpoint=str(out / "checkpoint-10"),
             is_main_process=True,
         )
+
+
+def test_persist_or_validate_run_configs_allows_resume_when_only_inert_model_fields_change(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    base_model = ModelConfig(backbone_type="rope")
+    base_data = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    base_train = TrainConfig()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=base_model,
+        data_cfg=base_data,
+        train_cfg=base_train,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    inert_changed_model = ModelConfig(
+        backbone_type="rope",
+        hf_attention_kernel="stable",
+        hf_max_position_embeddings=1024,
+    )
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=inert_changed_model,
+        data_cfg=base_data,
+        train_cfg=base_train,
+        resume_checkpoint=str(out / "checkpoint-10"),
+        is_main_process=True,
+    )
 
 
 def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
@@ -2631,14 +2711,32 @@ def test_validate_model_config_inert_param_warnings(cfg_kwargs, expect_warn):
     [
         # 1D: compile=false + non-auto scope → warn
         ({"torch_compile": False, "torch_compile_scope": "backbones"}, True),
+        # 1D: compile=false + non-default mode → warn
+        ({"torch_compile": False, "torch_compile_mode": "max-autotune"}, True),
+        # 1D: compile=false + non-default backend → warn
+        ({"torch_compile": False, "torch_compile_backend": "aot_eager"}, True),
+        # 1D: report_to!=wandb + non-default watch mode → warn
+        ({"report_to": "tensorboard", "wandb_watch": "all"}, True),
+        # 1D: report_to!=wandb + non-default watch freq → warn
+        ({"report_to": "none", "wandb_watch_log_freq": 7}, True),
         # 1D: compile=false + auto scope → no warn
         ({"torch_compile": False, "torch_compile_scope": "auto"}, False),
+        # 1D: compile=false + default mode/backend/watch knobs → no warn
+        ({"torch_compile": False, "report_to": "none"}, False),
+        # 1D: wandb backend + watch options active → no inert warning
+        ({"report_to": "wandb", "wandb_watch": "all", "wandb_watch_log_freq": 7}, False),
         # 1D: compile=true + non-auto scope → no warn
         ({"torch_compile": True, "torch_compile_scope": "backbones"}, False),
     ],
     ids=[
         "1D-nocompile-scope-warn",
+        "1D-nocompile-mode-warn",
+        "1D-nocompile-backend-warn",
+        "1D-nowandb-watchmode-warn",
+        "1D-nowandb-watchfreq-warn",
         "1D-nocompile-auto-nowarn",
+        "1D-nocompile-defaults-nowarn",
+        "1D-wandb-watch-active-nowarn",
         "1D-compile-scope-nowarn",
     ],
 )

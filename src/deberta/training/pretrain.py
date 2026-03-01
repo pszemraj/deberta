@@ -147,21 +147,25 @@ def _resolve_output_dir(
     output_dir: str | None,
     project_name: str,
     config_path: str | Path | None,
+    run_name: str | None = None,
 ) -> Path:
     """Resolve the concrete training output directory.
 
     :param str | None output_dir: User-configured output directory.
     :param str project_name: Tracker project namespace.
     :param str | Path | None config_path: Optional config file path for naming hint.
+    :param str | None run_name: Optional explicit run-name hint for auto naming.
     :return Path: Concrete output directory path.
     """
     if output_dir is not None and str(output_dir).strip():
         return Path(str(output_dir))
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name_hint = "run"
-    if config_path is not None:
+    name_hint = str(run_name).strip() if run_name is not None else ""
+    if not name_hint and config_path is not None:
         name_hint = Path(config_path).stem or "run"
+    if not name_hint:
+        name_hint = "run"
     run_name = _sanitize_run_label(name_hint)
     project = _sanitize_run_label(project_name)
     return Path("runs") / project / f"{stamp}_{run_name}"
@@ -173,6 +177,7 @@ def _resolve_output_dir_for_accelerator(
     output_dir: str | None,
     project_name: str,
     config_path: str | Path | None,
+    run_name: str | None = None,
     broadcast_fn: Any | None = None,
 ) -> Path:
     """Resolve output_dir with deterministic auto-naming across distributed ranks.
@@ -181,6 +186,7 @@ def _resolve_output_dir_for_accelerator(
     :param str | None output_dir: User-configured output directory.
     :param str project_name: Tracker project namespace.
     :param str | Path | None config_path: Optional config path used for auto-naming.
+    :param str | None run_name: Optional explicit run-name hint for auto naming.
     :param Any | None broadcast_fn: Optional callable compatible with
         ``accelerate.utils.broadcast_object_list``.
     :raises RuntimeError: If distributed broadcast fails or returns an empty path.
@@ -196,6 +202,7 @@ def _resolve_output_dir_for_accelerator(
             output_dir=None,
             project_name=project_name,
             config_path=config_path,
+            run_name=run_name,
         )
 
     if broadcast_fn is None:
@@ -213,6 +220,7 @@ def _resolve_output_dir_for_accelerator(
                 output_dir=None,
                 project_name=project_name,
                 config_path=config_path,
+                run_name=run_name,
             )
         )
 
@@ -475,13 +483,26 @@ def _resolve_resume_checkpoint(
     :param bool is_main_process: Whether to emit logs.
     :raises ValueError: If ``resume_from_checkpoint='auto'`` is requested for a non-empty output
         directory that does not contain any ``checkpoint-*`` folders.
+    :raises FileNotFoundError: If an explicit resume checkpoint path does not exist.
     :return str | None: Concrete checkpoint path, or ``None``.
     """
-    if not resume_from_checkpoint:
+    resume_value = str(resume_from_checkpoint).strip() if resume_from_checkpoint is not None else ""
+    if not resume_value:
         return None
 
-    if str(resume_from_checkpoint).lower() != "auto":
-        return str(resume_from_checkpoint)
+    if resume_value.lower() != "auto":
+        checkpoint_path = Path(resume_value).expanduser()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                "train.resume_from_checkpoint was provided but the checkpoint path does not exist: "
+                f"{checkpoint_path}"
+            )
+        if not checkpoint_path.is_dir():
+            raise ValueError(
+                "train.resume_from_checkpoint must point to a checkpoint directory. "
+                f"Got a non-directory path: {checkpoint_path}"
+            )
+        return str(checkpoint_path.resolve())
 
     latest = _find_latest_checkpoint(output_dir)
     if latest is None:
@@ -496,6 +517,32 @@ def _resolve_resume_checkpoint(
             logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
         return None
     return str(latest)
+
+
+def _effective_model_config_for_resume_compare(cfg: ModelConfig) -> dict[str, Any]:
+    """Build a normalized model config snapshot for resume compatibility checks.
+
+    Fields that are explicitly documented as inert in the active model mode are normalized to
+    canonical defaults so no-op config churn does not block resume.
+
+    :param ModelConfig cfg: Model config to canonicalize.
+    :return dict[str, Any]: Normalized dict payload suitable for equality checks.
+    """
+    payload = asdict(cfg)
+    defaults = ModelConfig()
+
+    if cfg.backbone_type == "rope":
+        payload["hf_attention_kernel"] = defaults.hf_attention_kernel
+        payload["hf_max_position_embeddings"] = defaults.hf_max_position_embeddings
+
+    if cfg.norm_arch == "post":
+        payload["keel_alpha_init"] = defaults.keel_alpha_init
+        payload["keel_alpha_learnable"] = defaults.keel_alpha_learnable
+
+    if cfg.ffn_type == "mlp":
+        payload["swiglu_adjust_intermediate"] = defaults.swiglu_adjust_intermediate
+
+    return payload
 
 
 def _load_resume_state_with_compile_fallback(
@@ -594,7 +641,10 @@ def _persist_or_validate_run_configs(
         validate_model_config(saved_model_cfg)
         validate_data_config(saved_data_cfg)
 
-        if asdict(saved_model_cfg) != asdict(model_cfg):
+        # Match on effective model semantics; inert fields are normalized by mode.
+        if _effective_model_config_for_resume_compare(
+            saved_model_cfg
+        ) != _effective_model_config_for_resume_compare(model_cfg):
             raise ValueError(
                 "Resume configuration mismatch for model_config.json. "
                 "Refusing to overwrite run metadata with incompatible model settings."
@@ -2266,6 +2316,7 @@ def run_pretraining(
         output_dir=train_cfg.output_dir,
         project_name=train_cfg.project_name,
         config_path=config_path,
+        run_name=train_cfg.run_name,
     )
     train_cfg.output_dir = str(output_dir)
     if accelerator.is_main_process and (
