@@ -726,6 +726,16 @@ class TrainConfig:
     # Logging / eval / save
     logging_steps: int = field(default=50, metadata={"help": "Log every N optimizer steps."})
 
+    debug_metrics: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable verbose local-only debug metric rows (for example zero-token window counters) "
+                "in output_dir/metrics.jsonl.gz. These debug metrics are never sent to trackers."
+            )
+        },
+    )
+
     save_steps: int = field(default=1_000, metadata={"help": "Save checkpoint every N steps."})
 
     save_total_limit: int = field(
