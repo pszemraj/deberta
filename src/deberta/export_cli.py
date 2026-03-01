@@ -303,6 +303,55 @@ def _load_export_state_with_compile_fallback(
     )
 
 
+def _prepare_discriminator_state_for_strict_load(
+    *,
+    export_disc: Any,
+    disc_sd: dict[str, torch.Tensor],
+    embedding_sharing: str,
+    strict_export_load: bool,
+) -> dict[str, torch.Tensor]:
+    """Normalize discriminator checkpoint keys for strict export loading.
+
+    In ``embedding_sharing='gdes'``, discriminator checkpoints store embedding
+    tensors as ``embeddings.<attr>.base_weight`` + ``embeddings.<attr>.bias``.
+    Export backbones expect ``embeddings.<attr>.weight``; bias tensors are
+    merged afterward via ``merge_embeddings_into_export_backbone``.
+
+    :param Any export_disc: Export discriminator backbone module.
+    :param dict[str, torch.Tensor] disc_sd: Raw discriminator checkpoint state dict.
+    :param str embedding_sharing: Effective embedding sharing mode.
+    :param bool strict_export_load: Whether strict export load is enabled.
+    :return dict[str, torch.Tensor]: State dict prepared for strict backbone load.
+    """
+    if not strict_export_load or str(embedding_sharing).lower() != "gdes":
+        return dict(disc_sd)
+
+    model_keys = set(export_disc.state_dict().keys())
+    prepared = dict(disc_sd)
+
+    for key, value in list(disc_sd.items()):
+        if not key.startswith("embeddings."):
+            continue
+
+        if key.endswith(".base_weight"):
+            prefix = key[: -len(".base_weight")]
+            weight_key = f"{prefix}.weight"
+            # Export backbones expect .weight; checkpoint stores .base_weight.
+            if weight_key in model_keys and weight_key not in prepared:
+                prepared[weight_key] = value
+            prepared.pop(key, None)
+            continue
+
+        if key.endswith(".bias"):
+            prefix = key[: -len(".bias")]
+            weight_key = f"{prefix}.weight"
+            # Bias tensors are merge-only for GDES and should not participate in strict backbone load.
+            if weight_key in model_keys and key not in model_keys:
+                prepared.pop(key, None)
+
+    return prepared
+
+
 def run_export(cfg: ExportConfig) -> None:
     """Run checkpoint export flow.
 
@@ -466,9 +515,15 @@ def run_export(cfg: ExportConfig) -> None:
 
         # Discriminator
         if export_disc is not None:
+            disc_sd_for_load = _prepare_discriminator_state_for_strict_load(
+                export_disc=export_disc,
+                disc_sd=disc_sd,
+                embedding_sharing=embedding_sharing,
+                strict_export_load=bool(strict_export_load),
+            )
             incompat_disc = load_intersection_state_dict(
                 export_disc,
-                disc_sd,
+                disc_sd_for_load,
                 strict=strict_export_load,
                 context="export.discriminator",
             )

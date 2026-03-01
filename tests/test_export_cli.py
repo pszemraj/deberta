@@ -413,6 +413,72 @@ def test_run_export_allows_partial_backbone_load_with_opt_in_flag(
     assert (out_dir / "discriminator").exists()
 
 
+def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    called: dict[str, object] = {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+        "build_backbones_calls": [],
+    }
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    class _EmbeddingWeightBackbone(_FakeExportBackbone):
+        def __init__(self) -> None:
+            self._weights = {
+                "embeddings.word_embeddings.weight": torch.tensor([0.0]),
+                "encoder.weight": torch.tensor([0.0]),
+            }
+
+    merge_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (_EmbeddingWeightBackbone(), None),
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "split_pretrainer_state_dict",
+        lambda full_sd: (
+            {
+                "embeddings.word_embeddings.base_weight": torch.tensor([1.0]),
+                "embeddings.word_embeddings.bias": torch.tensor([0.2]),
+                "encoder.weight": torch.tensor([3.0]),
+            },
+            {"embeddings.word_embeddings.weight": torch.tensor([0.8])},
+        ),
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "merge_embeddings_into_export_backbone",
+        lambda **kwargs: merge_calls.append(dict(kwargs)),
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="discriminator",
+            embedding_sharing="gdes",
+        )
+    )
+
+    assert (out_dir / "discriminator").exists()
+    assert len(merge_calls) == 1
+    assert "embeddings.word_embeddings.bias" in merge_calls[0]["disc_sd"]
+
+
 def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
