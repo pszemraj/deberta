@@ -365,6 +365,66 @@ def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
     assert called["load_state_calls"] == []
 
 
+def test_run_export_strips_training_internal_keys_from_saved_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    called: dict[str, object] = {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+        "build_backbones_calls": [],
+    }
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    class _ConfigWritingBackbone(_FakeExportBackbone):
+        def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
+            del safe_serialization
+            target = Path(path)
+            target.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "model_type": "deberta-v2",
+                "hidden_size": 768,
+                "hf_attention_kernel": "stable",
+                "use_rmsnorm_heads": False,
+                "legacy": True,
+                "cls_token_id": 1,
+            }
+            (target / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (_ConfigWritingBackbone(), None),
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="discriminator",
+        )
+    )
+
+    config_path = out_dir / "discriminator" / "config.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "hf_attention_kernel" not in data
+    assert "use_rmsnorm_heads" not in data
+    assert "legacy" not in data
+    assert "cls_token_id" not in data
+    assert data["model_type"] == "deberta-v2"
+    assert data["hidden_size"] == 768
+
+
 def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

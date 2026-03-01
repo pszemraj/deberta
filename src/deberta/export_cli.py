@@ -33,6 +33,19 @@ from deberta.modeling.export_utils import (
 
 logger = logging.getLogger(__name__)
 
+_EXPORT_CONFIG_STRIP_KEYS = frozenset(
+    {
+        "hf_attention_kernel",
+        "use_rmsnorm_heads",
+        "cls_token_id",
+        "mask_token_id",
+        "sep_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "legacy",
+    }
+)
+
 
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
     """Infer parent run directory from checkpoint path.
@@ -43,6 +56,23 @@ def _infer_run_dir(checkpoint_dir: Path) -> Path:
     # checkpoint_dir = .../checkpoint-XXXX
     # run dir is usually parent.
     return checkpoint_dir.parent
+
+
+def _clean_exported_config(config_path: Path) -> None:
+    """Remove training-only keys from exported ``config.json`` files.
+
+    :param Path config_path: Path to the saved HF ``config.json``.
+    :raises ValueError: If the config file exists but is not valid JSON.
+    """
+    if not config_path.exists():
+        return
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from e
+
+    cleaned = {k: v for k, v in raw.items() if k not in _EXPORT_CONFIG_STRIP_KEYS}
+    config_path.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
 
 
 def _validate_run_metadata_if_present(run_dir: Path) -> None:
@@ -438,6 +468,7 @@ def run_export(cfg: ExportConfig) -> None:
             export_disc.save_pretrained(
                 str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
             )
+            _clean_exported_config(stage_dir / "discriminator" / "config.json")
             meta["exported_discriminator"] = True
 
         # Generator
@@ -446,6 +477,7 @@ def run_export(cfg: ExportConfig) -> None:
             export_gen.save_pretrained(
                 str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
             )
+            _clean_exported_config(stage_dir / "generator" / "config.json")
             meta["exported_generator"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
