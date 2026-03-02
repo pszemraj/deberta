@@ -101,20 +101,13 @@ RTD wrapper glue (sampling/corruption/label construction) remains eager by desig
 Default compile scope is resolved from `train.torch_compile_scope=auto`:
 
 - baseline: compile both `generator` and `discriminator` backbones
-- for `model.backbone_type=hf_deberta_v2` with `train.torch_compile_mode=default` and backend `inductor`, auto scope compiles FFN blocks only (`generator.encoder.layer[*].intermediate/output`, `discriminator.encoder.layer[*].intermediate/output`)
+- exception: for `model.backbone_type=rope` with `data.block_cross_document_attention=true`, auto scope downgrades to `ffn` to avoid mask-shape churn recompiles
 
-This preserves compile on dominant MLP FLOPs while avoiding known unstable default-mode inductor paths in full HF-DeBERTa attention compile.
+Recommended HFv2 compile path:
 
-Recommended stable HFv2 compile path:
-
-- `model.hf_attention_kernel=stable`
 - `train.torch_compile_mode=default`
 - `train.torch_compile_backend=inductor`
-- `train.torch_compile_scope=ffn` (or `auto` with the default-mode fallback)
-
-Full-backbone HFv2 compile with inductor is not recommended for production
-pretraining runs. The runtime emits a warning if this path is requested
-explicitly.
+- `train.torch_compile_scope=backbones` (or `auto`)
 
 Compile behavior is configured directly via train/model config:
 
@@ -122,7 +115,7 @@ Compile behavior is configured directly via train/model config:
 - `train.torch_compile_backend=inductor|aot_eager`
 
 Native HF attention-kernel variants (`model.hf_attention_kernel`) are defined in [HF DeBERTa-v2 backbone](model.md#hf-deberta-v2-backbone).
-For native HF runs, prefer `model.hf_attention_kernel=stable`.
+`dynamic` and `stable` are both supported for compiled native HF runs.
 
 Compile is applied to module `forward` callables (module identity is preserved),
 so checkpoints keep canonical state-dict keys. Resume still normalizes

@@ -533,7 +533,7 @@ def _resolve_compile_scope(
     compile_backend: str,
     block_cross_document_attention: bool = False,
 ) -> tuple[str, str | None]:
-    """Resolve effective compile scope with default-mode stability fallback.
+    """Resolve effective compile scope for auto compile mode.
 
     :param str requested_scope: Requested canonical compile scope.
     :param ModelConfig model_cfg: Model configuration.
@@ -545,15 +545,9 @@ def _resolve_compile_scope(
     if requested_scope != "auto":
         return requested_scope, None
 
+    del compile_mode
+    del compile_backend
     backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
-    # Empirically, full-backbone inductor compile on HF DeBERTa v2 defaults can drift
-    # during train-mode updates. Auto scope keeps compile on the dominant FFN FLOPs
-    # while leaving attention + embeddings eager.
-    if backbone_type == "hf_deberta_v2" and compile_mode == "default" and compile_backend == "inductor":
-        return (
-            "ffn",
-            "auto scope selected FFN-only fallback for hf_deberta_v2 (default+inductor)",
-        )
     # Doc-blocking batches alternate between None and 3D masks (single-doc vs multi-doc),
     # causing mask shape churn under compile. Downgrade to FFN-only to avoid recompilation.
     if bool(block_cross_document_attention) and backbone_type == "rope":
@@ -571,7 +565,7 @@ def _full_backbone_hf_inductor_warning(
     compile_scope: str,
     compile_backend: str,
 ) -> str | None:
-    """Return warning text for empirically unstable HFv2 full-backbone compile requests.
+    """Return warning text for unsupported full-backbone compile combinations.
 
     :param ModelConfig model_cfg: Model configuration.
     :param bool compile_enabled: Whether compile is active.
@@ -579,20 +573,11 @@ def _full_backbone_hf_inductor_warning(
     :param str compile_backend: Compile backend.
     :return str | None: Warning message for unstable configuration, else ``None``.
     """
-    if not bool(compile_enabled):
-        return None
-    if str(getattr(model_cfg, "backbone_type", "")).strip().lower() != "hf_deberta_v2":
-        return None
-    if str(compile_backend).strip().lower() != "inductor":
-        return None
-    if str(compile_scope).strip().lower() != "backbones":
-        return None
-    return (
-        "Requested full-backbone torch.compile for hf_deberta_v2 + inductor. "
-        "This path is empirically unstable and not recommended for production training. "
-        "Preferred stable path: train.torch_compile_scope=ffn, "
-        "model.hf_attention_kernel=stable, train.torch_compile_mode=default."
-    )
+    del model_cfg
+    del compile_enabled
+    del compile_scope
+    del compile_backend
+    return None
 
 
 def _compile_backbones_for_scope(

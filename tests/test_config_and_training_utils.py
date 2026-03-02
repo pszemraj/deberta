@@ -2351,7 +2351,7 @@ def test_run_pretraining_compiles_generator_and_discriminator(
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
-def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
+def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class _FakeLayer(torch.nn.Module):
@@ -2368,7 +2368,7 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
             self.encoder = torch.nn.Module()
             self.encoder.layer = torch.nn.ModuleList([_FakeLayer()])
 
-    class _FFNScopeRTD(SimpleRTD):
+    class _BackboneScopeRTD(SimpleRTD):
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.generator = _FakeBackbone()
@@ -2384,7 +2384,7 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        rtd_cls=_FFNScopeRTD,
+        rtd_cls=_BackboneScopeRTD,
         build_backbones_fn=lambda **kwargs: (_FakeBackbone(), _FakeBackbone()),
     )
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
@@ -2410,17 +2410,14 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
         train_cfg=train_cfg,
     )
 
-    instance = _FFNScopeRTD.last_instance
+    instance = _BackboneScopeRTD.last_instance
     assert instance is not None
-    assert len(compile_calls) == 4
-    for i in range(4):
+    assert len(compile_calls) == 2
+    for i in range(2):
         assert callable(compile_calls[i][0])
         assert compile_calls[i][1] == {"mode": "default", "backend": "inductor", "dynamic": False}
-    assert getattr(compile_calls[0][0], "__self__", None) is instance.generator.encoder.layer[0].intermediate
-    assert getattr(compile_calls[1][0], "__self__", None) is instance.generator.encoder.layer[0].output
-    disc_layer = instance.discriminator.encoder.layer[0]
-    assert getattr(compile_calls[2][0], "__self__", None) is disc_layer.intermediate
-    assert getattr(compile_calls[3][0], "__self__", None) is disc_layer.output
+    assert getattr(compile_calls[0][0], "__self__", None) is instance.generator
+    assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
 def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
@@ -4154,15 +4151,15 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
     assert "attention_mask" not in out3
 
 
-def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
+def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking():
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         compile_mode="default",
         compile_backend="inductor",
     )
-    assert scope == "ffn"
-    assert reason is not None
+    assert scope == "backbones"
+    assert reason is None
 
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
@@ -4203,21 +4200,12 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
     assert reason is None
 
 
-def test_full_backbone_hf_inductor_warning_for_unstable_combo():
-    msg = _full_backbone_hf_inductor_warning(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        compile_enabled=True,
-        compile_scope="backbones",
-        compile_backend="inductor",
-    )
-    assert msg is not None
-    assert "ffn" in msg
-
+def test_full_backbone_hf_inductor_warning_is_disabled():
     assert (
         _full_backbone_hf_inductor_warning(
             model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
             compile_enabled=True,
-            compile_scope="ffn",
+            compile_scope="backbones",
             compile_backend="inductor",
         )
         is None
