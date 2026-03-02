@@ -88,6 +88,7 @@ class DebertaV3ElectraCollator:
         self._non_special_token_ids_cpu = self._build_non_special_token_ids()
         self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
         self._word_boundary_scheme = self._detect_word_boundary_scheme()
+        self._word_continuation_by_id = self._build_word_continuation_lookup()
         if int(self.cfg.max_ngram) > 1 and self._word_boundary_scheme == "none":
             logger.warning(
                 "Tokenizer word-boundary probe returned scheme='none'; "
@@ -317,6 +318,44 @@ class DebertaV3ElectraCollator:
             return None
         return self._infer_word_boundary_scheme_from_tokens([str(tok) for tok in probe])
 
+    def _build_word_continuation_lookup(self) -> list[bool] | None:
+        """Build a vocabulary-indexed continuation lookup for n-gram word grouping.
+
+        This avoids repeated ``convert_ids_to_tokens`` calls in the collator hot path.
+
+        :return list[bool] | None: Per-id continuation flags or ``None`` if unavailable.
+        """
+        scheme = str(self._word_boundary_scheme or "").strip().lower()
+        if scheme not in {"wordpiece", "sentencepiece", "gpt2"}:
+            return None
+
+        vocab_size = self._effective_vocab_size(self.tokenizer)
+        try:
+            tokens = self.tokenizer.convert_ids_to_tokens(list(range(vocab_size)))
+        except Exception:
+            return None
+        if not isinstance(tokens, list) or len(tokens) != int(vocab_size):
+            return None
+
+        special_tokens = set(getattr(self.tokenizer, "all_special_tokens", []))
+        continuation = [False] * int(vocab_size)
+        for i, tok in enumerate(tokens):
+            if tok is None:
+                continue
+            tok = str(tok)
+            if not tok or tok in special_tokens:
+                continue
+            if tok.startswith("##"):
+                continuation[i] = True
+                continue
+            if scheme == "sentencepiece":
+                continuation[i] = not tok.startswith("▁")
+            elif scheme == "gpt2":
+                continuation[i] = not tok.startswith("Ġ")
+            elif scheme == "wordpiece":
+                continuation[i] = False
+        return continuation
+
     def _infer_word_boundary_scheme_from_tokens(self, tokens: Sequence[str]) -> str:
         """Infer continuation marker style from token strings.
 
@@ -403,9 +442,99 @@ class DebertaV3ElectraCollator:
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
+        if int(self.cfg.max_ngram) <= 1:
+            return self._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special_tokens_mask)
         return self._mask_tokens_ngram(
             input_ids, special_tokens_mask=special_tokens_mask, max_ngram=int(self.cfg.max_ngram)
         )
+
+    @staticmethod
+    def _sample_windowed_unigram_indices(maskable_idx: torch.Tensor, *, mask_window: int) -> torch.Tensor:
+        """Sample one mask position per DeBERTa window from sorted candidate indices.
+
+        :param torch.Tensor maskable_idx: 1D sorted token positions.
+        :param int mask_window: Window size ``int(1 / mlm_probability)``.
+        :return torch.Tensor: Selected token positions.
+        """
+        count = int(maskable_idx.numel())
+        if count <= 0:
+            return maskable_idx.new_empty((0,), dtype=torch.long)
+        if mask_window <= 1:
+            return maskable_idx
+
+        n_windows = int(math.ceil(float(count) / float(mask_window)))
+        starts = torch.arange(n_windows, device=maskable_idx.device, dtype=torch.long) * int(mask_window)
+        sizes = torch.clamp(
+            torch.full((n_windows,), int(mask_window), device=maskable_idx.device, dtype=torch.long),
+            max=count - starts,
+        )
+        offsets = torch.floor(
+            torch.rand(n_windows, device=maskable_idx.device, dtype=torch.float32) * sizes.float()
+        ).to(torch.long)
+        selected_offsets = starts + offsets
+        return maskable_idx.index_select(0, selected_offsets)
+
+    def _mask_tokens_unigram_windowed(
+        self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply DeBERTa windowed-unigram masking for ``max_ngram=1``.
+
+        :param torch.Tensor input_ids: Input token ids of shape (B, S).
+        :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
+        :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
+        """
+        if input_ids.dtype != torch.long:
+            input_ids = input_ids.long()
+
+        input_ids = input_ids.clone()
+        labels = torch.full_like(input_ids, -100)
+
+        batch, seq_len = input_ids.shape
+        mask_token_id = int(self.tokenizer.mask_token_id)
+        mlm_prob = float(self.cfg.mlm_probability)
+        if mlm_prob <= 0.0:
+            return input_ids, labels
+
+        mask_prob = float(self.cfg.mask_token_prob)
+        random_prob = float(self.cfg.random_token_prob)
+        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
+        mask_window = max(1, int(1.0 / mlm_prob))
+        max_preds_per_seq = int(math.ceil(float(seq_len) * mlm_prob / 10.0) * 10)
+
+        for b in range(batch):
+            spec = special_tokens_mask[b].to(dtype=torch.bool)
+            if bool(spec.all().item()):
+                continue
+
+            num_to_predict = min(max_preds_per_seq, max(1, int(round(float(seq_len) * mlm_prob))))
+            maskable_idx = torch.nonzero(~spec, as_tuple=False).squeeze(-1)
+            if int(maskable_idx.numel()) == 0:
+                continue
+
+            selected = self._sample_windowed_unigram_indices(maskable_idx, mask_window=mask_window)
+            if int(selected.numel()) == 0:
+                continue
+            if int(selected.numel()) > int(num_to_predict):
+                selected = selected[: int(num_to_predict)]
+
+            originals = input_ids[b].index_select(0, selected)
+            labels[b].scatter_(0, selected, originals)
+
+            if mask_prob >= 1.0 and random_prob <= 0.0:
+                input_ids[b, selected] = mask_token_id
+                continue
+
+            roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
+            mask_sel = roll < mask_prob
+            rand_sel = roll >= (mask_prob + keep_prob)
+
+            if bool(mask_sel.any().item()):
+                input_ids[b, selected[mask_sel]] = mask_token_id
+            if random_prob > 0.0 and bool(rand_sel.any().item()):
+                rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
+                input_ids[b, selected[rand_sel]] = rand_ids
+
+        return input_ids, labels
 
     def _mask_tokens_bert(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
@@ -487,7 +616,6 @@ class DebertaV3ElectraCollator:
           - windowed selection with ``mask_window = int(1 / mlm_probability)``
           - sequence-level target budget derived from full sequence length
         For ``max_ngram > 1``, word groups are built from tokenizer boundary heuristics.
-        For ``max_ngram == 1``, masking uses unigram groups.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
@@ -495,8 +623,8 @@ class DebertaV3ElectraCollator:
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
 
-        if int(max_ngram) < 1:
-            raise ValueError("max_ngram must be >= 1")
+        if int(max_ngram) <= 1:
+            return self._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special_tokens_mask)
 
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
@@ -533,12 +661,8 @@ class DebertaV3ElectraCollator:
             ids = input_ids[b].tolist()
             spec_list = spec.tolist()
 
-            if int(max_ngram) > 1:
-                groups = self._build_word_groups(ids, spec_list)
-                groups = [g for g in groups if any(not bool(spec[idx]) for idx in g)]
-            else:
-                maskable = torch.nonzero(~spec, as_tuple=False).squeeze(-1).tolist()
-                groups = [[int(i)] for i in maskable]
+            groups = self._build_word_groups(ids, spec_list)
+            groups = [g for g in groups if any(not bool(spec[idx]) for idx in g)]
 
             if not groups:
                 continue
@@ -558,29 +682,38 @@ class DebertaV3ElectraCollator:
                 for i in range(start, end):
                     mask_grams[i] = True
 
-            masked_count = 0
+            selected_positions: list[int] = []
+            remaining = int(num_to_predict)
             for do_mask, group in zip(mask_grams, groups, strict=True):
                 if not do_mask:
                     continue
-                for idx in group:
-                    if masked_count >= num_to_predict:
-                        break
-                    if bool(spec[idx].item()):
-                        continue
-                    orig_id = int(input_ids[b, idx].item())
-                    labels[b, idx] = orig_id
-
-                    r = float(torch.rand((), device=input_ids.device).item())
-                    if r < mask_prob:
-                        input_ids[b, idx] = mask_token_id
-                    elif r < (mask_prob + keep_prob):
-                        input_ids[b, idx] = orig_id
-                    elif random_prob > 0.0:
-                        # Keep random replacement special-token-safe.
-                        input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
-                    masked_count += 1
-                if masked_count >= num_to_predict:
+                if remaining <= 0:
                     break
+                take = min(len(group), remaining)
+                if take > 0:
+                    selected_positions.extend(group[:take])
+                    remaining -= take
+
+            if not selected_positions:
+                continue
+
+            selected = torch.tensor(selected_positions, device=input_ids.device, dtype=torch.long)
+            originals = input_ids[b].index_select(0, selected)
+            labels[b].scatter_(0, selected, originals)
+
+            if mask_prob >= 1.0 and random_prob <= 0.0:
+                input_ids[b, selected] = mask_token_id
+                continue
+
+            roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
+            mask_sel = roll < mask_prob
+            rand_sel = roll >= (mask_prob + keep_prob)
+
+            if bool(mask_sel.any().item()):
+                input_ids[b, selected[mask_sel]] = mask_token_id
+            if random_prob > 0.0 and bool(rand_sel.any().item()):
+                rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
+                input_ids[b, selected[rand_sel]] = rand_ids
 
         return input_ids, labels
 
@@ -598,6 +731,32 @@ class DebertaV3ElectraCollator:
         :param Sequence[bool] spec: Boolean special-token mask for one sequence.
         :return list[list[int]]: Contiguous index groups representing words.
         """
+        continuation_lookup = self._word_continuation_by_id
+        if continuation_lookup is not None:
+            lookup_size = len(continuation_lookup)
+            groups: list[list[int]] = []
+            prev_i: int | None = None
+            for i, (tid, is_spec) in enumerate(zip(ids, spec, strict=True)):
+                if is_spec:
+                    prev_i = None
+                    continue
+                try:
+                    tid_i = int(tid)
+                except Exception:
+                    prev_i = None
+                    continue
+                if tid_i in self._special_token_ids or tid_i < 0 or tid_i >= lookup_size:
+                    prev_i = None
+                    continue
+
+                is_cont = bool(continuation_lookup[tid_i])
+                start_new = not groups or prev_i is None or i != prev_i + 1 or not is_cont
+                if start_new:
+                    groups.append([i])
+                else:
+                    groups[-1].append(i)
+                prev_i = i
+            return groups
 
         tokens = self.tokenizer.convert_ids_to_tokens(list(ids))
         groups: list[list[int]] = []

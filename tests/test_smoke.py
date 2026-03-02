@@ -420,14 +420,16 @@ def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pyte
 
     calls = {"n": 0}
 
-    def _sample_one(_device: torch.device) -> int:
+    def _sample_random(shape: torch.Size | tuple[int, ...], device: torch.device) -> torch.Tensor:
+        del device
         calls["n"] += 1
-        return 50 if calls["n"] == 1 else 51
+        n = int(shape[0]) if isinstance(shape, tuple) else int(shape[0])
+        return torch.tensor([50, 51], dtype=torch.long)[:n]
 
-    monkeypatch.setattr(coll, "_sample_one_random_word", _sample_one)
+    monkeypatch.setattr(coll, "_sample_random_words", _sample_random)
     masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
 
-    assert calls["n"] == 2
+    assert calls["n"] == 1
     assert int(labels.ne(-100).sum().item()) == 2
     assert masked[0, 1].item() == 50
     assert masked[0, 2].item() == 51

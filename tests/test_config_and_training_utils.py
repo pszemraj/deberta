@@ -1850,8 +1850,8 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert metrics["gen_loss"] == pytest.approx(8.2, rel=0.0, abs=1e-6)
     assert metrics["disc_loss"] == pytest.approx(104.0 / 12.0, rel=0.0, abs=1e-6)
     assert metrics["disc_acc"] == pytest.approx(0.3, rel=0.0, abs=1e-6)
-    assert metrics["gen_token_count"] == pytest.approx(10.0, rel=0.0, abs=1e-6)
-    assert metrics["disc_token_count"] == pytest.approx(12.0, rel=0.0, abs=1e-6)
+    assert "gen_token_count" not in metrics
+    assert "disc_token_count" not in metrics
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
 
 
@@ -1972,7 +1972,7 @@ def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phase
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
-    assert step_rows[-1]["decoupled_training"] == pytest.approx(1.0, rel=0.0, abs=1e-9)
+    assert "decoupled_training" not in step_rows[-1]
 
 
 def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_token_counts(

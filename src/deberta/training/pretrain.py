@@ -2452,12 +2452,9 @@ def run_pretraining(
                         "gen_loss": float(gen_loss_window),
                         "disc_loss": float(disc_loss_window),
                         "disc_acc": float(disc_acc_window),
-                        "gen_token_count": float(global_gen_tokens),
-                        "disc_token_count": float(global_disc_tokens),
                         "disc_pos_frac": float(disc_pos_frac),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
-                        "decoupled_training": 1.0,
                     }
                     if accelerator.is_main_process:
                         logger.info(
@@ -2931,8 +2928,6 @@ def run_pretraining(
                         "gen_loss": float(gen_loss_window),
                         "disc_loss": float(disc_loss_window),
                         "disc_acc": float(disc_acc_window),
-                        "gen_token_count": float(global_gen_tokens),
-                        "disc_token_count": float(global_disc_tokens),
                         "disc_pos_frac": float(disc_pos_frac),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
