@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import logging
 import re
@@ -616,6 +617,21 @@ def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
     m[0].bias.requires_grad_(False)
     d_partial = _optimizer_param_order_digest(m)
     assert d_all != d_partial, "Freezing params changes the trainable param set and digest"
+
+
+def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig()
+    opt = _build_optimizer(model, cfg)
+
+    param_to_name = {id(p): n for n, p in model.named_parameters() if p.requires_grad}
+    ordered_names: list[str] = []
+    for group in opt.param_groups:
+        ordered_names.extend(param_to_name[id(p)] for p in group["params"])
+    expected = hashlib.sha256("\n".join(ordered_names).encode()).hexdigest()[:16]
+
+    assert _optimizer_param_order_digest(model) == expected
+    assert str(opt._param_order_digest) == expected
 
 
 def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
@@ -2207,6 +2223,68 @@ def test_gumbel_sample_rejects_all_forbidden_vocab_mask():
         )
 
 
+def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    class _TinyBackbone(torch.nn.Module):
+        def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
+            super().__init__()
+            self.embeddings = types.SimpleNamespace(
+                word_embeddings=torch.nn.Embedding(vocab_size, hidden_size),
+            )
+
+        def forward(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            return_dict: bool = True,
+        ) -> Any:
+            del attention_mask, token_type_ids, return_dict
+            hidden = self.embeddings.word_embeddings(input_ids)
+            return types.SimpleNamespace(last_hidden_state=hidden)
+
+    cfg = types.SimpleNamespace(
+        vocab_size=32,
+        hidden_size=8,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.0,
+        norm_eps=1e-6,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
+        generator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    )
+
+    def _fail_if_called(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("discriminator.forward should not run when there are no masked tokens")
+
+    monkeypatch.setattr(model.discriminator, "forward", _fail_if_called)
+
+    input_ids = torch.tensor([[1, 11, 12, 2]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    out = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+    )
+
+    torch.testing.assert_close(out.loss, torch.zeros((), dtype=out.loss.dtype))
+    torch.testing.assert_close(out.disc_loss, torch.zeros((), dtype=out.disc_loss.dtype))
+    torch.testing.assert_close(out.disc_accuracy, torch.zeros((), dtype=out.disc_accuracy.dtype))
+    torch.testing.assert_close(out.disc_token_count, torch.zeros((), dtype=out.disc_token_count.dtype))
+    torch.testing.assert_close(out.disc_positive_count, torch.zeros((), dtype=out.disc_positive_count.dtype))
+
+
 def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
@@ -2266,6 +2344,40 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
     )
 
     assert called_targets == [inner.discriminator, inner.generator]
+
+
+def test_export_discriminator_hf_collects_state_dicts_on_non_main_rank(tmp_path: Path) -> None:
+    class _Inner(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discriminator = torch.nn.Linear(2, 2)
+            self.generator = torch.nn.Linear(2, 2)
+            self.disc_config = object()
+
+    inner = _Inner()
+    called_targets: list[torch.nn.Module] = []
+
+    class _FakeAccelerator:
+        is_main_process = False
+
+        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+            assert model is inner
+            return model
+
+        def get_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+            called_targets.append(model)
+            return {}
+
+    _export_discriminator_hf(
+        accelerator=_FakeAccelerator(),
+        model=inner,  # type: ignore[arg-type]
+        tokenizer=DummyTokenizer(),
+        output_dir=tmp_path / "export",
+        embedding_sharing="none",
+    )
+
+    assert called_targets == [inner.discriminator, inner.generator]
+    assert not (tmp_path / "export").exists()
 
 
 def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Path):

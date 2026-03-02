@@ -836,14 +836,93 @@ def _prefill_rotary_caches_for_compile(
     return prefilled
 
 
-def _optimizer_param_order_digest(model: torch.nn.Module) -> str:
-    """Compute a SHA-256 prefix digest of trainable param names in registration order.
+def _is_no_decay_param(*, name: str, param: torch.Tensor) -> bool:
+    """Check whether a parameter should skip weight decay.
 
-    :param torch.nn.Module model: Model whose param ordering to digest.
+    :param str name: Parameter name.
+    :param torch.Tensor param: Parameter tensor.
+    :return bool: True when parameter belongs to no-decay groups.
+    """
+    lname = str(name).lower()
+    # Keep vector/scalar biases in no-decay; high-rank "bias" tensors (for example
+    # GDES embedding deltas) should follow standard weight-decay behavior.
+    if lname.endswith(".bias") and param.dim() <= 1:
+        return True
+    if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
+        return True
+    # Scalars and 1D params are typically excluded from decay.
+    if param.dim() <= 1:
+        return True
+    return False
+
+
+def _is_generator_param(name: str) -> bool:
+    """Check whether a parameter belongs to the generator branch.
+
+    :param str name: Parameter name.
+    :return bool: True when parameter is generator-owned.
+    """
+    return name.startswith("generator.") or name.startswith("generator_lm_head.")
+
+
+def _partition_optimizer_params(model: torch.nn.Module) -> dict[str, dict[str, list[Any]]]:
+    """Partition trainable parameters into optimizer groups with ordered names.
+
+    :param torch.nn.Module model: Model whose trainable parameters should be partitioned.
+    :return dict[str, dict[str, list[Any]]]: Group map keyed by
+        ``gen_decay|gen_no_decay|disc_decay|disc_no_decay`` with ``params`` and ``names`` lists.
+    """
+    groups: dict[str, dict[str, list[Any]]] = {
+        "gen_decay": {"params": [], "names": []},
+        "gen_no_decay": {"params": [], "names": []},
+        "disc_decay": {"params": [], "names": []},
+        "disc_no_decay": {"params": [], "names": []},
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        no_decay = _is_no_decay_param(name=name, param=param)
+        is_gen = _is_generator_param(name)
+        if is_gen and no_decay:
+            key = "gen_no_decay"
+        elif is_gen:
+            key = "gen_decay"
+        elif no_decay:
+            key = "disc_no_decay"
+        else:
+            key = "disc_decay"
+
+        groups[key]["params"].append(param)
+        groups[key]["names"].append(str(name))
+
+    return groups
+
+
+def _digest_param_name_order(names: list[str]) -> str:
+    """Compute a short digest for an ordered list of parameter names.
+
+    :param list[str] names: Ordered parameter names.
+    :return str: 16-char SHA-256 hex prefix.
+    """
+    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
+
+
+def _optimizer_param_order_digest(model: torch.nn.Module) -> str:
+    """Compute digest of trainable parameter names in optimizer insertion order.
+
+    This mirrors `_build_optimizer` ordering (grouped as gen-decay, gen-no-decay,
+    disc-decay, disc-no-decay), not raw ``named_parameters()`` registration order.
+
+    :param torch.nn.Module model: Model whose optimizer ordering to digest.
     :return str: 16-char hex digest.
     """
-    names = [n for n, p in model.named_parameters() if p.requires_grad]
-    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
+    partitions = _partition_optimizer_params(model)
+    ordered_names: list[str] = []
+    for key in ("gen_decay", "gen_no_decay", "disc_decay", "disc_no_decay"):
+        ordered_names.extend(partitions[key]["names"])
+    return _digest_param_name_order(ordered_names)
 
 
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
@@ -889,60 +968,26 @@ def _build_optimizer(
         else float(cfg.learning_rate)
     )
     disc_lr = float(cfg.learning_rate)
-
-    gen_decay: list[torch.nn.Parameter] = []
-    gen_no_decay: list[torch.nn.Parameter] = []
-    disc_decay: list[torch.nn.Parameter] = []
-    disc_no_decay: list[torch.nn.Parameter] = []
-
-    def _is_no_decay(name: str, p: torch.Tensor) -> bool:
-        """Check whether parameter should skip weight decay.
-
-        :param str name: Parameter name.
-        :param torch.Tensor p: Parameter tensor.
-        :return bool: True when parameter belongs to no-decay group.
-        """
-        lname = name.lower()
-        # Keep vector/scalar biases in no-decay; high-rank "bias" tensors (for example
-        # GDES embedding deltas) should follow standard weight-decay behavior.
-        if lname.endswith(".bias") and p.dim() <= 1:
-            return True
-        if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
-            return True
-        # Scalars and 1D params are typically excluded from decay.
-        if p.dim() <= 1:
-            return True
-        return False
-
-    def _is_generator(name: str) -> bool:
-        """Check whether parameter belongs to the generator branch.
-
-        :param str name: Parameter name.
-        :return bool: True when parameter is generator-owned.
-        """
-        return name.startswith("generator.") or name.startswith("generator_lm_head.")
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        no_decay = _is_no_decay(name, param)
-        is_gen = _is_generator(name)
-
-        if is_gen:
-            (gen_no_decay if no_decay else gen_decay).append(param)
-        else:
-            (disc_no_decay if no_decay else disc_decay).append(param)
+    partitions = _partition_optimizer_params(model)
+    gen_decay = partitions["gen_decay"]["params"]
+    gen_no_decay = partitions["gen_no_decay"]["params"]
+    disc_decay = partitions["disc_decay"]["params"]
+    disc_no_decay = partitions["disc_no_decay"]["params"]
 
     groups: list[dict[str, Any]] = []
+    ordered_names: list[str] = []
     if gen_decay:
         groups.append({"params": gen_decay, "weight_decay": float(cfg.weight_decay), "lr": gen_lr})
+        ordered_names.extend(partitions["gen_decay"]["names"])
     if gen_no_decay:
         groups.append({"params": gen_no_decay, "weight_decay": 0.0, "lr": gen_lr})
+        ordered_names.extend(partitions["gen_no_decay"]["names"])
     if disc_decay:
         groups.append({"params": disc_decay, "weight_decay": float(cfg.weight_decay), "lr": disc_lr})
+        ordered_names.extend(partitions["disc_decay"]["names"])
     if disc_no_decay:
         groups.append({"params": disc_no_decay, "weight_decay": 0.0, "lr": disc_lr})
+        ordered_names.extend(partitions["disc_no_decay"]["names"])
 
     fused_kwargs = _maybe_fused_adamw_kwargs()
 
@@ -958,6 +1003,7 @@ def _build_optimizer(
         eps=eps,
         **fused_kwargs,
     )
+    opt._param_order_digest = _digest_param_name_order(ordered_names)
     return opt
 
 
@@ -1748,35 +1794,39 @@ def _export_discriminator_hf(
     :param Any train_cfg: Optional training config for README generation.
     """
 
-    if not accelerator.is_main_process:
-        return
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        from transformers import AutoModel
-    except Exception as e:
-        logger.warning(f"Skipping HF export: transformers import failed: {e}")
-        return
-
-    try:
-        from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
-    except Exception:
-        DebertaRoPEConfig = None  # type: ignore
-        DebertaRoPEModel = None  # type: ignore
-
     try:
         unwrapped = unwrap_compiled_model(accelerator, model)
 
         # Try to gather state dicts via accelerator (preferred for distributed).
+        # Under sharded engines this can be collective; all ranks must participate.
         disc_mod = getattr(unwrapped, "discriminator", None)
         gen_mod = getattr(unwrapped, "generator", None)
         if disc_mod is None or gen_mod is None:
             raise RuntimeError(
                 "Unwrapped RTD model must expose discriminator and generator modules for export."
             )
-        disc_sd = canonicalize_state_dict_keys(dict(accelerator.get_state_dict(disc_mod)))
-        gen_sd = canonicalize_state_dict_keys(dict(accelerator.get_state_dict(gen_mod)))
+        disc_sd_raw = accelerator.get_state_dict(disc_mod)
+        gen_sd_raw = accelerator.get_state_dict(gen_mod)
+
+        if not accelerator.is_main_process:
+            return
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            from transformers import AutoModel
+        except Exception as e:
+            logger.warning(f"Skipping HF export: transformers import failed: {e}")
+            return
+
+        try:
+            from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+        except Exception:
+            DebertaRoPEConfig = None  # type: ignore
+            DebertaRoPEModel = None  # type: ignore
+
+        disc_sd = canonicalize_state_dict_keys(dict(disc_sd_raw))
+        gen_sd = canonicalize_state_dict_keys(dict(gen_sd_raw))
 
         # Build a fresh model from config.
         if DebertaRoPEConfig is not None and isinstance(
@@ -2029,7 +2079,6 @@ def run_pretraining(
     )
 
     # Optimizer + scheduler
-    param_digest = _optimizer_param_order_digest(model)
     optimizer = _build_optimizer(
         model,
         train_cfg,
@@ -2038,6 +2087,7 @@ def run_pretraining(
         compile_scope=compile_scope,
         mixed_precision=mixed_precision,
     )
+    param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
     lr_scheduler = _build_scheduler(optimizer, train_cfg)
 
     # Prepare (wrap for DDP/FSDP etc)
@@ -2228,7 +2278,7 @@ def run_pretraining(
                 raise RuntimeError(
                     f"Optimizer parameter-order digest mismatch on resume from '{ckpt}'. "
                     f"Saved digest: {saved_digest}, current digest: {param_digest}. "
-                    "This means named_parameters() registration order changed between the "
+                    "This means optimizer group insertion order changed between the "
                     "checkpoint code version and the current code version. Resuming would "
                     "silently map optimizer momentum/variance to wrong parameters. "
                     "Start a new run or restore with matching code."
@@ -2628,7 +2678,9 @@ def run_pretraining(
 
                     # If embedding_sharing=gdes, the discriminator embedding base weights must track the
                     # generator embedding weights. Generator embeddings update only on optimizer steps,
-                    # so syncing here is sufficient (and avoids per-microbatch copies).
+                    # so syncing here is sufficient (and avoids per-microbatch copies). This means
+                    # discriminator base weights intentionally lag inside each GA window and catch up
+                    # immediately after the optimizer step.
                     _sync_discriminator_embeddings_if_available(unwrapped_model)
 
             if not did_optimizer_step:

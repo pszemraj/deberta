@@ -14,6 +14,8 @@ Each training step follows DeBERTaV3/ELECTRA-style RTD:
 6. Run discriminator on corrupted sequence.
 7. Train discriminator to predict original (`0`) vs replaced (`1`) per token.
 
+Special-token filtering in RTD is config-driven. If you add tokenizer special tokens beyond the standard config id fields, ensure those ids are represented in model configs for consistent sampling/loss exclusion.
+
 ## Loss Terms
 
 - Generator loss: cross entropy on masked positions only.
@@ -29,6 +31,10 @@ Exposed controls:
 - `train.token_weighted_gradient_accumulation` (default `true`)
 
 Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
+
+For `model.embedding_sharing=gdes`, discriminator embedding base weights are synchronized from the
+generator after each optimizer step (and checkpoint load). During a gradient-accumulation window,
+the discriminator therefore sees the previous optimizer-step snapshot until the next sync.
 
 ## Numerical Stability
 

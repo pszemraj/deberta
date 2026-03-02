@@ -388,6 +388,9 @@ class DebertaV3RTDPretrainer(nn.Module):
     def _collect_forbidden_sample_token_ids(self) -> set[int]:
         """Collect special token ids to exclude from generator sampling.
 
+        The forbidden set is config-driven; tokenizer-only special ids that are not
+        represented on configs are invisible here.
+
         :return set[int]: Valid special token ids present in generator/discriminator configs.
         """
         out: set[int] = set()
@@ -524,6 +527,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         """Sync GDES base weights from generator embedding weights.
 
         Must be called after each optimizer step and after checkpoint load.
+        With gradient accumulation, discriminator base weights intentionally stay at
+        the last optimizer-step snapshot until the next sync call (one-step lag).
         No-op unless embedding_sharing == 'gdes'.
         """
 
@@ -674,6 +679,26 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         if masked_idx.numel() == 0:
             gen_loss = hidden.sum() * 0.0
+            disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+            gen_term = compute_generator_loss_term(
+                gen_loss=gen_loss,
+                disc_loss=disc_zero,
+                decoupled_loss_scaling=decoupled_loss_scaling,
+            )
+            total = float(gen_loss_weight) * gen_term
+            # Degenerate batch: no supervised generator targets, so skip discriminator
+            # entirely instead of logging a weighted all-negative discriminator step.
+            return RTDOutput(
+                loss=total,
+                gen_loss=gen_loss.detach(),
+                disc_loss=disc_zero.detach(),
+                disc_accuracy=disc_zero.detach(),
+                gen_token_count=gen_token_count.detach(),
+                disc_token_count=disc_zero.detach(),
+                disc_positive_count=disc_zero.detach(),
+                gen_loss_raw=gen_loss,
+                disc_loss_raw=disc_zero,
+            )
         else:
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
             masked_hidden = hidden_flat.index_select(0, masked_idx)
@@ -721,6 +746,8 @@ class DebertaV3RTDPretrainer(nn.Module):
             pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
         )
 
+        # Special-position filtering is config-token-id based; tokenizer special ids not
+        # represented in config fields are not excluded by this mask.
         special = self._special_position_mask(input_ids)
         special = special & (~masked_positions)
         disc_active = active & (~special)
