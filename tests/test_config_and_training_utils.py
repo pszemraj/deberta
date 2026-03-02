@@ -944,6 +944,71 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.ended is False
 
 
+def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes import _PRETRAINING_BATCH
+
+    saved_checkpoints: list[tuple[str, int, str]] = []
+
+    def _fake_save_checkpoint(
+        *,
+        accelerator,
+        checkpoint_dir,
+        output_dir,
+        consumed_micro_batches,
+        save_total_limit,
+        log_label,
+        **kwargs,
+    ):
+        del accelerator, output_dir, save_total_limit, kwargs
+        saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        save_checkpoint_fn=_fake_save_checkpoint,
+        extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
+    )
+
+    # Complete one accumulation window (2 micro-batches), then interrupt in the next
+    # window after fetching one more micro-batch. Final checkpoint should persist only
+    # committed-step progress for checkpoint-{global_step}.
+    def _interrupt_cycle(_loader, *, start_epoch: int = 0):
+        del start_epoch
+        yield _PRETRAINING_BATCH
+        yield _PRETRAINING_BATCH
+        yield _PRETRAINING_BATCH
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=3,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
+
+    assert saved_checkpoints
+    assert saved_checkpoints[-1][0].endswith("checkpoint-1")
+    assert saved_checkpoints[-1][1] == 2
+    assert saved_checkpoints[-1][2] == "final"
+
+
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

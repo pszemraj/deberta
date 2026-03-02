@@ -2110,6 +2110,7 @@ def run_pretraining(
 
     global_step = 0
     consumed_micro_batches = 0
+    consumed_micro_batches_committed = 0
     last_saved_step = 0
     lr_mult = 1.0
     nonfinite_skip_total = 0
@@ -2206,6 +2207,7 @@ def run_pretraining(
                     "code version or start a new run."
                 )
             consumed_micro_batches = int(restored)
+            consumed_micro_batches_committed = int(restored)
             lr_mult = float(restored_lr_mult)
 
             if saved_digest is not None and saved_digest != param_digest:
@@ -2634,6 +2636,7 @@ def run_pretraining(
                         with suppress(Exception):
                             optimizer.state.clear()
                     global_step += 1
+                    consumed_micro_batches_committed = int(consumed_micro_batches)
                     if train_progress is not None:
                         train_progress.update(1)
                     if train_cfg.report_to != "none":
@@ -2669,7 +2672,7 @@ def run_pretraining(
                             accelerator=accelerator,
                             checkpoint_dir=ckpt_dir,
                             output_dir=output_dir,
-                            consumed_micro_batches=consumed_micro_batches,
+                            consumed_micro_batches=consumed_micro_batches_committed,
                             save_total_limit=int(train_cfg.save_total_limit),
                             log_label="periodic",
                             lr_mult=lr_mult,
@@ -2691,6 +2694,7 @@ def run_pretraining(
                 if out is None:
                     raise RuntimeError("Accumulation window produced no forward pass outputs.")
                 global_step += 1
+                consumed_micro_batches_committed = int(consumed_micro_batches)
                 if train_progress is not None:
                     train_progress.update(1)
 
@@ -2820,7 +2824,7 @@ def run_pretraining(
                         accelerator=accelerator,
                         checkpoint_dir=ckpt_dir,
                         output_dir=output_dir,
-                        consumed_micro_batches=consumed_micro_batches,
+                        consumed_micro_batches=consumed_micro_batches_committed,
                         save_total_limit=int(train_cfg.save_total_limit),
                         log_label="periodic",
                         lr_mult=lr_mult,
@@ -2871,7 +2875,7 @@ def run_pretraining(
                     accelerator=accelerator,
                     checkpoint_dir=final_ckpt,
                     output_dir=output_dir,
-                    consumed_micro_batches=consumed_micro_batches,
+                    consumed_micro_batches=consumed_micro_batches_committed,
                     save_total_limit=int(train_cfg.save_total_limit),
                     log_label="final",
                     lr_mult=lr_mult,
