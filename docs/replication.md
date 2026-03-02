@@ -37,7 +37,7 @@ train:
   disc_loss_weight: 10.0
   adam_epsilon: 1.0e-6
   token_weighted_gradient_accumulation: false
-  decoupled_training: null
+  decoupled_training: true
   report_to: none
 ```
 
@@ -45,7 +45,7 @@ Notes:
 
 - `model.profile=deberta_v3_parity` applies parity-oriented defaults where values are still unset.
 - `backbone_type=hf_deberta_v2` is the key switch for disentangled attention + LayerNorm parity.
-- `train.decoupled_training: null` auto-resolves to `true` on `hf_deberta_v2` and `false` otherwise.
+- `train.decoupled_training=true` is the default and keeps two-phase RTD updates enabled.
 - Decoupled mode is intentionally incompatible with `model.embedding_sharing=es`; use `gdes` (recommended) or `none`.
 - Keep RoPE-only knobs at defaults (they do not apply on the HF-compatible backbone).
 - This repo keeps RTD objective semantics and GDES behavior explicit and tested; it does not guarantee bit-identical reproduction of original Microsoft training pipelines.

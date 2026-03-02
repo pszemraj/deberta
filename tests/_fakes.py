@@ -267,6 +267,55 @@ class SimpleRTD(torch.nn.Module):
             disc_loss_raw=t,
         )
 
+    @staticmethod
+    def _loss_anchor(module: torch.nn.Module, fallback: torch.Tensor) -> torch.Tensor:
+        """Return a scalar tensor connected to ``module`` parameters when possible."""
+        for param in module.parameters():
+            return param.sum() * 0.0 + 1.0
+        return fallback * 0.0 + 1.0
+
+    def forward_generator_phase(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        sampling_temperature: float = 1.0,
+    ) -> Any:
+        """Return deterministic generator-phase outputs for decoupled-loop tests."""
+        del attention_mask, labels, token_type_ids, sampling_temperature
+        gen_loss = self._loss_anchor(self.generator, self.weight)
+        return _types.SimpleNamespace(
+            gen_loss_raw=gen_loss,
+            gen_token_count=torch.tensor(1.0),
+            corrupted_input_ids=input_ids.detach().clone(),
+            disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
+        )
+
+    def forward_discriminator_phase(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        corrupted_input_ids: torch.Tensor,
+        disc_labels: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+    ) -> Any:
+        """Return deterministic discriminator-phase outputs for decoupled-loop tests."""
+        del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
+        disc_loss = self._loss_anchor(self.discriminator, self.weight)
+        return _types.SimpleNamespace(
+            disc_loss_raw=disc_loss,
+            disc_accuracy=torch.tensor(1.0),
+            disc_token_count=torch.tensor(1.0),
+            disc_positive_count=torch.tensor(1.0),
+        )
+
+    def sync_discriminator_embeddings_from_generator(self) -> None:
+        """No-op embedding sync hook for GDES parity path."""
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Shared scaffolding for ``run_pretraining`` integration tests

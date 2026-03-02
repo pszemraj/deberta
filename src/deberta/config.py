@@ -735,14 +735,9 @@ class TrainConfig:
         },
     )
 
-    decoupled_training: bool | None = field(
-        default=None,
-        metadata={
-            "help": (
-                "Enable true two-phase RTD training (generator step then discriminator step). "
-                "If null, defaults to true for model.backbone_type=hf_deberta_v2 and false otherwise."
-            )
-        },
+    decoupled_training: bool = field(
+        default=True,
+        metadata={"help": ("Enable true two-phase RTD training (generator step then discriminator step).")},
     )
 
     # Logging / eval / save
@@ -1466,6 +1461,11 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("train.mlm_max_ngram must be >= 1.")
     if float(cfg.sampling_temperature) <= 0.0:
         raise ValueError("train.sampling_temperature must be > 0.")
+    if not isinstance(cfg.decoupled_training, bool):
+        raise ValueError(
+            "train.decoupled_training must be a boolean (true/false). "
+            f"Got {type(cfg.decoupled_training).__name__}."
+        )
 
     defaults = TrainConfig()
 
@@ -1539,18 +1539,6 @@ def apply_profile_defaults(*, model_cfg: ModelConfig, train_cfg: TrainConfig) ->
         train_cfg.token_weighted_gradient_accumulation = False
 
 
-def resolve_decoupled_training(*, model_cfg: ModelConfig, train_cfg: TrainConfig) -> bool:
-    """Resolve effective decoupled-training toggle.
-
-    :param ModelConfig model_cfg: Model configuration.
-    :param TrainConfig train_cfg: Train configuration.
-    :return bool: Effective decoupled-training mode.
-    """
-    if train_cfg.decoupled_training is not None:
-        return bool(train_cfg.decoupled_training)
-    return str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2"
-
-
 def validate_training_workflow_options(
     *,
     data_cfg: DataConfig,
@@ -1610,7 +1598,7 @@ def validate_training_workflow_options(
                 f"Set generator_learning_rate=-1 (inherit) or match it to learning_rate, "
                 f"or switch to embedding_sharing='gdes'/'none'."
             )
-        if resolve_decoupled_training(model_cfg=model_cfg, train_cfg=train_cfg) and embed_sharing == "es":
+        if bool(train_cfg.decoupled_training) and embed_sharing == "es":
             raise ValueError(
                 "train.decoupled_training is incompatible with model.embedding_sharing='es' because "
                 "shared embedding parameters would be stepped in both generator and discriminator phases. "

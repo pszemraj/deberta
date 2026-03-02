@@ -49,7 +49,7 @@ train:
   gen_loss_weight: 1.0
   disc_loss_weight: 10.0
   decoupled_loss_scaling: false
-  decoupled_training: null
+  decoupled_training: true
   token_weighted_gradient_accumulation: false
 
   logging_steps: 25

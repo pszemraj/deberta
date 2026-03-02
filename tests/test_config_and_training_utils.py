@@ -40,7 +40,6 @@ from deberta.config import (
     load_data_config_snapshot,
     load_model_config_snapshot,
     normalize_mixed_precision,
-    resolve_decoupled_training,
     validate_data_config,
     validate_model_config,
     validate_train_config,
@@ -270,7 +269,7 @@ def test_parity_yaml_configs_parse_and_validate(
     assert model_cfg.profile == "deberta_v3_parity"
     assert model_cfg.backbone_type == "hf_deberta_v2"
     assert model_cfg.discriminator_model_name_or_path == expected_disc_source
-    assert resolve_decoupled_training(model_cfg=model_cfg, train_cfg=train_cfg) is True
+    assert bool(train_cfg.decoupled_training) is True
 
 
 def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
@@ -1832,6 +1831,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
     )
@@ -2082,6 +2082,7 @@ def _run_zero_token_weighted_case(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=True,
+        decoupled_training=False,
         debug_metrics=bool(debug_metrics),
         torch_compile=False,
         export_hf_final=False,
@@ -2139,6 +2140,7 @@ def test_run_pretraining_warns_and_excludes_zero_token_weighted_metrics_from_tra
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=True,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
     )
@@ -2328,6 +2330,7 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
         max_grad_norm=1.0,
@@ -2380,6 +2383,7 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
         max_grad_norm=1.0,
@@ -4487,23 +4491,16 @@ def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
     assert train_cfg.token_weighted_gradient_accumulation is False
 
 
-def test_resolve_decoupled_training_auto_and_explicit_overrides() -> None:
-    assert resolve_decoupled_training(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        train_cfg=TrainConfig(decoupled_training=None),
-    )
-    assert not resolve_decoupled_training(
-        model_cfg=ModelConfig(backbone_type="rope"),
-        train_cfg=TrainConfig(decoupled_training=None),
-    )
-    assert not resolve_decoupled_training(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        train_cfg=TrainConfig(decoupled_training=False),
-    )
-    assert resolve_decoupled_training(
-        model_cfg=ModelConfig(backbone_type="rope"),
-        train_cfg=TrainConfig(decoupled_training=True),
-    )
+def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
+    assert bool(TrainConfig().decoupled_training) is True
+    assert bool(TrainConfig(decoupled_training=False).decoupled_training) is False
+
+
+def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
+    cfg = TrainConfig()
+    cfg.decoupled_training = None  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="train.decoupled_training must be a boolean"):
+        validate_train_config(cfg)
 
 
 def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Path):

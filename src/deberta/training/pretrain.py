@@ -37,7 +37,6 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     apply_profile_defaults,
     normalize_mixed_precision,
-    resolve_decoupled_training,
     validate_data_config,
     validate_model_config,
     validate_train_config,
@@ -2122,15 +2121,14 @@ def run_pretraining(
         additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
 
-    effective_decoupled_training = resolve_decoupled_training(model_cfg=model_cfg, train_cfg=train_cfg)
+    effective_decoupled_training = bool(train_cfg.decoupled_training)
     if effective_decoupled_training and (
         not hasattr(model, "forward_generator_phase") or not hasattr(model, "forward_discriminator_phase")
     ):
-        logger.warning(
-            "Resolved decoupled training is enabled but runtime model does not expose "
-            "forward_generator_phase/forward_discriminator_phase; falling back to coupled mode."
+        raise RuntimeError(
+            "train.decoupled_training=true requires runtime model methods "
+            "forward_generator_phase and forward_discriminator_phase."
         )
-        effective_decoupled_training = False
 
     optimizer: torch.optim.Optimizer | None = None
     lr_scheduler: Any | None = None
