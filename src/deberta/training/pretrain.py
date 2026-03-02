@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import inspect
 import json
 import logging
@@ -840,6 +841,16 @@ def _prefill_rotary_caches_for_compile(
             prefill(int(seq_len), device=device, dtype=dtype)
             prefilled += 1
     return prefilled
+
+
+def _optimizer_param_order_digest(model: torch.nn.Module) -> str:
+    """Compute a SHA-256 prefix digest of trainable param names in registration order.
+
+    :param torch.nn.Module model: Model whose param ordering to digest.
+    :return str: 16-char hex digest.
+    """
+    names = [n for n, p in model.named_parameters() if p.requires_grad]
+    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
 
 
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
@@ -2022,6 +2033,7 @@ def run_pretraining(
     )
 
     # Optimizer + scheduler
+    param_digest = _optimizer_param_order_digest(model)
     optimizer = _build_optimizer(
         model,
         train_cfg,
@@ -2186,7 +2198,7 @@ def run_pretraining(
 
             global_step = _parse_checkpoint_step(ckpt)
             last_saved_step = global_step
-            restored, restored_lr_mult = _load_checkpoint_data_progress(Path(ckpt))
+            restored, restored_lr_mult, saved_digest = _load_checkpoint_data_progress(Path(ckpt))
             if restored is None:
                 raise RuntimeError(
                     "Checkpoint resume requires data_state.json with consumed_micro_batches metadata. "
@@ -2195,6 +2207,23 @@ def run_pretraining(
                 )
             consumed_micro_batches = int(restored)
             lr_mult = float(restored_lr_mult)
+
+            if saved_digest is not None and saved_digest != param_digest:
+                raise RuntimeError(
+                    f"Optimizer parameter-order digest mismatch on resume from '{ckpt}'. "
+                    f"Saved digest: {saved_digest}, current digest: {param_digest}. "
+                    "This means named_parameters() registration order changed between the "
+                    "checkpoint code version and the current code version. Resuming would "
+                    "silently map optimizer momentum/variance to wrong parameters. "
+                    "Start a new run or restore with matching code."
+                )
+            if saved_digest is None:
+                logger.warning(
+                    "Checkpoint '%s' has no optimizer_param_digest; skipping param-order "
+                    "validation. Future checkpoints will include the digest.",
+                    ckpt,
+                )
+
             max_tracker_step_logged = max(int(max_tracker_step_logged), int(global_step))
 
         # Training loop
@@ -2644,6 +2673,7 @@ def run_pretraining(
                             save_total_limit=int(train_cfg.save_total_limit),
                             log_label="periodic",
                             lr_mult=lr_mult,
+                            optimizer_param_digest=param_digest,
                         )
                         last_saved_step = global_step
                     continue
@@ -2794,6 +2824,7 @@ def run_pretraining(
                         save_total_limit=int(train_cfg.save_total_limit),
                         log_label="periodic",
                         lr_mult=lr_mult,
+                        optimizer_param_digest=param_digest,
                     )
                     last_saved_step = global_step
 
@@ -2844,6 +2875,7 @@ def run_pretraining(
                     save_total_limit=int(train_cfg.save_total_limit),
                     log_label="final",
                     lr_mult=lr_mult,
+                    optimizer_param_digest=param_digest,
                 )
                 last_saved_step = final_step
         elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:

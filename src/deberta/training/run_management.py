@@ -200,41 +200,49 @@ def _resolve_resume_checkpoint(
     return str(latest)
 
 
-def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, float]:
-    """Load persisted data progress and LR multiplier for resume alignment.
+def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, float, str | None]:
+    """Load persisted data progress, LR multiplier, and optimizer param digest.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float]: (consumed micro-batch count or None, lr_mult).
+    :return tuple[int | None, float, str | None]: (consumed micro-batch count or None, lr_mult, optimizer_param_digest or None).
     """
     path = checkpoint_dir / "data_state.json"
     if not path.exists():
-        return None, 1.0
+        return None, 1.0, None
     try:
         raw = json.loads(path.read_text())
         val = raw.get("consumed_micro_batches", None)
         consumed = max(0, int(val)) if val is not None else None
         lr_mult = float(raw.get("lr_mult", 1.0))
-        return consumed, lr_mult
+        digest = raw.get("optimizer_param_digest", None)
+        if digest is not None:
+            digest = str(digest)
+        return consumed, lr_mult, digest
     except Exception:
-        return None, 1.0
+        return None, 1.0, None
 
 
 def _save_checkpoint_data_progress(
-    *, checkpoint_dir: Path, consumed_micro_batches: int, lr_mult: float = 1.0
+    *,
+    checkpoint_dir: Path,
+    consumed_micro_batches: int,
+    lr_mult: float = 1.0,
+    optimizer_param_digest: str | None = None,
 ) -> None:
-    """Persist data iterator progress and LR multiplier next to a checkpoint.
+    """Persist data iterator progress, LR multiplier, and optimizer param digest.
 
     :param Path checkpoint_dir: Checkpoint directory.
     :param int consumed_micro_batches: Number of consumed micro-batches.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
+    :param str | None optimizer_param_digest: SHA-256 prefix digest of trainable param names.
     """
-    dump_json(
-        {
-            "consumed_micro_batches": int(max(0, consumed_micro_batches)),
-            "lr_mult": float(lr_mult),
-        },
-        checkpoint_dir / "data_state.json",
-    )
+    payload: dict[str, Any] = {
+        "consumed_micro_batches": int(max(0, consumed_micro_batches)),
+        "lr_mult": float(lr_mult),
+    }
+    if optimizer_param_digest is not None:
+        payload["optimizer_param_digest"] = str(optimizer_param_digest)
+    dump_json(payload, checkpoint_dir / "data_state.json")
 
 
 def _save_training_checkpoint(
@@ -246,6 +254,7 @@ def _save_training_checkpoint(
     save_total_limit: int,
     log_label: str,
     lr_mult: float = 1.0,
+    optimizer_param_digest: str | None = None,
 ) -> None:
     """Save one training checkpoint with collective state-dict write.
 
@@ -256,6 +265,7 @@ def _save_training_checkpoint(
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
+    :param str | None optimizer_param_digest: SHA-256 prefix digest of trainable param names.
     """
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -271,6 +281,7 @@ def _save_training_checkpoint(
             checkpoint_dir=checkpoint_dir,
             consumed_micro_batches=consumed_micro_batches,
             lr_mult=float(lr_mult),
+            optimizer_param_digest=optimizer_param_digest,
         )
         _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
         logger.info(f"Saved {log_label} checkpoint: {checkpoint_dir}")

@@ -67,6 +67,7 @@ from deberta.training.pretrain import (
     _init_trackers,
     _load_checkpoint_data_progress,
     _load_resume_state_with_compile_fallback,
+    _optimizer_param_order_digest,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
     _resolve_compile_enabled_or_raise,
@@ -437,22 +438,85 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    consumed, lr_mult = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
     assert consumed is None
     assert lr_mult == 1.0
+    assert digest is None
 
     _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123, lr_mult=0.25)
-    consumed, lr_mult = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
     assert consumed == 123
     assert abs(lr_mult - 0.25) < 1e-9
+    assert digest is None  # no digest was saved
 
-    # Back-compat: old checkpoints without lr_mult default to 1.0.
+    # With optimizer param digest.
+    _save_checkpoint_data_progress(
+        checkpoint_dir=ckpt,
+        consumed_micro_batches=200,
+        lr_mult=0.5,
+        optimizer_param_digest="abc123deadbeef00",
+    )
+    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    assert consumed == 200
+    assert abs(lr_mult - 0.5) < 1e-9
+    assert digest == "abc123deadbeef00"
+
+    # Back-compat: old checkpoints without lr_mult or digest default gracefully.
     import json
 
     (ckpt / "data_state.json").write_text(json.dumps({"consumed_micro_batches": 50}))
-    consumed_old, lr_mult_old = _load_checkpoint_data_progress(ckpt)
+    consumed_old, lr_mult_old, digest_old = _load_checkpoint_data_progress(ckpt)
     assert consumed_old == 50
     assert lr_mult_old == 1.0
+    assert digest_old is None
+
+
+def test_optimizer_param_order_digest_deterministic() -> None:
+    """Same model produces the same digest across calls."""
+    m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+    d1 = _optimizer_param_order_digest(m)
+    d2 = _optimizer_param_order_digest(m)
+    assert d1 == d2
+    assert len(d1) == 16  # 16-char hex prefix
+
+
+def test_optimizer_param_order_digest_changes_on_different_params() -> None:
+    """Different parameter names produce a different digest."""
+    m1 = torch.nn.ModuleDict({"alpha": torch.nn.Linear(4, 4), "beta": torch.nn.Linear(4, 2)})
+    m2 = torch.nn.ModuleDict({"gamma": torch.nn.Linear(4, 4), "beta": torch.nn.Linear(4, 2)})
+    d1 = _optimizer_param_order_digest(m1)
+    d2 = _optimizer_param_order_digest(m2)
+    assert d1 != d2, "Different param names must produce different digest"
+
+
+def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
+    """Frozen parameters are excluded from the digest."""
+    m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+    d_all = _optimizer_param_order_digest(m)
+    m[0].weight.requires_grad_(False)
+    m[0].bias.requires_grad_(False)
+    d_partial = _optimizer_param_order_digest(m)
+    assert d_all != d_partial, "Freezing params changes the trainable param set and digest"
+
+
+def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
+    """_save_training_checkpoint forwards optimizer_param_digest to data_state.json."""
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-5"
+
+    accel = _FakeAccelerator(is_main_process=True)
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=ckpt,
+        output_dir=out,
+        consumed_micro_batches=10,
+        save_total_limit=3,
+        log_label="test",
+        optimizer_param_digest="deadbeef12345678",
+    )
+    _, _, digest = _load_checkpoint_data_progress(ckpt)
+    assert digest == "deadbeef12345678"
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
@@ -1713,9 +1777,10 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     )
 
     assert accel.save_paths == [str(ckpt)]
-    consumed, lr_mult = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
     assert consumed == 42
     assert lr_mult == 1.0
+    assert digest is None  # no digest passed
 
 
 def test_cycle_dataloader_advances_dataset_epoch_each_pass():
