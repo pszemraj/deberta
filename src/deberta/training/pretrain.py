@@ -439,38 +439,6 @@ def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> 
     return local_flag > 0
 
 
-@torch.no_grad()
-def _sanitize_nonfinite_gradients_(model: torch.nn.Module) -> int:
-    """Replace non-finite gradient entries in-place with zeros.
-
-    :param torch.nn.Module model: Model whose gradients are sanitized.
-    :return int: Number of non-finite gradient elements replaced.
-    """
-    replaced = 0
-    for param in model.parameters():
-        grad = param.grad
-        if grad is None:
-            continue
-        if grad.is_sparse:
-            grad = grad.coalesce()
-            values = grad.values()
-            bad = ~torch.isfinite(values)
-            count = int(bad.sum().item())
-            if count > 0:
-                replaced += count
-                values.masked_fill_(bad, 0.0)
-                param.grad = grad
-            continue
-
-        bad = ~torch.isfinite(grad)
-        count = int(bad.sum().item())
-        if count <= 0:
-            continue
-        replaced += count
-        grad.masked_fill_(bad, 0.0)
-    return replaced
-
-
 def _apply_lr_mult(optimizer: torch.optim.Optimizer, lr_mult: float) -> None:
     """Scale all optimizer param-group LRs by a persistent multiplier.
 
@@ -1258,57 +1226,36 @@ def _compute_disc_active_mask(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     attention_mask: torch.Tensor | None,
-    special_token_mask: torch.Tensor | None,
     pad_token_id: int | None,
 ) -> torch.Tensor:
     """Compute discriminator-active token mask before model forward.
 
-    This mirrors the RTD discriminator masking semantics while accounting for
-    masked positions that will be replaced before discriminator scoring.
+    The RTD discriminator supervises all non-padding tokens. Masked positions
+    remain active because they are part of the discriminator objective.
 
     :param torch.Tensor input_ids: Input token ids.
     :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
     :param torch.Tensor | None attention_mask: Optional attention mask.
-    :param torch.Tensor | None special_token_mask: Boolean vocab mask (V,) with True for special token ids.
     :param int | None pad_token_id: Padding token id.
     :return torch.Tensor: Boolean active-token mask.
     """
+    del labels
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=attention_mask,
         pad_token_id=pad_token_id,
     )
-
-    if (
-        special_token_mask is None
-        or not isinstance(special_token_mask, torch.Tensor)
-        or special_token_mask.numel() == 0
-    ):
-        return active
-
-    # Indexing a boolean vocab mask is substantially cheaper (and compile-friendly)
-    # than per-step torch.isin + device tensor construction.
-    if special_token_mask.device != input_ids.device:
-        special_token_mask = special_token_mask.to(device=input_ids.device)
-    special = special_token_mask[input_ids]
-
-    # Masked positions are replaced before discriminator scoring and should not
-    # be excluded solely because their pre-corruption token may be special.
-    masked_positions = labels.ne(-100)
-    special = special & (~masked_positions)
-    return active & (~special)
+    return active
 
 
 def _count_rtd_tokens_for_batch(
     batch: dict[str, torch.Tensor],
     *,
-    special_token_mask: torch.Tensor | None,
     pad_token_id: int | None,
 ) -> tuple[float, float]:
     """Return generator/discriminator active-token counts for one microbatch.
 
     :param dict[str, torch.Tensor] batch: Microbatch tensors.
-    :param torch.Tensor | None special_token_mask: Boolean vocab mask (V,) with True for special token ids.
     :param int | None pad_token_id: Padding token id.
     :return tuple[float, float]: (generator_count, discriminator_count).
     """
@@ -1318,7 +1265,6 @@ def _count_rtd_tokens_for_batch(
         input_ids=batch["input_ids"],
         labels=labels,
         attention_mask=batch.get("attention_mask"),
-        special_token_mask=special_token_mask,
         pad_token_id=pad_token_id,
     )
     disc_count = float(disc_active.sum().item())
@@ -2346,17 +2292,6 @@ def run_pretraining(
         train_iter = _cycle_dataloader(train_loader, start_epoch=start_epoch)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
         unwrapped_model = unwrap_compiled_model(accelerator, model)
-        # Boolean vocab mask used both by the RTD module and token-weighted GA.
-        # Keep a CPU copy for token counting to avoid per-microbatch GPU->CPU transfers
-        # before `_move_batch_to_device` runs.
-        special_token_mask = getattr(unwrapped_model, "_forbidden_sample_token_mask", None)
-        special_token_mask_cpu: torch.Tensor | None
-        if isinstance(special_token_mask, torch.Tensor):
-            special_token_mask_cpu = special_token_mask.detach()
-            if special_token_mask_cpu.device.type != "cpu":
-                special_token_mask_cpu = special_token_mask_cpu.to(device="cpu")
-        else:
-            special_token_mask_cpu = None
         disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
         if disc_pad_token_id is not None:
             disc_pad_token_id = int(disc_pad_token_id)
@@ -2415,7 +2350,6 @@ def run_pretraining(
                 if token_weighted_ga:
                     gen_count, disc_count = _count_rtd_tokens_for_batch(
                         batch,
-                        special_token_mask=special_token_mask_cpu,
                         pad_token_id=disc_pad_token_id,
                     )
                     local_gen_tokens += gen_count
@@ -2480,7 +2414,6 @@ def run_pretraining(
             skipped_window_due_nonfinite = False
             nonfinite_reason: str | None = None
             nonfinite_debug_path: Path | None = None
-            nonfinite_sanitized_count = 0
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
@@ -2596,51 +2529,36 @@ def run_pretraining(
                         accelerator=accelerator,
                         grad_norm=float(grad_norm_for_check),
                     ):
-                        sanitized = _sanitize_nonfinite_gradients_(model)
-                        nonfinite_sanitized_count += int(sanitized)
-                        grad_norm_for_check = _global_grad_l2_norm(model)
-                        if not _has_nonfinite_grad_norm_any_rank(
-                            accelerator=accelerator,
+                        skipped_window_due_nonfinite = True
+                        nonfinite_skip_total += 1
+                        nonfinite_skip_streak += 1
+                        nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
+                        lr_now = _scheduler_current_lr(lr_scheduler)
+                        nonfinite_debug_path = _write_nonfinite_debug_artifact(
+                            output_dir=output_dir,
+                            step=int(global_step + 1),
+                            micro_step_idx=int(step_idx),
+                            offending=str(nonfinite_reason),
+                            gen_loss_raw=out.gen_loss_raw if out is not None else None,
+                            disc_loss_raw=out.disc_loss_raw if out is not None else None,
+                            forward_loss=out.loss if out is not None else None,
+                            backward_loss=None,
                             grad_norm=float(grad_norm_for_check),
-                        ):
-                            logger.warning(
-                                "Sanitized %d non-finite gradient elements before optimizer step "
-                                "(step=%d, micro_step=%d); continuing.",
-                                int(sanitized),
-                                int(global_step + 1),
-                                int(step_idx),
-                            )
-                        else:
-                            skipped_window_due_nonfinite = True
-                            nonfinite_skip_total += 1
-                            nonfinite_skip_streak += 1
-                            nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
-                            lr_now = _scheduler_current_lr(lr_scheduler)
-                            nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=output_dir,
-                                step=int(global_step + 1),
-                                micro_step_idx=int(step_idx),
-                                offending=str(nonfinite_reason),
-                                gen_loss_raw=out.gen_loss_raw if out is not None else None,
-                                disc_loss_raw=out.disc_loss_raw if out is not None else None,
-                                forward_loss=out.loss if out is not None else None,
-                                backward_loss=None,
-                                grad_norm=float(grad_norm_for_check),
-                                lr=lr_now,
-                                compile_enabled=compile_enabled,
-                                compile_mode=compile_mode,
-                                embedding_sharing=str(model_cfg.embedding_sharing),
-                            )
-                            logger.warning(
-                                "Skipping optimizer step due persistent non-finite gradient norm "
-                                "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                                int(global_step + 1),
-                                int(nonfinite_skip_streak),
-                                int(nonfinite_skip_total),
-                                nonfinite_debug_path,
-                            )
-                            optimizer.zero_grad(set_to_none=True)
-                            break
+                            lr=lr_now,
+                            compile_enabled=compile_enabled,
+                            compile_mode=compile_mode,
+                            embedding_sharing=str(model_cfg.embedding_sharing),
+                        )
+                        logger.warning(
+                            "Skipping optimizer step due non-finite gradient norm "
+                            "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                            int(global_step + 1),
+                            int(nonfinite_skip_streak),
+                            int(nonfinite_skip_total),
+                            nonfinite_debug_path,
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        break
 
                     if _should_clip_gradients(
                         sync_gradients=True,
@@ -2652,51 +2570,36 @@ def run_pretraining(
                             accelerator=accelerator,
                             grad_norm=float(post_clip_grad_norm),
                         ):
-                            sanitized = _sanitize_nonfinite_gradients_(model)
-                            nonfinite_sanitized_count += int(sanitized)
-                            post_clip_grad_norm = _global_grad_l2_norm(model)
-                            if not _has_nonfinite_grad_norm_any_rank(
-                                accelerator=accelerator,
+                            skipped_window_due_nonfinite = True
+                            nonfinite_skip_total += 1
+                            nonfinite_skip_streak += 1
+                            nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
+                            lr_now = _scheduler_current_lr(lr_scheduler)
+                            nonfinite_debug_path = _write_nonfinite_debug_artifact(
+                                output_dir=output_dir,
+                                step=int(global_step + 1),
+                                micro_step_idx=int(step_idx),
+                                offending=str(nonfinite_reason),
+                                gen_loss_raw=out.gen_loss_raw if out is not None else None,
+                                disc_loss_raw=out.disc_loss_raw if out is not None else None,
+                                forward_loss=out.loss if out is not None else None,
+                                backward_loss=None,
                                 grad_norm=float(post_clip_grad_norm),
-                            ):
-                                logger.warning(
-                                    "Sanitized %d non-finite post-clip gradient elements "
-                                    "(step=%d, micro_step=%d); continuing.",
-                                    int(sanitized),
-                                    int(global_step + 1),
-                                    int(step_idx),
-                                )
-                            else:
-                                skipped_window_due_nonfinite = True
-                                nonfinite_skip_total += 1
-                                nonfinite_skip_streak += 1
-                                nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
-                                lr_now = _scheduler_current_lr(lr_scheduler)
-                                nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                    output_dir=output_dir,
-                                    step=int(global_step + 1),
-                                    micro_step_idx=int(step_idx),
-                                    offending=str(nonfinite_reason),
-                                    gen_loss_raw=out.gen_loss_raw if out is not None else None,
-                                    disc_loss_raw=out.disc_loss_raw if out is not None else None,
-                                    forward_loss=out.loss if out is not None else None,
-                                    backward_loss=None,
-                                    grad_norm=float(post_clip_grad_norm),
-                                    lr=lr_now,
-                                    compile_enabled=compile_enabled,
-                                    compile_mode=compile_mode,
-                                    embedding_sharing=str(model_cfg.embedding_sharing),
-                                )
-                                logger.warning(
-                                    "Skipping optimizer step due persistent non-finite post-clip gradient norm "
-                                    "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                                    int(global_step + 1),
-                                    int(nonfinite_skip_streak),
-                                    int(nonfinite_skip_total),
-                                    nonfinite_debug_path,
-                                )
-                                optimizer.zero_grad(set_to_none=True)
-                                break
+                                lr=lr_now,
+                                compile_enabled=compile_enabled,
+                                compile_mode=compile_mode,
+                                embedding_sharing=str(model_cfg.embedding_sharing),
+                            )
+                            logger.warning(
+                                "Skipping optimizer step due non-finite post-clip gradient norm "
+                                "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                                int(global_step + 1),
+                                int(nonfinite_skip_streak),
+                                int(nonfinite_skip_total),
+                                nonfinite_debug_path,
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            break
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -2743,7 +2646,6 @@ def run_pretraining(
                                 "nonfinite_window_skipped": 1.0,
                                 "nonfinite_skip_total": float(nonfinite_skip_total),
                                 "nonfinite_skip_streak": float(nonfinite_skip_streak),
-                                "nonfinite_sanitized_grad_elems": float(nonfinite_sanitized_count),
                                 "nonfinite_recovery_lr_mult": float(lr_mult),
                                 "nonfinite_recovery_optimizer_state_reset": 1.0 if reset_state else 0.0,
                             },
@@ -2753,12 +2655,11 @@ def run_pretraining(
                     if accelerator.is_main_process:
                         logger.warning(
                             "step=%d | nonfinite_window_skipped=1 | reason=%s | streak=%d | total_skips=%d | "
-                            "sanitized_grad_elems=%d | lr_mult=%.4f | opt_state_reset=%s | debug=%s",
+                            "lr_mult=%.4f | opt_state_reset=%s | debug=%s",
                             int(global_step),
                             str(nonfinite_reason or "unknown"),
                             int(nonfinite_skip_streak),
                             int(nonfinite_skip_total),
-                            int(nonfinite_sanitized_count),
                             float(lr_mult),
                             bool(reset_state),
                             str(nonfinite_debug_path) if nonfinite_debug_path is not None else "n/a",

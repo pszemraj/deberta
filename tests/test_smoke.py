@@ -2092,7 +2092,7 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
     )
 
 
-def test_pretrainer_disc_loss_excludes_special_tokens_from_active_count():
+def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
     import pytest
 
     pytest.importorskip("transformers")
@@ -2144,11 +2144,11 @@ def test_pretrainer_disc_loss_excludes_special_tokens_from_active_count():
         disc_loss_weight=50.0,
         decoupled_loss_scaling=False,
     )
-    expected_active = ((input_ids != 0) & (input_ids != 1) & (input_ids != 2) & (input_ids != 3)).sum()
+    expected_active = (input_ids != 0).sum()
     assert int(out.disc_token_count.item()) == int(expected_active.item())
 
 
-def test_pretrainer_disc_active_keeps_masked_positions_even_if_sampled_special(monkeypatch):
+def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_special(monkeypatch):
     import pytest
 
     pytest.importorskip("transformers")
@@ -2206,7 +2206,7 @@ def test_pretrainer_disc_active_keeps_masked_positions_even_if_sampled_special(m
             decoupled_loss_scaling=False,
         )
 
-    torch.testing.assert_close(out.disc_token_count, torch.tensor(2.0))
+    torch.testing.assert_close(out.disc_token_count, torch.tensor(4.0))
 
 
 def test_rope_config_rejects_unknown_ffn_type():

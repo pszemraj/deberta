@@ -82,7 +82,6 @@ from deberta.training.pretrain import (
     _resolve_resume_checkpoint,
     _resolve_resume_checkpoint_for_accelerator,
     _resolve_window_token_denominators,
-    _sanitize_nonfinite_gradients_,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
     _scale_loss_for_backward,
@@ -1947,19 +1946,57 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
     assert "nonfinite_window_skipped=1" in caplog.text
 
 
-def test_sanitize_nonfinite_gradients_replaces_nan_inf_values() -> None:
-    class _Tiny(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.w = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opt_ref: dict[str, Any] = {}
 
-    model = _Tiny()
-    model.w.grad = torch.tensor([float("nan"), float("inf"), -float("inf")], dtype=torch.float32)
-    replaced = _sanitize_nonfinite_gradients_(model)
-    assert int(replaced) == 3
-    assert model.w.grad is not None
-    assert torch.isfinite(model.w.grad).all()
-    assert torch.equal(model.w.grad, torch.zeros_like(model.w.grad))
+    class _CountingSGD(torch.optim.SGD):
+        def __init__(self, params: Any, lr: float) -> None:
+            super().__init__(params, lr=lr)
+            self.step_calls = 0
+
+        def step(self, closure: Any = None):  # type: ignore[override]
+            self.step_calls += 1
+            return super().step(closure=closure)
+
+    def _build_optimizer(model: torch.nn.Module, _cfg: Any, **_kwargs: Any) -> torch.optim.Optimizer:
+        opt = _CountingSGD(model.parameters(), lr=0.1)
+        opt_ref["opt"] = opt
+        return opt
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        extra_patches={
+            "_global_grad_l2_norm": lambda _model: float("inf"),
+            "_build_optimizer": _build_optimizer,
+        },
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        max_grad_norm=1.0,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+    opt = opt_ref.get("opt")
+    assert isinstance(opt, _CountingSGD)
+    assert int(opt.step_calls) == 0
 
 
 def test_apply_nonfinite_recovery_ratchets_lr_mult_and_resets_state_on_interval() -> None:
@@ -3075,15 +3112,12 @@ def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discrimina
         "input_ids": torch.tensor([[1, 3, 11, 2, 0]], dtype=torch.long),
         "labels": torch.tensor([[-100, 99, -100, -100, -100]], dtype=torch.long),
     }
-    special_token_mask = torch.zeros(16, dtype=torch.bool)
-    special_token_mask[torch.tensor([0, 1, 2, 3])] = True
     gen_count, disc_count = _count_rtd_tokens_for_batch(
         batch,
-        special_token_mask=special_token_mask,
         pad_token_id=0,
     )
     assert gen_count == pytest.approx(1.0)
-    assert disc_count == pytest.approx(2.0)
+    assert disc_count == pytest.approx(4.0)
 
 
 def test_count_input_tokens_for_batch_with_various_mask_shapes():
@@ -3118,17 +3152,14 @@ def test_count_input_tokens_for_batch_with_various_mask_shapes():
 def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
     from deberta.training.pretrain import _compute_disc_active_mask
 
-    special_token_mask = torch.zeros(16, dtype=torch.bool)
-    special_token_mask[torch.tensor([0, 1, 2])] = True
     mask = _compute_disc_active_mask(
         input_ids=torch.tensor([[1, 11, 2, 13, 0]], dtype=torch.long),
         labels=torch.tensor([[-100, 99, -100, 77, -100]], dtype=torch.long),
         attention_mask=torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long),
-        special_token_mask=special_token_mask,
         pad_token_id=0,
     )
 
-    expected = torch.tensor([[False, True, False, True, False]], dtype=torch.bool)
+    expected = torch.tensor([[True, True, True, True, True]], dtype=torch.bool)
     assert torch.equal(mask, expected)
 
 

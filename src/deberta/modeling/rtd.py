@@ -345,7 +345,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         self.embedding_sharing = str(embedding_sharing or "none")
 
-        # Special ids excluded from generator sampling and (for non-masked positions) from discriminator loss.
+        # Special ids excluded from generator sampling.
         self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids()
 
         vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
@@ -418,17 +418,6 @@ class DebertaV3RTDPretrainer(nn.Module):
                 if 0 <= sid_i < vocab_size:
                     out.add(sid_i)
         return out
-
-    def _special_position_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Map input ids to a boolean mask of special-token positions.
-
-        :param torch.Tensor input_ids: Input token ids with shape ``(B, S)``.
-        :return torch.Tensor: Boolean mask marking positions whose ids are forbidden special tokens.
-        """
-        mask = getattr(self, "_forbidden_sample_token_mask", None)
-        if not isinstance(mask, torch.Tensor) or mask.numel() == 0:
-            return torch.zeros_like(input_ids, dtype=torch.bool)
-        return mask[input_ids]
 
     # ------------------------------
     # Embedding sharing
@@ -745,12 +734,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             attention_mask=attention_mask,
             pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
         )
-
-        # Special-position filtering is config-token-id based; tokenizer special ids not
-        # represented in config fields are not excluded by this mask.
-        special = self._special_position_mask(input_ids)
-        special = special & (~masked_positions)
-        disc_active = active & (~special)
+        disc_active = active
 
         disc_active_f = disc_active.to(dtype=torch.float32)
         disc_token_count = disc_active_f.sum()
