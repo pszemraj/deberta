@@ -9,6 +9,7 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 
 ## Data/Packing
 
+- evaluate RTD corruption with `train.mlm_max_ngram > 1` (whole-word/n-gram masking) against the parity baseline `mlm_max_ngram=1`; track discriminator-loss stability, corruption quality, and downstream transfer impact
 - implement bit-identical resume mode for packed streaming by checkpointing iterator cursor, packer buffer, and worker RNG state (not just consumed micro-batch count)
 - ~~replace collator-time dense document attention mask materialization with compact doc-boundary representation and on-device block masking~~ — **resolved**: collator now emits `doc_ids (B,S)` and the training loop builds the 3D mask on-device; future: evaluate `flex_attention` block-sparse path to avoid dense `(B,S,S)` materialization entirely
 - refactor token-weighted GA to avoid whole-window microbatch buffering so large per-batch metadata does not scale host memory linearly with `gradient_accumulation_steps`

@@ -90,7 +90,7 @@ For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.Deber
 - Data pipeline, packing, and masking behavior: [`docs/data.md`](docs/data.md)
 - RTD objective and loss semantics: [`docs/objective.md`](docs/objective.md)
 - FSDP2/runtime/export behavior: [`docs/fsdp2.md`](docs/fsdp2.md)
-- Dev/runtime implementation notes and tracked compatibility breaks: [`docs/dev.md`](docs/dev.md)
+- Dev/runtime implementation notes and tracked compatibility breaks: [`docs/dev/index.md`](docs/dev/index.md)
 - Normalization strategy (`post` default, `keel` upgrade path): [`docs/norm-strategy.md`](docs/norm-strategy.md)
 - Deferred follow-ups: [`docs/roadmap.md`](docs/roadmap.md)
 

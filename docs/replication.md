@@ -46,6 +46,7 @@ Notes:
 - `model.profile=deberta_v3_parity` applies parity-oriented defaults where values are still unset.
 - `backbone_type=hf_deberta_v2` is the key switch for disentangled attention + LayerNorm parity.
 - `train.decoupled_training=true` is the default and keeps two-phase RTD updates enabled.
+- `train.mlm_max_ngram=1` is intentional for RTD parity and means token-level masking (not whole-word masking).
 - Decoupled mode is intentionally incompatible with `model.embedding_sharing=es`; use `gdes` (recommended) or `none`.
 - Keep RoPE-only knobs at defaults (they do not apply on the HF-compatible backbone).
 - This repo keeps RTD objective semantics and GDES behavior explicit and tested; it does not guarantee bit-identical reproduction of original Microsoft training pipelines.

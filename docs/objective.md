@@ -19,6 +19,15 @@ step (generator step, embedding sync for GDES, then discriminator step).
 
 Special-token filtering in RTD is config-driven by default, with optional runtime additive ids from `tokenizer.all_special_ids` in training/export paths.
 
+## Masking Granularity
+
+For strict DeBERTa RTD parity, this repo uses `train.mlm_max_ngram=1` in parity configs.
+That is unigram/token-level masking (no whole-word grouping), matching the original
+Microsoft RTD task behavior (`NGramMaskGenerator` with `max_gram=1`).
+
+When `train.mlm_max_ngram > 1`, the collator switches to whole-word n-gram masking.
+Treat that as an objective variant, not parity mode.
+
 ## Loss Terms
 
 - Generator loss: cross entropy on masked positions only.
