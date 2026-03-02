@@ -67,6 +67,7 @@ from deberta.training.pretrain import (
     _init_trackers,
     _load_checkpoint_data_progress,
     _load_resume_state_with_compile_fallback,
+    _normalize_resume_consumed_micro_batches,
     _optimizer_param_order_digest,
     _persist_or_validate_run_configs,
     _prepare_output_dir,
@@ -432,6 +433,43 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
         is_main_process=True,
     )
     assert resolved == str(ckpt.resolve())
+
+
+def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    ckpt1 = out / "checkpoint-1"
+    ckpt1.mkdir(parents=True, exist_ok=True)
+    (ckpt1 / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 10}),
+        encoding="utf-8",
+    )
+
+    # Simulate interrupted checkpoint write: directory exists but metadata was never written.
+    ckpt2 = out / "checkpoint-2"
+    ckpt2.mkdir(parents=True, exist_ok=True)
+
+    resolved = _resolve_resume_checkpoint(
+        output_dir=out,
+        resume_from_checkpoint="auto",
+        is_main_process=True,
+    )
+    assert resolved == str(ckpt1)
+
+
+def test_resolve_resume_checkpoint_auto_rejects_when_all_checkpoints_non_resumable(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "checkpoint-1").mkdir(parents=True, exist_ok=True)
+    (out / "checkpoint-2").mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError, match="none are resumable"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint="auto",
+            is_main_process=True,
+        )
 
 
 def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
@@ -1063,6 +1101,64 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
         train_cfg=train_cfg,
     )
     assert replay_calls["next"] == 0
+
+
+def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _ResumeAccelerator(FakeAccelerator):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.loaded: list[tuple[str, dict[str, Any]]] = []
+
+        def load_state(self, ckpt: str, **kwargs: Any) -> None:
+            self.loaded.append((ckpt, dict(kwargs)))
+
+    checkpoint_dir = tmp_path / "run" / "checkpoint-1"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 3}),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, int] = {}
+
+    def _capture_policy(*, train_cfg: Any, consumed_micro_batches: int, global_step: int):
+        del train_cfg
+        captured["consumed_micro_batches"] = int(consumed_micro_batches)
+        captured["global_step"] = int(global_step)
+        return 0, False, "captured"
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_ResumeAccelerator,
+    )
+    monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert captured["global_step"] == 1
+    assert captured["consumed_micro_batches"] == 2
 
 
 def test_run_pretraining_resume_requires_data_state_json(
@@ -1940,6 +2036,27 @@ def test_resolve_data_resume_policy_respects_explicit_strategy():
     )
     assert start_epoch_restart == 17
     assert do_replay_restart is False
+
+
+def test_normalize_resume_consumed_micro_batches_clamps_legacy_partial_window():
+    consumed, reason = _normalize_resume_consumed_micro_batches(
+        consumed_micro_batches=35,
+        global_step=11,
+        gradient_accumulation_steps=3,
+    )
+    assert consumed == 33
+    assert reason is not None
+    assert "clamped_legacy_partial_accumulation_delta" in reason
+
+
+def test_normalize_resume_consumed_micro_batches_keeps_non_legacy_mismatch():
+    consumed, reason = _normalize_resume_consumed_micro_batches(
+        consumed_micro_batches=100,
+        global_step=11,
+        gradient_accumulation_steps=3,
+    )
+    assert consumed == 100
+    assert reason is None
 
 
 def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

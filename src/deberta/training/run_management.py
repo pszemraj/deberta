@@ -151,6 +151,35 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     return checkpoints[-1][1]
 
 
+def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
+    """Return latest checkpoint directory that has valid resume data progress metadata.
+
+    A checkpoint is considered resumable only when ``data_state.json`` exists and
+    contains ``consumed_micro_batches``. This avoids auto-resume selecting a
+    half-written latest checkpoint that may have completed ``save_state`` but not
+    metadata persistence.
+
+    :param Path output_dir: Training output directory.
+    :return Path | None: Latest resumable checkpoint path, or ``None`` if absent.
+    """
+    checkpoints: list[tuple[int, Path]] = []
+    for p in output_dir.glob("checkpoint-*"):
+        if not p.is_dir():
+            continue
+        step = _parse_checkpoint_step(str(p))
+        checkpoints.append((step, p))
+
+    if not checkpoints:
+        return None
+
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
+    for _, checkpoint_dir in checkpoints:
+        consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
+        if consumed is not None:
+            return checkpoint_dir
+    return None
+
+
 def _resolve_resume_checkpoint(
     *,
     output_dir: Path,
@@ -185,8 +214,8 @@ def _resolve_resume_checkpoint(
             )
         return str(checkpoint_path.resolve())
 
-    latest = _find_latest_checkpoint(output_dir)
-    if latest is None:
+    latest_any = _find_latest_checkpoint(output_dir)
+    if latest_any is None:
         has_existing_contents = output_dir.exists() and any(output_dir.iterdir())
         if has_existing_contents:
             raise ValueError(
@@ -197,7 +226,23 @@ def _resolve_resume_checkpoint(
         if is_main_process:
             logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
         return None
-    return str(latest)
+
+    latest_resumable = _find_latest_resumable_checkpoint(output_dir)
+    if latest_resumable is None:
+        raise ValueError(
+            "resume_from_checkpoint=auto found checkpoint-* directories but none are resumable "
+            "(missing/invalid data_state.json with consumed_micro_batches). "
+            "Provide an explicit checkpoint path or clean stale/incomplete checkpoints."
+        )
+
+    if is_main_process and latest_resumable != latest_any:
+        logger.warning(
+            "resume_from_checkpoint=auto skipped newest checkpoint %s because resume metadata "
+            "is missing/invalid; falling back to %s.",
+            latest_any,
+            latest_resumable,
+        )
+    return str(latest_resumable)
 
 
 def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, float, str | None]:

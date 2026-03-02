@@ -1053,6 +1053,39 @@ def _resolve_data_resume_policy(
     )
 
 
+def _normalize_resume_consumed_micro_batches(
+    *,
+    consumed_micro_batches: int,
+    global_step: int,
+    gradient_accumulation_steps: int,
+) -> tuple[int, str | None]:
+    """Normalize legacy resume data progress to committed optimizer-step boundaries.
+
+    Legacy checkpoints may contain micro-batch progress ahead of ``global_step`` when
+    a crash happened mid-accumulation window. Detect this pattern and clamp to the
+    last committed window boundary.
+
+    :param int consumed_micro_batches: Restored consumed micro-batch count.
+    :param int global_step: Resumed optimizer step from checkpoint path.
+    :param int gradient_accumulation_steps: Configured accumulation steps.
+    :return tuple[int, str | None]: ``(normalized_consumed, reason_or_none)``.
+    """
+    consumed = max(0, int(consumed_micro_batches))
+    step = max(0, int(global_step))
+    ga_steps = max(1, int(gradient_accumulation_steps))
+
+    # Non-standard checkpoint names can parse as step=0; avoid clamping in that case.
+    if step <= 0:
+        return int(consumed), None
+
+    expected_committed = int(step * ga_steps)
+    if consumed > expected_committed:
+        delta = int(consumed - expected_committed)
+        if 0 < delta < ga_steps:
+            return int(expected_committed), f"clamped_legacy_partial_accumulation_delta={delta}"
+    return int(consumed), None
+
+
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     """Move all batch tensors onto a device.
 
@@ -2111,6 +2144,7 @@ def run_pretraining(
     global_step = 0
     consumed_micro_batches = 0
     consumed_micro_batches_committed = 0
+    ga_steps = max(1, int(train_cfg.gradient_accumulation_steps))
     last_saved_step = 0
     lr_mult = 1.0
     nonfinite_skip_total = 0
@@ -2206,8 +2240,24 @@ def run_pretraining(
                     f"Missing file for checkpoint '{ckpt}'. Resume from a checkpoint created by this "
                     "code version or start a new run."
                 )
-            consumed_micro_batches = int(restored)
-            consumed_micro_batches_committed = int(restored)
+            (
+                consumed_micro_batches,
+                consumed_normalize_reason,
+            ) = _normalize_resume_consumed_micro_batches(
+                consumed_micro_batches=int(restored),
+                global_step=int(global_step),
+                gradient_accumulation_steps=int(ga_steps),
+            )
+            if consumed_normalize_reason is not None and accelerator.is_main_process:
+                logger.warning(
+                    "Resume checkpoint '%s' had consumed_micro_batches=%d ahead of committed step boundary; "
+                    "clamped to %d (%s).",
+                    ckpt,
+                    int(restored),
+                    int(consumed_micro_batches),
+                    consumed_normalize_reason,
+                )
+            consumed_micro_batches_committed = int(consumed_micro_batches)
             lr_mult = float(restored_lr_mult)
 
             if saved_digest is not None and saved_digest != param_digest:
@@ -2247,7 +2297,6 @@ def run_pretraining(
             global_step=global_step,
         )
         train_iter = _cycle_dataloader(train_loader, start_epoch=start_epoch)
-        ga_steps = int(train_cfg.gradient_accumulation_steps)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
         unwrapped_model = unwrap_compiled_model(accelerator, model)
         # Boolean vocab mask used both by the RTD module and token-weighted GA.
