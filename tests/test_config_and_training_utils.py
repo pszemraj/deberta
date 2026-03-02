@@ -67,6 +67,7 @@ from deberta.training.pretrain import (
     _has_nonfinite_grad_norm_any_rank,
     _init_trackers,
     _load_checkpoint_data_progress,
+    _load_checkpoint_progress_metadata,
     _load_resume_state_with_compile_fallback,
     _normalize_resume_consumed_micro_batches,
     _optimizer_param_order_digest,
@@ -79,6 +80,7 @@ from deberta.training.pretrain import (
     _resolve_output_dir,
     _resolve_output_dir_for_accelerator,
     _resolve_resume_checkpoint,
+    _resolve_resume_checkpoint_for_accelerator,
     _resolve_window_token_denominators,
     _sanitize_nonfinite_gradients_,
     _save_checkpoint_data_progress,
@@ -388,6 +390,58 @@ def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
     assert out == Path("runs/demo/20260101_010101_shared")
 
 
+def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tmp_path: Path):
+    class _FakeAccelerator:
+        is_main_process = False
+        num_processes = 4
+
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    def _fake_broadcast(payload: list[dict[str, Any]], *, from_process: int = 0) -> None:
+        assert from_process == 0
+        payload[0] = {
+            "ok": True,
+            "value": str((out / "checkpoint-9").resolve()),
+            "error_type": None,
+            "error_message": None,
+        }
+
+    resolved = _resolve_resume_checkpoint_for_accelerator(
+        accelerator=_FakeAccelerator(),
+        output_dir=out,
+        resume_from_checkpoint="auto",
+        broadcast_fn=_fake_broadcast,
+    )
+    assert resolved == str((out / "checkpoint-9").resolve())
+
+
+def test_resolve_resume_checkpoint_for_accelerator_propagates_rank0_error(tmp_path: Path):
+    class _FakeAccelerator:
+        is_main_process = False
+        num_processes = 2
+
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+
+    def _fake_broadcast(payload: list[dict[str, Any]], *, from_process: int = 0) -> None:
+        assert from_process == 0
+        payload[0] = {
+            "ok": False,
+            "value": None,
+            "error_type": "ValueError",
+            "error_message": "rank0 failed",
+        }
+
+    with pytest.raises(ValueError, match="rank0 failed"):
+        _resolve_resume_checkpoint_for_accelerator(
+            accelerator=_FakeAccelerator(),
+            output_dir=out,
+            resume_from_checkpoint="auto",
+            broadcast_fn=_fake_broadcast,
+        )
+
+
 def test_resolve_resume_checkpoint_auto_returns_none_when_no_checkpoint(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -447,6 +501,7 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
         json.dumps({"consumed_micro_batches": 2}),
         encoding="utf-8",
     )
+    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     resolved = _resolve_resume_checkpoint(
         output_dir=out,
         resume_from_checkpoint=str(ckpt),
@@ -455,14 +510,34 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
     assert resolved == str(ckpt.resolve())
 
 
+def test_resolve_resume_checkpoint_rejects_explicit_path_without_complete_marker(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-2"
+    ckpt.mkdir()
+    (ckpt / "model.safetensors").write_bytes(b"weights")
+    (ckpt / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 2}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing .complete marker"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint=str(ckpt),
+            is_main_process=True,
+        )
+
+
 def test_resolve_resume_checkpoint_rejects_explicit_path_without_data_state(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-2"
     ckpt.mkdir()
     (ckpt / "model.safetensors").write_bytes(b"weights")
+    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="missing or has an invalid data_state.json"):
+    with pytest.raises(ValueError, match="missing/invalid data_state.json"):
         _resolve_resume_checkpoint(
             output_dir=out,
             resume_from_checkpoint=str(ckpt),
@@ -479,6 +554,7 @@ def test_resolve_resume_checkpoint_rejects_explicit_path_without_model_weights(t
         json.dumps({"consumed_micro_batches": 2}),
         encoding="utf-8",
     )
+    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="model weights appear missing or empty"):
         _resolve_resume_checkpoint(
@@ -499,6 +575,7 @@ def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tm
         json.dumps({"consumed_micro_batches": 10}),
         encoding="utf-8",
     )
+    (ckpt1 / ".complete").write_text("ok\n", encoding="utf-8")
 
     # Simulate interrupted checkpoint write: directory exists but metadata was never written.
     ckpt2 = out / "checkpoint-2"
@@ -509,7 +586,7 @@ def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tm
         resume_from_checkpoint="auto",
         is_main_process=True,
     )
-    assert resolved == str(ckpt1)
+    assert resolved == str(ckpt1.resolve())
 
 
 def test_resolve_resume_checkpoint_auto_rejects_when_all_checkpoints_non_resumable(tmp_path: Path):
@@ -547,11 +624,16 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
         consumed_micro_batches=200,
         lr_mult=0.5,
         optimizer_param_digest="abc123deadbeef00",
+        global_step=17,
+        gradient_accumulation_steps=4,
     )
     consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
     assert consumed == 200
     assert abs(lr_mult - 0.5) < 1e-9
     assert digest == "abc123deadbeef00"
+    _, _, _, global_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
+    assert global_step == 17
+    assert saved_ga == 4
 
     # Back-compat: old checkpoints without lr_mult or digest default gracefully.
     import json
@@ -1201,6 +1283,20 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
     assert saved_checkpoints[-1][2] == "final"
 
 
+def _write_resume_source_snapshots(run_dir: Path) -> None:
+    """Write minimal model/data snapshots required for strict resume validation."""
+    model_cfg = ModelConfig()
+    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(model_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "data_config.json").write_text(
+        json.dumps(asdict(data_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1214,11 +1310,13 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
     (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
     (checkpoint_dir / "data_state.json").write_text(
         json.dumps({"consumed_micro_batches": 50}),
         encoding="utf-8",
     )
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
 
     replay_calls = {"next": 0}
 
@@ -1271,11 +1369,13 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 
     checkpoint_dir = tmp_path / "run" / "checkpoint-1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
     (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
     (checkpoint_dir / "data_state.json").write_text(
         json.dumps({"consumed_micro_batches": 3}),
         encoding="utf-8",
     )
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
 
     captured: dict[str, int] = {}
 
@@ -1317,12 +1417,82 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
     assert captured["consumed_micro_batches"] == 2
 
 
+def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _ResumeAccelerator(FakeAccelerator):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.loaded: list[tuple[str, dict[str, Any]]] = []
+
+        def load_state(self, ckpt: str, **kwargs: Any) -> None:
+            self.loaded.append((ckpt, dict(kwargs)))
+
+    checkpoint_dir = tmp_path / "run" / "checkpoint-1"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+    (checkpoint_dir / "data_state.json").write_text(
+        json.dumps(
+            {
+                "consumed_micro_batches": 3,
+                "global_step": 1,
+                "gradient_accumulation_steps": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
+
+    captured: dict[str, int] = {}
+
+    def _capture_policy(*, train_cfg: Any, consumed_micro_batches: int, global_step: int):
+        del train_cfg
+        captured["consumed_micro_batches"] = int(consumed_micro_batches)
+        captured["global_step"] = int(global_step)
+        return 0, False, "captured"
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_ResumeAccelerator,
+    )
+    monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
+
+    # Current run uses GA=2, but resume normalization should use save-time GA=3.
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert captured["global_step"] == 1
+    assert captured["consumed_micro_batches"] == 3
+
+
 def test_run_pretraining_resume_requires_data_state_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
     (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
     train_cfg = TrainConfig(
@@ -1341,7 +1511,45 @@ def test_run_pretraining_resume_requires_data_state_json(
         resume_from_checkpoint=str(checkpoint_dir),
     )
 
-    with pytest.raises(ValueError, match="missing or has an invalid data_state.json"):
+    with pytest.raises(ValueError, match="missing/invalid data_state.json"):
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
+
+
+def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_dir = tmp_path / "run" / "checkpoint-2"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+    (checkpoint_dir / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 2, "global_step": 1}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
+    pretrain_mod = setup_pretraining_mocks(monkeypatch)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=3,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+
+    with pytest.raises(RuntimeError, match="Checkpoint step mismatch on resume"):
         pretrain_mod.run_pretraining(
             model_cfg=ModelConfig(),
             data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
@@ -1843,6 +2051,96 @@ def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_re
     assert not run_meta_path.exists()
 
 
+def test_persist_or_validate_run_configs_validates_against_resume_source_run_dir(tmp_path: Path):
+    source_run = tmp_path / "source-run"
+    source_run.mkdir(parents=True, exist_ok=True)
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=10)
+    _persist_or_validate_run_configs(
+        output_dir=source_run,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    checkpoint_dir = source_run / "checkpoint-10"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    new_output_dir = tmp_path / "new-run"
+    new_output_dir.mkdir(parents=True, exist_ok=True)
+    mismatched_model = ModelConfig(backbone_type="rope", hidden_size=1024)
+    with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
+        _persist_or_validate_run_configs(
+            output_dir=new_output_dir,
+            model_cfg=mismatched_model,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            resume_checkpoint=str(checkpoint_dir),
+            is_main_process=True,
+        )
+
+
+def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_differs(tmp_path: Path):
+    source_run = tmp_path / "source-run"
+    source_run.mkdir(parents=True, exist_ok=True)
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=10)
+    _persist_or_validate_run_configs(
+        output_dir=source_run,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    checkpoint_dir = source_run / "checkpoint-10"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    new_output_dir = tmp_path / "new-run"
+    new_output_dir.mkdir(parents=True, exist_ok=True)
+    changed_train_cfg = TrainConfig(max_steps=25)
+    _persist_or_validate_run_configs(
+        output_dir=new_output_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=changed_train_cfg,
+        resume_checkpoint=str(checkpoint_dir),
+        is_main_process=True,
+    )
+
+    resume_source = json.loads((new_output_dir / "resume_source.json").read_text(encoding="utf-8"))
+    assert resume_source["resume_checkpoint"] == str(checkpoint_dir.resolve())
+    assert resume_source["resume_run_dir"] == str(source_run.resolve())
+    assert (new_output_dir / "model_config.json").read_text(encoding="utf-8") == (
+        source_run / "model_config.json"
+    ).read_text(encoding="utf-8")
+    assert (new_output_dir / "train_config.json").read_text(encoding="utf-8") == (
+        source_run / "train_config.json"
+    ).read_text(encoding="utf-8")
+
+
+def test_persist_or_validate_run_configs_rejects_resume_when_source_snapshots_missing(tmp_path: Path):
+    source_run = tmp_path / "source-run"
+    source_run.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = source_run / "checkpoint-1"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(ValueError, match="source run directory is missing model/data config snapshots"):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=ModelConfig(backbone_type="rope"),
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=TrainConfig(),
+            resume_checkpoint=str(checkpoint_dir),
+            is_main_process=True,
+        )
+
+
 def test_persist_or_validate_run_configs_allows_resume_when_only_inert_model_fields_change(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -2005,7 +2303,10 @@ def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_pat
         log_label="periodic",
     )
 
-    assert accel.save_paths == [str(ckpt)]
+    assert len(accel.save_paths) == 1
+    staged = Path(accel.save_paths[0])
+    assert staged.parent == out
+    assert staged.name.startswith(f".{ckpt.name}.tmp-")
     assert accel.wait_count >= 3
     assert not (ckpt / "data_state.json").exists()
 
@@ -2025,11 +2326,34 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
         log_label="final",
     )
 
-    assert accel.save_paths == [str(ckpt)]
+    assert len(accel.save_paths) == 1
+    staged = Path(accel.save_paths[0])
+    assert staged.parent == out
+    assert staged.name.startswith(f".{ckpt.name}.tmp-")
     consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
     assert consumed == 42
     assert lr_mult == 1.0
     assert digest is None  # no digest passed
+    assert (ckpt / ".complete").exists()
+
+
+def test_save_training_checkpoint_rejects_overwrite_of_nonempty_checkpoint_dir(tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-8"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    (ckpt / "stale.bin").write_bytes(b"stale")
+
+    accel = _FakeAccelerator(is_main_process=True)
+    with pytest.raises(RuntimeError, match="Refusing to overwrite non-empty checkpoint directory"):
+        _save_training_checkpoint(
+            accelerator=accel,
+            checkpoint_dir=ckpt,
+            output_dir=out,
+            consumed_micro_batches=1,
+            save_total_limit=2,
+            log_label="periodic",
+        )
 
 
 def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_path: Path) -> None:
@@ -2042,6 +2366,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
         json.dumps({"consumed_micro_batches": 1}),
         encoding="utf-8",
     )
+    (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
     accel = _FakeAccelerator(is_main_process=True)
@@ -2056,10 +2381,11 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
 
     assert not old_ckpt.exists()
     assert new_ckpt.exists()
+    assert (new_ckpt / ".complete").exists()
 
 
 def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_invalid(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
 ) -> None:
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -2070,6 +2396,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
         json.dumps({"consumed_micro_batches": 1}),
         encoding="utf-8",
     )
+    (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
     class _BrokenSaveAccelerator(_FakeAccelerator):
@@ -2080,7 +2407,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
             (p / "main.txt").write_text("ok", encoding="utf-8")
 
     accel = _BrokenSaveAccelerator(is_main_process=True)
-    with caplog.at_level(logging.ERROR):
+    with pytest.raises(RuntimeError, match="Post-save structural validation failed"):
         _save_training_checkpoint(
             accelerator=accel,
             checkpoint_dir=new_ckpt,
@@ -2091,8 +2418,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
         )
 
     assert old_ckpt.exists()
-    assert new_ckpt.exists()
-    assert any("failed post-save structural validation" in record.message for record in caplog.records)
+    assert not new_ckpt.exists()
 
 
 def test_cycle_dataloader_advances_dataset_epoch_each_pass():

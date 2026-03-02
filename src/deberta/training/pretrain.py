@@ -70,11 +70,13 @@ _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 # Re-exported for compatibility with existing tests/tooling that import private helpers from pretrain.py.
 _find_latest_checkpoint = _run_management._find_latest_checkpoint
 _load_checkpoint_data_progress = _run_management._load_checkpoint_data_progress
+_load_checkpoint_progress_metadata = _run_management._load_checkpoint_progress_metadata
 _parse_checkpoint_step = _run_management._parse_checkpoint_step
 _prepare_output_dir = _run_management._prepare_output_dir
 _resolve_output_dir = _run_management._resolve_output_dir
 _resolve_output_dir_for_accelerator = _run_management._resolve_output_dir_for_accelerator
 _resolve_resume_checkpoint = _run_management._resolve_resume_checkpoint
+_resolve_resume_checkpoint_for_accelerator = _run_management._resolve_resume_checkpoint_for_accelerator
 _rotate_checkpoints = _run_management._rotate_checkpoints
 _sanitize_run_label = _run_management._sanitize_run_label
 _save_checkpoint_data_progress = _run_management._save_checkpoint_data_progress
@@ -1106,7 +1108,7 @@ def _normalize_resume_consumed_micro_batches(
 
     :param int consumed_micro_batches: Restored consumed micro-batch count.
     :param int global_step: Resumed optimizer step from checkpoint path.
-    :param int gradient_accumulation_steps: Configured accumulation steps.
+    :param int gradient_accumulation_steps: Accumulation steps used to interpret saved progress.
     :return tuple[int, str | None]: ``(normalized_consumed, reason_or_none)``.
     """
     consumed = max(0, int(consumed_micro_batches))
@@ -1973,10 +1975,10 @@ def run_pretraining(
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=accelerator.is_main_process,
     )
-    ckpt = _resolve_resume_checkpoint(
+    ckpt = _resolve_resume_checkpoint_for_accelerator(
+        accelerator=accelerator,
         output_dir=output_dir,
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
-        is_main_process=accelerator.is_main_process,
     )
     _persist_or_validate_run_configs(
         output_dir=output_dir,
@@ -2244,9 +2246,13 @@ def run_pretraining(
             with suppress(Exception):
                 _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
 
-            global_step = _parse_checkpoint_step(ckpt)
-            last_saved_step = global_step
-            restored, restored_lr_mult, saved_digest = _load_checkpoint_data_progress(Path(ckpt))
+            (
+                restored,
+                restored_lr_mult,
+                saved_digest,
+                saved_global_step,
+                saved_ga_steps,
+            ) = _load_checkpoint_progress_metadata(Path(ckpt))
             if restored is None:
                 raise RuntimeError(
                     "Checkpoint resume requires data_state.json with consumed_micro_batches metadata. "
@@ -2254,13 +2260,40 @@ def run_pretraining(
                     "The checkpoint may be incomplete due to a crashed save. "
                     "Resume from a different checkpoint created by this code version or start a new run."
                 )
+            parsed_checkpoint_step = _parse_checkpoint_step(ckpt)
+            if saved_global_step is None:
+                global_step = int(parsed_checkpoint_step)
+            else:
+                global_step = int(max(0, saved_global_step))
+                if int(parsed_checkpoint_step) > 0 and int(parsed_checkpoint_step) != int(global_step):
+                    raise RuntimeError(
+                        "Checkpoint step mismatch on resume: "
+                        f"path step={int(parsed_checkpoint_step)} but data_state.json global_step={int(global_step)} "
+                        f"for checkpoint '{ckpt}'."
+                    )
+            last_saved_step = int(global_step)
+            normalization_ga_steps = (
+                int(saved_ga_steps) if saved_ga_steps is not None else int(max(1, int(ga_steps)))
+            )
+            if (
+                saved_ga_steps is not None
+                and int(saved_ga_steps) != int(ga_steps)
+                and accelerator.is_main_process
+            ):
+                logger.warning(
+                    "Resume checkpoint '%s' was saved with gradient_accumulation_steps=%d but current run uses %d; "
+                    "using save-time GA only for resume-progress normalization.",
+                    ckpt,
+                    int(saved_ga_steps),
+                    int(ga_steps),
+                )
             (
                 consumed_micro_batches,
                 consumed_normalize_reason,
             ) = _normalize_resume_consumed_micro_batches(
                 consumed_micro_batches=int(restored),
                 global_step=int(global_step),
-                gradient_accumulation_steps=int(ga_steps),
+                gradient_accumulation_steps=int(normalization_ga_steps),
             )
             if consumed_normalize_reason is not None and accelerator.is_main_process:
                 logger.warning(
@@ -2742,6 +2775,8 @@ def run_pretraining(
                             log_label="periodic",
                             lr_mult=lr_mult,
                             optimizer_param_digest=param_digest,
+                            global_step=int(global_step),
+                            gradient_accumulation_steps=int(ga_steps),
                         )
                         last_saved_step = global_step
                     continue
@@ -2894,6 +2929,8 @@ def run_pretraining(
                         log_label="periodic",
                         lr_mult=lr_mult,
                         optimizer_param_digest=param_digest,
+                        global_step=int(global_step),
+                        gradient_accumulation_steps=int(ga_steps),
                     )
                     last_saved_step = global_step
 
@@ -2945,6 +2982,8 @@ def run_pretraining(
                     log_label="final",
                     lr_mult=lr_mult,
                     optimizer_param_digest=param_digest,
+                    global_step=int(final_step),
+                    gradient_accumulation_steps=int(ga_steps),
                 )
                 last_saved_step = final_step
             except Exception as save_exc:

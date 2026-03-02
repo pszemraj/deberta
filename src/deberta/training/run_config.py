@@ -159,6 +159,16 @@ def _effective_model_config_for_resume_compare(cfg: ModelConfig) -> dict[str, An
     return payload
 
 
+def _infer_resume_run_dir(resume_checkpoint: str | Path) -> Path:
+    """Infer parent run directory from a checkpoint path.
+
+    :param str | Path resume_checkpoint: Checkpoint directory path.
+    :return Path: Parent run directory.
+    """
+    checkpoint_dir = Path(resume_checkpoint).expanduser().resolve()
+    return checkpoint_dir.parent
+
+
 def _persist_or_validate_run_configs(
     *,
     output_dir: Path,
@@ -166,6 +176,7 @@ def _persist_or_validate_run_configs(
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
     resume_checkpoint: str | None,
+    resume_run_dir: Path | None = None,
     config_path: str | Path | None = None,
     is_main_process: bool,
     effective_compile_scope: str | None = None,
@@ -178,16 +189,31 @@ def _persist_or_validate_run_configs(
     :param DataConfig data_cfg: Current data config.
     :param TrainConfig train_cfg: Current train config.
     :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
+    :param Path | None resume_run_dir: Optional explicit source run directory for resume validation.
     :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
     :param str | None effective_compile_scope: Resolved compile scope for metadata.
     :param str | None compile_scope_reason: Reason for compile scope selection.
     :raises ValueError: If resume mode detects incompatible model/data config snapshots.
     """
-    model_cfg_path = output_dir / "model_config.json"
-    data_cfg_path = output_dir / "data_config.json"
-    train_cfg_path = output_dir / "train_config.json"
-    run_meta_path = output_dir / "run_metadata.json"
+    output_dir_abs = output_dir.expanduser().resolve()
+    source_run_dir: Path | None = None
+    snapshot_dir = output_dir
+    if resume_checkpoint is not None:
+        source_run_dir = (
+            resume_run_dir.expanduser().resolve()
+            if resume_run_dir is not None
+            else _infer_resume_run_dir(resume_checkpoint)
+        )
+        snapshot_dir = source_run_dir
+
+    model_cfg_path = snapshot_dir / "model_config.json"
+    data_cfg_path = snapshot_dir / "data_config.json"
+    run_meta_path = snapshot_dir / "run_metadata.json"
+    output_model_cfg_path = output_dir / "model_config.json"
+    output_data_cfg_path = output_dir / "data_config.json"
+    output_train_cfg_path = output_dir / "train_config.json"
+    output_run_meta_path = output_dir / "run_metadata.json"
 
     run_meta = _build_run_metadata(
         effective_compile_scope=effective_compile_scope,
@@ -195,6 +221,11 @@ def _persist_or_validate_run_configs(
     )
 
     has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
+    if resume_checkpoint is not None and not has_saved_model_data:
+        raise ValueError(
+            "Resume checkpoint source run directory is missing model/data config snapshots. "
+            f"Expected both model_config.json and data_config.json under {snapshot_dir}."
+        )
     if resume_checkpoint is not None and has_saved_model_data:
         if run_meta_path.exists():
             _validate_run_metadata(run_meta_path)
@@ -236,7 +267,43 @@ def _persist_or_validate_run_configs(
         if is_main_process and not run_meta_path.exists():
             # Backfill schema metadata for older runs only after compatibility checks pass.
             dump_json(run_meta, run_meta_path)
-        if is_main_process:
+
+        if is_main_process and source_run_dir is not None and source_run_dir != output_dir_abs:
+            resume_checkpoint_abs = Path(resume_checkpoint).expanduser().resolve()
+            # Copy source snapshots into output_dir to keep provenance when resuming into a new run dir.
+            for filename in (
+                "model_config.json",
+                "data_config.json",
+                "train_config.json",
+                "run_metadata.json",
+            ):
+                src = source_run_dir / filename
+                if not src.exists():
+                    continue
+                dst = output_dir / filename
+                src_text = src.read_text(encoding="utf-8")
+                if dst.exists():
+                    dst_text = dst.read_text(encoding="utf-8")
+                    if dst_text != src_text:
+                        raise ValueError(
+                            "Output directory contains conflicting run snapshot while resuming from "
+                            f"a different source run. Conflicting file: {dst}"
+                        )
+                else:
+                    dst.write_text(src_text, encoding="utf-8")
+
+            dump_json(
+                {
+                    "resume_checkpoint": str(resume_checkpoint_abs),
+                    "resume_run_dir": str(source_run_dir),
+                },
+                output_dir / "resume_source.json",
+            )
+            logger.info(
+                "Resume mode: validated snapshots from source run_dir=%s and synchronized provenance into output_dir.",
+                source_run_dir,
+            )
+        elif is_main_process:
             logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
         _persist_config_yaml_snapshots(
             output_dir=output_dir,
@@ -249,10 +316,18 @@ def _persist_or_validate_run_configs(
         return
 
     if is_main_process:
-        dump_json(asdict(model_cfg), model_cfg_path)
-        dump_json(asdict(data_cfg), data_cfg_path)
-        dump_json(asdict(train_cfg), train_cfg_path)
-        dump_json(run_meta, run_meta_path)
+        dump_json(asdict(model_cfg), output_model_cfg_path)
+        dump_json(asdict(data_cfg), output_data_cfg_path)
+        dump_json(asdict(train_cfg), output_train_cfg_path)
+        dump_json(run_meta, output_run_meta_path)
+        if resume_checkpoint is not None and source_run_dir is not None and source_run_dir != output_dir_abs:
+            dump_json(
+                {
+                    "resume_checkpoint": str(Path(resume_checkpoint).expanduser().resolve()),
+                    "resume_run_dir": str(source_run_dir),
+                },
+                output_dir / "resume_source.json",
+            )
     _persist_config_yaml_snapshots(
         output_dir=output_dir,
         model_cfg=model_cfg,
