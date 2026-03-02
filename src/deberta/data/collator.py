@@ -571,16 +571,20 @@ class DebertaV3ElectraCollator:
             # Apply replacements.
             for group in selected_groups:
                 r = float(torch.rand(1).item())
-                replacement_id: int | None = None
+                replacement_mode: str | None = None
                 if r < float(self.cfg.mask_token_prob):
-                    replacement_id = mask_token_id
+                    replacement_mode = "mask"
                 elif r < float(self.cfg.mask_token_prob) + float(self.cfg.random_token_prob):
-                    replacement_id = self._sample_one_random_word(input_ids.device)
+                    replacement_mode = "random"
 
                 for idx in group:
                     labels[b, idx] = ids[idx]
-                    if replacement_id is not None:
-                        input_ids[b, idx] = replacement_id
+                    if replacement_mode == "mask":
+                        input_ids[b, idx] = mask_token_id
+                    elif replacement_mode == "random":
+                        # Keep replacement TYPE coherent per whole-word group, but sample
+                        # random token IDs per subtoken to avoid repeated-token artifacts.
+                        input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
 
         return input_ids, labels
 

@@ -2586,6 +2586,55 @@ def test_gumbel_sample_rejects_all_forbidden_vocab_mask():
         )
 
 
+def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -> None:
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    class _TinyBackbone(torch.nn.Module):
+        def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
+            super().__init__()
+            self.embeddings = types.SimpleNamespace(
+                word_embeddings=torch.nn.Embedding(vocab_size, hidden_size),
+            )
+
+        def forward(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            return_dict: bool = True,
+        ) -> Any:
+            del attention_mask, token_type_ids, return_dict
+            hidden = self.embeddings.word_embeddings(input_ids)
+            return types.SimpleNamespace(last_hidden_state=hidden)
+
+    cfg = types.SimpleNamespace(
+        vocab_size=32,
+        hidden_size=8,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.0,
+        norm_eps=1e-6,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
+        generator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+        additional_forbidden_token_ids=[7, 15, -1, 99],
+    )
+
+    expected = {0, 1, 2, 3, 7, 15}
+    assert expected.issubset(model._forbidden_sample_token_ids)
+    assert int(model._forbidden_sample_token_mask.numel()) == 32
+    for tid in expected:
+        assert bool(model._forbidden_sample_token_mask[tid].item())
+
+
 def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 

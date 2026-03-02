@@ -98,7 +98,7 @@ Full pipeline audit covering forward pass faithfulness, loss computation, attent
 ### RTD Objective Correctness (verified)
 
 - Generator loss: restricted to masked positions only; CLS/SEP/PAD excluded via `special_tokens_mask` + `maskable` filter in collator.
-- Discriminator loss: computed over ALL active non-special non-pad tokens (not just replaced ones) — the classic ELECTRA-bug does not apply here.
+- Discriminator loss: computed over ALL active non-padding tokens (not just replaced ones) — the classic ELECTRA-bug does not apply here.
 - Edge case: when the generator samples the original token, discriminator label is correctly 0 (not replaced).
 - Sampling: Gumbel-max stochastic sampling, not argmax — corruption is non-trivial.
 - Gradient isolation: `torch.no_grad()` wraps sampling/corruption/label construction; discriminator cannot backprop through generator sampling.

@@ -18,6 +18,7 @@ Embedding sharing:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -322,6 +323,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         gen_config: Any,
         embedding_sharing: str = "gdes",
         tie_generator_word_embeddings: bool = True,
+        additional_forbidden_token_ids: Iterable[int] | None = None,
     ) -> None:
         """Initialize RTD pretrainer with generator/discriminator backbones.
 
@@ -331,6 +333,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param Any gen_config: Generator configuration object.
         :param str embedding_sharing: Embedding sharing mode (``none``, ``es``, or ``gdes``).
         :param bool tie_generator_word_embeddings: Whether MLM output head is tied to generator word embeddings.
+        :param Iterable[int] | None additional_forbidden_token_ids: Optional extra token ids excluded from
+            generator sampling (for example tokenizer-only specials not represented on configs).
         :return None: This constructor does not return a value.
         """
         super().__init__()
@@ -346,7 +350,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.embedding_sharing = str(embedding_sharing or "none")
 
         # Special ids excluded from generator sampling.
-        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids()
+        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids(
+            additional_forbidden_token_ids=additional_forbidden_token_ids
+        )
 
         vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
         self.register_buffer(
@@ -385,11 +391,13 @@ class DebertaV3RTDPretrainer(nn.Module):
                 mask[int(tid)] = True
         return mask
 
-    def _collect_forbidden_sample_token_ids(self) -> set[int]:
+    def _collect_forbidden_sample_token_ids(
+        self, *, additional_forbidden_token_ids: Iterable[int] | None = None
+    ) -> set[int]:
         """Collect special token ids to exclude from generator sampling.
 
-        The forbidden set is config-driven; tokenizer-only special ids that are not
-        represented on configs are invisible here.
+        The forbidden set is config-driven by default, with optional additive ids
+        provided by runtime call sites (for tokenizer-only specials).
 
         :return set[int]: Valid special token ids present in generator/discriminator configs.
         """
@@ -411,6 +419,14 @@ class DebertaV3RTDPretrainer(nn.Module):
                 sid = getattr(cfg, attr, None)
                 if sid is None:
                     continue
+                try:
+                    sid_i = int(sid)
+                except Exception:
+                    continue
+                if 0 <= sid_i < vocab_size:
+                    out.add(sid_i)
+        if additional_forbidden_token_ids is not None:
+            for sid in additional_forbidden_token_ids:
                 try:
                     sid_i = int(sid)
                 except Exception:
@@ -734,6 +750,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             attention_mask=attention_mask,
             pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
         )
+        # RTD supervision targets all active (non-padding) positions.
+        # [CLS]/[SEP] are never corruption candidates in the collator, so they
+        # contribute valid all-negative discriminator labels here.
         disc_active = active
 
         disc_active_f = disc_active.to(dtype=torch.float32)

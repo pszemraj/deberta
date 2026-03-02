@@ -9,17 +9,17 @@ Each training step follows DeBERTaV3/ELECTRA-style RTD:
 1. Apply dynamic MLM masking to input tokens.
 2. Run generator on masked input.
 3. Compute generator logits only at masked positions.
-4. Sample replacements from generator distribution, excluding configured tokenizer special token ids (`pad/cls/sep/mask/bos/eos`).
+4. Sample replacements from generator distribution, excluding config special token ids (`pad/cls/sep/mask/bos/eos`) plus runtime-provided tokenizer special ids.
 5. Create corrupted sequence by inserting sampled tokens at masked positions.
 6. Run discriminator on corrupted sequence.
 7. Train discriminator to predict original (`0`) vs replaced (`1`) per token.
 
-Special-token filtering in RTD is config-driven. If you add tokenizer special tokens beyond the standard config id fields, ensure those ids are represented in model configs for consistent sampling/loss exclusion.
+Special-token filtering in RTD is config-driven by default, with optional runtime additive ids from `tokenizer.all_special_ids` in training/export paths.
 
 ## Loss Terms
 
 - Generator loss: cross entropy on masked positions only.
-- Discriminator loss: BCE-with-logits on active non-special tokens.
+- Discriminator loss: BCE-with-logits on all active non-padding tokens.
 - Total loss: `gen_loss_weight * gen_loss + disc_loss_weight * disc_loss`.
 
 Exposed controls:

@@ -365,6 +365,7 @@ def run_export(cfg: ExportConfig) -> None:
         disc_config=disc_config,
         gen_config=gen_config,
         embedding_sharing=embedding_sharing,
+        additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
 
     model = accelerator.prepare(model)

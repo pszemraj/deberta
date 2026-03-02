@@ -1577,6 +1577,7 @@ def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighte
     Accelerate scales all backward losses by ``1 / gradient_accumulation_steps``.
     Token-weighted micro objectives are already normalized over the accumulation
     window, so we cancel that scaling for the token-weighted path only.
+    This helper is intentionally coupled to ``accelerator.accumulate(...)`` semantics.
 
     :param torch.Tensor loss: Raw microbatch loss/objective.
     :param int ga_steps: Gradient accumulation steps.
@@ -2024,6 +2025,7 @@ def run_pretraining(
         gen_config=gen_config,
         embedding_sharing=model_cfg.embedding_sharing,
         tie_generator_word_embeddings=True,
+        additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
 
     # Optimizer + scheduler

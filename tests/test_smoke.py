@@ -81,6 +81,45 @@ def test_packed_streaming_does_not_emit_separator_tail_chunk():
     assert ex["special_tokens_mask"] == [1, 0, 0, 0, 0, 0, 0, 1]
 
 
+def test_packed_streaming_flush_strips_all_trailing_separators(monkeypatch: pytest.MonkeyPatch):
+    import deberta.data.streaming as streaming_mod
+
+    class _NoopLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+    class _DummySharedInt:
+        def __init__(self, _typecode: str, value: int) -> None:
+            self.value = int(value)
+            self._lock = _NoopLock()
+
+        def get_lock(self) -> _NoopLock:
+            return self._lock
+
+    monkeypatch.setattr(streaming_mod.mp, "Value", _DummySharedInt)
+
+    tok = DummyTokenizer(vocab_size=64)
+    hf_dataset = [{"text": "a"}, {"text": "b"}]
+
+    ds = PackedStreamingDataset(
+        hf_dataset=hf_dataset,
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(text_column_name="text", max_seq_length=8, seed=0, shuffle_buffer_size=0),
+        process_index=0,
+        num_processes=1,
+    )
+
+    # Pathological tokenizer output: lexical stream itself is separator-only.
+    # Final flush should drop the entire trailing separator run.
+    monkeypatch.setattr(ds, "_tokenize_text", lambda _raw: [tok.sep_token_id])
+    rows = list(ds)
+    assert rows == []
+
+
 def test_packed_streaming_strips_leading_sep_from_chunk():
     tok = DummyTokenizer(vocab_size=64)
     # max_seq=8 => block_len=6.
@@ -354,7 +393,7 @@ def test_ngram_masking_does_not_split_selected_word_groups():
     assert masked[0, 2].item() == tok.mask_token_id
 
 
-def test_ngram_masking_uses_one_replacement_draw_per_word_group(monkeypatch: pytest.MonkeyPatch):
+def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pytest.MonkeyPatch):
     class WordPiecePairTokenizer(DummyTokenizer):
         def tokenize(self, text: str) -> list[str]:
             del text
@@ -388,10 +427,10 @@ def test_ngram_masking_uses_one_replacement_draw_per_word_group(monkeypatch: pyt
     monkeypatch.setattr(coll, "_sample_one_random_word", _sample_one)
     masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
 
-    assert calls["n"] == 1
+    assert calls["n"] == 2
     assert int(labels.ne(-100).sum().item()) == 2
     assert masked[0, 1].item() == 50
-    assert masked[0, 2].item() == 50
+    assert masked[0, 2].item() == 51
 
 
 def test_ngram_masking_respects_specials():

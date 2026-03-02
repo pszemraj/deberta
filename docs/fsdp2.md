@@ -150,8 +150,8 @@ Training keeps strict scalar checks and non-finite recovery behavior for gradien
 
 - checks run before backward (`gen_loss_raw`, `disc_loss_raw`, forward/backward scalar objectives)
 - checks run before optimizer step (global gradient norm, and post-clip gradient norm when clipping is enabled)
-- when non-finite gradients are detected, training first sanitizes non-finite grad elements to zero and retries the norm check
-- if gradients are still non-finite after sanitize, the accumulation window is skipped, recovery is applied (LR backoff and periodic optimizer-state reset), and training continues
+- when non-finite gradients are detected, the entire accumulation window is skipped (no partial/sanitized optimizer step)
+- recovery is then applied (LR backoff and periodic optimizer-state reset) before continuing
 - skipped non-finite windows are logged as `nonfinite_window_skipped=1` with `nonfinite_skip_total`, `nonfinite_skip_streak`, and recovery metrics
 - when triggered, a compact debug artifact is written to:
   - `<output_dir>/debug/nonfinite_step_<STEP>_<TAG>.json`
