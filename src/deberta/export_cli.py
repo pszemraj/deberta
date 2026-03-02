@@ -219,7 +219,7 @@ def _build_export_backbone(
     :param str export_what: Export target (discriminator|generator|both).
     :return tuple[Any | None, Any | None]: Discriminator and generator export models.
     """
-    bt = (model_cfg.backbone_type or "rope").lower()
+    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     export_what = export_what.lower()
 
     if bt == "hf_deberta_v2":

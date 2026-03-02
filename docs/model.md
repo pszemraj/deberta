@@ -6,18 +6,18 @@ See also: [replication guide](replication.md), [data pipeline](data.md), [RTD ob
 
 `model.backbone_type` supports two architecturally distinct encoder families that share the same RTD pretraining objective and GDES embedding sharing:
 
-| | `rope` (default) | `hf_deberta_v2` |
+| | `hf_deberta_v2` (default) | `rope` (experimental opt-in) |
 |---|---|---|
-| **Attention** | Standard multi-head (QKV → RoPE → SDPA) | Disentangled (C2C + C2P + P2C relative-position bias) |
-| **Position encoding** | Rotary embeddings (geometric, no learned table) | Learned relative-position embeddings + bucket indices |
-| **Normalization** | RMSNorm | LayerNorm |
-| **FFN** | SwiGLU (default) or MLP | MLP only (GELU) |
-| **Bias** | Configurable (`use_bias`) | Hardcoded per layer |
+| **Attention** | Disentangled (C2C + C2P + P2C relative-position bias) | Standard multi-head (QKV → RoPE → SDPA) |
+| **Position encoding** | Learned relative-position embeddings + bucket indices | Rotary embeddings (geometric, no learned table) |
+| **Normalization** | LayerNorm | RMSNorm |
+| **FFN** | MLP only (GELU) | SwiGLU (default) or MLP |
+| **Bias** | Hardcoded per layer | Configurable (`use_bias`) |
 | **Pretraining objective** | RTD (ELECTRA-style) + GDES | RTD (ELECTRA-style) + GDES |
 
-The `rope` backbone is a **modern encoder** (comparable to ModernBERT/NeoEncoder architecture) that uses the DeBERTa-v3 RTD pretraining recipe and GDES embedding sharing — it does **not** implement disentangled attention. Position information is encoded geometrically via rotary embeddings in Q/K vectors.
+The `hf_deberta_v2` backbone faithfully implements the DeBERTa-v2/v3 architecture including disentangled attention with content-to-position (C2P) and position-to-content (P2C) bias decomposition via separate `pos_key_proj`/`pos_query_proj` projections.
 
-The `hf_deberta_v2` backbone faithfully implements the DeBERTa-v2/v3 architecture including disentangled attention with content-to-position (C2P) and position-to-content (P2C) bias decomposition via separate `pos_key_proj`/`pos_query_proj` projections. This is the path to use when disentangled attention is the research variable.
+The `rope` backbone is an experimental modern encoder path that uses the DeBERTa-v3 RTD pretraining recipe and GDES embedding sharing but does **not** implement disentangled attention. Position information is encoded geometrically via rotary embeddings in Q/K vectors.
 
 ## Source Resolution Contract
 

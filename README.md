@@ -1,6 +1,6 @@
 # deberta: a modern refresh
 
-A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
+A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with a default `hf_deberta_v2` backbone plus optional RoPE/KEEL experimental tracks, Accelerate, and FSDP2 workflows.
 
 ## Install
 
@@ -35,14 +35,14 @@ Use `--help` on each command for full argument docs.
 Single-GPU training:
 
 ```bash
-deberta train configs/pretrain_rope_fineweb_edu.yaml \
-  --output-dir runs/deberta_rope_single_gpu
+deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
+  --output-dir runs/deberta_hf_small_single_gpu
 ```
 
 Preflight validation only (no training side effects):
 
 ```bash
-deberta train configs/pretrain_rope_fineweb_edu.yaml --dry-run
+deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml --dry-run
 ```
 
 Preset-driven DeBERTa-v3-base starter (no config file):
@@ -54,28 +54,28 @@ deberta train --preset deberta-v3-base
 Single-GPU export:
 
 ```bash
-deberta export runs/deberta_rope_single_gpu/checkpoint-10000 \
+deberta export runs/deberta_hf_small_single_gpu/checkpoint-10000 \
   --what discriminator \
-  --output-dir runs/deberta_rope_single_gpu/exported_hf
+  --output-dir runs/deberta_hf_small_single_gpu/exported_hf
 ```
 
 FSDP2 parallel training:
 
 ```bash
 accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_fineweb_edu.yaml
+  deberta train configs/pretrain_hf_deberta_v2_parity_base.yaml
 ```
 
 FSDP2 parallel export:
 
 ```bash
 accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta export \
-  runs/deberta_rope_rtd/checkpoint-10000 \
+  runs/deberta_hf_base_rtd/checkpoint-10000 \
   --what discriminator \
-  --output-dir runs/deberta_rope_rtd/exported_hf
+  --output-dir runs/deberta_hf_base_rtd/exported_hf
 ```
 
-Long-context and custom debug presets live under [`configs/`](configs/), including strict
+Long-context RoPE experiments and custom debug presets live under [`configs/`](configs/), including strict
 DeBERTa parity tracks for `hf_deberta_v2` base/small.
 
 For distributed/FSDP2 runtime behavior and export details, see [`docs/fsdp2.md`](docs/fsdp2.md).
@@ -96,9 +96,8 @@ For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.Deber
 
 ## Configs
 
-- Base pretraining config: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml)
-- Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
-- DeBERTa-v2/v3 parity (HF-compatible backbone): [`configs/pretrain_hf_deberta_v2_parity_base.yaml`](configs/pretrain_hf_deberta_v2_parity_base.yaml), [`configs/pretrain_hf_deberta_v2_parity_small.yaml`](configs/pretrain_hf_deberta_v2_parity_small.yaml)
+- Default DeBERTa-v2/v3 parity (HF-compatible backbone): [`configs/pretrain_hf_deberta_v2_parity_base.yaml`](configs/pretrain_hf_deberta_v2_parity_base.yaml), [`configs/pretrain_hf_deberta_v2_parity_small.yaml`](configs/pretrain_hf_deberta_v2_parity_small.yaml)
+- RoPE experimental tracks: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml), [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
 - Accelerate/FSDP2: [`configs/accelerate/fsdp2_1node.yaml`](configs/accelerate/fsdp2_1node.yaml), [`configs/accelerate/fsdp2_hf_deberta_1node.yaml`](configs/accelerate/fsdp2_hf_deberta_1node.yaml)
 

@@ -1,6 +1,6 @@
 # Replication Guide (DeBERTa-v2/v3)
 
-Use this page when you want strict architecture parity rather than the repo's modern RoPE defaults.
+Use this page when you want strict architecture parity rather than the repo's default modernized DeBERTa-v2 workflow.
 
 See also: [model](model.md), [objective](objective.md), [data](data.md), [norm strategy](norm-strategy.md).
 

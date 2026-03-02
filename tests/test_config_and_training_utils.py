@@ -2221,7 +2221,7 @@ def test_run_pretraining_compiles_generator_and_discriminator(
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
+        model_cfg=ModelConfig(backbone_type="rope"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -4436,6 +4436,11 @@ def test_validate_train_config_trims_resume_hint():
     assert cfg.resume_from_checkpoint == "auto"
 
 
+def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
+    cfg = ModelConfig()
+    assert cfg.backbone_type == "hf_deberta_v2"
+
+
 def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
     model_cfg = ModelConfig(profile="deberta_v3_parity")
     train_cfg = TrainConfig()
@@ -4607,13 +4612,13 @@ def test_validate_training_workflow_options_allows_es_with_matching_gen_lr():
     # Explicit gen LR matching disc LR — should pass.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=5e-4),
+        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=5e-4, decoupled_training=False),
         model_cfg=ModelConfig(embedding_sharing="es"),
     )
     # Inherited gen LR (-1) — should pass.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=-1.0),
+        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=-1.0, decoupled_training=False),
         model_cfg=ModelConfig(embedding_sharing="es"),
     )
 

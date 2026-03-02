@@ -188,7 +188,7 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     :param ModelConfig model_cfg: User model configuration.
     :return _ResolvedBackboneSources: Resolved sources for discriminator/generator.
     """
-    bt = (model_cfg.backbone_type or "rope").lower()
+    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     from_scratch = bool(model_cfg.from_scratch)
 
     disc_cfg_source = model_cfg.discriminator_model_name_or_path
@@ -643,7 +643,7 @@ def build_backbone_configs(
     :return tuple[Any, Any]: Discriminator and generator configs.
     """
     validate_model_config(model_cfg)
-    bt = (model_cfg.backbone_type or "rope").lower()
+    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
@@ -741,7 +741,7 @@ def build_backbones(
     :return tuple[Any, Any]: Instantiated discriminator and generator modules.
     """
     validate_model_config(model_cfg)
-    bt = (model_cfg.backbone_type or "rope").lower()
+    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":

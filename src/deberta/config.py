@@ -125,13 +125,13 @@ class ModelConfig:
 
     This codebase supports two backbone families:
 
-      1) backbone_type="rope" (default): a modern encoder stack that replaces DeBERTa's
-         disentangled position bias with RoPE (rotary embeddings) and uses RMSNorm with
-         a Post-Norm or KEEL residual topology.
+      1) backbone_type="hf_deberta_v2" (default): DeBERTa-v2/v3-style encoder
+         implementation (disentangled attention + LayerNorm), with configs/weights
+         sourced from HF checkpoints when requested.
 
-      2) backbone_type="hf_deberta_v2": compatibility path using this repo's native
-         DeBERTa-v2/v3-style encoder implementation (disentangled attention + LayerNorm),
-         with configs/weights sourced from HF checkpoints when requested.
+      2) backbone_type="rope" (opt-in): an experimental modern encoder stack that
+         replaces DeBERTa's disentangled position bias with RoPE (rotary embeddings)
+         and supports RMSNorm Post-Norm or KEEL residual topology.
 
     For RTD/ELECTRA pretraining, the discriminator config is the primary source; the
     generator config is either provided explicitly or derived from the discriminator.
@@ -185,10 +185,10 @@ class ModelConfig:
     )
 
     backbone_type: str = field(
-        default="rope",
+        default="hf_deberta_v2",
         metadata={
             "help": (
-                "Backbone implementation: 'rope' (recommended) or 'hf_deberta_v2' (HF DeBERTa compatibility mode). "
+                "Backbone implementation: 'hf_deberta_v2' (default) or 'rope' (experimental opt-in). "
                 "RoPE/RMSNorm/KEEL only apply to 'rope'; hf_deberta_v2 uses the native DeBERTa-v2 stack."
             )
         },
