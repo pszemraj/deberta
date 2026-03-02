@@ -96,6 +96,8 @@ class RotaryEmbedding(nn.Module):
         """
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (seq, dim/2)
+        # Interleave frequencies as [f0, f0, f1, f1, ...] to match even/odd
+        # channel pairing in `_rotate_half` (GPT-NeoX convention).
         emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)  # (seq, dim)
         cos = emb.cos().to(dtype=dtype)
         sin = emb.sin().to(dtype=dtype)

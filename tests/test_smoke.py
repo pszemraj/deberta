@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import math
+
 import pytest
 import torch
 from _fakes import DummyTokenizer
@@ -296,7 +299,7 @@ def test_collator_build_drops_document_mask_when_not_packed():
     assert "attention_mask" not in batch
 
 
-def test_ngram_masking_fills_shortfall_from_remaining_candidates(monkeypatch: pytest.MonkeyPatch):
+def test_ngram_masking_does_not_force_token_level_topup(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.75, max_ngram=3))
 
@@ -315,8 +318,80 @@ def test_ngram_masking_fills_shortfall_from_remaining_candidates(monkeypatch: py
 
     masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
 
-    # With 4 maskable positions and 75% target ratio, fallback should reach 3 masked positions.
-    assert int(labels.ne(-100).sum().item()) == 3
+    # With repeated sampling of one span, we can underfill. Whole-word mode keeps
+    # approximate budgets and does not force a token-level tail fill.
+    assert int(labels.ne(-100).sum().item()) == 1
+
+
+def test_ngram_masking_does_not_split_selected_word_groups():
+    class WordPiecePairTokenizer(DummyTokenizer):
+        def tokenize(self, text: str) -> list[str]:
+            del text
+            return ["hello", "##world"]
+
+        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+            table = {
+                self.pad_token_id: "[PAD]",
+                self.cls_token_id: "[CLS]",
+                self.sep_token_id: "[SEP]",
+                self.mask_token_id: "[MASK]",
+                10: "hello",
+                11: "##world",
+            }
+            return [table.get(i, f"tok{i}") for i in ids]
+
+    tok = WordPiecePairTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.4, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
+    )
+    input_ids = torch.tensor([[tok.cls_token_id, 10, 11, tok.sep_token_id]], dtype=torch.long)
+    special = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
+
+    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    assert int(labels.ne(-100).sum().item()) == 2
+    assert masked[0, 1].item() == tok.mask_token_id
+    assert masked[0, 2].item() == tok.mask_token_id
+
+
+def test_ngram_masking_uses_one_replacement_draw_per_word_group(monkeypatch: pytest.MonkeyPatch):
+    class WordPiecePairTokenizer(DummyTokenizer):
+        def tokenize(self, text: str) -> list[str]:
+            del text
+            return ["hello", "##world"]
+
+        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+            table = {
+                self.pad_token_id: "[PAD]",
+                self.cls_token_id: "[CLS]",
+                self.sep_token_id: "[SEP]",
+                self.mask_token_id: "[MASK]",
+                10: "hello",
+                11: "##world",
+            }
+            return [table.get(i, f"tok{i}") for i in ids]
+
+    tok = WordPiecePairTokenizer(vocab_size=256)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.9, mask_token_prob=0.0, random_token_prob=1.0, max_ngram=3),
+    )
+    input_ids = torch.tensor([[tok.cls_token_id, 10, 11, tok.sep_token_id]], dtype=torch.long)
+    special = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
+
+    calls = {"n": 0}
+
+    def _sample_one(_device: torch.device) -> int:
+        calls["n"] += 1
+        return 50 if calls["n"] == 1 else 51
+
+    monkeypatch.setattr(coll, "_sample_one_random_word", _sample_one)
+    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+
+    assert calls["n"] == 1
+    assert int(labels.ne(-100).sum().item()) == 2
+    assert masked[0, 1].item() == 50
+    assert masked[0, 2].item() == 50
 
 
 def test_ngram_masking_respects_specials():
@@ -431,6 +506,32 @@ def test_word_boundary_scheme_detected_once_from_tokenizer_probe():
     spec = [1, 0, 0, 0, 1]
     groups = coll._build_word_groups(ids, spec)
     assert groups == [[1], [2], [3]]
+
+
+def test_collator_warns_when_word_boundary_scheme_is_none_for_ngram(caplog: pytest.LogCaptureFixture):
+    class NoBoundaryTokenizer(DummyTokenizer):
+        def tokenize(self, text: str) -> list[str]:
+            del text
+            return ["hello", "world"]
+
+        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+            table = {
+                self.pad_token_id: "[PAD]",
+                self.cls_token_id: "[CLS]",
+                self.sep_token_id: "[SEP]",
+                self.mask_token_id: "[MASK]",
+                10: "hello",
+                11: "world",
+            }
+            return [table.get(i, f"tok{i}") for i in ids]
+
+    with caplog.at_level(logging.WARNING):
+        _ = DebertaV3ElectraCollator(
+            tokenizer=NoBoundaryTokenizer(vocab_size=128),
+            cfg=MLMConfig(mlm_probability=0.2, max_ngram=3),
+        )
+
+    assert "scheme='none'" in caplog.text
 
 
 def test_collator_drops_all_ones_attention_mask():
@@ -1821,7 +1922,7 @@ def test_rope_keel_default_alpha_matches_paper_contract():
         keel_alpha_learnable=False,
     )
     encoder = DebertaRoPEEncoder(cfg).eval()
-    expected_alpha = float(2 * int(cfg.num_hidden_layers))
+    expected_alpha = 1.0 / math.sqrt(float(2 * int(cfg.num_hidden_layers)))
 
     for layer in encoder.layers:
         assert float(layer.alpha1.alpha.item()) == pytest.approx(expected_alpha)

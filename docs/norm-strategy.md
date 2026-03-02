@@ -22,7 +22,7 @@ KEEL-style update follows the paper form (with RMSNorm in this codebase):
 Repo parameterization:
 
 - `L` means total residual sublayers (attention + FFN), so `L = 2 * num_hidden_layers`
-- paper-faithful default: `keel_alpha_init` is `L` (that is, `2 * num_hidden_layers`) when unset, with
+- paper-faithful default: `keel_alpha_init` is `1/sqrt(L)` (that is, `1/sqrt(2 * num_hidden_layers)`) when unset, with
   `keel_alpha_learnable=false` so alpha is fixed
 - implementation detail: attention and FFN each have their own alpha slot (`alpha1`, `alpha2`) initialized
   to the same value; this is equivalent to paper behavior when `keel_alpha_learnable=false`

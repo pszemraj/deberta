@@ -298,7 +298,7 @@ class ModelConfig:
         metadata={
             "help": (
                 "KEEL alpha initial value (skip scaling). If unset, defaults to "
-                "2*num_hidden_layers (two residual sublayers per transformer block)."
+                "1/sqrt(2*num_hidden_layers) (two residual sublayers per transformer block)."
             )
         },
     )

@@ -443,9 +443,11 @@ class DebertaRoPEEncoder(nn.Module):
         if config.keel_alpha_init is not None:
             alpha_init = float(config.keel_alpha_init)
         else:
-            # KEEL paper notation uses L = number of residual sublayers. Our encoder
-            # has 2 residual sublayers per transformer block (attention + FFN).
-            alpha_init = float(2 * int(config.num_hidden_layers))
+            # KEEL uses L = number of residual sublayers. Our encoder has
+            # two residual sublayers per transformer block (attention + FFN),
+            # with default alpha = 1 / sqrt(L).
+            total_sublayers = float(2 * int(config.num_hidden_layers))
+            alpha_init = 1.0 / math.sqrt(total_sublayers)
 
         self.layers = nn.ModuleList(
             [DebertaRoPELayer(config, alpha_init=alpha_init) for _ in range(config.num_hidden_layers)]

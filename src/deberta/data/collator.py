@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,6 +85,11 @@ class DebertaV3ElectraCollator:
         self._non_special_token_ids_cpu = self._build_non_special_token_ids()
         self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
         self._word_boundary_scheme = self._detect_word_boundary_scheme()
+        if int(self.cfg.max_ngram) > 1 and self._word_boundary_scheme == "none":
+            logger.warning(
+                "Tokenizer word-boundary probe returned scheme='none'; "
+                "whole-word n-gram masking will degrade to conservative token-level groups."
+            )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         features = self._harmonize_optional_attention_masks(features)
@@ -416,7 +424,8 @@ class DebertaV3ElectraCollator:
         mask_token_id = int(self.tokenizer.mask_token_id)
 
         # Use a fixed budget per sequence (rounded from maskable count) to stabilize
-        # effective masked-token counts across microbatches.
+        # effective masked-token counts across microbatches. This executes in eager
+        # collator workers (not under torch.compile graph capture).
         maskable = ~special_tokens_mask
         if pad_token_id is not None:
             maskable = maskable & input_ids.ne(int(pad_token_id))
@@ -473,6 +482,8 @@ class DebertaV3ElectraCollator:
         Implementation notes:
           - We group sub-tokens into "words" using tokenizer token string heuristics.
           - We sample contiguous spans of whole words with an n-gram distribution p(n) ∝ 1/n.
+          - Mask budget is approximate at whole-word granularity; we do not split selected words
+            or add subword-level tail fills.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
@@ -518,69 +529,58 @@ class DebertaV3ElectraCollator:
             if not word_groups:
                 continue
 
-            masked: list[int] = []
-            masked_set = set()
+            selected_groups: list[list[int]] = []
+            selected_group_ids: set[int] = set()
+            selected_token_count = 0
 
             # Try a bounded number of attempts to fill the mask budget.
             # (Avoids pathological loops on very short / heavily special-token sequences.)
             max_attempts = max(50, 10 * len(word_groups))
             attempts = 0
 
-            while len(masked) < num_to_mask and attempts < max_attempts:
+            while selected_token_count < num_to_mask and attempts < max_attempts:
                 attempts += 1
 
                 start = int(torch.randint(low=0, high=len(word_groups), size=(1,)).item())
                 n = int(torch.multinomial(probs, 1).item()) + 1
 
-                span = word_groups[start : start + n]
-                if not span:
+                end = min(start + n, len(word_groups))
+                if end <= start:
                     continue
 
-                # Flatten span indices and filter already-masked.
-                span_indices: list[int] = []
-                for g in span:
-                    for idx in g:
-                        if idx in maskable_set and idx not in masked_set:
-                            span_indices.append(idx)
-
-                if not span_indices:
-                    continue
-
-                # Add tokens until we hit the budget.
-                for idx in span_indices:
-                    if len(masked) >= num_to_mask:
+                span_added = False
+                for group_id in range(start, end):
+                    if group_id in selected_group_ids:
+                        continue
+                    group = word_groups[group_id]
+                    group_maskable = [idx for idx in group if idx in maskable_set]
+                    if not group_maskable:
+                        continue
+                    selected_group_ids.add(group_id)
+                    selected_groups.append(group_maskable)
+                    selected_token_count += len(group_maskable)
+                    span_added = True
+                    if selected_token_count >= num_to_mask:
                         break
-                    masked.append(idx)
-                    masked_set.add(idx)
+                if not span_added:
+                    continue
 
-            if not masked:
+            if not selected_groups:
                 continue
 
-            if len(masked) < num_to_mask:
-                # Best-effort WWM: if span sampling under-fills budget, top up with
-                # remaining token indices. This preserves fixed-budget masking while
-                # allowing a subword-level tail fill on rare edge cases.
-                remaining_candidates = [idx for idx in maskable_set if idx not in masked_set]
-                if remaining_candidates:
-                    missing = num_to_mask - len(masked)
-                    fill = torch.randperm(len(remaining_candidates))[:missing].tolist()
-                    for idx in (remaining_candidates[i] for i in fill):
-                        if idx not in masked_set:
-                            masked.append(idx)
-                            masked_set.add(idx)
-
             # Apply replacements.
-            for idx in masked:
-                labels[b, idx] = ids[idx]
-
+            for group in selected_groups:
                 r = float(torch.rand(1).item())
+                replacement_id: int | None = None
                 if r < float(self.cfg.mask_token_prob):
-                    input_ids[b, idx] = mask_token_id
+                    replacement_id = mask_token_id
                 elif r < float(self.cfg.mask_token_prob) + float(self.cfg.random_token_prob):
-                    input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
-                else:
-                    # Keep original.
-                    pass
+                    replacement_id = self._sample_one_random_word(input_ids.device)
+
+                for idx in group:
+                    labels[b, idx] = ids[idx]
+                    if replacement_id is not None:
+                        input_ids[b, idx] = replacement_id
 
         return input_ids, labels
 

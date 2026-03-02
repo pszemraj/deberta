@@ -13,7 +13,7 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 - ~~replace collator-time dense document attention mask materialization with compact doc-boundary representation and on-device block masking~~ — **resolved**: collator now emits `doc_ids (B,S)` and the training loop builds the 3D mask on-device; future: evaluate `flex_attention` block-sparse path to avoid dense `(B,S,S)` materialization entirely
 - refactor token-weighted GA to avoid whole-window microbatch buffering so large per-batch metadata does not scale host memory linearly with `gradient_accumulation_steps`
 - replace whole-word n-gram retry-loop masking (`mlm_max_ngram > 1`) with a deterministic linear-time candidate walk (and/or vectorized path) to avoid worst-case per-sample retry spin on long sequences
-- add optional strict whole-word n-gram masking mode that disallows token-level tail fill when n-gram span sampling under-fills budget
+- ~~add optional strict whole-word n-gram masking mode that disallows token-level tail fill when n-gram span sampling under-fills budget~~ — **resolved**: n-gram masking now keeps whole-word semantics by default (no partial-word splits or token-level tail fill), using approximate token budgets at word granularity
 
 ## Runtime/Compile
 
@@ -22,6 +22,7 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 - for rope backbone compile hardening, evaluate replacing custom `RMSNorm` with `torch.nn.RMSNorm` and compare convergence/runtime
 - for rope backbone compile hardening, evaluate static/sliced RoPE cache buffers to remove compile-time cache-build branching
 - ~~auto compile scope + doc-blocking mask shape churn~~ — **resolved**: `_resolve_compile_scope` auto-downgrades to FFN when `block_cross_document_attention=True` to avoid alternating None/3D mask shapes under compile
+- evaluate an optional compatibility mode that coerces obvious {0,1}-valued float attention masks to bool with warning, while keeping strict validation as the default contract
 
 ## HF DeBERTa-v2 Modernization
 
@@ -38,6 +39,7 @@ These do not affect disentangled attention or RTD correctness; they are efficien
 - investigate active-token-only projection paths for heavily padded 2D batches (skip attention/FFN projection FLOPs on known-dead pad positions rather than zeroing outputs post projection)
 - ~~for HF DeBERTa-v2 backbone: evaluate lazy or on-demand relative-position table construction to avoid O(max_len²) init-time allocation~~ — **resolved**: removed upfront `_rel_pos_table` buffer; all kernels now call `build_relative_position()` on-device per forward (cheap, compile-safe)
 - ~~HF DeBERTa-v2 2D→(B,1,S,S) padding mask expansion~~ — **resolved**: `get_attention_mask` now returns `(B,1,1,S)` broadcast mask for 2D padding inputs, avoiding O(S²) outer product
+- evaluate flipping rope default `model.norm_arch` from `post` to `keel` after controlled convergence/stability benchmarking with the corrected KEEL alpha default
 
 ## Export Interop
 
