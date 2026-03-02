@@ -349,10 +349,11 @@ def _prepare_output_dir(
     if not is_main_process:
         return
 
+    resume_value = str(resume_from_checkpoint).strip() if resume_from_checkpoint is not None else ""
     if output_dir.exists() and any(output_dir.iterdir()):
         if overwrite_output_dir:
             shutil.rmtree(output_dir)
-        elif not resume_from_checkpoint:
+        elif not resume_value:
             raise ValueError(
                 f"Output directory exists and is not empty: {output_dir}. "
                 "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."

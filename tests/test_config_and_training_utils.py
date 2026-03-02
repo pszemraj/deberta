@@ -290,6 +290,20 @@ def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
     assert not any(out.iterdir())
 
 
+def test_prepare_output_dir_rejects_blank_resume_hint_on_nonempty_dir(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "existing.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Output directory exists and is not empty"):
+        _prepare_output_dir(
+            output_dir=out,
+            overwrite_output_dir=False,
+            resume_from_checkpoint="   ",
+            is_main_process=True,
+        )
+
+
 def test_find_latest_checkpoint_picks_highest_step(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -3247,6 +3261,18 @@ def test_validate_train_config_rejects_overwrite_with_resume_conflict():
                 resume_from_checkpoint="auto",
             )
         )
+
+
+def test_validate_train_config_normalizes_blank_resume_hint_to_none():
+    cfg = TrainConfig(resume_from_checkpoint="   ")
+    validate_train_config(cfg)
+    assert cfg.resume_from_checkpoint is None
+
+
+def test_validate_train_config_trims_resume_hint():
+    cfg = TrainConfig(resume_from_checkpoint=" auto ")
+    validate_train_config(cfg)
+    assert cfg.resume_from_checkpoint == "auto"
 
 
 def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Path):

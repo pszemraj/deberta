@@ -1369,22 +1369,6 @@ def run_pretraining_dry_run(
     validate_train_config(train_cfg)
     validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
 
-    mixed_precision = _resolve_effective_mixed_precision_or_raise(train_cfg.mixed_precision)
-    compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
-    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
-    compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
-    compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
-    compile_scope = compile_scope_requested
-    compile_scope_reason: str | None = None
-    if compile_enabled:
-        compile_scope, compile_scope_reason = _resolve_compile_scope(
-            requested_scope=compile_scope_requested,
-            model_cfg=model_cfg,
-            compile_mode=compile_mode,
-            compile_backend=compile_backend,
-            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
-        )
-
     output_dir = _resolve_output_dir(
         output_dir=train_cfg.output_dir,
         project_name=train_cfg.project_name,
@@ -1401,6 +1385,22 @@ def run_pretraining_dry_run(
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=True,
     )
+
+    mixed_precision = _resolve_effective_mixed_precision_or_raise(train_cfg.mixed_precision)
+    compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
+    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
+    compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
+    compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
+    compile_scope = compile_scope_requested
+    compile_scope_reason: str | None = None
+    if compile_enabled:
+        compile_scope, compile_scope_reason = _resolve_compile_scope(
+            requested_scope=compile_scope_requested,
+            model_cfg=model_cfg,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        )
 
     # Validate run snapshot compatibility in resume mode, without writing files.
     _persist_or_validate_run_configs(

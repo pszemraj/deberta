@@ -1381,6 +1381,9 @@ def validate_train_config(cfg: TrainConfig) -> None:
     cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
     if cfg.output_dir is not None and not str(cfg.output_dir).strip():
         cfg.output_dir = None
+    if cfg.resume_from_checkpoint is not None:
+        resume_from_checkpoint = str(cfg.resume_from_checkpoint).strip()
+        cfg.resume_from_checkpoint = resume_from_checkpoint if resume_from_checkpoint else None
     if not str(cfg.project_name).strip():
         raise ValueError("train.project_name must be non-empty.")
     if bool(cfg.overwrite_output_dir) and bool(cfg.resume_from_checkpoint):
