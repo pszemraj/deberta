@@ -266,9 +266,17 @@ class DebertaRoPESelfAttention(nn.Module):
             # Eager attention (debug/fallback) — upcast to fp32 for numeric stability.
             scale = 1.0 / math.sqrt(self.head_dim)
             scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale  # (B, nh, S, S)
+            dead_rows = None
             if eager_attn_mask is not None:
                 scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
+                # Guard fully-masked query rows explicitly in eager mode:
+                # 1) set their logits to 0 before softmax (avoid potential NaNs if mask-fill semantics change),
+                # 2) zero their attention rows after softmax.
+                dead_rows = eager_attn_mask.all(dim=-1, keepdim=True)
+                scores = scores.masked_fill(dead_rows, 0.0)
             attn = torch.softmax(scores, dim=-1)
+            if dead_rows is not None:
+                attn = attn.masked_fill(dead_rows, 0.0)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
             out = torch.matmul(attn.to(dtype=v.dtype), v)
 
