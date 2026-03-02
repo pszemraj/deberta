@@ -14,6 +14,9 @@ Each training step follows DeBERTaV3/ELECTRA-style RTD:
 6. Run discriminator on corrupted sequence.
 7. Train discriminator to predict original (`0`) vs replaced (`1`) per token.
 
+When `train.decoupled_training=true`, this is executed as two optimizer phases per global
+step (generator step, embedding sync for GDES, then discriminator step).
+
 Special-token filtering in RTD is config-driven by default, with optional runtime additive ids from `tokenizer.all_special_ids` in training/export paths.
 
 ## Loss Terms
@@ -27,8 +30,16 @@ Exposed controls:
 - `train.gen_loss_weight`
 - `train.disc_loss_weight` (default `50.0`)
 - `train.decoupled_loss_scaling`
+- `train.decoupled_training` (`null` auto-resolves by backbone type)
 - `train.sampling_temperature`
 - `train.token_weighted_gradient_accumulation` (default `true`)
+
+Parity profile note:
+
+- `model.profile=deberta_v3_parity` applies DeBERTa-style defaults such as
+  `disc_loss_weight=10.0`, `mask_token_prob=1.0`, `random_token_prob=0.0`,
+  `adam_epsilon=1e-6`, and `token_weighted_gradient_accumulation=false` when those
+  values remain unset.
 
 Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
 

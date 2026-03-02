@@ -131,6 +131,8 @@ Full pipeline audit covering forward pass faithfulness, loss computation, attent
 13. **N-gram masking implementation is Python-heavy** — `_mask_tokens_ngram()` still relies on per-sample token-string conversion and loop-based span assembly. Correctness is acceptable, but throughput can become dataloader-bound at scale.
 14. **Grad-norm telemetry computes full-model norms every sync step** — this is intentional for now to maximize non-finite detection, but it adds per-step overhead and should become configurable once default stability policy is finalized.
 15. **`suppress(Exception)` usage is intentionally broad in non-critical paths** — useful for crash-safe logging/cleanup, but a follow-up pass should narrow exception scopes and add explicit one-shot warnings where silent fallback is still too opaque.
+16. **HF DeBERTa-v2 `pos_att_type=p2p` branch is still deferred** — current disentangled attention parity work closed high/medium-impact RTD and training gaps first. Add full `p2p` scoring branch plus scale-factor parity before calling backbone parity complete.
+17. **Relative-position log-bucketing clamp parity is still deferred** — `_make_log_bucket_position` should clamp raw relative offsets to `[-max_position+1, max_position-1]` before bucketing to match Microsoft reference edge behavior at long context.
 
 ## HF DeBERTa-v2 Modernization Plan (PyTorch 2.9.1+)
 
@@ -183,3 +185,5 @@ Goal: improve HFv2 throughput/memory while keeping DeBERTa-v2 disentangled atten
 - Vectorize n-gram masking setup by replacing per-batch `convert_ids_to_tokens()` calls with precomputed continuation-token metadata.
 - Add configurable grad-norm/check cadence (`always`, `on_clip`, `every_n_steps`) with default preserving current safety-first behavior.
 - Audit `suppress(Exception)` callsites and narrow to expected exception types in resume/export correctness paths; keep best-effort behavior only for optional telemetry/cleanup.
+- Implement `pos_att_type=p2p` in `DisentangledSelfAttention` and add a fixed-seed parity unit test against the reference branch math.
+- Clamp relative offsets before log-bucket conversion in HFv2 native attention utilities and add long-context edge-case tests.

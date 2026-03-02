@@ -75,7 +75,8 @@ accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python 
   --output-dir runs/deberta_rope_rtd/exported_hf
 ```
 
-Long-context and custom debug presets live under [`configs/`](configs/).
+Long-context and custom debug presets live under [`configs/`](configs/), including strict
+DeBERTa parity tracks for `hf_deberta_v2` base/small.
 
 For distributed/FSDP2 runtime behavior and export details, see [`docs/fsdp2.md`](docs/fsdp2.md).
 
@@ -97,6 +98,7 @@ For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.Deber
 
 - Base pretraining config: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml)
 - Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
+- DeBERTa-v2/v3 parity (HF-compatible backbone): [`configs/pretrain_hf_deberta_v2_parity_base.yaml`](configs/pretrain_hf_deberta_v2_parity_base.yaml), [`configs/pretrain_hf_deberta_v2_parity_small.yaml`](configs/pretrain_hf_deberta_v2_parity_small.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
 - Accelerate/FSDP2: [`configs/accelerate/fsdp2_1node.yaml`](configs/accelerate/fsdp2_1node.yaml), [`configs/accelerate/fsdp2_hf_deberta_1node.yaml`](configs/accelerate/fsdp2_hf_deberta_1node.yaml)
 

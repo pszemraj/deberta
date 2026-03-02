@@ -6,10 +6,12 @@ See also: [model](model.md), [objective](objective.md), [data](data.md), [norm s
 
 ## Strict Architecture Settings
 
-For DeBERTa-v2/v3 architecture parity in this repo, use the native HF-compatible backbone:
+For DeBERTa-v2/v3 parity in this repo, use the `deberta_v3_parity` profile on the native
+HF-compatible backbone:
 
 ```yaml
 model:
+  profile: deberta_v3_parity
   backbone_type: hf_deberta_v2
   tokenizer_name_or_path: microsoft/deberta-v3-base
   discriminator_model_name_or_path: microsoft/deberta-v3-base
@@ -29,19 +31,31 @@ data:
 train:
   max_steps: 500000
   mlm_probability: 0.15
-  mlm_max_ngram: 3
-  mask_token_prob: 0.8
-  random_token_prob: 0.1
-  disc_loss_weight: 50.0
+  mlm_max_ngram: 1
+  mask_token_prob: 1.0
+  random_token_prob: 0.0
+  disc_loss_weight: 10.0
+  adam_epsilon: 1.0e-6
+  token_weighted_gradient_accumulation: false
+  decoupled_training: null
   report_to: none
 ```
 
 Notes:
 
+- `model.profile=deberta_v3_parity` applies parity-oriented defaults where values are still unset.
 - `backbone_type=hf_deberta_v2` is the key switch for disentangled attention + LayerNorm parity.
+- `train.decoupled_training: null` auto-resolves to `true` on `hf_deberta_v2` and `false` otherwise.
+- Decoupled mode is intentionally incompatible with `model.embedding_sharing=es`; use `gdes` (recommended) or `none`.
 - Keep RoPE-only knobs at defaults (they do not apply on the HF-compatible backbone).
-- `mlm_max_ngram=3` enables whole-word n-gram masking mode used in DeBERTa-style recipes.
 - This repo keeps RTD objective semantics and GDES behavior explicit and tested; it does not guarantee bit-identical reproduction of original Microsoft training pipelines.
+
+## Canonical Configs
+
+Use the default long-run parity configs in `configs/`:
+
+- `configs/pretrain_hf_deberta_v2_parity_base.yaml`
+- `configs/pretrain_hf_deberta_v2_parity_small.yaml`
 
 ## CLI Preset
 
@@ -61,8 +75,8 @@ Examples:
 # Full starter run (no config file)
 deberta train --preset deberta-v3-base
 
-# Config-driven run, but force model parity settings from preset
-deberta train configs/pretrain_rope_fineweb_edu.yaml --preset deberta-v3-base
+# Config-driven run with strict parity defaults
+deberta train configs/pretrain_hf_deberta_v2_parity_base.yaml
 
 # Preset + explicit override
 deberta train --preset deberta-v3-base --max_steps 20000
