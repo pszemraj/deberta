@@ -663,6 +663,26 @@ def test_collator_infers_special_tokens_mask_when_missing():
     assert torch.all(batch["labels"][batch["input_ids"] == tok.pad_token_id] == -100)
 
 
+def test_collator_merges_partial_special_tokens_mask_with_tokenizer_special_ids():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.999, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=1),
+    )
+
+    # Upstream packed datasets may emit a partial special_tokens_mask that only marks
+    # structural specials. The collator should still protect tokenizer specials such as
+    # mask_token_id even when the provided mask marks them as non-special.
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, tok.mask_token_id, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 1],
+        }
+    ]
+    batch = coll(features)
+    assert int(batch["labels"][0, 1].item()) == -100
+
+
 def test_collator_random_replacement_avoids_special_ids():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(

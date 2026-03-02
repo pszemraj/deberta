@@ -39,7 +39,8 @@ class DebertaV3ElectraCollator:
       - token_type_ids (if present)
 
     Notes:
-      - We honor `special_tokens_mask` if provided.
+      - If `special_tokens_mask` is provided, we merge it with tokenizer-inferred
+        special ids so upstream partial masks cannot unprotect tokenizer specials.
       - Default behavior mirrors BERT's 80/10/10 replacement.
       - Supports optional whole-word n-gram masking (max_ngram > 1) as used by DeBERTa.
     """
@@ -120,10 +121,14 @@ class DebertaV3ElectraCollator:
                     batch["attention_mask"] = attn.long()
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
+        inferred_special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
         if special_tokens_mask is None:
-            special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
+            special_tokens_mask = inferred_special_tokens_mask
         else:
-            special_tokens_mask = special_tokens_mask.bool()
+            # Some upstream datasets (for example packed streaming) may only tag
+            # structural specials (CLS/SEP/PAD). Union with tokenizer-level specials
+            # so corruption targets stay aligned with forbidden sampling ids.
+            special_tokens_mask = special_tokens_mask.bool() | inferred_special_tokens_mask
 
         doc_ids = (
             self._compute_document_ids(
