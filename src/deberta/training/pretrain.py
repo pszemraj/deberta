@@ -164,35 +164,10 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     :param bool enabled: Whether to enable TF32.
     :param bool force_legacy: Whether to force legacy ``allow_tf32`` flags.
     """
-    if force_legacy:
-        torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
-        torch.backends.cudnn.allow_tf32 = bool(enabled)
-        return
-
-    # Prefer the modern fp32_precision API when available (PyTorch 2.9+).
-    target = "tf32" if enabled else "ieee"
-    _fp32_paths: tuple[tuple[Any, str], ...] = (
-        (torch.backends, "fp32_precision"),
-        (torch.backends.cuda.matmul, "fp32_precision"),
-        (torch.backends.cudnn, "fp32_precision"),
-    )
-    # Granular cudnn knobs on newer builds.
-    for parent_name in ("conv", "rnn"):
-        parent = getattr(torch.backends.cudnn, parent_name, None)
-        if parent is not None:
-            _fp32_paths = (*_fp32_paths, (parent, "fp32_precision"))
-
-    configured = False
-    for obj, attr in _fp32_paths:
-        with suppress(Exception):
-            if hasattr(obj, attr):
-                setattr(obj, attr, target)
-                configured = True
-
-    if not configured:
-        # Legacy fallback.
-        torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
-        torch.backends.cudnn.allow_tf32 = bool(enabled)
+    del force_legacy
+    # Use legacy flags consistently to avoid mixing legacy/new TF32 APIs in-process.
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    torch.backends.cudnn.allow_tf32 = bool(enabled)
 
 
 def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
