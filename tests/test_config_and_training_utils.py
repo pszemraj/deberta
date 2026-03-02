@@ -441,6 +441,11 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-2"
     ckpt.mkdir()
+    (ckpt / "model.safetensors").write_bytes(b"weights")
+    (ckpt / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 2}),
+        encoding="utf-8",
+    )
     resolved = _resolve_resume_checkpoint(
         output_dir=out,
         resume_from_checkpoint=str(ckpt),
@@ -449,12 +454,46 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
     assert resolved == str(ckpt.resolve())
 
 
+def test_resolve_resume_checkpoint_rejects_explicit_path_without_data_state(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-2"
+    ckpt.mkdir()
+    (ckpt / "model.safetensors").write_bytes(b"weights")
+
+    with pytest.raises(ValueError, match="missing or has an invalid data_state.json"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint=str(ckpt),
+            is_main_process=True,
+        )
+
+
+def test_resolve_resume_checkpoint_rejects_explicit_path_without_model_weights(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-2"
+    ckpt.mkdir()
+    (ckpt / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 2}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="model weights appear missing or empty"):
+        _resolve_resume_checkpoint(
+            output_dir=out,
+            resume_from_checkpoint=str(ckpt),
+            is_main_process=True,
+        )
+
+
 def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
     ckpt1 = out / "checkpoint-1"
     ckpt1.mkdir(parents=True, exist_ok=True)
+    (ckpt1 / "model.safetensors").write_bytes(b"weights")
     (ckpt1 / "data_state.json").write_text(
         json.dumps({"consumed_micro_batches": 10}),
         encoding="utf-8",
@@ -521,6 +560,34 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert consumed_old == 50
     assert lr_mult_old == 1.0
     assert digest_old is None
+
+
+def test_load_checkpoint_data_progress_warns_on_invalid_json(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ckpt = tmp_path / "checkpoint-7"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    (ckpt / "data_state.json").write_text('{"consumed_micro_batches": ', encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+
+    assert consumed is None
+    assert lr_mult == 1.0
+    assert digest is None
+    assert any("invalid data_state.json" in record.message for record in caplog.records)
+
+
+def test_dump_json_is_atomic_on_serialization_failure(tmp_path: Path) -> None:
+    from deberta.io_utils import dump_json
+
+    target = tmp_path / "state.json"
+    with pytest.raises(TypeError):
+        dump_json({"bad": {1, 2, 3}}, target)
+
+    assert not target.exists()
+    tmp_files = list(tmp_path.glob(".*state.json.*.tmp"))
+    assert not tmp_files
 
 
 def test_optimizer_param_order_digest_deterministic() -> None:
@@ -996,6 +1063,63 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.ended is False
 
 
+def test_run_pretraining_logs_crash_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from _fakes import _PRETRAINING_BATCH
+
+    def _fake_save_checkpoint(
+        *,
+        accelerator,
+        checkpoint_dir,
+        output_dir,
+        consumed_micro_batches,
+        save_total_limit,
+        log_label,
+        **kwargs,
+    ):
+        del accelerator, checkpoint_dir, output_dir, consumed_micro_batches, save_total_limit, kwargs
+        if str(log_label) == "final":
+            raise RuntimeError("disk full")
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        save_checkpoint_fn=_fake_save_checkpoint,
+        extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
+    )
+
+    def _interrupt_cycle(_loader, *, start_epoch: int = 0):
+        del start_epoch
+        yield _PRETRAINING_BATCH
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=2,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(KeyboardInterrupt):
+            pretrain_mod.run_pretraining(
+                model_cfg=ModelConfig(),
+                data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+                train_cfg=train_cfg,
+            )
+
+    assert any("Final/crash-time checkpoint save failed" in rec.message for rec in caplog.records)
+
+
 def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1074,6 +1198,7 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
     (checkpoint_dir / "data_state.json").write_text(
         json.dumps({"consumed_micro_batches": 50}),
         encoding="utf-8",
@@ -1130,6 +1255,7 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 
     checkpoint_dir = tmp_path / "run" / "checkpoint-1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
     (checkpoint_dir / "data_state.json").write_text(
         json.dumps({"consumed_micro_batches": 3}),
         encoding="utf-8",
@@ -1180,6 +1306,7 @@ def test_run_pretraining_resume_requires_data_state_json(
 ) -> None:
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
     train_cfg = TrainConfig(
@@ -1198,7 +1325,7 @@ def test_run_pretraining_resume_requires_data_state_json(
         resume_from_checkpoint=str(checkpoint_dir),
     )
 
-    with pytest.raises(RuntimeError, match="requires data_state.json"):
+    with pytest.raises(ValueError, match="missing or has an invalid data_state.json"):
         pretrain_mod.run_pretraining(
             model_cfg=ModelConfig(),
             data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
@@ -1911,6 +2038,7 @@ class _FakeAccelerator:
         self.save_paths.append(path)
         p = Path(path)
         p.mkdir(parents=True, exist_ok=True)
+        (p / "model.safetensors").write_bytes(b"weights")
         marker = "main" if self.is_main_process else "worker"
         (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
 
@@ -1956,6 +2084,69 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     assert consumed == 42
     assert lr_mult == 1.0
     assert digest is None  # no digest passed
+
+
+def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    old_ckpt = out / "checkpoint-1"
+    old_ckpt.mkdir(parents=True, exist_ok=True)
+    (old_ckpt / "model.safetensors").write_bytes(b"old")
+    (old_ckpt / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 1}),
+        encoding="utf-8",
+    )
+    new_ckpt = out / "checkpoint-2"
+
+    accel = _FakeAccelerator(is_main_process=True)
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=new_ckpt,
+        output_dir=out,
+        consumed_micro_batches=2,
+        save_total_limit=1,
+        log_label="periodic",
+    )
+
+    assert not old_ckpt.exists()
+    assert new_ckpt.exists()
+
+
+def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_invalid(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    old_ckpt = out / "checkpoint-1"
+    old_ckpt.mkdir(parents=True, exist_ok=True)
+    (old_ckpt / "model.safetensors").write_bytes(b"old")
+    (old_ckpt / "data_state.json").write_text(
+        json.dumps({"consumed_micro_batches": 1}),
+        encoding="utf-8",
+    )
+    new_ckpt = out / "checkpoint-2"
+
+    class _BrokenSaveAccelerator(_FakeAccelerator):
+        def save_state(self, path: str) -> None:
+            self.save_paths.append(path)
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "main.txt").write_text("ok", encoding="utf-8")
+
+    accel = _BrokenSaveAccelerator(is_main_process=True)
+    with caplog.at_level(logging.ERROR):
+        _save_training_checkpoint(
+            accelerator=accel,
+            checkpoint_dir=new_ckpt,
+            output_dir=out,
+            consumed_micro_batches=2,
+            save_total_limit=1,
+            log_label="periodic",
+        )
+
+    assert old_ckpt.exists()
+    assert new_ckpt.exists()
+    assert any("failed post-save structural validation" in record.message for record in caplog.records)
 
 
 def test_cycle_dataloader_advances_dataset_epoch_each_pass():
@@ -2071,6 +2262,19 @@ def test_normalize_resume_consumed_micro_batches_keeps_non_legacy_mismatch():
     )
     assert consumed == 100
     assert reason is None
+
+
+def test_gumbel_sample_rejects_all_forbidden_vocab_mask():
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    logits = torch.zeros((4, 8), dtype=torch.float32)
+    forbidden = torch.ones(8, dtype=torch.bool)
+    with pytest.raises(ValueError, match="excludes all vocabulary ids"):
+        DebertaV3RTDPretrainer._gumbel_sample(
+            logits,
+            temperature=1.0,
+            forbidden_vocab_mask=forbidden,
+        )
 
 
 def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

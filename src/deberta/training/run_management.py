@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import shutil
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -151,6 +152,43 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     return checkpoints[-1][1]
 
 
+def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
+    """Return whether a checkpoint has non-empty model-weight payloads.
+
+    This is a structural check intended to catch common crash artifacts
+    (missing/zero-byte model files), not a full deserialization validation.
+
+    :param Path checkpoint_dir: Candidate checkpoint directory.
+    :return bool: ``True`` when model-weight files appear present and non-empty.
+    """
+    root_patterns = (
+        "model.safetensors",
+        "pytorch_model.bin",
+        "model.bin",
+        "*model*.safetensors",
+        "*model*.bin",
+    )
+    for pattern in root_patterns:
+        for candidate in checkpoint_dir.glob(pattern):
+            if not candidate.is_file():
+                continue
+            with suppress(OSError):
+                if int(candidate.stat().st_size) > 0:
+                    return True
+
+    # FSDP sharded model-state directories written by accelerate/torch DCP.
+    for subdir in checkpoint_dir.glob("pytorch_model_fsdp*"):
+        if not subdir.is_dir():
+            continue
+        for shard in subdir.rglob("*"):
+            if not shard.is_file():
+                continue
+            with suppress(OSError):
+                if int(shard.stat().st_size) > 0:
+                    return True
+    return False
+
+
 def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
     """Return latest checkpoint directory that has valid resume data progress metadata.
 
@@ -175,8 +213,16 @@ def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
     checkpoints.sort(key=lambda x: x[0], reverse=True)
     for _, checkpoint_dir in checkpoints:
         consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
-        if consumed is not None:
-            return checkpoint_dir
+        if consumed is None:
+            continue
+        if not _checkpoint_weights_appear_valid(checkpoint_dir):
+            logger.warning(
+                "Checkpoint %s has valid data_state.json but model weights appear missing/empty; "
+                "skipping as unresumable.",
+                checkpoint_dir,
+            )
+            continue
+        return checkpoint_dir
     return None
 
 
@@ -211,6 +257,18 @@ def _resolve_resume_checkpoint(
             raise ValueError(
                 "train.resume_from_checkpoint must point to a checkpoint directory. "
                 f"Got a non-directory path: {checkpoint_path}"
+            )
+        consumed, _, _ = _load_checkpoint_data_progress(checkpoint_path)
+        if consumed is None:
+            raise ValueError(
+                f"Explicit resume checkpoint '{checkpoint_path}' is missing or has an invalid "
+                "data_state.json with consumed_micro_batches metadata. "
+                "The checkpoint may be incomplete due to a crashed save."
+            )
+        if not _checkpoint_weights_appear_valid(checkpoint_path):
+            raise ValueError(
+                f"Explicit resume checkpoint '{checkpoint_path}' has metadata but model weights "
+                "appear missing or empty. The checkpoint may be incomplete due to a crashed save."
             )
         return str(checkpoint_path.resolve())
 
@@ -255,7 +313,7 @@ def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, fl
     if not path.exists():
         return None, 1.0, None
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
         val = raw.get("consumed_micro_batches", None)
         consumed = max(0, int(val)) if val is not None else None
         lr_mult = float(raw.get("lr_mult", 1.0))
@@ -263,7 +321,20 @@ def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, fl
         if digest is not None:
             digest = str(digest)
         return consumed, lr_mult, digest
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Checkpoint %s has invalid data_state.json (%s: %s); treating as unresumable.",
+            checkpoint_dir,
+            type(exc).__name__,
+            exc,
+        )
+        return None, 1.0, None
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error reading data_state.json for checkpoint %s (%s); treating as unresumable.",
+            checkpoint_dir,
+            exc,
+        )
         return None, 1.0, None
 
 
@@ -328,7 +399,18 @@ def _save_training_checkpoint(
             lr_mult=float(lr_mult),
             optimizer_param_digest=optimizer_param_digest,
         )
-        _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
+        progress_ok = _load_checkpoint_data_progress(checkpoint_dir)[0] is not None
+        weights_ok = _checkpoint_weights_appear_valid(checkpoint_dir)
+        if progress_ok and weights_ok:
+            _rotate_checkpoints(output_dir, save_total_limit=int(save_total_limit))
+        else:
+            logger.error(
+                "Checkpoint %s failed post-save structural validation "
+                "(data_state_ok=%s, weights_ok=%s); skipping rotation to preserve older checkpoints.",
+                checkpoint_dir,
+                bool(progress_ok),
+                bool(weights_ok),
+            )
         logger.info(f"Saved {log_label} checkpoint: {checkpoint_dir}")
 
 

@@ -2237,8 +2237,9 @@ def run_pretraining(
             if restored is None:
                 raise RuntimeError(
                     "Checkpoint resume requires data_state.json with consumed_micro_batches metadata. "
-                    f"Missing file for checkpoint '{ckpt}'. Resume from a checkpoint created by this "
-                    "code version or start a new run."
+                    f"File is missing or invalid for checkpoint '{ckpt}'. "
+                    "The checkpoint may be incomplete due to a crashed save. "
+                    "Resume from a different checkpoint created by this code version or start a new run."
                 )
             (
                 consumed_micro_batches,
@@ -2918,7 +2919,7 @@ def run_pretraining(
         final_step = int(global_step)
         should_try_crash_save = (crash_reason is None) or int(getattr(accelerator, "num_processes", 1)) == 1
         if final_step > 0 and final_step != int(last_saved_step) and should_try_crash_save:
-            with suppress(Exception):
+            try:
                 final_ckpt = output_dir / f"checkpoint-{final_step}"
                 _save_training_checkpoint(
                     accelerator=accelerator,
@@ -2931,6 +2932,15 @@ def run_pretraining(
                     optimizer_param_digest=param_digest,
                 )
                 last_saved_step = final_step
+            except Exception as save_exc:
+                logger.error(
+                    "Final/crash-time checkpoint save failed at step %d: %s. "
+                    "Progress since checkpoint-%d may be lost.",
+                    int(final_step),
+                    str(save_exc),
+                    int(last_saved_step),
+                    exc_info=True,
+                )
         elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:
             logger.warning(
                 "Skipping crash-time final checkpoint save on distributed run "

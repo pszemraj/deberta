@@ -576,7 +576,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor logits: Unnormalized logits with vocabulary dimension on the last axis.
         :param float temperature: Sampling temperature (> 0).
         :param torch.Tensor | None forbidden_vocab_mask: Optional boolean mask over vocabulary ids to suppress.
-        :raises ValueError: If ``temperature`` is non-positive.
+        :raises ValueError: If ``temperature`` is non-positive or the mask forbids every token for a row.
         :return torch.Tensor: Sampled token ids for each row of ``logits``.
         """
 
@@ -588,7 +588,35 @@ class DebertaV3RTDPretrainer(nn.Module):
         if forbidden_vocab_mask is not None and forbidden_vocab_mask.numel() != 0:
             if forbidden_vocab_mask.device != x.device:
                 forbidden_vocab_mask = forbidden_vocab_mask.to(device=x.device)
-            x = x.masked_fill(forbidden_vocab_mask, -1e9)
+            mask = forbidden_vocab_mask.to(dtype=torch.bool)
+            if mask.ndim == 1:
+                if int(mask.shape[0]) != int(x.shape[-1]):
+                    raise ValueError(
+                        "forbidden_vocab_mask length must match logits vocabulary dimension: "
+                        f"{int(mask.shape[0])} vs {int(x.shape[-1])}."
+                    )
+                if bool(mask.all().item()):
+                    raise ValueError(
+                        "forbidden_vocab_mask excludes all vocabulary ids; at least one token must remain sampleable."
+                    )
+            else:
+                if int(mask.shape[-1]) != int(x.shape[-1]):
+                    raise ValueError(
+                        "forbidden_vocab_mask last dimension must match logits vocabulary dimension: "
+                        f"{int(mask.shape[-1])} vs {int(x.shape[-1])}."
+                    )
+                try:
+                    expanded = mask.expand_as(x)
+                except RuntimeError as exc:
+                    raise ValueError(
+                        "forbidden_vocab_mask with rank > 1 must be broadcastable to logits."
+                    ) from exc
+                if bool(expanded.all(dim=-1).any().item()):
+                    raise ValueError(
+                        "forbidden_vocab_mask excludes all vocabulary ids for at least one row; "
+                        "at least one token must remain sampleable."
+                    )
+            x = x.masked_fill(mask, -1e9)
 
         u = torch.rand_like(x).clamp_(min=1e-6, max=1.0 - 1e-6)
         g = -torch.log(-torch.log(u))
