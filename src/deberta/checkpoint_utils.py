@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import torch
 
 _FSDP_SHARDED_MODEL_PREFIX = "pytorch_model_fsdp"
+logger = logging.getLogger(__name__)
 
 
 def _clone_tensor_state_dict(template: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -287,3 +289,47 @@ def unwrap_compiled_model(accelerator: Any, model: torch.nn.Module) -> torch.nn.
     while hasattr(candidate, "module"):
         candidate = candidate.module
     return candidate
+
+
+def load_state_with_compile_fallback(
+    *,
+    accelerator: Any,
+    model: torch.nn.Module,
+    checkpoint_dir: str | Path,
+    context: str,
+    remap_loader: Any | None = None,
+) -> None:
+    """Load accelerate state with fallback for ``torch.compile`` wrapper mismatches.
+
+    :param Any accelerator: Accelerator runtime exposing ``load_state`` and ``unwrap_model``.
+    :param torch.nn.Module model: Potentially wrapped target model.
+    :param str | Path checkpoint_dir: Checkpoint directory path.
+    :param str context: Human-readable context label (for example ``resume`` or ``export``).
+    :param Any | None remap_loader: Optional loader callable for remapping state dict keys.
+        Signature must match ``load_model_state_with_compile_key_remap(model, checkpoint_dir)``.
+    :raises RuntimeError: If normal load fails for non-compile reasons or remap fallback fails.
+    """
+    ckpt = str(checkpoint_dir)
+    try:
+        accelerator.load_state(ckpt)
+        return
+    except RuntimeError as err:
+        if "_orig_mod" not in str(err):
+            raise
+
+    ctx = str(context).strip() or "checkpoint"
+    logger.warning(
+        "Checkpoint model key mismatch due compile wrappers detected; retrying %s load "
+        "with strict=False and canonical key remap.",
+        ctx,
+    )
+    accelerator.load_state(ckpt, strict=False)
+    unwrapped = unwrap_compiled_model(accelerator, model)
+    remap_fn = load_model_state_with_compile_key_remap if remap_loader is None else remap_loader
+    stats = remap_fn(unwrapped, Path(ckpt))
+    logger.info(
+        "%s model remap loaded %d tensors from %s.",
+        ctx.capitalize(),
+        int(stats["matched"]),
+        ckpt,
+    )

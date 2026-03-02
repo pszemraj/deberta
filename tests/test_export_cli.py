@@ -65,6 +65,18 @@ def _write_run_layout(tmp_path: Path) -> tuple[Path, Path]:
     return run_dir, checkpoint_dir
 
 
+def _new_export_call_counters() -> dict[str, object]:
+    """Return a fresh mutable counter map used by export fakes."""
+    return {
+        "get_state_dict": 0,
+        "unwrap_model": 0,
+        "get_model_state_dict": 0,
+        "options_kwargs": None,
+        "load_state_calls": [],
+        "build_backbones_calls": [],
+    }
+
+
 def _install_export_fakes(
     *,
     monkeypatch: pytest.MonkeyPatch,
@@ -171,14 +183,7 @@ def test_run_export_fsdp_state_dict_paths(
     rank0: bool,
 ):
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "build_backbones_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -219,14 +224,8 @@ def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "remap_calls": [],
-    }
+    called = _new_export_call_counters()
+    called["remap_calls"] = []
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -263,13 +262,7 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -335,14 +328,7 @@ def test_run_export_fails_on_partial_backbone_load_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "build_backbones_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -375,14 +361,7 @@ def test_run_export_allows_partial_backbone_load_with_opt_in_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "build_backbones_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -417,14 +396,7 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "build_backbones_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -487,14 +459,7 @@ def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "stale.txt").write_text("x", encoding="utf-8")
 
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "build_backbones_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,
@@ -524,14 +489,7 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called: dict[str, object] = {
-        "get_state_dict": 0,
-        "unwrap_model": 0,
-        "get_model_state_dict": 0,
-        "options_kwargs": None,
-        "load_state_calls": [],
-        "build_backbones_calls": [],
-    }
+    called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
         called=called,

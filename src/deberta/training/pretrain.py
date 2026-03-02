@@ -24,7 +24,7 @@ from tqdm.auto import tqdm
 
 from deberta.checkpoint_utils import (
     canonicalize_state_dict_keys,
-    load_model_state_with_compile_key_remap,
+    load_state_with_compile_fallback,
     unwrap_compiled_model,
 )
 from deberta.config import (
@@ -46,7 +46,13 @@ from deberta.data.streaming import PackedStreamingConfig
 from deberta.io_utils import dump_json
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.modeling.export_utils import load_intersection_state_dict, merge_embeddings_into_export_backbone
+from deberta.modeling.export_utils import (
+    clean_exported_config as _clean_exported_config_impl,
+)
+from deberta.modeling.export_utils import (
+    load_intersection_state_dict,
+    merge_embeddings_into_export_backbone,
+)
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training import run_config as _run_config
 from deberta.training import run_management as _run_management
@@ -153,24 +159,11 @@ def _load_resume_state_with_compile_fallback(
     :raises RuntimeError: If both normal and fallback load paths fail.
     :return None: None.
     """
-    try:
-        accelerator.load_state(checkpoint_dir)
-        return
-    except RuntimeError as err:
-        if "_orig_mod" not in str(err):
-            raise
-
-    logger.warning(
-        "Checkpoint model key mismatch due compile wrappers detected; retrying resume with "
-        "strict=False and canonical key remap."
-    )
-    accelerator.load_state(checkpoint_dir, strict=False)
-    unwrapped = unwrap_compiled_model(accelerator, model)
-    stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
-    logger.info(
-        "Resume model remap loaded %d tensors from %s.",
-        int(stats["matched"]),
-        checkpoint_dir,
+    load_state_with_compile_fallback(
+        accelerator=accelerator,
+        model=model,
+        checkpoint_dir=checkpoint_dir,
+        context="resume",
     )
 
 
@@ -1617,36 +1610,6 @@ def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int |
 
 _REPO_URL = "https://github.com/pszemraj/deberta"
 
-# Keys injected by this repo's training configs that should not leak into
-# exported HF model configs (they are not part of the upstream schema).
-_EXPORT_CONFIG_STRIP_KEYS = frozenset(
-    {
-        "hf_attention_kernel",
-        "use_rmsnorm_heads",
-        "cls_token_id",
-        "mask_token_id",
-        "sep_token_id",
-        "bos_token_id",
-        "eos_token_id",
-        "legacy",
-    }
-)
-
-
-def _clean_exported_config(config_path: Path) -> None:
-    """Remove training-internal keys from an exported config.json in-place.
-
-    :param Path config_path: Path to config.json.
-    """
-    if not config_path.exists():
-        return
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-        cleaned = {k: v for k, v in raw.items() if k not in _EXPORT_CONFIG_STRIP_KEYS}
-        config_path.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
-    except Exception:
-        pass
-
 
 def _write_export_readme(
     output_dir: Path,
@@ -1843,7 +1806,7 @@ def _export_discriminator_hf(
         export_disc.save_pretrained(str(output_dir), safe_serialization=True)
 
         # Strip training-internal keys from the exported config.json.
-        _clean_exported_config(output_dir / "config.json")
+        _clean_exported_config_impl(output_dir / "config.json", strict=False)
 
         dump_json({"embedding_sharing": embedding_sharing}, output_dir / "export_meta.json")
 

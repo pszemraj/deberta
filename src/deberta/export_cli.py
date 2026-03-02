@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, unwrap_compiled_model
+from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, load_state_with_compile_fallback
 from deberta.config import (
     ModelConfig,
     load_data_config_snapshot,
@@ -26,25 +26,13 @@ from deberta.io_utils import load_json_mapping
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import (
+    clean_exported_config,
     load_intersection_state_dict,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
 )
 
 logger = logging.getLogger(__name__)
-
-_EXPORT_CONFIG_STRIP_KEYS = frozenset(
-    {
-        "hf_attention_kernel",
-        "use_rmsnorm_heads",
-        "cls_token_id",
-        "mask_token_id",
-        "sep_token_id",
-        "bos_token_id",
-        "eos_token_id",
-        "legacy",
-    }
-)
 
 
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
@@ -56,23 +44,6 @@ def _infer_run_dir(checkpoint_dir: Path) -> Path:
     # checkpoint_dir = .../checkpoint-XXXX
     # run dir is usually parent.
     return checkpoint_dir.parent
-
-
-def _clean_exported_config(config_path: Path) -> None:
-    """Remove training-only keys from exported ``config.json`` files.
-
-    :param Path config_path: Path to the saved HF ``config.json``.
-    :raises ValueError: If the config file exists but is not valid JSON.
-    """
-    if not config_path.exists():
-        return
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from e
-
-    cleaned = {k: v for k, v in raw.items() if k not in _EXPORT_CONFIG_STRIP_KEYS}
-    config_path.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
 
 
 def _validate_run_metadata_if_present(run_dir: Path) -> None:
@@ -272,37 +243,6 @@ def _build_export_backbone(
     return disc, gen
 
 
-def _load_export_state_with_compile_fallback(
-    accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
-) -> None:
-    """Load checkpoint state, retrying with compile-key canonical remapping when needed.
-
-    :param Any accelerator: Accelerator instance.
-    :param torch.nn.Module model: Export model container.
-    :param str checkpoint_dir: Path to checkpoint directory.
-    :raises RuntimeError: If both normal and compile-remap fallback load paths fail.
-    """
-    try:
-        accelerator.load_state(checkpoint_dir)
-        return
-    except RuntimeError as err:
-        if "_orig_mod" not in str(err):
-            raise
-
-    logger.warning(
-        "Checkpoint model key mismatch due compile wrappers detected; retrying export load with "
-        "strict=False and canonical key remap."
-    )
-    accelerator.load_state(checkpoint_dir, strict=False)
-    unwrapped = unwrap_compiled_model(accelerator, model)
-    stats = load_model_state_with_compile_key_remap(unwrapped, Path(checkpoint_dir))
-    logger.info(
-        "Export model remap loaded %d tensors from %s.",
-        int(stats["matched"]),
-        checkpoint_dir,
-    )
-
-
 def _prepare_discriminator_state_for_strict_load(
     *,
     export_disc: Any,
@@ -430,7 +370,13 @@ def run_export(cfg: ExportConfig) -> None:
     model = accelerator.prepare(model)
 
     # Load accelerate checkpoint (FSDP2 SHARDED_STATE_DICT is handled here by accelerate/torch.distributed.checkpoint).
-    _load_export_state_with_compile_fallback(accelerator, model, str(checkpoint_dir))
+    load_state_with_compile_fallback(
+        accelerator=accelerator,
+        model=model,
+        checkpoint_dir=checkpoint_dir,
+        context="export",
+        remap_loader=load_model_state_with_compile_key_remap,
+    )
     accelerator.wait_for_everyone()
 
     # Consolidate FULL_STATE_DICT when FSDP is enabled.
@@ -549,7 +495,7 @@ def run_export(cfg: ExportConfig) -> None:
             export_disc.save_pretrained(
                 str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
             )
-            _clean_exported_config(stage_dir / "discriminator" / "config.json")
+            clean_exported_config(stage_dir / "discriminator" / "config.json", strict=True)
             meta["exported_discriminator"] = True
 
         # Generator
@@ -573,7 +519,7 @@ def run_export(cfg: ExportConfig) -> None:
             export_gen.save_pretrained(
                 str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
             )
-            _clean_exported_config(stage_dir / "generator" / "config.json")
+            clean_exported_config(stage_dir / "generator" / "config.json", strict=True)
             meta["exported_generator"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:

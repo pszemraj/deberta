@@ -139,12 +139,7 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     :param Path output_dir: Training output directory.
     :return Path | None: Latest checkpoint path, or ``None`` if absent.
     """
-    checkpoints: list[tuple[int, Path]] = []
-    for p in output_dir.glob("checkpoint-*"):
-        if p.is_dir():
-            step = _parse_checkpoint_step(str(p))
-            checkpoints.append((step, p))
-
+    checkpoints = _list_checkpoints(output_dir)
     if not checkpoints:
         return None
 
@@ -200,13 +195,7 @@ def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
     :param Path output_dir: Training output directory.
     :return Path | None: Latest resumable checkpoint path, or ``None`` if absent.
     """
-    checkpoints: list[tuple[int, Path]] = []
-    for p in output_dir.glob("checkpoint-*"):
-        if not p.is_dir():
-            continue
-        step = _parse_checkpoint_step(str(p))
-        checkpoints.append((step, p))
-
+    checkpoints = _list_checkpoints(output_dir)
     if not checkpoints:
         return None
 
@@ -453,12 +442,7 @@ def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
     if save_total_limit <= 0:
         return
 
-    checkpoints = []
-    for p in output_dir.glob("checkpoint-*"):
-        if p.is_dir():
-            step = _parse_checkpoint_step(str(p))
-            checkpoints.append((step, p))
-
+    checkpoints = _list_checkpoints(output_dir)
     checkpoints.sort(key=lambda x: x[0])
     if len(checkpoints) <= save_total_limit:
         return
@@ -470,6 +454,19 @@ def _rotate_checkpoints(output_dir: Path, *, save_total_limit: int) -> None:
             logger.info(f"Deleted old checkpoint: {p} (step={step})")
         except Exception as e:
             logger.warning(f"Failed to delete checkpoint {p}: {e}")
+
+
+def _list_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
+    """Collect ``checkpoint-*`` directories with parsed step ids.
+
+    :param Path output_dir: Directory to scan.
+    :return list[tuple[int, Path]]: ``(step, checkpoint_dir)`` pairs.
+    """
+    checkpoints: list[tuple[int, Path]] = []
+    for p in output_dir.glob("checkpoint-*"):
+        if p.is_dir():
+            checkpoints.append((_parse_checkpoint_step(str(p)), p))
+    return checkpoints
 
 
 __all__ = [
