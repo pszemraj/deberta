@@ -59,18 +59,24 @@ def _make_log_bucket_position(
     :return torch.Tensor: Bucketized relative-position ids.
     """
 
-    sign = torch.sign(relative_pos)
+    # Match original DeBERTa behavior: clamp representable distances before
+    # bucketing so extreme relative offsets saturate instead of drifting.
+    rel = relative_pos
+    if int(max_position) > 0:
+        rel = rel.clamp(min=-int(max_position) + 1, max=int(max_position) - 1)
+
+    sign = torch.sign(rel)
     mid = int(bucket_size // 2)
     if mid <= 1:
-        return relative_pos
+        return rel
 
-    abs_pos = relative_pos.abs().clamp_min(1)
+    abs_pos = rel.abs().clamp_min(1)
     near = abs_pos < mid
 
     # Match HF semantics while avoiding scripted helper branches in forward.
     log_base = math.log(max(float(max_position - 1), float(mid + 1)) / float(mid))
     if log_base <= 0.0:
-        return relative_pos
+        return rel
 
     log_pos = torch.ceil(torch.log(abs_pos.float() / float(mid)) / log_base * float(mid - 1)) + float(mid)
     bucket = torch.where(near, abs_pos.to(log_pos.dtype), log_pos)
@@ -201,11 +207,11 @@ class DisentangledSelfAttention(nn.Module):
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
 
         if self.relative_attention and (not self.share_att_key):
-            if "c2p" in self.pos_att_type:
+            if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
                 self.pos_key_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_key_proj = None
-            if "p2c" in self.pos_att_type:
+            if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
                 self.pos_query_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_query_proj = None
@@ -289,6 +295,53 @@ class DisentangledSelfAttention(nn.Module):
         projected = projected.view(2 * att_span, self.num_attention_heads, self.attention_head_size)
         return projected.permute(1, 0, 2).contiguous()
 
+    def _p2p_bias(
+        self,
+        *,
+        rel_pos: torch.Tensor,
+        pos_query_layer: torch.Tensor,
+        pos_key_layer: torch.Tensor,
+        bsz: int,
+        nheads: int,
+        query_len: int,
+        key_len: int,
+        att_span: int,
+    ) -> torch.Tensor:
+        """Compute position-to-position (p2p) bias.
+
+        :param torch.Tensor rel_pos: Relative ids with shape ``(Q,K)``.
+        :param torch.Tensor pos_query_layer: Relative query projections ``(H,2A,D)``.
+        :param torch.Tensor pos_key_layer: Relative key projections ``(H,2A,D)``.
+        :param int bsz: Batch size.
+        :param int nheads: Number of attention heads.
+        :param int query_len: Query length.
+        :param int key_len: Key length.
+        :param int att_span: Relative-attention span ``A``.
+        :return torch.Tensor: p2p bias tensor with shape ``(B,H,Q,K)``.
+        """
+
+        # Mirror reference behavior: use positive-half relative query table.
+        pos_query = pos_query_layer[:, att_span:, :]  # (H, A, D)
+        if pos_query.shape[1] == 0:
+            return torch.zeros(
+                (bsz, nheads, query_len, key_len),
+                device=rel_pos.device,
+                dtype=pos_query_layer.dtype,
+            )
+
+        # (H, A, 2A)
+        p2p_table = torch.einsum("hqd,hkd->hqk", pos_query, pos_key_layer)
+
+        # Map runtime query positions to available p2p rows.
+        q_index = torch.arange(query_len, device=rel_pos.device, dtype=torch.long)
+        q_index = q_index.clamp(max=int(p2p_table.shape[1]) - 1)
+        p2p_query = p2p_table.index_select(1, q_index)  # (H, Q, 2A)
+
+        p2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)  # (Q, K)
+        p2p_idx = p2p_idx.unsqueeze(0).expand(nheads, query_len, key_len)
+        p2p_bias = p2p_query.gather(-1, p2p_idx)  # (H, Q, K)
+        return p2p_bias.unsqueeze(0).expand(bsz, nheads, query_len, key_len)
+
     def _disentangled_attention_bias_dynamic(
         self,
         query_layer: torch.Tensor,
@@ -320,9 +373,17 @@ class DisentangledSelfAttention(nn.Module):
         rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
 
         score: torch.Tensor | None = None
+        pos_key_layer: torch.Tensor | None = None
+        pos_query_layer: torch.Tensor | None = None
+
+        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)
+        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)
 
         if "c2p" in self.pos_att_type:
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)
+            if pos_key_layer is None:
+                raise RuntimeError("p2p/c2p path requires pos_key projection.")
             c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
             c2p_att = torch.einsum("bhqd,hkd->bhqk", query_layer, pos_key_layer)
 
@@ -332,7 +393,8 @@ class DisentangledSelfAttention(nn.Module):
             score = c2p_bias if score is None else score + c2p_bias
 
         if "p2c" in self.pos_att_type:
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)
+            if pos_query_layer is None:
+                raise RuntimeError("p2p/p2c path requires pos_query projection.")
             p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
             p2c_att = torch.einsum("bhkd,hqd->bhkq", key_layer, pos_query_layer)
 
@@ -341,6 +403,21 @@ class DisentangledSelfAttention(nn.Module):
             p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
             p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
             score = p2c_bias if score is None else score + p2c_bias
+
+        if "p2p" in self.pos_att_type:
+            if pos_key_layer is None or pos_query_layer is None:
+                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
+            p2p_bias = self._p2p_bias(
+                rel_pos=rel_pos,
+                pos_query_layer=pos_query_layer,
+                pos_key_layer=pos_key_layer,
+                bsz=bsz,
+                nheads=nheads,
+                query_len=query_len,
+                key_len=key_len,
+                att_span=att_span,
+            )
+            score = p2p_bias if score is None else score + p2p_bias
 
         if score is None:
             score = torch.zeros(
@@ -378,9 +455,17 @@ class DisentangledSelfAttention(nn.Module):
         att_span = int(self.pos_ebd_size)
         rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
         score: torch.Tensor | None = None
+        pos_key_layer: torch.Tensor | None = None
+        pos_query_layer: torch.Tensor | None = None
+
+        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)  # (H,2A,D)
+        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)  # (H,2A,D)
 
         if "c2p" in self.pos_att_type:
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)  # (H,2A,D)
+            if pos_key_layer is None:
+                raise RuntimeError("p2p/c2p path requires pos_key projection.")
             c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
 
             q_flat = query_layer.permute(1, 0, 2, 3).reshape(
@@ -396,7 +481,8 @@ class DisentangledSelfAttention(nn.Module):
             score = c2p_bias if score is None else score + c2p_bias
 
         if "p2c" in self.pos_att_type:
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)  # (H,2A,D)
+            if pos_query_layer is None:
+                raise RuntimeError("p2p/p2c path requires pos_query projection.")
             p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
 
             k_flat = key_layer.permute(1, 0, 2, 3).reshape(nheads, bsz * key_len, self.attention_head_size)
@@ -408,6 +494,21 @@ class DisentangledSelfAttention(nn.Module):
             p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
             p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
             score = p2c_bias if score is None else score + p2c_bias
+
+        if "p2p" in self.pos_att_type:
+            if pos_key_layer is None or pos_query_layer is None:
+                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
+            p2p_bias = self._p2p_bias(
+                rel_pos=rel_pos,
+                pos_query_layer=pos_query_layer,
+                pos_key_layer=pos_key_layer,
+                bsz=bsz,
+                nheads=nheads,
+                query_len=query_len,
+                key_len=key_len,
+                att_span=att_span,
+            )
+            score = p2p_bias if score is None else score + p2p_bias
 
         if score is None:
             score = torch.zeros(
@@ -481,6 +582,8 @@ class DisentangledSelfAttention(nn.Module):
         if "c2p" in self.pos_att_type:
             scale_factor += 1
         if "p2c" in self.pos_att_type:
+            scale_factor += 1
+        if "p2p" in self.pos_att_type:
             scale_factor += 1
 
         scale = math.sqrt(float(self.attention_head_size * scale_factor))

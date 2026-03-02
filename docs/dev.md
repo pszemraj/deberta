@@ -25,10 +25,10 @@ Until this repo has a stable release, backward compatibility is not required. Fa
 
 Model/data config mismatches fail fast; train config drift is allowed by design.
 
-## DeBERTa-v2 Parity Gaps Still Open
+## DeBERTa-v2 Parity Gap Closures
 
-- `pos_att_type=p2p` branch is not implemented in native HF DeBERTa-v2 attention.
-- Relative-position values are not clamped to `[-max_position+1, max_position-1]` before log bucketing.
+- Native HF DeBERTa-v2 attention now supports `pos_att_type=p2p` with matching scale-factor behavior.
+- Relative-position values are clamped to `[-max_position+1, max_position-1]` before log bucketing.
 
 ## Follow-up Work
 

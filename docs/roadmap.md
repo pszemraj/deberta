@@ -29,8 +29,8 @@ Deferred follow-ups. See [model](model.md), [data](data.md), [objective](objecti
 
 Parity gaps vs the RoPE path that matter for fair head-to-head comparison:
 
-- implement `pos_att_type=p2p` branch support in native disentangled attention
-- clamp relative-position values to `[-max_position+1, max_position-1]` before log bucketing
+- ~~implement `pos_att_type=p2p` branch support in native disentangled attention~~ — **resolved**
+- ~~clamp relative-position values to `[-max_position+1, max_position-1]` before log bucketing~~ — **resolved**
 - optional RMSNorm support (currently LayerNorm only) — ~10-15% faster, different convergence profile
 - optional SwiGLU FFN support (currently MLP-only; SwiGLU is ~2/3 the parameters for equivalent capacity)
 - configurable `use_bias` (currently hardcoded per layer; RoPE path defaults to bias-free)

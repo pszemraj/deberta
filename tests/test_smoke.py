@@ -1728,6 +1728,111 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
     torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
 
 
+def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="p2p",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DisentangledSelfAttention(cfg).eval()
+
+    bsz, nheads, qlen, klen = 2, 4, 8, 8
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    query = torch.randn(bsz, nheads, qlen, head_dim)
+    key = torch.randn(bsz, nheads, klen, head_dim)
+    rel_embeddings = torch.randn(2 * cfg.max_position_embeddings, cfg.hidden_size)
+
+    score = attn.disentangled_attention_bias(
+        query_layer=query,
+        key_layer=key,
+        relative_pos=None,
+        rel_embeddings=rel_embeddings,
+        scale_factor=2,  # base 1 + p2p 1
+    )
+    assert score.shape == (bsz, nheads, qlen, klen)
+    assert torch.isfinite(score).all()
+    assert float(score.abs().sum().item()) > 0.0
+
+
+def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic_with_p2p():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c|p2p",
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    torch.manual_seed(321)
+    cfg.hf_attention_kernel = "dynamic"
+    dynamic_model = DebertaV2Model(cfg).eval()
+    snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
+
+    cfg.hf_attention_kernel = "cached_bmm"
+    cached_model = DebertaV2Model(cfg).eval()
+    cached_model.load_state_dict(snapshot, strict=True)
+
+    cfg.hf_attention_kernel = "stable"
+    stable_model = DebertaV2Model(cfg).eval()
+    stable_model.load_state_dict(snapshot, strict=True)
+
+    with torch.no_grad():
+        out_dynamic = dynamic_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        out_cached = cached_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        out_stable = stable_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
+
+
+def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
+    from deberta.modeling.deberta_v2_native import _make_log_bucket_position
+
+    relative_pos = torch.tensor(
+        [-999, -800, -511, -510, 0, 510, 511, 800, 999],
+        dtype=torch.long,
+    )
+    bucket = _make_log_bucket_position(relative_pos, bucket_size=128, max_position=512)
+
+    neg_edge = bucket[2].item()  # rel=-511
+    pos_edge = bucket[6].item()  # rel=511
+
+    assert bucket[0].item() == neg_edge
+    assert bucket[1].item() == neg_edge
+    assert bucket[-1].item() == pos_edge
+    assert bucket[-2].item() == pos_edge
+
+
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
     import pytest
 
