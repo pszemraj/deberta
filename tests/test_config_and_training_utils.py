@@ -2165,6 +2165,39 @@ def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_di
     ).read_text(encoding="utf-8")
 
 
+def test_persist_or_validate_run_configs_preflight_rejects_conflicting_resume_snapshot(tmp_path: Path):
+    source_run = tmp_path / "source-run"
+    source_run.mkdir(parents=True, exist_ok=True)
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=10)
+    _persist_or_validate_run_configs(
+        output_dir=source_run,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    checkpoint_dir = source_run / "checkpoint-10"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    new_output_dir = tmp_path / "new-run"
+    new_output_dir.mkdir(parents=True, exist_ok=True)
+    (new_output_dir / "model_config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="conflicting run snapshot"):
+        _persist_or_validate_run_configs(
+            output_dir=new_output_dir,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            resume_checkpoint=str(checkpoint_dir),
+            is_main_process=False,
+            preflight_only=True,
+        )
+
+
 def test_persist_or_validate_run_configs_rejects_resume_when_source_snapshots_missing(tmp_path: Path):
     source_run = tmp_path / "source-run"
     source_run.mkdir(parents=True, exist_ok=True)
@@ -4451,6 +4484,22 @@ def test_build_run_metadata_omits_compile_scope_when_none():
     meta = _build_run_metadata()
     assert "effective_compile_scope" not in meta
     assert "compile_scope_reason" not in meta
+
+
+def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(data_files="dummy.txt"),
+        train_cfg=TrainConfig(),
+        resume_checkpoint=None,
+        is_main_process=True,
+        preflight_only=True,
+    )
+    for filename in ("model_config.json", "data_config.json", "train_config.json", "run_metadata.json"):
+        assert not (out / filename).exists()
 
 
 def test_persist_run_configs_writes_compile_scope_to_metadata(tmp_path: Path):

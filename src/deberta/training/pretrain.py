@@ -1361,6 +1361,7 @@ def run_pretraining_dry_run(
         resume_checkpoint=ckpt,
         config_path=config_path,
         is_main_process=False,
+        preflight_only=True,
         effective_compile_scope=compile_scope if compile_enabled else None,
         compile_scope_reason=compile_scope_reason,
     )

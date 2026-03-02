@@ -22,6 +22,12 @@ from deberta.config import (
 from deberta.io_utils import dump_json, load_json_mapping
 
 logger = logging.getLogger(__name__)
+_RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
+    "model_config.json",
+    "data_config.json",
+    "train_config.json",
+    "run_metadata.json",
+)
 
 
 def _build_run_metadata(
@@ -169,6 +175,30 @@ def _infer_resume_run_dir(resume_checkpoint: str | Path) -> Path:
     return checkpoint_dir.parent
 
 
+def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
+    """Raise when ``output_dir`` contains conflicting copied snapshots for resume provenance.
+
+    :param Path source_run_dir: Source run directory inferred from the resume checkpoint.
+    :param Path output_dir: Target output directory for the resumed run.
+    :raises ValueError: If any persisted snapshot file exists in both locations with different content.
+    """
+    for filename in _RUN_SNAPSHOT_FILENAMES:
+        src = source_run_dir / filename
+        if not src.exists():
+            continue
+        dst = output_dir / filename
+        if not dst.exists():
+            continue
+
+        src_text = src.read_text(encoding="utf-8")
+        dst_text = dst.read_text(encoding="utf-8")
+        if dst_text != src_text:
+            raise ValueError(
+                "Output directory contains conflicting run snapshot while resuming from "
+                f"a different source run. Conflicting file: {dst}"
+            )
+
+
 def _persist_or_validate_run_configs(
     *,
     output_dir: Path,
@@ -179,6 +209,7 @@ def _persist_or_validate_run_configs(
     resume_run_dir: Path | None = None,
     config_path: str | Path | None = None,
     is_main_process: bool,
+    preflight_only: bool = False,
     effective_compile_scope: str | None = None,
     compile_scope_reason: str | None = None,
 ) -> None:
@@ -192,6 +223,7 @@ def _persist_or_validate_run_configs(
     :param Path | None resume_run_dir: Optional explicit source run directory for resume validation.
     :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
+    :param bool preflight_only: When ``True``, perform full validation without writing/updating files.
     :param str | None effective_compile_scope: Resolved compile scope for metadata.
     :param str | None compile_scope_reason: Reason for compile scope selection.
     :raises ValueError: If resume mode detects incompatible model/data config snapshots.
@@ -264,6 +296,16 @@ def _persist_or_validate_run_configs(
                 "Resume configuration mismatch for data_config.json. "
                 "Refusing to overwrite run metadata with incompatible data settings."
             )
+
+        if source_run_dir is not None and source_run_dir != output_dir_abs:
+            _validate_resume_output_snapshot_conflicts(
+                source_run_dir=source_run_dir,
+                output_dir=output_dir,
+            )
+
+        if preflight_only:
+            return
+
         if is_main_process and not run_meta_path.exists():
             # Backfill schema metadata for older runs only after compatibility checks pass.
             dump_json(run_meta, run_meta_path)
@@ -271,12 +313,7 @@ def _persist_or_validate_run_configs(
         if is_main_process and source_run_dir is not None and source_run_dir != output_dir_abs:
             resume_checkpoint_abs = Path(resume_checkpoint).expanduser().resolve()
             # Copy source snapshots into output_dir to keep provenance when resuming into a new run dir.
-            for filename in (
-                "model_config.json",
-                "data_config.json",
-                "train_config.json",
-                "run_metadata.json",
-            ):
+            for filename in _RUN_SNAPSHOT_FILENAMES:
                 src = source_run_dir / filename
                 if not src.exists():
                     continue
@@ -285,10 +322,8 @@ def _persist_or_validate_run_configs(
                 if dst.exists():
                     dst_text = dst.read_text(encoding="utf-8")
                     if dst_text != src_text:
-                        raise ValueError(
-                            "Output directory contains conflicting run snapshot while resuming from "
-                            f"a different source run. Conflicting file: {dst}"
-                        )
+                        # Should already be guarded by _validate_resume_output_snapshot_conflicts.
+                        raise RuntimeError(f"Unexpected snapshot conflict after pre-validation: {dst}")
                 else:
                     dst.write_text(src_text, encoding="utf-8")
 
@@ -313,6 +348,9 @@ def _persist_or_validate_run_configs(
             config_path=config_path,
             is_main_process=is_main_process,
         )
+        return
+
+    if preflight_only:
         return
 
     if is_main_process:
