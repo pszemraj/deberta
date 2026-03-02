@@ -1075,17 +1075,15 @@ def check_rtd_loss_integrity(repo_root: Path, *, verbose: bool) -> CheckResult:
     disc_labels_flat.scatter_(0, masked_idx, replaced)
     disc_labels = disc_labels_flat.view_as(input_ids)
 
-    # Active token mask logic is in attention_mask_to_active_tokens + special-token exclusion.
-    # Import it directly (safe; no training deps).
+    # Active token mask logic mirrors DebertaV3RTDPretrainer.forward:
+    # discriminator supervision applies to all active (non-padding) tokens.
+    # Import helper directly to avoid dragging training runtime deps into this audit.
     from deberta.modeling.rtd import attention_mask_to_active_tokens
 
     pad_token_id = int(getattr(disc_cfg, "pad_token_id", tokenizer.pad_token_id))
-    active = attention_mask_to_active_tokens(
+    disc_active = attention_mask_to_active_tokens(
         input_ids=input_ids, attention_mask=attention_mask, pad_token_id=pad_token_id
     )
-    special = model._special_position_mask(input_ids)
-    special = special & (~masked_positions)
-    disc_active = active & (~special)
 
     disc_active_f = disc_active.to(dtype=torch.float32)
     disc_token_count = disc_active_f.sum()
@@ -1102,7 +1100,7 @@ def check_rtd_loss_integrity(repo_root: Path, *, verbose: bool) -> CheckResult:
         return _fail(
             "rtd_loss_integrity",
             f"Discriminator loss mismatch: ref={float(disc_loss_ref):.6f} impl={float(out.disc_loss_raw):.6f} (abs diff={max_abs:.2e})",
-            hint="This usually means the discriminator active token-set is wrong (pads/specials included/excluded incorrectly) or reduction differs.",
+            hint="This usually means the discriminator active token-set is wrong (padding/attention mask handling) or reduction differs.",
         )
 
     # Gradient isolation (embedding_sharing='none'):
@@ -1161,18 +1159,34 @@ def check_rtd_loss_integrity(repo_root: Path, *, verbose: bool) -> CheckResult:
                     hint="Forbidden vocab mask must be applied before sampling (masked_fill to -inf/-1e9 is typical).",
                 )
 
-    # Token-set sanity: discriminator active set must exclude *originally* special tokens.
-    # Use orig_padded_ids (pre-corruption) to identify true special positions; input_ids
-    # may contain MASK tokens at positions the collator replaced — those are valid disc targets.
+    # Token-set sanity: discriminator active set must include all non-padding active tokens.
+    # Original non-padding specials (for example CLS/SEP) are valid all-negative targets.
+    # Padding must never be active.
+    pad_id = int(tokenizer.pad_token_id)
+    active_pad = orig_padded_ids.eq(pad_id) & disc_active
+    if bool(active_pad.any().item()):
+        return _fail(
+            "rtd_loss_integrity",
+            "Discriminator active token set incorrectly includes padding positions "
+            f"{active_pad.nonzero(as_tuple=False)[:5].tolist()}",
+            hint="Discriminator supervision must exclude padding tokens.",
+        )
+
+    non_pad_special = torch.zeros_like(orig_padded_ids, dtype=torch.bool)
     for sid in tokenizer.all_special_ids:
-        sid = int(sid)
-        pos = (orig_padded_ids == sid) & disc_active
-        if bool(pos.any().item()):
-            return _fail(
-                "rtd_loss_integrity",
-                f"Discriminator active token set includes originally-special token id={sid} at positions {pos.nonzero(as_tuple=False)[:5].tolist()}",
-                hint="Original special tokens (CLS/SEP/PAD/MASK/...) must not contribute to discriminator loss.",
-            )
+        sid_i = int(sid)
+        if sid_i == pad_id:
+            continue
+        non_pad_special = non_pad_special | orig_padded_ids.eq(sid_i)
+
+    inactive_non_pad_special = non_pad_special & (~disc_active)
+    if bool(inactive_non_pad_special.any().item()):
+        return _fail(
+            "rtd_loss_integrity",
+            "Discriminator active token set dropped non-padding special-token positions "
+            f"{inactive_non_pad_special.nonzero(as_tuple=False)[:5].tolist()}",
+            hint="RTD discriminator loss should supervise all active non-padding tokens, including CLS/SEP.",
+        )
 
     details = "Recomputed gen/disc losses match implementation; gradient boundaries OK; sampling stochastic; forbidden ids respected."
     if verbose:
