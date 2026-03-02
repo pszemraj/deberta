@@ -338,7 +338,7 @@ def test_collator_build_drops_document_mask_when_not_packed():
     assert "attention_mask" not in batch
 
 
-def test_ngram_masking_does_not_force_token_level_topup(monkeypatch: pytest.MonkeyPatch):
+def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.75, max_ngram=3))
 
@@ -357,9 +357,9 @@ def test_ngram_masking_does_not_force_token_level_topup(monkeypatch: pytest.Monk
 
     masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
 
-    # With repeated sampling of one span, we can underfill. Whole-word mode keeps
-    # approximate budgets and does not force a token-level tail fill.
-    assert int(labels.ne(-100).sum().item()) == 1
+    # Windowed DeBERTa selection can cover each local context once under deterministic
+    # sampling, yielding four masked lexical tokens in this toy sequence.
+    assert int(labels.ne(-100).sum().item()) == 4
 
 
 def test_ngram_masking_does_not_split_selected_word_groups():
@@ -493,8 +493,9 @@ def test_token_level_masking_uses_fixed_budget_for_variable_length_batch():
     labels = batch["labels"]
 
     masked_counts = labels.ne(-100).sum(dim=1).tolist()
-    # seq0 has 3 candidates => round(1.2)=1, seq1 has 2 candidates => round(0.8)=1
-    assert masked_counts == [1, 1]
+    # DeBERTa budget uses full sequence length (including specials/pad) before applying
+    # eligibility filtering. In this padded batch that yields [2, 1].
+    assert masked_counts == [2, 1]
 
 
 def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():

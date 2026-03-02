@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -17,8 +18,9 @@ class MLMConfig:
     """Masking configuration.
 
     Notes:
-      - Token-level masking (BERT-style) is used when max_ngram == 1.
-      - Whole-word n-gram masking is enabled when max_ngram > 1.
+      - Mask selection uses DeBERTa's windowed n-gram policy for all max_ngram>=1.
+      - max_ngram == 1 corresponds to DeBERTa windowed unigram masking (not BERT iid masking).
+      - max_ngram > 1 enables whole-word n-gram grouping.
       - Replacement probabilities are conditional on *being selected for masking*.
         (i.e., they should sum to <= 1; remainder keeps the original token).
     """
@@ -395,14 +397,12 @@ class DebertaV3ElectraCollator:
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dispatch masking strategy based on max_ngram setting.
+        """Apply DeBERTa-style masking based on configured n-gram width.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
-        if int(self.cfg.max_ngram) <= 1:
-            return self._mask_tokens_bert(input_ids, special_tokens_mask=special_tokens_mask)
         return self._mask_tokens_ngram(
             input_ids, special_tokens_mask=special_tokens_mask, max_ngram=int(self.cfg.max_ngram)
         )
@@ -480,21 +480,23 @@ class DebertaV3ElectraCollator:
         special_tokens_mask: torch.Tensor,
         max_ngram: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Whole-word n-gram masking (DeBERTa-style).
+        """Apply DeBERTa NGramMaskGenerator-style masking.
 
-        This is slower than token-level masking, but is a closer match to DeBERTa pretraining.
-
-        Implementation notes:
-          - We group sub-tokens into "words" using tokenizer token string heuristics.
-          - We sample contiguous spans of whole words with an n-gram distribution p(n) ∝ 1/n.
-          - Mask budget is approximate at whole-word granularity; we do not split selected words
-            or add subword-level tail fills.
+        Selection matches the original DeBERTa policy:
+          - n-gram length sampled with p(n) ∝ 1/n
+          - windowed selection with ``mask_window = int(1 / mlm_probability)``
+          - sequence-level target budget derived from full sequence length
+        For ``max_ngram > 1``, word groups are built from tokenizer boundary heuristics.
+        For ``max_ngram == 1``, masking uses unigram groups.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
         :param int max_ngram: Maximum n-gram width.
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
+
+        if int(max_ngram) < 1:
+            raise ValueError("max_ngram must be >= 1")
 
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
@@ -503,93 +505,82 @@ class DebertaV3ElectraCollator:
         labels = torch.full_like(input_ids, -100)
 
         B, S = input_ids.shape
-        pad_token_id = self.tokenizer.pad_token_id
         mask_token_id = int(self.tokenizer.mask_token_id)
+        mlm_prob = float(self.cfg.mlm_probability)
+        if mlm_prob <= 0.0:
+            return input_ids, labels
+        mask_prob = float(self.cfg.mask_token_prob)
+        random_prob = float(self.cfg.random_token_prob)
+        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
 
         # n-gram sampling distribution: p(n) ∝ 1/n
-        probs = torch.tensor([1.0 / float(n) for n in range(1, max_ngram + 1)], dtype=torch.float)
-        probs = probs / probs.sum()
+        probs = torch.tensor(
+            [1.0 / float(n) for n in range(1, int(max_ngram) + 1)],
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        probs = probs / probs.sum().clamp(min=1e-12)
+
+        mask_window = max(1, int(1.0 / mlm_prob))
+        max_preds_per_seq = int(math.ceil(float(S) * mlm_prob / 10.0) * 10)
 
         for b in range(B):
+            spec = special_tokens_mask[b].to(dtype=torch.bool)
+            if bool(spec.all().item()):
+                continue
+
+            num_to_predict = min(max_preds_per_seq, max(1, int(round(float(S) * mlm_prob))))
             ids = input_ids[b].tolist()
-            spec = special_tokens_mask[b].tolist()
+            spec_list = spec.tolist()
 
-            maskable: list[int] = []
-            for i, (tid, is_spec) in enumerate(zip(ids, spec, strict=True)):
-                if is_spec:
-                    continue
-                if pad_token_id is not None and tid == pad_token_id:
-                    continue
-                maskable.append(i)
+            if int(max_ngram) > 1:
+                groups = self._build_word_groups(ids, spec_list)
+                groups = [g for g in groups if any(not bool(spec[idx]) for idx in g)]
+            else:
+                maskable = torch.nonzero(~spec, as_tuple=False).squeeze(-1).tolist()
+                groups = [[int(i)] for i in maskable]
 
-            if not maskable:
+            if not groups:
                 continue
 
-            num_to_mask = max(1, int(round(len(maskable) * float(self.cfg.mlm_probability))))
-            maskable_set = set(maskable)
+            mask_grams = [False] * len(groups)
+            offset = 0
+            while offset < len(groups):
+                gram_n = int(torch.multinomial(probs, 1).item()) + 1
+                ctx_size = min(gram_n * mask_window, len(groups) - offset)
+                if ctx_size <= 0:
+                    break
 
-            word_groups = self._build_word_groups(ids, spec)
-            # Keep only groups that contain at least one maskable position
-            word_groups = [g for g in word_groups if any(i in maskable_set for i in g)]
-            if not word_groups:
-                continue
+                m = int(torch.randint(low=0, high=ctx_size, size=(1,), device=input_ids.device).item())
+                start = offset + m
+                end = min(offset + m + gram_n, len(groups))
+                offset = max(offset + ctx_size, end)
+                for i in range(start, end):
+                    mask_grams[i] = True
 
-            selected_groups: list[list[int]] = []
-            selected_group_ids: set[int] = set()
-            selected_token_count = 0
-
-            # Try a bounded number of attempts to fill the mask budget.
-            # (Avoids pathological loops on very short / heavily special-token sequences.)
-            max_attempts = max(50, 10 * len(word_groups))
-            attempts = 0
-
-            while selected_token_count < num_to_mask and attempts < max_attempts:
-                attempts += 1
-
-                start = int(torch.randint(low=0, high=len(word_groups), size=(1,)).item())
-                n = int(torch.multinomial(probs, 1).item()) + 1
-
-                end = min(start + n, len(word_groups))
-                if end <= start:
+            masked_count = 0
+            for do_mask, group in zip(mask_grams, groups, strict=True):
+                if not do_mask:
                     continue
-
-                span_added = False
-                for group_id in range(start, end):
-                    if group_id in selected_group_ids:
-                        continue
-                    group = word_groups[group_id]
-                    group_maskable = [idx for idx in group if idx in maskable_set]
-                    if not group_maskable:
-                        continue
-                    selected_group_ids.add(group_id)
-                    selected_groups.append(group_maskable)
-                    selected_token_count += len(group_maskable)
-                    span_added = True
-                    if selected_token_count >= num_to_mask:
-                        break
-                if not span_added:
-                    continue
-
-            if not selected_groups:
-                continue
-
-            # Apply replacements.
-            for group in selected_groups:
-                r = float(torch.rand(1).item())
-                replacement_mode: str | None = None
-                if r < float(self.cfg.mask_token_prob):
-                    replacement_mode = "mask"
-                elif r < float(self.cfg.mask_token_prob) + float(self.cfg.random_token_prob):
-                    replacement_mode = "random"
-
                 for idx in group:
-                    labels[b, idx] = ids[idx]
-                    if replacement_mode == "mask":
+                    if masked_count >= num_to_predict:
+                        break
+                    if bool(spec[idx].item()):
+                        continue
+                    orig_id = int(input_ids[b, idx].item())
+                    labels[b, idx] = orig_id
+
+                    r = float(torch.rand((), device=input_ids.device).item())
+                    if r < mask_prob:
                         input_ids[b, idx] = mask_token_id
-                    elif replacement_mode == "random":
-                        # Keep replacement TYPE coherent per whole-word group, but sample
-                        # random token IDs per subtoken to avoid repeated-token artifacts.
+                    elif r < (mask_prob + keep_prob):
+                        input_ids[b, idx] = orig_id
+                    elif random_prob > 0.0:
+                        # Keep random replacement special-token-safe.
                         input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
+                    masked_count += 1
+                if masked_count >= num_to_predict:
+                    break
 
         return input_ids, labels
 
