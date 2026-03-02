@@ -414,10 +414,19 @@ def check_optimizer_state_ordering_risk(repo_root: Path) -> CheckResult:
     If parameter registration order changes between code versions, resume can silently corrupt
     optimizer state.
 
-    We can't fix that from an audit harness, but we can detect the risk and force an explicit policy.
+    If the codebase has a param-order digest mechanism (persist + validate on resume), this is
+    mitigated; otherwise it is a silent risk.
     """
     path = repo_root / "src" / "deberta" / "training" / "pretrain.py"
     src = _read_text(path)
+
+    # Check if param-order digest mechanism is present.
+    has_digest = "_optimizer_param_order_digest" in src and "optimizer_param_digest" in src
+    if has_digest:
+        return _pass(
+            "optimizer_resume_param_order_risk",
+            details="Optimizer param-order digest is persisted in checkpoints and validated on resume.",
+        )
 
     # Heuristic: optimizer builder iterates model.named_parameters() without sorting or explicit name->state mapping.
     if "for name, param in model.named_parameters()" in src and "sorted(" not in src:
@@ -533,7 +542,13 @@ def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
 
 def check_attention_mask_to_active_tokens_contract(repo_root: Path) -> CheckResult:
     path = repo_root / "src" / "deberta" / "modeling" / "rtd.py"
-    g = {"torch": torch}
+    try:
+        from deberta.modeling.mask_utils import normalize_keep_mask
+    except ImportError:
+        normalize_keep_mask = None  # type: ignore[assignment]
+    g: dict[str, Any] = {"torch": torch}
+    if normalize_keep_mask is not None:
+        g["normalize_keep_mask"] = normalize_keep_mask
     try:
         fn = _exec_extracted_function(path, "attention_mask_to_active_tokens", g)
     except Exception as e:
@@ -587,21 +602,20 @@ def check_attention_mask_to_active_tokens_contract(repo_root: Path) -> CheckResu
             "4D broadcast path must return per-token activity mask (B,S).",
         )
 
-    # Footgun: float/additive masks.
-    # This function unconditionally casts attention_mask -> bool. If a caller accidentally passes an *additive* mask
-    # (e.g., 0.0 for keep, -1e4 for masked), bool casting flips semantics and silently corrupts attention patterns.
+    # Float/additive masks must be *rejected* (not silently cast to bool).
+    # normalize_keep_mask raises ValueError for floating-point masks.
     add = torch.zeros((B, S), dtype=torch.float32)
     add[:, 2:] = -1e4  # masked positions in additive convention
-    _ = fn(input_ids=input_ids, attention_mask=add, pad_token_id=pad)
-
-    if bool(((add != 0.0) & (add != 1.0)).any().item()):
+    try:
+        _ = fn(input_ids=input_ids, attention_mask=add, pad_token_id=pad)
         return _warn(
             "attention_mask_to_active_tokens_contract",
-            "attention_mask_to_active_tokens accepts float masks and casts them to bool. "
-            "If a caller passes an additive float mask (0/-1e4), masking semantics are silently wrong.",
-            hint="Guard against float additive masks (raise on floating dtype unless values are exactly {0,1}), "
-            "or canonicalize masks to bool keep-masks at the caller boundary.",
+            "attention_mask_to_active_tokens silently accepts float masks. "
+            "Additive float masks (0/-1e4) become all-True under bool cast, corrupting attention.",
+            hint="Reject floating-point masks at the boundary to prevent silent mask corruption.",
         )
+    except (ValueError, TypeError):
+        pass  # Expected: normalize_keep_mask rejects float masks.
 
     return _pass("attention_mask_to_active_tokens_contract")
 
@@ -963,6 +977,7 @@ def check_rtd_loss_integrity(repo_root: Path, *, verbose: bool) -> CheckResult:
             cls_token_id=tokenizer.cls_token_id,
             sep_token_id=tokenizer.sep_token_id,
             mask_token_id=tokenizer.mask_token_id,
+            unk_token_id=tokenizer.unk_token_id,
         )
 
     gen_cfg = _mk_cfg()
@@ -1146,16 +1161,17 @@ def check_rtd_loss_integrity(repo_root: Path, *, verbose: bool) -> CheckResult:
                     hint="Forbidden vocab mask must be applied before sampling (masked_fill to -inf/-1e9 is typical).",
                 )
 
-    # Token-set sanity: discriminator active set must exclude special tokens (when not masked).
-    # We already used that in disc_loss_ref; add an explicit check.
+    # Token-set sanity: discriminator active set must exclude *originally* special tokens.
+    # Use orig_padded_ids (pre-corruption) to identify true special positions; input_ids
+    # may contain MASK tokens at positions the collator replaced — those are valid disc targets.
     for sid in tokenizer.all_special_ids:
         sid = int(sid)
-        pos = (input_ids == sid) & disc_active
+        pos = (orig_padded_ids == sid) & disc_active
         if bool(pos.any().item()):
             return _fail(
                 "rtd_loss_integrity",
-                f"Discriminator active token set includes special token id={sid} at positions {pos.nonzero(as_tuple=False)[:5].tolist()}",
-                hint="Special tokens (CLS/SEP/PAD/MASK/...) must not contribute to discriminator loss unless explicitly intended.",
+                f"Discriminator active token set includes originally-special token id={sid} at positions {pos.nonzero(as_tuple=False)[:5].tolist()}",
+                hint="Original special tokens (CLS/SEP/PAD/MASK/...) must not contribute to discriminator loss.",
             )
 
     details = "Recomputed gen/disc losses match implementation; gradient boundaries OK; sampling stochastic; forbidden ids respected."
@@ -1279,7 +1295,7 @@ def scan_unused_config_fields(repo_root: Path) -> CheckResult:
     unused = []
     for f in all_fields:
         # crude token search
-        if re.search(rf"\\b{re.escape(f)}\\b", corpus) is None:
+        if re.search(rf"\b{re.escape(f)}\b", corpus) is None:
             unused.append(f)
 
     if unused:
