@@ -6,18 +6,6 @@ from dataclasses import asdict
 from typing import Any
 
 
-def _pretty_cfg(cfg: Any) -> str:
-    """Render config object for user-facing error messages.
-
-    :param Any cfg: Config-like object.
-    :return str: Best-effort readable representation.
-    """
-    try:
-        return str(asdict(cfg))
-    except Exception:
-        return repr(cfg)
-
-
 def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
     """Load a dataset split using 🤗 Datasets.
 
@@ -55,6 +43,8 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
             ds = ds[split]
         return ds
 
+    _files = [p.strip() for p in cfg.data_files.split(",") if p.strip()] if cfg.data_files else []
+
     if cfg.dataset_name:
         load_kwargs: dict[str, Any] = {
             "split": split,
@@ -63,20 +53,14 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
         }
         if cfg.dataset_config_name:
             load_kwargs["name"] = cfg.dataset_config_name
-        if cfg.data_files:
-            files = [p.strip() for p in cfg.data_files.split(",") if p.strip()]
-            load_kwargs["data_files"] = files
-        return datasets.load_dataset(
-            cfg.dataset_name,
-            **load_kwargs,
-        )
+        if _files:
+            load_kwargs["data_files"] = _files
+        return datasets.load_dataset(cfg.dataset_name, **load_kwargs)
 
-    if cfg.data_files:
-        files = [p.strip() for p in cfg.data_files.split(",") if p.strip()]
-        # Use the 'text' builder; split can be 'train' etc.
+    if _files:
         return datasets.load_dataset(
             "text",
-            data_files=files,
+            data_files=_files,
             split=split,
             streaming=streaming,
             cache_dir=cfg.cache_dir,
@@ -84,5 +68,5 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
 
     raise ValueError(
         "No dataset source provided. Specify one of: --load_from_disk, --dataset_name, --data_files. "
-        f"Config was: {_pretty_cfg(cfg)}"
+        f"Config was: {asdict(cfg)}"
     )

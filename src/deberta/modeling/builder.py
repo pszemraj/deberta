@@ -504,36 +504,32 @@ def _apply_rope_scratch_arch_overrides(
         cfg.intermediate_size = _scaled_swiglu_intermediate_size(curr_intermediate)
 
 
+_PRETRAINED_OVERRIDE_MAP: tuple[tuple[str, str, type], ...] = (
+    ("pretrained_max_position_embeddings", "max_position_embeddings", int),
+    ("pretrained_rope_theta", "rope_theta", float),
+    ("pretrained_rotary_pct", "rotary_pct", float),
+    ("pretrained_use_absolute_position_embeddings", "use_absolute_position_embeddings", bool),
+    ("pretrained_type_vocab_size", "type_vocab_size", int),
+    ("pretrained_norm_arch", "norm_arch", str),
+    ("pretrained_norm_eps", "norm_eps", float),
+    ("pretrained_keel_alpha_init", "keel_alpha_init", float),
+    ("pretrained_keel_alpha_learnable", "keel_alpha_learnable", bool),
+    ("pretrained_ffn_type", "ffn_type", str),
+    ("pretrained_use_bias", "use_bias", bool),
+    ("pretrained_initializer_range", "initializer_range", float),
+)
+
+
 def _apply_rope_pretrained_explicit_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
     """Apply explicit pretrained RoPE overrides.
 
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     """
-    if model_cfg.pretrained_max_position_embeddings is not None:
-        cfg.max_position_embeddings = int(model_cfg.pretrained_max_position_embeddings)
-    if model_cfg.pretrained_rope_theta is not None:
-        cfg.rope_theta = float(model_cfg.pretrained_rope_theta)
-    if model_cfg.pretrained_rotary_pct is not None:
-        cfg.rotary_pct = float(model_cfg.pretrained_rotary_pct)
-    if model_cfg.pretrained_use_absolute_position_embeddings is not None:
-        cfg.use_absolute_position_embeddings = bool(model_cfg.pretrained_use_absolute_position_embeddings)
-    if model_cfg.pretrained_type_vocab_size is not None:
-        cfg.type_vocab_size = int(model_cfg.pretrained_type_vocab_size)
-    if model_cfg.pretrained_norm_arch is not None:
-        cfg.norm_arch = str(model_cfg.pretrained_norm_arch)
-    if model_cfg.pretrained_norm_eps is not None:
-        cfg.norm_eps = float(model_cfg.pretrained_norm_eps)
-    if model_cfg.pretrained_keel_alpha_init is not None:
-        cfg.keel_alpha_init = float(model_cfg.pretrained_keel_alpha_init)
-    if model_cfg.pretrained_keel_alpha_learnable is not None:
-        cfg.keel_alpha_learnable = bool(model_cfg.pretrained_keel_alpha_learnable)
-    if model_cfg.pretrained_ffn_type is not None:
-        cfg.ffn_type = str(model_cfg.pretrained_ffn_type)
-    if model_cfg.pretrained_use_bias is not None:
-        cfg.use_bias = bool(model_cfg.pretrained_use_bias)
-    if model_cfg.pretrained_initializer_range is not None:
-        cfg.initializer_range = float(model_cfg.pretrained_initializer_range)
+    for src_attr, dst_attr, cast in _PRETRAINED_OVERRIDE_MAP:
+        val = getattr(model_cfg, src_attr, None)
+        if val is not None:
+            setattr(cfg, dst_attr, cast(val))
 
 
 def _apply_hf_config_normalization(

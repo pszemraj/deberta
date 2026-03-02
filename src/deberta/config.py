@@ -1102,6 +1102,48 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     return any(v.startswith(prefix) for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
 
 
+# Canonical field-name sets for cross-backbone / scratch-vs-pretrained validation.
+# rope_knobs = _ROPE_SCRATCH_ONLY_FIELDS | _ROPE_PRETRAINED_OVERRIDE_FIELDS | {"attention_implementation"}
+_ROPE_SCRATCH_ONLY_FIELDS: frozenset[str] = frozenset(
+    {
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "intermediate_size",
+        "hidden_act",
+        "rope_theta",
+        "rotary_pct",
+        "use_absolute_position_embeddings",
+        "max_position_embeddings",
+        "type_vocab_size",
+        "norm_arch",
+        "norm_eps",
+        "keel_alpha_init",
+        "keel_alpha_learnable",
+        "ffn_type",
+        "use_bias",
+        "swiglu_adjust_intermediate",
+        "initializer_range",
+    }
+)
+_ROPE_PRETRAINED_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "pretrained_max_position_embeddings",
+        "pretrained_rope_theta",
+        "pretrained_rotary_pct",
+        "pretrained_use_absolute_position_embeddings",
+        "pretrained_type_vocab_size",
+        "pretrained_norm_arch",
+        "pretrained_norm_eps",
+        "pretrained_keel_alpha_init",
+        "pretrained_keel_alpha_learnable",
+        "pretrained_ffn_type",
+        "pretrained_use_bias",
+        "pretrained_initializer_range",
+    }
+)
+
+
 def validate_model_config(cfg: ModelConfig) -> None:
     """Validate model config semantics and normalize constrained values.
 
@@ -1127,9 +1169,10 @@ def validate_model_config(cfg: ModelConfig) -> None:
     if cfg.tokenizer_vocab_target is not None and int(cfg.tokenizer_vocab_target) <= 0:
         raise ValueError("model.tokenizer_vocab_target must be > 0 when provided.")
 
+    defaults = ModelConfig()
+
     # Explicit dependency check: rope-only knobs are invalid in HF-compat mode.
     if cfg.backbone_type == "hf_deberta_v2":
-        defaults = ModelConfig()
         if cfg.hf_max_position_embeddings is not None and int(cfg.hf_max_position_embeddings) <= 0:
             raise ValueError("model.hf_max_position_embeddings must be > 0 when provided.")
         if cfg.hf_max_position_embeddings is not None and not bool(cfg.from_scratch):
@@ -1138,37 +1181,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "hf_deberta_v2 runs."
             )
         rope_knobs = (
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "hidden_act",
-            "rope_theta",
-            "rotary_pct",
-            "use_absolute_position_embeddings",
-            "max_position_embeddings",
-            "type_vocab_size",
-            "norm_arch",
-            "norm_eps",
-            "keel_alpha_init",
-            "keel_alpha_learnable",
-            "attention_implementation",
-            "ffn_type",
-            "use_bias",
-            "swiglu_adjust_intermediate",
-            "initializer_range",
-            "pretrained_max_position_embeddings",
-            "pretrained_rope_theta",
-            "pretrained_rotary_pct",
-            "pretrained_use_absolute_position_embeddings",
-            "pretrained_type_vocab_size",
-            "pretrained_norm_arch",
-            "pretrained_norm_eps",
-            "pretrained_keel_alpha_init",
-            "pretrained_keel_alpha_learnable",
-            "pretrained_ffn_type",
-            "pretrained_use_bias",
-            "pretrained_initializer_range",
+            _ROPE_SCRATCH_ONLY_FIELDS | _ROPE_PRETRAINED_OVERRIDE_FIELDS | {"attention_implementation"}
         )
         changed = [name for name in rope_knobs if getattr(cfg, name) != getattr(defaults, name)]
         if changed:
@@ -1176,7 +1189,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
             )
     else:
-        default_hf_kernel = ModelConfig().hf_attention_kernel
+        default_hf_kernel = defaults.hf_attention_kernel
         if cfg.hf_attention_kernel != default_hf_kernel:
             warnings.warn(
                 "model.hf_attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
@@ -1192,23 +1205,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 stacklevel=2,
             )
 
-    pretrained_override_fields = (
-        "pretrained_max_position_embeddings",
-        "pretrained_rope_theta",
-        "pretrained_rotary_pct",
-        "pretrained_use_absolute_position_embeddings",
-        "pretrained_type_vocab_size",
-        "pretrained_norm_arch",
-        "pretrained_norm_eps",
-        "pretrained_keel_alpha_init",
-        "pretrained_keel_alpha_learnable",
-        "pretrained_ffn_type",
-        "pretrained_use_bias",
-        "pretrained_initializer_range",
-    )
-
     if cfg.backbone_type == "rope" and bool(cfg.from_scratch):
-        set_pretrained = [name for name in pretrained_override_fields if getattr(cfg, name) is not None]
+        set_pretrained = [name for name in _ROPE_PRETRAINED_OVERRIDE_FIELDS if getattr(cfg, name) is not None]
         if set_pretrained:
             raise ValueError(
                 "These options apply only when model.from_scratch=false: " + ", ".join(sorted(set_pretrained))
@@ -1228,29 +1226,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "for RoPE model initialization. Invalid sources: " + ", ".join(sorted(invalid_sources))
             )
 
-        defaults = ModelConfig()
-        scratch_rope_pretrained_knobs = (
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "hidden_act",
-            "rope_theta",
-            "rotary_pct",
-            "use_absolute_position_embeddings",
-            "max_position_embeddings",
-            "type_vocab_size",
-            "norm_arch",
-            "norm_eps",
-            "keel_alpha_init",
-            "keel_alpha_learnable",
-            "ffn_type",
-            "use_bias",
-            "swiglu_adjust_intermediate",
-            "initializer_range",
-        )
         changed_scratch_knobs = [
-            name for name in scratch_rope_pretrained_knobs if getattr(cfg, name) != getattr(defaults, name)
+            name for name in _ROPE_SCRATCH_ONLY_FIELDS if getattr(cfg, name) != getattr(defaults, name)
         ]
         if changed_scratch_knobs:
             raise ValueError(
@@ -1323,7 +1300,6 @@ def validate_model_config(cfg: ModelConfig) -> None:
             raise ValueError("model.hidden_size must be divisible by model.num_attention_heads.")
 
     # Warn on KEEL params when norm_arch="post" (they only apply when norm_arch="keel").
-    defaults = ModelConfig()
     if cfg.norm_arch == "post":
         if cfg.keel_alpha_init is not None and cfg.keel_alpha_init != defaults.keel_alpha_init:
             warnings.warn(
@@ -1440,24 +1416,19 @@ def validate_train_config(cfg: TrainConfig) -> None:
             "Overwrite would delete checkpoints before resume."
         )
 
-    if int(cfg.max_steps) <= 0:
-        raise ValueError("train.max_steps must be > 0.")
-    if int(cfg.per_device_train_batch_size) <= 0:
-        raise ValueError("train.per_device_train_batch_size must be > 0.")
-    if int(cfg.gradient_accumulation_steps) <= 0:
-        raise ValueError("train.gradient_accumulation_steps must be > 0.")
-    if int(cfg.warmup_steps) < 0:
-        raise ValueError("train.warmup_steps must be >= 0.")
-    if int(cfg.logging_steps) < 0:
-        raise ValueError("train.logging_steps must be >= 0.")
-    if int(cfg.save_steps) < 0:
-        raise ValueError("train.save_steps must be >= 0.")
-    if int(cfg.save_total_limit) < 0:
-        raise ValueError("train.save_total_limit must be >= 0.")
-    if int(cfg.wandb_watch_log_freq) <= 0:
-        raise ValueError("train.wandb_watch_log_freq must be >= 1.")
-    if int(cfg.resume_replay_max_micro_batches) < 0:
-        raise ValueError("train.resume_replay_max_micro_batches must be >= 0.")
+    for _name, _min in (
+        ("max_steps", 1),
+        ("per_device_train_batch_size", 1),
+        ("gradient_accumulation_steps", 1),
+        ("warmup_steps", 0),
+        ("logging_steps", 0),
+        ("save_steps", 0),
+        ("save_total_limit", 0),
+        ("wandb_watch_log_freq", 1),
+        ("resume_replay_max_micro_batches", 0),
+    ):
+        if int(getattr(cfg, _name)) < _min:
+            raise ValueError(f"train.{_name} must be >= {_min}.")
 
     mlm = float(cfg.mlm_probability)
     if mlm <= 0.0 or mlm >= 1.0:
@@ -1477,27 +1448,15 @@ def validate_train_config(cfg: TrainConfig) -> None:
 
     # Warn when compile-specific knobs are configured while compile is disabled.
     if not bool(cfg.torch_compile):
-        if cfg.torch_compile_scope != defaults.torch_compile_scope:
-            warnings.warn(
-                "train.torch_compile_scope has no effect when train.torch_compile=false. "
-                f"Current scope ({cfg.torch_compile_scope!r}) will be ignored.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if cfg.torch_compile_mode != defaults.torch_compile_mode:
-            warnings.warn(
-                "train.torch_compile_mode has no effect when train.torch_compile=false. "
-                f"Current mode ({cfg.torch_compile_mode!r}) will be ignored.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if cfg.torch_compile_backend != defaults.torch_compile_backend:
-            warnings.warn(
-                "train.torch_compile_backend has no effect when train.torch_compile=false. "
-                f"Current backend ({cfg.torch_compile_backend!r}) will be ignored.",
-                UserWarning,
-                stacklevel=2,
-            )
+        for _knob in ("torch_compile_scope", "torch_compile_mode", "torch_compile_backend"):
+            if getattr(cfg, _knob) != getattr(defaults, _knob):
+                _short = _knob.removeprefix("torch_compile_")
+                warnings.warn(
+                    f"train.{_knob} has no effect when train.torch_compile=false. "
+                    f"Current {_short} ({getattr(cfg, _knob)!r}) will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     if cfg.report_to != "wandb":
         if cfg.wandb_watch != defaults.wandb_watch:

@@ -382,57 +382,49 @@ class DebertaV3RTDPretrainer(nn.Module):
         """
         if vocab_size <= 0:
             return torch.empty(0, dtype=torch.bool)
-        if not forbidden_ids:
-            return torch.zeros(vocab_size, dtype=torch.bool)
-
         mask = torch.zeros(vocab_size, dtype=torch.bool)
-        for tid in forbidden_ids:
-            if 0 <= int(tid) < vocab_size:
-                mask[int(tid)] = True
+        valid = [int(tid) for tid in forbidden_ids if 0 <= int(tid) < vocab_size]
+        if valid:
+            mask[valid] = True
         return mask
+
+    _SPECIAL_ID_ATTRS = (
+        "pad_token_id",
+        "cls_token_id",
+        "sep_token_id",
+        "mask_token_id",
+        "unk_token_id",
+        "bos_token_id",
+        "eos_token_id",
+    )
 
     def _collect_forbidden_sample_token_ids(
         self, *, additional_forbidden_token_ids: Iterable[int] | None = None
     ) -> set[int]:
         """Collect special token ids to exclude from generator sampling.
 
-        The forbidden set is config-driven by default, with optional additive ids
-        provided by runtime call sites (for tokenizer-only specials).
-
         :return set[int]: Valid special token ids present in generator/discriminator configs.
         """
-        out: set[int] = set()
         vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
         if vocab_size <= 0:
-            return out
+            return set()
 
+        candidates: list[Any] = []
         for cfg in (self.gen_config, self.disc_config):
-            for attr in (
-                "pad_token_id",
-                "cls_token_id",
-                "sep_token_id",
-                "mask_token_id",
-                "unk_token_id",
-                "bos_token_id",
-                "eos_token_id",
-            ):
-                sid = getattr(cfg, attr, None)
-                if sid is None:
-                    continue
-                try:
-                    sid_i = int(sid)
-                except Exception:
-                    continue
-                if 0 <= sid_i < vocab_size:
-                    out.add(sid_i)
+            candidates.extend(getattr(cfg, attr, None) for attr in self._SPECIAL_ID_ATTRS)
         if additional_forbidden_token_ids is not None:
-            for sid in additional_forbidden_token_ids:
-                try:
-                    sid_i = int(sid)
-                except Exception:
-                    continue
-                if 0 <= sid_i < vocab_size:
-                    out.add(sid_i)
+            candidates.extend(additional_forbidden_token_ids)
+
+        out: set[int] = set()
+        for sid in candidates:
+            if sid is None:
+                continue
+            try:
+                sid_i = int(sid)
+            except Exception:
+                continue
+            if 0 <= sid_i < vocab_size:
+                out.add(sid_i)
         return out
 
     # ------------------------------

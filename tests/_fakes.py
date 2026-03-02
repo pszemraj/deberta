@@ -279,6 +279,16 @@ _PRETRAINING_BATCH: dict[str, torch.Tensor] = {
 }
 
 
+def _default_build_backbones(**_kw: Any) -> tuple[torch.nn.Module, torch.nn.Module]:
+    return (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+
+
+def _default_cycle(_loader: Any, *, start_epoch: int = 0) -> Any:
+    del start_epoch
+    while True:
+        yield _PRETRAINING_BATCH
+
+
 def setup_pretraining_mocks(
     monkeypatch: Any,
     *,
@@ -295,29 +305,11 @@ def setup_pretraining_mocks(
     """
     import deberta.training.pretrain as pretrain_mod
 
-    if accelerator_cls is None:
-        accelerator_cls = FakeAccelerator
-    if rtd_cls is None:
-        rtd_cls = SimpleRTD
-    if build_backbones_fn is None:
-
-        def build_backbones_fn(**kwargs: Any) -> tuple[torch.nn.Module, torch.nn.Module]:
-            del kwargs
-            return (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
-
-    if save_checkpoint_fn is None:
-
-        def save_checkpoint_fn(**kwargs: Any) -> None:
-            del kwargs
-
-    batch = _PRETRAINING_BATCH
-
-    if cycle_fn is None:
-
-        def cycle_fn(_loader: Any, *, start_epoch: int = 0) -> Any:
-            del start_epoch
-            while True:
-                yield batch
+    accelerator_cls = accelerator_cls or FakeAccelerator
+    rtd_cls = rtd_cls or SimpleRTD
+    build_backbones_fn = build_backbones_fn or _default_build_backbones
+    save_checkpoint_fn = save_checkpoint_fn or (lambda **_kw: None)
+    cycle_fn = cycle_fn or _default_cycle
 
     fake_accelerate = _types.ModuleType("accelerate")
     fake_accelerate.Accelerator = accelerator_cls
@@ -336,8 +328,8 @@ def setup_pretraining_mocks(
     monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
     monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [batch])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [batch])
+    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [_PRETRAINING_BATCH])
+    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [_PRETRAINING_BATCH])
     monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
     monkeypatch.setattr(
         pretrain_mod,

@@ -54,9 +54,18 @@ from deberta.modeling.export_utils import (
     merge_embeddings_into_export_backbone,
 )
 from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
-from deberta.training import run_config as _run_config
-from deberta.training import run_management as _run_management
-from deberta.training import tracker_utils as _tracker_utils
+from deberta.training.run_config import _persist_or_validate_run_configs
+from deberta.training.run_management import (
+    _load_checkpoint_progress_metadata,
+    _parse_checkpoint_step,
+    _prepare_output_dir,
+    _resolve_output_dir,
+    _resolve_output_dir_for_accelerator,
+    _resolve_resume_checkpoint,
+    _resolve_resume_checkpoint_for_accelerator,
+    _save_training_checkpoint,
+)
+from deberta.training.tracker_utils import _init_trackers, _setup_wandb_watch, _upload_wandb_original_config
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -66,31 +75,6 @@ _NONFINITE_LR_MULT_RECOVERY = 1.1  # gradual recovery factor per successful step
 _NONFINITE_OPT_STATE_RESET_EVERY = 4
 _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
-
-# Re-exported for compatibility with existing tests/tooling that import private helpers from pretrain.py.
-_find_latest_checkpoint = _run_management._find_latest_checkpoint
-_load_checkpoint_data_progress = _run_management._load_checkpoint_data_progress
-_load_checkpoint_progress_metadata = _run_management._load_checkpoint_progress_metadata
-_parse_checkpoint_step = _run_management._parse_checkpoint_step
-_prepare_output_dir = _run_management._prepare_output_dir
-_resolve_output_dir = _run_management._resolve_output_dir
-_resolve_output_dir_for_accelerator = _run_management._resolve_output_dir_for_accelerator
-_resolve_resume_checkpoint = _run_management._resolve_resume_checkpoint
-_resolve_resume_checkpoint_for_accelerator = _run_management._resolve_resume_checkpoint_for_accelerator
-_rotate_checkpoints = _run_management._rotate_checkpoints
-_sanitize_run_label = _run_management._sanitize_run_label
-_save_checkpoint_data_progress = _run_management._save_checkpoint_data_progress
-_save_training_checkpoint = _run_management._save_training_checkpoint
-_build_run_metadata = _run_config._build_run_metadata
-_dump_yaml_mapping = _run_config._dump_yaml_mapping
-_effective_model_config_for_resume_compare = _run_config._effective_model_config_for_resume_compare
-_persist_config_yaml_snapshots = _run_config._persist_config_yaml_snapshots
-_persist_or_validate_run_configs = _run_config._persist_or_validate_run_configs
-_resolved_config_payload = _run_config._resolved_config_payload
-_validate_run_metadata = _run_config._validate_run_metadata
-_init_trackers = _tracker_utils._init_trackers
-_setup_wandb_watch = _tracker_utils._setup_wandb_watch
-_upload_wandb_original_config = _tracker_utils._upload_wandb_original_config
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -106,12 +90,10 @@ def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(row, ensure_ascii=False) + "\n"
-    if path.suffix == ".gz":
-        with gzip.open(path, "at", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-        return
-    with path.open("a", encoding="utf-8", buffering=1) as f:
+    opener = (
+        gzip.open(path, "at", encoding="utf-8") if path.suffix == ".gz" else path.open("a", encoding="utf-8")
+    )
+    with opener as f:
         f.write(line)
         f.flush()
 
@@ -181,48 +163,29 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
         return
 
     # Prefer the modern fp32_precision API when available (PyTorch 2.9+).
-    # Fallback to allow_tf32 flags on older builds.
     target = "tf32" if enabled else "ieee"
-    configured = False
-
-    try:
-        if hasattr(torch.backends, "fp32_precision"):
-            torch.backends.fp32_precision = target
-            configured = True
-    except Exception:
-        pass
-
-    try:
-        if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-            torch.backends.cuda.matmul.fp32_precision = target
-            configured = True
-    except Exception:
-        pass
-
-    try:
-        if hasattr(torch.backends.cudnn, "fp32_precision"):
-            torch.backends.cudnn.fp32_precision = target
-            configured = True
-    except Exception:
-        pass
-
+    _fp32_paths: tuple[tuple[Any, str], ...] = (
+        (torch.backends, "fp32_precision"),
+        (torch.backends.cuda.matmul, "fp32_precision"),
+        (torch.backends.cudnn, "fp32_precision"),
+    )
     # Granular cudnn knobs on newer builds.
-    try:
-        if hasattr(torch.backends.cudnn, "conv") and hasattr(torch.backends.cudnn.conv, "fp32_precision"):
-            torch.backends.cudnn.conv.fp32_precision = target
-            configured = True
-        if hasattr(torch.backends.cudnn, "rnn") and hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
-            torch.backends.cudnn.rnn.fp32_precision = target
-            configured = True
-    except Exception:
-        pass
+    for parent_name in ("conv", "rnn"):
+        parent = getattr(torch.backends.cudnn, parent_name, None)
+        if parent is not None:
+            _fp32_paths = (*_fp32_paths, (parent, "fp32_precision"))
 
-    if configured:
-        return
+    configured = False
+    for obj, attr in _fp32_paths:
+        with suppress(Exception):
+            if hasattr(obj, attr):
+                setattr(obj, attr, target)
+                configured = True
 
-    # Legacy fallback.
-    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
-    torch.backends.cudnn.allow_tf32 = bool(enabled)
+    if not configured:
+        # Legacy fallback.
+        torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+        torch.backends.cudnn.allow_tf32 = bool(enabled)
 
 
 def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
