@@ -1188,7 +1188,6 @@ def test_pretrainer_forward_smoke():
         sampling_temperature=1.0,
         gen_loss_weight=1.0,
         disc_loss_weight=50.0,
-        decoupled_loss_scaling=False,
     )
 
     assert out.loss.ndim == 0
@@ -1475,7 +1474,6 @@ def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_
             sampling_temperature=1.0,
             gen_loss_weight=1.0,
             disc_loss_weight=50.0,
-            decoupled_loss_scaling=False,
         )
 
 
@@ -1596,7 +1594,6 @@ def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
             sampling_temperature=1.0,
             gen_loss_weight=1.0,
             disc_loss_weight=50.0,
-            decoupled_loss_scaling=False,
         )
 
 
@@ -2285,7 +2282,6 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
         sampling_temperature=1.0,
         gen_loss_weight=1.0,
         disc_loss_weight=50.0,
-        decoupled_loss_scaling=False,
     )
 
     torch.manual_seed(0)
@@ -2296,7 +2292,6 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
         sampling_temperature=1.0,
         gen_loss_weight=1.0,
         disc_loss_weight=50.0,
-        decoupled_loss_scaling=False,
     )
 
     torch.testing.assert_close(
@@ -2354,7 +2349,6 @@ def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
         sampling_temperature=1.0,
         gen_loss_weight=1.0,
         disc_loss_weight=50.0,
-        decoupled_loss_scaling=False,
     )
     expected_active = (input_ids != 0).sum()
     assert int(out.disc_token_count.item()) == int(expected_active.item())
@@ -2415,7 +2409,6 @@ def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_spe
             sampling_temperature=1.0,
             gen_loss_weight=1.0,
             disc_loss_weight=50.0,
-            decoupled_loss_scaling=False,
         )
 
     torch.testing.assert_close(out.disc_token_count, torch.tensor(4.0))

@@ -10,8 +10,6 @@ import logging
 import math
 import os
 import re
-import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
@@ -25,7 +23,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from deberta.checkpoint_utils import (
-    canonicalize_state_dict_keys,
     load_state_with_compile_fallback,
     unwrap_compiled_model,
 )
@@ -49,14 +46,21 @@ from deberta.data.streaming import PackedStreamingConfig
 from deberta.io_utils import dump_json
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.modeling.export_utils import (
-    clean_exported_config as _clean_exported_config_impl,
+from deberta.training.export_helpers import (
+    _export_discriminator_hf,  # noqa: F401
+    _export_discriminator_hf_subprocess,
+    _write_export_readme,  # noqa: F401
 )
-from deberta.modeling.export_utils import (
-    load_intersection_state_dict,
-    merge_embeddings_into_export_backbone,
+from deberta.training.loop_utils import (
+    _count_input_tokens_for_batch,
+    _count_rtd_tokens_for_batch,
+    _finalize_window_metric_loss,
+    _resolve_window_token_denominators,
+    _scale_loss_for_backward,
+    _should_clip_gradients,
+    _sum_local_scalar,
+    _token_weighted_micro_objective,
 )
-from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
 from deberta.training.run_config import _persist_or_validate_run_configs
 from deberta.training.run_management import (
     _load_checkpoint_progress_metadata,
@@ -1265,85 +1269,6 @@ def _build_training_collator(
     )
 
 
-def _compute_disc_active_mask(
-    *,
-    input_ids: torch.Tensor,
-    labels: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    pad_token_id: int | None,
-) -> torch.Tensor:
-    """Compute discriminator-active token mask before model forward.
-
-    The RTD discriminator supervises all non-padding tokens. Masked positions
-    remain active because they are part of the discriminator objective.
-
-    :param torch.Tensor input_ids: Input token ids.
-    :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
-    :param torch.Tensor | None attention_mask: Optional attention mask.
-    :param int | None pad_token_id: Padding token id.
-    :return torch.Tensor: Boolean active-token mask.
-    """
-    del labels
-    active = attention_mask_to_active_tokens(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        pad_token_id=pad_token_id,
-    )
-    return active
-
-
-def _count_rtd_tokens_for_batch(
-    batch: dict[str, torch.Tensor],
-    *,
-    pad_token_id: int | None,
-) -> tuple[float, float]:
-    """Return generator/discriminator active-token counts for one microbatch.
-
-    :param dict[str, torch.Tensor] batch: Microbatch tensors.
-    :param int | None pad_token_id: Padding token id.
-    :return tuple[float, float]: (generator_count, discriminator_count).
-    """
-    labels = batch["labels"]
-    gen_count = float(labels.ne(-100).sum().item())
-    disc_active = _compute_disc_active_mask(
-        input_ids=batch["input_ids"],
-        labels=labels,
-        attention_mask=batch.get("attention_mask"),
-        pad_token_id=pad_token_id,
-    )
-    disc_count = float(disc_active.sum().item())
-    return gen_count, disc_count
-
-
-def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
-    """Return non-padding input-token count for one microbatch.
-
-    :param dict[str, torch.Tensor] batch: Microbatch mapping.
-    :return float: Count of active input tokens.
-    """
-    attention_mask = batch.get("attention_mask")
-    input_ids = batch.get("input_ids")
-    if isinstance(attention_mask, torch.Tensor):
-        if isinstance(input_ids, torch.Tensor):
-            active = attention_mask_to_active_tokens(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pad_token_id=None,
-            )
-            return float(active.detach().sum().item())
-
-        mask = attention_mask.detach().to(dtype=torch.bool)
-        if mask.ndim == 4:
-            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if mask.ndim == 3:
-            mask = torch.diagonal(mask, dim1=-2, dim2=-1)
-        return float(mask.sum().item())
-
-    if not isinstance(input_ids, torch.Tensor):
-        return 0.0
-    return float(input_ids.numel())
-
-
 def _validate_output_dir_preflight(
     *,
     output_dir: Path,
@@ -1545,380 +1470,6 @@ def run_pretraining_dry_run(
         "discriminator_vocab_size": int(disc_config.vocab_size),
         "generator_vocab_size": int(gen_config.vocab_size),
     }
-
-
-def _token_weighted_micro_objective(
-    *,
-    gen_loss: torch.Tensor,
-    disc_loss: torch.Tensor,
-    gen_count: float,
-    disc_count: float,
-    gen_window_tokens_per_rank: float,
-    disc_window_tokens_per_rank: float,
-    gen_loss_weight: float,
-    disc_loss_weight: float,
-    decoupled_loss_scaling: bool,
-) -> torch.Tensor:
-    """Build token-weighted microbatch objective for one accumulation window.
-
-    :param torch.Tensor gen_loss: Generator loss mean for the microbatch.
-    :param torch.Tensor disc_loss: Discriminator loss mean for the microbatch.
-    :param float gen_count: Generator token count for the microbatch.
-    :param float disc_count: Discriminator token count for the microbatch.
-    :param float gen_window_tokens_per_rank: Mean generator-token total per rank in the accumulation window.
-    :param float disc_window_tokens_per_rank: Mean discriminator-token total per rank in the accumulation window.
-    :param float gen_loss_weight: Generator loss weight.
-    :param float disc_loss_weight: Discriminator loss weight.
-    :param bool decoupled_loss_scaling: Whether to use DeBERTa-style decoupled scaling.
-    :return torch.Tensor: Unscaled microbatch objective contribution.
-    """
-    gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
-    disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
-
-    gen_term = compute_generator_loss_term(
-        gen_loss=gen_loss,
-        disc_loss=disc_loss,
-        decoupled_loss_scaling=bool(decoupled_loss_scaling),
-    )
-
-    return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
-
-
-def _resolve_window_token_denominators(
-    *, gen_window_tokens_per_rank_raw: float, disc_window_tokens_per_rank_raw: float
-) -> tuple[float, float, bool, bool]:
-    """Resolve safe per-window token denominators for token-weighted GA.
-
-    :param float gen_window_tokens_per_rank_raw: Raw mean generator-token count per rank for the window.
-    :param float disc_window_tokens_per_rank_raw: Raw mean discriminator-token count per rank for the window.
-    :return tuple[float, float, bool, bool]: ``(gen_denom, disc_denom, gen_is_zero, disc_is_zero)``.
-    """
-    gen_zero = float(gen_window_tokens_per_rank_raw) <= 0.0
-    disc_zero = float(disc_window_tokens_per_rank_raw) <= 0.0
-    gen_denom = max(float(gen_window_tokens_per_rank_raw), 1.0)
-    disc_denom = max(float(disc_window_tokens_per_rank_raw), 1.0)
-    return float(gen_denom), float(disc_denom), bool(gen_zero), bool(disc_zero)
-
-
-def _finalize_window_metric_loss(
-    *, accumulated_loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool
-) -> torch.Tensor:
-    """Finalize per-window loss metric for logging.
-
-    :param torch.Tensor accumulated_loss: Sum of microbatch metric contributions.
-    :param int ga_steps: Gradient accumulation steps in the window.
-    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
-    :return torch.Tensor: Window-level scalar loss metric.
-    """
-    if token_weighted_ga:
-        # Token-weighted path already accumulates normalized micro objectives.
-        return accumulated_loss
-    denom = max(1, int(ga_steps))
-    return accumulated_loss / float(denom)
-
-
-def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool) -> torch.Tensor:
-    """Prepare microbatch loss for ``Accelerator.backward``.
-
-    Accelerate scales all backward losses by ``1 / gradient_accumulation_steps``.
-    Token-weighted micro objectives are already normalized over the accumulation
-    window, so we cancel that scaling for the token-weighted path only.
-    This helper is intentionally coupled to ``accelerator.accumulate(...)`` semantics.
-
-    :param torch.Tensor loss: Raw microbatch loss/objective.
-    :param int ga_steps: Gradient accumulation steps.
-    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
-    :return torch.Tensor: Loss to pass into ``accelerator.backward``.
-    """
-    if not token_weighted_ga:
-        return loss
-    return loss * float(max(1, int(ga_steps)))
-
-
-def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
-    """Return whether gradient clipping should run for this micro-step.
-
-    :param bool sync_gradients: Whether gradients are synchronized this step.
-    :param float | int | None max_grad_norm: Configured clipping norm.
-    :return bool: ``True`` when clipping should be applied.
-    """
-    if not bool(sync_gradients):
-        return False
-    if max_grad_norm is None:
-        return False
-    return float(max_grad_norm) > 0.0
-
-
-_REPO_URL = "https://github.com/pszemraj/deberta"
-
-
-def _write_export_readme(
-    output_dir: Path,
-    *,
-    model_cfg: Any,
-    data_cfg: Any | None = None,
-    train_cfg: Any,
-    embedding_sharing: str,
-) -> None:
-    """Write a basic README.md and LICENSE to the export directory.
-
-    :param Path output_dir: Export destination directory.
-    :param Any model_cfg: Model configuration dataclass.
-    :param Any | None data_cfg: Optional data configuration dataclass.
-    :param Any train_cfg: Training configuration dataclass.
-    :param str embedding_sharing: Embedding sharing mode.
-    """
-    backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
-    hidden = int(getattr(model_cfg, "hidden_size", 0))
-    layers = int(getattr(model_cfg, "num_hidden_layers", 0) or 0)
-    heads = int(getattr(model_cfg, "num_attention_heads", 0) or 0)
-    seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
-    if seq_len == 0:
-        seq_len = int(getattr(model_cfg, "max_position_embeddings", 0) or 0)
-    steps = int(getattr(train_cfg, "max_steps", 0) or 0)
-
-    if backbone == "rope":
-        arch_desc = "RoPE encoder (RMSNorm, SwiGLU, rotary embeddings)"
-        usage_snippet = """from transformers import AutoTokenizer
-from deberta.modeling.rope_encoder import DebertaRoPEModel
-
-model = DebertaRoPEModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
-"""
-        compatibility_note = (
-            "Note: RoPE exports use a custom `model_type` (`deberta-rope`) and are not currently "
-            "loadable via `transformers.AutoModel.from_pretrained(...)` without custom auto-class registration."
-        )
-    else:
-        arch_desc = "DeBERTa-v2 (disentangled attention, LayerNorm)"
-        usage_snippet = """from transformers import AutoModel, AutoTokenizer
-
-model = AutoModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
-"""
-        compatibility_note = ""
-
-    readme = f"""---
-library_name: transformers
-tags:
-- deberta
-- encoder
-- rtd
-- fill-mask
-license: mit
----
-
-# {backbone}-{hidden}h-{layers}L-{heads}H
-
-RTD-pretrained encoder ({arch_desc}).
-
-| Parameter | Value |
-|---|---|
-| Backbone | `{backbone}` |
-| Hidden size | {hidden} |
-| Layers | {layers} |
-| Attention heads | {heads} |
-| Max sequence length | {seq_len} |
-| Embedding sharing | `{embedding_sharing}` |
-| Training steps | {steps} |
-
-## Training
-
-Pretrained with replaced-token detection (RTD / ELECTRA-style) using
-[pszemraj/deberta]({_REPO_URL}).
-
-## Usage
-
-```python
-{usage_snippet}
-```
-{compatibility_note}
-"""
-    (output_dir / "README.md").write_text(readme, encoding="utf-8")
-
-    mit_license = (
-        "MIT License\n\n"
-        "Copyright (c) 2025-2026 Peter Szemraj\n\n"
-        "Permission is hereby granted, free of charge, to any person obtaining a copy\n"
-        'of this software and associated documentation files (the "Software"), to deal\n'
-        "in the Software without restriction, including without limitation the rights\n"
-        "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n"
-        "copies of the Software, and to permit persons to whom the Software is\n"
-        "furnished to do so, subject to the following conditions:\n\n"
-        "The above copyright notice and this permission notice shall be included in all\n"
-        "copies or substantial portions of the Software.\n\n"
-        'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n'
-        "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n"
-        "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n"
-        "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n"
-        "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n"
-        "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n"
-        "SOFTWARE.\n"
-    )
-    (output_dir / "LICENSE").write_text(mit_license, encoding="utf-8")
-
-
-def _export_discriminator_hf(
-    *,
-    accelerator: Any,
-    model: DebertaV3RTDPretrainer,
-    tokenizer: Any,
-    output_dir: Path,
-    embedding_sharing: str,
-    model_cfg: Any = None,
-    data_cfg: Any = None,
-    train_cfg: Any = None,
-) -> None:
-    """Best-effort export of a standalone discriminator model.
-
-    Why "best-effort"?
-      - Under FSDP2 + SHARDED_STATE_DICT, gathering a full state dict inside the training process
-        can fail depending on accelerate/FSDP state-dict configuration.
-      - For a *guaranteed* export from sharded checkpoints, use `deberta export` which
-        loads the checkpoint and consolidates weights with FULL_STATE_DICT on rank0.
-
-    This function is intentionally lightweight and is safe to keep enabled by default.
-
-    :param Any accelerator: Accelerate runtime object.
-    :param DebertaV3RTDPretrainer model: Wrapped RTD pretrainer.
-    :param Any tokenizer: Tokenizer to export.
-    :param Path output_dir: Export destination directory.
-    :param str embedding_sharing: Sharing mode used during training.
-    :param Any model_cfg: Optional model config for README generation.
-    :param Any data_cfg: Optional data config for README generation.
-    :param Any train_cfg: Optional training config for README generation.
-    """
-
-    try:
-        unwrapped = unwrap_compiled_model(accelerator, model)
-
-        # Try to gather state dicts via accelerator (preferred for distributed).
-        # Under sharded engines this can be collective; all ranks must participate.
-        disc_mod = getattr(unwrapped, "discriminator", None)
-        gen_mod = getattr(unwrapped, "generator", None)
-        if disc_mod is None or gen_mod is None:
-            raise RuntimeError(
-                "Unwrapped RTD model must expose discriminator and generator modules for export."
-            )
-        disc_sd_raw = accelerator.get_state_dict(disc_mod)
-        gen_sd_raw = accelerator.get_state_dict(gen_mod)
-
-        if not accelerator.is_main_process:
-            return
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            from transformers import AutoModel
-        except Exception as e:
-            logger.warning(f"Skipping HF export: transformers import failed: {e}")
-            return
-
-        try:
-            from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
-        except Exception:
-            DebertaRoPEConfig = None  # type: ignore
-            DebertaRoPEModel = None  # type: ignore
-
-        disc_sd = canonicalize_state_dict_keys(dict(disc_sd_raw))
-        gen_sd = canonicalize_state_dict_keys(dict(gen_sd_raw))
-
-        # Build a fresh model from config.
-        if DebertaRoPEConfig is not None and isinstance(
-            getattr(unwrapped, "disc_config", None), DebertaRoPEConfig
-        ):
-            export_disc = DebertaRoPEModel(unwrapped.disc_config)  # type: ignore[arg-type]
-        else:
-            export_disc = AutoModel.from_config(unwrapped.disc_config)
-
-        # Load overlap keys only to tolerate training/export module-shape differences.
-        missing = load_intersection_state_dict(export_disc, disc_sd)
-        if missing.missing_keys:
-            logger.info(
-                f"HF export: missing keys (often expected with tied embeddings): {missing.missing_keys[:5]}..."
-            )
-
-        mode = (embedding_sharing or "none").lower()
-        merge_embeddings_into_export_backbone(
-            export_model=export_disc,
-            disc_sd=disc_sd,
-            gen_sd=gen_sd,
-            mode=mode,
-            fp32_accumulate=True,
-        )
-
-        tokenizer.save_pretrained(str(output_dir))
-        export_disc.save_pretrained(str(output_dir), safe_serialization=True)
-
-        # Strip training-internal keys from the exported config.json.
-        _clean_exported_config_impl(output_dir / "config.json", strict=False)
-
-        dump_json({"embedding_sharing": embedding_sharing}, output_dir / "export_meta.json")
-
-        # Write README.md and LICENSE.
-        if model_cfg is not None and train_cfg is not None:
-            _write_export_readme(
-                output_dir,
-                model_cfg=model_cfg,
-                data_cfg=data_cfg,
-                train_cfg=train_cfg,
-                embedding_sharing=embedding_sharing,
-            )
-
-        logger.info(f"Exported discriminator to: {output_dir}")
-
-    except Exception as e:
-        logger.warning(
-            "HF export failed (common under FSDP2 + SHARDED_STATE_DICT). "
-            "Use `deberta export` after training for a guaranteed consolidation+export. "
-            f"Error: {e}"
-        )
-
-
-def _export_discriminator_hf_subprocess(
-    *,
-    checkpoint_dir: Path,
-    output_dir: Path,
-) -> None:
-    """Run discriminator export in an isolated subprocess.
-
-    This avoids teardown-time crashes from C-extension thread finalization in the
-    long-lived training process (observed intermittently on streaming+CUDA runs).
-
-    :param Path checkpoint_dir: Source checkpoint directory.
-    :param Path output_dir: Destination directory for exported artifacts.
-    """
-    cmd = [
-        sys.executable,
-        "-m",
-        "deberta",
-        "export",
-        str(checkpoint_dir),
-        "--what",
-        "discriminator",
-        "--output-dir",
-        str(output_dir),
-        "--allow-partial-export",
-    ]
-    logger.info(
-        "Running post-train export in subprocess from checkpoint %s.",
-        checkpoint_dir,
-    )
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        logger.warning(
-            "Post-train export subprocess failed (exit=%d). Output:\n%s",
-            int(proc.returncode),
-            str(proc.stdout).strip(),
-        )
-        return
-    logger.info("Post-train export complete: %s", output_dir)
 
 
 def run_pretraining(
@@ -2489,31 +2040,74 @@ def run_pretraining(
         zero_disc_window_since_log = 0
 
         if effective_decoupled_training:
-            if token_weighted_ga and accelerator.is_main_process:
-                logger.warning(
-                    "Decoupled training currently uses equal microbatch averaging; "
-                    "disabling train.token_weighted_gradient_accumulation for this run."
-                )
-            token_weighted_ga = False
             if gen_optimizer is None or disc_optimizer is None:
                 raise RuntimeError("Decoupled training requires generator/discriminator optimizers.")
             if gen_lr_scheduler is None or disc_lr_scheduler is None:
                 raise RuntimeError("Decoupled training requires generator/discriminator schedulers.")
 
             while global_step < int(train_cfg.max_steps):
-                window: list[dict[str, torch.Tensor]] = []
+                window: list[tuple[dict[str, torch.Tensor], float, float]] = []
                 local_window_input_tokens = 0.0
+                local_gen_tokens = 0.0
+                local_disc_tokens = 0.0
 
                 for _ in range(ga_steps):
                     batch = next(train_iter)
                     consumed_micro_batches += 1
                     local_window_input_tokens += _count_input_tokens_for_batch(batch)
-                    window.append(batch)
+                    if token_weighted_ga:
+                        gen_count, disc_count = _count_rtd_tokens_for_batch(
+                            batch,
+                            pad_token_id=disc_pad_token_id,
+                        )
+                        local_gen_tokens += gen_count
+                        local_disc_tokens += disc_count
+                    else:
+                        gen_count, disc_count = 1.0, 1.0
+                    window.append((batch, gen_count, disc_count))
 
                 local_input_tokens_seen += local_window_input_tokens
                 local_input_tokens_since_log += local_window_input_tokens
+                if token_weighted_ga:
+                    local_totals = torch.tensor(
+                        [local_gen_tokens, local_disc_tokens],
+                        device=accelerator.device,
+                        dtype=torch.float32,
+                    )
+                    mean_totals = accelerator.reduce(local_totals, reduction="mean")
+                    raw_gen_window_tokens_per_rank = float(mean_totals[0].item())
+                    raw_disc_window_tokens_per_rank = float(mean_totals[1].item())
+                    (
+                        gen_window_tokens_per_rank,
+                        disc_window_tokens_per_rank,
+                        gen_window_zero_tokens,
+                        disc_window_zero_tokens,
+                    ) = _resolve_window_token_denominators(
+                        gen_window_tokens_per_rank_raw=raw_gen_window_tokens_per_rank,
+                        disc_window_tokens_per_rank_raw=raw_disc_window_tokens_per_rank,
+                    )
+                    if gen_window_zero_tokens:
+                        zero_gen_window_total += 1
+                        zero_gen_window_since_log += 1
+                    if disc_window_zero_tokens:
+                        zero_disc_window_total += 1
+                        zero_disc_window_since_log += 1
+                    if accelerator.is_main_process and (gen_window_zero_tokens or disc_window_zero_tokens):
+                        logger.warning(
+                            "Token-weighted GA window has zero effective tokens "
+                            "(next_step=%d, gen_zero=%s, disc_zero=%s, gen_raw=%.1f, disc_raw=%.1f); "
+                            "corresponding loss term is zero-weighted for this window.",
+                            int(global_step + 1),
+                            bool(gen_window_zero_tokens),
+                            bool(disc_window_zero_tokens),
+                            float(raw_gen_window_tokens_per_rank),
+                            float(raw_disc_window_tokens_per_rank),
+                        )
+                else:
+                    gen_window_tokens_per_rank = 1.0
+                    disc_window_tokens_per_rank = 1.0
 
-                disc_phase_inputs: list[dict[str, torch.Tensor | None]] = []
+                disc_phase_inputs: list[dict[str, torch.Tensor | float | None]] = []
                 loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 gen_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 disc_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -2533,7 +2127,7 @@ def run_pretraining(
                 disc_optimizer.zero_grad(set_to_none=True)
 
                 # Phase 1: generator update + corruption target construction.
-                for step_idx, batch in enumerate(window):
+                for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                     batch = _move_batch_to_device(batch, accelerator.device)
                     batch = _stabilize_compile_attention_mask(
                         batch=batch,
@@ -2559,14 +2153,20 @@ def run_pretraining(
                             sampling_temperature=train_cfg.sampling_temperature,
                         )
                         gen_loss = gen_phase_out.gen_loss_raw
+                        if token_weighted_ga:
+                            gen_obj = gen_loss * (
+                                float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
+                            )
+                        else:
+                            gen_obj = gen_loss
                         loss_for_metrics = loss_for_metrics + (
-                            float(train_cfg.gen_loss_weight) * gen_loss.detach()
+                            float(train_cfg.gen_loss_weight) * gen_obj.detach()
                         )
 
                         backward_loss = _scale_loss_for_backward(
-                            loss=gen_loss,
+                            loss=gen_obj,
                             ga_steps=ga_steps,
-                            token_weighted_ga=False,
+                            token_weighted_ga=token_weighted_ga,
                         )
 
                         offending: str | None = None
@@ -2614,6 +2214,7 @@ def run_pretraining(
                                 "token_type_ids": batch.get("token_type_ids"),
                                 "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                                 "disc_labels": gen_phase_out.disc_labels,
+                                "disc_count": float(disc_count),
                             }
                         )
                         accelerator.backward(backward_loss)
@@ -2657,13 +2258,20 @@ def run_pretraining(
                                 token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                             )
                             disc_loss = disc_phase_out.disc_loss_raw
+                            if token_weighted_ga:
+                                disc_obj = disc_loss * (
+                                    float(payload["disc_count"])
+                                    / max(float(disc_window_tokens_per_rank), 1.0)
+                                )
+                            else:
+                                disc_obj = disc_loss
                             loss_for_metrics = loss_for_metrics + (
-                                float(train_cfg.disc_loss_weight) * disc_loss.detach()
+                                float(train_cfg.disc_loss_weight) * disc_obj.detach()
                             )
                             backward_loss = _scale_loss_for_backward(
-                                loss=disc_loss,
+                                loss=disc_obj,
                                 ga_steps=ga_steps,
-                                token_weighted_ga=False,
+                                token_weighted_ga=token_weighted_ga,
                             )
 
                             offending = None
@@ -2807,19 +2415,16 @@ def run_pretraining(
                         x = x.detach().float().reshape(1)
                         return accelerator.gather(x).mean().item()
 
-                    def _sum_local_scalar(x: float) -> float:
-                        """Sum a local float across ranks.
-
-                        :param float x: Local scalar.
-                        :return float: Reduced global sum.
-                        """
-                        local = torch.tensor([x], device=accelerator.device, dtype=torch.float64)
-                        return float(accelerator.reduce(local, reduction="sum")[0].item())
-
                     log_now = time.perf_counter()
                     elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
-                    global_input_tokens_interval = _sum_local_scalar(local_input_tokens_since_log)
-                    global_input_tokens_seen = _sum_local_scalar(local_input_tokens_seen)
+                    global_input_tokens_interval = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_since_log,
+                    )
+                    global_input_tokens_seen = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_seen,
+                    )
                     input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
                     local_input_tokens_since_log = 0.0
                     last_log_started_at = log_now
@@ -3020,7 +2625,6 @@ def run_pretraining(
                         sampling_temperature=train_cfg.sampling_temperature,
                         gen_loss_weight=train_cfg.gen_loss_weight,
                         disc_loss_weight=train_cfg.disc_loss_weight,
-                        decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
                     )
 
                     if token_weighted_ga:
@@ -3033,7 +2637,6 @@ def run_pretraining(
                             disc_window_tokens_per_rank=disc_window_tokens_per_rank,
                             gen_loss_weight=float(train_cfg.gen_loss_weight),
                             disc_loss_weight=float(train_cfg.disc_loss_weight),
-                            decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
                         )
                         loss = micro_obj
                         loss_for_metrics = loss_for_metrics + micro_obj.detach()
@@ -3288,19 +2891,16 @@ def run_pretraining(
                         x = x.detach().float().reshape(1)
                         return accelerator.gather(x).mean().item()
 
-                    def _sum_local_scalar(x: float) -> float:
-                        """Compute global sum for a local scalar across processes.
-
-                        :param float x: Local scalar value.
-                        :return float: Summed value across all ranks.
-                        """
-                        local = torch.tensor([x], device=accelerator.device, dtype=torch.float64)
-                        return float(accelerator.reduce(local, reduction="sum")[0].item())
-
                     log_now = time.perf_counter()
                     elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
-                    global_input_tokens_interval = _sum_local_scalar(local_input_tokens_since_log)
-                    global_input_tokens_seen = _sum_local_scalar(local_input_tokens_seen)
+                    global_input_tokens_interval = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_since_log,
+                    )
+                    global_input_tokens_seen = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_seen,
+                    )
                     input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
                     local_input_tokens_since_log = 0.0
                     last_log_started_at = log_now

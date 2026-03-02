@@ -42,38 +42,6 @@ from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.norm import RMSNorm
 
 # -----------------------------------------------------------------------------
-# Loss helpers
-# -----------------------------------------------------------------------------
-
-
-def compute_generator_loss_term(
-    *, gen_loss: torch.Tensor, disc_loss: torch.Tensor, decoupled_loss_scaling: bool
-) -> torch.Tensor:
-    """Compute the generator contribution to total RTD loss.
-
-    DeBERTa RTD sometimes uses a *decoupled* scaling where the generator loss is
-    multiplied by a detached ratio ``disc/gen`` to keep both losses on a similar
-    numeric scale.
-
-    Args:
-        gen_loss: Scalar generator MLM loss.
-        disc_loss: Scalar discriminator RTD loss.
-        decoupled_loss_scaling: Enable/disable detached scaling.
-
-    Returns:
-        Scaled (or raw) generator loss term.
-    """
-
-    if not decoupled_loss_scaling:
-        return gen_loss
-
-    eps = 1e-6
-    # Clamp keeps things sane for pathological early steps.
-    alpha = (disc_loss.detach() / (gen_loss.detach() + eps)).clamp(min=0.0, max=1e4)
-    return alpha * gen_loss
-
-
-# -----------------------------------------------------------------------------
 # Mask utilities
 # -----------------------------------------------------------------------------
 
@@ -1128,7 +1096,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         sampling_temperature: float = 1.0,
         gen_loss_weight: float = 1.0,
         disc_loss_weight: float = 50.0,
-        decoupled_loss_scaling: bool = False,
     ) -> RTDOutput:
         """Run one RTD forward pass with generator corruption and discriminator scoring.
 
@@ -1139,7 +1106,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param float sampling_temperature: Generator sampling temperature.
         :param float gen_loss_weight: Generator loss weight.
         :param float disc_loss_weight: Discriminator loss weight.
-        :param bool decoupled_loss_scaling: Whether to apply detached generator scaling.
         :return RTDOutput: Combined loss and detached metrics.
         """
 
@@ -1152,12 +1118,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         )
         if float(gen_phase.gen_token_count.item()) <= 0.0:
             disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
-            gen_term = compute_generator_loss_term(
-                gen_loss=gen_phase.gen_loss_raw,
-                disc_loss=disc_zero,
-                decoupled_loss_scaling=decoupled_loss_scaling,
-            )
-            total = float(gen_loss_weight) * gen_term
+            total = float(gen_loss_weight) * gen_phase.gen_loss_raw
             return RTDOutput(
                 loss=total,
                 gen_loss=gen_phase.gen_loss_raw.detach(),
@@ -1178,12 +1139,10 @@ class DebertaV3RTDPretrainer(nn.Module):
             disc_labels=gen_phase.disc_labels,
         )
 
-        gen_term = compute_generator_loss_term(
-            gen_loss=gen_phase.gen_loss_raw,
-            disc_loss=disc_phase.disc_loss_raw,
-            decoupled_loss_scaling=decoupled_loss_scaling,
+        total = (
+            float(gen_loss_weight) * gen_phase.gen_loss_raw
+            + float(disc_loss_weight) * disc_phase.disc_loss_raw
         )
-        total = float(gen_loss_weight) * gen_term + float(disc_loss_weight) * disc_phase.disc_loss_raw
 
         return RTDOutput(
             loss=total,

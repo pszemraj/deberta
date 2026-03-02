@@ -1028,7 +1028,6 @@ def check_rtd_loss_integrity(repo_root: Path, *, verbose: bool) -> CheckResult:
             sampling_temperature=1.0,
             gen_loss_weight=1.0,
             disc_loss_weight=50.0,
-            decoupled_loss_scaling=False,
         )
     finally:
         h1.remove()

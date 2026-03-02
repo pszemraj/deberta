@@ -29,7 +29,6 @@ Exposed controls:
 
 - `train.gen_loss_weight`
 - `train.disc_loss_weight` (default `50.0`)
-- `train.decoupled_loss_scaling`
 - `train.decoupled_training` (default `true`)
 - `train.sampling_temperature`
 - `train.token_weighted_gradient_accumulation` (default `true`)

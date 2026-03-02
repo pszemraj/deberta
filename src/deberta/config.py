@@ -728,13 +728,6 @@ class TrainConfig:
 
     disc_loss_weight: float = field(default=50.0, metadata={"help": "Discriminator loss weight."})
 
-    decoupled_loss_scaling: bool = field(
-        default=False,
-        metadata={
-            "help": "If true, rescales generator loss to match discriminator loss magnitude (DeBERTa RTD style)."
-        },
-    )
-
     decoupled_training: bool = field(
         default=True,
         metadata={"help": ("Enable true two-phase RTD training (generator step then discriminator step).")},

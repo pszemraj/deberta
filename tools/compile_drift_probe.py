@@ -53,7 +53,6 @@ class ProbeConfig:
     sampling_temperature: float
     gen_loss_weight: float
     disc_loss_weight: float
-    decoupled_loss_scaling: bool
     embedding_sharing: str
     hf_attention_kernel: str
     compile_backend: str
@@ -90,7 +89,6 @@ def _parse_args() -> ProbeConfig:
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--gen-loss-weight", type=float, default=1.0)
     parser.add_argument("--disc-loss-weight", type=float, default=50.0)
-    parser.add_argument("--decoupled-loss-scaling", action="store_true")
     parser.add_argument("--embedding-sharing", choices=["none", "es", "gdes"], default="gdes")
     parser.add_argument(
         "--hf-attention-kernel",
@@ -130,7 +128,6 @@ def _parse_args() -> ProbeConfig:
         sampling_temperature=float(args.sampling_temperature),
         gen_loss_weight=float(args.gen_loss_weight),
         disc_loss_weight=float(args.disc_loss_weight),
-        decoupled_loss_scaling=bool(args.decoupled_loss_scaling),
         embedding_sharing=str(args.embedding_sharing),
         hf_attention_kernel=str(args.hf_attention_kernel),
         compile_backend=str(args.compile_backend),
@@ -348,7 +345,6 @@ def _run_step(
             sampling_temperature=float(cfg.sampling_temperature),
             gen_loss_weight=float(cfg.gen_loss_weight),
             disc_loss_weight=float(cfg.disc_loss_weight),
-            decoupled_loss_scaling=bool(cfg.decoupled_loss_scaling),
         )
         loss = out.loss
 

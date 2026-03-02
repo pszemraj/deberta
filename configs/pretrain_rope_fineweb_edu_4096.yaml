@@ -59,7 +59,6 @@ train:
 
   gen_loss_weight: 1.0
   disc_loss_weight: 50.0
-  decoupled_loss_scaling: false
 
   # SDPA backend preference: auto|flash|mem_efficient|math
   sdpa_kernel: flash
