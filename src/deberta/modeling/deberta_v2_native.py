@@ -127,10 +127,36 @@ class DebertaV2SelfOutput(nn.Module):
         :return torch.Tensor: Layer output.
         """
 
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
+        return _apply_output_residual_norm(
+            hidden_states=hidden_states,
+            input_tensor=input_tensor,
+            dense=self.dense,
+            dropout=self.dropout,
+            layer_norm=self.LayerNorm,
+        )
+
+
+def _apply_output_residual_norm(
+    *,
+    hidden_states: torch.Tensor,
+    input_tensor: torch.Tensor,
+    dense: nn.Module,
+    dropout: nn.Module,
+    layer_norm: nn.Module,
+) -> torch.Tensor:
+    """Apply shared output projection + dropout + residual LayerNorm pattern.
+
+    :param torch.Tensor hidden_states: Projected branch input tensor.
+    :param torch.Tensor input_tensor: Residual branch tensor.
+    :param nn.Module dense: Output projection module.
+    :param nn.Module dropout: Dropout module.
+    :param nn.Module layer_norm: LayerNorm module.
+    :return torch.Tensor: Residual-normalized output.
+    """
+    x = dense(hidden_states)
+    x = dropout(x)
+    x = layer_norm(x + input_tensor)
+    return x
 
 
 class DisentangledSelfAttention(nn.Module):
@@ -605,10 +631,13 @@ class DebertaV2Output(nn.Module):
         :return torch.Tensor: Layer output tensor.
         """
 
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
+        return _apply_output_residual_norm(
+            hidden_states=hidden_states,
+            input_tensor=input_tensor,
+            dense=self.dense,
+            dropout=self.dropout,
+            layer_norm=self.LayerNorm,
+        )
 
 
 class DebertaV2Layer(nn.Module):

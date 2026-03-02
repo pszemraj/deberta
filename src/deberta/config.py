@@ -870,15 +870,43 @@ def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
     return v
 
 
+def _normalize_choice_with_aliases(
+    *,
+    name: str,
+    value: str,
+    aliases: dict[str, str],
+    choices: set[str],
+    replace_hyphen: bool = False,
+) -> str:
+    """Normalize a string option with alias mapping and choice validation.
+
+    :param str name: Option name.
+    :param str value: Raw option value.
+    :param dict[str, str] aliases: Alias-to-canonical mapping.
+    :param set[str] choices: Allowed canonical values.
+    :param bool replace_hyphen: Whether to normalize ``-`` to ``_`` before alias lookup.
+    :return str: Canonical normalized value.
+    """
+    v = str(value).strip().lower()
+    if bool(replace_hyphen):
+        v = v.replace("-", "_")
+    v = aliases.get(v, v)
+    return _ensure_choice(name, v, choices)
+
+
 def _normalize_sdpa_kernel(value: str) -> str:
     """Normalize and validate SDPA kernel policy values.
 
     :param str value: Raw SDPA kernel value.
     :return str: Canonical lower-case SDPA kernel policy.
     """
-    v = str(value).strip().lower()
-    v = _SDPA_KERNEL_ALIASES.get(v, v)
-    return _ensure_choice("train.sdpa_kernel", v, _SDPA_KERNEL_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.sdpa_kernel",
+        value=value,
+        aliases=_SDPA_KERNEL_ALIASES,
+        choices=_SDPA_KERNEL_CHOICES,
+        replace_hyphen=False,
+    )
 
 
 def _normalize_torch_compile_mode(value: str) -> str:
@@ -887,9 +915,13 @@ def _normalize_torch_compile_mode(value: str) -> str:
     :param str value: Raw compile mode value.
     :return str: Canonical compile mode.
     """
-    v = str(value).strip().lower()
-    v = _TORCH_COMPILE_MODE_ALIASES.get(v, v)
-    return _ensure_choice("train.torch_compile_mode", v, _TORCH_COMPILE_MODE_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.torch_compile_mode",
+        value=value,
+        aliases=_TORCH_COMPILE_MODE_ALIASES,
+        choices=_TORCH_COMPILE_MODE_CHOICES,
+        replace_hyphen=False,
+    )
 
 
 def _normalize_torch_compile_scope(value: str) -> str:
@@ -898,9 +930,13 @@ def _normalize_torch_compile_scope(value: str) -> str:
     :param str value: Raw compile scope value.
     :return str: Canonical compile scope.
     """
-    v = str(value).strip().lower().replace("-", "_")
-    v = _TORCH_COMPILE_SCOPE_ALIASES.get(v, v)
-    return _ensure_choice("train.torch_compile_scope", v, _TORCH_COMPILE_SCOPE_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.torch_compile_scope",
+        value=value,
+        aliases=_TORCH_COMPILE_SCOPE_ALIASES,
+        choices=_TORCH_COMPILE_SCOPE_CHOICES,
+        replace_hyphen=True,
+    )
 
 
 def _normalize_torch_compile_backend(value: str) -> str:
@@ -909,9 +945,13 @@ def _normalize_torch_compile_backend(value: str) -> str:
     :param str value: Raw compile backend value.
     :return str: Canonical compile backend.
     """
-    v = str(value).strip().lower().replace("-", "_")
-    v = _TORCH_COMPILE_BACKEND_ALIASES.get(v, v)
-    return _ensure_choice("train.torch_compile_backend", v, _TORCH_COMPILE_BACKEND_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.torch_compile_backend",
+        value=value,
+        aliases=_TORCH_COMPILE_BACKEND_ALIASES,
+        choices=_TORCH_COMPILE_BACKEND_CHOICES,
+        replace_hyphen=True,
+    )
 
 
 def _normalize_wandb_watch(value: str) -> str:
@@ -920,9 +960,13 @@ def _normalize_wandb_watch(value: str) -> str:
     :param str value: Raw W&B watch mode.
     :return str: Canonical W&B watch mode.
     """
-    v = str(value).strip().lower().replace("-", "_")
-    v = _WANDB_WATCH_ALIASES.get(v, v)
-    return _ensure_choice("train.wandb_watch", v, _WANDB_WATCH_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.wandb_watch",
+        value=value,
+        aliases=_WANDB_WATCH_ALIASES,
+        choices=_WANDB_WATCH_CHOICES,
+        replace_hyphen=True,
+    )
 
 
 def _normalize_hf_attention_kernel(value: str) -> str:
@@ -931,9 +975,13 @@ def _normalize_hf_attention_kernel(value: str) -> str:
     :param str value: Raw attention-kernel value.
     :return str: Canonical attention-kernel name.
     """
-    v = str(value).strip().lower().replace("-", "_")
-    v = _HF_ATTN_KERNEL_ALIASES.get(v, v)
-    return _ensure_choice("model.hf_attention_kernel", v, _HF_ATTN_KERNEL_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="model.hf_attention_kernel",
+        value=value,
+        aliases=_HF_ATTN_KERNEL_ALIASES,
+        choices=_HF_ATTN_KERNEL_CHOICES,
+        replace_hyphen=True,
+    )
 
 
 def normalize_mixed_precision(value: object) -> str:
