@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from deberta.config import ModelConfig, validate_model_config
+from deberta.modeling.deberta_v2_native import DebertaV2Model
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 _SPECIAL_ID_ATTRS = (
@@ -18,6 +19,7 @@ _SPECIAL_ID_ATTRS = (
     "eos_token_id",
 )
 _COMPONENT_KIND = Literal["discriminator", "generator"]
+_EXTRA_TOKEN_TEMPLATE = "<|deberta_extra_token_{idx}|>"
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,126 @@ def _tokenizer_vocab_size(tokenizer: Any) -> int:
         raise ValueError("Tokenizer must support len(tokenizer) for vocab-size alignment.") from e
 
 
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """Round ``value`` up to ``multiple``.
+
+    :param int value: Input value.
+    :param int multiple: Positive multiple.
+    :return int: Rounded value.
+    """
+    if multiple <= 1:
+        return int(value)
+    remainder = int(value) % int(multiple)
+    if remainder == 0:
+        return int(value)
+    return int(value) + (int(multiple) - remainder)
+
+
+def _resize_tokenizer_to_vocab_size(
+    *,
+    tokenizer: Any,
+    target_size: int,
+    component: _COMPONENT_KIND,
+    allow_resize: bool,
+) -> None:
+    """Grow tokenizer vocabulary to ``target_size`` by adding inert placeholder tokens.
+
+    :param Any tokenizer: Tokenizer instance.
+    :param int target_size: Desired tokenizer vocabulary size.
+    :param str component: Component name for diagnostics.
+    :param bool allow_resize: Whether tokenizer growth is permitted.
+    :raises ValueError: If growth is required but not permitted/available.
+    :raises RuntimeError: If tokenizer growth does not reach the requested size.
+    """
+    current = _tokenizer_vocab_size(tokenizer)
+    if int(target_size) <= int(current):
+        return
+    if not bool(allow_resize):
+        raise ValueError(
+            f"{component} tokenizer vocab ({current}) is smaller than required size ({target_size}), "
+            "but model.tokenizer_allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
+        )
+
+    add_tokens = getattr(tokenizer, "add_tokens", None)
+    if not callable(add_tokens):
+        raise ValueError(
+            f"{component} tokenizer does not support add_tokens(...), cannot grow vocab from "
+            f"{current} to {target_size}."
+        )
+
+    needed = int(target_size) - int(current)
+    extra_tokens = [_EXTRA_TOKEN_TEMPLATE.format(idx=idx) for idx in range(int(current), int(target_size))]
+    added = int(add_tokens(extra_tokens, special_tokens=False))
+    final_size = _tokenizer_vocab_size(tokenizer)
+    if added != needed or final_size != int(target_size):
+        raise RuntimeError(
+            f"Failed to grow {component} tokenizer vocab: needed={needed}, added={added}, "
+            f"final_size={final_size}, target={int(target_size)}."
+        )
+
+
+def _resolve_required_tokenizer_vocab_size(
+    *,
+    current_size: int,
+    model_cfg: ModelConfig,
+    from_scratch: bool,
+    component: _COMPONENT_KIND,
+    config_vocab_size: int | None = None,
+) -> int:
+    """Resolve required tokenizer size from config controls.
+
+    :param int current_size: Current tokenizer size.
+    :param ModelConfig model_cfg: Runtime model config.
+    :param bool from_scratch: Whether run builds backbones from scratch.
+    :param str component: Component name for diagnostics.
+    :param int | None config_vocab_size: Existing config vocab size for pretrained validation.
+    :raises ValueError: If requested size constraints are invalid.
+    :return int: Required tokenizer size.
+    """
+    requested_target = (
+        int(model_cfg.tokenizer_vocab_target) if model_cfg.tokenizer_vocab_target is not None else None
+    )
+    multiple = int(model_cfg.tokenizer_vocab_multiple)
+    desired = int(current_size)
+
+    if requested_target is not None:
+        if requested_target < int(current_size):
+            raise ValueError(
+                f"model.tokenizer_vocab_target ({requested_target}) is smaller than tokenizer size "
+                f"({current_size}) for {component}; shrinking tokenizer vocab is not supported."
+            )
+        desired = max(desired, int(requested_target))
+
+    if not bool(from_scratch):
+        if config_vocab_size is None:
+            raise ValueError(f"{component} config vocab_size is required in pretrained mode.")
+        cfg_vocab = int(config_vocab_size)
+        if int(current_size) > cfg_vocab:
+            raise ValueError(
+                f"Tokenizer/checkpoint vocab mismatch for {component}: tokenizer={int(current_size)}, "
+                f"config={cfg_vocab}. Use a matching tokenizer or checkpoint."
+            )
+        # Optional convenience path: when resize is enabled and no explicit target is provided,
+        # align tokenizer length to checkpoint vocab_size.
+        if requested_target is None and bool(model_cfg.tokenizer_allow_vocab_resize):
+            desired = max(desired, cfg_vocab)
+        if desired > cfg_vocab:
+            raise ValueError(
+                f"Requested tokenizer vocab for {component} ({desired}) exceeds checkpoint config "
+                f"vocab_size ({cfg_vocab})."
+            )
+
+    desired = _round_up_to_multiple(desired, multiple)
+    if not bool(from_scratch):
+        cfg_vocab = int(config_vocab_size)
+        if desired > cfg_vocab:
+            raise ValueError(
+                f"model.tokenizer_vocab_multiple={multiple} rounds {component} tokenizer size to {desired}, "
+                f"which exceeds checkpoint config vocab_size ({cfg_vocab})."
+            )
+    return int(desired)
+
+
 def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSources:
     """Resolve deterministic config/weight sources for both components.
 
@@ -69,19 +191,7 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     bt = (model_cfg.backbone_type or "rope").lower()
     from_scratch = bool(model_cfg.from_scratch)
 
-    has_gen_cfg_src = bool(model_cfg.generator_config_name_or_path)
-    has_gen_model_src = bool(model_cfg.generator_model_name_or_path)
-
-    if not from_scratch and has_gen_cfg_src and not has_gen_model_src:
-        raise ValueError(
-            "model.generator_config_name_or_path requires model.generator_model_name_or_path when "
-            "model.from_scratch=false. Explicit generator configs must pair with explicit generator "
-            "weights; leave both unset to use derived-generator fallback from discriminator weights."
-        )
-
-    disc_cfg_source = (
-        model_cfg.discriminator_config_name_or_path or model_cfg.discriminator_model_name_or_path
-    )
+    disc_cfg_source = model_cfg.discriminator_model_name_or_path
     if bt == "rope" and from_scratch:
         discriminator = _ResolvedComponentSources(
             component="discriminator",
@@ -95,27 +205,14 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
         discriminator = _ResolvedComponentSources(
             component="discriminator",
             config_source=disc_cfg_source,
-            config_origin=(
-                "discriminator_config_name_or_path"
-                if model_cfg.discriminator_config_name_or_path
-                else "discriminator_model_name_or_path"
-            ),
+            config_origin="discriminator_model_name_or_path",
             weight_source=(None if from_scratch else model_cfg.discriminator_model_name_or_path),
             weight_origin=("scratch" if from_scratch else "discriminator_model_name_or_path"),
             derived_from_discriminator=False,
         )
 
     if from_scratch:
-        if model_cfg.generator_config_name_or_path:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.generator_config_name_or_path,
-                config_origin="generator_config_name_or_path",
-                weight_source=None,
-                weight_origin="scratch",
-                derived_from_discriminator=False,
-            )
-        elif model_cfg.generator_model_name_or_path:
+        if model_cfg.generator_model_name_or_path:
             generator = _ResolvedComponentSources(
                 component="generator",
                 config_source=model_cfg.generator_model_name_or_path,
@@ -134,16 +231,7 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 derived_from_discriminator=True,
             )
     else:
-        if model_cfg.generator_config_name_or_path and model_cfg.generator_model_name_or_path:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.generator_config_name_or_path,
-                config_origin="generator_config_name_or_path",
-                weight_source=model_cfg.generator_model_name_or_path,
-                weight_origin="generator_model_name_or_path",
-                derived_from_discriminator=False,
-            )
-        elif model_cfg.generator_model_name_or_path:
+        if model_cfg.generator_model_name_or_path:
             generator = _ResolvedComponentSources(
                 component="generator",
                 config_source=model_cfg.generator_model_name_or_path,
@@ -222,7 +310,7 @@ def _align_or_validate_tokenizer_contract(
     tokenizer: Any,
     *,
     component: _COMPONENT_KIND,
-    from_scratch: bool,
+    model_cfg: ModelConfig,
 ) -> None:
     """Apply tokenizer/config contract policy.
 
@@ -232,10 +320,25 @@ def _align_or_validate_tokenizer_contract(
     :param Any cfg: Target config object.
     :param Any tokenizer: Tokenizer source.
     :param str component: Component name for error messaging.
-    :param bool from_scratch: Whether this run uses random initialization.
+    :param ModelConfig model_cfg: Runtime model configuration.
     """
+    from_scratch = bool(model_cfg.from_scratch)
     tok_vocab = _tokenizer_vocab_size(tokenizer)
+
     if from_scratch:
+        required_vocab = _resolve_required_tokenizer_vocab_size(
+            current_size=tok_vocab,
+            model_cfg=model_cfg,
+            from_scratch=True,
+            component=component,
+        )
+        _resize_tokenizer_to_vocab_size(
+            tokenizer=tokenizer,
+            target_size=required_vocab,
+            component=component,
+            allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+        )
+        tok_vocab = _tokenizer_vocab_size(tokenizer)
         cfg.vocab_size = tok_vocab
         _apply_tokenizer_special_ids(cfg, tokenizer)
         return
@@ -245,9 +348,24 @@ def _align_or_validate_tokenizer_contract(
         raise ValueError(
             f"{component} config is missing vocab_size; cannot validate tokenizer/checkpoint compatibility."
         )
-    if int(cfg_vocab) != tok_vocab:
+    required_vocab = _resolve_required_tokenizer_vocab_size(
+        current_size=tok_vocab,
+        model_cfg=model_cfg,
+        from_scratch=False,
+        component=component,
+        config_vocab_size=int(cfg_vocab),
+    )
+    _resize_tokenizer_to_vocab_size(
+        tokenizer=tokenizer,
+        target_size=required_vocab,
+        component=component,
+        allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+    )
+    tok_vocab = _tokenizer_vocab_size(tokenizer)
+
+    if int(cfg_vocab) != int(tok_vocab):
         raise ValueError(
-            f"Tokenizer/checkpoint vocab mismatch for {component}: tokenizer={tok_vocab}, "
+            f"Tokenizer/checkpoint vocab mismatch for {component}: tokenizer={int(tok_vocab)}, "
             f"config={int(cfg_vocab)}. Use a matching tokenizer or checkpoint."
         )
     _validate_or_fill_special_ids_from_tokenizer(cfg, tokenizer, component=component)
@@ -386,36 +504,32 @@ def _apply_rope_scratch_arch_overrides(
         cfg.intermediate_size = _scaled_swiglu_intermediate_size(curr_intermediate)
 
 
+_PRETRAINED_OVERRIDE_MAP: tuple[tuple[str, str, type], ...] = (
+    ("pretrained_max_position_embeddings", "max_position_embeddings", int),
+    ("pretrained_rope_theta", "rope_theta", float),
+    ("pretrained_rotary_pct", "rotary_pct", float),
+    ("pretrained_use_absolute_position_embeddings", "use_absolute_position_embeddings", bool),
+    ("pretrained_type_vocab_size", "type_vocab_size", int),
+    ("pretrained_norm_arch", "norm_arch", str),
+    ("pretrained_norm_eps", "norm_eps", float),
+    ("pretrained_keel_alpha_init", "keel_alpha_init", float),
+    ("pretrained_keel_alpha_learnable", "keel_alpha_learnable", bool),
+    ("pretrained_ffn_type", "ffn_type", str),
+    ("pretrained_use_bias", "use_bias", bool),
+    ("pretrained_initializer_range", "initializer_range", float),
+)
+
+
 def _apply_rope_pretrained_explicit_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
     """Apply explicit pretrained RoPE overrides.
 
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     """
-    if model_cfg.pretrained_max_position_embeddings is not None:
-        cfg.max_position_embeddings = int(model_cfg.pretrained_max_position_embeddings)
-    if model_cfg.pretrained_rope_theta is not None:
-        cfg.rope_theta = float(model_cfg.pretrained_rope_theta)
-    if model_cfg.pretrained_rotary_pct is not None:
-        cfg.rotary_pct = float(model_cfg.pretrained_rotary_pct)
-    if model_cfg.pretrained_use_absolute_position_embeddings is not None:
-        cfg.use_absolute_position_embeddings = bool(model_cfg.pretrained_use_absolute_position_embeddings)
-    if model_cfg.pretrained_type_vocab_size is not None:
-        cfg.type_vocab_size = int(model_cfg.pretrained_type_vocab_size)
-    if model_cfg.pretrained_norm_arch is not None:
-        cfg.norm_arch = str(model_cfg.pretrained_norm_arch)
-    if model_cfg.pretrained_norm_eps is not None:
-        cfg.norm_eps = float(model_cfg.pretrained_norm_eps)
-    if model_cfg.pretrained_keel_alpha_init is not None:
-        cfg.keel_alpha_init = float(model_cfg.pretrained_keel_alpha_init)
-    if model_cfg.pretrained_keel_alpha_learnable is not None:
-        cfg.keel_alpha_learnable = bool(model_cfg.pretrained_keel_alpha_learnable)
-    if model_cfg.pretrained_ffn_type is not None:
-        cfg.ffn_type = str(model_cfg.pretrained_ffn_type)
-    if model_cfg.pretrained_use_bias is not None:
-        cfg.use_bias = bool(model_cfg.pretrained_use_bias)
-    if model_cfg.pretrained_initializer_range is not None:
-        cfg.initializer_range = float(model_cfg.pretrained_initializer_range)
+    for src_attr, dst_attr, cast in _PRETRAINED_OVERRIDE_MAP:
+        val = getattr(model_cfg, src_attr, None)
+        if val is not None:
+            setattr(cfg, dst_attr, cast(val))
 
 
 def _apply_hf_config_normalization(
@@ -436,9 +550,12 @@ def _apply_hf_config_normalization(
         cfg,
         tokenizer,
         component=component,
-        from_scratch=bool(model_cfg.from_scratch),
+        model_cfg=model_cfg,
     )
+    if model_cfg.hf_max_position_embeddings is not None:
+        cfg.max_position_embeddings = int(model_cfg.hf_max_position_embeddings)
     _apply_dropout_overrides(cfg, model_cfg)
+    cfg.hf_attention_kernel = str(model_cfg.hf_attention_kernel)
     cfg.use_rmsnorm_heads = False
 
 
@@ -493,7 +610,7 @@ def _apply_rope_config_normalization(
         cfg,
         tokenizer,
         component=component,
-        from_scratch=bool(model_cfg.from_scratch),
+        model_cfg=model_cfg,
     )
     _validate_required_max_positions(
         cfg,
@@ -606,23 +723,26 @@ def build_backbones(
     model_cfg: ModelConfig,
     disc_config: Any,
     gen_config: Any,
+    load_pretrained_weights: bool = True,
 ) -> tuple[Any, Any]:
     """Instantiate discriminator + generator backbones.
 
     :param ModelConfig model_cfg: User model configuration.
     :param Any disc_config: Discriminator config object.
     :param Any gen_config: Generator config object.
+    :param bool load_pretrained_weights: Whether to load pretrained weights from resolved model sources
+        when ``model.from_scratch=false``. Set ``False`` for resume/export flows that will load from an
+        accelerate checkpoint immediately after instantiation.
     :return tuple[Any, Any]: Instantiated discriminator and generator modules.
     """
+    validate_model_config(model_cfg)
     bt = (model_cfg.backbone_type or "rope").lower()
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
-        from transformers import AutoModel
-
-        if model_cfg.from_scratch:
-            disc = AutoModel.from_config(disc_config)
-            gen = AutoModel.from_config(gen_config)
+        if model_cfg.from_scratch or not bool(load_pretrained_weights):
+            disc = DebertaV2Model(disc_config)
+            gen = DebertaV2Model(gen_config)
             return disc, gen
 
         disc_src = resolved.discriminator.weight_source
@@ -631,7 +751,7 @@ def build_backbones(
             raise RuntimeError("Resolved pretrained HF weight source is missing.")
 
         try:
-            disc = AutoModel.from_pretrained(disc_src, config=disc_config)
+            disc = DebertaV2Model.from_pretrained(disc_src, config=disc_config)
         except Exception as e:
             raise RuntimeError(
                 "Failed to load discriminator HF backbone from "
@@ -639,7 +759,7 @@ def build_backbones(
             ) from e
 
         try:
-            gen = AutoModel.from_pretrained(gen_src, config=gen_config)
+            gen = DebertaV2Model.from_pretrained(gen_src, config=gen_config)
         except Exception as e:
             raise RuntimeError(
                 "Failed to load generator HF backbone from "
@@ -649,7 +769,7 @@ def build_backbones(
         return disc, gen
 
     # RoPE backbone
-    if model_cfg.from_scratch:
+    if model_cfg.from_scratch or not bool(load_pretrained_weights):
         disc = DebertaRoPEModel(disc_config)
         gen = DebertaRoPEModel(gen_config)
         return disc, gen

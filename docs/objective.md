@@ -1,8 +1,6 @@
 # Objective: RTD (Replaced Token Detection)
 
-This document is the primary reference for the pretraining objective implemented in this repo.
-
-For data/collator behavior, see [`docs/data.md`](data.md). For distributed/runtime configuration, see [`docs/fsdp2.md`](fsdp2.md).
+See also: [data/collator](data.md), [runtime](fsdp2.md).
 
 ## RTD Flow
 
@@ -11,15 +9,17 @@ Each training step follows DeBERTaV3/ELECTRA-style RTD:
 1. Apply dynamic MLM masking to input tokens.
 2. Run generator on masked input.
 3. Compute generator logits only at masked positions.
-4. Sample replacements from generator distribution, excluding configured tokenizer special token ids (`pad/cls/sep/mask/bos/eos`).
+4. Sample replacements from generator distribution, excluding config special token ids (`pad/cls/sep/mask/bos/eos`) plus runtime-provided tokenizer special ids.
 5. Create corrupted sequence by inserting sampled tokens at masked positions.
 6. Run discriminator on corrupted sequence.
 7. Train discriminator to predict original (`0`) vs replaced (`1`) per token.
 
+Special-token filtering in RTD is config-driven by default, with optional runtime additive ids from `tokenizer.all_special_ids` in training/export paths.
+
 ## Loss Terms
 
 - Generator loss: cross entropy on masked positions only.
-- Discriminator loss: BCE-with-logits on active non-special tokens.
+- Discriminator loss: BCE-with-logits on all active non-padding tokens.
 - Total loss: `gen_loss_weight * gen_loss + disc_loss_weight * disc_loss`.
 
 Exposed controls:
@@ -31,6 +31,10 @@ Exposed controls:
 - `train.token_weighted_gradient_accumulation` (default `true`)
 
 Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
+
+For `model.embedding_sharing=gdes`, discriminator embedding base weights are synchronized from the
+generator after each optimizer step (and checkpoint load). During a gradient-accumulation window,
+the discriminator therefore sees the previous optimizer-step snapshot until the next sync.
 
 ## Numerical Stability
 

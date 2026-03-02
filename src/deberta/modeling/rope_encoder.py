@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deberta.modeling.activations import get_act_fn
+from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.norm import RMSNorm
 from deberta.modeling.rope import RotaryEmbedding
 
@@ -116,17 +118,6 @@ class DebertaRoPEConfig(PretrainedConfig):
             raise ValueError("attention_implementation must be one of: sdpa|eager")
 
 
-def _get_act_fn(name: str) -> Any:
-    """Resolve activation callable from transformers registry.
-
-    :param str name: Activation function key.
-    :return Any: Activation callable.
-    """
-    from transformers.activations import ACT2FN
-
-    return ACT2FN[name]
-
-
 class DebertaRoPEEmbeddings(nn.Module):
     """Embedding stack combining token, optional type/position, norm, and dropout."""
 
@@ -232,7 +223,7 @@ class DebertaRoPESelfAttention(nn.Module):
         query_keep: torch.Tensor | None = None
         query_keep_tokens = None
         if attention_mask is not None:
-            mask = attention_mask.to(dtype=torch.bool)
+            mask = normalize_keep_mask(attention_mask)
 
             if mask.ndim == 2:
                 # 2D key mask: attention_mask is 1 for tokens, 0 for pad.
@@ -245,11 +236,10 @@ class DebertaRoPESelfAttention(nn.Module):
                 query_keep = key_keep
             elif mask.ndim == 3:
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
+                # Diagonal encodes query activity: active rows are True, inactive/pad rows
+                # are False. Inactive rows still carry a single keep edge to CLS to avoid
+                # all-False SDPA rows.
                 pair_keep = mask
-                # Collator-produced pairwise masks guarantee diagonal=True for active
-                # tokens and diagonal=False for inactive/padded queries. Read query
-                # activity from the diagonal (O(B*S)) instead of reducing rows
-                # (O(B*S^2)) in every layer.
                 query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
 
                 sdpa_attn_mask = pair_keep[:, None, :, :]  # (B,1,S,S)
@@ -273,19 +263,22 @@ class DebertaRoPESelfAttention(nn.Module):
                 is_causal=False,
             )
         else:
-            # Eager attention (debug/fallback)
+            # Eager attention (debug/fallback) — upcast to fp32 for numeric stability.
             scale = 1.0 / math.sqrt(self.head_dim)
-            scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, nh, S, S)
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale  # (B, nh, S, S)
+            dead_rows = None
             if eager_attn_mask is not None:
                 scores = scores.masked_fill(eager_attn_mask, torch.finfo(scores.dtype).min)
-                if query_keep is not None:
-                    # Avoid NaNs for all-masked query rows in eager mode. Those
-                    # rows are explicitly zeroed after projection via query_keep_tokens.
-                    dead_queries = (~query_keep)[:, None, :, None]
-                    scores = scores.masked_fill(dead_queries, 0.0)
+                # Guard fully-masked query rows explicitly in eager mode:
+                # 1) set their logits to 0 before softmax (avoid potential NaNs if mask-fill semantics change),
+                # 2) zero their attention rows after softmax.
+                dead_rows = eager_attn_mask.all(dim=-1, keepdim=True)
+                scores = scores.masked_fill(dead_rows, 0.0)
             attn = torch.softmax(scores, dim=-1)
+            if dead_rows is not None:
+                attn = attn.masked_fill(dead_rows, 0.0)
             attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
-            out = torch.matmul(attn, v)
+            out = torch.matmul(attn.to(dtype=v.dtype), v)
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
         out = self.out_proj(out)
@@ -326,7 +319,7 @@ class DebertaRoPEMLP(nn.Module):
                 int(config.intermediate_size),
                 bias=add_bias,
             )
-            self.act = _get_act_fn(config.hidden_act)
+            self.act = get_act_fn(config.hidden_act)
             self.dense_out = nn.Linear(
                 int(config.intermediate_size),
                 int(config.hidden_size),
@@ -450,9 +443,11 @@ class DebertaRoPEEncoder(nn.Module):
         if config.keel_alpha_init is not None:
             alpha_init = float(config.keel_alpha_init)
         else:
-            # KEEL paper notation uses L = number of residual sublayers. Our encoder
-            # has 2 residual sublayers per transformer block (attention + FFN).
-            alpha_init = float(2 * int(config.num_hidden_layers))
+            # KEEL uses L = number of residual sublayers. Our encoder has
+            # two residual sublayers per transformer block (attention + FFN),
+            # with default alpha = 1 / sqrt(L).
+            total_sublayers = float(2 * int(config.num_hidden_layers))
+            alpha_init = 1.0 / math.sqrt(total_sublayers)
 
         self.layers = nn.ModuleList(
             [DebertaRoPELayer(config, alpha_init=alpha_init) for _ in range(config.num_hidden_layers)]

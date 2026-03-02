@@ -1,15 +1,23 @@
 # Model Architecture and Config
 
-This document is the primary reference for model/backbone choices in this repo.
+See also: [replication guide](replication.md), [data pipeline](data.md), [RTD objective](objective.md), [runtime/compile](fsdp2.md).
 
-For data-path details, see [`docs/data.md`](data.md). For RTD objective/loss behavior, see [`docs/objective.md`](objective.md). For distributed/runtime tuning, see [`docs/fsdp2.md`](fsdp2.md).
+## Backbone Families
 
-## Backbone Modes
+`model.backbone_type` supports two architecturally distinct encoder families that share the same RTD pretraining objective and GDES embedding sharing:
 
-`model.backbone_type` supports:
+| | `rope` (default) | `hf_deberta_v2` |
+|---|---|---|
+| **Attention** | Standard multi-head (QKV → RoPE → SDPA) | Disentangled (C2C + C2P + P2C relative-position bias) |
+| **Position encoding** | Rotary embeddings (geometric, no learned table) | Learned relative-position embeddings + bucket indices |
+| **Normalization** | RMSNorm | LayerNorm |
+| **FFN** | SwiGLU (default) or MLP | MLP only (GELU) |
+| **Bias** | Configurable (`use_bias`) | Hardcoded per layer |
+| **Pretraining objective** | RTD (ELECTRA-style) + GDES | RTD (ELECTRA-style) + GDES |
 
-- `rope` (default): modernized encoder stack in this repo
-- `hf_deberta_v2`: Hugging Face DeBERTa v2/v3 compatibility path
+The `rope` backbone is a **modern encoder** (comparable to ModernBERT/NeoEncoder architecture) that uses the DeBERTa-v3 RTD pretraining recipe and GDES embedding sharing — it does **not** implement disentangled attention. Position information is encoded geometrically via rotary embeddings in Q/K vectors.
+
+The `hf_deberta_v2` backbone faithfully implements the DeBERTa-v2/v3 architecture including disentangled attention with content-to-position (C2P) and position-to-content (P2C) bias decomposition via separate `pos_key_proj`/`pos_query_proj` projections. This is the path to use when disentangled attention is the research variable.
 
 ## Source Resolution Contract
 
@@ -22,9 +30,9 @@ Builder behavior is intentionally deterministic and split into two phases:
 
 | Mode | Discriminator config | Generator config |
 |---|---|---|
-| `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.generator_config_name_or_path` / `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
-| `backbone_type=rope`, `from_scratch=false` | `model.discriminator_config_name_or_path` else `model.discriminator_model_name_or_path` | explicit generator config/model source if set; otherwise derived from discriminator config |
-| `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | `model.discriminator_config_name_or_path` else `model.discriminator_model_name_or_path` | explicit generator config/model source if set; otherwise derived from discriminator config |
+| `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
+| `backbone_type=rope`, `from_scratch=false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
+| `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
 
 ### Weight Sources
 
@@ -34,15 +42,20 @@ Builder behavior is intentionally deterministic and split into two phases:
 | `from_scratch=false` + explicit generator model source | `model.discriminator_model_name_or_path` | `model.generator_model_name_or_path` |
 | `from_scratch=false` + no generator source (derived generator exception) | `model.discriminator_model_name_or_path` | discriminator fallback (`model.discriminator_model_name_or_path`) |
 
-Strict pairing rule in pretrained mode:
+Generator-source rule:
 
-- if `model.generator_config_name_or_path` is set, `model.generator_model_name_or_path` must also be set
-- cross-component fallback is only allowed for the derived-generator mode (both generator source fields unset)
+- set `model.generator_model_name_or_path` to use explicit generator config+weights from that source
+- leave it unset to use derived-generator fallback from discriminator source
 
 ### Tokenizer Compatibility Policy
 
 - scratch mode (`from_scratch=true`): config `vocab_size` and special token ids are aligned to the tokenizer
 - pretrained mode (`from_scratch=false`): config/tokenizer vocabulary and special ids are validated; mismatches fail fast
+- optional vocab controls:
+  - `model.tokenizer_allow_vocab_resize=true` enables tokenizer growth via `add_tokens(...)`
+  - `model.tokenizer_vocab_target=<N>` requests a minimum tokenizer/model vocab size (`N`)
+  - `model.tokenizer_vocab_multiple=<M>` rounds resolved vocab up to multiple `M` (`1` disables)
+- placeholder growth tokens use the inert pattern `<|deberta_extra_token_{idx}|>`
 
 ## Pretrained RoPE Overrides (`from_scratch=false`)
 
@@ -61,9 +74,9 @@ Pretrained RoPE loads use explicit override fields only:
 - `pretrained_use_bias`
 - `pretrained_initializer_range`
 
-Legacy implicit behavior is removed:
+Pretrained override behavior is explicit:
 
-- non-default scratch fields (for example `rope_theta`, `ffn_type`, `norm_arch`) are no longer interpreted as pretrained overrides
+- non-default scratch fields (for example `rope_theta`, `ffn_type`, `norm_arch`) are not interpreted as pretrained overrides
 - to override pretrained RoPE configs, use the `pretrained_*` fields above
 
 ## `rope` Backbone Knobs
@@ -94,9 +107,23 @@ Key options in `ModelConfig`:
 - optional activation checkpointing:
   - `gradient_checkpointing`
 
+### Export Interoperability (RoPE)
+
+RoPE exports are saved with `model_type="deberta-rope"` and currently require this repo's model class:
+
+```python
+from transformers import AutoTokenizer
+from deberta.modeling.rope_encoder import DebertaRoPEModel
+
+model = DebertaRoPEModel.from_pretrained("<export_dir>")
+tokenizer = AutoTokenizer.from_pretrained("<export_dir>")
+```
+
+`transformers.AutoModel.from_pretrained("<export_dir>")` is not currently supported for RoPE exports without custom auto-class registration and packaged modeling code.
+
 ## Norm Architecture Rationale (`norm_arch`)
 
-Normalization-policy rationale, equations, and selection guidance are defined in [`docs/norm-strategy.md`](norm-strategy.md).
+Normalization-policy rationale, equations, and selection guidance are in [norm-strategy.md](norm-strategy.md).
 
 ## Generator/Discriminator Configuration
 
@@ -110,8 +137,7 @@ RTD uses separate generator and discriminator backbones.
   - `generator_intermediate_size`
   - `generator_num_attention_heads`
 
-If `generator_config_name_or_path` or `generator_model_name_or_path` is set, the derived-generator sizing knobs above must be unset.
-In pretrained mode, explicit generator config also requires explicit generator model weights (strict pairing).
+If `generator_model_name_or_path` is set, the derived-generator sizing knobs above must be unset.
 
 ## Embedding Sharing
 
@@ -121,20 +147,49 @@ In pretrained mode, explicit generator config also requires explicit generator m
 - `es` (vanilla embedding sharing)
 - `gdes` (gradient-disentangled sharing; default)
 
-`gdes` is implemented to remain compatible with FSDP2 wrapping.
+`gdes` remains compatible with FSDP2 wrapping.
 
 Operational constraint: embedding sharing adapters bind discriminator embeddings to the
 generator embedding modules present at pretrainer construction time. If you replace
 generator/discriminator embedding modules later (for example during manual model surgery),
 recreate `DebertaV3RTDPretrainer` so sharing adapters are rebound consistently.
 
-## HF Compatibility Mode Notes
+## HF DeBERTa-v2 Backbone
 
-With `backbone_type=hf_deberta_v2`, the run uses the HF DeBERTa implementation.
+With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 implementation in
+[`src/deberta/modeling/deberta_v2_native.py`](../src/deberta/modeling/deberta_v2_native.py).
+Training does not instantiate `transformers.DebertaV2Model` directly.
 
-RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in that mode.
+HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`) for compatibility.
 
-Packed 3D document-blocking masks are rope-only. The canonical pairwise-mask contract lives in [`docs/data.md#pairwise-mask-contract-block_cross_document_attentiontrue`](data.md#pairwise-mask-contract-block_cross_document_attentiontrue); HF backbone runs must keep `data.block_cross_document_attention=false`.
+Context length for this mode should be configured directly in YAML with
+`model.hf_max_position_embeddings` (supported when `model.from_scratch=true`).
+
+### Architectural properties
+
+- **Disentangled attention**: decomposes attention scores into content-to-content (C2C), content-to-position (C2P), and position-to-content (P2C) terms via separate `pos_key_proj`/`pos_query_proj` projections
+- **Relative position**: learned embedding table with bucket indices, computed on-device per forward (no upfront O(max_len²) allocation)
+- **Padding masks**: 2D `(B,S)` padding masks stay as `(B,1,1,S)` broadcast — no S² outer product expansion
+- **No-mask fast path**: when `attention_mask=None` (unpadded batches), no mask is materialized
+
+### Current limitations vs RoPE path
+
+- LayerNorm only (no RMSNorm option) — tracked in [roadmap](roadmap.md)
+- MLP FFN only (no SwiGLU option) — tracked in [roadmap](roadmap.md)
+- Bias not configurable — tracked in [roadmap](roadmap.md)
+- `data.block_cross_document_attention` must be `false` (packed 3D doc-blocking masks are rope-only; see [data.md](data.md))
+
+### Attention kernel selection
+
+RoPE-specific options (`rope_theta`, `rotary_pct`, `norm_arch`, `ffn_type`, etc.) do not apply in this mode.
+
+`model.hf_attention_kernel` selects the disentangled attention implementation:
+
+- `dynamic` (default): computes disentangled bias with the dynamic einsum+gather path
+- `cached_bmm`: computes disentangled bias with a batched-matmul+gather path
+- `stable`: semantic alias for the `cached_bmm` kernel, used by compile-stability presets
+
+Compile scope and stability policy for this mode is in [runtime: torch.compile](fsdp2.md#torchcompile).
 
 Pretraining heads follow backbone norm style by config:
 

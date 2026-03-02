@@ -13,32 +13,26 @@ from typing import Any
 
 import torch
 
+from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, load_state_with_compile_fallback
 from deberta.config import (
-    DataConfig,
     ModelConfig,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
     validate_data_config,
     validate_model_config,
     validate_run_metadata_schema,
 )
+from deberta.io_utils import load_json_mapping
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import (
+    clean_exported_config,
     load_intersection_state_dict,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    """Load JSON mapping from disk.
-
-    :param Path path: JSON path.
-    :return dict[str, Any]: Parsed mapping.
-    """
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
@@ -61,8 +55,28 @@ def _validate_run_metadata_if_present(run_dir: Path) -> None:
     meta_path = run_dir / "run_metadata.json"
     if not meta_path.exists():
         return
-    raw = _load_json(meta_path)
+    raw = load_json_mapping(meta_path)
     validate_run_metadata_schema(raw, source=str(meta_path))
+
+
+def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path:
+    """Resolve and preflight-validate export output directory.
+
+    :param str | None output_dir: Requested output directory override.
+    :param Path run_dir: Run directory used for default output location.
+    :raises ValueError: If path exists as a non-directory or as a non-empty directory.
+    :return Path: Resolved output path.
+    """
+    resolved = Path(output_dir).expanduser().resolve() if output_dir else (run_dir / "exported_hf")
+    if resolved.exists():
+        if not resolved.is_dir():
+            raise ValueError(f"output_dir exists and is not a directory: {resolved}")
+        if any(resolved.iterdir()):
+            raise ValueError(
+                f"output_dir already exists and is not empty: {resolved}. "
+                "Choose a new --output-dir or clear the directory."
+            )
+    return resolved
 
 
 @dataclass
@@ -78,10 +92,11 @@ class ExportConfig:
 
     # Memory knobs for FULL_STATE_DICT gather under FSDP
     offload_to_cpu: bool = True
-    rank0_only: bool = True
+    rank0: bool = True
 
     # Override embedding_sharing (normally read from model_config.json)
     embedding_sharing: str | None = None
+    allow_partial_export: bool = False
 
 
 def add_export_arguments(parser: argparse.ArgumentParser) -> None:
@@ -147,22 +162,30 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
     rank0_group = parser.add_mutually_exclusive_group()
     rank0_group.add_argument(
         "--rank0-only",
-        dest="rank0_only",
+        dest="rank0",
         action="store_true",
         help="Gather full state dict on rank 0 only under FSDP export.",
     )
     rank0_group.add_argument(
         "--no-rank0-only",
-        dest="rank0_only",
+        dest="rank0",
         action="store_false",
         help="Gather full state dict on all ranks under FSDP export.",
     )
-    parser.set_defaults(rank0_only=True)
+    parser.set_defaults(rank0=True)
     parser.add_argument(
         "--embedding-sharing",
         default=None,
         choices=("none", "es", "gdes"),
         help="Override embedding sharing mode. Defaults to training config value.",
+    )
+    parser.add_argument(
+        "--allow-partial-export",
+        action="store_true",
+        help=(
+            "Allow partial backbone state loads when exporting. "
+            "By default export fails on any missing/unexpected backbone keys."
+        ),
     )
 
 
@@ -179,8 +202,9 @@ def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
         export_what=ns.export_what,
         safe_serialization=bool(ns.safe_serialization),
         offload_to_cpu=bool(ns.offload_to_cpu),
-        rank0_only=bool(ns.rank0_only),
+        rank0=bool(ns.rank0),
         embedding_sharing=ns.embedding_sharing,
+        allow_partial_export=bool(getattr(ns, "allow_partial_export", False)),
     )
 
 
@@ -219,6 +243,55 @@ def _build_export_backbone(
     return disc, gen
 
 
+def _prepare_discriminator_state_for_strict_load(
+    *,
+    export_disc: Any,
+    disc_sd: dict[str, torch.Tensor],
+    embedding_sharing: str,
+    strict_export_load: bool,
+) -> dict[str, torch.Tensor]:
+    """Normalize discriminator checkpoint keys for strict export loading.
+
+    In ``embedding_sharing='gdes'``, discriminator checkpoints store embedding
+    tensors as ``embeddings.<attr>.base_weight`` + ``embeddings.<attr>.bias``.
+    Export backbones expect ``embeddings.<attr>.weight``; bias tensors are
+    merged afterward via ``merge_embeddings_into_export_backbone``.
+
+    :param Any export_disc: Export discriminator backbone module.
+    :param dict[str, torch.Tensor] disc_sd: Raw discriminator checkpoint state dict.
+    :param str embedding_sharing: Effective embedding sharing mode.
+    :param bool strict_export_load: Whether strict export load is enabled.
+    :return dict[str, torch.Tensor]: State dict prepared for strict backbone load.
+    """
+    if not strict_export_load or str(embedding_sharing).lower() != "gdes":
+        return dict(disc_sd)
+
+    model_keys = set(export_disc.state_dict().keys())
+    prepared = dict(disc_sd)
+
+    for key, value in list(disc_sd.items()):
+        if not key.startswith("embeddings."):
+            continue
+
+        if key.endswith(".base_weight"):
+            prefix = key[: -len(".base_weight")]
+            weight_key = f"{prefix}.weight"
+            # Export backbones expect .weight; checkpoint stores .base_weight.
+            if weight_key in model_keys and weight_key not in prepared:
+                prepared[weight_key] = value
+            prepared.pop(key, None)
+            continue
+
+        if key.endswith(".bias"):
+            prefix = key[: -len(".bias")]
+            weight_key = f"{prefix}.weight"
+            # Bias tensors are merge-only for GDES and should not participate in strict backbone load.
+            if weight_key in model_keys and key not in model_keys:
+                prepared.pop(key, None)
+
+    return prepared
+
+
 def run_export(cfg: ExportConfig) -> None:
     """Run checkpoint export flow.
 
@@ -242,6 +315,7 @@ def run_export(cfg: ExportConfig) -> None:
     run_dir = Path(cfg.run_dir).expanduser().resolve() if cfg.run_dir else _infer_run_dir(checkpoint_dir)
     if not run_dir.exists():
         raise FileNotFoundError(f"run_dir not found: {run_dir}")
+    out_dir = _resolve_export_output_dir(output_dir=cfg.output_dir, run_dir=run_dir)
 
     model_cfg_path = run_dir / "model_config.json"
     data_cfg_path = run_dir / "data_config.json"
@@ -252,12 +326,15 @@ def run_export(cfg: ExportConfig) -> None:
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
     _validate_run_metadata_if_present(run_dir)
 
-    model_cfg = ModelConfig(**_load_json(model_cfg_path))
-    data_cfg = DataConfig(**_load_json(data_cfg_path))
+    # Pre-stable policy: export does not coerce legacy snapshot keys.
+    # Stored configs must match current dataclass schemas.
+    model_cfg = load_model_config_snapshot(load_json_mapping(model_cfg_path), source=str(model_cfg_path))
+    data_cfg = load_data_config_snapshot(load_json_mapping(data_cfg_path), source=str(data_cfg_path))
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
 
     embedding_sharing = (cfg.embedding_sharing or model_cfg.embedding_sharing or "none").lower()
+    strict_export_load = not bool(cfg.allow_partial_export)
 
     # Tokenizer (needed for configs, and we also export it)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
@@ -271,7 +348,10 @@ def run_export(cfg: ExportConfig) -> None:
 
     # Build backbones + pretrainer container so accelerate.load_state can restore the exact structure.
     disc_backbone, gen_backbone = build_backbones(
-        model_cfg=model_cfg, disc_config=disc_config, gen_config=gen_config
+        model_cfg=model_cfg,
+        disc_config=disc_config,
+        gen_config=gen_config,
+        load_pretrained_weights=False,
     )
     if model_cfg.gradient_checkpointing:
         if hasattr(disc_backbone, "gradient_checkpointing_enable"):
@@ -285,12 +365,19 @@ def run_export(cfg: ExportConfig) -> None:
         disc_config=disc_config,
         gen_config=gen_config,
         embedding_sharing=embedding_sharing,
+        additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
 
     model = accelerator.prepare(model)
 
     # Load accelerate checkpoint (FSDP2 SHARDED_STATE_DICT is handled here by accelerate/torch.distributed.checkpoint).
-    accelerator.load_state(str(checkpoint_dir))
+    load_state_with_compile_fallback(
+        accelerator=accelerator,
+        model=model,
+        checkpoint_dir=checkpoint_dir,
+        context="export",
+        remap_loader=load_model_state_with_compile_key_remap,
+    )
     accelerator.wait_for_everyone()
 
     # Consolidate FULL_STATE_DICT when FSDP is enabled.
@@ -308,12 +395,12 @@ def run_export(cfg: ExportConfig) -> None:
                 full_sd = accelerator.get_state_dict(model)
             else:
                 # Map CLI knobs to FSDP2 state-dict options.
-                # - rank0_only=True  -> rank0 materializes full state and broadcasts tensor payloads.
-                # - rank0_only=False -> all ranks materialize full state.
+                # - rank0=True  -> rank0 materializes full state and broadcasts tensor payloads.
+                # - rank0=False -> all ranks materialize full state.
                 opts = StateDictOptions(
                     full_state_dict=True,
                     cpu_offload=bool(cfg.offload_to_cpu),
-                    broadcast_from_rank0=bool(cfg.rank0_only),
+                    broadcast_from_rank0=bool(cfg.rank0),
                 )
                 full_sd = get_model_state_dict(model, options=opts)
         else:
@@ -327,7 +414,8 @@ def run_export(cfg: ExportConfig) -> None:
 
             if is_fsdp_instance:
                 cfg_full = FullStateDictConfig(
-                    offload_to_cpu=bool(cfg.offload_to_cpu), rank0_only=bool(cfg.rank0_only)
+                    offload_to_cpu=bool(cfg.offload_to_cpu),
+                    rank0_only=bool(cfg.rank0),
                 )
                 with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg_full):
                     full_sd = model.state_dict()
@@ -358,16 +446,6 @@ def run_export(cfg: ExportConfig) -> None:
 
     export_disc, export_gen = _build_export_backbone(model_cfg, disc_config, gen_config, export_what)
 
-    out_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else (run_dir / "exported_hf")
-    if out_dir.exists():
-        if not out_dir.is_dir():
-            raise ValueError(f"output_dir exists and is not a directory: {out_dir}")
-        if any(out_dir.iterdir()):
-            raise ValueError(
-                f"output_dir already exists and is not empty: {out_dir}. "
-                "Choose a new --output-dir or clear the directory."
-            )
-
     stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
     stage_dir.mkdir(parents=True, exist_ok=False)
 
@@ -384,7 +462,28 @@ def run_export(cfg: ExportConfig) -> None:
 
         # Discriminator
         if export_disc is not None:
-            load_intersection_state_dict(export_disc, disc_sd)
+            disc_sd_for_load = _prepare_discriminator_state_for_strict_load(
+                export_disc=export_disc,
+                disc_sd=disc_sd,
+                embedding_sharing=embedding_sharing,
+                strict_export_load=bool(strict_export_load),
+            )
+            incompat_disc = load_intersection_state_dict(
+                export_disc,
+                disc_sd_for_load,
+                strict=strict_export_load,
+                context="export.discriminator",
+            )
+            if not strict_export_load:
+                missing = list(getattr(incompat_disc, "missing_keys", []))
+                unexpected = list(getattr(incompat_disc, "unexpected_keys", []))
+                if missing or unexpected:
+                    logger.warning(
+                        "Discriminator export loaded partial state due --allow-partial-export: "
+                        "missing=%d unexpected=%d",
+                        len(missing),
+                        len(unexpected),
+                    )
             if embedding_sharing in {"es", "gdes"}:
                 merge_embeddings_into_export_backbone(
                     export_model=export_disc,
@@ -397,14 +496,31 @@ def run_export(cfg: ExportConfig) -> None:
             export_disc.save_pretrained(
                 str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
             )
+            clean_exported_config(stage_dir / "discriminator" / "config.json", strict=True)
             meta["exported_discriminator"] = True
 
         # Generator
         if export_gen is not None:
-            load_intersection_state_dict(export_gen, gen_sd)
+            incompat_gen = load_intersection_state_dict(
+                export_gen,
+                gen_sd,
+                strict=strict_export_load,
+                context="export.generator",
+            )
+            if not strict_export_load:
+                missing = list(getattr(incompat_gen, "missing_keys", []))
+                unexpected = list(getattr(incompat_gen, "unexpected_keys", []))
+                if missing or unexpected:
+                    logger.warning(
+                        "Generator export loaded partial state due --allow-partial-export: "
+                        "missing=%d unexpected=%d",
+                        len(missing),
+                        len(unexpected),
+                    )
             export_gen.save_pretrained(
                 str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
             )
+            clean_exported_config(stage_dir / "generator" / "config.json", strict=True)
             meta["exported_generator"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
@@ -421,27 +537,17 @@ def run_export(cfg: ExportConfig) -> None:
         raise
 
 
-def _build_export_parser(*, prog: str = "deberta export") -> argparse.ArgumentParser:
-    """Build argparse parser for export commands.
-
-    :param str prog: Program name shown in help output.
-    :return argparse.ArgumentParser: Configured parser.
-    """
-    parser = argparse.ArgumentParser(
-        prog=prog,
-        description="Consolidate a training checkpoint and export standalone HF artifacts.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_export_arguments(parser)
-    return parser
-
-
 def main(argv: list[str] | None = None) -> None:
     """Run checkpoint export CLI.
 
     :param list[str] | None argv: Optional CLI argv (excluding program name).
     """
-    parser = _build_export_parser()
+    parser = argparse.ArgumentParser(
+        prog="deberta export",
+        description="Consolidate a training checkpoint and export standalone HF artifacts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_export_arguments(parser)
     args = parser.parse_args(argv)
     cfg = namespace_to_export_config(args)
     run_export(cfg)

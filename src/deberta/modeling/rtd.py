@@ -1,7 +1,24 @@
-"""RTD (ELECTRA-style) pretraining heads and wrapper module."""
+"""RTD (ELECTRA/DeBERTa-v3 style) pretraining heads and wrapper module.
+
+Objective:
+- Generator MLM cross entropy on masked positions.
+- Discriminator replaced-token detection BCE on active tokens.
+
+Compile boundary:
+- RTD glue stays eager (sampling/corruption/label assembly).
+- Training compiles backbone modules only (configured in training runtime).
+
+Embedding sharing:
+- ``none``: no sharing.
+- ``es``: direct parameter sharing.
+- ``gdes``: discriminator uses synced non-trainable base weights + trainable bias tensors.
+  The training loop must call ``sync_discriminator_embeddings_from_generator()``
+  after checkpoint load and after optimizer steps.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,37 +26,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deberta.modeling.activations import get_act_fn
+from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.norm import RMSNorm
-
-
-def _get_act_fn(name_or_fn: str | Any) -> Any:
-    """Resolve activation callable from name or passthrough callable.
-
-    :param str | Any name_or_fn: Activation name or callable.
-    :return Any: Activation callable.
-    """
-    try:
-        from transformers.activations import ACT2FN
-
-        if isinstance(name_or_fn, str):
-            return ACT2FN[name_or_fn]
-        return name_or_fn
-    except Exception:
-        return name_or_fn
 
 
 def compute_generator_loss_term(
     *, gen_loss: torch.Tensor, disc_loss: torch.Tensor, decoupled_loss_scaling: bool
 ) -> torch.Tensor:
-    """Return generator loss term with optional decoupled RTD scaling.
+    """Compute the generator contribution to total RTD loss.
 
-    :param torch.Tensor gen_loss: Raw generator loss.
-    :param torch.Tensor disc_loss: Raw discriminator loss.
-    :param bool decoupled_loss_scaling: Whether to rescale generator loss.
-    :return torch.Tensor: Generator loss term used in total objective.
+    :param torch.Tensor gen_loss: Raw generator MLM loss.
+    :param torch.Tensor disc_loss: Raw discriminator RTD loss.
+    :param bool decoupled_loss_scaling: Whether to scale generator loss by detached discriminator/gen ratio.
+    :return torch.Tensor: Generator term used in total loss.
     """
+
     if not decoupled_loss_scaling:
         return gen_loss
+
     eps = 1e-6
     alpha = (disc_loss.detach() / (gen_loss.detach() + eps)).clamp(min=0.0, max=1e4)
     return alpha * gen_loss
@@ -53,96 +58,111 @@ def attention_mask_to_active_tokens(
 ) -> torch.Tensor:
     """Convert optional attention mask variants into a 2D active-token mask.
 
-    :param torch.Tensor input_ids: Input token ids shaped ``(B, S)``.
-    :param torch.Tensor | None attention_mask: Optional 2D/3D/4D attention mask.
-    :param int | None pad_token_id: Optional pad token id when ``attention_mask`` is omitted.
-    :return torch.Tensor: Active-token mask shaped ``(B, S)``.
+    :param torch.Tensor input_ids: Input token ids with shape ``(B, S)``.
+    :param torch.Tensor | None attention_mask: Optional attention mask in ``(B,S)``, ``(B,S,S)``, or ``(B,H,S,S)`` form.
+    :param int | None pad_token_id: Optional pad token id used when mask does not encode token activity directly.
+    :raises ValueError: If ``attention_mask`` rank is unsupported.
+    :return torch.Tensor: Boolean active-token mask with shape ``(B, S)``.
     """
+
     if attention_mask is None:
         if pad_token_id is None:
             return torch.ones_like(input_ids, dtype=torch.bool)
         return input_ids.ne(int(pad_token_id))
 
-    mask = attention_mask.to(torch.bool)
+    mask = normalize_keep_mask(attention_mask)
     if mask.ndim == 2:
         return mask
     if mask.ndim == 3:
-        # Packed pairwise masks encode document constraints, not padding identity.
-        # Recover token activity from input ids when padding metadata is available.
+        # Diagonal encodes per-token query activity for pairwise masks.
+        active = torch.diagonal(mask, dim1=-2, dim2=-1)
         if pad_token_id is not None:
-            return input_ids.ne(int(pad_token_id))
-        return mask.any(dim=-1)
+            active = active & input_ids.ne(int(pad_token_id))
+        return active
     if mask.ndim == 4:
+        squeezed = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
+        if squeezed.shape[-2] == 1:
+            # Broadcast path: (B,1,1,S) -> (B,1,S), keep full per-token activity mask.
+            active = squeezed[:, 0, :]
+        else:
+            active = torch.diagonal(squeezed, dim1=-2, dim2=-1)
         if pad_token_id is not None:
-            return input_ids.ne(int(pad_token_id))
-        active = mask.any(dim=-1)
-        if active.ndim == 3:
-            active = active.any(dim=1)
+            active = active & input_ids.ne(int(pad_token_id))
         return active
     raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
 
 
-class _TiedEmbedding(nn.Module):
-    """Embedding that reads weights from a different module.
+class _SyncedBufferEmbedding(nn.Module):
+    """Compile-safe embedding used for GDES.
 
-    This avoids sharing *module instances* (which can break FSDP2 wrapping), while still allowing:
+    Effective output is:
+        E(ids) = base_weight[ids] + bias[ids]
 
-      - vanilla sharing (grad flows to base weight) via detach_base=False
-      - gdes sharing (grad does NOT flow to base weight) via detach_base=True + trainable bias
-
-    NOTE: We intentionally keep an unregistered *strong* reference to the base module
-    and do not register the base weight as a parameter or buffer.
+    base_weight is a non-trainable Parameter synced from generator weights.
+    bias is a trainable parameter (same shape).
     """
 
     def __init__(
         self,
         *,
-        base_embedding_module: nn.Module,
+        init_weight: torch.Tensor,
         padding_idx: int | None,
-        detach_base: bool,
         add_bias: bool,
     ) -> None:
-        """Create tied-embedding adapter.
+        """Initialize synced-buffer embedding used for GDES.
 
-        :param nn.Module base_embedding_module: Source embedding module exposing ``.weight``.
-        :param int | None padding_idx: Padding index for embedding lookup.
-        :param bool detach_base: Whether to detach base weights.
-        :param bool add_bias: Whether to add trainable bias matrix.
+        :param torch.Tensor init_weight: Initial embedding matrix used to seed ``base_weight``.
+        :param int | None padding_idx: Optional embedding padding index.
+        :param bool add_bias: Whether to create a trainable per-token bias matrix.
+        :raises ValueError: If ``init_weight`` is not rank-2.
+        :return None: This constructor does not return a value.
         """
         super().__init__()
-        base_weight = getattr(base_embedding_module, "weight", None)
-        if not isinstance(base_weight, torch.Tensor):
-            raise RuntimeError("base_embedding_module must expose a `.weight` tensor.")
-        # Keep an unregistered strong ref to survive FSDP parameter replacement.
-        object.__setattr__(self, "_base_embedding_module", base_embedding_module)
+        if not isinstance(init_weight, torch.Tensor) or init_weight.ndim != 2:
+            raise ValueError("init_weight must be a rank-2 tensor")
+
+        # Keep base_weight as a Parameter (requires_grad=False) so torch.compile
+        # observes version-counter bumps from sync copy_() updates.
+        self.base_weight = nn.Parameter(
+            init_weight.detach().clone(),
+            requires_grad=False,
+        )
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
-        self.detach_base = bool(detach_base)
 
         self.bias: torch.nn.Parameter | None
         if add_bias:
-            # Bias is a full embedding matrix (same shape as base_weight). This matches DeBERTaV3 gdes behavior.
-            self.bias = nn.Parameter(torch.zeros_like(base_weight))
+            self.bias = nn.Parameter(torch.zeros_like(init_weight))
         else:
             self.bias = None
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Lookup embeddings from tied source weight.
+    @torch.no_grad()
+    def sync_from(self, weight: torch.Tensor) -> None:
+        """Copy generator weights into the local base buffer.
 
-        :param torch.Tensor input_ids: Input token ids.
+        :param torch.Tensor weight: Source embedding matrix from the generator.
+        :raises ValueError: If shapes differ from the local ``base_weight`` shape.
+        :return None: This method updates the local buffer in-place.
+        """
+        if weight.shape != self.base_weight.shape:
+            raise ValueError(
+                f"sync_from shape mismatch: src={tuple(weight.shape)} dst={tuple(self.base_weight.shape)}"
+            )
+        src = weight.detach()
+        if src.device != self.base_weight.device:
+            src = src.to(device=self.base_weight.device)
+        if src.dtype != self.base_weight.dtype:
+            src = src.to(dtype=self.base_weight.dtype)
+        self.base_weight.copy_(src)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token ids using synced base weights plus optional bias.
+
+        :param torch.Tensor input_ids: Token ids to embed.
         :return torch.Tensor: Embedded representations.
         """
-        base_mod = getattr(self, "_base_embedding_module", None)
-        w = getattr(base_mod, "weight", None)
-        if not isinstance(w, torch.Tensor):
-            raise RuntimeError("Base embedding module no longer exposes a `.weight` tensor.")
-
-        base_w = w.detach() if self.detach_base else w
-        out = F.embedding(input_ids, base_w, padding_idx=self.padding_idx)
-
+        out = F.embedding(input_ids, self.base_weight, padding_idx=self.padding_idx)
         if self.bias is not None:
-            # Efficient: lookup bias rows only (avoid constructing full base_w + bias).
             out = out + F.embedding(input_ids, self.bias, padding_idx=self.padding_idx)
-
         return out
 
 
@@ -150,14 +170,15 @@ class MLMTransform(nn.Module):
     """Projection-activation-norm transform used by MLM head."""
 
     def __init__(self, config: Any) -> None:
-        """Create MLM transform layers.
+        """Initialize the MLM transform stack.
 
-        :param Any config: Backbone config.
+        :param Any config: Backbone config containing hidden size, activation, and norm settings.
+        :return None: This constructor does not return a value.
         """
         super().__init__()
         hidden_size = int(config.hidden_size)
         self.dense = nn.Linear(hidden_size, hidden_size)
-        self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
+        self.act = get_act_fn(getattr(config, "hidden_act", "gelu"))
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", True)):
             self.norm = RMSNorm(hidden_size, eps=eps)
@@ -165,7 +186,7 @@ class MLMTransform(nn.Module):
             self.norm = nn.LayerNorm(hidden_size, eps=eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Transform hidden states before vocab projection.
+        """Project, activate, and normalize hidden states for MLM prediction.
 
         :param torch.Tensor hidden_states: Input hidden states.
         :return torch.Tensor: Transformed hidden states.
@@ -177,16 +198,17 @@ class MLMTransform(nn.Module):
 
 
 class MaskedLMHead(nn.Module):
-    """Generic masked LM head.
+    """Masked LM head.
 
-    We optionally tie the output projection to the input embeddings if dimensions match.
+    In tied mode we keep only the output bias and project using external embedding weights.
     """
 
     def __init__(self, config: Any, *, tie_word_embeddings: bool = True) -> None:
-        """Create masked language modeling head.
+        """Initialize the masked language modeling head.
 
-        :param Any config: Backbone config.
-        :param bool tie_word_embeddings: Whether to tie decoder to embeddings.
+        :param Any config: Generator config containing ``hidden_size`` and ``vocab_size``.
+        :param bool tie_word_embeddings: Whether to use external tied embedding weights for output projection.
+        :return None: This constructor does not return a value.
         """
         super().__init__()
         self.transform = MLMTransform(config)
@@ -195,7 +217,6 @@ class MaskedLMHead(nn.Module):
 
         self.tie_word_embeddings = bool(tie_word_embeddings)
         if self.tie_word_embeddings:
-            # Tied mode projects with external embedding weights; keep only output bias.
             self.decoder = None
             self.bias = nn.Parameter(torch.zeros(self.vocab_size))
         else:
@@ -205,11 +226,12 @@ class MaskedLMHead(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Project hidden states to vocabulary logits.
+        """Compute MLM logits from hidden states.
 
-        :param torch.Tensor hidden_states: Input hidden states.
-        :param torch.Tensor | None word_embedding_weight: Optional tied embedding weight.
-        :return torch.Tensor: Vocabulary logits.
+        :param torch.Tensor hidden_states: Hidden states for masked-token positions.
+        :param torch.Tensor | None word_embedding_weight: Tied embedding matrix when ``tie_word_embeddings`` is enabled.
+        :raises RuntimeError: If required tied embedding weights are missing or incompatible.
+        :return torch.Tensor: Token logits over the vocabulary.
         """
         x = self.transform(hidden_states)
 
@@ -223,10 +245,10 @@ class MaskedLMHead(nn.Module):
                     "Tied word_embedding_weight hidden size mismatch: "
                     f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
                 )
+
             w = word_embedding_weight
             b = self.bias
-            # Never cast the full embedding matrix in the hot path. Outside autocast,
-            # align dtypes by casting the much smaller activation tensor instead.
+            # Never cast the full embedding matrix. Outside autocast, cast the activation instead.
             if not torch.is_autocast_enabled() and x.dtype != w.dtype:
                 x = x.to(dtype=w.dtype)
             if b.dtype != w.dtype:
@@ -242,18 +264,18 @@ class RTDHead(nn.Module):
     """Discriminator head for replaced-token detection."""
 
     def __init__(self, config: Any) -> None:
-        """Create RTD discriminator head.
+        """Initialize discriminator token-classification head.
 
-        :param Any config: Backbone config.
+        :param Any config: Discriminator config with hidden size, dropout, activation, and norm settings.
+        :return None: This constructor does not return a value.
         """
         super().__init__()
         hidden_size = int(config.hidden_size)
         drop_out = getattr(config, "hidden_dropout_prob", 0.0)
         self.dropout = nn.Dropout(float(drop_out))
 
-        # A small transform helps stability.
         self.dense = nn.Linear(hidden_size, hidden_size)
-        self.act = _get_act_fn(getattr(config, "hidden_act", "gelu"))
+        self.act = get_act_fn(getattr(config, "hidden_act", "gelu"))
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", True)):
             self.norm = RMSNorm(hidden_size, eps=eps)
@@ -262,17 +284,16 @@ class RTDHead(nn.Module):
         self.classifier = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Compute RTD logits per token position.
+        """Compute replaced-token logits per token.
 
-        :param torch.Tensor hidden_states: Input hidden states.
-        :return torch.Tensor: RTD logits.
+        :param torch.Tensor hidden_states: Discriminator hidden states.
+        :return torch.Tensor: Scalar logit per token.
         """
         x = self.dropout(hidden_states)
         x = self.dense(x)
         x = self.act(x)
         x = self.norm(x)
-        logits = self.classifier(x).squeeze(-1)
-        return logits
+        return self.classifier(x).squeeze(-1)
 
 
 @dataclass
@@ -285,6 +306,7 @@ class RTDOutput:
     disc_accuracy: torch.Tensor
     gen_token_count: torch.Tensor
     disc_token_count: torch.Tensor
+    disc_positive_count: torch.Tensor
     gen_loss_raw: torch.Tensor
     disc_loss_raw: torch.Tensor
 
@@ -301,15 +323,19 @@ class DebertaV3RTDPretrainer(nn.Module):
         gen_config: Any,
         embedding_sharing: str = "gdes",
         tie_generator_word_embeddings: bool = True,
+        additional_forbidden_token_ids: Iterable[int] | None = None,
     ) -> None:
-        """Create combined generator+discriminator RTD module.
+        """Initialize RTD pretrainer with generator/discriminator backbones.
 
-        :param nn.Module discriminator_backbone: Discriminator encoder backbone.
-        :param nn.Module generator_backbone: Generator encoder backbone.
-        :param Any disc_config: Discriminator config.
-        :param Any gen_config: Generator config.
-        :param str embedding_sharing: Embedding sharing mode.
-        :param bool tie_generator_word_embeddings: Whether to tie generator LM head to embeddings.
+        :param nn.Module discriminator_backbone: Discriminator backbone model.
+        :param nn.Module generator_backbone: Generator backbone model.
+        :param Any disc_config: Discriminator configuration object.
+        :param Any gen_config: Generator configuration object.
+        :param str embedding_sharing: Embedding sharing mode (``none``, ``es``, or ``gdes``).
+        :param bool tie_generator_word_embeddings: Whether MLM output head is tied to generator word embeddings.
+        :param Iterable[int] | None additional_forbidden_token_ids: Optional extra token ids excluded from
+            generator sampling (for example tokenizer-only specials not represented on configs).
+        :return None: This constructor does not return a value.
         """
         super().__init__()
         self.disc_config = disc_config
@@ -321,108 +347,207 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.generator_lm_head = MaskedLMHead(gen_config, tie_word_embeddings=tie_generator_word_embeddings)
         self.discriminator_head = RTDHead(disc_config)
 
-        self.embedding_sharing = embedding_sharing
-        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids()
-        self._allowed_sample_token_ids_cpu = self._build_allowed_sample_token_ids()
-        self._allowed_sample_token_ids_by_device: dict[str, torch.Tensor] = {}
-        self._forbidden_sample_token_ids_by_device: dict[str, torch.Tensor] = {}
-        self._tied_embedding_attrs: tuple[str, ...] = ()
-        self._tied_embedding_bindings_validated = False
-        self._maybe_patch_discriminator_embeddings()
+        self.embedding_sharing = str(embedding_sharing or "none")
 
-    def _collect_forbidden_sample_token_ids(self) -> set[int]:
-        """Collect special token ids to exclude from generator replacement sampling.
+        # Special ids excluded from generator sampling.
+        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids(
+            additional_forbidden_token_ids=additional_forbidden_token_ids
+        )
 
-        :return set[int]: Special token ids bounded to generator vocab range.
+        vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
+        self.register_buffer(
+            "_forbidden_sample_token_mask",
+            self._build_forbidden_token_mask(
+                vocab_size=vocab_size, forbidden_ids=self._forbidden_sample_token_ids
+            ),
+            persistent=False,
+        )
+
+        # For GDES: list of (attr, disc_emb_module, gen_emb_module)
+        self._gdes_synced_embeddings: list[tuple[str, _SyncedBufferEmbedding, nn.Module]] = []
+
+        self._patch_discriminator_embeddings_for_sharing()
+
+    # ------------------------------
+    # Forbidden token mask helpers
+    # ------------------------------
+
+    @staticmethod
+    def _build_forbidden_token_mask(*, vocab_size: int, forbidden_ids: set[int]) -> torch.Tensor:
+        """Build boolean vocabulary mask for ids that must never be sampled.
+
+        :param int vocab_size: Generator vocabulary size.
+        :param set[int] forbidden_ids: Token ids disallowed for generator sampling.
+        :return torch.Tensor: Boolean mask of shape ``(vocab_size,)``.
         """
-        out: set[int] = set()
+        if vocab_size <= 0:
+            return torch.empty(0, dtype=torch.bool)
+        mask = torch.zeros(vocab_size, dtype=torch.bool)
+        valid = [int(tid) for tid in forbidden_ids if 0 <= int(tid) < vocab_size]
+        if valid:
+            mask[valid] = True
+        return mask
+
+    _SPECIAL_ID_ATTRS = (
+        "pad_token_id",
+        "cls_token_id",
+        "sep_token_id",
+        "mask_token_id",
+        "unk_token_id",
+        "bos_token_id",
+        "eos_token_id",
+    )
+
+    def _collect_forbidden_sample_token_ids(
+        self, *, additional_forbidden_token_ids: Iterable[int] | None = None
+    ) -> set[int]:
+        """Collect special token ids to exclude from generator sampling.
+
+        :return set[int]: Valid special token ids present in generator/discriminator configs.
+        """
         vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
         if vocab_size <= 0:
-            return out
+            return set()
 
+        candidates: list[Any] = []
         for cfg in (self.gen_config, self.disc_config):
-            for attr in (
-                "pad_token_id",
-                "cls_token_id",
-                "sep_token_id",
-                "mask_token_id",
-                "bos_token_id",
-                "eos_token_id",
-            ):
-                sid = getattr(cfg, attr, None)
-                if sid is None:
-                    continue
-                try:
-                    sid_i = int(sid)
-                except Exception:
-                    continue
-                if 0 <= sid_i < vocab_size:
-                    out.add(sid_i)
+            candidates.extend(getattr(cfg, attr, None) for attr in self._SPECIAL_ID_ATTRS)
+        if additional_forbidden_token_ids is not None:
+            candidates.extend(additional_forbidden_token_ids)
+
+        out: set[int] = set()
+        for sid in candidates:
+            if sid is None:
+                continue
+            try:
+                sid_i = int(sid)
+            except Exception:
+                continue
+            if 0 <= sid_i < vocab_size:
+                out.add(sid_i)
         return out
 
-    def _build_allowed_sample_token_ids(self) -> torch.Tensor | None:
-        """Build allowed generator replacement token ids.
+    # ------------------------------
+    # Embedding sharing
+    # ------------------------------
 
-        :return torch.Tensor | None: CPU tensor of sampleable token ids, or None.
+    def _patch_discriminator_embeddings_for_sharing(self) -> None:
+        """Apply configured embedding sharing policy to discriminator embeddings.
+
+        :raises ValueError: If ``embedding_sharing`` mode is unsupported or embedding shapes mismatch.
+        :raises RuntimeError: If expected embedding modules/weights are unavailable.
+        :return None: This method mutates discriminator embedding modules in-place.
         """
-        if not self._forbidden_sample_token_ids:
-            return None
+        mode = (self.embedding_sharing or "none").lower()
+        if mode not in {"none", "es", "gdes"}:
+            raise ValueError("embedding_sharing must be one of: none|es|gdes")
+        if mode == "none":
+            return
 
-        vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
-        if vocab_size <= 0:
-            return None
+        try:
+            gen_embeddings = self.generator.embeddings
+            disc_embeddings = self.discriminator.embeddings
+        except Exception as e:
+            raise RuntimeError(
+                "Expected backbones with an `.embeddings` module containing word_embeddings."
+            ) from e
 
-        allowed = torch.ones(vocab_size, dtype=torch.bool)
-        for sid in self._forbidden_sample_token_ids:
-            if 0 <= int(sid) < vocab_size:
-                allowed[int(sid)] = False
+        attrs = ("word_embeddings", "position_embeddings", "token_type_embeddings")
 
-        if not bool(allowed.any().item()):
-            return None
-        return torch.arange(vocab_size, dtype=torch.long)[allowed]
+        def _padding_idx(mod: nn.Module) -> int | None:
+            """Extract optional padding index from embedding-like module.
 
-    def _get_allowed_sample_token_ids(self, device: torch.device) -> torch.Tensor | None:
-        """Get cached allowed token ids on a device.
+            :param nn.Module mod: Embedding-like module.
+            :return int | None: Padding index when available.
+            """
+            val = getattr(mod, "padding_idx", None)
+            return int(val) if val is not None else None
 
-        :param torch.device device: Device for returned tensor.
-        :return torch.Tensor | None: Device-local allowed ids, or None.
+        def _weight(mod: nn.Module) -> torch.Tensor:
+            """Read required ``weight`` tensor from an embedding-like module.
+
+            :param nn.Module mod: Embedding-like module.
+            :raises RuntimeError: If module has no tensor ``weight`` attribute.
+            :return torch.Tensor: Embedding weight tensor.
+            """
+            w = getattr(mod, "weight", None)
+            if not isinstance(w, torch.Tensor):
+                raise RuntimeError("Embedding module must expose .weight tensor")
+            return w
+
+        def _validate(attr: str, gen_mod: nn.Module, disc_mod: nn.Module) -> torch.Tensor:
+            """Validate shareable shapes between generator and discriminator embedding modules.
+
+            :param str attr: Embedding attribute name.
+            :param nn.Module gen_mod: Generator embedding module.
+            :param nn.Module disc_mod: Discriminator embedding module.
+            :raises ValueError: If generator/discriminator weight shapes differ.
+            :return torch.Tensor: Generator embedding weight tensor.
+            """
+            gw = _weight(gen_mod)
+            dw = _weight(disc_mod)
+            if gw.shape != dw.shape:
+                raise ValueError(
+                    f"Cannot share embeddings for '{attr}': generator shape {tuple(gw.shape)} != discriminator shape {tuple(dw.shape)}."
+                )
+            return gw
+
+        if mode == "es":
+            # Share Parameters directly (compile-safe).
+            for attr in attrs:
+                gen_mod = getattr(gen_embeddings, attr, None)
+                disc_mod = getattr(disc_embeddings, attr, None)
+                if gen_mod is None or disc_mod is None:
+                    continue
+                gw = _validate(attr, gen_mod, disc_mod)
+                disc_mod.weight = gw  # type: ignore[assignment]
+            return
+
+        # GDES
+        for attr in attrs:
+            gen_mod = getattr(gen_embeddings, attr, None)
+            disc_mod = getattr(disc_embeddings, attr, None)
+            if gen_mod is None or disc_mod is None:
+                continue
+            gw = _validate(attr, gen_mod, disc_mod)
+
+            synced = _SyncedBufferEmbedding(
+                init_weight=gw,
+                padding_idx=_padding_idx(disc_mod),
+                add_bias=True,
+            )
+            setattr(disc_embeddings, attr, synced)
+            self._gdes_synced_embeddings.append((attr, synced, gen_mod))
+
+    @torch.no_grad()
+    def sync_discriminator_embeddings_from_generator(self) -> None:
+        """Sync GDES base weights from generator embedding weights.
+
+        Must be called after each optimizer step and after checkpoint load.
+        With gradient accumulation, discriminator base weights intentionally stay at
+        the last optimizer-step snapshot until the next sync call (one-step lag).
+        No-op unless embedding_sharing == 'gdes'.
         """
-        if self._allowed_sample_token_ids_cpu is None:
-            return None
 
-        key = f"{device.type}:{device.index if device.index is not None else -1}"
-        ids = self._allowed_sample_token_ids_by_device.get(key)
-        if ids is None:
-            ids = self._allowed_sample_token_ids_cpu.to(device=device)
-            self._allowed_sample_token_ids_by_device[key] = ids
-        return ids
+        mode = (self.embedding_sharing or "none").lower()
+        if mode != "gdes" or not self._gdes_synced_embeddings:
+            return
 
-    def _sample_generator_tokens(self, logits: torch.Tensor, *, sampling_temperature: float) -> torch.Tensor:
-        """Sample generator replacements from logits with optional special-id filtering.
+        for attr, disc_mod, gen_mod in self._gdes_synced_embeddings:
+            w = getattr(gen_mod, "weight", None)
+            if not isinstance(w, torch.Tensor):
+                raise RuntimeError(f"Generator embedding '{attr}' no longer exposes .weight")
+            disc_mod.sync_from(w)
 
-        :param torch.Tensor logits: Generator logits of shape (N, vocab_size).
-        :param float sampling_temperature: Positive sampling temperature.
-        :return torch.Tensor: Sampled token ids of shape (N,).
-        """
-        temp = float(sampling_temperature)
-        if temp <= 0:
-            raise ValueError("sampling_temperature must be > 0")
-
-        logits_f = logits.float()
-        allowed = self._get_allowed_sample_token_ids(logits.device)
-        if allowed is not None:
-            filtered_logits = logits_f.index_select(dim=-1, index=allowed)
-            probs = torch.softmax(filtered_logits / temp, dim=-1)
-            sampled_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            return allowed[sampled_idx]
-
-        probs = torch.softmax(logits_f / temp, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    # ------------------------------
+    # Generator helpers
+    # ------------------------------
 
     def _get_generator_word_embedding_weight(self) -> torch.Tensor:
-        """Return generator token embedding matrix for LM-head tying.
+        """Fetch generator word embedding weights used for MLM head tying.
 
-        :return torch.Tensor: Generator word embedding weights.
+        :raises RuntimeError: If generator embedding modules or weight tensor are unavailable.
+        :return torch.Tensor: Generator word embedding matrix.
         """
         embeddings = getattr(self.generator, "embeddings", None)
         if embeddings is None:
@@ -437,126 +562,71 @@ class DebertaV3RTDPretrainer(nn.Module):
             raise RuntimeError("Generator word_embeddings.weight must be a torch.Tensor.")
         return weight
 
-    def _special_position_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Build a boolean mask over configured special token ids.
+    # ------------------------------
+    # Sampling
+    # ------------------------------
 
-        :param torch.Tensor input_ids: Token ids shaped (B, S).
-        :return torch.Tensor: True at special-token positions.
+    @staticmethod
+    def _gumbel_sample(
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        forbidden_vocab_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sample token ids from categorical logits via Gumbel-max.
+
+        :param torch.Tensor logits: Unnormalized logits with vocabulary dimension on the last axis.
+        :param float temperature: Sampling temperature (> 0).
+        :param torch.Tensor | None forbidden_vocab_mask: Optional boolean mask over vocabulary ids to suppress.
+        :raises ValueError: If ``temperature`` is non-positive or the mask forbids every token for a row.
+        :return torch.Tensor: Sampled token ids for each row of ``logits``.
         """
-        if not self._forbidden_sample_token_ids:
-            return torch.zeros_like(input_ids, dtype=torch.bool)
-        key = (
-            f"{input_ids.device.type}:{input_ids.device.index if input_ids.device.index is not None else -1}"
-        )
-        forbidden = self._forbidden_sample_token_ids_by_device.get(key)
-        if forbidden is None:
-            forbidden = torch.tensor(
-                sorted(int(sid) for sid in self._forbidden_sample_token_ids),
-                device=input_ids.device,
-            )
-            self._forbidden_sample_token_ids_by_device[key] = forbidden
-        return torch.isin(input_ids, forbidden)
 
-    def _maybe_patch_discriminator_embeddings(self) -> None:
-        """Patch discriminator embeddings to follow configured sharing mode."""
-        mode = (self.embedding_sharing or "none").lower()
-        if mode not in {"none", "es", "gdes"}:
-            raise ValueError("embedding_sharing must be one of: none|es|gdes")
-        if mode == "none":
-            self._tied_embedding_attrs = ()
-            return
+        temp = float(temperature)
+        if temp <= 0:
+            raise ValueError("sampling_temperature must be > 0")
 
-        # We avoid sharing module instances (FSDP2 hazard). Tied adapters keep an
-        # unregistered strong ref to the generator embedding module.
-        try:
-            gen_embeddings = self.generator.embeddings
-            disc_embeddings = self.discriminator.embeddings
-        except Exception as e:
-            raise RuntimeError(
-                "Expected backbones with an `.embeddings` module containing `word_embeddings`. "
-                "Use backbone_type='rope' or HF DebertaV2Model-like backbones."
-            ) from e
+        x = logits.float() / temp
+        if forbidden_vocab_mask is not None and forbidden_vocab_mask.numel() != 0:
+            if forbidden_vocab_mask.device != x.device:
+                forbidden_vocab_mask = forbidden_vocab_mask.to(device=x.device)
+            mask = forbidden_vocab_mask.to(dtype=torch.bool)
+            if mask.ndim == 1:
+                if int(mask.shape[0]) != int(x.shape[-1]):
+                    raise ValueError(
+                        "forbidden_vocab_mask length must match logits vocabulary dimension: "
+                        f"{int(mask.shape[0])} vs {int(x.shape[-1])}."
+                    )
+                if bool(mask.all().item()):
+                    raise ValueError(
+                        "forbidden_vocab_mask excludes all vocabulary ids; at least one token must remain sampleable."
+                    )
+            else:
+                if int(mask.shape[-1]) != int(x.shape[-1]):
+                    raise ValueError(
+                        "forbidden_vocab_mask last dimension must match logits vocabulary dimension: "
+                        f"{int(mask.shape[-1])} vs {int(x.shape[-1])}."
+                    )
+                try:
+                    expanded = mask.expand_as(x)
+                except RuntimeError as exc:
+                    raise ValueError(
+                        "forbidden_vocab_mask with rank > 1 must be broadcastable to logits."
+                    ) from exc
+                if bool(expanded.all(dim=-1).any().item()):
+                    raise ValueError(
+                        "forbidden_vocab_mask excludes all vocabulary ids for at least one row; "
+                        "at least one token must remain sampleable."
+                    )
+            x = x.masked_fill(mask, -1e9)
 
-        detach_base = mode == "gdes"
-        add_bias = mode == "gdes"
-        tied_attrs: list[str] = []
+        u = torch.rand_like(x).clamp_(min=1e-6, max=1.0 - 1e-6)
+        g = -torch.log(-torch.log(u))
+        return torch.argmax(x + g, dim=-1)
 
-        # Helper: tie attribute if present on both
-        def tie_attr(attr: str) -> None:
-            """Tie one embedding attribute between generator and discriminator.
-
-            :param str attr: Embedding attribute name.
-            """
-            gen_mod = getattr(gen_embeddings, attr, None)
-            disc_mod = getattr(disc_embeddings, attr, None)
-            if gen_mod is None or disc_mod is None:
-                return
-            if not hasattr(gen_mod, "weight") or not hasattr(disc_mod, "weight"):
-                return
-            if gen_mod.weight.shape != disc_mod.weight.shape:
-                raise ValueError(
-                    f"Cannot share embeddings for '{attr}': generator shape {tuple(gen_mod.weight.shape)} != discriminator shape {tuple(disc_mod.weight.shape)}. "
-                    "Set embedding_sharing=none or make hidden_size match."
-                )
-            setattr(
-                disc_embeddings,
-                attr,
-                _TiedEmbedding(
-                    base_embedding_module=gen_mod,
-                    padding_idx=getattr(disc_mod, "padding_idx", None),
-                    detach_base=detach_base,
-                    add_bias=add_bias,
-                ),
-            )
-            tied_attrs.append(attr)
-
-        tie_attr("word_embeddings")
-        tie_attr("position_embeddings")
-        tie_attr("token_type_embeddings")
-        self._tied_embedding_attrs = tuple(tied_attrs)
-
-    def _validate_tied_embedding_bindings(self) -> None:
-        """Ensure tied embedding adapters still point to live generator modules.
-
-        :raises RuntimeError: If generator/discriminator embedding surgery left stale ties.
-        """
-        if not self._tied_embedding_attrs:
-            return
-
-        try:
-            gen_embeddings = self.generator.embeddings
-            disc_embeddings = self.discriminator.embeddings
-        except Exception as e:
-            raise RuntimeError(
-                "Expected generator/discriminator backbones with `.embeddings` modules while validating "
-                "tied embedding adapters."
-            ) from e
-
-        stale: list[str] = []
-        for attr in self._tied_embedding_attrs:
-            gen_mod = getattr(gen_embeddings, attr, None)
-            disc_mod = getattr(disc_embeddings, attr, None)
-            if not isinstance(disc_mod, _TiedEmbedding):
-                stale.append(attr)
-                continue
-            base_mod = getattr(disc_mod, "_base_embedding_module", None)
-            if gen_mod is None or base_mod is None:
-                stale.append(attr)
-                continue
-            gen_weight = getattr(gen_mod, "weight", None)
-            base_weight = getattr(base_mod, "weight", None)
-            if not isinstance(gen_weight, torch.Tensor) or not isinstance(base_weight, torch.Tensor):
-                stale.append(attr)
-                continue
-            if gen_weight.data_ptr() != base_weight.data_ptr():
-                stale.append(attr)
-
-        if stale:
-            names = ", ".join(sorted(stale))
-            raise RuntimeError(
-                "Detected stale tied embeddings after module replacement for: "
-                f"{names}. Recreate DebertaV3RTDPretrainer to rebind embedding sharing."
-            )
+    # ------------------------------
+    # Forward
+    # ------------------------------
 
     def forward(
         self,
@@ -570,28 +640,29 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_loss_weight: float = 50.0,
         decoupled_loss_scaling: bool = False,
     ) -> RTDOutput:
-        """Run one ELECTRA-style forward pass.
+        """Run one RTD forward pass with generator corruption and discriminator scoring.
 
-        :param torch.Tensor input_ids: Masked input ids.
-        :param torch.Tensor | None attention_mask: Binary mask (1 real token, 0 pad).
-        :param torch.Tensor labels: Original token ids at masked positions, else -100.
+        :param torch.Tensor input_ids: Input token ids with shape ``(B, S)``.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor labels: MLM labels with ``-100`` for non-masked positions.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
-        :param float sampling_temperature: Sampling temperature for generator tokens.
-        :param float gen_loss_weight: Generator loss weight.
-        :param float disc_loss_weight: Discriminator loss weight.
-        :param bool decoupled_loss_scaling: Whether to apply decoupled loss scaling.
-        :return RTDOutput: Total loss plus generator/discriminator diagnostics.
+        :param float sampling_temperature: Generator sampling temperature.
+        :param float gen_loss_weight: Scalar multiplier for generator term.
+        :param float disc_loss_weight: Scalar multiplier for discriminator term.
+        :param bool decoupled_loss_scaling: Whether to apply detached discriminator/gen scaling to generator term.
+        :raises ValueError: If labels are missing.
+        :return RTDOutput: Total loss plus detached logging metrics and raw differentiable loss terms.
         """
 
         if labels is None:
             raise ValueError("labels must be provided (MLM labels with -100 for unmasked positions)")
-        if not self._tied_embedding_bindings_validated:
-            self._validate_tied_embedding_bindings()
-            self._tied_embedding_bindings_validated = True
 
-        # -------------------
+        masked_positions = labels.ne(-100)  # (B,S)
+        masked_flat = masked_positions.view(-1)
+        masked_idx = torch.nonzero(masked_flat, as_tuple=False).squeeze(-1)  # (N,)
+        gen_token_count = masked_flat.sum().to(dtype=torch.float32)
+
         # Generator
-        # -------------------
         gen_out = self.generator(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -600,35 +671,62 @@ class DebertaV3RTDPretrainer(nn.Module):
         )
         hidden = gen_out.last_hidden_state
 
-        masked = labels.ne(-100)
-        gen_token_count = masked.to(torch.float32).sum()
-        if masked.any():
-            masked_hidden = hidden[masked]
-            # Compute logits only on masked positions.
+        corrupted_input_ids = input_ids
+        disc_labels = torch.zeros_like(input_ids, dtype=torch.float32)
+
+        if masked_idx.numel() == 0:
+            gen_loss = hidden.sum() * 0.0
+            disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+            gen_term = compute_generator_loss_term(
+                gen_loss=gen_loss,
+                disc_loss=disc_zero,
+                decoupled_loss_scaling=decoupled_loss_scaling,
+            )
+            total = float(gen_loss_weight) * gen_term
+            # Degenerate batch: no supervised generator targets, so skip discriminator
+            # entirely instead of logging a weighted all-negative discriminator step.
+            return RTDOutput(
+                loss=total,
+                gen_loss=gen_loss.detach(),
+                disc_loss=disc_zero.detach(),
+                disc_accuracy=disc_zero.detach(),
+                gen_token_count=gen_token_count.detach(),
+                disc_token_count=disc_zero.detach(),
+                disc_positive_count=disc_zero.detach(),
+                gen_loss_raw=gen_loss,
+                disc_loss_raw=disc_zero,
+            )
+        else:
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            masked_hidden = hidden_flat.index_select(0, masked_idx)
+
+            labels_flat = labels.view(-1)
+            masked_labels = labels_flat.index_select(0, masked_idx)
+
             word_w = self._get_generator_word_embedding_weight()
             gen_logits = self.generator_lm_head(masked_hidden, word_embedding_weight=word_w)
-            gen_labels = labels[masked]
-            gen_loss = F.cross_entropy(gen_logits.float(), gen_labels)
+            gen_loss = F.cross_entropy(gen_logits.float(), masked_labels)
 
-            # Sample replacements from detached logits.
             with torch.no_grad():
-                sampled = self._sample_generator_tokens(gen_logits, sampling_temperature=sampling_temperature)
+                forbidden_mask = getattr(self, "_forbidden_sample_token_mask", None)
+                sampled = self._gumbel_sample(
+                    gen_logits,
+                    temperature=sampling_temperature,
+                    forbidden_vocab_mask=forbidden_mask,
+                ).to(dtype=input_ids.dtype)
 
-            corrupted_input_ids = input_ids.clone()
-            corrupted_input_ids[masked] = sampled
+                # Corrupt ids — functional scatter returns a new tensor (no clone needed).
+                corrupted_flat = input_ids.view(-1).scatter(0, masked_idx, sampled)
+                corrupted_input_ids = corrupted_flat.view_as(input_ids)
 
-            # discriminator labels: 1 if replaced, 0 otherwise
-            disc_labels = torch.zeros_like(input_ids, dtype=torch.float32)
-            disc_labels[masked] = (sampled != gen_labels).float()
-        else:
-            # Degenerate case: no masked tokens (very small sequences or mlm_probability=0)
-            gen_loss = hidden.sum() * 0.0
-            corrupted_input_ids = input_ids
-            disc_labels = torch.zeros_like(input_ids, dtype=torch.float32)
+                replaced = sampled.ne(masked_labels.to(dtype=sampled.dtype)).to(dtype=torch.float32)
+                disc_labels_flat = torch.zeros(
+                    input_ids.numel(), dtype=torch.float32, device=input_ids.device
+                )
+                disc_labels_flat.scatter_(0, masked_idx, replaced)
+                disc_labels = disc_labels_flat.view_as(input_ids)
 
-        # -------------------
         # Discriminator
-        # -------------------
         disc_out = self.discriminator(
             input_ids=corrupted_input_ids,
             attention_mask=attention_mask,
@@ -638,46 +736,49 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_hidden = disc_out.last_hidden_state
         disc_logits = self.discriminator_head(disc_hidden)
 
+        pad_token_id = getattr(self.disc_config, "pad_token_id", None)
         active = attention_mask_to_active_tokens(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            pad_token_id=getattr(self.disc_config, "pad_token_id", None),
+            pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
         )
+        # RTD supervision targets all active (non-padding) positions.
+        # [CLS]/[SEP] are never corruption candidates in the collator, so they
+        # contribute valid all-negative discriminator labels here.
+        disc_active = active
 
-        # Exclude structural specials from discriminator loss, but keep all masked
-        # positions active even if the original token id is special.
-        special_on_original = self._special_position_mask(input_ids)
-        special = special_on_original & (~masked)
-        active = active & (~special)
-        disc_token_count = active.to(torch.float32).sum()
+        disc_active_f = disc_active.to(dtype=torch.float32)
+        disc_token_count = disc_active_f.sum()
+        disc_denom = disc_token_count.clamp(min=1.0)
 
-        if bool(active.any().item()):
-            disc_loss = F.binary_cross_entropy_with_logits(disc_logits[active].float(), disc_labels[active])
-            # Accuracy for monitoring: threshold at 0
-            with torch.no_grad():
-                pred = (disc_logits[active] > 0).to(torch.float32)
-                disc_acc = (pred == disc_labels[active]).to(torch.float32).mean()
-        else:
-            disc_loss = disc_logits.sum() * 0.0
-            disc_acc = disc_logits.sum() * 0.0
+        disc_loss_per_token = F.binary_cross_entropy_with_logits(
+            disc_logits.float(),
+            disc_labels.float(),
+            reduction="none",
+        )
+        disc_loss = (disc_loss_per_token * disc_active_f).sum() / disc_denom
 
-        # -------------------
-        # Total
-        # -------------------
-        gen_loss_scaled = compute_generator_loss_term(
+        disc_pred = disc_logits.gt(0)
+        disc_true = disc_labels.gt(0.5)
+        disc_positive_count = (disc_true.to(dtype=torch.float32) * disc_active_f).sum()
+        correct = (disc_pred == disc_true).to(dtype=torch.float32) * disc_active_f
+        disc_acc = correct.sum() / disc_denom
+
+        gen_term = compute_generator_loss_term(
             gen_loss=gen_loss,
             disc_loss=disc_loss,
-            decoupled_loss_scaling=bool(decoupled_loss_scaling),
+            decoupled_loss_scaling=decoupled_loss_scaling,
         )
+        total = float(gen_loss_weight) * gen_term + float(disc_loss_weight) * disc_loss
 
-        total = float(gen_loss_weight) * gen_loss_scaled + float(disc_loss_weight) * disc_loss
         return RTDOutput(
             loss=total,
             gen_loss=gen_loss.detach(),
             disc_loss=disc_loss.detach(),
-            disc_accuracy=disc_acc,
+            disc_accuracy=disc_acc.detach(),
             gen_token_count=gen_token_count.detach(),
             disc_token_count=disc_token_count.detach(),
+            disc_positive_count=disc_positive_count.detach(),
             gen_loss_raw=gen_loss,
             disc_loss_raw=disc_loss,
         )

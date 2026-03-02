@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,7 +39,8 @@ class DebertaV3ElectraCollator:
       - token_type_ids (if present)
 
     Notes:
-      - We honor `special_tokens_mask` if provided.
+      - If `special_tokens_mask` is provided, we merge it with tokenizer-inferred
+        special ids so upstream partial masks cannot unprotect tokenizer specials.
       - Default behavior mirrors BERT's 80/10/10 replacement.
       - Supports optional whole-word n-gram masking (max_ngram > 1) as used by DeBERTa.
     """
@@ -82,6 +86,11 @@ class DebertaV3ElectraCollator:
         self._non_special_token_ids_cpu = self._build_non_special_token_ids()
         self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
         self._word_boundary_scheme = self._detect_word_boundary_scheme()
+        if int(self.cfg.max_ngram) > 1 and self._word_boundary_scheme == "none":
+            logger.warning(
+                "Tokenizer word-boundary probe returned scheme='none'; "
+                "whole-word n-gram masking will degrade to conservative token-level groups."
+            )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         features = self._harmonize_optional_attention_masks(features)
@@ -112,13 +121,17 @@ class DebertaV3ElectraCollator:
                     batch["attention_mask"] = attn.long()
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
+        inferred_special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
         if special_tokens_mask is None:
-            special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
+            special_tokens_mask = inferred_special_tokens_mask
         else:
-            special_tokens_mask = special_tokens_mask.bool()
+            # Some upstream datasets (for example packed streaming) may only tag
+            # structural specials (CLS/SEP/PAD). Union with tokenizer-level specials
+            # so corruption targets stay aligned with forbidden sampling ids.
+            special_tokens_mask = special_tokens_mask.bool() | inferred_special_tokens_mask
 
-        block_mask = (
-            self._build_document_attention_mask(
+        doc_ids = (
+            self._compute_document_ids(
                 input_ids=batch["input_ids"],
                 special_tokens_mask=special_tokens_mask,
                 attention_mask=batch.get("attention_mask"),
@@ -126,9 +139,8 @@ class DebertaV3ElectraCollator:
             if self._packed_sequences and self._block_cross_document_attention
             else None
         )
-        if block_mask is not None:
-            # Keep packed pairwise masks in bool form to avoid pointless int64 expansion.
-            batch["attention_mask"] = block_mask
+        if doc_ids is not None:
+            batch["doc_ids"] = doc_ids
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
@@ -201,12 +213,24 @@ class DebertaV3ElectraCollator:
             out.add(int(pad_id))
         return out
 
+    @staticmethod
+    def _effective_vocab_size(tokenizer: Any) -> int:
+        """Return the full tokenizer vocabulary size including added tokens.
+
+        :param Any tokenizer: Tokenizer instance.
+        :return int: Effective vocabulary size.
+        """
+        try:
+            return int(len(tokenizer))
+        except TypeError:
+            return int(tokenizer.vocab_size)
+
     def _build_non_special_token_ids(self) -> torch.Tensor | None:
         """Build tensor of non-special token ids for random replacement.
 
         :return torch.Tensor | None: CPU tensor of non-special ids, or None.
         """
-        vocab_size = int(self.tokenizer.vocab_size)
+        vocab_size = self._effective_vocab_size(self.tokenizer)
         if not self._special_token_ids:
             return None
 
@@ -227,7 +251,9 @@ class DebertaV3ElectraCollator:
         :return torch.Tensor: Random token ids.
         """
         if self._non_special_token_ids_cpu is None:
-            return torch.randint(low=0, high=int(self.tokenizer.vocab_size), size=shape, device=device)
+            return torch.randint(
+                low=0, high=self._effective_vocab_size(self.tokenizer), size=shape, device=device
+            )
 
         key = f"{device.type}:{device.index if device.index is not None else -1}"
         ids = self._non_special_token_ids_by_device.get(key)
@@ -303,22 +329,24 @@ class DebertaV3ElectraCollator:
             return "gpt2"
         return "none"
 
-    def _build_document_attention_mask(
+    def _compute_document_ids(
         self,
         *,
         input_ids: torch.Tensor,
         special_tokens_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        """Build pairwise attention keep-mask that blocks cross-document attention.
+        """Compute per-token document ids for cross-document attention blocking.
 
-        This is only enabled when internal separator tokens are present in a sequence,
-        which indicates packed multi-document input.
+        Returns a compact ``(B, S)`` long tensor of document ids (1-based for active
+        tokens, 0 for padding) instead of a dense ``(B, S, S)`` pairwise mask.  The
+        pairwise mask is constructed on-device in the training loop to avoid CPU→GPU
+        transfer of O(B*S²) data.
 
         :param torch.Tensor input_ids: Batch token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Boolean special-token mask (B, S).
         :param torch.Tensor | None attention_mask: Optional 2D active-token mask (B, S).
-        :return torch.Tensor | None: Pairwise keep-mask (B, S, S), or ``None`` when unnecessary.
+        :return torch.Tensor | None: Document ids ``(B, S)`` long, or ``None`` when unnecessary.
         """
         if input_ids.ndim != 2:
             return None
@@ -341,7 +369,7 @@ class DebertaV3ElectraCollator:
             active = torch.ones_like(input_ids, dtype=torch.bool)
 
         # Packed batches that contain only single-document chunks have no internal
-        # separators and do not need a dense pairwise mask.
+        # separators and do not need doc-blocking metadata.
         internal_sep_positions = sep_positions[:, 1:-1] & active[:, 1:-1]
         if not bool(internal_sep_positions.any().item()):
             return None
@@ -362,15 +390,7 @@ class DebertaV3ElectraCollator:
         if pad_id is not None:
             doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
 
-        # TODO(roadmap): replace dense (B,S,S) mask materialization with compact doc-boundary
-        # metadata and construct block structure lazily on device.
-        same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
-        keep = same_doc & active[:, :, None] & active[:, None, :]
-
-        # Guarantee at least self-attend for active queries to avoid all-masked rows.
-        eye = torch.eye(input_ids.shape[1], dtype=torch.bool, device=input_ids.device).unsqueeze(0)
-        keep = keep | (active[:, :, None] & eye)
-        return keep
+        return doc_ids
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
@@ -409,7 +429,8 @@ class DebertaV3ElectraCollator:
         mask_token_id = int(self.tokenizer.mask_token_id)
 
         # Use a fixed budget per sequence (rounded from maskable count) to stabilize
-        # effective masked-token counts across microbatches.
+        # effective masked-token counts across microbatches. This executes in eager
+        # collator workers (not under torch.compile graph capture).
         maskable = ~special_tokens_mask
         if pad_token_id is not None:
             maskable = maskable & input_ids.ne(int(pad_token_id))
@@ -466,6 +487,8 @@ class DebertaV3ElectraCollator:
         Implementation notes:
           - We group sub-tokens into "words" using tokenizer token string heuristics.
           - We sample contiguous spans of whole words with an n-gram distribution p(n) ∝ 1/n.
+          - Mask budget is approximate at whole-word granularity; we do not split selected words
+            or add subword-level tail fills.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
@@ -511,66 +534,62 @@ class DebertaV3ElectraCollator:
             if not word_groups:
                 continue
 
-            masked: list[int] = []
-            masked_set = set()
+            selected_groups: list[list[int]] = []
+            selected_group_ids: set[int] = set()
+            selected_token_count = 0
 
             # Try a bounded number of attempts to fill the mask budget.
             # (Avoids pathological loops on very short / heavily special-token sequences.)
             max_attempts = max(50, 10 * len(word_groups))
             attempts = 0
 
-            while len(masked) < num_to_mask and attempts < max_attempts:
+            while selected_token_count < num_to_mask and attempts < max_attempts:
                 attempts += 1
 
                 start = int(torch.randint(low=0, high=len(word_groups), size=(1,)).item())
                 n = int(torch.multinomial(probs, 1).item()) + 1
 
-                span = word_groups[start : start + n]
-                if not span:
+                end = min(start + n, len(word_groups))
+                if end <= start:
                     continue
 
-                # Flatten span indices and filter already-masked.
-                span_indices: list[int] = []
-                for g in span:
-                    for idx in g:
-                        if idx in maskable_set and idx not in masked_set:
-                            span_indices.append(idx)
-
-                if not span_indices:
-                    continue
-
-                # Add tokens until we hit the budget.
-                for idx in span_indices:
-                    if len(masked) >= num_to_mask:
+                span_added = False
+                for group_id in range(start, end):
+                    if group_id in selected_group_ids:
+                        continue
+                    group = word_groups[group_id]
+                    group_maskable = [idx for idx in group if idx in maskable_set]
+                    if not group_maskable:
+                        continue
+                    selected_group_ids.add(group_id)
+                    selected_groups.append(group_maskable)
+                    selected_token_count += len(group_maskable)
+                    span_added = True
+                    if selected_token_count >= num_to_mask:
                         break
-                    masked.append(idx)
-                    masked_set.add(idx)
+                if not span_added:
+                    continue
 
-            if not masked:
+            if not selected_groups:
                 continue
 
-            if len(masked) < num_to_mask:
-                remaining_candidates = [idx for idx in maskable_set if idx not in masked_set]
-                if remaining_candidates:
-                    missing = num_to_mask - len(masked)
-                    fill = torch.randperm(len(remaining_candidates))[:missing].tolist()
-                    for idx in (remaining_candidates[i] for i in fill):
-                        if idx not in masked_set:
-                            masked.append(idx)
-                            masked_set.add(idx)
-
             # Apply replacements.
-            for idx in masked:
-                labels[b, idx] = ids[idx]
-
+            for group in selected_groups:
                 r = float(torch.rand(1).item())
+                replacement_mode: str | None = None
                 if r < float(self.cfg.mask_token_prob):
-                    input_ids[b, idx] = mask_token_id
+                    replacement_mode = "mask"
                 elif r < float(self.cfg.mask_token_prob) + float(self.cfg.random_token_prob):
-                    input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
-                else:
-                    # Keep original.
-                    pass
+                    replacement_mode = "random"
+
+                for idx in group:
+                    labels[b, idx] = ids[idx]
+                    if replacement_mode == "mask":
+                        input_ids[b, idx] = mask_token_id
+                    elif replacement_mode == "random":
+                        # Keep replacement TYPE coherent per whole-word group, but sample
+                        # random token IDs per subtoken to avoid repeated-token artifacts.
+                        input_ids[b, idx] = self._sample_one_random_word(input_ids.device)
 
         return input_ids, labels
 

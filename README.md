@@ -2,18 +2,6 @@
 
 A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with RoPE, Accelerate, and FSDP2 workflows.
 
----
-
-- [Install](#install)
-- [CLI Entrypoints](#cli-entrypoints)
-- [Quickstart](#quickstart)
-- [Documentation](#documentation)
-- [Configs](#configs)
-- [Repo Layout](#repo-layout)
-- [Citations](#citations)
-
----
-
 ## Install
 
 Clone + editable install:
@@ -32,12 +20,6 @@ pip install -e '.[dev]'
 pip install -e '.[wandb]'
 ```
 
-Direct install from GitHub:
-
-```bash
-pip install "git+https://github.com/pszemraj/deberta.git"
-```
-
 ## CLI Entrypoints
 
 `pyproject.toml` defines installable commands:
@@ -50,40 +32,64 @@ Use `--help` on each command for full argument docs.
 
 ## Quickstart
 
-Train from YAML (recommended):
+Single-GPU training:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
+deberta train configs/pretrain_rope_fineweb_edu.yaml \
+  --output-dir runs/deberta_rope_single_gpu
+```
+
+Preflight validation only (no training side effects):
+
+```bash
+deberta train configs/pretrain_rope_fineweb_edu.yaml --dry-run
+```
+
+Preset-driven DeBERTa-v3-base starter (no config file):
+
+```bash
+deberta train --preset deberta-v3-base
+```
+
+Single-GPU export:
+
+```bash
+deberta export runs/deberta_rope_single_gpu/checkpoint-10000 \
+  --what discriminator \
+  --output-dir runs/deberta_rope_single_gpu/exported_hf
+```
+
+FSDP2 parallel training:
+
+```bash
+accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
   deberta train configs/pretrain_rope_fineweb_edu.yaml
 ```
 
-Long-context presets:
+FSDP2 parallel export:
 
 ```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_fineweb_edu_2048.yaml
-```
-
-```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python \
-  deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
-```
-
-Export from an FSDP2 checkpoint:
-
-```bash
-accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta export \
+accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta export \
   runs/deberta_rope_rtd/checkpoint-10000 \
   --what discriminator \
   --output-dir runs/deberta_rope_rtd/exported_hf
 ```
 
+Long-context and custom debug presets live under [`configs/`](configs/).
+
+For distributed/FSDP2 runtime behavior and export details, see [`docs/fsdp2.md`](docs/fsdp2.md).
+
+For `backbone_type=rope` exports, load with `deberta.modeling.rope_encoder.DebertaRoPEModel.from_pretrained(...)`.
+`transformers.AutoModel.from_pretrained(...)` does not currently support `model_type=deberta-rope` out of the box.
+
 ## Documentation
 
 - Model/backbone config and architecture behavior (including load/source resolution contract): [`docs/model.md`](docs/model.md)
+- Strict DeBERTa-v2/v3 replication settings and preset behavior: [`docs/replication.md`](docs/replication.md)
 - Data pipeline, packing, and masking behavior: [`docs/data.md`](docs/data.md)
 - RTD objective and loss semantics: [`docs/objective.md`](docs/objective.md)
 - FSDP2/runtime/export behavior: [`docs/fsdp2.md`](docs/fsdp2.md)
+- Dev/runtime implementation notes and tracked compatibility breaks: [`docs/dev.md`](docs/dev.md)
 - Normalization strategy (`post` default, `keel` upgrade path): [`docs/norm-strategy.md`](docs/norm-strategy.md)
 - Deferred follow-ups: [`docs/roadmap.md`](docs/roadmap.md)
 
@@ -92,15 +98,7 @@ accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta exp
 - Base pretraining config: [`configs/pretrain_rope_fineweb_edu.yaml`](configs/pretrain_rope_fineweb_edu.yaml)
 - Long context: [`configs/pretrain_rope_fineweb_edu_2048.yaml`](configs/pretrain_rope_fineweb_edu_2048.yaml), [`configs/pretrain_rope_fineweb_edu_4096.yaml`](configs/pretrain_rope_fineweb_edu_4096.yaml)
 - CPU smoke: [`configs/tiny_cpu_smoke.yaml`](configs/tiny_cpu_smoke.yaml)
-- Accelerate/FSDP2: [`configs/fsdp2_1node.yaml`](configs/fsdp2_1node.yaml), [`configs/fsdp2_hf_deberta_1node.yaml`](configs/fsdp2_hf_deberta_1node.yaml)
-
-## Repo Layout
-
-- `src/deberta/` - package source
-- `src/deberta/training/pretrain.py` - training loop
-- `src/deberta/export_cli.py` - FSDP-aware exporter
-- `configs/` - training and accelerate configs
-- `docs/` - canonical docs by concept
+- Accelerate/FSDP2: [`configs/accelerate/fsdp2_1node.yaml`](configs/accelerate/fsdp2_1node.yaml), [`configs/accelerate/fsdp2_hf_deberta_1node.yaml`](configs/accelerate/fsdp2_hf_deberta_1node.yaml)
 
 ## Citations
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, fields
+from typing import TypeVar
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _NORM_ARCH_CHOICES = {"post", "keel"}
@@ -10,6 +12,18 @@ _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
 _FFN_CHOICES = {"swiglu", "mlp"}
 _EMBED_SHARING_CHOICES = {"none", "es", "gdes"}
 _REPORT_TO_CHOICES = {"none", "wandb", "tensorboard"}
+_WANDB_WATCH_CHOICES = {"none", "gradients", "parameters", "all"}
+_WANDB_WATCH_ALIASES = {
+    "off": "none",
+    "disabled": "none",
+    "false": "none",
+    "0": "none",
+    "grad": "gradients",
+    "gradient": "gradients",
+    "weights": "parameters",
+    "params": "parameters",
+    "param": "parameters",
+}
 _LR_SCHEDULER_CHOICES = {
     "linear",
     "cosine",
@@ -18,7 +32,8 @@ _LR_SCHEDULER_CHOICES = {
     "constant",
     "constant_with_warmup",
 }
-_SDPA_KERNEL_CHOICES = {"auto", "flash", "mem_efficient", "math", "flash_only"}
+_RESUME_DATA_STRATEGY_CHOICES = {"auto", "replay", "restart_epoch"}
+_SDPA_KERNEL_CHOICES = {"auto", "flash", "mem_efficient", "math"}
 _SDPA_KERNEL_ALIASES = {
     "mem": "mem_efficient",
     "mem-efficient": "mem_efficient",
@@ -36,6 +51,45 @@ _TORCH_COMPILE_MODE_ALIASES = {
     "reduce_overhead": "reduce-overhead",
     "max_autotune": "max-autotune",
     "max_autotune_no_cudagraphs": "max-autotune-no-cudagraphs",
+}
+_TORCH_COMPILE_SCOPE_CHOICES = {
+    "auto",
+    "backbones",
+    "encoder",
+    "gen_encoder",
+    "disc_encoder",
+    "ffn",
+    "gen_ffn",
+    "disc_ffn",
+}
+_TORCH_COMPILE_SCOPE_ALIASES = {
+    "both": "backbones",
+    "backbone": "backbones",
+    "full": "backbones",
+    "encoder": "encoder",
+    "encoders": "encoder",
+    "gen_encoder": "gen_encoder",
+    "generator_encoder": "gen_encoder",
+    "disc_encoder": "disc_encoder",
+    "discriminator_encoder": "disc_encoder",
+    "ffn": "ffn",
+    "ffns": "ffn",
+    "gen_ffn": "gen_ffn",
+    "generator_ffn": "gen_ffn",
+    "disc_ffn": "disc_ffn",
+    "discriminator_ffn": "disc_ffn",
+}
+_TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
+_TORCH_COMPILE_BACKEND_ALIASES = {
+    "aot-eager": "aot_eager",
+}
+_HF_ATTN_KERNEL_CHOICES = {"dynamic", "cached_bmm", "stable"}
+_HF_ATTN_KERNEL_ALIASES = {
+    "default": "dynamic",
+    "cache": "cached_bmm",
+    "cached": "cached_bmm",
+    "safe": "stable",
+    "compile_safe": "stable",
 }
 _MIXED_PRECISION_CANONICAL = {"bf16", "no"}
 _MIXED_PRECISION_ALIASES = {
@@ -58,7 +112,10 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
     "microsoft/deberta-v3",
     "microsoft/mdeberta-v3",
 )
-RUN_CONFIG_SCHEMA_VERSION = 1
+_DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
+# Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
+# Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
+RUN_CONFIG_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -71,9 +128,9 @@ class ModelConfig:
          disentangled position bias with RoPE (rotary embeddings) and uses RMSNorm with
          a Post-Norm or KEEL residual topology.
 
-      2) backbone_type="hf_deberta_v2": compatibility path that instantiates Hugging Face
-         DebertaV2Model backbones (DeBERTa v2/v3). This keeps the original disentangled
-         attention implementation, and does NOT apply RoPE/RMSNorm/KEEL changes.
+      2) backbone_type="hf_deberta_v2": compatibility path using this repo's native
+         DeBERTa-v2/v3-style encoder implementation (disentangled attention + LayerNorm),
+         with configs/weights sourced from HF checkpoints when requested.
 
     For RTD/ELECTRA pretraining, the discriminator config is the primary source; the
     generator config is either provided explicitly or derived from the discriminator.
@@ -84,12 +141,53 @@ class ModelConfig:
         metadata={"help": "Tokenizer name or local path."},
     )
 
+    tokenizer_allow_vocab_resize: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow runtime tokenizer vocabulary growth via tokenizer.add_tokens(...) when "
+                "vocab alignment controls require a larger size."
+            )
+        },
+    )
+
+    tokenizer_vocab_target: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional target tokenizer/model vocab size. When set, runtime validates that "
+                "len(tokenizer) <= target and can add inert placeholder tokens (if enabled) "
+                "to reach this size."
+            )
+        },
+    )
+
+    tokenizer_vocab_multiple: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Round resolved tokenizer vocab size up to this multiple (for tensor-core-friendly "
+                "embedding dimensions). Use 1 to disable."
+            )
+        },
+    )
+
     backbone_type: str = field(
         default="rope",
         metadata={
             "help": (
                 "Backbone implementation: 'rope' (recommended) or 'hf_deberta_v2' (HF DeBERTa compatibility mode). "
-                "RoPE/RMSNorm/KEEL only apply to 'rope'."
+                "RoPE/RMSNorm/KEEL only apply to 'rope'; hf_deberta_v2 uses the native DeBERTa-v2 stack."
+            )
+        },
+    )
+
+    hf_attention_kernel: str = field(
+        default="dynamic",
+        metadata={
+            "help": (
+                "Native hf_deberta_v2 attention kernel variant (dynamic|cached_bmm|stable). "
+                "Only applies when model.backbone_type=hf_deberta_v2."
             )
         },
     )
@@ -99,8 +197,8 @@ class ModelConfig:
         default="microsoft/deberta-v3-base",
         metadata={
             "help": (
-                "HF model name or path for the discriminator. Used to fetch a config (and weights if from_scratch=false) "
-                "unless discriminator_config_name_or_path is provided."
+                "HF model name or path for the discriminator. Used to fetch config "
+                "(and weights if from_scratch=false)."
             )
         },
     )
@@ -110,14 +208,14 @@ class ModelConfig:
         metadata={"help": "Optional HF model name/path for generator (config and weights)."},
     )
 
-    discriminator_config_name_or_path: str | None = field(
+    hf_max_position_embeddings: int | None = field(
         default=None,
-        metadata={"help": "Optional config name/path (JSON or directory) for discriminator."},
-    )
-
-    generator_config_name_or_path: str | None = field(
-        default=None,
-        metadata={"help": "Optional config name/path (JSON or directory) for generator."},
+        metadata={
+            "help": (
+                "Optional max_position_embeddings override for hf_deberta_v2 configs. "
+                "Use this instead of external edited JSON configs."
+            )
+        },
     )
 
     from_scratch: bool = field(
@@ -200,7 +298,7 @@ class ModelConfig:
         metadata={
             "help": (
                 "KEEL alpha initial value (skip scaling). If unset, defaults to "
-                "2*num_hidden_layers (two residual sublayers per transformer block)."
+                "1/sqrt(2*num_hidden_layers) (two residual sublayers per transformer block)."
             )
         },
     )
@@ -455,11 +553,6 @@ class DataConfig:
 
     train_split: str = field(default="train", metadata={"help": "Train split name."})
 
-    eval_split: str | None = field(
-        default=None,
-        metadata={"help": "Reserved for future evaluation workflow. Currently unsupported."},
-    )
-
     text_column_name: str = field(
         default="text",
         metadata={"help": "Text column to read from the dataset (for streaming packing)."},
@@ -502,17 +595,9 @@ class DataConfig:
         metadata={
             "help": (
                 "Streaming shuffle buffer size. 0 disables shuffle. "
-                "When data.streaming=false, any positive value is canonicalized to 1 "
+                "When data.streaming=false, this must be 0 or 1 "
                 "(non-streaming datasets only support shuffle off/on)."
             )
-        },
-    )
-
-    # Non-streaming preprocessing
-    preprocessing_num_workers: int = field(
-        default=8,
-        metadata={
-            "help": "Legacy non-streaming pretokenization workers. Currently unused in unified packer path."
         },
     )
 
@@ -521,9 +606,14 @@ class DataConfig:
 class TrainConfig:
     """Training-related arguments."""
 
-    output_dir: str = field(
-        default="runs/deberta_pretrain",
-        metadata={"help": "Output directory (checkpoints, logs)."},
+    output_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Output directory (checkpoints, logs). If null/empty, auto-create "
+                "runs/<project_name>/<timestamp>_<config_stem_or_run>."
+            )
+        },
     )
 
     overwrite_output_dir: bool = field(
@@ -536,9 +626,24 @@ class TrainConfig:
         },
     )
 
+    project_name: str = field(
+        default="deberta-train",
+        metadata={
+            "help": (
+                "Tracker project name (for example W&B project) and auto output-dir namespace "
+                "when train.output_dir is null."
+            )
+        },
+    )
+
     run_name: str | None = field(
         default=None,
-        metadata={"help": "Optional run name for experiment trackers."},
+        metadata={
+            "help": (
+                "Optional run name for experiment trackers. When null, defaults to the "
+                "resolved output directory basename."
+            )
+        },
     )
 
     seed: int = field(default=42, metadata={"help": "Random seed."})
@@ -546,16 +651,6 @@ class TrainConfig:
     max_steps: int = field(default=10_000, metadata={"help": "Total optimizer steps (streaming-friendly)."})
 
     per_device_train_batch_size: int = field(default=4, metadata={"help": "Train batch size per device."})
-
-    per_device_eval_batch_size: int = field(
-        default=4,
-        metadata={
-            "help": (
-                "Reserved for future evaluation workflow. Currently unused "
-                "(must remain default while eval is disabled)."
-            )
-        },
-    )
 
     gradient_accumulation_steps: int = field(
         default=1, metadata={"help": "Accumulate gradients this many steps before optimizer step."}
@@ -631,9 +726,14 @@ class TrainConfig:
     # Logging / eval / save
     logging_steps: int = field(default=50, metadata={"help": "Log every N optimizer steps."})
 
-    eval_steps: int = field(
-        default=0,
-        metadata={"help": "Reserved for future evaluation workflow. Must remain 0."},
+    debug_metrics: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable verbose local-only debug metric rows (for example zero-token window counters) "
+                "in output_dir/metrics.jsonl.gz. These debug metrics are never sent to trackers."
+            )
+        },
     )
 
     save_steps: int = field(default=1_000, metadata={"help": "Save checkpoint every N steps."})
@@ -645,6 +745,21 @@ class TrainConfig:
     report_to: str = field(
         default="none",
         metadata={"help": "Experiment tracker: none|wandb|tensorboard (accelerate loggers)."},
+    )
+
+    wandb_watch: str = field(
+        default="gradients",
+        metadata={
+            "help": (
+                "W&B model watch mode when train.report_to=wandb: "
+                "none|gradients|parameters|all. Default gradients."
+            )
+        },
+    )
+
+    wandb_watch_log_freq: int = field(
+        default=100,
+        metadata={"help": "W&B watch logging frequency in optimizer steps (>=1)."},
     )
 
     mixed_precision: str = field(
@@ -673,14 +788,28 @@ class TrainConfig:
         },
     )
 
+    torch_compile_scope: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "torch.compile scope (auto|backbones|encoder|gen_encoder|disc_encoder|ffn|gen_ffn|disc_ffn)."
+            )
+        },
+    )
+
+    torch_compile_backend: str = field(
+        default="inductor",
+        metadata={"help": "torch.compile backend (inductor|aot_eager)."},
+    )
+
     tf32: bool = field(default=True, metadata={"help": "Enable TF32 matmul on Ampere+ GPUs."})
 
     sdpa_kernel: str = field(
         default="auto",
         metadata={
             "help": (
-                "SDPA kernel policy: auto|flash|mem_efficient|math|flash_only. "
-                "Best-effort preference for PyTorch SDPA backends on CUDA."
+                "SDPA kernel policy: auto|flash|mem_efficient|math. "
+                "On CUDA, flash is strict (no mem_efficient/math fallback)."
             )
         },
     )
@@ -689,6 +818,29 @@ class TrainConfig:
         default=None,
         metadata={
             "help": "Resume from an accelerate checkpoint directory. Use 'auto' to resume the latest checkpoint-* in output_dir."
+        },
+    )
+
+    resume_data_strategy: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "Resume data-iterator alignment policy when resuming from checkpoint: "
+                "auto|replay|restart_epoch. "
+                "'replay' replays consumed microbatches exactly (deterministic but slow), "
+                "'restart_epoch' skips replay and shifts dataset epoch for O(1) resume, "
+                "'auto' replays only when replay cost is below train.resume_replay_max_micro_batches."
+            )
+        },
+    )
+
+    resume_replay_max_micro_batches: int = field(
+        default=10_000,
+        metadata={
+            "help": (
+                "Replay threshold used by train.resume_data_strategy=auto. "
+                "If consumed_micro_batches exceeds this value, resume switches to restart_epoch."
+            )
         },
     )
 
@@ -718,15 +870,43 @@ def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
     return v
 
 
+def _normalize_choice_with_aliases(
+    *,
+    name: str,
+    value: str,
+    aliases: dict[str, str],
+    choices: set[str],
+    replace_hyphen: bool = False,
+) -> str:
+    """Normalize a string option with alias mapping and choice validation.
+
+    :param str name: Option name.
+    :param str value: Raw option value.
+    :param dict[str, str] aliases: Alias-to-canonical mapping.
+    :param set[str] choices: Allowed canonical values.
+    :param bool replace_hyphen: Whether to normalize ``-`` to ``_`` before alias lookup.
+    :return str: Canonical normalized value.
+    """
+    v = str(value).strip().lower()
+    if bool(replace_hyphen):
+        v = v.replace("-", "_")
+    v = aliases.get(v, v)
+    return _ensure_choice(name, v, choices)
+
+
 def _normalize_sdpa_kernel(value: str) -> str:
     """Normalize and validate SDPA kernel policy values.
 
     :param str value: Raw SDPA kernel value.
     :return str: Canonical lower-case SDPA kernel policy.
     """
-    v = str(value).strip().lower()
-    v = _SDPA_KERNEL_ALIASES.get(v, v)
-    return _ensure_choice("train.sdpa_kernel", v, _SDPA_KERNEL_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.sdpa_kernel",
+        value=value,
+        aliases=_SDPA_KERNEL_ALIASES,
+        choices=_SDPA_KERNEL_CHOICES,
+        replace_hyphen=False,
+    )
 
 
 def _normalize_torch_compile_mode(value: str) -> str:
@@ -735,9 +915,73 @@ def _normalize_torch_compile_mode(value: str) -> str:
     :param str value: Raw compile mode value.
     :return str: Canonical compile mode.
     """
-    v = str(value).strip().lower()
-    v = _TORCH_COMPILE_MODE_ALIASES.get(v, v)
-    return _ensure_choice("train.torch_compile_mode", v, _TORCH_COMPILE_MODE_CHOICES)
+    return _normalize_choice_with_aliases(
+        name="train.torch_compile_mode",
+        value=value,
+        aliases=_TORCH_COMPILE_MODE_ALIASES,
+        choices=_TORCH_COMPILE_MODE_CHOICES,
+        replace_hyphen=False,
+    )
+
+
+def _normalize_torch_compile_scope(value: str) -> str:
+    """Normalize and validate torch.compile scope values.
+
+    :param str value: Raw compile scope value.
+    :return str: Canonical compile scope.
+    """
+    return _normalize_choice_with_aliases(
+        name="train.torch_compile_scope",
+        value=value,
+        aliases=_TORCH_COMPILE_SCOPE_ALIASES,
+        choices=_TORCH_COMPILE_SCOPE_CHOICES,
+        replace_hyphen=True,
+    )
+
+
+def _normalize_torch_compile_backend(value: str) -> str:
+    """Normalize and validate torch.compile backend values.
+
+    :param str value: Raw compile backend value.
+    :return str: Canonical compile backend.
+    """
+    return _normalize_choice_with_aliases(
+        name="train.torch_compile_backend",
+        value=value,
+        aliases=_TORCH_COMPILE_BACKEND_ALIASES,
+        choices=_TORCH_COMPILE_BACKEND_CHOICES,
+        replace_hyphen=True,
+    )
+
+
+def _normalize_wandb_watch(value: str) -> str:
+    """Normalize and validate W&B watch mode values.
+
+    :param str value: Raw W&B watch mode.
+    :return str: Canonical W&B watch mode.
+    """
+    return _normalize_choice_with_aliases(
+        name="train.wandb_watch",
+        value=value,
+        aliases=_WANDB_WATCH_ALIASES,
+        choices=_WANDB_WATCH_CHOICES,
+        replace_hyphen=True,
+    )
+
+
+def _normalize_hf_attention_kernel(value: str) -> str:
+    """Normalize and validate native hf_deberta_v2 attention-kernel values.
+
+    :param str value: Raw attention-kernel value.
+    :return str: Canonical attention-kernel name.
+    """
+    return _normalize_choice_with_aliases(
+        name="model.hf_attention_kernel",
+        value=value,
+        aliases=_HF_ATTN_KERNEL_ALIASES,
+        choices=_HF_ATTN_KERNEL_CHOICES,
+        replace_hyphen=True,
+    )
 
 
 def normalize_mixed_precision(value: object) -> str:
@@ -782,8 +1026,70 @@ def validate_run_metadata_schema(raw: dict[str, object], *, source: str) -> None
     if schema_version != int(RUN_CONFIG_SCHEMA_VERSION):
         raise ValueError(
             f"Unsupported run metadata schema at {source}: {schema_version}. "
-            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}."
+            f"Expected {int(RUN_CONFIG_SCHEMA_VERSION)}. "
+            "Backward resume/export compatibility is not guaranteed before stable release."
         )
+
+
+_SnapshotConfigT = TypeVar("_SnapshotConfigT", "ModelConfig", "DataConfig")
+
+
+def _load_snapshot_dataclass(
+    raw: dict[str, object], *, cls: type[_SnapshotConfigT], source: str, config_name: str
+) -> _SnapshotConfigT:
+    """Construct a config dataclass from a persisted snapshot with strict key checks.
+
+    :param dict[str, object] raw: Raw persisted JSON mapping.
+    :param type[_SnapshotConfigT] cls: Target dataclass type.
+    :param str source: Snapshot source path for errors.
+    :param str config_name: Human label used in error messages.
+    :raises ValueError: If unknown keys are present or dataclass construction fails.
+    :return _SnapshotConfigT: Parsed dataclass instance.
+    """
+    expected_keys = {f.name for f in fields(cls)}
+    unknown = sorted(set(raw) - expected_keys)
+    if unknown:
+        unknown_str = ", ".join(unknown)
+        raise ValueError(
+            f"Unsupported {config_name} keys in {source}: {unknown_str}. "
+            "This snapshot was produced by an older pre-release schema; "
+            "backward resume/export compatibility is not guaranteed before stable release."
+        )
+    missing = sorted(expected_keys - set(raw))
+    if missing:
+        missing_str = ", ".join(missing)
+        raise ValueError(
+            f"Missing required {config_name} keys in {source}: {missing_str}. "
+            "This snapshot does not match the current config schema."
+        )
+
+    try:
+        return cls(**raw)
+    except TypeError as e:
+        raise ValueError(
+            f"Failed to parse {config_name} at {source}. "
+            "The persisted config schema does not match this code version."
+        ) from e
+
+
+def load_model_config_snapshot(raw: dict[str, object], *, source: str) -> ModelConfig:
+    """Parse persisted ``model_config.json`` into ``ModelConfig``.
+
+    :param dict[str, object] raw: Raw model config mapping.
+    :param str source: Source path for error messages.
+    :return ModelConfig: Parsed model configuration.
+    """
+    return _load_snapshot_dataclass(raw, cls=ModelConfig, source=source, config_name="model_config.json")
+
+
+def load_data_config_snapshot(raw: dict[str, object], *, source: str) -> DataConfig:
+    """Parse persisted ``data_config.json`` into ``DataConfig``.
+
+    :param dict[str, object] raw: Raw data config mapping.
+    :param str source: Source path for error messages.
+    :return DataConfig: Parsed data configuration.
+    """
+    return _load_snapshot_dataclass(raw, cls=DataConfig, source=source, config_name="data_config.json")
 
 
 def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
@@ -796,12 +1102,55 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     return any(v.startswith(prefix) for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
 
 
+# Canonical field-name sets for cross-backbone / scratch-vs-pretrained validation.
+# rope_knobs = _ROPE_SCRATCH_ONLY_FIELDS | _ROPE_PRETRAINED_OVERRIDE_FIELDS | {"attention_implementation"}
+_ROPE_SCRATCH_ONLY_FIELDS: frozenset[str] = frozenset(
+    {
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "intermediate_size",
+        "hidden_act",
+        "rope_theta",
+        "rotary_pct",
+        "use_absolute_position_embeddings",
+        "max_position_embeddings",
+        "type_vocab_size",
+        "norm_arch",
+        "norm_eps",
+        "keel_alpha_init",
+        "keel_alpha_learnable",
+        "ffn_type",
+        "use_bias",
+        "swiglu_adjust_intermediate",
+        "initializer_range",
+    }
+)
+_ROPE_PRETRAINED_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "pretrained_max_position_embeddings",
+        "pretrained_rope_theta",
+        "pretrained_rotary_pct",
+        "pretrained_use_absolute_position_embeddings",
+        "pretrained_type_vocab_size",
+        "pretrained_norm_arch",
+        "pretrained_norm_eps",
+        "pretrained_keel_alpha_init",
+        "pretrained_keel_alpha_learnable",
+        "pretrained_ffn_type",
+        "pretrained_use_bias",
+        "pretrained_initializer_range",
+    }
+)
+
+
 def validate_model_config(cfg: ModelConfig) -> None:
     """Validate model config semantics and normalize constrained values.
 
     :param ModelConfig cfg: Model configuration.
     """
     cfg.backbone_type = _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
+    cfg.hf_attention_kernel = _normalize_hf_attention_kernel(cfg.hf_attention_kernel)
     cfg.norm_arch = _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES)
     cfg.attention_implementation = _ensure_choice(
         "model.attention_implementation", cfg.attention_implementation, _ATTN_IMPL_CHOICES
@@ -815,77 +1164,49 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError("model.max_position_embeddings must be > 0 when provided.")
     if float(cfg.rotary_pct) <= 0.0 or float(cfg.rotary_pct) > 1.0:
         raise ValueError("model.rotary_pct must be in (0, 1].")
+    if int(cfg.tokenizer_vocab_multiple) <= 0:
+        raise ValueError("model.tokenizer_vocab_multiple must be >= 1.")
+    if cfg.tokenizer_vocab_target is not None and int(cfg.tokenizer_vocab_target) <= 0:
+        raise ValueError("model.tokenizer_vocab_target must be > 0 when provided.")
+
+    defaults = ModelConfig()
 
     # Explicit dependency check: rope-only knobs are invalid in HF-compat mode.
     if cfg.backbone_type == "hf_deberta_v2":
-        defaults = ModelConfig()
-        rope_only = (
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "hidden_act",
-            "rope_theta",
-            "rotary_pct",
-            "use_absolute_position_embeddings",
-            "max_position_embeddings",
-            "type_vocab_size",
-            "norm_arch",
-            "norm_eps",
-            "keel_alpha_init",
-            "keel_alpha_learnable",
-            "attention_implementation",
-            "ffn_type",
-            "use_bias",
-            "swiglu_adjust_intermediate",
-            "initializer_range",
-            "pretrained_max_position_embeddings",
-            "pretrained_rope_theta",
-            "pretrained_rotary_pct",
-            "pretrained_use_absolute_position_embeddings",
-            "pretrained_type_vocab_size",
-            "pretrained_norm_arch",
-            "pretrained_norm_eps",
-            "pretrained_keel_alpha_init",
-            "pretrained_keel_alpha_learnable",
-            "pretrained_ffn_type",
-            "pretrained_use_bias",
-            "pretrained_initializer_range",
+        if cfg.hf_max_position_embeddings is not None and int(cfg.hf_max_position_embeddings) <= 0:
+            raise ValueError("model.hf_max_position_embeddings must be > 0 when provided.")
+        if cfg.hf_max_position_embeddings is not None and not bool(cfg.from_scratch):
+            raise ValueError(
+                "model.hf_max_position_embeddings is only supported when model.from_scratch=true for "
+                "hf_deberta_v2 runs."
+            )
+        rope_knobs = (
+            _ROPE_SCRATCH_ONLY_FIELDS | _ROPE_PRETRAINED_OVERRIDE_FIELDS | {"attention_implementation"}
         )
-        changed = [name for name in rope_only if getattr(cfg, name) != getattr(defaults, name)]
+        changed = [name for name in rope_knobs if getattr(cfg, name) != getattr(defaults, name)]
         if changed:
             raise ValueError(
                 "These options are only valid when model.backbone_type='rope': " + ", ".join(sorted(changed))
             )
-
-    if (
-        not bool(cfg.from_scratch)
-        and cfg.generator_config_name_or_path
-        and not cfg.generator_model_name_or_path
-    ):
-        raise ValueError(
-            "model.generator_config_name_or_path requires model.generator_model_name_or_path when "
-            "model.from_scratch=false. Explicit generator configs must pair with explicit generator "
-            "weights; leave both unset to use derived-generator fallback from discriminator weights."
-        )
-
-    pretrained_override_fields = (
-        "pretrained_max_position_embeddings",
-        "pretrained_rope_theta",
-        "pretrained_rotary_pct",
-        "pretrained_use_absolute_position_embeddings",
-        "pretrained_type_vocab_size",
-        "pretrained_norm_arch",
-        "pretrained_norm_eps",
-        "pretrained_keel_alpha_init",
-        "pretrained_keel_alpha_learnable",
-        "pretrained_ffn_type",
-        "pretrained_use_bias",
-        "pretrained_initializer_range",
-    )
+    else:
+        default_hf_kernel = defaults.hf_attention_kernel
+        if cfg.hf_attention_kernel != default_hf_kernel:
+            warnings.warn(
+                "model.hf_attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf_attention_kernel!r}) has no effect on the rope backbone.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if cfg.hf_max_position_embeddings is not None:
+            warnings.warn(
+                "model.hf_max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf_max_position_embeddings!r}) has no effect on the rope backbone.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     if cfg.backbone_type == "rope" and bool(cfg.from_scratch):
-        set_pretrained = [name for name in pretrained_override_fields if getattr(cfg, name) is not None]
+        set_pretrained = [name for name in _ROPE_PRETRAINED_OVERRIDE_FIELDS if getattr(cfg, name) is not None]
         if set_pretrained:
             raise ValueError(
                 "These options apply only when model.from_scratch=false: " + ", ".join(sorted(set_pretrained))
@@ -905,35 +1226,14 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "for RoPE model initialization. Invalid sources: " + ", ".join(sorted(invalid_sources))
             )
 
-        defaults = ModelConfig()
-        scratch_only_for_rope_pretrained = (
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "hidden_act",
-            "rope_theta",
-            "rotary_pct",
-            "use_absolute_position_embeddings",
-            "max_position_embeddings",
-            "type_vocab_size",
-            "norm_arch",
-            "norm_eps",
-            "keel_alpha_init",
-            "keel_alpha_learnable",
-            "ffn_type",
-            "use_bias",
-            "swiglu_adjust_intermediate",
-            "initializer_range",
-        )
-        changed_scratch_only = [
-            name for name in scratch_only_for_rope_pretrained if getattr(cfg, name) != getattr(defaults, name)
+        changed_scratch_knobs = [
+            name for name in _ROPE_SCRATCH_ONLY_FIELDS if getattr(cfg, name) != getattr(defaults, name)
         ]
-        if changed_scratch_only:
+        if changed_scratch_knobs:
             raise ValueError(
                 "These options only affect scratch RoPE initialization and are not applied when "
                 "model.from_scratch=false. Use explicit pretrained override fields instead "
-                "(model.pretrained_*). Invalid options: " + ", ".join(sorted(changed_scratch_only))
+                "(model.pretrained_*). Invalid options: " + ", ".join(sorted(changed_scratch_knobs))
             )
 
         if (
@@ -954,8 +1254,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "model.pretrained_ffn_type", cfg.pretrained_ffn_type, _FFN_CHOICES
             )
 
-    if cfg.generator_config_name_or_path or cfg.generator_model_name_or_path:
-        derived_only = []
+    if cfg.generator_model_name_or_path:
+        derived_knobs = []
         for name in (
             "generator_num_hidden_layers",
             "generator_hidden_size",
@@ -963,12 +1263,28 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "generator_num_attention_heads",
         ):
             if getattr(cfg, name) is not None:
-                derived_only.append(name)
-        if derived_only:
+                derived_knobs.append(name)
+        if derived_knobs:
             raise ValueError(
                 "These options are only used when deriving generator config and must be unset when "
-                "model.generator_config_name_or_path or model.generator_model_name_or_path is provided: "
-                + ", ".join(sorted(derived_only))
+                "model.generator_model_name_or_path is provided: " + ", ".join(sorted(derived_knobs))
+            )
+
+    if not bool(cfg.from_scratch) and not cfg.generator_model_name_or_path:
+        pretrained_shape_overrides = []
+        for name in (
+            "generator_hidden_size",
+            "generator_intermediate_size",
+            "generator_num_attention_heads",
+        ):
+            if getattr(cfg, name) is not None:
+                pretrained_shape_overrides.append(name)
+        if pretrained_shape_overrides:
+            raise ValueError(
+                "model.from_scratch=false with derived generator weights (generator_model_name_or_path unset) "
+                "cannot use generator shape overrides because generator weights are loaded from the "
+                "discriminator source. Set model.generator_model_name_or_path to an explicit generator "
+                "checkpoint or unset: " + ", ".join(sorted(pretrained_shape_overrides))
             )
 
     if cfg.backbone_type == "rope":
@@ -982,6 +1298,32 @@ def validate_model_config(cfg: ModelConfig) -> None:
             raise ValueError("model.intermediate_size must be > 0.")
         if int(cfg.hidden_size) % int(cfg.num_attention_heads) != 0:
             raise ValueError("model.hidden_size must be divisible by model.num_attention_heads.")
+
+    # Warn on KEEL params when norm_arch="post" (they only apply when norm_arch="keel").
+    if cfg.norm_arch == "post":
+        if cfg.keel_alpha_init is not None and cfg.keel_alpha_init != defaults.keel_alpha_init:
+            warnings.warn(
+                "model.keel_alpha_init has no effect when model.norm_arch='post'. "
+                "Set model.norm_arch='keel' to use KEEL alpha scaling.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if cfg.keel_alpha_learnable != defaults.keel_alpha_learnable:
+            warnings.warn(
+                "model.keel_alpha_learnable has no effect when model.norm_arch='post'. "
+                "Set model.norm_arch='keel' to use learnable KEEL alpha.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    # Warn on swiglu_adjust_intermediate with ffn_type="mlp" (only applies to swiglu).
+    if cfg.ffn_type == "mlp" and cfg.swiglu_adjust_intermediate != defaults.swiglu_adjust_intermediate:
+        warnings.warn(
+            "model.swiglu_adjust_intermediate has no effect when model.ffn_type='mlp'. "
+            "The intermediate size scaling is only applied for ffn_type='swiglu'.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def validate_data_config(cfg: DataConfig) -> None:
@@ -1017,21 +1359,27 @@ def validate_data_config(cfg: DataConfig) -> None:
         raise ValueError("data.max_seq_length must be >= 8 for pretraining.")
     if int(cfg.shuffle_buffer_size) < 0:
         raise ValueError("data.shuffle_buffer_size must be >= 0.")
-    if not bool(cfg.streaming) and int(cfg.shuffle_buffer_size) > 0:
-        # Non-streaming/map-style datasets expose full-dataset shuffle semantics only.
-        # Canonicalize any positive buffer request to "shuffle enabled" (1).
-        cfg.shuffle_buffer_size = 1
-    if int(cfg.preprocessing_num_workers) < 0:
-        raise ValueError("data.preprocessing_num_workers must be >= 0.")
-    default_preproc_workers = DataConfig().preprocessing_num_workers
-    if int(cfg.preprocessing_num_workers) != int(default_preproc_workers):
+    if not bool(cfg.streaming) and int(cfg.shuffle_buffer_size) not in {0, 1}:
         raise ValueError(
-            "data.preprocessing_num_workers is currently unused in the unified packer path. "
-            f"Keep the default ({default_preproc_workers}) to avoid inert config."
+            "data.shuffle_buffer_size must be 0 or 1 when data.streaming=false "
+            "(non-streaming datasets only support shuffle off/on)."
         )
-    if not bool(cfg.pack_sequences):
-        # Canonicalize inert setting in sequential mode (no packed doc boundaries exist).
-        cfg.block_cross_document_attention = False
+    if not bool(cfg.pack_sequences) and bool(cfg.block_cross_document_attention):
+        raise ValueError("data.block_cross_document_attention=true requires data.pack_sequences=true.")
+    if (
+        bool(cfg.pack_sequences)
+        and bool(cfg.block_cross_document_attention)
+        and int(cfg.max_seq_length) > int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)
+    ):
+        warnings.warn(
+            "data.block_cross_document_attention builds dense O(S^2) pairwise masks. "
+            f"Configured data.max_seq_length={int(cfg.max_seq_length)} may be expensive; "
+            f"consider reducing sequence length or disabling data.block_cross_document_attention "
+            f"until sparse/segment-aware attention support lands (warning threshold: "
+            f"{int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)}).",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def validate_train_config(cfg: TrainConfig) -> None:
@@ -1045,27 +1393,42 @@ def validate_train_config(cfg: TrainConfig) -> None:
     )
     cfg.sdpa_kernel = _normalize_sdpa_kernel(cfg.sdpa_kernel)
     cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
+    cfg.torch_compile_scope = _normalize_torch_compile_scope(cfg.torch_compile_scope)
+    cfg.torch_compile_backend = _normalize_torch_compile_backend(cfg.torch_compile_backend)
+    cfg.wandb_watch = _normalize_wandb_watch(cfg.wandb_watch)
+    cfg.resume_data_strategy = _ensure_choice(
+        "train.resume_data_strategy",
+        cfg.resume_data_strategy,
+        _RESUME_DATA_STRATEGY_CHOICES,
+    )
 
     cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
+    if cfg.output_dir is not None and not str(cfg.output_dir).strip():
+        cfg.output_dir = None
+    if cfg.resume_from_checkpoint is not None:
+        resume_from_checkpoint = str(cfg.resume_from_checkpoint).strip()
+        cfg.resume_from_checkpoint = resume_from_checkpoint if resume_from_checkpoint else None
+    if not str(cfg.project_name).strip():
+        raise ValueError("train.project_name must be non-empty.")
+    if bool(cfg.overwrite_output_dir) and bool(cfg.resume_from_checkpoint):
+        raise ValueError(
+            "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
+            "Overwrite would delete checkpoints before resume."
+        )
 
-    if int(cfg.max_steps) <= 0:
-        raise ValueError("train.max_steps must be > 0.")
-    if int(cfg.per_device_train_batch_size) <= 0:
-        raise ValueError("train.per_device_train_batch_size must be > 0.")
-    if int(cfg.per_device_eval_batch_size) <= 0:
-        raise ValueError("train.per_device_eval_batch_size must be > 0.")
-    if int(cfg.gradient_accumulation_steps) <= 0:
-        raise ValueError("train.gradient_accumulation_steps must be > 0.")
-    if int(cfg.warmup_steps) < 0:
-        raise ValueError("train.warmup_steps must be >= 0.")
-    if int(cfg.logging_steps) < 0:
-        raise ValueError("train.logging_steps must be >= 0.")
-    if int(cfg.eval_steps) < 0:
-        raise ValueError("train.eval_steps must be >= 0.")
-    if int(cfg.save_steps) < 0:
-        raise ValueError("train.save_steps must be >= 0.")
-    if int(cfg.save_total_limit) < 0:
-        raise ValueError("train.save_total_limit must be >= 0.")
+    for _name, _min in (
+        ("max_steps", 1),
+        ("per_device_train_batch_size", 1),
+        ("gradient_accumulation_steps", 1),
+        ("warmup_steps", 0),
+        ("logging_steps", 0),
+        ("save_steps", 0),
+        ("save_total_limit", 0),
+        ("wandb_watch_log_freq", 1),
+        ("resume_replay_max_micro_batches", 0),
+    ):
+        if int(getattr(cfg, _name)) < _min:
+            raise ValueError(f"train.{_name} must be >= {_min}.")
 
     mlm = float(cfg.mlm_probability)
     if mlm <= 0.0 or mlm >= 1.0:
@@ -1081,6 +1444,37 @@ def validate_train_config(cfg: TrainConfig) -> None:
     if float(cfg.sampling_temperature) <= 0.0:
         raise ValueError("train.sampling_temperature must be > 0.")
 
+    defaults = TrainConfig()
+
+    # Warn when compile-specific knobs are configured while compile is disabled.
+    if not bool(cfg.torch_compile):
+        for _knob in ("torch_compile_scope", "torch_compile_mode", "torch_compile_backend"):
+            if getattr(cfg, _knob) != getattr(defaults, _knob):
+                _short = _knob.removeprefix("torch_compile_")
+                warnings.warn(
+                    f"train.{_knob} has no effect when train.torch_compile=false. "
+                    f"Current {_short} ({getattr(cfg, _knob)!r}) will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+    if cfg.report_to != "wandb":
+        if cfg.wandb_watch != defaults.wandb_watch:
+            warnings.warn(
+                "train.wandb_watch only applies when train.report_to='wandb'. "
+                f"Current report_to ({cfg.report_to!r}) will ignore watch mode {cfg.wandb_watch!r}.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if int(cfg.wandb_watch_log_freq) != int(defaults.wandb_watch_log_freq):
+            warnings.warn(
+                "train.wandb_watch_log_freq only applies when train.report_to='wandb'. "
+                f"Current report_to ({cfg.report_to!r}) will ignore watch frequency "
+                f"{int(cfg.wandb_watch_log_freq)}.",
+                UserWarning,
+                stacklevel=2,
+            )
+
 
 def validate_training_workflow_options(
     *,
@@ -1094,33 +1488,29 @@ def validate_training_workflow_options(
     :param TrainConfig train_cfg: Training configuration.
     :param ModelConfig | None model_cfg: Optional model configuration for cross-surface checks.
     """
-    if data_cfg.eval_split is not None or int(train_cfg.eval_steps) > 0:
-        raise ValueError(
-            "Evaluation workflow is not implemented yet. Set data.eval_split=null and train.eval_steps=0."
-        )
-
-    default_eval_bs = TrainConfig().per_device_eval_batch_size
-    if int(train_cfg.per_device_eval_batch_size) != int(default_eval_bs):
-        raise ValueError(
-            "train.per_device_eval_batch_size is reserved for future evaluation and is currently unused. "
-            f"Keep the default ({default_eval_bs}) while evaluation is disabled."
-        )
-
     sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
     if (
         bool(data_cfg.pack_sequences)
         and bool(data_cfg.block_cross_document_attention)
-        and sdpa_policy == "flash_only"
+        and sdpa_policy == "flash"
     ):
         raise ValueError(
-            "train.sdpa_kernel=flash_only is not supported with data.pack_sequences=true. "
+            "train.sdpa_kernel=flash is not supported with data.pack_sequences=true. "
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
-            "with flash-only SDPA kernels. Use train.sdpa_kernel=flash|auto|mem_efficient|math instead."
+            "with strict flash SDPA kernels. Use train.sdpa_kernel=auto|mem_efficient|math instead."
         )
 
     if model_cfg is not None:
         backbone_type = str(model_cfg.backbone_type).strip().lower()
         attn_impl = str(model_cfg.attention_implementation).strip().lower()
+        if backbone_type != "rope" and sdpa_policy != "auto":
+            warnings.warn(
+                "train.sdpa_kernel has no effect when model.backbone_type='hf_deberta_v2'. "
+                "The HF DeBERTa-v2 disentangled attention uses explicit matmuls, not F.scaled_dot_product_attention. "
+                f"Current value ({train_cfg.sdpa_kernel!r}) will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
         if backbone_type == "rope" and attn_impl != "sdpa" and sdpa_policy != "auto":
             raise ValueError(
                 "train.sdpa_kernel only affects rope attention when model.attention_implementation='sdpa'. "
@@ -1134,4 +1524,14 @@ def validate_training_workflow_options(
             raise ValueError(
                 "data.block_cross_document_attention=true is only supported with model.backbone_type='rope'. "
                 "Use data.block_cross_document_attention=false or switch to model.backbone_type='rope'."
+            )
+        embed_sharing = str(model_cfg.embedding_sharing).strip().lower()
+        gen_lr = float(train_cfg.generator_learning_rate)
+        if embed_sharing == "es" and gen_lr > 0 and gen_lr != float(train_cfg.learning_rate):
+            raise ValueError(
+                f"model.embedding_sharing='es' shares embedding parameters between generator and discriminator, "
+                f"but train.generator_learning_rate ({gen_lr}) differs from train.learning_rate "
+                f"({train_cfg.learning_rate}). Shared embeddings would silently use the generator LR. "
+                f"Set generator_learning_rate=-1 (inherit) or match it to learning_rate, "
+                f"or switch to embedding_sharing='gdes'/'none'."
             )

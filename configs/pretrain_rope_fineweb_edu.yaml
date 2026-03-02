@@ -1,6 +1,6 @@
 # Example YAML config for `deberta train`.
 # Usage:
-#   accelerate launch --config_file configs/fsdp2_1node.yaml --no_python deberta train configs/pretrain_rope_fineweb_edu.yaml
+#   accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta train configs/pretrain_rope_fineweb_edu.yaml
 
 model:
   tokenizer_name_or_path: microsoft/deberta-v3-base
@@ -35,8 +35,11 @@ data:
   shuffle_buffer_size: 10000
 
 train:
+  # Set to null to auto-create runs/<project_name>/<timestamp>_<config_stem>.
   output_dir: runs/deberta_rope_rtd
   overwrite_output_dir: false
+  project_name: deberta-train
+  run_name: null
   max_steps: 10000
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 16
@@ -58,7 +61,7 @@ train:
   disc_loss_weight: 50.0
   decoupled_loss_scaling: false
 
-  # SDPA backend preference (best-effort): auto|flash|mem_efficient|math|flash_only
+  # SDPA backend preference: auto|flash|mem_efficient|math
   sdpa_kernel: auto
 
   # Logging

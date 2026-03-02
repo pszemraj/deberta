@@ -1,8 +1,6 @@
 # Data Pipeline
 
-This document is the primary reference for dataset ingestion, packing, and masking behavior.
-
-For objective/loss semantics, see [`docs/objective.md`](objective.md). For model/backbone constraints, see [`docs/model.md`](model.md). For runtime and FSDP2/precision controls, see [`docs/fsdp2.md`](fsdp2.md).
+See also: [objective/loss](objective.md), [model/backbone](model.md), [runtime/FSDP2](fsdp2.md).
 
 ## Dataset Source Selection
 
@@ -37,13 +35,15 @@ Packed chunks can contain inserted internal `[SEP]` separators. Those positions 
 `data.block_cross_document_attention` controls whether packed batches use strict pairwise document-blocking:
 
 - `false` (default): skip 3D doc-blocking masks (packed batches remain on 2D/no-mask attention paths)
-- `true`: emit 3D doc-blocking masks for packed batches with internal separators
+- `true`: emit compact `doc_ids (B,S)` metadata for packed batches with internal separators; the training loop builds the 3D mask on-device
 
-### Pairwise Mask Contract (`block_cross_document_attention=true`)
+### Doc-Blocking Contract (`block_cross_document_attention=true`)
 
-- mask type/shape: boolean keep-mask `(B, S, S)` where `True=attend`, `False=block`
-- emission condition: only emitted when packed chunks contain internal separators; single-document packed chunks keep `attention_mask=None`
-- query activity encoding: diagonal `True` marks active queries, diagonal `False` marks inactive/padded queries
+- collator output: `doc_ids` is a rank-2 `long` tensor `(B, S)` with 1-based document ids for active tokens and `0` for padding/inactive positions
+- emission condition: `doc_ids` is emitted only when packed chunks contain internal separators; single-document packed chunks keep `attention_mask=None` and do not emit `doc_ids`
+- training-loop materialization: `_build_doc_block_mask(doc_ids)` builds a boolean keep-mask `(B, S, S)` where `True=attend`, `False=block`
+- query activity encoding: the materialized mask diagonal encodes query activity (`True` active, `False` inactive/pad)
+- SDPA safety for inactive queries: inactive/padded query rows include one keep edge to the CLS key to avoid all-False rows in backend kernels; outputs remain zeroed by query-activity masking
 - document boundary behavior: CLS stays in document 1 (no global cross-document CLS channel)
 - consumers: rope attention and RTD token-activity accounting use this contract; keep `data.block_cross_document_attention=false` when strict doc-blocking is unnecessary
 
@@ -54,13 +54,13 @@ Set `data.pack_sequences=false` to switch to one-document chunking:
 - no cross-document concatenation
 - long documents are split into multiple one-document chunks
 - useful as a reference mode for validating loss-signal behavior independent of packing
-- `data.block_cross_document_attention` is inert in this mode and is canonicalized to `false`
+- `data.block_cross_document_attention=true` is invalid in this mode (validation error)
 
 ## Non-Streaming Packing
 
 When `streaming=false`, training still routes through the same iterable packing wrappers (`PackedStreamingDataset` / `SequentialStreamingDataset`) used in streaming mode, but backed by a map-style HF dataset iterator.
 
-`data.shuffle_buffer_size` keeps full buffer semantics only for streaming datasets. In non-streaming mode, shuffle is effectively an off/on toggle and config normalization canonicalizes any positive value to `1` (shuffle enabled).
+`data.shuffle_buffer_size` keeps full buffer semantics only for streaming datasets. In non-streaming mode, shuffle is effectively an off/on toggle and validation requires `data.shuffle_buffer_size` to be `0` (off) or `1` (on).
 
 ## Collator Behavior (Dynamic MLM Masking)
 
@@ -69,7 +69,11 @@ When `streaming=false`, training still routes through the same iterable packing 
 Masking modes:
 
 - token-level masking: `train.mlm_max_ngram = 1` (default)
-- whole-word n-gram masking: `train.mlm_max_ngram > 1`
+- whole-word n-gram masking: `train.mlm_max_ngram > 1` (whole-word budget, approximate token count)
+
+`mlm_max_ngram > 1` masks contiguous whole-word spans and applies one replacement decision per selected
+word group (all subwords in that group share the same mask/random/keep branch). The mask budget is
+approximate at whole-word granularity; selected groups are never split into partial-word token subsets.
 
 Replacement probabilities are controlled by:
 
@@ -93,4 +97,4 @@ The pipeline keeps this path lean by:
 
 Downstream model code treats missing masks as unpadded (`attention_mask=None`).
 
-Deferred data/packing follow-ups are tracked in [`docs/roadmap.md`](roadmap.md).
+Deferred data/packing follow-ups are tracked in the [roadmap](roadmap.md).
