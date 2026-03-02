@@ -17,7 +17,6 @@ EXPORT_CONFIG_STRIP_KEYS = frozenset(
         "sep_token_id",
         "bos_token_id",
         "eos_token_id",
-        "legacy",
     }
 )
 

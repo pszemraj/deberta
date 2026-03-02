@@ -532,10 +532,10 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert "hf_attention_kernel" not in data
     assert "use_rmsnorm_heads" not in data
-    assert "legacy" not in data
     assert "cls_token_id" not in data
     assert data["model_type"] == "deberta-v2"
     assert data["hidden_size"] == 768
+    assert data["legacy"] is True
 
 
 def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
