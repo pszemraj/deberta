@@ -222,7 +222,14 @@ RoPE export loading behavior is documented in [model export interoperability](mo
 
 ### In-Training HF Export
 
-`train.export_hf_final=true` (default) attempts a best-effort HF discriminator export into `<output_dir>/final_hf` at the end of training. For FSDP2 + sharded checkpoints, this is a convenience path; prefer running `deberta export` post-training for reliable artifact consolidation.
+`train.export_hf_final=true` (default) exports the discriminator into `<output_dir>/final_hf` at the end of training by invoking `deberta export` in a separate subprocess from the last saved checkpoint.
+This path uses `--allow-partial-export` so final export stays best-effort instead of failing on non-critical key drift.
+
+This keeps the training process isolated from export-time teardown issues while still producing a final artifact automatically.
+
+For full control and reproducibility, you can still run `deberta export` manually after training.
+
+The `deberta train` CLI also uses a fast process exit on successful completion by default (`DEBERTA_FAST_EXIT_AFTER_TRAIN=1`) to avoid interpreter-finalization crashes seen in some CUDA extension stacks. Set `DEBERTA_FAST_EXIT_AFTER_TRAIN=0` to use normal interpreter shutdown behavior.
 
 Run directories include `run_metadata.json` with a `config_schema_version`.
 Resume/export validate that schema and fail fast on unknown versions instead of

@@ -10,6 +10,8 @@ import logging
 import math
 import os
 import re
+import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
@@ -1874,6 +1876,52 @@ def _export_discriminator_hf(
         )
 
 
+def _export_discriminator_hf_subprocess(
+    *,
+    checkpoint_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Run discriminator export in an isolated subprocess.
+
+    This avoids teardown-time crashes from C-extension thread finalization in the
+    long-lived training process (observed intermittently on streaming+CUDA runs).
+
+    :param Path checkpoint_dir: Source checkpoint directory.
+    :param Path output_dir: Destination directory for exported artifacts.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "deberta",
+        "export",
+        str(checkpoint_dir),
+        "--what",
+        "discriminator",
+        "--output-dir",
+        str(output_dir),
+        "--allow-partial-export",
+    ]
+    logger.info(
+        "Running post-train export in subprocess from checkpoint %s.",
+        checkpoint_dir,
+    )
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        logger.warning(
+            "Post-train export subprocess failed (exit=%d). Output:\n%s",
+            int(proc.returncode),
+            str(proc.stdout).strip(),
+        )
+        return
+    logger.info("Post-train export complete: %s", output_dir)
+
+
 def run_pretraining(
     *,
     model_cfg: ModelConfig,
@@ -3367,20 +3415,6 @@ def run_pretraining(
                     )
                     last_saved_step = global_step
 
-        # Best-effort HF export
-        if train_cfg.export_hf_final:
-            accelerator.wait_for_everyone()
-            _export_discriminator_hf(
-                accelerator=accelerator,
-                model=model,
-                tokenizer=tokenizer,
-                output_dir=output_dir / "final_hf",
-                embedding_sharing=model_cfg.embedding_sharing,
-                model_cfg=model_cfg,
-                data_cfg=data_cfg,
-                train_cfg=train_cfg,
-            )
-
     except KeyboardInterrupt as exc:
         exit_code = 130
         crash_type = type(exc).__name__
@@ -3434,6 +3468,31 @@ def run_pretraining(
                 "(num_processes=%s) to avoid potential collective deadlocks after failure.",
                 getattr(accelerator, "num_processes", "unknown"),
             )
+
+        # Final export runs from the saved checkpoint in an isolated subprocess.
+        # This avoids teardown-time crashes observed on some streaming+CUDA runs
+        # when exporting directly from the live training process.
+        if (
+            bool(train_cfg.export_hf_final)
+            and crash_reason is None
+            and bool(getattr(accelerator, "is_main_process", True))
+        ):
+            export_step = int(last_saved_step)
+            if export_step <= 0 and int(global_step) > 0:
+                export_step = int(global_step)
+            if export_step > 0:
+                checkpoint_dir = output_dir / f"checkpoint-{export_step}"
+                if checkpoint_dir.exists():
+                    with suppress(Exception):
+                        _export_discriminator_hf_subprocess(
+                            checkpoint_dir=checkpoint_dir,
+                            output_dir=output_dir / "final_hf",
+                        )
+                else:
+                    logger.warning(
+                        "Skipping final export: checkpoint directory does not exist: %s",
+                        checkpoint_dir,
+                    )
 
         if crash_reason is not None:
             crash_log_step = int(

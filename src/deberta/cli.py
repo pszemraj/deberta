@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import types
 from dataclasses import fields
@@ -187,6 +188,18 @@ def _parse_bool(value: str) -> bool:
     if v in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+
+
+def _should_fast_exit_after_train(*, explicit_argv: bool) -> bool:
+    """Decide whether train CLI should use os._exit(0) on success.
+
+    :param bool explicit_argv: True when main() was called with argv list.
+    :return bool: Whether to fast-exit.
+    """
+    if explicit_argv:
+        return False
+    raw = str(os.getenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")).strip().lower()
+    return raw not in {"0", "false", "f", "no", "n", "off"}
 
 
 def _unwrap_optional(field_type: Any) -> Any:
@@ -532,12 +545,15 @@ def main(argv: list[str] | None = None) -> None:
 
     :param list[str] | None argv: Optional CLI argv (excluding program name).
     """
+    explicit_argv = argv is not None
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_main_parser()
     args = parser.parse_args(argv)
 
     if args.command == "train":
         _run_train(args, raw_train_argv=_subcommand_argv(argv, "train"))
+        if _should_fast_exit_after_train(explicit_argv=explicit_argv):
+            os._exit(0)
         return
 
     if args.command == "export":

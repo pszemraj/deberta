@@ -61,6 +61,7 @@ from deberta.training.pretrain import (
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
     _export_discriminator_hf,
+    _export_discriminator_hf_subprocess,
     _finalize_window_metric_loss,
     _flush_loggers,
     _full_backbone_hf_inductor_warning,
@@ -1974,6 +1975,60 @@ def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phase
     assert step_rows[-1]["decoupled_training"] == pytest.approx(1.0, rel=0.0, abs=1e-9)
 
 
+def test_run_pretraining_final_export_uses_subprocess_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    export_calls: list[tuple[str, str]] = []
+
+    def _fake_export_subprocess(*, checkpoint_dir: Path, output_dir: Path) -> None:
+        export_calls.append((str(checkpoint_dir), str(output_dir)))
+
+    def _fake_save_checkpoint(
+        *,
+        accelerator: Any,
+        checkpoint_dir: Path,
+        output_dir: Path,
+        consumed_micro_batches: int,
+        save_total_limit: int,
+        log_label: str,
+        **kwargs: Any,
+    ) -> None:
+        del accelerator, output_dir, consumed_micro_batches, save_total_limit, log_label, kwargs
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        save_checkpoint_fn=_fake_save_checkpoint,
+        extra_patches={"_export_discriminator_hf_subprocess": _fake_export_subprocess},
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert export_calls
+    ckpt_path, export_path = export_calls[-1]
+    assert ckpt_path.endswith("checkpoint-1")
+    assert export_path.endswith("final_hf")
+
+
 class _ZeroTokenTrackingAccelerator(FakeAccelerator):
     last_instance: _ZeroTokenTrackingAccelerator | None = None
 
@@ -3166,6 +3221,43 @@ def test_export_discriminator_hf_collects_state_dicts_on_non_main_rank(tmp_path:
     assert not (tmp_path / "export").exists()
 
 
+def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+
+    def _fake_run(
+        cmd: list[str],
+        *,
+        stdout: Any,
+        stderr: Any,
+        text: bool,
+        check: bool,
+    ) -> _Proc:
+        del stdout, stderr, text, check
+        calls.append(list(cmd))
+        return _Proc()
+
+    import deberta.training.pretrain as pretrain_mod
+
+    monkeypatch.setattr(pretrain_mod.subprocess, "run", _fake_run)
+
+    _export_discriminator_hf_subprocess(
+        checkpoint_dir=Path("runs/demo/checkpoint-1"),
+        output_dir=Path("runs/demo/final_hf"),
+    )
+
+    assert calls
+    cmd = calls[-1]
+    assert cmd[0] == sys.executable
+    assert cmd[1:5] == ["-m", "deberta", "export", "runs/demo/checkpoint-1"]
+    assert "--allow-partial-export" in cmd
+
+
 def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Path):
     out_dir = tmp_path / "rope-export"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4203,6 +4295,49 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
     )
     assert "train_cfg" in seen
     assert int(seen["train_cfg"].max_steps) == 5
+
+
+def test_main_cli_train_explicit_argv_skips_fast_exit(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, Any] = {"ran": False, "exit_called": False}
+
+    def _fake_run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
+        del ns, raw_train_argv
+        seen["ran"] = True
+
+    def _fake_exit(code: int) -> None:
+        del code
+        seen["exit_called"] = True
+        raise AssertionError("os._exit should not be called when main(argv=...) is used.")
+
+    monkeypatch.setattr(cli_mod, "_run_train", _fake_run_train)
+    monkeypatch.setattr(cli_mod.os, "_exit", _fake_exit)
+
+    cli_mod.main(["train", "--dry-run"])
+
+    assert seen["ran"] is True
+    assert seen["exit_called"] is False
+
+
+def test_main_cli_train_implicit_argv_fast_exit_enabled(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, Any] = {"ran": False}
+
+    def _fake_run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
+        del ns, raw_train_argv
+        seen["ran"] = True
+
+    def _fake_exit(code: int) -> None:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(cli_mod, "_run_train", _fake_run_train)
+    monkeypatch.setattr(cli_mod.os, "_exit", _fake_exit)
+    monkeypatch.setenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")
+    monkeypatch.setattr(cli_mod.sys, "argv", ["deberta", "train", "--dry-run"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main()
+
+    assert int(exc_info.value.code) == 0
+    assert seen["ran"] is True
 
 
 def test_train_parser_accepts_dry_run_flag():
