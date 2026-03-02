@@ -36,9 +36,11 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     _normalize_torch_compile_scope,
     _normalize_wandb_watch,
+    apply_profile_defaults,
     load_data_config_snapshot,
     load_model_config_snapshot,
     normalize_mixed_precision,
+    resolve_decoupled_training,
     validate_data_config,
     validate_model_config,
     validate_train_config,
@@ -52,6 +54,7 @@ from deberta.training.pretrain import (
     _append_metrics_jsonl_row,
     _apply_lr_mult,
     _apply_nonfinite_recovery,
+    _build_decoupled_optimizers,
     _build_optimizer,
     _build_training_collator,
     _count_input_tokens_for_batch,
@@ -234,6 +237,39 @@ def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
         _load_yaml(bad)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "expected_disc_source"),
+    [
+        ("pretrain_hf_deberta_v2_parity_base.yaml", "microsoft/deberta-v3-base"),
+        ("pretrain_hf_deberta_v2_parity_small.yaml", "microsoft/deberta-v3-small"),
+    ],
+)
+def test_parity_yaml_configs_parse_and_validate(
+    config_name: str,
+    expected_disc_source: str,
+) -> None:
+    pytest.importorskip("yaml")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "configs" / config_name
+    model_cfg, data_cfg, train_cfg = _load_yaml(config_path)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+    )
+
+    assert model_cfg.profile == "deberta_v3_parity"
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.discriminator_model_name_or_path == expected_disc_source
+    assert resolve_decoupled_training(model_cfg=model_cfg, train_cfg=train_cfg) is True
 
 
 def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
@@ -650,6 +686,33 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert digest_old is None
 
 
+def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path: Path):
+    ckpt = tmp_path / "checkpoint-12"
+    ckpt.mkdir(parents=True, exist_ok=True)
+
+    dual_digest = {"generator": "aaaabbbbccccdddd", "discriminator": "1111222233334444"}
+    _save_checkpoint_data_progress(
+        checkpoint_dir=ckpt,
+        consumed_micro_batches=77,
+        lr_mult=0.75,
+        optimizer_param_digest=dual_digest,
+        global_step=9,
+        gradient_accumulation_steps=3,
+    )
+
+    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    assert consumed == 77
+    assert lr_mult == pytest.approx(0.75)
+    assert isinstance(digest, dict)
+    assert digest == dual_digest
+
+    _, _, digest_meta, saved_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
+    assert isinstance(digest_meta, dict)
+    assert digest_meta == dual_digest
+    assert saved_step == 9
+    assert saved_ga == 3
+
+
 def test_load_checkpoint_data_progress_warns_on_invalid_json(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -721,6 +784,30 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
     assert str(opt._param_order_digest) == expected
 
 
+def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig(
+        learning_rate=5.0e-4,
+        generator_learning_rate=2.5e-4,
+        weight_decay=0.01,
+        mixed_precision="no",
+    )
+    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
+
+    assert gen_opt.param_groups
+    assert disc_opt.param_groups
+    for group in gen_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(2.5e-4)
+    for group in disc_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(5.0e-4)
+
+    assert isinstance(getattr(gen_opt, "_param_order_digest", ""), str)
+    assert isinstance(getattr(disc_opt, "_param_order_digest", ""), str)
+    assert len(str(gen_opt._param_order_digest)) == 16
+    assert len(str(disc_opt._param_order_digest)) == 16
+    assert str(gen_opt._param_order_digest) != str(disc_opt._param_order_digest)
+
+
 def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     """_save_training_checkpoint forwards optimizer_param_digest to data_state.json."""
     out = tmp_path / "run"
@@ -739,6 +826,27 @@ def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     )
     _, _, digest = _load_checkpoint_data_progress(ckpt)
     assert digest == "deadbeef12345678"
+
+
+def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-6"
+
+    dual_digest = {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"}
+    accel = _FakeAccelerator(is_main_process=True)
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=ckpt,
+        output_dir=out,
+        consumed_micro_batches=15,
+        save_total_limit=3,
+        log_label="test",
+        optimizer_param_digest=dual_digest,
+    )
+    _, _, digest = _load_checkpoint_data_progress(ckpt)
+    assert isinstance(digest, dict)
+    assert digest == dual_digest
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
@@ -1562,6 +1670,113 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
         )
 
 
+def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _ResumeAccelerator(FakeAccelerator):
+        def load_state(self, ckpt: str, **kwargs: Any) -> None:
+            del ckpt, kwargs
+
+    class _DecoupledRTD(SimpleRTD):
+        def forward_generator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            labels: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            sampling_temperature: float = 1.0,
+        ) -> Any:
+            del attention_mask, labels, token_type_ids, sampling_temperature
+            gen_loss = self.generator.weight.sum() * 0.0 + 1.0
+            return types.SimpleNamespace(
+                gen_loss_raw=gen_loss,
+                gen_token_count=torch.tensor(1.0),
+                corrupted_input_ids=input_ids.detach().clone(),
+                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
+            )
+
+        def forward_discriminator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            corrupted_input_ids: torch.Tensor,
+            disc_labels: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+        ) -> Any:
+            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
+            disc_loss = self.discriminator.weight.sum() * 0.0 + 1.0
+            return types.SimpleNamespace(
+                disc_loss_raw=disc_loss,
+                disc_accuracy=torch.tensor(0.5),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(0.0),
+            )
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            return None
+
+    checkpoint_dir = tmp_path / "run" / "checkpoint-0"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
+    (checkpoint_dir.parent / "model_config.json").write_text(
+        json.dumps(asdict(ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes")), indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+    (checkpoint_dir / "data_state.json").write_text(
+        json.dumps(
+            {
+                "consumed_micro_batches": 0,
+                "global_step": 0,
+                "optimizer_param_digest": "legacydeadbeef000",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_ResumeAccelerator,
+        rtd_cls=_DecoupledRTD,
+    )
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
+
+    assert any(
+        "legacy single optimizer digest while current run uses decoupled mode" in rec.message
+        for rec in caplog.records
+    )
+
+
 def test_run_pretraining_logs_window_averaged_rtd_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1637,6 +1852,126 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert metrics["gen_token_count"] == pytest.approx(10.0, rel=0.0, abs=1e-6)
     assert metrics["disc_token_count"] == pytest.approx(12.0, rel=0.0, abs=1e-6)
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
+
+
+def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TrackingAccelerator(FakeAccelerator):
+        last_instance: _TrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            _TrackingAccelerator.last_instance = self
+
+    call_order: list[str] = []
+
+    class _DecoupledRTD(SimpleRTD):
+        def forward_generator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            labels: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            sampling_temperature: float = 1.0,
+        ) -> Any:
+            del attention_mask, labels, token_type_ids, sampling_temperature
+            call_order.append("gen_forward")
+            gen_loss = self.generator.weight.sum() * 0.0 + 1.0
+            return types.SimpleNamespace(
+                gen_loss_raw=gen_loss,
+                gen_token_count=torch.tensor(1.0),
+                corrupted_input_ids=input_ids.detach().clone(),
+                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
+            )
+
+        def forward_discriminator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            corrupted_input_ids: torch.Tensor,
+            disc_labels: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+        ) -> Any:
+            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
+            call_order.append("disc_forward")
+            disc_loss = self.discriminator.weight.sum() * 0.0 + 2.0
+            return types.SimpleNamespace(
+                disc_loss_raw=disc_loss,
+                disc_accuracy=torch.tensor(0.5),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(0.0),
+            )
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            call_order.append("sync")
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_TrackingAccelerator,
+        rtd_cls=_DecoupledRTD,
+    )
+
+    original_build_decoupled = pretrain_mod._build_decoupled_optimizers
+
+    def _build_logged_decoupled(model: torch.nn.Module, cfg: TrainConfig, *, mixed_precision: str = "no"):
+        gen_opt, disc_opt = original_build_decoupled(model, cfg, mixed_precision=mixed_precision)
+        original_gen_step = gen_opt.step
+        original_disc_step = disc_opt.step
+
+        def _gen_step(_opt_self: Any, *args: Any, **kwargs: Any):
+            call_order.append("gen_step")
+            return original_gen_step(*args, **kwargs)
+
+        def _disc_step(_opt_self: Any, *args: Any, **kwargs: Any):
+            call_order.append("disc_step")
+            return original_disc_step(*args, **kwargs)
+
+        gen_opt.step = types.MethodType(_gen_step, gen_opt)  # type: ignore[method-assign]
+        disc_opt.step = types.MethodType(_disc_step, disc_opt)  # type: ignore[method-assign]
+        return gen_opt, disc_opt
+
+    monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="tensorboard",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert call_order.count("gen_step") == 1
+    assert call_order.count("disc_step") == 1
+    gen_forward_idx = call_order.index("gen_forward")
+    gen_step_idx = call_order.index("gen_step")
+    sync_after_gen_idx = call_order.index("sync", gen_step_idx + 1)
+    disc_forward_idx = call_order.index("disc_forward")
+    disc_step_idx = call_order.index("disc_step")
+    assert gen_forward_idx < gen_step_idx < sync_after_gen_idx < disc_forward_idx < disc_step_idx
+
+    accel = _TrackingAccelerator.last_instance
+    assert accel is not None
+    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+    assert step_rows
+    assert step_rows[-1]["decoupled_training"] == pytest.approx(1.0, rel=0.0, abs=1e-9)
 
 
 class _ZeroTokenTrackingAccelerator(FakeAccelerator):
@@ -3966,6 +4301,71 @@ def test_validate_train_config_trims_resume_hint():
     assert cfg.resume_from_checkpoint == "auto"
 
 
+def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
+    model_cfg = ModelConfig(profile="deberta_v3_parity")
+    train_cfg = TrainConfig()
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.embedding_sharing == "gdes"
+    assert model_cfg.hf_attention_kernel == "dynamic"
+    assert train_cfg.mask_token_prob == pytest.approx(1.0)
+    assert train_cfg.random_token_prob == pytest.approx(0.0)
+    assert train_cfg.mlm_max_ngram == 1
+    assert train_cfg.disc_loss_weight == pytest.approx(10.0)
+    assert train_cfg.adam_epsilon == pytest.approx(1e-6)
+    assert train_cfg.token_weighted_gradient_accumulation is False
+
+
+def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        embedding_sharing="none",
+        hf_attention_kernel="stable",
+    )
+    train_cfg = TrainConfig(
+        mask_token_prob=0.95,
+        random_token_prob=0.03,
+        mlm_max_ngram=2,
+        disc_loss_weight=12.5,
+        adam_epsilon=5e-6,
+        token_weighted_gradient_accumulation=False,
+    )
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.embedding_sharing == "none"
+    assert model_cfg.hf_attention_kernel == "stable"
+    assert train_cfg.mask_token_prob == pytest.approx(0.95)
+    assert train_cfg.random_token_prob == pytest.approx(0.03)
+    assert train_cfg.mlm_max_ngram == 2
+    assert train_cfg.disc_loss_weight == pytest.approx(12.5)
+    assert train_cfg.adam_epsilon == pytest.approx(5e-6)
+    assert train_cfg.token_weighted_gradient_accumulation is False
+
+
+def test_resolve_decoupled_training_auto_and_explicit_overrides() -> None:
+    assert resolve_decoupled_training(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        train_cfg=TrainConfig(decoupled_training=None),
+    )
+    assert not resolve_decoupled_training(
+        model_cfg=ModelConfig(backbone_type="rope"),
+        train_cfg=TrainConfig(decoupled_training=None),
+    )
+    assert not resolve_decoupled_training(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        train_cfg=TrainConfig(decoupled_training=False),
+    )
+    assert resolve_decoupled_training(
+        model_cfg=ModelConfig(backbone_type="rope"),
+        train_cfg=TrainConfig(decoupled_training=True),
+    )
+
+
 def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Path):
     out_dir = tmp_path / "run"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4090,6 +4490,15 @@ def test_validate_training_workflow_options_allows_gdes_with_divergent_gen_lr():
         train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
         model_cfg=ModelConfig(embedding_sharing="gdes"),
     )
+
+
+def test_validate_training_workflow_options_rejects_decoupled_with_es_embedding_sharing():
+    with pytest.raises(ValueError, match="incompatible with model.embedding_sharing='es'"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=TrainConfig(decoupled_training=True),
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="es"),
+        )
 
 
 def test_validate_model_config_rejects_rope_knobs_in_hf_mode():

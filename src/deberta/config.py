@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, fields
 from typing import TypeVar
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
+_MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
 _NORM_ARCH_CHOICES = {"post", "keel"}
 _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
 _FFN_CHOICES = {"swiglu", "mlp"}
@@ -139,6 +140,17 @@ class ModelConfig:
     tokenizer_name_or_path: str = field(
         default="microsoft/deberta-v3-base",
         metadata={"help": "Tokenizer name or local path."},
+    )
+
+    profile: str = field(
+        default="modern",
+        metadata={
+            "help": (
+                "Model/runtime profile. "
+                "'modern' keeps this repo's default modernization choices; "
+                "'deberta_v3_parity' applies DeBERTa-v3 parity-oriented defaults where unset."
+            )
+        },
     )
 
     tokenizer_allow_vocab_resize: bool = field(
@@ -723,6 +735,16 @@ class TrainConfig:
         },
     )
 
+    decoupled_training: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable true two-phase RTD training (generator step then discriminator step). "
+                "If null, defaults to true for model.backbone_type=hf_deberta_v2 and false otherwise."
+            )
+        },
+    )
+
     # Logging / eval / save
     logging_steps: int = field(default=50, metadata={"help": "Log every N optimizer steps."})
 
@@ -1150,6 +1172,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
     :param ModelConfig cfg: Model configuration.
     """
     cfg.backbone_type = _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
+    cfg.profile = _ensure_choice("model.profile", cfg.profile, _MODEL_PROFILE_CHOICES)
     cfg.hf_attention_kernel = _normalize_hf_attention_kernel(cfg.hf_attention_kernel)
     cfg.norm_arch = _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES)
     cfg.attention_implementation = _ensure_choice(
@@ -1476,6 +1499,58 @@ def validate_train_config(cfg: TrainConfig) -> None:
             )
 
 
+def apply_profile_defaults(*, model_cfg: ModelConfig, train_cfg: TrainConfig) -> None:
+    """Apply profile-specific defaults while preserving explicit non-default values.
+
+    :param ModelConfig model_cfg: Model config to update in-place.
+    :param TrainConfig train_cfg: Train config to update in-place.
+    """
+    profile = str(model_cfg.profile).strip().lower()
+    if profile != "deberta_v3_parity":
+        return
+
+    model_defaults = ModelConfig()
+    train_defaults = TrainConfig()
+
+    # Profile intends parity defaults on HF DeBERTa-v2 path unless user picked otherwise.
+    if str(model_cfg.backbone_type) == str(model_defaults.backbone_type):
+        model_cfg.backbone_type = "hf_deberta_v2"
+
+    if str(model_cfg.embedding_sharing) == str(model_defaults.embedding_sharing):
+        model_cfg.embedding_sharing = "gdes"
+
+    if str(model_cfg.hf_attention_kernel) == str(model_defaults.hf_attention_kernel):
+        model_cfg.hf_attention_kernel = "dynamic"
+
+    # RTD recipe defaults.
+    if float(train_cfg.mask_token_prob) == float(train_defaults.mask_token_prob):
+        train_cfg.mask_token_prob = 1.0
+    if float(train_cfg.random_token_prob) == float(train_defaults.random_token_prob):
+        train_cfg.random_token_prob = 0.0
+    if int(train_cfg.mlm_max_ngram) == int(train_defaults.mlm_max_ngram):
+        train_cfg.mlm_max_ngram = 1
+    if float(train_cfg.disc_loss_weight) == float(train_defaults.disc_loss_weight):
+        train_cfg.disc_loss_weight = 10.0
+    if float(train_cfg.adam_epsilon) == float(train_defaults.adam_epsilon):
+        train_cfg.adam_epsilon = 1e-6
+    if bool(train_cfg.token_weighted_gradient_accumulation) == bool(
+        train_defaults.token_weighted_gradient_accumulation
+    ):
+        train_cfg.token_weighted_gradient_accumulation = False
+
+
+def resolve_decoupled_training(*, model_cfg: ModelConfig, train_cfg: TrainConfig) -> bool:
+    """Resolve effective decoupled-training toggle.
+
+    :param ModelConfig model_cfg: Model configuration.
+    :param TrainConfig train_cfg: Train configuration.
+    :return bool: Effective decoupled-training mode.
+    """
+    if train_cfg.decoupled_training is not None:
+        return bool(train_cfg.decoupled_training)
+    return str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2"
+
+
 def validate_training_workflow_options(
     *,
     data_cfg: DataConfig,
@@ -1534,4 +1609,10 @@ def validate_training_workflow_options(
                 f"({train_cfg.learning_rate}). Shared embeddings would silently use the generator LR. "
                 f"Set generator_learning_rate=-1 (inherit) or match it to learning_rate, "
                 f"or switch to embedding_sharing='gdes'/'none'."
+            )
+        if resolve_decoupled_training(model_cfg=model_cfg, train_cfg=train_cfg) and embed_sharing == "es":
+            raise ValueError(
+                "train.decoupled_training is incompatible with model.embedding_sharing='es' because "
+                "shared embedding parameters would be stepped in both generator and discriminator phases. "
+                "Use embedding_sharing='gdes' or 'none' for decoupled training."
             )

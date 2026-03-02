@@ -760,11 +760,15 @@ class DebertaV2Embeddings(nn.Module):
             padding_idx=pad_token_id,
         )
 
+        # NOTE: DeBERTa-v2/v3 often set position_biased_input=False (no learned absolute
+        # positions added to the input). The original Microsoft implementation STILL
+        # instantiates position_embeddings because they are consumed by the Enhanced
+        # Mask Decoder (EMD) during RTD pretraining.
+        #
+        # We therefore ALWAYS create position_embeddings, but only ADD them in forward
+        # when position_biased_input=True.
         self.position_biased_input = bool(getattr(config, "position_biased_input", True))
-        if self.position_biased_input:
-            self.position_embeddings = nn.Embedding(int(config.max_position_embeddings), self.embedding_size)
-        else:
-            self.position_embeddings = None
+        self.position_embeddings = nn.Embedding(int(config.max_position_embeddings), self.embedding_size)
 
         if int(config.type_vocab_size) > 0:
             self.token_type_embeddings = nn.Embedding(int(config.type_vocab_size), self.embedding_size)

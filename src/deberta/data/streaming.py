@@ -57,7 +57,14 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         self.cfg = cfg
         self.process_index = int(process_index)
         self.num_processes = int(num_processes)
-        self._epoch = mp.Value("i", 0)
+        try:
+            self._epoch = mp.Value("i", 0)
+            self._epoch_shared = True
+        except Exception:
+            # Some restricted environments (for example sandboxed CI) may block
+            # shared-memory allocations used by multiprocessing.Value.
+            self._epoch = 0
+            self._epoch_shared = False
 
         if not hasattr(tokenizer, "cls_token_id") or tokenizer.cls_token_id is None:
             raise ValueError("Tokenizer must define cls_token_id.")
@@ -71,8 +78,11 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
         :param int epoch: Training epoch.
         """
-        with self._epoch.get_lock():
-            self._epoch.value = int(max(0, epoch))
+        if self._epoch_shared:
+            with self._epoch.get_lock():
+                self._epoch.value = int(max(0, epoch))
+        else:
+            self._epoch = int(max(0, epoch))
         # Some streaming datasets support set_epoch() for deterministic shuffling.
         if hasattr(self.hf_dataset, "set_epoch"):
             try:
@@ -85,7 +95,9 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
         :return int: Current dataset epoch.
         """
-        return int(self._epoch.value)
+        if self._epoch_shared:
+            return int(self._epoch.value)
+        return int(self._epoch)
 
     def _shard_dataset_for_worker(self, ds: Any) -> Any:
         """Shard dataset across processes and dataloader workers.

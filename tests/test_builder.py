@@ -274,6 +274,30 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
     assert disc_cfg.intermediate_size == 2816
 
 
+def test_derive_generator_config_uses_half_depth_for_hf_parity_profile():
+    base_cfg = types.SimpleNamespace(num_hidden_layers=12)
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        generator_num_hidden_layers=None,
+    )
+
+    gen_cfg = builder_mod._derive_generator_config(base_cfg, model_cfg)
+    assert int(gen_cfg.num_hidden_layers) == 6
+
+
+def test_derive_generator_config_keeps_modern_third_depth_default():
+    base_cfg = types.SimpleNamespace(num_hidden_layers=12)
+    model_cfg = ModelConfig(
+        profile="modern",
+        backbone_type="hf_deberta_v2",
+        generator_num_hidden_layers=None,
+    )
+
+    gen_cfg = builder_mod._derive_generator_config(base_cfg, model_cfg)
+    assert int(gen_cfg.num_hidden_layers) == 4
+
+
 def test_build_backbone_configs_respects_explicit_generator_intermediate_with_swiglu_adjust(
     monkeypatch: pytest.MonkeyPatch,
 ):

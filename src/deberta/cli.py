@@ -17,6 +17,7 @@ from deberta.config import (
     _HF_ATTN_KERNEL_ALIASES,
     _HF_ATTN_KERNEL_CHOICES,
     _LR_SCHEDULER_CHOICES,
+    _MODEL_PROFILE_CHOICES,
     _NORM_ARCH_CHOICES,
     _REPORT_TO_CHOICES,
     _RESUME_DATA_STRATEGY_CHOICES,
@@ -31,6 +32,7 @@ from deberta.config import (
     DataConfig,
     ModelConfig,
     TrainConfig,
+    apply_profile_defaults,
     validate_data_config,
     validate_model_config,
     validate_train_config,
@@ -44,6 +46,7 @@ _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "deberta-v3-base": {
         # Paper-faithful architecture path for DeBERTa-v3 experiments.
         "model": {
+            "profile": "deberta_v3_parity",
             "backbone_type": "hf_deberta_v2",
             "tokenizer_name_or_path": "microsoft/deberta-v3-base",
             "discriminator_model_name_or_path": "microsoft/deberta-v3-base",
@@ -224,6 +227,7 @@ def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_nam
     group = parser.add_argument_group(group_name)
     type_hints = get_type_hints(cls)
     constrained_choices: dict[str, tuple[str, ...]] = {
+        "profile": tuple(sorted(_MODEL_PROFILE_CHOICES)),
         "backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
         "norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
         "pretrained_norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
@@ -487,6 +491,8 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
         _apply_overrides(model_cfg, ns, provided_flags)
         _apply_overrides(data_cfg, ns, provided_flags)
         _apply_overrides(train_cfg, ns, provided_flags)
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
 
     # Validate after config load + CLI overrides so failures are immediate and explicit.
     validate_model_config(model_cfg)

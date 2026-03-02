@@ -416,10 +416,15 @@ def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
     """
     gen_cfg = copy.deepcopy(base_cfg)
 
-    # Default ELECTRA heuristic: fewer layers.
+    # Default heuristic: parity profile uses DeBERTa's half-depth generator;
+    # modern profile keeps the lighter ELECTRA-style 1/3 depth.
     if getattr(gen_cfg, "num_hidden_layers", None) is not None:
         disc_layers = int(gen_cfg.num_hidden_layers)
-        default_gen_layers = max(1, disc_layers // 3)
+        profile = str(getattr(model_cfg, "profile", "modern")).strip().lower()
+        if profile == "deberta_v3_parity" and str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
+            default_gen_layers = max(1, disc_layers // 2)
+        else:
+            default_gen_layers = max(1, disc_layers // 3)
         gen_cfg.num_hidden_layers = int(model_cfg.generator_num_hidden_layers or default_gen_layers)
 
     if model_cfg.generator_hidden_size is not None:

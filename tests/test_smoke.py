@@ -1340,7 +1340,7 @@ def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
     assert logits.dtype == torch.float32
 
 
-def test_rtd_head_applies_dropout_once_per_forward():
+def test_rtd_head_does_not_apply_dropout_in_parity_path():
     import pytest
 
     pytest.importorskip("transformers")
@@ -1374,7 +1374,55 @@ def test_rtd_head_applies_dropout_once_per_forward():
 
     hidden = torch.randn((2, 4, cfg.hidden_size), dtype=torch.float32)
     _ = head(hidden)
-    assert counting_dropout.calls == 1
+    assert counting_dropout.calls == 0
+
+
+def test_rtd_head_applies_cls_conditioning_before_dense_projection():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import RTDHead
+
+    class _Spy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: torch.Tensor | None = None
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.seen = x.detach().clone()
+            return x
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+    )
+    head = RTDHead(cfg)
+
+    norm_spy = _Spy()
+    dense_spy = _Spy()
+    head.norm = norm_spy
+    head.dense = dense_spy
+    head.act = torch.nn.Identity()
+    head.classifier = torch.nn.Linear(cfg.hidden_size, 1, bias=False)
+    with torch.no_grad():
+        head.classifier.weight.fill_(1.0)
+
+    hidden = torch.arange(0, 2 * 3 * cfg.hidden_size, dtype=torch.float32).view(2, 3, cfg.hidden_size)
+    logits = head(hidden)
+
+    expected_norm_input = hidden + hidden[:, 0:1, :]
+    assert norm_spy.seen is not None
+    assert dense_spy.seen is not None
+    torch.testing.assert_close(norm_spy.seen, expected_norm_input)
+    torch.testing.assert_close(dense_spy.seen, expected_norm_input)
+    assert logits.shape == (2, 3)
 
 
 def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
