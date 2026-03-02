@@ -544,22 +544,27 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
         assert cfg.use_bias is True
 
 
-def _build_hf_fake_transformers_module() -> types.ModuleType:
+def _build_hf_fake_transformers_module(
+    *, config_overrides: dict[str, object] | None = None
+) -> types.ModuleType:
     """Build a fake ``transformers`` module for deterministic AutoConfig tests."""
+    config_payload: dict[str, object] = {
+        "vocab_size": 50265,
+        "hidden_dropout_prob": 0.1,
+        "attention_probs_dropout_prob": 0.2,
+        "num_hidden_layers": 6,
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "num_attention_heads": 12,
+    }
+    if config_overrides is not None:
+        config_payload.update(config_overrides)
 
     class _FakeAutoConfig:
         @classmethod
         def from_pretrained(cls, src: str) -> types.SimpleNamespace:
             del src
-            return types.SimpleNamespace(
-                vocab_size=50265,
-                hidden_dropout_prob=0.1,
-                attention_probs_dropout_prob=0.2,
-                num_hidden_layers=6,
-                hidden_size=768,
-                intermediate_size=3072,
-                num_attention_heads=12,
-            )
+            return types.SimpleNamespace(**config_payload)
 
     module = types.ModuleType("transformers")
     module.AutoConfig = _FakeAutoConfig
@@ -665,24 +670,11 @@ def test_build_backbone_configs_pretrained_hf_can_auto_grow_tokenizer_to_config_
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
-
-    class _FakeAutoConfig:
-        @classmethod
-        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
-            del src
-            return types.SimpleNamespace(
-                vocab_size=512,
-                hidden_dropout_prob=0.1,
-                attention_probs_dropout_prob=0.2,
-                num_hidden_layers=6,
-                hidden_size=768,
-                intermediate_size=3072,
-                num_attention_heads=12,
-            )
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoConfig = _FakeAutoConfig
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _build_hf_fake_transformers_module(config_overrides={"vocab_size": 512}),
+    )
 
     tokenizer = DummyTokenizer(vocab_size=500)
     model_cfg = ModelConfig(
@@ -706,24 +698,11 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
-
-    class _FakeAutoConfig:
-        @classmethod
-        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
-            del src
-            return types.SimpleNamespace(
-                vocab_size=500,
-                hidden_dropout_prob=0.1,
-                attention_probs_dropout_prob=0.2,
-                num_hidden_layers=6,
-                hidden_size=768,
-                intermediate_size=3072,
-                num_attention_heads=12,
-            )
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoConfig = _FakeAutoConfig
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _build_hf_fake_transformers_module(config_overrides={"vocab_size": 500}),
+    )
 
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -742,24 +721,11 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
 
 def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
-
-    class _FakeAutoConfig:
-        @classmethod
-        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
-            del src
-            return types.SimpleNamespace(
-                vocab_size=777,
-                hidden_dropout_prob=0.1,
-                attention_probs_dropout_prob=0.2,
-                num_hidden_layers=6,
-                hidden_size=768,
-                intermediate_size=3072,
-                num_attention_heads=12,
-            )
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoConfig = _FakeAutoConfig
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _build_hf_fake_transformers_module(config_overrides={"vocab_size": 777}),
+    )
 
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -776,25 +742,11 @@ def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch
 
 def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
-
-    class _FakeAutoConfig:
-        @classmethod
-        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
-            del src
-            return types.SimpleNamespace(
-                vocab_size=50265,
-                cls_token_id=404,
-                hidden_dropout_prob=0.1,
-                attention_probs_dropout_prob=0.2,
-                num_hidden_layers=6,
-                hidden_size=768,
-                intermediate_size=3072,
-                num_attention_heads=12,
-            )
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoConfig = _FakeAutoConfig
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _build_hf_fake_transformers_module(config_overrides={"cls_token_id": 404}),
+    )
 
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
