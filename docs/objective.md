@@ -34,12 +34,7 @@ Exposed controls:
 - `train.sampling_temperature`
 - `train.token_weighted_gradient_accumulation` (default `true`)
 
-Parity profile note:
-
-- `model.profile=deberta_v3_parity` applies DeBERTa-style defaults such as
-  `disc_loss_weight=10.0`, `mask_token_prob=1.0`, `random_token_prob=0.0`,
-  `adam_epsilon=1e-6`, and `token_weighted_gradient_accumulation=false` when those
-  values remain unset.
+For parity-profile defaults and long-run parity configs, see [replication](replication.md).
 
 Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
 

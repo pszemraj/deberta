@@ -84,6 +84,9 @@ Checkpoint metadata in `data_state.json` stores:
 
 - `consumed_micro_batches`
 - `lr_mult` (persistent non-finite recovery multiplier)
+- `optimizer_param_digest` (single digest for coupled mode; generator/discriminator digests for decoupled mode)
+- `global_step`
+- `gradient_accumulation_steps`
 
 Resume fails fast when this file is missing; approximate replay offsets are not used.
 
@@ -192,7 +195,7 @@ Use `train.sdpa_kernel` to set SDPA backend preference:
 
 `train.sdpa_kernel` is only behaviorally relevant when `model.backbone_type='rope'` and `model.attention_implementation='sdpa'`. For rope eager attention, validation requires `train.sdpa_kernel=auto` to avoid inert config differences.
 
-When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in the [pairwise mask contract](data.md#pairwise-mask-contract-block_cross_document_attentiontrue). That mask path is incompatible with strict flash SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
+When `data.pack_sequences=true` and `data.block_cross_document_attention=true`, packed batches may emit the pairwise `(B, S, S)` keep-mask defined in the [doc-blocking contract](data.md#doc-blocking-contract-block_cross_document_attentiontrue). That mask path is incompatible with strict flash SDPA kernels, so `train.sdpa_kernel=flash` is rejected by config validation for that workflow.
 
 Use `auto`, `mem_efficient`, or `math` for packed+doc-block training runs.
 
