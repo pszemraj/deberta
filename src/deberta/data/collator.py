@@ -85,10 +85,17 @@ class DebertaV3ElectraCollator:
             )
 
         self._special_token_ids = self._collect_special_token_ids()
+        self._special_token_ids_tensor_cpu = (
+            torch.tensor(sorted(self._special_token_ids), dtype=torch.long)
+            if self._special_token_ids
+            else None
+        )
+        self._special_token_ids_tensor_by_device: dict[str, torch.Tensor] = {}
         self._non_special_token_ids_cpu = self._build_non_special_token_ids()
         self._non_special_token_ids_by_device: dict[str, torch.Tensor] = {}
         self._word_boundary_scheme = self._detect_word_boundary_scheme()
         self._word_continuation_by_id = self._build_word_continuation_lookup()
+        self._ngram_prob_cache: dict[tuple[int, str], torch.Tensor] = {}
         if int(self.cfg.max_ngram) > 1 and self._word_boundary_scheme == "none":
             logger.warning(
                 "Tokenizer word-boundary probe returned scheme='none'; "
@@ -275,6 +282,21 @@ class DebertaV3ElectraCollator:
         """
         return int(self._sample_random_words((1,), device=device)[0].item())
 
+    def _special_ids_tensor_for_device(self, device: torch.device) -> torch.Tensor | None:
+        """Return cached special-token id tensor on the requested device.
+
+        :param torch.device device: Target device.
+        :return torch.Tensor | None: 1D special-token id tensor or ``None``.
+        """
+        if self._special_token_ids_tensor_cpu is None:
+            return None
+        key = f"{device.type}:{device.index if device.index is not None else -1}"
+        cached = self._special_token_ids_tensor_by_device.get(key)
+        if cached is None:
+            cached = self._special_token_ids_tensor_cpu.to(device=device)
+            self._special_token_ids_tensor_by_device[key] = cached
+        return cached
+
     def _infer_special_tokens_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Infer special-token mask when dataset does not provide one.
 
@@ -283,7 +305,10 @@ class DebertaV3ElectraCollator:
         """
         inferred = torch.zeros_like(input_ids, dtype=torch.bool)
 
-        if hasattr(self.tokenizer, "get_special_tokens_mask"):
+        special_ids = self._special_ids_tensor_for_device(input_ids.device)
+        if special_ids is not None and int(special_ids.numel()) > 0:
+            inferred = torch.isin(input_ids, special_ids)
+        elif hasattr(self.tokenizer, "get_special_tokens_mask"):
             try:
                 rows = input_ids.detach().cpu().tolist()
                 masks = [
@@ -642,12 +667,19 @@ class DebertaV3ElectraCollator:
         keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
 
         # n-gram sampling distribution: p(n) ∝ 1/n
-        probs = torch.tensor(
-            [1.0 / float(n) for n in range(1, int(max_ngram) + 1)],
-            dtype=torch.float32,
-            device=input_ids.device,
+        cache_key = (
+            int(max_ngram),
+            f"{input_ids.device.type}:{input_ids.device.index if input_ids.device.index is not None else -1}",
         )
-        probs = probs / probs.sum().clamp(min=1e-12)
+        probs = self._ngram_prob_cache.get(cache_key)
+        if probs is None:
+            probs = torch.tensor(
+                [1.0 / float(n) for n in range(1, int(max_ngram) + 1)],
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            probs = probs / probs.sum().clamp(min=1e-12)
+            self._ngram_prob_cache[cache_key] = probs
 
         mask_window = max(1, int(1.0 / mlm_prob))
         max_preds_per_seq = int(math.ceil(float(S) * mlm_prob / 10.0) * 10)
