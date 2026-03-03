@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -133,14 +132,26 @@ def _upload_wandb_original_config(
         with suppress(Exception):
             owner = accelerator.get_tracker("wandb", unwrap=True)
     if owner is None:
+        with suppress(Exception):
+            owner = accelerator.get_tracker("wandb", unwrap=False)
+    if owner is None:
         return False
 
-    safe_run_name = _sanitize_run_label(run_name)
-    staged_files: list[tuple[Path, str]] = []
+    run_owner = owner
+    with suppress(Exception):
+        run_owner = owner.tracker
+    with suppress(Exception):
+        run_owner = owner.run
+
+    upload_files: list[Path] = []
     if config_original_path.exists():
-        staged_files.append((config_original_path, f"config_original_deberta_{safe_run_name}.yaml"))
+        upload_files.append(config_original_path)
+    else:
+        logger.warning("W&B config upload skipped missing file: %s", config_original_path)
     if config_resolved_path is not None and config_resolved_path.exists():
-        staged_files.append((config_resolved_path, f"config_resolved_deberta_{safe_run_name}.yaml"))
+        upload_files.append(config_resolved_path)
+    elif config_resolved_path is not None:
+        logger.warning("W&B config upload skipped missing file: %s", config_resolved_path)
 
     source_path_for_meta: str | None = None
     if config_source_path is not None:
@@ -149,52 +160,71 @@ def _upload_wandb_original_config(
             source_candidate = source_candidate.resolve()
         source_path_for_meta = str(source_candidate)
         if source_candidate.is_file():
-            source_suffix = source_candidate.suffix or ".yaml"
-            source_name = f"config_source_deberta_{safe_run_name}{source_suffix}"
-            staged_files.append((source_candidate, source_name))
+            upload_files.append(source_candidate)
+        else:
+            logger.warning("W&B config upload skipped missing source config path: %s", source_candidate)
 
-    if not staged_files:
+    if not upload_files:
         return False
 
+    # Keep first-seen order while de-duplicating by resolved path.
+    deduped_upload_files: list[Path] = []
+    seen_paths: set[str] = set()
+    for path in upload_files:
+        try:
+            key = str(path.expanduser().resolve())
+        except Exception:
+            key = str(path)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped_upload_files.append(path)
+
+    safe_run_name = _sanitize_run_label(run_name)
     upload_meta = {
         "source_config_path": source_path_for_meta,
         "config_original_snapshot": str(config_original_path),
         "config_resolved_snapshot": str(config_resolved_path) if config_resolved_path is not None else None,
     }
-    with TemporaryDirectory(prefix="deberta-wandb-config-") as tmp_dir:
-        staged_paths: list[Path] = []
-        for src, upload_name in staged_files:
-            staged = Path(tmp_dir) / upload_name
-            staged.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-            staged_paths.append(staged)
+    save_fn = getattr(run_owner, "save", None)
+    if callable(save_fn):
+        uploaded_any = False
+        for src in deduped_upload_files:
+            try:
+                save_fn(str(src), policy="now")
+            except TypeError:
+                save_fn(str(src))
+            uploaded_any = True
+            logger.info("Uploaded config snapshot to W&B as run file: %s", src)
+        if uploaded_any:
+            return True
 
-        save_fn = getattr(owner, "save", None)
-        if callable(save_fn):
+    with suppress(Exception):
+        import wandb  # type: ignore
+
+        if wandb.run is not None and callable(getattr(wandb, "save", None)):
             uploaded_any = False
-            for staged in staged_paths:
+            for src in deduped_upload_files:
                 try:
-                    save_fn(str(staged), base_path=tmp_dir, policy="now")
+                    wandb.save(str(src), policy="now")
                 except TypeError:
-                    try:
-                        save_fn(str(staged), base_path=tmp_dir)
-                    except TypeError:
-                        save_fn(str(staged))
+                    wandb.save(str(src))
                 uploaded_any = True
-                logger.info("Uploaded config snapshot to W&B as %s", staged.name)
+                logger.info("Uploaded config snapshot via wandb.save: %s", src)
             if uploaded_any:
                 return True
 
-        log_artifact_fn = getattr(owner, "log_artifact", None)
-        if callable(log_artifact_fn):
-            with suppress(Exception):
-                import wandb  # type: ignore
+    log_artifact_fn = getattr(run_owner, "log_artifact", None)
+    if callable(log_artifact_fn):
+        with suppress(Exception):
+            import wandb  # type: ignore
 
-                artifact = wandb.Artifact(name=f"config-{safe_run_name}", type="config", metadata=upload_meta)
-                for staged in staged_paths:
-                    artifact.add_file(str(staged), name=staged.name)
-                log_artifact_fn(artifact)
-                logger.info("Uploaded config snapshot artifact to W&B for run %s", safe_run_name)
-                return True
+            artifact = wandb.Artifact(name=f"config-{safe_run_name}", type="config", metadata=upload_meta)
+            for src in deduped_upload_files:
+                artifact.add_file(str(src), name=src.name)
+            log_artifact_fn(artifact)
+            logger.info("Uploaded config snapshot artifact to W&B for run %s", safe_run_name)
+            return True
 
     logger.warning("W&B tracker does not support save()/log_artifact(); skipping config upload.")
     return False

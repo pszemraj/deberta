@@ -1179,7 +1179,8 @@ def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Pa
     )
     assert uploaded is True
     assert run.saved
-    assert run.saved[0].name == "config_original_deberta_demo-run.yaml"
+    assert run.saved[0].name == "config_original.yaml"
+    assert run.saved[0] == src
 
 
 def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path: Path) -> None:
@@ -1214,9 +1215,9 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
     )
     assert uploaded is True
     saved_names = {p.name for p in run.saved}
-    assert "config_original_deberta_demo-run.yaml" in saved_names
-    assert "config_resolved_deberta_demo-run.yaml" in saved_names
-    assert "config_source_deberta_demo-run.yaml" in saved_names
+    assert "config_original.yaml" in saved_names
+    assert "config_resolved.yaml" in saved_names
+    assert "passed.yaml" in saved_names
 
 
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
@@ -1303,8 +1304,8 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.wandb_run.watch_calls
     assert accel.wandb_run.saved_paths
     saved_names = {p.name for p in accel.wandb_run.saved_paths}
-    assert "config_original_deberta_run.yaml" in saved_names
-    assert "config_resolved_deberta_run.yaml" in saved_names
+    assert "config_original.yaml" in saved_names
+    assert "config_resolved.yaml" in saved_names
     assert accel.wandb_run.watch_calls[0][1]["log"] == "gradients"
     assert accel.tracker_init_calls
     first_tracker_call = accel.tracker_init_calls[0]

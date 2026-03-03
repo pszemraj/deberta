@@ -1806,10 +1806,14 @@ def run_pretraining(
                 run_name=tracker_run_name,
             )
             if str(train_cfg.report_to).lower() == "wandb":
-                with suppress(Exception):
+                try:
                     wandb_run = accelerator.get_tracker("wandb", unwrap=True)
-                with suppress(Exception):
-                    _upload_wandb_original_config(
+                except Exception:
+                    wandb_run = None
+                    logger.exception("Failed to resolve W&B tracker from Accelerator.")
+
+                try:
+                    uploaded_config = _upload_wandb_original_config(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
                         config_original_path=output_dir / "config_original.yaml",
@@ -1817,7 +1821,17 @@ def run_pretraining(
                         config_resolved_path=output_dir / "config_resolved.yaml",
                         config_source_path=config_path,
                     )
-                with suppress(Exception):
+                    if not uploaded_config:
+                        logger.warning(
+                            "W&B config snapshot upload skipped; expected paths: %s, %s (source=%s).",
+                            output_dir / "config_original.yaml",
+                            output_dir / "config_resolved.yaml",
+                            config_path,
+                        )
+                except Exception:
+                    logger.exception("Failed to upload config snapshots to W&B.")
+
+                try:
                     _setup_wandb_watch(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
@@ -1825,6 +1839,8 @@ def run_pretraining(
                         watch_mode=train_cfg.wandb_watch,
                         watch_log_freq=int(train_cfg.wandb_watch_log_freq),
                     )
+                except Exception:
+                    logger.exception("Failed to initialize W&B model watch.")
 
         # Resume
         if ckpt:
