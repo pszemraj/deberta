@@ -1280,10 +1280,68 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
     assert payload["model"]["tokenizer_vocab_target"] == 32000
     assert payload["train"]["generator_learning_rate"] == pytest.approx(5e-4)
     assert payload["train"]["discriminator_learning_rate"] == pytest.approx(5e-4)
+    assert payload["model"]["pretrained_discriminator_path"] == "microsoft/deberta-v3-base"
     assert "pretrained_generator_path" not in payload["model"]
     assert "pretrained_ffn_type" not in payload["model"]
     assert "resume_from_checkpoint" not in payload["train"]
     assert payload["effective"]["generator_backbone"]["hidden_size"] == 384
+
+
+def test_build_runtime_resolved_tracker_config_compacts_effective_backbone_payload() -> None:
+    model_cfg = ModelConfig(profile="deberta_v3_parity", backbone_type="hf_deberta_v2")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig()
+    disc_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "model_type": "deberta-v2",
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "vocab_size": 32000,
+            "max_position_embeddings": 1024,
+            "pad_token_id": 3,
+            "max_length": 20,
+            "top_k": 50,
+            "id2label": {"0": "LABEL_0"},
+            "_name_or_path": "",
+        },
+    )
+    gen_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "model_type": "deberta-v2",
+            "hidden_size": 768,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "vocab_size": 32000,
+            "max_position_embeddings": 1024,
+            "pad_token_id": 3,
+            "max_length": 20,
+            "top_k": 50,
+            "id2label": {"0": "LABEL_0"},
+            "_name_or_path": "",
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    payload = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        tokenizer=tokenizer,
+    )
+
+    disc_eff = payload["effective"]["discriminator_backbone"]
+    gen_eff = payload["effective"]["generator_backbone"]
+    assert disc_eff["hidden_size"] == 768
+    assert gen_eff["num_hidden_layers"] == 6
+    assert "max_length" not in disc_eff
+    assert "top_k" not in disc_eff
+    assert "id2label" not in disc_eff
+    assert "_name_or_path" not in disc_eff
 
 
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(

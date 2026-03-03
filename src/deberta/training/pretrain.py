@@ -82,6 +82,69 @@ _NONFINITE_LR_MULT_RECOVERY = 1.1  # gradual recovery factor per successful step
 _NONFINITE_OPT_STATE_RESET_EVERY = 4
 _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
+_SPECIAL_ID_KEYS = (
+    "pad_token_id",
+    "cls_token_id",
+    "sep_token_id",
+    "mask_token_id",
+    "bos_token_id",
+    "eos_token_id",
+)
+_HF_EFFECTIVE_BACKBONE_KEYS = (
+    "model_type",
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "intermediate_size",
+    "hidden_act",
+    "hidden_dropout_prob",
+    "attention_probs_dropout_prob",
+    "initializer_range",
+    "layer_norm_eps",
+    "legacy",
+    "max_position_embeddings",
+    "max_relative_positions",
+    "position_buckets",
+    "relative_attention",
+    "position_biased_input",
+    "share_att_key",
+    "norm_rel_ebd",
+    "pos_att_type",
+    "type_vocab_size",
+    "pooler_hidden_size",
+    "pooler_hidden_act",
+    "pooler_dropout",
+    "hf_attention_kernel",
+    "use_rmsnorm_heads",
+    "z_steps",
+)
+_ROPE_EFFECTIVE_BACKBONE_KEYS = (
+    "model_type",
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "intermediate_size",
+    "hidden_act",
+    "hidden_dropout_prob",
+    "attention_probs_dropout_prob",
+    "initializer_range",
+    "max_position_embeddings",
+    "rope_theta",
+    "rotary_pct",
+    "use_absolute_position_embeddings",
+    "type_vocab_size",
+    "norm_arch",
+    "norm_eps",
+    "keel_alpha_init",
+    "keel_alpha_learnable",
+    "attention_implementation",
+    "ffn_type",
+    "use_bias",
+    "use_rmsnorm_heads",
+    "z_steps",
+)
 
 
 def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
@@ -193,6 +256,26 @@ def _config_obj_to_mapping(config_obj: Any) -> dict[str, Any]:
     return {}
 
 
+def _compact_effective_backbone_config(*, cfg_map: dict[str, Any], model_cfg: ModelConfig) -> dict[str, Any]:
+    """Keep only architecture/runtime-relevant backbone keys in resolved tracker snapshots.
+
+    :param dict[str, Any] cfg_map: Raw backbone config mapping.
+    :param ModelConfig model_cfg: Runtime model config.
+    :return dict[str, Any]: Compact, deterministic effective backbone mapping.
+    """
+    bt = str(model_cfg.backbone_type).strip().lower()
+    if bt == "hf_deberta_v2":
+        keys = _HF_EFFECTIVE_BACKBONE_KEYS
+    else:
+        keys = _ROPE_EFFECTIVE_BACKBONE_KEYS
+    keep = tuple(keys) + _SPECIAL_ID_KEYS
+    out: dict[str, Any] = {}
+    for key in keep:
+        if key in cfg_map:
+            out[str(key)] = cfg_map[key]
+    return out
+
+
 def _build_runtime_resolved_tracker_config(
     *,
     model_cfg: ModelConfig,
@@ -245,6 +328,10 @@ def _build_runtime_resolved_tracker_config(
     if model_payload.get("tokenizer_vocab_target") is None:
         with suppress(Exception):
             model_payload["tokenizer_vocab_target"] = int(len(tokenizer))
+    if not str(model_payload.get("pretrained_discriminator_path", "")).strip():
+        model_payload["pretrained_discriminator_path"] = None
+    if not str(model_payload.get("pretrained_generator_path", "")).strip():
+        model_payload["pretrained_generator_path"] = None
 
     # Resolve inherited branch LRs to effective numeric values.
     base_lr = float(train_cfg.learning_rate)
@@ -255,8 +342,14 @@ def _build_runtime_resolved_tracker_config(
     train_payload["discriminator_learning_rate"] = disc_lr if disc_lr > 0.0 else base_lr
 
     payload["effective"] = {
-        "discriminator_backbone": disc_cfg_map,
-        "generator_backbone": gen_cfg_map,
+        "discriminator_backbone": _compact_effective_backbone_config(
+            cfg_map=disc_cfg_map,
+            model_cfg=model_cfg,
+        ),
+        "generator_backbone": _compact_effective_backbone_config(
+            cfg_map=gen_cfg_map,
+            model_cfg=model_cfg,
+        ),
     }
     return _drop_none_recursive(payload)
 
