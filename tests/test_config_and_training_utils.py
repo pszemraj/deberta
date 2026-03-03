@@ -2832,6 +2832,55 @@ def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_di
     ).read_text(encoding="utf-8")
 
 
+def test_persist_or_validate_run_configs_allows_resume_when_only_logging_output_dir_differs(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source-run"
+    source_run.mkdir(parents=True, exist_ok=True)
+    source_logging_dir = source_run / "logs"
+    source_logging_dir.mkdir(parents=True, exist_ok=True)
+
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=10)
+    source_logging_cfg = LoggingConfig(output_dir=str(source_logging_dir))
+    _persist_or_validate_run_configs(
+        output_dir=source_run,
+        logging_output_dir=source_logging_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        logging_cfg=source_logging_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    checkpoint_dir = source_run / "checkpoint-10"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    new_output_dir = tmp_path / "new-run"
+    new_output_dir.mkdir(parents=True, exist_ok=True)
+    new_logging_dir = new_output_dir / "logs"
+    new_logging_dir.mkdir(parents=True, exist_ok=True)
+    resumed_logging_cfg = LoggingConfig(output_dir=str(new_logging_dir))
+    _persist_or_validate_run_configs(
+        output_dir=new_output_dir,
+        logging_output_dir=new_logging_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        logging_cfg=resumed_logging_cfg,
+        resume_checkpoint=str(checkpoint_dir),
+        is_main_process=True,
+    )
+
+    resume_source = json.loads((new_output_dir / "resume_source.json").read_text(encoding="utf-8"))
+    assert resume_source["resume_checkpoint"] == str(checkpoint_dir.resolve())
+    assert resume_source["resume_run_dir"] == str(source_run.resolve())
+    assert (new_output_dir / "logging_config.json").read_text(encoding="utf-8") == (
+        source_run / "logging_config.json"
+    ).read_text(encoding="utf-8")
+
+
 def test_persist_or_validate_run_configs_preflight_rejects_conflicting_resume_snapshot(tmp_path: Path):
     source_run = tmp_path / "source-run"
     source_run.mkdir(parents=True, exist_ok=True)

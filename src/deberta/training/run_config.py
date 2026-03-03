@@ -191,6 +191,21 @@ def _effective_model_config_for_resume_compare(cfg: ModelConfig) -> dict[str, An
     return payload
 
 
+def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str, Any]:
+    """Build a normalized logging config snapshot for resume compatibility checks.
+
+    ``logging.output_dir`` is run-local plumbing that can legitimately differ when
+    resuming into a new output directory, so we intentionally exclude it from strict
+    resume-compat validation.
+
+    :param LoggingConfig cfg: Logging config to canonicalize.
+    :return dict[str, Any]: Normalized dict payload suitable for equality checks.
+    """
+    payload = asdict_without_private(cfg)
+    payload["output_dir"] = None
+    return payload
+
+
 def _infer_resume_run_dir(resume_checkpoint: str | Path) -> Path:
     """Infer parent run directory from a checkpoint path.
 
@@ -352,7 +367,9 @@ def _persist_or_validate_run_configs(
                 "Resume configuration mismatch for optim_config.json. "
                 "Refusing to overwrite run metadata with incompatible optimizer settings."
             )
-        if asdict_without_private(saved_logging_cfg) != asdict_without_private(resolved_logging_cfg):
+        if _effective_logging_config_for_resume_compare(
+            saved_logging_cfg
+        ) != _effective_logging_config_for_resume_compare(resolved_logging_cfg):
             raise ValueError(
                 "Resume configuration mismatch for logging_config.json. "
                 "Refusing to overwrite run metadata with incompatible logging settings."
