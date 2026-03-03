@@ -44,13 +44,19 @@ deberta export runs/<run_name>/checkpoint-<step> \
 
 Start here: [`docs/index.md`](docs/index.md)
 
-Key pages:
+- install: [`docs/getting-started/installation.md`](docs/getting-started/installation.md)
+- quickstart: [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md)
+- configuration guide: [`docs/guides/configuration.md`](docs/guides/configuration.md)
+- data pipeline: [`docs/guides/data-pipeline.md`](docs/guides/data-pipeline.md)
+- exporting models: [`docs/guides/exporting-models.md`](docs/guides/exporting-models.md)
+- architecture and runtime internals: [`docs/advanced/architectures.md`](docs/advanced/architectures.md), [`docs/advanced/distributed-training.md`](docs/advanced/distributed-training.md), [`docs/advanced/torch-compile.md`](docs/advanced/torch-compile.md)
 
-- [`docs/model.md`](docs/model.md)
-- [`docs/replication.md`](docs/replication.md)
-- [`docs/data.md`](docs/data.md)
-- [`docs/objective.md`](docs/objective.md)
-- [`docs/fsdp2.md`](docs/fsdp2.md)
+Serve docs locally with MkDocs:
+
+```bash
+pip install mkdocs-material 'mkdocstrings[python]'
+mkdocs serve
+```
 
 ## Configs
 

@@ -1,0 +1,35 @@
+site_name: deberta
+site_url: https://github.com/pszemraj/deberta
+repo_url: https://github.com/pszemraj/deberta
+repo_name: pszemraj/deberta
+theme:
+  name: material
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - Guides:
+      - Configuration: guides/configuration.md
+      - Data Pipeline: guides/data-pipeline.md
+      - Exporting Models: guides/exporting-models.md
+  - Advanced:
+      - Architectures: advanced/architectures.md
+      - Distributed Training: advanced/distributed-training.md
+      - torch.compile: advanced/torch-compile.md
+  - API:
+      - Modeling: api/modeling.md
+      - Data: api/data.md
+      - Training: api/training.md
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true

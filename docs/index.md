@@ -1,25 +1,24 @@
-# Documentation
+# deberta documentation
 
-## Start
+## Start here
 
-- install and basic commands: [`../README.md`](../README.md)
-- training presets and strict parity runs: [`replication.md`](replication.md)
+- install and environment setup: [Getting Started / Installation](getting-started/installation.md)
+- first run on a small config: [Getting Started / Quickstart](getting-started/quickstart.md)
 
-## Configuration and Model Behavior
+## Guides
 
-- backbone families, source/weight resolution, embedding sharing: [`model.md`](model.md)
-- normalization options for rope (`post`, `keel`): [`norm-strategy.md`](norm-strategy.md)
+- config loading, precedence, defaults, and overrides: [Guides / Configuration](guides/configuration.md)
+- streaming packing, doc-block masking, and collator behavior: [Guides / Data Pipeline](guides/data-pipeline.md)
+- checkpoint consolidation and Hugging Face export: [Guides / Exporting Models](guides/exporting-models.md)
 
-## Data and Objective
+## Advanced
 
-- dataset loading, packing, doc-blocking masks, collator behavior: [`data.md`](data.md)
-- RTD flow, loss terms, decoupled phases: [`objective.md`](objective.md)
+- `hf_deberta_v2` vs `rope` architecture behavior: [Advanced / Architectures](advanced/architectures.md)
+- accelerate/FSDP usage, resume behavior, and token-weighted GA: [Advanced / Distributed Training](advanced/distributed-training.md)
+- compile scopes and graph-stability guidance: [Advanced / torch.compile](advanced/torch-compile.md)
 
-## Runtime and Export
+## API reference
 
-- accelerate/FSDP2, compile, resume, checkpoint/export behavior: [`fsdp2.md`](fsdp2.md)
-
-## Engineering Notes
-
-- runtime compatibility notes and known limitations: [`dev/index.md`](dev/index.md)
-- deferred tasks: [`roadmap.md`](roadmap.md)
+- [API / Modeling](api/modeling.md)
+- [API / Data](api/data.md)
+- [API / Training](api/training.md)
