@@ -2375,6 +2375,8 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
 
     root_obj = getattr(cfg, root)
     new_root = _apply_to_obj(root_obj, parts[1:], raw_value, path)
+    explicit_leaf_path = ".".join(parts[1:])
+    _mark_explicit_fields(new_root, _explicit_fields(root_obj) | {explicit_leaf_path})
     new_cfg = replace(cfg, **{root: new_root})
 
     # keep runtime train alias mirror coherent.
@@ -2383,17 +2385,6 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
         optim_cfg=new_cfg.optim,
         logging_cfg=new_cfg.logging,
     )
-
-    if root == "model":
-        _mark_explicit_fields(new_cfg.model, _explicit_fields(new_cfg.model) | {".".join(parts[1:])})
-    elif root == "data":
-        _mark_explicit_fields(new_cfg.data, _explicit_fields(new_cfg.data) | {".".join(parts[1:])})
-    elif root == "train":
-        _mark_explicit_fields(new_cfg.train, _explicit_fields(new_cfg.train) | {".".join(parts[1:])})
-    elif root == "optim":
-        _mark_explicit_fields(new_cfg.optim, _explicit_fields(new_cfg.optim) | {".".join(parts[1:])})
-    elif root == "logging":
-        _mark_explicit_fields(new_cfg.logging, _explicit_fields(new_cfg.logging) | {".".join(parts[1:])})
 
     return new_cfg
 

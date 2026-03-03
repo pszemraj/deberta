@@ -334,6 +334,19 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
     assert int(cfg2.train.warmup_steps) == 123
 
 
+def test_apply_dotted_override_preserves_existing_explicit_fields_per_section() -> None:
+    cfg = Config()
+    cfg = apply_dotted_override(cfg, "train.objective.mask_token_prob=0.8")
+    cfg = apply_dotted_override(cfg, "train.max_steps=20")
+
+    explicit_train_fields = set(getattr(cfg.train, "_explicit_fields", set()))
+    assert "objective.mask_token_prob" in explicit_train_fields
+    assert "max_steps" in explicit_train_fields
+
+    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
+    assert cfg.train.mask_token_prob == pytest.approx(0.8)
+
+
 def test_load_json_unknown_key_raises(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
