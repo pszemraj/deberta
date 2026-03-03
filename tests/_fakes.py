@@ -27,7 +27,9 @@ class DummyTokenizer:
         tokenize_output: list[str] | None = None,
         extra_length: int = 0,
         default_token_prefix: str = "▁",
+        vocab_type: str = "sentencepiece",
     ) -> None:
+        self.vocab_type = str(vocab_type).strip().lower()
         self.vocab_size = vocab_size
         self.pad_token_id = 0
         self.cls_token_id = 1
@@ -47,7 +49,12 @@ class DummyTokenizer:
         self._id_to_tok.update(self._token_map)
         self._tokenize_output = list(tokenize_output) if tokenize_output is not None else None
         self._extra_length = int(extra_length)
-        self._default_token_prefix = str(default_token_prefix)
+        if str(default_token_prefix):
+            self._default_token_prefix = str(default_token_prefix)
+        elif self.vocab_type == "wordpiece":
+            self._default_token_prefix = "##"
+        else:
+            self._default_token_prefix = "▁"
 
     def __len__(self) -> int:
         return int(self.vocab_size + self._extra_length)
@@ -175,6 +182,8 @@ class FakeAccelerator:
     without updating this class.
     """
 
+    last_instance: FakeAccelerator | None = None
+
     def __init__(self, **kwargs: Any) -> None:
         self.is_main_process = bool(kwargs.pop("is_main_process", True))
         self.process_index = int(kwargs.pop("process_index", 0))
@@ -182,6 +191,9 @@ class FakeAccelerator:
         self.load_state_error = kwargs.pop("load_state_error", None)
         self.load_state_hook = kwargs.pop("load_state_hook", None)
         self.save_state_hook = kwargs.pop("save_state_hook", None)
+        self.backward_hook = kwargs.pop("backward_hook", None)
+        self.unwrap_model_hook = kwargs.pop("unwrap_model_hook", None)
+        self.get_state_dict_hook = kwargs.pop("get_state_dict_hook", None)
         self.distributed_type = kwargs.pop("distributed_type", None)
         self.is_fsdp2 = bool(kwargs.pop("is_fsdp2", False))
         self.device = torch.device("cpu")
@@ -191,6 +203,7 @@ class FakeAccelerator:
         self.ended = False
         self.wandb_run = FakeWandbRun()
         self.calls: dict[str, list[Any]] = defaultdict(list)
+        FakeAccelerator.last_instance = self
 
     def wait_for_everyone(self) -> None:
         self.calls["wait_for_everyone"].append(None)
@@ -204,6 +217,8 @@ class FakeAccelerator:
 
     def unwrap_model(self, model: Any, **kwargs: Any) -> Any:
         self.calls["unwrap_model"].append(dict(kwargs))
+        if callable(self.unwrap_model_hook):
+            return self.unwrap_model_hook(model, **kwargs)
         return model
 
     def no_sync(self, model: Any) -> Any:
@@ -213,6 +228,8 @@ class FakeAccelerator:
 
     def backward(self, loss: torch.Tensor) -> None:
         self.calls["backward"].append(float(loss.detach().item()))
+        if callable(self.backward_hook):
+            self.backward_hook(loss)
 
     def clip_grad_norm_(self, params: Any, max_norm: float) -> None:
         del params
@@ -267,6 +284,8 @@ class FakeAccelerator:
             self.save_state_hook(output_dir)
 
     def get_state_dict(self, model: Any, unwrap: bool = True) -> dict[str, Any]:
+        if callable(self.get_state_dict_hook):
+            return dict(self.get_state_dict_hook(model, unwrap=unwrap))
         del model, unwrap
         self.calls["get_state_dict"].append(None)
         return {}
@@ -295,20 +314,44 @@ class SimpleRTD(torch.nn.Module):
         self._forbidden_sample_token_ids = {0, 1, 2, 3}
         self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
         self.disc_config = _types.SimpleNamespace(pad_token_id=0)
+        self.calls: dict[str, list[Any]] = defaultdict(list)
+        self._forward_calls = 0
+        self._generator_phase_calls = 0
+        self._discriminator_phase_calls = 0
         SimpleRTD.last_instance = self
+
+    def _behavior_value(self, key: str, default: float, *, call_idx: int) -> float:
+        """Read one behavior value with scalar/list/callable support."""
+
+        value = self.behavior.get(key, default)
+        if callable(value):
+            resolved = value(self, int(call_idx))
+            return float(resolved)
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return float(default)
+            idx = min(max(int(call_idx) - 1, 0), len(value) - 1)
+            return float(value[idx])
+        return float(value)
 
     def forward(self, **kwargs: Any) -> Any:
         del kwargs
-        base = float(self.behavior.get("loss", 1.0))
-        gen_loss_v = float(self.behavior.get("gen_loss", base))
-        disc_loss_v = float(self.behavior.get("disc_loss", base))
-        disc_acc_v = float(self.behavior.get("disc_accuracy", 1.0))
-        gen_tokens = float(self.behavior.get("gen_token_count", 1.0))
-        disc_tokens = float(self.behavior.get("disc_token_count", 1.0))
-        disc_pos = float(self.behavior.get("disc_positive_count", 1.0))
-        t = self.weight * 0.0 + base
-        gen_loss_raw = self.weight * 0.0 + gen_loss_v
-        disc_loss_raw = self.weight * 0.0 + disc_loss_v
+        self._forward_calls += 1
+        call_idx = int(self._forward_calls)
+        self.calls["forward"].append(call_idx)
+        if callable(self.behavior.get("on_forward")):
+            self.behavior["on_forward"](self, call_idx)
+        base = self._behavior_value("loss", 1.0, call_idx=call_idx)
+        gen_loss_v = self._behavior_value("gen_loss", base, call_idx=call_idx)
+        disc_loss_v = self._behavior_value("disc_loss", base, call_idx=call_idx)
+        disc_acc_v = self._behavior_value("disc_accuracy", 1.0, call_idx=call_idx)
+        gen_tokens = self._behavior_value("gen_token_count", 1.0, call_idx=call_idx)
+        disc_tokens = self._behavior_value("disc_token_count", 1.0, call_idx=call_idx)
+        disc_pos = self._behavior_value("disc_positive_count", 1.0, call_idx=call_idx)
+        anchor = self.weight.sum() * 0.0
+        t = anchor + base
+        gen_loss_raw = anchor + gen_loss_v
+        disc_loss_raw = anchor + disc_loss_v
         return _types.SimpleNamespace(
             loss=t,
             gen_loss=gen_loss_raw.detach(),
@@ -339,10 +382,14 @@ class SimpleRTD(torch.nn.Module):
     ) -> Any:
         """Return deterministic generator-phase outputs for decoupled-loop tests."""
         del attention_mask, labels, token_type_ids, sampling_temperature
-        gen_loss = self._loss_anchor(self.generator, self.weight) * float(
-            self.behavior.get("generator_phase_loss_scale", 1.0)
-        )
-        gen_token_count = float(self.behavior.get("generator_phase_token_count", 1.0))
+        self._generator_phase_calls += 1
+        call_idx = int(self._generator_phase_calls)
+        self.calls["forward_generator_phase"].append(call_idx)
+        if callable(self.behavior.get("on_generator_phase")):
+            self.behavior["on_generator_phase"](self, call_idx)
+        gen_scale = self._behavior_value("generator_phase_loss_scale", 1.0, call_idx=call_idx)
+        gen_loss = self._loss_anchor(self.generator, self.weight) * gen_scale
+        gen_token_count = self._behavior_value("generator_phase_token_count", 1.0, call_idx=call_idx)
         return _types.SimpleNamespace(
             gen_loss_raw=gen_loss,
             gen_token_count=torch.tensor(gen_token_count),
@@ -361,12 +408,18 @@ class SimpleRTD(torch.nn.Module):
     ) -> Any:
         """Return deterministic discriminator-phase outputs for decoupled-loop tests."""
         del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
-        disc_loss = self._loss_anchor(self.discriminator, self.weight) * float(
-            self.behavior.get("discriminator_phase_loss_scale", 1.0)
+        self._discriminator_phase_calls += 1
+        call_idx = int(self._discriminator_phase_calls)
+        self.calls["forward_discriminator_phase"].append(call_idx)
+        if callable(self.behavior.get("on_discriminator_phase")):
+            self.behavior["on_discriminator_phase"](self, call_idx)
+        disc_scale = self._behavior_value("discriminator_phase_loss_scale", 1.0, call_idx=call_idx)
+        disc_loss = self._loss_anchor(self.discriminator, self.weight) * disc_scale
+        disc_token_count = self._behavior_value("discriminator_phase_token_count", 1.0, call_idx=call_idx)
+        disc_positive_count = self._behavior_value(
+            "discriminator_phase_positive_count", 1.0, call_idx=call_idx
         )
-        disc_token_count = float(self.behavior.get("discriminator_phase_token_count", 1.0))
-        disc_positive_count = float(self.behavior.get("discriminator_phase_positive_count", 1.0))
-        disc_accuracy = float(self.behavior.get("discriminator_phase_accuracy", 1.0))
+        disc_accuracy = self._behavior_value("discriminator_phase_accuracy", 1.0, call_idx=call_idx)
         return _types.SimpleNamespace(
             disc_loss_raw=disc_loss,
             disc_accuracy=torch.tensor(disc_accuracy),
@@ -376,7 +429,21 @@ class SimpleRTD(torch.nn.Module):
 
     def sync_discriminator_embeddings_from_generator(self) -> None:
         """No-op embedding sync hook for GDES parity path."""
+        self.calls["sync_discriminator_embeddings_from_generator"].append(None)
+        if callable(self.behavior.get("on_sync_discriminator_embeddings")):
+            self.behavior["on_sync_discriminator_embeddings"](self)
         return None
+
+
+class TinyRTDLikeModel(torch.nn.Module):
+    """Minimal module exposing generator/discriminator-style parameter names."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.generator = torch.nn.Linear(8, 8)
+        self.generator_lm_head = torch.nn.Linear(8, 8)
+        self.discriminator = torch.nn.Linear(8, 8)
+        self.discriminator_norm = torch.nn.LayerNorm(8)
 
 
 # ---------------------------------------------------------------------------

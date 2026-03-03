@@ -17,7 +17,14 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer, FakeAccelerator, FakeWandbRun, SimpleRTD, setup_pretraining_mocks
+from _fakes import (
+    DummyTokenizer,
+    FakeAccelerator,
+    FakeWandbRun,
+    SimpleRTD,
+    TinyRTDLikeModel,
+    setup_pretraining_mocks,
+)
 
 import deberta.cli as cli_mod
 from deberta.checkpoint_utils import (
@@ -109,27 +116,6 @@ from deberta.training.tracker_utils import (
     _setup_wandb_watch,
     _upload_wandb_original_config,
 )
-
-
-class _TinyRTDLikeModel(torch.nn.Module):
-    """Minimal module exposing generator/discriminator-style parameter names."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.generator = torch.nn.Linear(8, 8)
-        self.generator_lm_head = torch.nn.Linear(8, 8)
-        self.discriminator = torch.nn.Linear(8, 8)
-        self.discriminator_norm = torch.nn.LayerNorm(8)
-
-
-class _LastInstanceAccelerator(FakeAccelerator):
-    """Fake accelerator that exposes the most recently created instance."""
-
-    last_instance: _LastInstanceAccelerator | None = None
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        _LastInstanceAccelerator.last_instance = self
 
 
 def test_load_yaml_nested_and_flat(tmp_path: Path):
@@ -858,7 +844,7 @@ def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
 
 
 def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig()
     opt = _build_optimizer(model, cfg)
 
@@ -873,7 +859,7 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
 
 
 def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(
         learning_rate=5.0e-4,
         generator_learning_rate=2.5e-4,
@@ -1444,7 +1430,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_LastInstanceAccelerator,
+        accelerator_cls=FakeAccelerator,
         save_checkpoint_fn=_fake_save_checkpoint,
         extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
@@ -1490,7 +1476,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert saved_checkpoints[-1][1] == 1
     assert saved_checkpoints[-1][2] == "final"
 
-    accel = _LastInstanceAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
     assert accel.wandb_run.summary["crashed"] is True
     assert accel.wandb_run.summary["crash_type"] == "KeyboardInterrupt"
@@ -1947,37 +1933,21 @@ def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
 def test_run_pretraining_logs_window_averaged_rtd_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _WindowMetricRTD(SimpleRTD):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self._call_idx = 0
-
-        def forward(self, **kwargs: Any) -> Any:
-            del kwargs
-            self._call_idx += 1
-            t = self.weight * 0.0 + 1.0
-            if self._call_idx % 2 == 1:
-                gen_loss, disc_loss, disc_acc = 1.0, 10.0, 0.2
-                gen_tokens, disc_tokens, disc_pos = 1.0, 10.0, 7.0
-            else:
-                gen_loss, disc_loss, disc_acc = 9.0, 2.0, 0.8
-                gen_tokens, disc_tokens, disc_pos = 9.0, 2.0, 1.0
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=torch.tensor(gen_loss, dtype=torch.float32),
-                disc_loss=torch.tensor(disc_loss, dtype=torch.float32),
-                disc_accuracy=torch.tensor(disc_acc, dtype=torch.float32),
-                gen_token_count=torch.tensor(gen_tokens, dtype=torch.float32),
-                disc_token_count=torch.tensor(disc_tokens, dtype=torch.float32),
-                disc_positive_count=torch.tensor(disc_pos, dtype=torch.float32),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_LastInstanceAccelerator,
-        rtd_cls=_WindowMetricRTD,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "loss": 1.0,
+                "gen_loss": [1.0, 9.0],
+                "disc_loss": [10.0, 2.0],
+                "disc_accuracy": [0.2, 0.8],
+                "gen_token_count": [1.0, 9.0],
+                "disc_token_count": [10.0, 2.0],
+                "disc_positive_count": [7.0, 1.0],
+            },
+            **kwargs,
+        ),
     )
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
@@ -2002,7 +1972,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         train_cfg=train_cfg,
     )
 
-    accel = _LastInstanceAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
@@ -2015,289 +1985,128 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
 
 
-def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phases(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "steps_and_sync",
+        "token_weighted_scaling",
+        "branch_loss_weights",
+        "skip_generator_step",
+    ],
+)
+def test_run_pretraining_decoupled_integration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
     call_order: list[str] = []
-
-    class _DecoupledRTD(SimpleRTD):
-        def forward_generator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            labels: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            sampling_temperature: float = 1.0,
-        ) -> Any:
-            del attention_mask, labels, token_type_ids, sampling_temperature
-            call_order.append("gen_forward")
-            gen_loss = self.generator.weight.sum() * 0.0 + 1.0
-            return types.SimpleNamespace(
-                gen_loss_raw=gen_loss,
-                gen_token_count=torch.tensor(1.0),
-                corrupted_input_ids=input_ids.detach().clone(),
-                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
-            )
-
-        def forward_discriminator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            corrupted_input_ids: torch.Tensor,
-            disc_labels: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-        ) -> Any:
-            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
-            call_order.append("disc_forward")
-            disc_loss = self.discriminator.weight.sum() * 0.0 + 2.0
-            return types.SimpleNamespace(
-                disc_loss_raw=disc_loss,
-                disc_accuracy=torch.tensor(0.5),
-                disc_token_count=torch.tensor(1.0),
-                disc_positive_count=torch.tensor(0.0),
-            )
-
-        def sync_discriminator_embeddings_from_generator(self) -> None:
-            call_order.append("sync")
-
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=_LastInstanceAccelerator,
-        rtd_cls=_DecoupledRTD,
-    )
-
-    original_build_decoupled = pretrain_mod._build_decoupled_optimizers
-
-    def _build_logged_decoupled(model: torch.nn.Module, cfg: TrainConfig, *, mixed_precision: str = "no"):
-        gen_opt, disc_opt = original_build_decoupled(model, cfg, mixed_precision=mixed_precision)
-        original_gen_step = gen_opt.step
-        original_disc_step = disc_opt.step
-
-        def _gen_step(_opt_self: Any, *args: Any, **kwargs: Any):
-            call_order.append("gen_step")
-            return original_gen_step(*args, **kwargs)
-
-        def _disc_step(_opt_self: Any, *args: Any, **kwargs: Any):
-            call_order.append("disc_step")
-            return original_disc_step(*args, **kwargs)
-
-        gen_opt.step = types.MethodType(_gen_step, gen_opt)  # type: ignore[method-assign]
-        disc_opt.step = types.MethodType(_disc_step, disc_opt)  # type: ignore[method-assign]
-        return gen_opt, disc_opt
-
-    monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
-
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        logging_steps=1,
-        save_steps=0,
-        report_to="tensorboard",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        token_weighted_gradient_accumulation=False,
-        torch_compile=False,
-        export_hf_final=False,
-        decoupled_training=True,
-    )
-
-    pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
-
-    assert call_order.count("gen_step") == 1
-    assert call_order.count("disc_step") == 1
-    gen_forward_idx = call_order.index("gen_forward")
-    gen_step_idx = call_order.index("gen_step")
-    sync_after_gen_idx = call_order.index("sync", gen_step_idx + 1)
-    disc_forward_idx = call_order.index("disc_forward")
-    disc_step_idx = call_order.index("disc_step")
-    assert gen_forward_idx < gen_step_idx < sync_after_gen_idx < disc_forward_idx < disc_step_idx
-
-    accel = _LastInstanceAccelerator.last_instance
-    assert accel is not None
-    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
-    assert step_rows
-    assert "decoupled_training" not in step_rows[-1]
-
-
-class _BackwardTrackingAccelerator(FakeAccelerator):
-    """Fake accelerator that records backward-loss scalars for decoupled-loop assertions."""
-
-    last_instance: _BackwardTrackingAccelerator | None = None
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.backward_losses: list[float] = []
-        _BackwardTrackingAccelerator.last_instance = self
-
-    def backward(self, loss: torch.Tensor) -> None:
-        self.backward_losses.append(float(loss.detach().item()))
-
-
-def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_token_counts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class _TokenWeightedDecoupledRTD(SimpleRTD):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self._gen_idx = 0
-            self._disc_idx = 0
-
-        def forward_generator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            labels: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            sampling_temperature: float = 1.0,
-        ) -> Any:
-            del attention_mask, labels, token_type_ids, sampling_temperature
-            self._gen_idx += 1
-            loss_val = 10.0 if self._gen_idx == 1 else 20.0
-            gen_loss = self.generator.weight.sum() * 0.0 + float(loss_val)
-            return types.SimpleNamespace(
-                gen_loss_raw=gen_loss,
-                gen_token_count=torch.tensor(1.0),
-                corrupted_input_ids=input_ids.detach().clone(),
-                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
-            )
-
-        def forward_discriminator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            corrupted_input_ids: torch.Tensor,
-            disc_labels: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-        ) -> Any:
-            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
-            self._disc_idx += 1
-            loss_val = 5.0 if self._disc_idx == 1 else 7.0
-            disc_loss = self.discriminator.weight.sum() * 0.0 + float(loss_val)
-            return types.SimpleNamespace(
-                disc_loss_raw=disc_loss,
-                disc_accuracy=torch.tensor(0.5),
-                disc_token_count=torch.tensor(1.0),
-                disc_positive_count=torch.tensor(0.0),
-            )
-
-        def sync_discriminator_embeddings_from_generator(self) -> None:
-            return None
-
-    micro_counts = iter([(1.0, 4.0), (3.0, 2.0)])
-
-    def _count_tokens_for_microbatch(*_args: Any, **_kwargs: Any) -> tuple[float, float]:
-        return next(micro_counts)
-
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=_BackwardTrackingAccelerator,
-        rtd_cls=_TokenWeightedDecoupledRTD,
-        extra_patches={"_count_rtd_tokens_for_batch": _count_tokens_for_microbatch},
-    )
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        logging_steps=1,
-        save_steps=0,
-        report_to="none",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        token_weighted_gradient_accumulation=True,
-        gen_loss_weight=1.0,
-        disc_loss_weight=1.0,
-        torch_compile=False,
-        export_hf_final=False,
-        decoupled_training=True,
-    )
-
-    pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
-
-    accel = _BackwardTrackingAccelerator.last_instance
-    assert accel is not None
-    assert accel.backward_losses == pytest.approx(
-        [
-            # Generator phase, scaled by (micro_gen_tokens / window_gen_tokens) and then by ga_steps.
-            10.0 * (1.0 / 4.0) * 2.0,
-            20.0 * (3.0 / 4.0) * 2.0,
-            # Discriminator phase, scaled by (micro_disc_tokens / window_disc_tokens) and then by ga_steps.
-            5.0 * (4.0 / 6.0) * 2.0,
-            7.0 * (2.0 / 6.0) * 2.0,
-        ],
-        rel=0.0,
-        abs=1e-6,
-    )
-
-
-def test_run_pretraining_decoupled_applies_branch_loss_weights_to_backward_objectives(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=_BackwardTrackingAccelerator,
-        rtd_cls=lambda **kwargs: SimpleRTD(
-            behavior={"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0},
-            **kwargs,
-        ),
-    )
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        logging_steps=0,
-        save_steps=0,
-        report_to="none",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        token_weighted_gradient_accumulation=False,
-        gen_loss_weight=0.25,
-        disc_loss_weight=4.0,
-        torch_compile=False,
-        export_hf_final=False,
-        decoupled_training=True,
-    )
-
-    pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
-
-    accel = _BackwardTrackingAccelerator.last_instance
-    assert accel is not None
-    assert accel.backward_losses == pytest.approx([2.0 * 0.25, 3.0 * 4.0], rel=0.0, abs=1e-6)
-
-
-def test_run_pretraining_decoupled_skips_generator_optimizer_when_gen_loss_weight_zero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
     step_counts = {"gen": 0, "disc": 0}
+    behavior: dict[str, Any] = {}
+    extra_patches: dict[str, Any] | None = None
+
+    if scenario == "steps_and_sync":
+        behavior = {
+            "generator_phase_loss_scale": 1.0,
+            "discriminator_phase_loss_scale": 2.0,
+            "on_generator_phase": lambda _m, _i: call_order.append("gen_forward"),
+            "on_discriminator_phase": lambda _m, _i: call_order.append("disc_forward"),
+            "on_sync_discriminator_embeddings": lambda _m: call_order.append("sync"),
+        }
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=1,
+            save_steps=0,
+            report_to="tensorboard",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=1.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    elif scenario == "token_weighted_scaling":
+        behavior = {
+            "generator_phase_loss_scale": [10.0, 20.0],
+            "discriminator_phase_loss_scale": [5.0, 7.0],
+            "discriminator_phase_accuracy": 0.5,
+            "discriminator_phase_positive_count": 0.0,
+        }
+        micro_counts = iter([(1.0, 4.0), (3.0, 2.0)])
+
+        def _count_tokens_for_microbatch(*_args: Any, **_kwargs: Any) -> tuple[float, float]:
+            return next(micro_counts)
+
+        extra_patches = {"_count_rtd_tokens_for_batch": _count_tokens_for_microbatch}
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=1,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            token_weighted_gradient_accumulation=True,
+            gen_loss_weight=1.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    elif scenario == "branch_loss_weights":
+        behavior = {"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0}
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=0,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=0.25,
+            disc_loss_weight=4.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    elif scenario == "skip_generator_step":
+        behavior = {"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0}
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=0,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=0.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    else:  # pragma: no cover
+        raise AssertionError(f"Unsupported scenario: {scenario}")
+
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_BackwardTrackingAccelerator,
-        rtd_cls=lambda **kwargs: SimpleRTD(
-            behavior={"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0},
-            **kwargs,
-        ),
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(behavior=behavior, **kwargs),
+        extra_patches=extra_patches,
     )
     original_build_decoupled = pretrain_mod._build_decoupled_optimizers
 
@@ -2308,10 +2117,14 @@ def test_run_pretraining_decoupled_skips_generator_optimizer_when_gen_loss_weigh
 
         def _gen_step(_opt_self: Any, *args: Any, **kwargs: Any):
             step_counts["gen"] += 1
+            if scenario == "steps_and_sync":
+                call_order.append("gen_step")
             return original_gen_step(*args, **kwargs)
 
         def _disc_step(_opt_self: Any, *args: Any, **kwargs: Any):
             step_counts["disc"] += 1
+            if scenario == "steps_and_sync":
+                call_order.append("disc_step")
             return original_disc_step(*args, **kwargs)
 
         gen_opt.step = types.MethodType(_gen_step, gen_opt)  # type: ignore[method-assign]
@@ -2319,24 +2132,6 @@ def test_run_pretraining_decoupled_skips_generator_optimizer_when_gen_loss_weigh
         return gen_opt, disc_opt
 
     monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        logging_steps=0,
-        save_steps=0,
-        report_to="none",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        token_weighted_gradient_accumulation=False,
-        gen_loss_weight=0.0,
-        disc_loss_weight=1.0,
-        torch_compile=False,
-        export_hf_final=False,
-        decoupled_training=True,
-    )
 
     pretrain_mod.run_pretraining(
         model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
@@ -2344,11 +2139,38 @@ def test_run_pretraining_decoupled_skips_generator_optimizer_when_gen_loss_weigh
         train_cfg=train_cfg,
     )
 
-    accel = _BackwardTrackingAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
-    assert accel.backward_losses == pytest.approx([3.0], rel=0.0, abs=1e-6)
-    assert step_counts["gen"] == 0
-    assert step_counts["disc"] == 1
+
+    if scenario == "steps_and_sync":
+        assert step_counts == {"gen": 1, "disc": 1}
+        gen_forward_idx = call_order.index("gen_forward")
+        gen_step_idx = call_order.index("gen_step")
+        sync_after_gen_idx = call_order.index("sync", gen_step_idx + 1)
+        disc_forward_idx = call_order.index("disc_forward")
+        disc_step_idx = call_order.index("disc_step")
+        assert gen_forward_idx < gen_step_idx < sync_after_gen_idx < disc_forward_idx < disc_step_idx
+        step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+        assert step_rows
+        assert "decoupled_training" not in step_rows[-1]
+    elif scenario == "token_weighted_scaling":
+        assert step_counts == {"gen": 1, "disc": 1}
+        assert accel.calls["backward"] == pytest.approx(
+            [
+                10.0 * (1.0 / 4.0) * 2.0,
+                20.0 * (3.0 / 4.0) * 2.0,
+                5.0 * (4.0 / 6.0) * 2.0,
+                7.0 * (2.0 / 6.0) * 2.0,
+            ],
+            rel=0.0,
+            abs=1e-6,
+        )
+    elif scenario == "branch_loss_weights":
+        assert step_counts == {"gen": 1, "disc": 1}
+        assert accel.calls["backward"] == pytest.approx([2.0 * 0.25, 3.0 * 4.0], rel=0.0, abs=1e-6)
+    elif scenario == "skip_generator_step":
+        assert step_counts == {"gen": 0, "disc": 1}
+        assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
 
 
 def test_run_pretraining_final_export_uses_subprocess_helper(
@@ -2405,31 +2227,6 @@ def test_run_pretraining_final_export_uses_subprocess_helper(
     assert export_path.endswith("final_hf")
 
 
-class _ZeroTokenTrackingAccelerator(FakeAccelerator):
-    last_instance: _ZeroTokenTrackingAccelerator | None = None
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        _ZeroTokenTrackingAccelerator.last_instance = self
-
-
-class _ZeroTokenScalarLossRTD(SimpleRTD):
-    def forward(self, **kwargs: Any) -> Any:
-        del kwargs
-        t = self.weight.sum() * 0.0 + 1.0
-        return types.SimpleNamespace(
-            loss=t,
-            gen_loss=t.detach(),
-            disc_loss=t.detach(),
-            disc_accuracy=t.detach(),
-            gen_token_count=torch.tensor(1.0),
-            disc_token_count=torch.tensor(1.0),
-            disc_positive_count=torch.tensor(1.0),
-            gen_loss_raw=t,
-            disc_loss_raw=t,
-        )
-
-
 def _run_zero_token_weighted_case(
     *,
     tmp_path: Path,
@@ -2438,8 +2235,19 @@ def _run_zero_token_weighted_case(
 ) -> Path:
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ZeroTokenTrackingAccelerator,
-        rtd_cls=_ZeroTokenScalarLossRTD,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "loss": 1.0,
+                "gen_loss": 1.0,
+                "disc_loss": 1.0,
+                "disc_accuracy": 1.0,
+                "gen_token_count": 1.0,
+                "disc_token_count": 1.0,
+                "disc_positive_count": 1.0,
+            },
+            **kwargs,
+        ),
         extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
     )
     train_cfg = TrainConfig(
@@ -2468,7 +2276,7 @@ def _run_zero_token_weighted_case(
 
 
 def _latest_zero_token_tracker_metrics() -> dict[str, Any]:
-    accel = _ZeroTokenTrackingAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
@@ -2491,70 +2299,44 @@ def _load_last_debug_metrics_row(metrics_path: Path) -> dict[str, Any]:
     return debug_rows[-1]
 
 
-def test_run_pretraining_warns_and_excludes_zero_token_weighted_metrics_from_trackers_by_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("debug_metrics", "expect_metrics_file", "expect_warning"),
+    [
+        (False, False, True),
+        (True, True, False),
+    ],
+)
+def test_run_pretraining_zero_token_weighted_metrics_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    debug_metrics: bool,
+    expect_metrics_file: bool,
+    expect_warning: bool,
 ) -> None:
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=_ZeroTokenTrackingAccelerator,
-        rtd_cls=_ZeroTokenScalarLossRTD,
-        extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
-    )
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        logging_steps=1,
-        save_steps=0,
-        report_to="tensorboard",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        token_weighted_gradient_accumulation=True,
-        decoupled_training=False,
-        torch_compile=False,
-        export_hf_final=False,
-    )
-
     with caplog.at_level(logging.WARNING):
-        pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(backbone_type="rope"),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-            train_cfg=train_cfg,
+        metrics_path = _run_zero_token_weighted_case(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            debug_metrics=bool(debug_metrics),
+        )
+    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
+
+    if expect_warning:
+        assert any(
+            "Token-weighted GA window has zero effective tokens" in rec.message for rec in caplog.records
         )
 
-    assert any("Token-weighted GA window has zero effective tokens" in rec.message for rec in caplog.records)
-    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
-    assert not (Path(train_cfg.output_dir) / "metrics.jsonl.gz").exists()
-
-
-def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_debug_metrics_enabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    metrics_path = _run_zero_token_weighted_case(
-        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=True
-    )
-    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
-
-    assert metrics_path.exists()
-    last = _load_last_debug_metrics_row(metrics_path)
-    assert int(last["step"]) == 1
-    assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-
-
-def test_run_pretraining_does_not_log_debug_metrics_when_debug_metrics_disabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    metrics_path = _run_zero_token_weighted_case(
-        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=False
-    )
-    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
-
-    assert not metrics_path.exists()
+    if expect_metrics_file:
+        assert metrics_path.exists()
+        last = _load_last_debug_metrics_row(metrics_path)
+        assert int(last["step"]) == 1
+        assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+        assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+        assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+        assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    else:
+        assert not metrics_path.exists()
 
 
 def test_run_pretraining_compiles_generator_and_discriminator(
@@ -2619,12 +2401,6 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
             self.encoder = torch.nn.Module()
             self.encoder.layer = torch.nn.ModuleList([_FakeLayer()])
 
-    class _BackboneScopeRTD(SimpleRTD):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.generator = _FakeBackbone()
-            self.discriminator = _FakeBackbone()
-
     compile_calls: list[tuple[Any, dict[str, Any]]] = []
 
     def _fake_compile(
@@ -2633,9 +2409,18 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
         compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
         return target
 
+    created_models: list[SimpleRTD] = []
+
+    def _make_scope_rtd(**kwargs: Any) -> SimpleRTD:
+        model = SimpleRTD(**kwargs)
+        model.generator = _FakeBackbone()
+        model.discriminator = _FakeBackbone()
+        created_models.append(model)
+        return model
+
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        rtd_cls=_BackboneScopeRTD,
+        rtd_cls=_make_scope_rtd,
         build_backbones_fn=lambda **kwargs: (_FakeBackbone(), _FakeBackbone()),
     )
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
@@ -2661,7 +2446,8 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
         train_cfg=train_cfg,
     )
 
-    instance = _BackboneScopeRTD.last_instance
+    assert created_models
+    instance = created_models[-1]
     assert instance is not None
     assert len(compile_calls) == 2
     for i in range(2):
@@ -3507,17 +3293,6 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
     wrapped = _Wrapped(inner)
     called_targets: list[torch.nn.Module] = []
 
-    class _FakeAccelerator:
-        is_main_process = True
-
-        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-            assert model is wrapped
-            return inner
-
-        def get_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-            called_targets.append(model)
-            return {}
-
     class _FakeExportModel:
         def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
             del safe_serialization
@@ -3537,8 +3312,22 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
         lambda **_kwargs: None,
     )
 
+    def _unwrap_model(model: torch.nn.Module, **_kwargs: Any) -> torch.nn.Module:
+        assert model is wrapped
+        return inner
+
+    def _get_state_dict(model: torch.nn.Module, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
+        del unwrap
+        called_targets.append(model)
+        return {}
+
+    accelerator = FakeAccelerator(
+        is_main_process=True,
+        unwrap_model_hook=_unwrap_model,
+        get_state_dict_hook=_get_state_dict,
+    )
     _export_discriminator_hf(
-        accelerator=_FakeAccelerator(),
+        accelerator=accelerator,
         model=wrapped,  # type: ignore[arg-type]
         tokenizer=DummyTokenizer(),
         output_dir=tmp_path / "export",
@@ -3559,19 +3348,23 @@ def test_export_discriminator_hf_collects_state_dicts_on_non_main_rank(tmp_path:
     inner = _Inner()
     called_targets: list[torch.nn.Module] = []
 
-    class _FakeAccelerator:
-        is_main_process = False
+    def _unwrap_model(model: torch.nn.Module, **_kwargs: Any) -> torch.nn.Module:
+        assert model is inner
+        return model
 
-        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-            assert model is inner
-            return model
+    def _get_state_dict(model: torch.nn.Module, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
+        del unwrap
+        called_targets.append(model)
+        return {}
 
-        def get_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-            called_targets.append(model)
-            return {}
+    accelerator = FakeAccelerator(
+        is_main_process=False,
+        unwrap_model_hook=_unwrap_model,
+        get_state_dict_hook=_get_state_dict,
+    )
 
     _export_discriminator_hf(
-        accelerator=_FakeAccelerator(),
+        accelerator=accelerator,
         model=inner,  # type: ignore[arg-type]
         tokenizer=DummyTokenizer(),
         output_dir=tmp_path / "export",
@@ -3657,7 +3450,7 @@ def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
 
 
 def test_build_optimizer_supports_generator_specific_lr():
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(learning_rate=1.0e-3, generator_learning_rate=5.0e-4, weight_decay=0.1)
     opt = _build_optimizer(model, cfg)
 
@@ -3670,7 +3463,7 @@ def test_build_optimizer_supports_generator_specific_lr():
 
 
 def test_build_optimizer_supports_discriminator_specific_lr():
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(
         learning_rate=1.0e-3,
         generator_learning_rate=5.0e-4,
@@ -3684,7 +3477,7 @@ def test_build_optimizer_supports_discriminator_specific_lr():
 
 
 def test_build_decoupled_optimizers_support_discriminator_specific_lr():
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(
         learning_rate=1.0e-3,
         generator_learning_rate=5.0e-4,
@@ -3705,7 +3498,7 @@ def test_build_decoupled_optimizers_support_discriminator_specific_lr():
 def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig()
 
     monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
@@ -3724,7 +3517,7 @@ def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: 
 def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig()
 
     monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
@@ -3741,7 +3534,7 @@ def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: p
 
 
 def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(adam_epsilon=1e-8)
 
     opt = _build_optimizer(model, cfg, mixed_precision="bf16")
@@ -3931,18 +3724,10 @@ def test_scale_loss_for_backward_cancels_accelerate_ga_division_for_token_weight
 
 
 def test_build_training_collator_propagates_packed_sequences_flag():
-    class _Tokenizer:
-        mask_token_id = 3
-        pad_token_id = 0
-        vocab_size = 64
-        all_special_ids = [0, 1, 2, 3]
-
-        def tokenize(self, text: str) -> list[str]:
-            return text.split()
-
+    tokenizer = DummyTokenizer(vocab_size=64)
     train_cfg = TrainConfig(mlm_probability=0.2, mlm_max_ngram=2)
     collator = _build_training_collator(
-        tokenizer=_Tokenizer(),
+        tokenizer=tokenizer,
         train_cfg=train_cfg,
         packed_sequences=True,
         block_cross_document_attention=True,
@@ -3960,15 +3745,13 @@ def test_should_clip_gradients_on_sync_steps():
 
 
 def test_has_nonfinite_grad_norm_any_rank_uses_reduced_flag():
-    class _FakeAccelerator:
-        device = torch.device("cpu")
+    accel = FakeAccelerator()
 
-        def reduce(self, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-            assert reduction == "sum"
-            # Simulate another rank reporting a non-finite norm.
-            return tensor + 1
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        assert reduction == "sum"
+        return tensor + 1
 
-    accel = _FakeAccelerator()
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
     assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is True
     assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
 
@@ -5384,22 +5167,12 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
 
 def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs():
     pytest.importorskip("transformers")
-
-    class _Tokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-        bos_token_id = 4
-        eos_token_id = 5
-
-        def __len__(self) -> int:
-            return 128
+    tokenizer = DummyTokenizer(vocab_size=128)
 
     model_cfg = ModelConfig(backbone_type="hf_deberta_v2", from_scratch=True)
     disc_cfg, gen_cfg = build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_Tokenizer(),
+        tokenizer=tokenizer,
         max_position_embeddings=128,
     )
 
@@ -5443,15 +5216,7 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
         "deberta.modeling.builder.DebertaRoPEConfig.from_pretrained",
         lambda _src: checkpoint_cfg,
     )
-
-    class _Tokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
-        def __len__(self) -> int:
-            return 32000
+    tokenizer = DummyTokenizer(vocab_size=32000)
 
     model_cfg = ModelConfig(
         backbone_type="rope",
@@ -5463,7 +5228,7 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
 
     disc_cfg, _ = build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_Tokenizer(),
+        tokenizer=tokenizer,
         max_position_embeddings=512,
     )
 

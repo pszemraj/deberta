@@ -11,6 +11,22 @@ from deberta.config import ModelConfig
 from deberta.modeling import builder as builder_mod
 
 
+@pytest.fixture(autouse=True)
+def _default_pretrained_config_stub(monkeypatch: pytest.MonkeyPatch):
+    """Default ``from_pretrained`` stub for RoPE config loads in builder tests."""
+    pytest.importorskip("transformers")
+
+    def _default_from_pretrained(cls, src: str):
+        del src
+        return cls(ffn_type="mlp", num_hidden_layers=6, intermediate_size=3072)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_default_from_pretrained),
+    )
+
+
 @pytest.mark.parametrize(
     ("loaded_kwargs", "model_kwargs", "expected"),
     [

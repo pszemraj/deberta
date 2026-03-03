@@ -18,8 +18,16 @@ from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
 
 
 class _FakeExportBackbone:
-    def __init__(self) -> None:
-        self._weights: dict[str, torch.Tensor] = {"weight": torch.tensor(0.0)}
+    def __init__(
+        self,
+        *,
+        weight_keys: tuple[str, ...] = ("weight",),
+        forced_missing_keys: tuple[str, ...] | None = None,
+        write_config_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._weights: dict[str, torch.Tensor] = {str(key): torch.tensor(0.0) for key in weight_keys}
+        self._forced_missing_keys = list(forced_missing_keys or ())
+        self._write_config_payload = dict(write_config_payload or {})
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return self._weights
@@ -29,13 +37,21 @@ class _FakeExportBackbone:
         model_keys = set(self._weights.keys())
         source_keys = set(state_dict.keys())
         missing = sorted(model_keys - source_keys)
+        if self._forced_missing_keys:
+            missing = sorted(set(missing) | set(self._forced_missing_keys))
         unexpected = sorted(source_keys - model_keys)
         for key in model_keys & source_keys:
             self._weights[key] = state_dict[key]
         return types.SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
 
     def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
-        Path(path).mkdir(parents=True, exist_ok=True)
+        target = Path(path)
+        target.mkdir(parents=True, exist_ok=True)
+        if self._write_config_payload:
+            (target / "config.json").write_text(
+                json.dumps(self._write_config_payload),
+                encoding="utf-8",
+            )
         del safe_serialization
         return None
 
@@ -363,14 +379,16 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         provide_torch_state_dict_api=False,
     )
 
-    class _BrokenBackbone(_FakeExportBackbone):
-        def __init__(self) -> None:
-            self._weights = {"other_weight": torch.tensor(0.0)}
-
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(
+                weight_keys=("other_weight",),
+                forced_missing_keys=("weight",),
+            ),
+            None,
+        ),
     )
 
     out_dir = tmp_path / f"exported-{int(allow_partial_export)}"
@@ -412,18 +430,16 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
         provide_torch_state_dict_api=False,
     )
 
-    class _EmbeddingWeightBackbone(_FakeExportBackbone):
-        def __init__(self) -> None:
-            self._weights = {
-                "embeddings.word_embeddings.weight": torch.tensor([0.0]),
-                "encoder.weight": torch.tensor([0.0]),
-            }
-
     merge_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_EmbeddingWeightBackbone(), None),
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(
+                weight_keys=("embeddings.word_embeddings.weight", "encoder.weight"),
+            ),
+            None,
+        ),
     )
     monkeypatch.setattr(
         export_cli,
@@ -505,25 +521,22 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
         provide_torch_state_dict_api=False,
     )
 
-    class _ConfigWritingBackbone(_FakeExportBackbone):
-        def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
-            del safe_serialization
-            target = Path(path)
-            target.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "model_type": "deberta-v2",
-                "hidden_size": 768,
-                "hf_attention_kernel": "stable",
-                "use_rmsnorm_heads": False,
-                "legacy": True,
-                "cls_token_id": 1,
-            }
-            (target / "config.json").write_text(json.dumps(payload), encoding="utf-8")
-
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_ConfigWritingBackbone(), None),
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(
+                write_config_payload={
+                    "model_type": "deberta-v2",
+                    "hidden_size": 768,
+                    "hf_attention_kernel": "stable",
+                    "use_rmsnorm_heads": False,
+                    "legacy": True,
+                    "cls_token_id": 1,
+                }
+            ),
+            None,
+        ),
     )
 
     out_dir = tmp_path / "exported"

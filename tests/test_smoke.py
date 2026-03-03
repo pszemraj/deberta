@@ -700,27 +700,6 @@ def test_collator_random_replacement_samples_full_vocab_including_added_tokens()
     assert bool((replaced >= 100).any().item()), "Expected some replacement tokens from the added-token range"
 
 
-def test_self_attention_zeroes_padded_query_outputs(tiny_rope_config_factory):
-    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
-
-    cfg = tiny_rope_config_factory(attention_implementation="eager")
-    attn = DebertaRoPESelfAttention(cfg).eval()
-    x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
-    attention_mask = torch.tensor(
-        [
-            [1, 1, 1, 1, 0, 0],
-            [1, 1, 1, 1, 1, 0],
-        ],
-        dtype=torch.long,
-    )
-
-    with torch.no_grad():
-        out = attn(x, attention_mask)
-
-    assert torch.allclose(out[0, 4:, :], torch.zeros_like(out[0, 4:, :]), atol=1e-6)
-    assert torch.allclose(out[1, 5:, :], torch.zeros_like(out[1, 5:, :]), atol=1e-6)
-
-
 def test_self_attention_has_no_internal_residual_dropout(tiny_rope_config_factory):
     from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
@@ -742,77 +721,84 @@ def test_self_attention_has_no_internal_residual_dropout(tiny_rope_config_factor
     torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("attention_implementation", ["eager", "sdpa"])
-def test_self_attention_handles_pairwise_mask_rows_without_keys(
+@pytest.mark.parametrize(
+    ("attention_implementation", "mask_case"),
+    [
+        ("eager", "padded_queries_2d"),
+        ("eager", "all_masked_2d"),
+        ("eager", "pairwise_row_without_keys"),
+        ("sdpa", "pairwise_row_without_keys"),
+        ("eager", "pairwise_dead_last_row"),
+        ("sdpa", "pairwise_dead_last_row"),
+    ],
+)
+def test_self_attention_mask_edge_cases(
     tiny_rope_config_factory,
     attention_implementation: str,
+    mask_case: str,
 ):
     from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
     torch.manual_seed(0)
     cfg = tiny_rope_config_factory(attention_implementation=attention_implementation)
     attn = DebertaRoPESelfAttention(cfg).eval()
-    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
-    pair_keep = torch.tensor(
-        [
+    if mask_case == "padded_queries_2d":
+        x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
+        attention_mask = torch.tensor(
             [
-                [1, 1, 0, 0],
-                [0, 0, 0, 0],  # row with no valid keys
-                [0, 0, 1, 1],
-                [0, 0, 1, 1],
-            ]
-        ],
-        dtype=torch.long,
-    )
-
-    with torch.no_grad():
-        out = attn(x, pair_keep)
-
-    assert torch.isfinite(out).all(), f"{attention_implementation} produced NaN for dead query row"
-    assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
-
-
-def test_self_attention_eager_handles_all_masked_padding_rows(tiny_rope_config_factory):
-    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
-
-    torch.manual_seed(0)
-    cfg = tiny_rope_config_factory(attention_implementation="eager")
-    attn = DebertaRoPESelfAttention(cfg).eval()
-    x = torch.randn((2, 4, cfg.hidden_size), dtype=torch.float32)
-    # Entire batch is fully padded/inactive (no keep edges at all).
-    attention_mask = torch.zeros((2, 4), dtype=torch.long)
-
-    with torch.no_grad():
-        out = attn(x, attention_mask)
-
-    assert torch.isfinite(out).all()
-    assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
-
-
-def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask(tiny_rope_config_factory):
-    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
-
-    cfg = tiny_rope_config_factory(attention_implementation="eager")
-    attn = DebertaRoPESelfAttention(cfg).eval()
-    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
-    # Last row/col correspond to pad-like token with no valid edges.
-    pair_keep = torch.tensor(
-        [
+                [1, 1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 1, 0],
+            ],
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            out = attn(x, attention_mask)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(out[0, 4:, :], torch.zeros_like(out[0, 4:, :]), atol=1e-6)
+        assert torch.allclose(out[1, 5:, :], torch.zeros_like(out[1, 5:, :]), atol=1e-6)
+    elif mask_case == "all_masked_2d":
+        x = torch.randn((2, 4, cfg.hidden_size), dtype=torch.float32)
+        attention_mask = torch.zeros((2, 4), dtype=torch.long)
+        with torch.no_grad():
+            out = attn(x, attention_mask)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
+    elif mask_case == "pairwise_row_without_keys":
+        x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+        pair_keep = torch.tensor(
             [
-                [1, 1, 0, 0],
-                [1, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 0],
-            ]
-        ],
-        dtype=torch.long,
-    )
-
-    with torch.no_grad():
-        out = attn(x, pair_keep)
-
-    assert torch.isfinite(out).all()
-    assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
+                [
+                    [1, 1, 0, 0],
+                    [0, 0, 0, 0],
+                    [0, 0, 1, 1],
+                    [0, 0, 1, 1],
+                ]
+            ],
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            out = attn(x, pair_keep)
+        assert torch.isfinite(out).all(), f"{attention_implementation} produced NaN for dead query row"
+        assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
+    elif mask_case == "pairwise_dead_last_row":
+        x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+        pair_keep = torch.tensor(
+            [
+                [
+                    [1, 1, 0, 0],
+                    [1, 1, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 0],
+                ]
+            ],
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            out = attn(x, pair_keep)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
+    else:  # pragma: no cover
+        raise AssertionError(f"Unexpected mask_case: {mask_case}")
 
 
 def test_self_attention_uses_pairwise_diagonal_for_query_activity(tiny_rope_config_factory):
