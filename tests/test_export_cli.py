@@ -56,12 +56,6 @@ class _FakeExportBackbone:
         return None
 
 
-class _FakeRTDModel:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        del args
-        del kwargs
-
-
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -188,7 +182,7 @@ def _install_export_fakes(
         return object(), object()
 
     monkeypatch.setattr(export_cli, "build_backbones", _fake_build_backbones)
-    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _FakeRTDModel())
+    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: types.SimpleNamespace())
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
