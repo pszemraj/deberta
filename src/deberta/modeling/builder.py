@@ -651,6 +651,7 @@ def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Conf
         pooler_hidden_size=int(dims["hidden_size"]),
         pooler_hidden_act="gelu",
         pooler_dropout=0.0,
+        z_steps=0,
         max_position_embeddings=512,
         max_relative_positions=-1,
         position_buckets=256,
@@ -752,6 +753,12 @@ def build_backbone_configs(
             gen_cfg = copy.deepcopy(disc_cfg)
         else:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
+
+        # Match released DeBERTa-v3 xsmall generator behavior.
+        if str(model_cfg.hf_model_size).strip().lower() == "xsmall":
+            gen_cfg.z_steps = 2
+        else:
+            gen_cfg.z_steps = 0
 
         _apply_hf_config_normalization(
             disc_cfg,

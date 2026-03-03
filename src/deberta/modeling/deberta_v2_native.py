@@ -1259,7 +1259,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         super().__init__(config)
         self.embeddings = DebertaV2Embeddings(config)
         self.encoder = DebertaV2Encoder(config)
-        self.z_steps = 0
+        self.z_steps = int(getattr(config, "z_steps", 0))
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
@@ -1360,27 +1360,55 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             inputs_embeds=inputs_embeds,
         )
 
+        need_hidden_states_for_z = int(self.z_steps) > 1
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=(output_hidden_states or need_hidden_states_for_z),
             output_attentions=output_attentions,
             return_dict=True,
         )
 
         sequence_output = encoder_outputs.last_hidden_state
+        hidden_states = encoder_outputs.hidden_states
+
+        if int(self.z_steps) > 1:
+            if hidden_states is None or len(hidden_states) < 2:
+                raise RuntimeError("z_steps>1 requires encoder hidden states.")
+            z_base_states = hidden_states[-2]
+            z_query_states = hidden_states[-1]
+            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            attn_mask = (
+                self.encoder.get_attention_mask(attention_mask) if attention_mask is not None else None
+            )
+            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            z_extras: list[torch.Tensor] = []
+            for layer in layers[1:]:
+                z_query_states, _ = layer(
+                    z_base_states,
+                    attn_mask,
+                    output_attentions=False,
+                    query_states=z_query_states,
+                    relative_pos=rel_pos,
+                    rel_embeddings=rel_embeddings,
+                )
+                z_extras.append(z_query_states)
+            sequence_output = z_query_states
+            if output_hidden_states and z_extras:
+                hidden_states = tuple(hidden_states) + tuple(z_extras)
 
         if not return_dict:
             out: list[torch.Tensor | tuple[torch.Tensor, ...] | None] = [sequence_output]
             if output_hidden_states:
-                out.append(encoder_outputs.hidden_states)
+                out.append(hidden_states)
             if output_attentions:
                 out.append(encoder_outputs.attentions)
             return tuple(x for x in out if x is not None)
 
         return BaseModelOutput(
             last_hidden_state=sequence_output,
-            hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
+            hidden_states=hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions if output_attentions else None,
         )
 

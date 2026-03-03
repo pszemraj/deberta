@@ -4,6 +4,7 @@ import types
 from typing import Any
 
 import pytest
+import torch
 from _fakes import DummyTokenizer
 
 from deberta.config import ModelConfig
@@ -637,12 +638,12 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
 
 
 @pytest.mark.parametrize(
-    ("hf_model_size", "hidden_size", "layers", "heads", "intermediate"),
+    ("hf_model_size", "hidden_size", "layers", "heads", "intermediate", "gen_z_steps"),
     [
-        ("xsmall", 384, 12, 6, 1536),
-        ("small", 768, 6, 12, 3072),
-        ("base", 768, 12, 12, 3072),
-        ("large", 1024, 24, 16, 4096),
+        ("xsmall", 384, 12, 6, 1536, 2),
+        ("small", 768, 6, 12, 3072, 0),
+        ("base", 768, 12, 12, 3072, 0),
+        ("large", 1024, 24, 16, 4096, 0),
     ],
 )
 def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
@@ -651,6 +652,7 @@ def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
     layers: int,
     heads: int,
     intermediate: int,
+    gen_z_steps: int,
 ):
     pytest.importorskip("transformers")
 
@@ -674,6 +676,8 @@ def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
     assert int(gen_cfg.hidden_size) == hidden_size
     assert int(gen_cfg.num_attention_heads) == heads
     assert int(gen_cfg.intermediate_size) == intermediate
+    assert int(getattr(disc_cfg, "z_steps", 0)) == 0
+    assert int(getattr(gen_cfg, "z_steps", 0)) == gen_z_steps
 
 
 def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():
@@ -1039,6 +1043,29 @@ def test_build_backbones_pretrained_hf_can_skip_pretrained_weight_loading(
     assert isinstance(disc, builder_mod.DebertaV2Model)
     assert isinstance(gen, builder_mod.DebertaV2Model)
     assert called["count"] == 0
+
+
+def test_native_deberta_v2_model_honors_config_z_steps():
+    pytest.importorskip("transformers")
+    from transformers import DebertaV2Config
+
+    cfg = DebertaV2Config(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        z_steps=2,
+    )
+    model = builder_mod.DebertaV2Model(cfg)
+    assert int(model.z_steps) == 2
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    attn = torch.ones_like(input_ids)
+    out = model(input_ids=input_ids, attention_mask=attn, output_hidden_states=True, return_dict=True)
+    assert out.hidden_states is not None
+    # num_layers + embeddings + (z_steps - 1) extra last-layer passes
+    assert len(out.hidden_states) == 4
 
 
 def test_build_backbone_configs_rejects_invalid_model_options_early():
