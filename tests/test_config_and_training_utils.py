@@ -627,28 +627,6 @@ def test_resolve_resume_checkpoint_auto_rejects_non_empty_output_dir_without_che
         )
 
 
-def _write_mock_checkpoint(
-    path: Path,
-    *,
-    with_weights: bool = True,
-    with_data_state: bool = True,
-    with_complete: bool = True,
-    consumed_micro_batches: int = 2,
-) -> Path:
-    """Create a checkpoint directory in one call for resume-related tests."""
-    path.mkdir(parents=True, exist_ok=True)
-    if with_weights:
-        (path / "model.safetensors").write_bytes(b"weights")
-    if with_data_state:
-        (path / "data_state.json").write_text(
-            json.dumps({"consumed_micro_batches": int(consumed_micro_batches)}),
-            encoding="utf-8",
-        )
-    if with_complete:
-        (path / ".complete").write_text("ok\n", encoding="utf-8")
-    return path
-
-
 @pytest.mark.parametrize(
     ("case", "exc_type", "match"),
     [
@@ -661,6 +639,7 @@ def _write_mock_checkpoint(
 )
 def test_resolve_resume_checkpoint_rejects_invalid_explicit_path_states(
     tmp_path: Path,
+    mock_checkpoint: Any,
     case: str,
     exc_type: type[Exception],
     match: str,
@@ -673,22 +652,25 @@ def test_resolve_resume_checkpoint_rejects_invalid_explicit_path_states(
         target = out / "not-a-dir.txt"
         target.write_text("x", encoding="utf-8")
     elif case == "missing_complete":
-        target = _write_mock_checkpoint(
-            out / "checkpoint-2",
+        target = mock_checkpoint(
+            root=out,
+            name="checkpoint-2",
             with_weights=True,
             with_data_state=True,
             with_complete=False,
         )
     elif case == "missing_data_state":
-        target = _write_mock_checkpoint(
-            out / "checkpoint-2",
+        target = mock_checkpoint(
+            root=out,
+            name="checkpoint-2",
             with_weights=True,
             with_data_state=False,
             with_complete=True,
         )
     elif case == "missing_weights":
-        target = _write_mock_checkpoint(
-            out / "checkpoint-2",
+        target = mock_checkpoint(
+            root=out,
+            name="checkpoint-2",
             with_weights=False,
             with_data_state=True,
             with_complete=True,
@@ -704,10 +686,10 @@ def test_resolve_resume_checkpoint_rejects_invalid_explicit_path_states(
         )
 
 
-def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path):
+def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path, mock_checkpoint: Any):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    ckpt = _write_mock_checkpoint(out / "checkpoint-2")
+    ckpt = mock_checkpoint(root=out, name="checkpoint-2", consumed_micro_batches=2)
     resolved = _resolve_resume_checkpoint(
         output_dir=out,
         resume_from_checkpoint=str(ckpt),
@@ -716,11 +698,13 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
     assert resolved == str(ckpt.resolve())
 
 
-def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tmp_path: Path):
+def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(
+    tmp_path: Path, mock_checkpoint: Any
+):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    ckpt1 = _write_mock_checkpoint(out / "checkpoint-1", consumed_micro_batches=10)
+    ckpt1 = mock_checkpoint(root=out, name="checkpoint-1", consumed_micro_batches=10)
 
     # Simulate interrupted checkpoint write: directory exists but metadata was never written.
     ckpt2 = out / "checkpoint-2"
@@ -918,7 +902,7 @@ def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-5"
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -938,7 +922,7 @@ def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path)
     ckpt = out / "checkpoint-6"
 
     dual_digest = {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"}
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -1085,24 +1069,19 @@ def test_load_resume_state_with_compile_fallback_retries_strict_false_and_remaps
         model[0].weight.zero_()
         model[0].bias.zero_()
 
-    class _ResumeAccelerator:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, dict[str, Any]]] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
 
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.calls.append((ckpt, dict(kwargs)))
-            if kwargs.get("strict", True):
-                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
+    def _load_state_hook(ckpt: str, kwargs: dict[str, Any]) -> None:
+        calls.append((str(ckpt), dict(kwargs)))
+        if kwargs.get("strict", True):
+            raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
 
-        def unwrap_model(self, wrapped: torch.nn.Module) -> torch.nn.Module:
-            return wrapped
-
-    accel = _ResumeAccelerator()
+    accel = FakeAccelerator(load_state_hook=_load_state_hook)
     _load_resume_state_with_compile_fallback(accel, model, str(checkpoint))
 
-    assert len(accel.calls) == 2
-    assert accel.calls[0][1] == {}
-    assert accel.calls[1][1] == {"strict": False}
+    assert len(calls) == 2
+    assert calls[0][1] == {}
+    assert calls[1][1] == {"strict": False}
     assert torch.allclose(model[0].weight, saved["0.weight"])
     assert torch.allclose(model[0].bias, saved["0.bias"])
 
@@ -3121,22 +3100,27 @@ def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(tmp
         )
 
 
-class _FakeAccelerator:
-    def __init__(self, *, is_main_process: bool) -> None:
-        self.is_main_process = bool(is_main_process)
-        self.wait_count = 0
-        self.save_paths: list[str] = []
+def _checkpoint_saving_accelerator(
+    *,
+    is_main_process: bool,
+    write_weights: bool = True,
+) -> FakeAccelerator:
+    """Build a fake accelerator whose ``save_state`` writes checkpoint-like files."""
 
-    def wait_for_everyone(self) -> None:
-        self.wait_count += 1
+    accel = FakeAccelerator(is_main_process=bool(is_main_process))
 
-    def save_state(self, path: str) -> None:
-        self.save_paths.append(path)
-        p = Path(path)
+    def _save_state(output_dir: str | None) -> None:
+        if output_dir is None:
+            return
+        p = Path(output_dir)
         p.mkdir(parents=True, exist_ok=True)
-        (p / "model.safetensors").write_bytes(b"weights")
-        marker = "main" if self.is_main_process else "worker"
+        if write_weights:
+            (p / "model.safetensors").write_bytes(b"weights")
+        marker = "main" if accel.is_main_process else "worker"
         (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
+
+    accel.save_state_hook = _save_state
+    return accel
 
 
 def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_path: Path):
@@ -3145,7 +3129,7 @@ def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_pat
     ckpt = out / "checkpoint-1"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    accel = _FakeAccelerator(is_main_process=False)
+    accel = _checkpoint_saving_accelerator(is_main_process=False)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -3155,11 +3139,11 @@ def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_pat
         log_label="periodic",
     )
 
-    assert len(accel.save_paths) == 1
-    staged = Path(accel.save_paths[0])
+    assert len(accel.calls["save_state"]) == 1
+    staged = Path(str(accel.calls["save_state"][0]))
     assert staged.parent == out
     assert staged.name.startswith(f".{ckpt.name}.tmp-")
-    assert accel.wait_count >= 3
+    assert len(accel.calls["wait_for_everyone"]) >= 3
     assert not (ckpt / "data_state.json").exists()
 
 
@@ -3168,7 +3152,7 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-3"
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -3178,8 +3162,8 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
         log_label="final",
     )
 
-    assert len(accel.save_paths) == 1
-    staged = Path(accel.save_paths[0])
+    assert len(accel.calls["save_state"]) == 1
+    staged = Path(str(accel.calls["save_state"][0]))
     assert staged.parent == out
     assert staged.name.startswith(f".{ckpt.name}.tmp-")
     consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
@@ -3196,7 +3180,7 @@ def test_save_training_checkpoint_rejects_overwrite_of_nonempty_checkpoint_dir(t
     ckpt.mkdir(parents=True, exist_ok=True)
     (ckpt / "stale.bin").write_bytes(b"stale")
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     with pytest.raises(RuntimeError, match="Refusing to overwrite non-empty checkpoint directory"):
         _save_training_checkpoint(
             accelerator=accel,
@@ -3221,7 +3205,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
     (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=new_ckpt,
@@ -3236,9 +3220,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
     assert (new_ckpt / ".complete").exists()
 
 
-def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_invalid(
-    tmp_path: Path,
-) -> None:
+def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_invalid(tmp_path: Path) -> None:
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     old_ckpt = out / "checkpoint-1"
@@ -3251,14 +3233,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
     (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
-    class _BrokenSaveAccelerator(_FakeAccelerator):
-        def save_state(self, path: str) -> None:
-            self.save_paths.append(path)
-            p = Path(path)
-            p.mkdir(parents=True, exist_ok=True)
-            (p / "main.txt").write_text("ok", encoding="utf-8")
-
-    accel = _BrokenSaveAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True, write_weights=False)
     with pytest.raises(RuntimeError, match="Post-save structural validation failed"):
         _save_training_checkpoint(
             accelerator=accel,

@@ -180,6 +180,10 @@ class FakeAccelerator:
         self.process_index = int(kwargs.pop("process_index", 0))
         self.num_processes = int(kwargs.pop("num_processes", 1))
         self.load_state_error = kwargs.pop("load_state_error", None)
+        self.load_state_hook = kwargs.pop("load_state_hook", None)
+        self.save_state_hook = kwargs.pop("save_state_hook", None)
+        self.distributed_type = kwargs.pop("distributed_type", None)
+        self.is_fsdp2 = bool(kwargs.pop("is_fsdp2", False))
         self.device = torch.device("cpu")
         self.state = "fake-accelerator"
         self.logged_rows: list[tuple[dict[str, Any], int | None]] = []
@@ -194,6 +198,8 @@ class FakeAccelerator:
 
     def prepare(self, *objs: Any) -> Any:
         self.calls["prepare"].append(len(objs))
+        if len(objs) == 1:
+            return objs[0]
         return objs
 
     def unwrap_model(self, model: Any, **kwargs: Any) -> Any:
@@ -247,6 +253,8 @@ class FakeAccelerator:
 
     def load_state(self, ckpt: str, **kwargs: Any) -> None:
         self.calls["load_state"].append({"ckpt": str(ckpt), "kwargs": dict(kwargs)})
+        if callable(self.load_state_hook):
+            self.load_state_hook(str(ckpt), dict(kwargs))
         if self.load_state_error is not None:
             err = self.load_state_error
             if isinstance(err, Exception):
@@ -255,6 +263,8 @@ class FakeAccelerator:
 
     def save_state(self, output_dir: str | None = None) -> None:
         self.calls["save_state"].append(str(output_dir) if output_dir is not None else None)
+        if callable(self.save_state_hook):
+            self.save_state_hook(output_dir)
 
     def get_state_dict(self, model: Any, unwrap: bool = True) -> dict[str, Any]:
         del model, unwrap

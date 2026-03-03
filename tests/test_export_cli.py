@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import tempfile
 import types
 from dataclasses import asdict
 from pathlib import Path
@@ -45,7 +46,7 @@ class _FakeRTDModel:
         del kwargs
 
 
-def _write_run_layout(tmp_path: Path) -> tuple[Path, Path]:
+def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     model_cfg = ModelConfig(
@@ -61,8 +62,13 @@ def _write_run_layout(tmp_path: Path) -> tuple[Path, Path]:
         json.dumps(asdict(data_cfg)),
         encoding="utf-8",
     )
-    checkpoint_dir = tmp_path / "checkpoint-10"
-    checkpoint_dir.mkdir()
+    if mock_checkpoint is None:
+        checkpoint_dir = tmp_path / "checkpoint-10"
+        checkpoint_dir.mkdir()
+    else:
+        checkpoint_dir = mock_checkpoint(
+            root=tmp_path, name="checkpoint-10", with_data_state=False, with_complete=False
+        )
     return run_dir, checkpoint_dir
 
 
@@ -89,38 +95,6 @@ def _install_export_fakes(
     fake_utils = types.ModuleType("accelerate.utils")
     fake_utils.DistributedType = types.SimpleNamespace(FSDP="FSDP")
 
-    class _FakeAccelerator(FakeAccelerator):
-        distributed_type = fake_utils.DistributedType.FSDP
-        is_fsdp2 = fsdp2
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-
-        def prepare(self, model):
-            self.calls["prepare"].append("export")
-            return model
-
-        def load_state(self, _checkpoint_dir: str, **kwargs: Any) -> None:
-            called["load_state_calls"] = list(called["load_state_calls"]) + [dict(kwargs)]
-            if load_state_orig_mod_mismatch and kwargs.get("strict", True):
-                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
-            return None
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def get_state_dict(self, model):
-            del model
-            called["get_state_dict"] = int(called["get_state_dict"]) + 1
-            return {
-                "discriminator.weight": torch.tensor(1.0),
-                "generator.weight": torch.tensor(2.0),
-            }
-
-        def unwrap_model(self, model):
-            called["unwrap_model"] = int(called["unwrap_model"]) + 1
-            return model
-
     if provide_torch_state_dict_api:
 
         class _FakeStateDictOptions:
@@ -146,7 +120,45 @@ def _install_export_fakes(
         from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
+
+    def _accelerator_factory(**kwargs: Any) -> FakeAccelerator:
+        del kwargs
+        accel = FakeAccelerator(
+            distributed_type=fake_utils.DistributedType.FSDP,
+            is_fsdp2=bool(fsdp2),
+            is_main_process=True,
+        )
+
+        def _prepare(self: FakeAccelerator, model: Any) -> Any:
+            self.calls["prepare"].append("export")
+            return model
+
+        def _load_state(self: FakeAccelerator, _checkpoint_dir: str, **load_kwargs: Any) -> None:
+            called["load_state_calls"] = list(called["load_state_calls"]) + [dict(load_kwargs)]
+            if load_state_orig_mod_mismatch and load_kwargs.get("strict", True):
+                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
+            return None
+
+        def _get_state_dict(self: FakeAccelerator, model: Any) -> dict[str, torch.Tensor]:
+            del model
+            called["get_state_dict"] = int(called["get_state_dict"]) + 1
+            return {
+                "discriminator.weight": torch.tensor(1.0),
+                "generator.weight": torch.tensor(2.0),
+            }
+
+        def _unwrap_model(self: FakeAccelerator, model: Any, **unwrap_kwargs: Any) -> Any:
+            del unwrap_kwargs
+            called["unwrap_model"] = int(called["unwrap_model"]) + 1
+            return model
+
+        accel.prepare = types.MethodType(_prepare, accel)  # type: ignore[method-assign]
+        accel.load_state = types.MethodType(_load_state, accel)  # type: ignore[method-assign]
+        accel.get_state_dict = types.MethodType(_get_state_dict, accel)  # type: ignore[method-assign]
+        accel.unwrap_model = types.MethodType(_unwrap_model, accel)  # type: ignore[method-assign]
+        return accel
+
+    fake_accelerate.Accelerator = _accelerator_factory
     fake_accelerate.utils = fake_utils
 
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
@@ -179,12 +191,13 @@ def _install_export_fakes(
 def test_run_export_fsdp_state_dict_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
     fsdp2: bool,
     provide_torch_state_dict_api: bool,
     offload_to_cpu: bool,
     rank0: bool,
 ):
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -223,9 +236,9 @@ def test_run_export_fsdp_state_dict_paths(
 
 
 def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     called["remap_calls"] = []
     _install_export_fakes(
@@ -262,8 +275,9 @@ def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
 def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -336,10 +350,11 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
 def test_run_export_partial_backbone_load_respects_allow_partial_flag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
     allow_partial_export: bool,
     expect_error: bool,
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -386,9 +401,9 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
 
 
 def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -445,9 +460,9 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
 
 
 def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     out_dir = tmp_path / "exported"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "stale.txt").write_text("x", encoding="utf-8")
@@ -479,9 +494,9 @@ def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
 
 
 def test_run_export_strips_training_internal_keys_from_saved_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -549,16 +564,18 @@ def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path)
 
 
 def test_namespace_to_export_config_maps_allow_partial_export() -> None:
-    ns = types.SimpleNamespace(
-        checkpoint_dir="/tmp/checkpoint-1",
-        output_dir="/tmp/exported",
-        run_dir="/tmp/run",
-        export_what="discriminator",
-        safe_serialization=True,
-        offload_to_cpu=True,
-        rank0=True,
-        embedding_sharing=None,
-        allow_partial_export=True,
-    )
-    cfg = export_cli.namespace_to_export_config(ns)
-    assert cfg.allow_partial_export is True
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        ns = types.SimpleNamespace(
+            checkpoint_dir=str(root / "checkpoint-1"),
+            output_dir=str(root / "exported"),
+            run_dir=str(root / "run"),
+            export_what="discriminator",
+            safe_serialization=True,
+            offload_to_cpu=True,
+            rank0=True,
+            embedding_sharing=None,
+            allow_partial_export=True,
+        )
+        cfg = export_cli.namespace_to_export_config(ns)
+        assert cfg.allow_partial_export is True
