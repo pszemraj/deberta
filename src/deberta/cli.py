@@ -30,17 +30,19 @@ from deberta.config import (
     _TORCH_COMPILE_MODE_CHOICES,
     _TORCH_COMPILE_SCOPE_ALIASES,
     _TORCH_COMPILE_SCOPE_CHOICES,
+    Config,
     DataConfig,
     ModelConfig,
     TrainConfig,
+    apply_dotted_override,
     apply_profile_defaults,
+    load_config_sections,
     validate_data_config,
     validate_model_config,
     validate_train_config,
     validate_training_workflow_options,
 )
 from deberta.export_cli import add_export_arguments, namespace_to_export_config, run_export
-from deberta.io_utils import load_json_mapping
 from deberta.training import run_pretraining, run_pretraining_dry_run
 
 _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
@@ -75,40 +77,6 @@ _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
-def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Split flat config keys into model/data/train sections.
-
-    :param dict[str, Any] raw: Flat config mapping.
-    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed model/data/train dicts.
-    """
-
-    model_keys = {f.name for f in fields(ModelConfig)}
-    data_keys = {f.name for f in fields(DataConfig)}
-    train_keys = {f.name for f in fields(TrainConfig)}
-
-    model_dict: dict[str, Any] = {}
-    data_dict: dict[str, Any] = {}
-    train_dict: dict[str, Any] = {}
-
-    unknown: dict[str, Any] = {}
-
-    for k, v in raw.items():
-        if k in model_keys:
-            model_dict[k] = v
-        elif k in data_keys:
-            data_dict[k] = v
-        elif k in train_keys:
-            train_dict[k] = v
-        else:
-            unknown[k] = v
-
-    if unknown:
-        keys = ", ".join(sorted(unknown.keys()))
-        raise ValueError(f"Unknown keys in config file (not in ModelConfig/DataConfig/TrainConfig): {keys}")
-
-    return model_dict, data_dict, train_dict
-
-
 def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
     """Load model/data/train dataclasses from a YAML file.
 
@@ -125,20 +93,7 @@ def _load_yaml_sections(path: Path) -> tuple[dict[str, Any], dict[str, Any], dic
     :param Path path: YAML path.
     :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed section mappings.
     """
-    try:
-        import yaml  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
-        ) from e
-
-    raw = yaml.safe_load(path.read_text())
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("YAML config must parse to a dict.")
-
-    return _split_nested_or_flat_sections(raw, format_name="YAML")
+    return load_config_sections(path)
 
 
 def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
@@ -157,38 +112,7 @@ def _load_json_sections(path: Path) -> tuple[dict[str, Any], dict[str, Any], dic
     :param Path path: JSON path.
     :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed section mappings.
     """
-    raw = load_json_mapping(path)
-    return _split_nested_or_flat_sections(raw, format_name="JSON")
-
-
-def _split_nested_or_flat_sections(
-    raw: dict[str, Any], *, format_name: str
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Split nested/flat config mappings into model/data/train sections.
-
-    :param dict[str, Any] raw: Parsed config mapping.
-    :param str format_name: Human-readable format label (e.g., JSON/YAML).
-    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Section dictionaries.
-    """
-    if any(k in raw for k in ("model", "data", "train")):
-        unknown_top = sorted(k for k in raw.keys() if k not in {"model", "data", "train"})
-        if unknown_top:
-            raise ValueError(
-                f"Unknown top-level keys in nested {format_name} config "
-                f"(expected only model/data/train): {', '.join(unknown_top)}"
-            )
-        model_dict = raw.get("model", {}) or {}
-        data_dict = raw.get("data", {}) or {}
-        train_dict = raw.get("train", {}) or {}
-        if (
-            not isinstance(model_dict, dict)
-            or not isinstance(data_dict, dict)
-            or not isinstance(train_dict, dict)
-        ):
-            raise ValueError(f"{format_name} config sections model/data/train must be dicts.")
-        return model_dict, data_dict, train_dict
-
-    return _split_flat_dict(raw)
+    return load_config_sections(path)
 
 
 def _parse_bool(value: str) -> bool:
@@ -326,6 +250,16 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
             "Without a config file, presets provide model+data+train defaults."
         ),
     )
+    train.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="SECTION.FIELD=VALUE",
+        help=(
+            "Typed dotted override applied after config/preset and regular CLI field flags. "
+            "Can be passed multiple times, for example --override train.max_steps=2000."
+        ),
+    )
     _add_dataclass_flags(train, ModelConfig, group_name="Model")
     _add_dataclass_flags(train, DataConfig, group_name="Data")
     _add_dataclass_flags(train, TrainConfig, group_name="Train")
@@ -410,6 +344,46 @@ def _apply_overrides(target: Any, source: argparse.Namespace, provided_flags: se
         if f.name in provided_flags:
             setattr(target, f.name, getattr(source, f.name))
             applied.add(str(f.name))
+    return applied
+
+
+def _apply_dotted_overrides(
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    overrides: list[str],
+) -> list[tuple[str, str, str]]:
+    """Apply typed dotted overrides to config objects.
+
+    :param ModelConfig model_cfg: Model config.
+    :param DataConfig data_cfg: Data config.
+    :param TrainConfig train_cfg: Train config.
+    :param list[str] overrides: Override expressions like ``train.max_steps=2000``.
+    :raises ValueError: If an override expression is invalid.
+    :return list[tuple[str, str, str]]: Applied `(section, key, expression)` rows.
+    """
+    if not overrides:
+        return []
+
+    cfg_bundle = Config(model=model_cfg, data=data_cfg, train=train_cfg)
+    applied: list[tuple[str, str, str]] = []
+    for expr in overrides:
+        text = str(expr).strip()
+        if "=" not in text:
+            raise ValueError(f"Invalid --override value {expr!r}. Expected SECTION.FIELD=VALUE.")
+        dotted_path = text.split("=", 1)[0].strip()
+        if "." not in dotted_path:
+            raise ValueError(f"Invalid --override target {dotted_path!r}. Expected SECTION.FIELD.")
+        section, key = dotted_path.split(".", 1)
+        section = str(section).strip().lower()
+        key = str(key).strip()
+        cfg_bundle = apply_dotted_override(cfg_bundle, text)
+        applied.append((section, key, text))
+
+    model_cfg.__dict__.update(cfg_bundle.model.__dict__)
+    data_cfg.__dict__.update(cfg_bundle.data.__dict__)
+    train_cfg.__dict__.update(cfg_bundle.train.__dict__)
     return applied
 
 
@@ -636,6 +610,28 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
         if key in train_flag_fields:
             explicit_train_fields.add(str(key))
             train_change_reasons.setdefault(str(key), f"CLI override (--{str(key).replace('_', '-')})")
+
+    dotted_overrides = _apply_dotted_overrides(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        overrides=list(getattr(ns, "override", []) or []),
+    )
+    for section, key, expr in dotted_overrides:
+        reason = f"CLI override (--override {expr})"
+        if section == "model":
+            explicit_model_fields.add(str(key))
+            model_change_reasons[str(key)] = reason
+        elif section == "data":
+            explicit_data_fields.add(str(key))
+            data_change_reasons[str(key)] = reason
+        elif section == "train":
+            explicit_train_fields.add(str(key))
+            train_change_reasons[str(key)] = reason
+        else:
+            raise ValueError(
+                f"Invalid override section {section!r} from --override {expr!r}; expected model|data|train."
+            )
 
     _mark_explicit_fields(model_cfg, explicit_model_fields)
     _mark_explicit_fields(train_cfg, explicit_train_fields)

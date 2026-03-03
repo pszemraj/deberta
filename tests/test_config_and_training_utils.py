@@ -200,6 +200,57 @@ def test_load_json_nested_and_flat(tmp_path: Path):
     assert train_flat.mask_token_prob == pytest.approx(0.7)
 
 
+def test_load_yaml_resolves_variables(tmp_path: Path):
+    pytest.importorskip("yaml")
+
+    cfg = tmp_path / "vars.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "variables:",
+                "  seq: 256",
+                "  lr: 5e-4",
+                "model:",
+                "  backbone_type: hf_deberta_v2",
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  max_seq_length: $variables.seq",
+                "train:",
+                "  max_steps: 10",
+                "  learning_rate: $variables.lr",
+                "  run_name: run-{$variables.seq}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _, data_cfg, train_cfg = _load_yaml(cfg)
+    assert int(data_cfg.max_seq_length) == 256
+    assert float(train_cfg.learning_rate) == pytest.approx(5e-4)
+    assert train_cfg.run_name == "run-256"
+
+
+def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
+    pytest.importorskip("yaml")
+
+    cfg = tmp_path / "vars_cycle.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "variables:",
+                "  a: $variables.b",
+                "  b: $variables.a",
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Circular variable reference"):
+        _load_yaml(cfg)
+
+
 def test_load_json_unknown_key_raises(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
@@ -4798,6 +4849,75 @@ def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
     assert int(seen["train_cfg"].max_steps) == 7
     err = capsys.readouterr().err
     assert "train.max_steps: 5 -> 7 (CLI override (--max-steps))" in err
+
+
+def test_main_cli_train_supports_dotted_overrides_with_type_casting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+                "  adam_epsilon: 1e-6",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--max_steps",
+            "7",
+            "--override",
+            "train.max_steps=11",
+            "--override",
+            "train.adam_epsilon=1e-5",
+            "--override",
+            "model.hf_max_position_embeddings=640",
+        ]
+    )
+
+    assert int(seen["train_cfg"].max_steps) == 11
+    assert float(seen["train_cfg"].adam_epsilon) == pytest.approx(1e-5)
+    assert int(seen["model_cfg"].hf_max_position_embeddings) == 640
+    err = capsys.readouterr().err
+    assert "train.max_steps: 5 -> 11 (CLI override (--override train.max_steps=11))" in err
+
+
+def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_mod, "run_pretraining", lambda **_: None)
+    with pytest.raises(ValueError, match="Unknown override field"):
+        cli_mod.main(["train", str(cfg_path), "--override", "train.no_such_field=1"])
 
 
 def test_main_cli_train_with_config_and_preset_applies_model_only(

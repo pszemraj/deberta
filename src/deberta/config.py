@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import re
+import types
 import warnings
-from dataclasses import dataclass, field, fields
-from typing import Any, TypeVar
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
+
+from deberta.io_utils import load_json_mapping
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
@@ -118,6 +123,10 @@ _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
 RUN_CONFIG_SCHEMA_VERSION = 3
+_VAR_FULL_RE = re.compile(r"^\$variables\.([A-Za-z0-9_.-]+)$")
+_VAR_INLINE_RE = re.compile(r"\{\$variables\.([A-Za-z0-9_.-]+)\}")
+_VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")
+_VAR_SUSPICIOUS_RE = re.compile(r"\$variables\.[A-Za-z0-9_.-]+")
 
 
 @dataclass
@@ -879,6 +888,290 @@ class TrainConfig:
             )
         },
     )
+
+
+@dataclass
+class Config:
+    """Top-level training config bundle."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+
+
+def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Split a flat mapping into model/data/train field mappings.
+
+    :param dict[str, Any] raw: Flat config mapping.
+    :raises ValueError: If unknown keys are present.
+    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Section mappings.
+    """
+    model_keys = {f.name for f in fields(ModelConfig)}
+    data_keys = {f.name for f in fields(DataConfig)}
+    train_keys = {f.name for f in fields(TrainConfig)}
+
+    model_dict: dict[str, Any] = {}
+    data_dict: dict[str, Any] = {}
+    train_dict: dict[str, Any] = {}
+    unknown: dict[str, Any] = {}
+
+    for key, value in raw.items():
+        if key in model_keys:
+            model_dict[key] = value
+        elif key in data_keys:
+            data_dict[key] = value
+        elif key in train_keys:
+            train_dict[key] = value
+        else:
+            unknown[key] = value
+
+    if unknown:
+        keys = ", ".join(sorted(unknown.keys()))
+        raise ValueError(f"Unknown keys in config file (not in ModelConfig/DataConfig/TrainConfig): {keys}")
+
+    return model_dict, data_dict, train_dict
+
+
+def _split_nested_or_flat_sections(
+    raw: dict[str, Any], *, format_name: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Split nested/flat config mappings into model/data/train sections.
+
+    :param dict[str, Any] raw: Parsed config mapping.
+    :param str format_name: Format label for error messages.
+    :raises ValueError: If config shape is invalid.
+    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Section mappings.
+    """
+    if any(key in raw for key in ("model", "data", "train")):
+        unknown_top = sorted(key for key in raw.keys() if key not in {"model", "data", "train"})
+        if unknown_top:
+            raise ValueError(
+                f"Unknown top-level keys in nested {format_name} config "
+                f"(expected only model/data/train): {', '.join(unknown_top)}"
+            )
+        model_dict = raw.get("model", {}) or {}
+        data_dict = raw.get("data", {}) or {}
+        train_dict = raw.get("train", {}) or {}
+        if (
+            not isinstance(model_dict, dict)
+            or not isinstance(data_dict, dict)
+            or not isinstance(train_dict, dict)
+        ):
+            raise ValueError(f"{format_name} config sections model/data/train must be dicts.")
+        return model_dict, data_dict, train_dict
+
+    return _split_flat_dict(raw)
+
+
+def _resolve_variables(data: dict[str, Any]) -> dict[str, Any]:
+    """Resolve ``$variables.*`` references in a config mapping.
+
+    Supported forms:
+      - full replacement: ``$variables.foo``
+      - inline replacement: ``{$variables.foo}`` and ``${variables.foo}``
+
+    :param dict[str, Any] data: Raw config mapping.
+    :raises ValueError: If a variable reference is missing or circular.
+    :return dict[str, Any]: Mapping with variables expanded and removed.
+    """
+    raw_vars = data.get("variables") or {}
+    if not isinstance(raw_vars, dict):
+        raise ValueError("variables must be a mapping if provided.")
+
+    resolved: dict[str, Any] = {}
+    resolving: set[str] = set()
+
+    def _lookup_var(path: str) -> Any:
+        """Resolve one variable path from the variables mapping.
+
+        :param str path: Dot-separated variables path.
+        :raises ValueError: If a variable is unknown or circular.
+        :return Any: Resolved variable value.
+        """
+        if path in resolved:
+            return resolved[path]
+        if path in resolving:
+            cycle = " -> ".join(list(resolving) + [path])
+            raise ValueError(f"Circular variable reference: {cycle}")
+
+        cur: Any = raw_vars
+        for part in str(path).split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                raise ValueError(f"Unknown variable reference: variables.{path}")
+            cur = cur[part]
+
+        resolving.add(path)
+        value = _resolve_value(cur)
+        resolving.remove(path)
+        resolved[path] = value
+        return value
+
+    def _sub_var(match: re.Match[str]) -> str:
+        """Stringify and substitute a variable regex match.
+
+        :param re.Match[str] match: Match containing the variable path.
+        :return str: Resolved string value.
+        """
+        return str(_lookup_var(match.group(1)))
+
+    def _resolve_value(value: Any) -> Any:
+        """Resolve variables in a nested value tree.
+
+        :param Any value: Nested value.
+        :return Any: Resolved value.
+        """
+        if isinstance(value, dict):
+            return {k: _resolve_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_resolve_value(v) for v in value]
+        if isinstance(value, str):
+            full = _VAR_FULL_RE.fullmatch(value)
+            if full:
+                return _lookup_var(full.group(1))
+            out = _VAR_INLINE_RE.sub(_sub_var, value)
+            out = _VAR_BRACE_RE.sub(_sub_var, out)
+            remaining = _VAR_SUSPICIOUS_RE.findall(out)
+            if remaining:
+                warnings.warn(
+                    f"String contains unresolved variable-like patterns: {remaining}. "
+                    "Use {$variables.name} or ${variables.name} for inline substitution.",
+                    stacklevel=2,
+                )
+            return out
+        return value
+
+    def _collect_var_leaf_paths(prefix: str, value: Any) -> list[str]:
+        """Collect dotted leaf paths from a nested variable mapping.
+
+        :param str prefix: Current path prefix.
+        :param Any value: Nested variable value.
+        :return list[str]: Leaf variable paths.
+        """
+        if isinstance(value, dict):
+            out: list[str] = []
+            for key, item in value.items():
+                part = str(key).strip()
+                child = f"{prefix}.{part}" if prefix else part
+                out.extend(_collect_var_leaf_paths(child, item))
+            return out
+        return [prefix]
+
+    # Resolve every variable leaf eagerly so missing/circular references fail fast,
+    # even when a variable is not directly used in model/data/train sections.
+    for var_path in _collect_var_leaf_paths("", raw_vars):
+        _lookup_var(var_path)
+
+    return {k: _resolve_value(v) for k, v in data.items() if k != "variables"}
+
+
+def load_config_sections(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load strict model/data/train mappings from a YAML or JSON file.
+
+    :param str | Path path: Config path.
+    :raises ValueError: If file content is invalid for this config schema.
+    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed section mappings.
+    """
+    cfg_path = Path(path).expanduser().resolve()
+    suffix = cfg_path.suffix.lower()
+    if suffix not in {".yaml", ".yml", ".json"}:
+        raise ValueError("Config file must end with .json, .yaml, or .yml")
+
+    if suffix in {".yaml", ".yml"}:
+        try:
+            import yaml  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
+            ) from e
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    else:
+        raw = load_json_mapping(cfg_path)
+
+    if not isinstance(raw, dict):
+        raise ValueError("Config file must parse to a dict.")
+    resolved_raw = _resolve_variables(raw)
+    return _split_nested_or_flat_sections(
+        resolved_raw, format_name="YAML" if suffix in {".yaml", ".yml"} else "JSON"
+    )
+
+
+def _unwrap_optional_type(field_type: Any) -> tuple[Any, bool]:
+    """Unwrap ``Optional[T]`` annotations.
+
+    :param Any field_type: Raw type annotation.
+    :return tuple[Any, bool]: Unwrapped type and whether ``None`` is allowed.
+    """
+    origin = get_origin(field_type)
+    if origin in {Union, types.UnionType}:
+        args = get_args(field_type)
+        allows_none = any(a is type(None) for a in args)
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0], allows_none
+    return field_type, False
+
+
+def _coerce_override_value(raw: str, field_type: Any) -> Any:
+    """Cast a dotted-override raw string to the target dataclass field type.
+
+    :param str raw: Raw override value string.
+    :param Any field_type: Dataclass field type annotation.
+    :raises ValueError: If value cannot be parsed as the target type.
+    :return Any: Typed override value.
+    """
+    target_t, allows_none = _unwrap_optional_type(field_type)
+    text = str(raw).strip()
+    if allows_none and text.lower() in {"none", "null"}:
+        return None
+    if target_t is bool:
+        v = text.lower()
+        if v in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise ValueError(f"Expected a boolean override value, got: {raw!r}")
+    if target_t is int:
+        return int(text)
+    if target_t is float:
+        return float(text)
+    if target_t is str:
+        return text
+    return raw
+
+
+def apply_dotted_override(cfg: Config, override: str) -> Config:
+    """Apply one dotted override expression to a ``Config`` object.
+
+    Format: ``section.field=value`` where ``section`` is one of model/data/train.
+
+    :param Config cfg: Existing config bundle.
+    :param str override: Override expression.
+    :raises ValueError: If expression/section/field/value is invalid.
+    :return Config: New config with one updated field.
+    """
+    text = str(override).strip()
+    if "=" not in text:
+        raise ValueError(f"Invalid override {override!r}. Expected format like model.hidden_size=768.")
+    path, raw_value = text.split("=", 1)
+    path = path.strip()
+    raw_value = raw_value.strip()
+    if "." not in path:
+        raise ValueError(
+            f"Invalid override path {path!r}. Expected format section.field (for example train.max_steps)."
+        )
+    section, field_name = path.split(".", 1)
+    section = str(section).strip().lower()
+    field_name = str(field_name).strip()
+    if section not in {"model", "data", "train"}:
+        raise ValueError(f"Unknown override section {section!r}; expected one of model|data|train.")
+    section_obj = getattr(cfg, section)
+    if not hasattr(section_obj, field_name):
+        raise ValueError(f"Unknown override field {section}.{field_name!r}.")
+    type_hints = get_type_hints(type(section_obj))
+    field_type = type_hints.get(field_name, Any)
+    coerced = _coerce_override_value(raw_value, field_type)
+    new_section = replace(section_obj, **{field_name: coerced})
+    return replace(cfg, **{section: new_section})
 
 
 def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
