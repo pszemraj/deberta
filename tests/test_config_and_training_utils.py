@@ -1954,7 +1954,7 @@ def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phase
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -2067,7 +2067,7 @@ def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_toke
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -2131,7 +2131,7 @@ def test_run_pretraining_final_export_uses_subprocess_helper(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
+        model_cfg=ModelConfig(backbone_type="rope"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -2201,7 +2201,7 @@ def _run_zero_token_weighted_case(
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
+        model_cfg=ModelConfig(backbone_type="rope"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -2260,7 +2260,7 @@ def test_run_pretraining_warns_and_excludes_zero_token_weighted_metrics_from_tra
 
     with caplog.at_level(logging.WARNING):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
+            model_cfg=ModelConfig(backbone_type="rope"),
             data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
         )
@@ -3422,6 +3422,39 @@ def test_build_optimizer_supports_generator_specific_lr():
     assert wds == {0.0, 0.1}
 
 
+def test_build_optimizer_supports_discriminator_specific_lr():
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig(
+        learning_rate=1.0e-3,
+        generator_learning_rate=5.0e-4,
+        discriminator_learning_rate=2.0e-4,
+        weight_decay=0.1,
+    )
+    opt = _build_optimizer(model, cfg)
+
+    lrs = {float(g["lr"]) for g in opt.param_groups}
+    assert lrs == {5.0e-4, 2.0e-4}
+
+
+def test_build_decoupled_optimizers_support_discriminator_specific_lr():
+    model = _TinyRTDLikeModel()
+    cfg = TrainConfig(
+        learning_rate=1.0e-3,
+        generator_learning_rate=5.0e-4,
+        discriminator_learning_rate=2.0e-4,
+        weight_decay=0.1,
+        mixed_precision="no",
+    )
+    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
+
+    assert gen_opt.param_groups
+    assert disc_opt.param_groups
+    for group in gen_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(5.0e-4)
+    for group in disc_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(2.0e-4)
+
+
 def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
@@ -4534,7 +4567,36 @@ def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
     assert train_cfg.mlm_max_ngram == 1
     assert train_cfg.disc_loss_weight == pytest.approx(10.0)
     assert train_cfg.adam_epsilon == pytest.approx(1e-6)
+    assert train_cfg.warmup_steps == 10_000
     assert train_cfg.token_weighted_gradient_accumulation is False
+
+
+def test_apply_profile_defaults_applies_hf_parity_values_without_parity_profile() -> None:
+    model_cfg = ModelConfig(profile="modern", backbone_type="hf_deberta_v2")
+    train_cfg = TrainConfig()
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    assert train_cfg.mask_token_prob == pytest.approx(1.0)
+    assert train_cfg.random_token_prob == pytest.approx(0.0)
+    assert train_cfg.disc_loss_weight == pytest.approx(10.0)
+    assert train_cfg.adam_epsilon == pytest.approx(1e-6)
+    assert train_cfg.warmup_steps == 10_000
+    assert train_cfg.token_weighted_gradient_accumulation is False
+
+
+def test_apply_profile_defaults_keeps_rope_modern_defaults() -> None:
+    model_cfg = ModelConfig(profile="modern", backbone_type="rope")
+    train_cfg = TrainConfig()
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    assert train_cfg.mask_token_prob == pytest.approx(0.8)
+    assert train_cfg.random_token_prob == pytest.approx(0.1)
+    assert train_cfg.disc_loss_weight == pytest.approx(50.0)
+    assert train_cfg.adam_epsilon == pytest.approx(1e-8)
+    assert train_cfg.warmup_steps == 1_000
+    assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
@@ -4550,6 +4612,7 @@ def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
         mlm_max_ngram=2,
         disc_loss_weight=12.5,
         adam_epsilon=5e-6,
+        warmup_steps=2_000,
         token_weighted_gradient_accumulation=False,
     )
 
@@ -4563,6 +4626,7 @@ def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
     assert train_cfg.mlm_max_ngram == 2
     assert train_cfg.disc_loss_weight == pytest.approx(12.5)
     assert train_cfg.adam_epsilon == pytest.approx(5e-6)
+    assert train_cfg.warmup_steps == 2_000
     assert train_cfg.token_weighted_gradient_accumulation is False
 
 
@@ -4575,6 +4639,19 @@ def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
     cfg = TrainConfig()
     cfg.decoupled_training = None  # type: ignore[assignment]
     with pytest.raises(ValueError, match="train.decoupled_training must be a boolean"):
+        validate_train_config(cfg)
+
+
+@pytest.mark.parametrize("value", [-1.0, 1.0e-4, 2.5e-3])
+def test_validate_train_config_allows_discriminator_learning_rate_inherit_or_positive(value: float) -> None:
+    cfg = TrainConfig(discriminator_learning_rate=value)
+    validate_train_config(cfg)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, -2.0])
+def test_validate_train_config_rejects_invalid_discriminator_learning_rate(value: float) -> None:
+    cfg = TrainConfig(discriminator_learning_rate=value)
+    with pytest.raises(ValueError, match="train.discriminator_learning_rate"):
         validate_train_config(cfg)
 
 

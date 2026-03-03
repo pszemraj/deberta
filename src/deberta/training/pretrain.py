@@ -872,7 +872,11 @@ def _build_optimizer(
         if float(cfg.generator_learning_rate) > 0
         else float(cfg.learning_rate)
     )
-    disc_lr = float(cfg.learning_rate)
+    disc_lr = (
+        float(cfg.discriminator_learning_rate)
+        if float(getattr(cfg, "discriminator_learning_rate", -1.0)) > 0
+        else float(cfg.learning_rate)
+    )
     partitions = _partition_optimizer_params(model)
     gen_decay = partitions["gen_decay"]["params"]
     gen_no_decay = partitions["gen_no_decay"]["params"]
@@ -931,7 +935,11 @@ def _build_decoupled_optimizers(
         if float(cfg.generator_learning_rate) > 0
         else float(cfg.learning_rate)
     )
-    disc_lr = float(cfg.learning_rate)
+    disc_lr = (
+        float(cfg.discriminator_learning_rate)
+        if float(getattr(cfg, "discriminator_learning_rate", -1.0)) > 0
+        else float(cfg.learning_rate)
+    )
     partitions = _partition_optimizer_params(model)
 
     gen_groups: list[dict[str, Any]] = []

@@ -274,10 +274,10 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
     assert disc_cfg.intermediate_size == 2816
 
 
-def test_derive_generator_config_uses_half_depth_for_hf_parity_profile():
+def test_derive_generator_config_uses_half_depth_for_hf_backbone():
     base_cfg = types.SimpleNamespace(num_hidden_layers=12)
     model_cfg = ModelConfig(
-        profile="deberta_v3_parity",
+        profile="modern",
         backbone_type="hf_deberta_v2",
         generator_num_hidden_layers=None,
     )
@@ -286,11 +286,11 @@ def test_derive_generator_config_uses_half_depth_for_hf_parity_profile():
     assert int(gen_cfg.num_hidden_layers) == 6
 
 
-def test_derive_generator_config_keeps_modern_third_depth_default():
+def test_derive_generator_config_keeps_third_depth_default_for_non_hf_backbone():
     base_cfg = types.SimpleNamespace(num_hidden_layers=12)
     model_cfg = ModelConfig(
         profile="modern",
-        backbone_type="hf_deberta_v2",
+        backbone_type="rope",
         generator_num_hidden_layers=None,
     )
 

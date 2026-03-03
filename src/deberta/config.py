@@ -685,6 +685,11 @@ class TrainConfig:
         metadata={"help": "Optional override learning rate for generator params. -1 uses learning_rate."},
     )
 
+    discriminator_learning_rate: float = field(
+        default=-1.0,
+        metadata={"help": "Optional override learning rate for discriminator params. -1 uses learning_rate."},
+    )
+
     weight_decay: float = field(default=0.01, metadata={"help": "AdamW weight decay."})
 
     adam_beta1: float = field(default=0.9, metadata={"help": "Adam beta1."})
@@ -1454,6 +1459,9 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("train.mlm_max_ngram must be >= 1.")
     if float(cfg.sampling_temperature) <= 0.0:
         raise ValueError("train.sampling_temperature must be > 0.")
+    disc_lr = float(cfg.discriminator_learning_rate)
+    if disc_lr != -1.0 and disc_lr <= 0.0:
+        raise ValueError("train.discriminator_learning_rate must be -1 (inherit) or > 0.")
     if not isinstance(cfg.decoupled_training, bool):
         raise ValueError(
             "train.decoupled_training must be a boolean (true/false). "
@@ -1493,43 +1501,42 @@ def validate_train_config(cfg: TrainConfig) -> None:
 
 
 def apply_profile_defaults(*, model_cfg: ModelConfig, train_cfg: TrainConfig) -> None:
-    """Apply profile-specific defaults while preserving explicit non-default values.
+    """Apply profile/backbone-specific defaults while preserving explicit non-default values.
 
     :param ModelConfig model_cfg: Model config to update in-place.
     :param TrainConfig train_cfg: Train config to update in-place.
     """
     profile = str(model_cfg.profile).strip().lower()
-    if profile != "deberta_v3_parity":
-        return
-
     model_defaults = ModelConfig()
     train_defaults = TrainConfig()
 
-    # Profile intends parity defaults on HF DeBERTa-v2 path unless user picked otherwise.
-    if str(model_cfg.backbone_type) == str(model_defaults.backbone_type):
-        model_cfg.backbone_type = "hf_deberta_v2"
+    if profile == "deberta_v3_parity":
+        # Profile intends parity defaults on HF DeBERTa-v2 path unless user picked otherwise.
+        if str(model_cfg.backbone_type) == str(model_defaults.backbone_type):
+            model_cfg.backbone_type = "hf_deberta_v2"
 
-    if str(model_cfg.embedding_sharing) == str(model_defaults.embedding_sharing):
-        model_cfg.embedding_sharing = "gdes"
+        if str(model_cfg.embedding_sharing) == str(model_defaults.embedding_sharing):
+            model_cfg.embedding_sharing = "gdes"
 
-    if str(model_cfg.hf_attention_kernel) == str(model_defaults.hf_attention_kernel):
-        model_cfg.hf_attention_kernel = "dynamic"
+        if str(model_cfg.hf_attention_kernel) == str(model_defaults.hf_attention_kernel):
+            model_cfg.hf_attention_kernel = "dynamic"
 
-    # RTD recipe defaults.
-    if float(train_cfg.mask_token_prob) == float(train_defaults.mask_token_prob):
-        train_cfg.mask_token_prob = 1.0
-    if float(train_cfg.random_token_prob) == float(train_defaults.random_token_prob):
-        train_cfg.random_token_prob = 0.0
-    if int(train_cfg.mlm_max_ngram) == int(train_defaults.mlm_max_ngram):
-        train_cfg.mlm_max_ngram = 1
-    if float(train_cfg.disc_loss_weight) == float(train_defaults.disc_loss_weight):
-        train_cfg.disc_loss_weight = 10.0
-    if float(train_cfg.adam_epsilon) == float(train_defaults.adam_epsilon):
-        train_cfg.adam_epsilon = 1e-6
-    if bool(train_cfg.token_weighted_gradient_accumulation) == bool(
-        train_defaults.token_weighted_gradient_accumulation
-    ):
-        train_cfg.token_weighted_gradient_accumulation = False
+    # Parity++ defaults apply to hf_deberta_v2 unless explicitly overridden.
+    if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
+        if float(train_cfg.mask_token_prob) == float(train_defaults.mask_token_prob):
+            train_cfg.mask_token_prob = 1.0
+        if float(train_cfg.random_token_prob) == float(train_defaults.random_token_prob):
+            train_cfg.random_token_prob = 0.0
+        if float(train_cfg.disc_loss_weight) == float(train_defaults.disc_loss_weight):
+            train_cfg.disc_loss_weight = 10.0
+        if float(train_cfg.adam_epsilon) == float(train_defaults.adam_epsilon):
+            train_cfg.adam_epsilon = 1e-6
+        if int(train_cfg.warmup_steps) == int(train_defaults.warmup_steps):
+            train_cfg.warmup_steps = 10_000
+        if bool(train_cfg.token_weighted_gradient_accumulation) == bool(
+            train_defaults.token_weighted_gradient_accumulation
+        ):
+            train_cfg.token_weighted_gradient_accumulation = False
 
 
 def validate_training_workflow_options(
