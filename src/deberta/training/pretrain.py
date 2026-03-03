@@ -2092,6 +2092,10 @@ def run_pretraining(
                 did_disc_optimizer_step = False
                 gen_phase_out: Any | None = None
                 disc_phase_out: Any | None = None
+                gen_loss_weight = float(train_cfg.gen_loss_weight)
+                disc_loss_weight = float(train_cfg.disc_loss_weight)
+                gen_phase_enabled = gen_loss_weight != 0.0
+                disc_phase_enabled = disc_loss_weight != 0.0
 
                 gen_optimizer.zero_grad(set_to_none=True)
                 disc_optimizer.zero_grad(set_to_none=True)
@@ -2129,21 +2133,22 @@ def run_pretraining(
                             )
                         else:
                             gen_obj = gen_loss
-                        loss_for_metrics = loss_for_metrics + (
-                            float(train_cfg.gen_loss_weight) * gen_obj.detach()
-                        )
-
-                        backward_loss = _scale_loss_for_backward(
-                            loss=gen_obj,
-                            ga_steps=ga_steps,
-                            token_weighted_ga=token_weighted_ga,
-                        )
+                        loss_for_metrics = loss_for_metrics + (gen_loss_weight * gen_obj.detach())
 
                         offending: str | None = None
                         if not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all():
                             offending = "gen_loss_raw"
-                        elif not torch.isfinite(backward_loss.detach()).all():
-                            offending = "gen_backward_loss"
+
+                        backward_loss: torch.Tensor | None = None
+                        if offending is None and gen_phase_enabled:
+                            weighted_gen_obj = gen_obj * gen_loss_weight
+                            backward_loss = _scale_loss_for_backward(
+                                loss=weighted_gen_obj,
+                                ga_steps=ga_steps,
+                                token_weighted_ga=token_weighted_ga,
+                            )
+                            if not torch.isfinite(backward_loss.detach()).all():
+                                offending = "gen_backward_loss"
 
                         if offending is not None:
                             skipped_window_due_nonfinite = True
@@ -2187,9 +2192,13 @@ def run_pretraining(
                                 "disc_count": float(disc_count),
                             }
                         )
-                        accelerator.backward(backward_loss)
+                        if backward_loss is not None:
+                            accelerator.backward(backward_loss)
 
                     if is_sync_step and not skipped_window_due_nonfinite:
+                        if not gen_phase_enabled:
+                            did_gen_optimizer_step = True
+                            continue
                         grad_norm_for_check = _global_grad_l2_norm(model)
                         if _has_nonfinite_grad_norm_any_rank(
                             accelerator=accelerator,
@@ -2235,20 +2244,21 @@ def run_pretraining(
                                 )
                             else:
                                 disc_obj = disc_loss
-                            loss_for_metrics = loss_for_metrics + (
-                                float(train_cfg.disc_loss_weight) * disc_obj.detach()
-                            )
-                            backward_loss = _scale_loss_for_backward(
-                                loss=disc_obj,
-                                ga_steps=ga_steps,
-                                token_weighted_ga=token_weighted_ga,
-                            )
-
+                            loss_for_metrics = loss_for_metrics + (disc_loss_weight * disc_obj.detach())
                             offending = None
                             if not torch.isfinite(disc_phase_out.disc_loss_raw.detach()).all():
                                 offending = "disc_loss_raw"
-                            elif not torch.isfinite(backward_loss.detach()).all():
-                                offending = "disc_backward_loss"
+
+                            backward_loss: torch.Tensor | None = None
+                            if offending is None and disc_phase_enabled:
+                                weighted_disc_obj = disc_obj * disc_loss_weight
+                                backward_loss = _scale_loss_for_backward(
+                                    loss=weighted_disc_obj,
+                                    ga_steps=ga_steps,
+                                    token_weighted_ga=token_weighted_ga,
+                                )
+                                if not torch.isfinite(backward_loss.detach()).all():
+                                    offending = "disc_backward_loss"
 
                             if offending is not None:
                                 skipped_window_due_nonfinite = True
@@ -2292,9 +2302,13 @@ def run_pretraining(
                                 disc_phase_out.disc_accuracy.detach().float()
                                 * disc_phase_out.disc_token_count.detach().float()
                             )
-                            accelerator.backward(backward_loss)
+                            if backward_loss is not None:
+                                accelerator.backward(backward_loss)
 
                         if is_sync_step and not skipped_window_due_nonfinite:
+                            if not disc_phase_enabled:
+                                did_disc_optimizer_step = True
+                                continue
                             grad_norm_for_check = _global_grad_l2_norm(model)
                             if _has_nonfinite_grad_norm_any_rank(
                                 accelerator=accelerator,

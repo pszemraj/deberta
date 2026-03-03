@@ -2100,6 +2100,8 @@ def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_toke
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=True,
+        gen_loss_weight=1.0,
+        disc_loss_weight=1.0,
         torch_compile=False,
         export_hf_final=False,
         decoupled_training=True,
@@ -2125,6 +2127,207 @@ def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_toke
         rel=0.0,
         abs=1e-6,
     )
+
+
+def test_run_pretraining_decoupled_applies_branch_loss_weights_to_backward_objectives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _BackwardTrackingAccelerator(FakeAccelerator):
+        last_instance: _BackwardTrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.backward_losses: list[float] = []
+            _BackwardTrackingAccelerator.last_instance = self
+
+        def backward(self, loss: torch.Tensor) -> None:
+            self.backward_losses.append(float(loss.detach().item()))
+
+    class _WeightedDecoupledRTD(SimpleRTD):
+        def forward_generator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            labels: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            sampling_temperature: float = 1.0,
+        ) -> Any:
+            del attention_mask, labels, token_type_ids, sampling_temperature
+            gen_loss = self.generator.weight.sum() * 0.0 + 2.0
+            return types.SimpleNamespace(
+                gen_loss_raw=gen_loss,
+                gen_token_count=torch.tensor(1.0),
+                corrupted_input_ids=input_ids.detach().clone(),
+                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
+            )
+
+        def forward_discriminator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            corrupted_input_ids: torch.Tensor,
+            disc_labels: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+        ) -> Any:
+            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
+            disc_loss = self.discriminator.weight.sum() * 0.0 + 3.0
+            return types.SimpleNamespace(
+                disc_loss_raw=disc_loss,
+                disc_accuracy=torch.tensor(0.5),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(0.0),
+            )
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            return None
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_BackwardTrackingAccelerator,
+        rtd_cls=_WeightedDecoupledRTD,
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        gen_loss_weight=0.25,
+        disc_loss_weight=4.0,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    accel = _BackwardTrackingAccelerator.last_instance
+    assert accel is not None
+    assert accel.backward_losses == pytest.approx([2.0 * 0.25, 3.0 * 4.0], rel=0.0, abs=1e-6)
+
+
+def test_run_pretraining_decoupled_skips_generator_optimizer_when_gen_loss_weight_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _BackwardTrackingAccelerator(FakeAccelerator):
+        last_instance: _BackwardTrackingAccelerator | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.backward_losses: list[float] = []
+            _BackwardTrackingAccelerator.last_instance = self
+
+        def backward(self, loss: torch.Tensor) -> None:
+            self.backward_losses.append(float(loss.detach().item()))
+
+    class _ZeroWeightedGenRTD(SimpleRTD):
+        def forward_generator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            labels: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            sampling_temperature: float = 1.0,
+        ) -> Any:
+            del attention_mask, labels, token_type_ids, sampling_temperature
+            gen_loss = self.generator.weight.sum() * 0.0 + 2.0
+            return types.SimpleNamespace(
+                gen_loss_raw=gen_loss,
+                gen_token_count=torch.tensor(1.0),
+                corrupted_input_ids=input_ids.detach().clone(),
+                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
+            )
+
+        def forward_discriminator_phase(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            corrupted_input_ids: torch.Tensor,
+            disc_labels: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+        ) -> Any:
+            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
+            disc_loss = self.discriminator.weight.sum() * 0.0 + 3.0
+            return types.SimpleNamespace(
+                disc_loss_raw=disc_loss,
+                disc_accuracy=torch.tensor(0.5),
+                disc_token_count=torch.tensor(1.0),
+                disc_positive_count=torch.tensor(0.0),
+            )
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            return None
+
+    step_counts = {"gen": 0, "disc": 0}
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=_BackwardTrackingAccelerator,
+        rtd_cls=_ZeroWeightedGenRTD,
+    )
+    original_build_decoupled = pretrain_mod._build_decoupled_optimizers
+
+    def _build_logged_decoupled(model: torch.nn.Module, cfg: TrainConfig, *, mixed_precision: str = "no"):
+        gen_opt, disc_opt = original_build_decoupled(model, cfg, mixed_precision=mixed_precision)
+        original_gen_step = gen_opt.step
+        original_disc_step = disc_opt.step
+
+        def _gen_step(_opt_self: Any, *args: Any, **kwargs: Any):
+            step_counts["gen"] += 1
+            return original_gen_step(*args, **kwargs)
+
+        def _disc_step(_opt_self: Any, *args: Any, **kwargs: Any):
+            step_counts["disc"] += 1
+            return original_disc_step(*args, **kwargs)
+
+        gen_opt.step = types.MethodType(_gen_step, gen_opt)  # type: ignore[method-assign]
+        disc_opt.step = types.MethodType(_disc_step, disc_opt)  # type: ignore[method-assign]
+        return gen_opt, disc_opt
+
+    monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        gen_loss_weight=0.0,
+        disc_loss_weight=1.0,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    accel = _BackwardTrackingAccelerator.last_instance
+    assert accel is not None
+    assert accel.backward_losses == pytest.approx([3.0], rel=0.0, abs=1e-6)
+    assert step_counts["gen"] == 0
+    assert step_counts["disc"] == 1
 
 
 def test_run_pretraining_final_export_uses_subprocess_helper(
