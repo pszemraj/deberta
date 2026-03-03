@@ -12,29 +12,34 @@
 | FFN | MLP | MLP or SwiGLU |
 | Primary use | DeBERTa-v2/v3 parity path | experimental modernized path |
 
-For `hf_deberta_v2`, backbone configs are synthesized in-repo from `model.hf_model_size` + explicit overrides. The trainer does not load architecture config JSON from HF model hubs.
+For `hf_deberta_v2`, backbone configs are synthesized in-repo from `model.hf.model_size` + explicit overrides. The trainer does not load architecture config JSON from HF model hubs.
 
-## HF-size presets (`hf_model_size`)
+## HF-size presets (`model.hf.model_size`)
 
-`hf_model_size` supports `xsmall`, `small`, `base`, `large`.
+`model.hf.model_size` supports `xsmall`, `small`, `base`, `large`.
 
 Generator defaults are derived from discriminator width/heads/ffn and half depth on `hf_deberta_v2`.
 
 ## RTD architecture notes
 
 - discriminator and generator backbones are separate modules
-- `embedding_sharing` supports `none`, `es`, `gdes`
+- `model.embedding_sharing` supports `none`, `es`, `gdes`
 - decoupled two-phase RTD updates are enabled by default (`train.decoupled_training=true`)
 
 ## Default deltas vs released DeBERTa-v3 configs
 
 Intentional repo defaults:
 
-- dropout defaults are `0.0` (`model.hidden_dropout_prob`, `model.attention_probs_dropout_prob`)
-- RTD parity++ default `train.disc_loss_weight` is `10.0`
-- default `train.adam_beta2` is `0.999`
+- dropout defaults are `0.0` (`model.dropout.hidden_prob`, `model.dropout.attention_probs_prob`)
+- RTD parity++ default `train.objective.disc_loss_weight` is `10.0`
+- default `optim.adam.beta2` is `0.999`
 
 Use explicit config values when you want different behavior.
+
+## Parity divergences
+
+- Intentional divergence: generator sampling excludes special/control token ids via a forbidden vocabulary mask (for example PAD/CLS/SEP/MASK). This differs from original DeBERTa sampling and is kept intentionally.
+- TODO (strict parity follow-up): evaluate narrowing discriminator embedding sharing to only word+position embeddings; current sharing also includes `token_type_embeddings`.
 
 ## RoPE-specific controls
 

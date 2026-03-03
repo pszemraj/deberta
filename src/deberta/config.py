@@ -1739,6 +1739,9 @@ def apply_profile_defaults(
     :param TrainConfig train_cfg: Train config to update in-place.
     :param OptimConfig | None optim_cfg: Optim config to update in-place.
     """
+    # Explicit-field metadata is populated from YAML + dotted CLI flags and is
+    # checked before equality comparisons so explicit values are preserved even
+    # when they match raw dataclass defaults.
     explicit_model_fields = _explicit_fields(model_cfg)
     explicit_train_fields = _explicit_fields(train_cfg)
     explicit_optim_fields = _explicit_fields(optim_cfg) if optim_cfg is not None else set()

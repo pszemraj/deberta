@@ -714,6 +714,9 @@ class DebertaV3RTDPretrainer(nn.Module):
     ) -> set[int]:
         """Collect special token ids to exclude from generator sampling.
 
+        This is an intentional divergence from strict DeBERTa parity to prevent
+        sampled replacements from landing on control/special tokens.
+
         :param Iterable[int] | None additional_forbidden_token_ids: Optional extra forbidden ids.
         :return set[int]: Forbidden vocabulary ids.
         """
@@ -1038,7 +1041,7 @@ class DebertaV3RTDPretrainer(nn.Module):
     ) -> RTDDiscriminatorPhaseOutput:
         """Run discriminator scoring only, given prebuilt corrupted ids/labels.
 
-        :param torch.Tensor input_ids: Original (uncorrupted) input ids.
+        :param torch.Tensor input_ids: Input ids used only for active-token masking.
         :param torch.Tensor corrupted_input_ids: Corrupted ids sampled from generator logits.
         :param torch.Tensor disc_labels: Binary RTD labels.
         :param torch.Tensor | None attention_mask: Optional attention mask.
