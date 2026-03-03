@@ -899,6 +899,33 @@ def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None
     assert str(gen_opt._param_order_digest) != str(disc_opt._param_order_digest)
 
 
+def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_optimizer() -> None:
+    class _ModelWithEmd(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = torch.nn.Linear(8, 8)
+            self.generator_lm_head = torch.nn.Linear(8, 8)
+            self.enhanced_mask_decoder = torch.nn.Linear(8, 8)
+            self.discriminator = torch.nn.Linear(8, 8)
+
+    model = _ModelWithEmd()
+    cfg = TrainConfig(
+        learning_rate=5.0e-4,
+        generator_learning_rate=2.5e-4,
+        weight_decay=0.01,
+        mixed_precision="no",
+    )
+    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
+
+    gen_param_ids = {id(p) for group in gen_opt.param_groups for p in group["params"]}
+    disc_param_ids = {id(p) for group in disc_opt.param_groups for p in group["params"]}
+    emd_param_ids = {id(p) for p in model.enhanced_mask_decoder.parameters() if p.requires_grad}
+
+    assert emd_param_ids
+    assert emd_param_ids.issubset(gen_param_ids)
+    assert emd_param_ids.isdisjoint(disc_param_ids)
+
+
 def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     """_save_training_checkpoint forwards optimizer_param_digest to data_state.json."""
     out = tmp_path / "run"

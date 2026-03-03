@@ -982,7 +982,15 @@ def _is_generator_param(name: str) -> bool:
     :param str name: Parameter name.
     :return bool: True when parameter is generator-owned.
     """
-    return name.startswith("generator.") or name.startswith("generator_lm_head.")
+    # Generator-owned modules:
+    # - generator backbone
+    # - generator MLM head
+    # - enhanced mask decoder (used only on the generator path)
+    return (
+        name.startswith("generator.")
+        or name.startswith("generator_lm_head.")
+        or name.startswith("enhanced_mask_decoder.")
+    )
 
 
 def _partition_optimizer_params(model: torch.nn.Module) -> dict[str, dict[str, list[Any]]]:
