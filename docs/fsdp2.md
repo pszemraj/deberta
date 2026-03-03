@@ -62,10 +62,10 @@ train:
 
 `train.tf32=true` by default.
 
-The training loop prefers backend fp32-precision controls (`torch.backends.*.fp32_precision`) when available,
-falling back to legacy `allow_tf32` flags on older builds.
+The training loop configures TF32 using legacy backend flags:
 
-For `torch.compile` max-autotune modes, TF32 flags may be forced for compatibility.
+- `torch.backends.cuda.matmul.allow_tf32`
+- `torch.backends.cudnn.allow_tf32`
 
 ## Resume Data Alignment
 
@@ -232,5 +232,8 @@ Run directories also persist:
 - `config_original.yaml` (source config snapshot when provided; otherwise current resolved config baseline)
 - `config_resolved.yaml` (fully resolved model/data/train payload used at runtime)
 
-When `train.report_to=wandb`, `config_original.yaml` is uploaded once at startup using
-the filename pattern `config_deberta_<run_name>`.
+When `train.report_to=wandb`, config snapshots are uploaded once at startup:
+
+- `config_original_deberta_<run_name>.yaml`
+- `config_resolved_deberta_<run_name>.yaml` (when present)
+- `config_source_deberta_<run_name>.<ext>` (when a source config path is available)

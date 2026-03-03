@@ -30,11 +30,6 @@ Model/data config mismatches fail fast; train config drift is allowed by design.
 - Native HF DeBERTa-v2 attention now supports `pos_att_type=p2p` with matching scale-factor behavior.
 - Relative-position values are clamped to `[-max_position+1, max_position-1]` before log bucketing.
 
-## Objective Notes
-
-- RTD parity configs intentionally use `train.mlm_max_ngram=1` (token-level masking).
-- Whole-word/n-gram RTD corruption (`mlm_max_ngram > 1`) is tracked as follow-up objective work.
-
 ## Follow-up Work
 
 Use [roadmap](../roadmap.md) for pending engineering tasks and migration items.

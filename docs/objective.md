@@ -33,6 +33,8 @@ Treat that as an objective variant, not parity mode.
 - Generator loss: cross entropy on masked positions only.
 - Discriminator loss: BCE-with-logits on all active non-padding tokens.
 - Total loss: `gen_loss_weight * gen_loss + disc_loss_weight * disc_loss`.
+- Loss weights affect optimization in both coupled and decoupled training paths.
+- In decoupled mode, a branch weight of `0.0` disables that branch's backward/optimizer step for the window.
 
 Exposed controls:
 
