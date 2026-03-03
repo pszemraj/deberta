@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from deberta.config import ModelConfig, validate_model_config
-from deberta.modeling.deberta_v2_native import DebertaV2Model
+from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 _SPECIAL_ID_ATTRS = (
@@ -190,6 +190,43 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     """
     bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     from_scratch = bool(model_cfg.from_scratch)
+
+    if bt == "hf_deberta_v2":
+        discriminator = _ResolvedComponentSources(
+            component="discriminator",
+            config_source=None,
+            config_origin="repo_hf_defaults",
+            weight_source=(None if from_scratch else model_cfg.discriminator_model_name_or_path),
+            weight_origin=("scratch" if from_scratch else "discriminator_model_name_or_path"),
+            derived_from_discriminator=False,
+        )
+        if from_scratch:
+            generator = _ResolvedComponentSources(
+                component="generator",
+                config_source=None,
+                config_origin="derived_from_discriminator_config",
+                weight_source=None,
+                weight_origin="scratch",
+                derived_from_discriminator=not bool(model_cfg.generator_model_name_or_path),
+            )
+        else:
+            gen_weight_src = (
+                model_cfg.generator_model_name_or_path or model_cfg.discriminator_model_name_or_path
+            )
+            gen_weight_origin = (
+                "generator_model_name_or_path"
+                if model_cfg.generator_model_name_or_path
+                else "derived_from_discriminator_model_name_or_path"
+            )
+            generator = _ResolvedComponentSources(
+                component="generator",
+                config_source=None,
+                config_origin="derived_from_discriminator_config",
+                weight_source=gen_weight_src,
+                weight_origin=gen_weight_origin,
+                derived_from_discriminator=not bool(model_cfg.generator_model_name_or_path),
+            )
+        return _ResolvedBackboneSources(discriminator=discriminator, generator=generator)
 
     disc_cfg_source = model_cfg.discriminator_model_name_or_path
     if bt == "rope" and from_scratch:
@@ -564,6 +601,34 @@ def _apply_hf_config_normalization(
     cfg.use_rmsnorm_heads = False
 
 
+def _build_repo_hf_deberta_v2_base_config() -> DebertaV2Config:
+    """Build the repo-owned default HF-compatible DeBERTa-v3 base architecture config.
+
+    :return DebertaV2Config: Fresh config object populated from repo defaults.
+    """
+    return DebertaV2Config(
+        vocab_size=128_100,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        initializer_range=0.02,
+        layer_norm_eps=1e-7,
+        max_position_embeddings=512,
+        max_relative_positions=-1,
+        position_buckets=256,
+        relative_attention=True,
+        position_biased_input=False,
+        share_att_key=True,
+        norm_rel_ebd="layer_norm",
+        pos_att_type=["p2c", "c2p"],
+        type_vocab_size=0,
+    )
+
+
 def _apply_rope_config_normalization(
     cfg: Any,
     *,
@@ -632,7 +697,7 @@ def build_backbone_configs(
 ) -> tuple[Any, Any]:
     """Build discriminator + generator configs.
 
-    - For backbone_type='hf_deberta_v2': returns HF configs (AutoConfig instances).
+    - For backbone_type='hf_deberta_v2': returns DebertaV2Config instances from repo defaults.
     - For backbone_type='rope': returns DebertaRoPEConfig instances.
 
     Generator config is loaded if specified, otherwise derived from discriminator config.
@@ -647,16 +712,12 @@ def build_backbone_configs(
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
-        from transformers import AutoConfig
-
-        if resolved.discriminator.config_source is None:
-            raise RuntimeError("Resolved discriminator config source is missing for hf_deberta_v2 backbone.")
-        disc_cfg = AutoConfig.from_pretrained(resolved.discriminator.config_source)
-
-        if resolved.generator.config_source is None:
-            gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
+        disc_cfg = _build_repo_hf_deberta_v2_base_config()
+        if model_cfg.generator_model_name_or_path:
+            # Explicit generator model sources affect weight loading, not config synthesis.
+            gen_cfg = copy.deepcopy(disc_cfg)
         else:
-            gen_cfg = AutoConfig.from_pretrained(resolved.generator.config_source)
+            gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
 
         _apply_hf_config_normalization(
             disc_cfg,

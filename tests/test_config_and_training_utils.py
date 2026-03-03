@@ -5326,21 +5326,8 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
         validate_model_config(cfg)
 
 
-def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    class _FakeHFConfig:
-        def __init__(self) -> None:
-            self.vocab_size = 64
-            self.hidden_size = 32
-            self.num_hidden_layers = 2
-            self.num_attention_heads = 4
-            self.intermediate_size = 64
-            self.hidden_act = "gelu"
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=lambda _src: _FakeHFConfig())
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs():
+    pytest.importorskip("transformers")
 
     class _Tokenizer:
         pad_token_id = 0

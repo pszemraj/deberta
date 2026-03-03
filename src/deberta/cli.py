@@ -50,8 +50,6 @@ _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "profile": "deberta_v3_parity",
             "backbone_type": "hf_deberta_v2",
             "tokenizer_name_or_path": "microsoft/deberta-v3-base",
-            "discriminator_model_name_or_path": "microsoft/deberta-v3-base",
-            "generator_model_name_or_path": None,
             "from_scratch": True,
             "embedding_sharing": "gdes",
             "hf_attention_kernel": "dynamic",

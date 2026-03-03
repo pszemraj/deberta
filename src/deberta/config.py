@@ -109,9 +109,9 @@ _MIXED_PRECISION_ALIASES = {
     "n": "no",
 }
 _HF_DEBERTA_PRETRAINED_PREFIXES = (
-    "microsoft/deberta-v2",
-    "microsoft/deberta-v3",
-    "microsoft/mdeberta-v3",
+    "deberta-v2",
+    "deberta-v3",
+    "mdeberta-v3",
 )
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
@@ -206,11 +206,11 @@ class ModelConfig:
 
     # These are used as CONFIG SOURCES (and optionally weight sources if from_scratch=False).
     discriminator_model_name_or_path: str = field(
-        default="microsoft/deberta-v3-base",
+        default="",
         metadata={
             "help": (
-                "HF model name or path for the discriminator. Used to fetch config "
-                "(and weights if from_scratch=false)."
+                "Model name or path for discriminator weights when model.from_scratch=false. "
+                "HF backbone configs are synthesized from repo defaults."
             )
         },
     )
@@ -1113,8 +1113,8 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     :param str value: Model source string.
     :return bool: True when source matches known HF DeBERTa hub-id prefixes.
     """
-    v = str(value).strip().lower()
-    return any(v.startswith(prefix) for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
+    v = f"/{str(value).strip().lower()}"
+    return any(f"/{prefix}" in v for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
 
 
 # Canonical field-name sets for cross-backbone / scratch-vs-pretrained validation.
@@ -1175,6 +1175,18 @@ def validate_model_config(cfg: ModelConfig) -> None:
     cfg.embedding_sharing = _ensure_choice(
         "model.embedding_sharing", cfg.embedding_sharing, _EMBED_SHARING_CHOICES
     )
+    cfg.tokenizer_name_or_path = str(cfg.tokenizer_name_or_path).strip()
+    cfg.discriminator_model_name_or_path = str(cfg.discriminator_model_name_or_path or "").strip()
+    if cfg.generator_model_name_or_path is not None:
+        cfg.generator_model_name_or_path = str(cfg.generator_model_name_or_path).strip() or None
+
+    if not cfg.tokenizer_name_or_path:
+        raise ValueError("model.tokenizer_name_or_path must be a non-empty tokenizer source.")
+    if not bool(cfg.from_scratch) and not cfg.discriminator_model_name_or_path:
+        raise ValueError(
+            "model.discriminator_model_name_or_path must be set when model.from_scratch=false "
+            "(weights are loaded from this source)."
+        )
 
     if cfg.max_position_embeddings is not None and int(cfg.max_position_embeddings) <= 0:
         raise ValueError("model.max_position_embeddings must be > 0 when provided.")

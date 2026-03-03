@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import types
 from typing import Any
 
@@ -377,9 +376,9 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
         ("rope", True, "gen_model", None, None, "gen_model", None, False),
         ("rope", False, None, "disc", "disc", None, "disc", True),
         ("rope", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
-        ("hf_deberta_v2", True, None, "disc", None, None, None, True),
-        ("hf_deberta_v2", False, None, "disc", "disc", None, "disc", True),
-        ("hf_deberta_v2", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
+        ("hf_deberta_v2", True, None, None, None, None, None, True),
+        ("hf_deberta_v2", False, None, None, "disc", None, "disc", True),
+        ("hf_deberta_v2", False, "gen_model", None, "disc", None, "gen_model", False),
     ],
 )
 def test_resolve_backbone_sources_matrix(
@@ -567,31 +566,20 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
         assert cfg.use_bias is True
 
 
-def _build_hf_fake_transformers_module(
-    *, config_overrides: dict[str, object] | None = None
-) -> types.ModuleType:
-    """Build a fake ``transformers`` module for deterministic AutoConfig tests."""
-    config_payload: dict[str, object] = {
-        "vocab_size": 50265,
-        "hidden_dropout_prob": 0.1,
-        "attention_probs_dropout_prob": 0.2,
-        "num_hidden_layers": 6,
-        "hidden_size": 768,
-        "intermediate_size": 3072,
-        "num_attention_heads": 12,
-    }
-    if config_overrides is not None:
-        config_payload.update(config_overrides)
+def _patch_repo_hf_base_config(
+    monkeypatch: pytest.MonkeyPatch, *, config_overrides: dict[str, object] | None = None
+) -> None:
+    """Patch repo HF base config builder for deterministic tests."""
+    overrides = dict(config_overrides or {})
+    original = builder_mod._build_repo_hf_deberta_v2_base_config
 
-    class _FakeAutoConfig:
-        @classmethod
-        def from_pretrained(cls, src: str) -> types.SimpleNamespace:
-            del src
-            return types.SimpleNamespace(**config_payload)
+    def _factory() -> Any:
+        cfg = original()
+        for key, value in overrides.items():
+            setattr(cfg, str(key), value)
+        return cfg
 
-    module = types.ModuleType("transformers")
-    module.AutoConfig = _FakeAutoConfig
-    return module
+    monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_base_config", _factory)
 
 
 _USE_MODEL_DEFAULT = object()
@@ -608,8 +596,8 @@ _USE_MODEL_DEFAULT = object()
     [
         (False, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.0, 0.0),
         (True, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.0, 0.0),
-        (False, None, None, 0.1, 0.2),
-        (True, None, None, 0.1, 0.2),
+        (False, None, None, 0.1, 0.1),
+        (True, None, None, 0.1, 0.1),
         (False, 0.5, 0.25, 0.5, 0.25),
         (True, 0.0, 0.0, 0.0, 0.0),
     ],
@@ -624,9 +612,6 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
 ):
     pytest.importorskip("transformers")
 
-    fake_transformers = _build_hf_fake_transformers_module()
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
     model_kwargs: dict[str, object] = dict(
         backbone_type="hf_deberta_v2",
         from_scratch=from_scratch,
@@ -638,9 +623,10 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
         model_kwargs["attention_probs_dropout_prob"] = attention_probs_dropout_prob
 
     model_cfg = ModelConfig(**model_kwargs)
+    tokenizer_vocab = 128100 if not from_scratch else 50265
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=DummyTokenizer(vocab_size=50265),
+        tokenizer=DummyTokenizer(vocab_size=tokenizer_vocab),
         max_position_embeddings=128,
     )
 
@@ -693,11 +679,7 @@ def test_build_backbone_configs_pretrained_hf_can_auto_grow_tokenizer_to_config_
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        _build_hf_fake_transformers_module(config_overrides={"vocab_size": 512}),
-    )
+    _patch_repo_hf_base_config(monkeypatch, config_overrides={"vocab_size": 512})
 
     tokenizer = DummyTokenizer(vocab_size=500)
     model_cfg = ModelConfig(
@@ -721,11 +703,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        _build_hf_fake_transformers_module(config_overrides={"vocab_size": 500}),
-    )
+    _patch_repo_hf_base_config(monkeypatch, config_overrides={"vocab_size": 500})
 
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -744,11 +722,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
 
 def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        _build_hf_fake_transformers_module(config_overrides={"vocab_size": 777}),
-    )
+    _patch_repo_hf_base_config(monkeypatch, config_overrides={"vocab_size": 777})
 
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -765,11 +739,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch
 
 def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        _build_hf_fake_transformers_module(config_overrides={"cls_token_id": 404}),
-    )
+    _patch_repo_hf_base_config(monkeypatch, config_overrides={"cls_token_id": 404})
 
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -779,7 +749,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkey
     with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=cfg,
-            tokenizer=DummyTokenizer(vocab_size=50265),
+            tokenizer=DummyTokenizer(vocab_size=128100),
             max_position_embeddings=128,
         )
 
