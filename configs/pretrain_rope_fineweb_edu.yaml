@@ -45,10 +45,11 @@ train:
   gradient_accumulation_steps: 16
 
   # Optim
-  learning_rate: 5.0e-4
+  learning_rate: 5e-4
   # generator_learning_rate: 2.5e-4   # optional
   weight_decay: 0.01
   warmup_steps: 1000
+  adam_beta2: 0.999
 
   # Objective
   mlm_probability: 0.15
