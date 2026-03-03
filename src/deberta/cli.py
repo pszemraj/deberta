@@ -342,7 +342,7 @@ def _apply_overrides(target: Any, source: argparse.Namespace, provided_flags: se
     applied: set[str] = set()
     for f in fields(type(target)):
         if f.name in provided_flags:
-            setattr(target, f.name, getattr(source, f.name))
+            object.__setattr__(target, f.name, getattr(source, f.name))
             applied.add(str(f.name))
     return applied
 
@@ -381,9 +381,12 @@ def _apply_dotted_overrides(
         cfg_bundle = apply_dotted_override(cfg_bundle, text)
         applied.append((section, key, text))
 
-    model_cfg.__dict__.update(cfg_bundle.model.__dict__)
-    data_cfg.__dict__.update(cfg_bundle.data.__dict__)
-    train_cfg.__dict__.update(cfg_bundle.train.__dict__)
+    for f in fields(ModelConfig):
+        object.__setattr__(model_cfg, f.name, getattr(cfg_bundle.model, f.name))
+    for f in fields(DataConfig):
+        object.__setattr__(data_cfg, f.name, getattr(cfg_bundle.data, f.name))
+    for f in fields(TrainConfig):
+        object.__setattr__(train_cfg, f.name, getattr(cfg_bundle.train, f.name))
     return applied
 
 
@@ -397,7 +400,7 @@ def _apply_mapping_overrides(target: Any, overrides: dict[str, Any]) -> None:
     for key, value in overrides.items():
         if not hasattr(target, key):
             raise ValueError(f"Preset override key {key!r} is not a valid field for {type(target).__name__}.")
-        setattr(target, key, value)
+        object.__setattr__(target, key, value)
 
 
 def _apply_train_preset(
@@ -453,7 +456,7 @@ def _mark_explicit_fields(cfg_obj: Any, explicit_fields: set[str]) -> None:
     :param Any cfg_obj: Config dataclass object.
     :param set[str] explicit_fields: Field names explicitly provided by file/preset/CLI.
     """
-    cfg_obj._explicit_fields = set(str(x) for x in explicit_fields)
+    object.__setattr__(cfg_obj, "_explicit_fields", set(str(x) for x in explicit_fields))
 
 
 def _collect_user_config_mutations(
@@ -628,9 +631,14 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
         elif section == "train":
             explicit_train_fields.add(str(key))
             train_change_reasons[str(key)] = reason
+        elif section in {"optim", "checkpoint", "logging", "debug"}:
+            # Section-level overrides are projected onto runtime train fields by config.apply_dotted_override.
+            pass
         else:
             raise ValueError(
-                f"Invalid override section {section!r} from --override {expr!r}; expected model|data|train."
+                "Invalid override section "
+                f"{section!r} from --override {expr!r}; expected one of "
+                "model|data|train|optim|checkpoint|logging|debug."
             )
 
     _mark_explicit_fields(model_cfg, explicit_model_fields)

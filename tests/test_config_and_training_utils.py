@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -27,6 +28,7 @@ from deberta.checkpoint_utils import (
 from deberta.cli import _load_json, _load_yaml
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
+    Config,
     DataConfig,
     ModelConfig,
     TrainConfig,
@@ -36,7 +38,9 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     _normalize_torch_compile_scope,
     _normalize_wandb_watch,
+    apply_dotted_override,
     apply_profile_defaults,
+    load_config,
     load_data_config_snapshot,
     load_model_config_snapshot,
     normalize_mixed_precision,
@@ -249,6 +253,72 @@ def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="Circular variable reference"):
         _load_yaml(cfg)
+
+
+def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    assert isinstance(cfg, Config)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.train = TrainConfig(max_steps=2)  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.optim.warmup_steps = 5  # type: ignore[misc]
+
+
+def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+                "optim:",
+                "  warmup_steps: 222",
+                "checkpoint:",
+                "  save_steps: 777",
+                "logging:",
+                "  report_to: wandb",
+                "  wandb:",
+                "    watch: all",
+                "debug:",
+                "  debug_metrics: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    assert int(cfg.train.warmup_steps) == 222
+    assert int(cfg.train.save_steps) == 777
+    assert str(cfg.train.report_to) == "wandb"
+    assert str(cfg.train.wandb_watch) == "all"
+    assert bool(cfg.train.debug_metrics) is True
+
+
+def test_apply_dotted_override_supports_nested_section_paths() -> None:
+    cfg = Config(
+        data=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train=TrainConfig(max_steps=1),
+    )
+    cfg2 = apply_dotted_override(cfg, "logging.wandb.watch=all")
+    cfg2 = apply_dotted_override(cfg2, "optim.warmup_steps=123")
+    assert cfg2.logging.wandb.watch == "all"
+    assert int(cfg2.optim.warmup_steps) == 123
+    assert int(cfg2.train.warmup_steps) == 123
 
 
 def test_load_json_unknown_key_raises(tmp_path: Path):
@@ -4901,6 +4971,48 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
     assert "train.max_steps: 5 -> 11 (CLI override (--override train.max_steps=11))" in err
 
 
+def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--override",
+            "optim.warmup_steps=333",
+            "--override",
+            "logging.wandb.watch=all",
+        ]
+    )
+
+    assert int(seen["train_cfg"].warmup_steps) == 333
+    assert seen["train_cfg"].wandb_watch == "all"
+
+
 def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("yaml")
     cfg_path = tmp_path / "train.yaml"
@@ -5255,15 +5367,23 @@ def test_apply_profile_defaults_honors_explicit_fields_even_when_matching_raw_de
         warmup_steps=1_000,
         token_weighted_gradient_accumulation=True,
     )
-    model_cfg._explicit_fields = {"backbone_type", "embedding_sharing", "hf_attention_kernel"}
-    train_cfg._explicit_fields = {
-        "mask_token_prob",
-        "random_token_prob",
-        "disc_loss_weight",
-        "adam_epsilon",
-        "warmup_steps",
-        "token_weighted_gradient_accumulation",
-    }
+    object.__setattr__(
+        model_cfg,
+        "_explicit_fields",
+        {"backbone_type", "embedding_sharing", "hf_attention_kernel"},
+    )
+    object.__setattr__(
+        train_cfg,
+        "_explicit_fields",
+        {
+            "mask_token_prob",
+            "random_token_prob",
+            "disc_loss_weight",
+            "adam_epsilon",
+            "warmup_steps",
+            "token_weighted_gradient_accumulation",
+        },
+    )
 
     apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
 
@@ -5284,8 +5404,7 @@ def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
 
 
 def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
-    cfg = TrainConfig()
-    cfg.decoupled_training = None  # type: ignore[assignment]
+    cfg = TrainConfig(decoupled_training=None)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="train.decoupled_training must be a boolean"):
         validate_train_config(cfg)
 

@@ -129,7 +129,7 @@ _VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")
 _VAR_SUSPICIOUS_RE = re.compile(r"\$variables\.[A-Za-z0-9_.-]+")
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
     """Model-related arguments.
 
@@ -553,7 +553,7 @@ class ModelConfig:
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class DataConfig:
     """Data-related arguments."""
 
@@ -634,7 +634,7 @@ class DataConfig:
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class TrainConfig:
     """Training-related arguments."""
 
@@ -890,13 +890,73 @@ class TrainConfig:
     )
 
 
-@dataclass
+@dataclass(frozen=True)
+class OptimConfig:
+    """Optimization section for strict top-level config layout."""
+
+    learning_rate: float = field(default=5e-4)
+    generator_learning_rate: float = field(default=-1.0)
+    discriminator_learning_rate: float = field(default=-1.0)
+    weight_decay: float = field(default=0.01)
+    adam_beta1: float = field(default=0.9)
+    adam_beta2: float = field(default=0.999)
+    adam_epsilon: float = field(default=1e-8)
+    warmup_steps: int = field(default=1_000)
+    lr_scheduler_type: str = field(default="linear")
+    max_grad_norm: float = field(default=1.0)
+
+
+@dataclass(frozen=True)
+class CheckpointConfig:
+    """Checkpoint/resume section for strict top-level config layout."""
+
+    output_dir: str | None = field(default=None)
+    overwrite_output_dir: bool = field(default=False)
+    save_steps: int = field(default=1_000)
+    save_total_limit: int = field(default=3)
+    resume_from_checkpoint: str | None = field(default=None)
+    resume_data_strategy: str = field(default="auto")
+    resume_replay_max_micro_batches: int = field(default=10_000)
+    export_hf_final: bool = field(default=True)
+
+
+@dataclass(frozen=True)
+class WandbConfig:
+    """W&B subsection for strict top-level logging config."""
+
+    watch: str = field(default="gradients")
+    watch_log_freq: int = field(default=100)
+
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    """Logging/tracking section for strict top-level config layout."""
+
+    project_name: str = field(default="deberta-train")
+    run_name: str | None = field(default=None)
+    logging_steps: int = field(default=50)
+    report_to: str = field(default="none")
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+@dataclass(frozen=True)
+class DebugConfig:
+    """Debug/diagnostics section for strict top-level config layout."""
+
+    debug_metrics: bool = field(default=False)
+
+
+@dataclass(frozen=True)
 class Config:
     """Top-level training config bundle."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 
 
 def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -961,6 +1021,45 @@ def _split_nested_or_flat_sections(
         return model_dict, data_dict, train_dict
 
     return _split_flat_dict(raw)
+
+
+def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, dict[str, Any]]:
+    """Split config mappings into strict top-level sections.
+
+    Supports both:
+      - legacy top-level model/data/train only
+      - extended top-level model/data/train/optim/checkpoint/logging/debug
+      - legacy flat key mode (mapped into model/data/train)
+
+    :param dict[str, Any] raw: Parsed config mapping.
+    :param str format_name: Format label for error messages.
+    :raises ValueError: If config shape is invalid.
+    :return dict[str, dict[str, Any]]: Section dictionaries.
+    """
+    known = {"model", "data", "train", "optim", "checkpoint", "logging", "debug"}
+    if any(key in raw for key in known):
+        unknown_top = sorted(key for key in raw.keys() if key not in known)
+        if unknown_top:
+            raise ValueError(
+                f"Unknown top-level keys in nested {format_name} config "
+                f"(expected only {', '.join(sorted(known))}): {', '.join(unknown_top)}"
+            )
+        sections = {key: (raw.get(key, {}) or {}) for key in known}
+        for key, section in sections.items():
+            if not isinstance(section, dict):
+                raise ValueError(f"{format_name} config section {key!r} must be a dict.")
+        return sections
+
+    model_dict, data_dict, train_dict = _split_flat_dict(raw)
+    return {
+        "model": model_dict,
+        "data": data_dict,
+        "train": train_dict,
+        "optim": {},
+        "checkpoint": {},
+        "logging": {},
+        "debug": {},
+    }
 
 
 def _resolve_variables(data: dict[str, Any]) -> dict[str, Any]:
@@ -1064,12 +1163,12 @@ def _resolve_variables(data: dict[str, Any]) -> dict[str, Any]:
     return {k: _resolve_value(v) for k, v in data.items() if k != "variables"}
 
 
-def load_config_sections(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Load strict model/data/train mappings from a YAML or JSON file.
+def _load_raw_config_mapping(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Load raw config mapping from YAML/JSON and return format label.
 
     :param str | Path path: Config path.
-    :raises ValueError: If file content is invalid for this config schema.
-    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed section mappings.
+    :raises ValueError: If path extension/content is invalid.
+    :return tuple[dict[str, Any], str]: Parsed mapping and format name.
     """
     cfg_path = Path(path).expanduser().resolve()
     suffix = cfg_path.suffix.lower()
@@ -1089,10 +1188,276 @@ def load_config_sections(path: str | Path) -> tuple[dict[str, Any], dict[str, An
 
     if not isinstance(raw, dict):
         raise ValueError("Config file must parse to a dict.")
-    resolved_raw = _resolve_variables(raw)
-    return _split_nested_or_flat_sections(
-        resolved_raw, format_name="YAML" if suffix in {".yaml", ".yml"} else "JSON"
+    format_name = "YAML" if suffix in {".yaml", ".yml"} else "JSON"
+    return raw, format_name
+
+
+def _replace_from_mapping(cfg_obj: Any, mapping: dict[str, Any], *, section_name: str) -> Any:
+    """Apply mapping values onto a frozen dataclass via ``dataclasses.replace``.
+
+    :param Any cfg_obj: Dataclass instance.
+    :param dict[str, Any] mapping: Field/value mapping.
+    :param str section_name: Section label for error messages.
+    :raises ValueError: If unknown keys are provided.
+    :return Any: Replaced dataclass object.
+    """
+    if not mapping:
+        return cfg_obj
+    allowed = {f.name for f in fields(type(cfg_obj))}
+    unknown = sorted(set(mapping.keys()) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown keys in section {section_name!r}: {', '.join(unknown)}")
+    return replace(cfg_obj, **mapping)
+
+
+def _project_train_from_sections(cfg: Config) -> TrainConfig:
+    """Project top-level optim/checkpoint/logging/debug sections into runtime ``TrainConfig``.
+
+    :param Config cfg: Top-level config bundle.
+    :return TrainConfig: Runtime train config with section values applied.
+    """
+    updates: dict[str, Any] = {
+        "learning_rate": cfg.optim.learning_rate,
+        "generator_learning_rate": cfg.optim.generator_learning_rate,
+        "discriminator_learning_rate": cfg.optim.discriminator_learning_rate,
+        "weight_decay": cfg.optim.weight_decay,
+        "adam_beta1": cfg.optim.adam_beta1,
+        "adam_beta2": cfg.optim.adam_beta2,
+        "adam_epsilon": cfg.optim.adam_epsilon,
+        "warmup_steps": cfg.optim.warmup_steps,
+        "lr_scheduler_type": cfg.optim.lr_scheduler_type,
+        "max_grad_norm": cfg.optim.max_grad_norm,
+        "output_dir": cfg.checkpoint.output_dir,
+        "overwrite_output_dir": cfg.checkpoint.overwrite_output_dir,
+        "save_steps": cfg.checkpoint.save_steps,
+        "save_total_limit": cfg.checkpoint.save_total_limit,
+        "resume_from_checkpoint": cfg.checkpoint.resume_from_checkpoint,
+        "resume_data_strategy": cfg.checkpoint.resume_data_strategy,
+        "resume_replay_max_micro_batches": cfg.checkpoint.resume_replay_max_micro_batches,
+        "export_hf_final": cfg.checkpoint.export_hf_final,
+        "project_name": cfg.logging.project_name,
+        "run_name": cfg.logging.run_name,
+        "logging_steps": cfg.logging.logging_steps,
+        "report_to": cfg.logging.report_to,
+        "wandb_watch": cfg.logging.wandb.watch,
+        "wandb_watch_log_freq": cfg.logging.wandb.watch_log_freq,
+        "debug_metrics": cfg.debug.debug_metrics,
+    }
+    return replace(cfg.train, **updates)
+
+
+def _project_sections_from_train(cfg: Config) -> Config:
+    """Project runtime ``train`` values back into top-level section mirrors.
+
+    :param Config cfg: Top-level config bundle.
+    :return Config: Updated config with section mirrors refreshed from ``train``.
+    """
+    optim_cfg = replace(
+        cfg.optim,
+        learning_rate=cfg.train.learning_rate,
+        generator_learning_rate=cfg.train.generator_learning_rate,
+        discriminator_learning_rate=cfg.train.discriminator_learning_rate,
+        weight_decay=cfg.train.weight_decay,
+        adam_beta1=cfg.train.adam_beta1,
+        adam_beta2=cfg.train.adam_beta2,
+        adam_epsilon=cfg.train.adam_epsilon,
+        warmup_steps=cfg.train.warmup_steps,
+        lr_scheduler_type=cfg.train.lr_scheduler_type,
+        max_grad_norm=cfg.train.max_grad_norm,
     )
+    checkpoint_cfg = replace(
+        cfg.checkpoint,
+        output_dir=cfg.train.output_dir,
+        overwrite_output_dir=cfg.train.overwrite_output_dir,
+        save_steps=cfg.train.save_steps,
+        save_total_limit=cfg.train.save_total_limit,
+        resume_from_checkpoint=cfg.train.resume_from_checkpoint,
+        resume_data_strategy=cfg.train.resume_data_strategy,
+        resume_replay_max_micro_batches=cfg.train.resume_replay_max_micro_batches,
+        export_hf_final=cfg.train.export_hf_final,
+    )
+    logging_cfg = replace(
+        cfg.logging,
+        project_name=cfg.train.project_name,
+        run_name=cfg.train.run_name,
+        logging_steps=cfg.train.logging_steps,
+        report_to=cfg.train.report_to,
+        wandb=replace(
+            cfg.logging.wandb,
+            watch=cfg.train.wandb_watch,
+            watch_log_freq=cfg.train.wandb_watch_log_freq,
+        ),
+    )
+    debug_cfg = replace(cfg.debug, debug_metrics=cfg.train.debug_metrics)
+    return replace(cfg, optim=optim_cfg, checkpoint=checkpoint_cfg, logging=logging_cfg, debug=debug_cfg)
+
+
+def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]]) -> Config:
+    """Construct top-level ``Config`` from parsed section mappings.
+
+    :param dict[str, dict[str, Any]] section_maps: Parsed section mappings.
+    :return Config: Top-level config object.
+    """
+    model_cfg = _replace_from_mapping(ModelConfig(), section_maps.get("model", {}), section_name="model")
+    data_cfg = _replace_from_mapping(DataConfig(), section_maps.get("data", {}), section_name="data")
+    train_cfg = _replace_from_mapping(TrainConfig(), section_maps.get("train", {}), section_name="train")
+
+    optim_cfg = _replace_from_mapping(
+        OptimConfig(
+            learning_rate=train_cfg.learning_rate,
+            generator_learning_rate=train_cfg.generator_learning_rate,
+            discriminator_learning_rate=train_cfg.discriminator_learning_rate,
+            weight_decay=train_cfg.weight_decay,
+            adam_beta1=train_cfg.adam_beta1,
+            adam_beta2=train_cfg.adam_beta2,
+            adam_epsilon=train_cfg.adam_epsilon,
+            warmup_steps=train_cfg.warmup_steps,
+            lr_scheduler_type=train_cfg.lr_scheduler_type,
+            max_grad_norm=train_cfg.max_grad_norm,
+        ),
+        section_maps.get("optim", {}),
+        section_name="optim",
+    )
+    checkpoint_cfg = _replace_from_mapping(
+        CheckpointConfig(
+            output_dir=train_cfg.output_dir,
+            overwrite_output_dir=train_cfg.overwrite_output_dir,
+            save_steps=train_cfg.save_steps,
+            save_total_limit=train_cfg.save_total_limit,
+            resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+            resume_data_strategy=train_cfg.resume_data_strategy,
+            resume_replay_max_micro_batches=train_cfg.resume_replay_max_micro_batches,
+            export_hf_final=train_cfg.export_hf_final,
+        ),
+        section_maps.get("checkpoint", {}),
+        section_name="checkpoint",
+    )
+
+    logging_raw = dict(section_maps.get("logging", {}) or {})
+    wandb_raw = dict(logging_raw.pop("wandb", {}) or {})
+    logging_cfg = _replace_from_mapping(
+        LoggingConfig(
+            project_name=train_cfg.project_name,
+            run_name=train_cfg.run_name,
+            logging_steps=train_cfg.logging_steps,
+            report_to=train_cfg.report_to,
+            wandb=WandbConfig(
+                watch=train_cfg.wandb_watch,
+                watch_log_freq=train_cfg.wandb_watch_log_freq,
+            ),
+        ),
+        logging_raw,
+        section_name="logging",
+    )
+    wandb_cfg = _replace_from_mapping(logging_cfg.wandb, wandb_raw, section_name="logging.wandb")
+    logging_cfg = replace(logging_cfg, wandb=wandb_cfg)
+
+    debug_cfg = _replace_from_mapping(
+        DebugConfig(debug_metrics=train_cfg.debug_metrics),
+        section_maps.get("debug", {}),
+        section_name="debug",
+    )
+
+    cfg = Config(
+        model=model_cfg,
+        data=data_cfg,
+        train=train_cfg,
+        optim=optim_cfg,
+        checkpoint=checkpoint_cfg,
+        logging=logging_cfg,
+        debug=debug_cfg,
+    )
+    return replace(cfg, train=_project_train_from_sections(cfg))
+
+
+def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
+    """Load, resolve, override, and validate config into a top-level ``Config`` object.
+
+    :param str | Path path: YAML/JSON config path.
+    :param list[str] | None overrides: Optional dotted overrides.
+    :return Config: Validated immutable config object.
+    """
+    raw, format_name = _load_raw_config_mapping(path)
+    resolved_raw = _resolve_variables(raw)
+    section_maps = _split_full_sections(resolved_raw, format_name=format_name)
+    cfg = _build_config_from_section_mappings(section_maps)
+    if overrides:
+        for expr in overrides:
+            cfg = apply_dotted_override(cfg, expr)
+        cfg = replace(cfg, train=_project_train_from_sections(cfg))
+    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train)
+    validate_model_config(cfg.model)
+    validate_data_config(cfg.data)
+    validate_train_config(cfg.train)
+    validate_training_workflow_options(data_cfg=cfg.data, train_cfg=cfg.train, model_cfg=cfg.model)
+    return _project_sections_from_train(cfg)
+
+
+def load_config_sections(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load strict model/data/train mappings from a YAML or JSON file.
+
+    :param str | Path path: Config path.
+    :raises ValueError: If file content is invalid for this config schema.
+    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed section mappings.
+    """
+    raw, format_name = _load_raw_config_mapping(path)
+    resolved_raw = _resolve_variables(raw)
+    section_maps = _split_full_sections(resolved_raw, format_name=format_name)
+
+    # Validate section keys/types early while preserving explicit-key semantics.
+    _build_config_from_section_mappings(section_maps)
+
+    model_dict = dict(section_maps.get("model", {}) or {})
+    data_dict = dict(section_maps.get("data", {}) or {})
+    train_dict = dict(section_maps.get("train", {}) or {})
+
+    optim_raw = dict(section_maps.get("optim", {}) or {})
+    checkpoint_raw = dict(section_maps.get("checkpoint", {}) or {})
+    logging_raw = dict(section_maps.get("logging", {}) or {})
+    wandb_raw = dict(logging_raw.get("wandb", {}) or {})
+    debug_raw = dict(section_maps.get("debug", {}) or {})
+
+    for key in (
+        "learning_rate",
+        "generator_learning_rate",
+        "discriminator_learning_rate",
+        "weight_decay",
+        "adam_beta1",
+        "adam_beta2",
+        "adam_epsilon",
+        "warmup_steps",
+        "lr_scheduler_type",
+        "max_grad_norm",
+    ):
+        if key in optim_raw:
+            train_dict[key] = optim_raw[key]
+
+    for key in (
+        "output_dir",
+        "overwrite_output_dir",
+        "save_steps",
+        "save_total_limit",
+        "resume_from_checkpoint",
+        "resume_data_strategy",
+        "resume_replay_max_micro_batches",
+        "export_hf_final",
+    ):
+        if key in checkpoint_raw:
+            train_dict[key] = checkpoint_raw[key]
+
+    for key in ("project_name", "run_name", "logging_steps", "report_to"):
+        if key in logging_raw:
+            train_dict[key] = logging_raw[key]
+
+    if "watch" in wandb_raw:
+        train_dict["wandb_watch"] = wandb_raw["watch"]
+    if "watch_log_freq" in wandb_raw:
+        train_dict["wandb_watch_log_freq"] = wandb_raw["watch_log_freq"]
+
+    if "debug_metrics" in debug_raw:
+        train_dict["debug_metrics"] = debug_raw["debug_metrics"]
+
+    return model_dict, data_dict, train_dict
 
 
 def _unwrap_optional_type(field_type: Any) -> tuple[Any, bool]:
@@ -1142,7 +1507,8 @@ def _coerce_override_value(raw: str, field_type: Any) -> Any:
 def apply_dotted_override(cfg: Config, override: str) -> Config:
     """Apply one dotted override expression to a ``Config`` object.
 
-    Format: ``section.field=value`` where ``section`` is one of model/data/train.
+    Format: ``section.field=value`` where section is a top-level ``Config`` key.
+    Nested dataclass paths are supported (for example ``logging.wandb.watch=all``).
 
     :param Config cfg: Existing config bundle.
     :param str override: Override expression.
@@ -1155,23 +1521,49 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
     path, raw_value = text.split("=", 1)
     path = path.strip()
     raw_value = raw_value.strip()
-    if "." not in path:
+    parts = [str(p).strip() for p in path.split(".") if str(p).strip()]
+    if len(parts) < 2:
         raise ValueError(
             f"Invalid override path {path!r}. Expected format section.field (for example train.max_steps)."
         )
-    section, field_name = path.split(".", 1)
-    section = str(section).strip().lower()
-    field_name = str(field_name).strip()
-    if section not in {"model", "data", "train"}:
-        raise ValueError(f"Unknown override section {section!r}; expected one of model|data|train.")
-    section_obj = getattr(cfg, section)
-    if not hasattr(section_obj, field_name):
-        raise ValueError(f"Unknown override field {section}.{field_name!r}.")
-    type_hints = get_type_hints(type(section_obj))
-    field_type = type_hints.get(field_name, Any)
-    coerced = _coerce_override_value(raw_value, field_type)
-    new_section = replace(section_obj, **{field_name: coerced})
-    return replace(cfg, **{section: new_section})
+
+    root = parts[0]
+    if root not in {f.name for f in fields(Config)}:
+        raise ValueError(
+            "Unknown override section "
+            f"{root!r}; expected one of {', '.join(sorted(f.name for f in fields(Config)))}."
+        )
+
+    def _apply_to_obj(obj: Any, remaining: list[str], value_text: str, full_path: str) -> Any:
+        """Apply a dotted leaf override to a (nested) dataclass object.
+
+        :param Any obj: Dataclass object.
+        :param list[str] remaining: Remaining path parts.
+        :param str value_text: Raw value text.
+        :param str full_path: Full dotted path for errors.
+        :return Any: Replaced dataclass object.
+        """
+        key = remaining[0]
+        if not hasattr(obj, key):
+            raise ValueError(f"Unknown override field {full_path!r}.")
+        if len(remaining) == 1:
+            type_hints = get_type_hints(type(obj))
+            field_type = type_hints.get(key, Any)
+            coerced = _coerce_override_value(value_text, field_type)
+            return replace(obj, **{key: coerced})
+        child = getattr(obj, key)
+        new_child = _apply_to_obj(child, remaining[1:], value_text, full_path)
+        return replace(obj, **{key: new_child})
+
+    root_obj = getattr(cfg, root)
+    new_root = _apply_to_obj(root_obj, parts[1:], raw_value, path)
+    new_cfg = replace(cfg, **{root: new_root})
+    # Keep runtime train projection coherent when section-level overrides are used.
+    if root in {"optim", "checkpoint", "logging", "debug"}:
+        new_cfg = replace(new_cfg, train=_project_train_from_sections(new_cfg))
+    elif root == "train":
+        new_cfg = _project_sections_from_train(new_cfg)
+    return new_cfg
 
 
 def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
@@ -1421,6 +1813,16 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     return any(f"/{prefix}" in v for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
 
 
+def _cfg_set(cfg_obj: Any, field_name: str, value: Any) -> None:
+    """Set a dataclass field via ``object.__setattr__`` (supports frozen dataclasses).
+
+    :param Any cfg_obj: Dataclass instance.
+    :param str field_name: Field name.
+    :param Any value: Field value.
+    """
+    object.__setattr__(cfg_obj, str(field_name), value)
+
+
 # Canonical field-name sets for cross-backbone / scratch-vs-pretrained validation.
 # rope_knobs = _ROPE_SCRATCH_ONLY_FIELDS | _ROPE_PRETRAINED_OVERRIDE_FIELDS | {"attention_implementation"}
 _ROPE_SCRATCH_ONLY_FIELDS: frozenset[str] = frozenset(
@@ -1468,22 +1870,30 @@ def validate_model_config(cfg: ModelConfig) -> None:
 
     :param ModelConfig cfg: Model configuration.
     """
-    cfg.backbone_type = _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
-    cfg.profile = _ensure_choice("model.profile", cfg.profile, _MODEL_PROFILE_CHOICES)
-    cfg.hf_attention_kernel = _normalize_hf_attention_kernel(cfg.hf_attention_kernel)
-    cfg.hf_model_size = _ensure_choice("model.hf_model_size", cfg.hf_model_size, _HF_MODEL_SIZE_CHOICES)
-    cfg.norm_arch = _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES)
-    cfg.attention_implementation = _ensure_choice(
-        "model.attention_implementation", cfg.attention_implementation, _ATTN_IMPL_CHOICES
+    _cfg_set(
+        cfg, "backbone_type", _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
     )
-    cfg.ffn_type = _ensure_choice("model.ffn_type", cfg.ffn_type, _FFN_CHOICES)
-    cfg.embedding_sharing = _ensure_choice(
-        "model.embedding_sharing", cfg.embedding_sharing, _EMBED_SHARING_CHOICES
+    _cfg_set(cfg, "profile", _ensure_choice("model.profile", cfg.profile, _MODEL_PROFILE_CHOICES))
+    _cfg_set(cfg, "hf_attention_kernel", _normalize_hf_attention_kernel(cfg.hf_attention_kernel))
+    _cfg_set(
+        cfg, "hf_model_size", _ensure_choice("model.hf_model_size", cfg.hf_model_size, _HF_MODEL_SIZE_CHOICES)
     )
-    cfg.tokenizer_name_or_path = str(cfg.tokenizer_name_or_path).strip()
-    cfg.pretrained_discriminator_path = str(cfg.pretrained_discriminator_path or "").strip()
+    _cfg_set(cfg, "norm_arch", _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES))
+    _cfg_set(
+        cfg,
+        "attention_implementation",
+        _ensure_choice("model.attention_implementation", cfg.attention_implementation, _ATTN_IMPL_CHOICES),
+    )
+    _cfg_set(cfg, "ffn_type", _ensure_choice("model.ffn_type", cfg.ffn_type, _FFN_CHOICES))
+    _cfg_set(
+        cfg,
+        "embedding_sharing",
+        _ensure_choice("model.embedding_sharing", cfg.embedding_sharing, _EMBED_SHARING_CHOICES),
+    )
+    _cfg_set(cfg, "tokenizer_name_or_path", str(cfg.tokenizer_name_or_path).strip())
+    _cfg_set(cfg, "pretrained_discriminator_path", str(cfg.pretrained_discriminator_path or "").strip())
     if cfg.pretrained_generator_path is not None:
-        cfg.pretrained_generator_path = str(cfg.pretrained_generator_path).strip() or None
+        _cfg_set(cfg, "pretrained_generator_path", str(cfg.pretrained_generator_path).strip() or None)
 
     if not cfg.tokenizer_name_or_path:
         raise ValueError("model.tokenizer_name_or_path must be a non-empty tokenizer source.")
@@ -1586,12 +1996,16 @@ def validate_model_config(cfg: ModelConfig) -> None:
             if pct <= 0.0 or pct > 1.0:
                 raise ValueError("model.pretrained_rotary_pct must be in (0, 1] when provided.")
         if cfg.pretrained_norm_arch is not None:
-            cfg.pretrained_norm_arch = _ensure_choice(
-                "model.pretrained_norm_arch", cfg.pretrained_norm_arch, _NORM_ARCH_CHOICES
+            _cfg_set(
+                cfg,
+                "pretrained_norm_arch",
+                _ensure_choice("model.pretrained_norm_arch", cfg.pretrained_norm_arch, _NORM_ARCH_CHOICES),
             )
         if cfg.pretrained_ffn_type is not None:
-            cfg.pretrained_ffn_type = _ensure_choice(
-                "model.pretrained_ffn_type", cfg.pretrained_ffn_type, _FFN_CHOICES
+            _cfg_set(
+                cfg,
+                "pretrained_ffn_type",
+                _ensure_choice("model.pretrained_ffn_type", cfg.pretrained_ffn_type, _FFN_CHOICES),
             )
 
     if cfg.pretrained_generator_path:
@@ -1727,27 +2141,29 @@ def validate_train_config(cfg: TrainConfig) -> None:
 
     :param TrainConfig cfg: Training configuration.
     """
-    cfg.report_to = _ensure_choice("train.report_to", cfg.report_to, _REPORT_TO_CHOICES)
-    cfg.lr_scheduler_type = _ensure_choice(
-        "train.lr_scheduler_type", cfg.lr_scheduler_type, _LR_SCHEDULER_CHOICES
+    _cfg_set(cfg, "report_to", _ensure_choice("train.report_to", cfg.report_to, _REPORT_TO_CHOICES))
+    _cfg_set(
+        cfg,
+        "lr_scheduler_type",
+        _ensure_choice("train.lr_scheduler_type", cfg.lr_scheduler_type, _LR_SCHEDULER_CHOICES),
     )
-    cfg.sdpa_kernel = _normalize_sdpa_kernel(cfg.sdpa_kernel)
-    cfg.torch_compile_mode = _normalize_torch_compile_mode(cfg.torch_compile_mode)
-    cfg.torch_compile_scope = _normalize_torch_compile_scope(cfg.torch_compile_scope)
-    cfg.torch_compile_backend = _normalize_torch_compile_backend(cfg.torch_compile_backend)
-    cfg.wandb_watch = _normalize_wandb_watch(cfg.wandb_watch)
-    cfg.resume_data_strategy = _ensure_choice(
-        "train.resume_data_strategy",
-        cfg.resume_data_strategy,
-        _RESUME_DATA_STRATEGY_CHOICES,
+    _cfg_set(cfg, "sdpa_kernel", _normalize_sdpa_kernel(cfg.sdpa_kernel))
+    _cfg_set(cfg, "torch_compile_mode", _normalize_torch_compile_mode(cfg.torch_compile_mode))
+    _cfg_set(cfg, "torch_compile_scope", _normalize_torch_compile_scope(cfg.torch_compile_scope))
+    _cfg_set(cfg, "torch_compile_backend", _normalize_torch_compile_backend(cfg.torch_compile_backend))
+    _cfg_set(cfg, "wandb_watch", _normalize_wandb_watch(cfg.wandb_watch))
+    _cfg_set(
+        cfg,
+        "resume_data_strategy",
+        _ensure_choice("train.resume_data_strategy", cfg.resume_data_strategy, _RESUME_DATA_STRATEGY_CHOICES),
     )
 
-    cfg.mixed_precision = normalize_mixed_precision(cfg.mixed_precision)
+    _cfg_set(cfg, "mixed_precision", normalize_mixed_precision(cfg.mixed_precision))
     if cfg.output_dir is not None and not str(cfg.output_dir).strip():
-        cfg.output_dir = None
+        _cfg_set(cfg, "output_dir", None)
     if cfg.resume_from_checkpoint is not None:
         resume_from_checkpoint = str(cfg.resume_from_checkpoint).strip()
-        cfg.resume_from_checkpoint = resume_from_checkpoint if resume_from_checkpoint else None
+        _cfg_set(cfg, "resume_from_checkpoint", resume_from_checkpoint if resume_from_checkpoint else None)
     if not str(cfg.project_name).strip():
         raise ValueError("train.project_name must be non-empty.")
     if bool(cfg.overwrite_output_dir) and bool(cfg.resume_from_checkpoint):
@@ -1858,44 +2274,44 @@ def apply_profile_defaults(*, model_cfg: ModelConfig, train_cfg: TrainConfig) ->
         if "backbone_type" not in explicit_model_fields and str(model_cfg.backbone_type) == str(
             model_defaults.backbone_type
         ):
-            model_cfg.backbone_type = "hf_deberta_v2"
+            _cfg_set(model_cfg, "backbone_type", "hf_deberta_v2")
 
         if "embedding_sharing" not in explicit_model_fields and str(model_cfg.embedding_sharing) == str(
             model_defaults.embedding_sharing
         ):
-            model_cfg.embedding_sharing = "gdes"
+            _cfg_set(model_cfg, "embedding_sharing", "gdes")
 
         if "hf_attention_kernel" not in explicit_model_fields and str(model_cfg.hf_attention_kernel) == str(
             model_defaults.hf_attention_kernel
         ):
-            model_cfg.hf_attention_kernel = "dynamic"
+            _cfg_set(model_cfg, "hf_attention_kernel", "dynamic")
 
     # Parity++ defaults apply to hf_deberta_v2 unless explicitly overridden.
     if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
         if "mask_token_prob" not in explicit_train_fields and float(train_cfg.mask_token_prob) == float(
             train_defaults.mask_token_prob
         ):
-            train_cfg.mask_token_prob = 1.0
+            _cfg_set(train_cfg, "mask_token_prob", 1.0)
         if "random_token_prob" not in explicit_train_fields and float(train_cfg.random_token_prob) == float(
             train_defaults.random_token_prob
         ):
-            train_cfg.random_token_prob = 0.0
+            _cfg_set(train_cfg, "random_token_prob", 0.0)
         if "disc_loss_weight" not in explicit_train_fields and float(train_cfg.disc_loss_weight) == float(
             train_defaults.disc_loss_weight
         ):
-            train_cfg.disc_loss_weight = 10.0
+            _cfg_set(train_cfg, "disc_loss_weight", 10.0)
         if "adam_epsilon" not in explicit_train_fields and float(train_cfg.adam_epsilon) == float(
             train_defaults.adam_epsilon
         ):
-            train_cfg.adam_epsilon = 1e-6
+            _cfg_set(train_cfg, "adam_epsilon", 1e-6)
         if "warmup_steps" not in explicit_train_fields and int(train_cfg.warmup_steps) == int(
             train_defaults.warmup_steps
         ):
-            train_cfg.warmup_steps = 10_000
+            _cfg_set(train_cfg, "warmup_steps", 10_000)
         if "token_weighted_gradient_accumulation" not in explicit_train_fields and bool(
             train_cfg.token_weighted_gradient_accumulation
         ) == bool(train_defaults.token_weighted_gradient_accumulation):
-            train_cfg.token_weighted_gradient_accumulation = True
+            _cfg_set(train_cfg, "token_weighted_gradient_accumulation", True)
 
 
 def validate_training_workflow_options(

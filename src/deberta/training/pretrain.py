@@ -1655,7 +1655,7 @@ def run_pretraining(
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
-    train_cfg.mixed_precision = mixed_precision
+    object.__setattr__(train_cfg, "mixed_precision", mixed_precision)
     accelerator = Accelerator(
         gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
         log_with=log_with,
@@ -1713,7 +1713,7 @@ def run_pretraining(
         config_path=config_path,
         run_name=train_cfg.run_name,
     )
-    train_cfg.output_dir = str(output_dir)
+    object.__setattr__(train_cfg, "output_dir", str(output_dir))
     if accelerator.is_main_process and (
         configured_output_dir is None or not str(configured_output_dir).strip()
     ):
