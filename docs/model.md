@@ -19,28 +19,9 @@ The `hf_deberta_v2` backbone faithfully implements the DeBERTa-v2/v3 architectur
 
 The `rope` backbone is an experimental modern encoder path that uses the DeBERTa-v3 RTD pretraining recipe and GDES embedding sharing but does **not** implement disentangled attention. Position information is encoded geometrically via rotary embeddings in Q/K vectors.
 
-## HF Reference Defaults vs Repo Defaults
+## Defaults and Parity Deltas
 
-The reference DeBERTa-v3-base architecture includes:
-
-```yaml
-hidden_act: gelu
-hidden_size: 768
-intermediate_size: 3072
-num_hidden_layers: 12
-num_attention_heads: 12
-hidden_dropout_prob: 0.1
-attention_probs_dropout_prob: 0.1
-initializer_range: 0.02
-```
-
-Repo default policy:
-
-- `backbone_type=hf_deberta_v2` keeps HF architecture compatibility (same DeBERTa-v2/v3 stack).
-- `model.hf_model_size` selects repo-owned architecture presets: `xsmall`, `small`, `base`, `large`.
-- `model.ffn_type` is rope-only and defaults to `mlp`; it is not applied in `hf_deberta_v2` mode.
-- repo-wide dropout override defaults are `hidden_dropout_prob=0.0` and `attention_probs_dropout_prob=0.0`.
-- set either dropout field to `null` to preserve source/checkpoint-native dropout values (for example HF `0.1`).
+Architecture defaults and parity-oriented deltas are listed in [replication.md](replication.md#hf-deberta-v3-base-reference-and-explicit-deltas).
 
 ## Source Resolution Contract
 

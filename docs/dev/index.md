@@ -33,6 +33,3 @@ Model/data config mismatches fail fast; train config drift is allowed by design.
 ## Follow-up Work
 
 Use [roadmap](../roadmap.md) for pending engineering tasks and migration items.
-
-RoPE Hugging Face custom-model integration planning lives in
-[rope_hf_modular_plan.md](rope_hf_modular_plan.md).

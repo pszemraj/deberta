@@ -39,13 +39,13 @@ Treat that as an objective variant, not parity mode.
 Exposed controls:
 
 - `train.gen_loss_weight`
-- `train.disc_loss_weight` (raw default `50.0`; effective `10.0` for `model.backbone_type=hf_deberta_v2` when unset)
+- `train.disc_loss_weight`
 - `train.decoupled_training` (default `true`)
 - `train.sampling_temperature`
-- `train.token_weighted_gradient_accumulation` (raw default `true`; effective `true` for `model.backbone_type=hf_deberta_v2` when unset)
-- `model.hidden_dropout_prob` and `model.attention_probs_dropout_prob` (default `0.0`; set `null` to preserve source/checkpoint-native dropout)
+- `train.token_weighted_gradient_accumulation`
+- `model.hidden_dropout_prob` and `model.attention_probs_dropout_prob`
 
-For parity-profile defaults and long-run parity configs, see [replication](replication.md).
+For parity-profile defaults and long-run parity configs, see [replication.md](replication.md).
 
 Per-microbatch loss terms are token-level means. When gradient accumulation is enabled, token-weighted accumulation is used by default so each microbatch contributes proportionally to its active-token counts (instead of equal microbatch averaging).
 
