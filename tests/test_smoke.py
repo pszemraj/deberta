@@ -1066,6 +1066,63 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
         assert not bool((sampled == int(sid)).any().item())
 
 
+def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    common_kwargs = dict(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        relative_attention=True,
+        pos_att_type=["p2c", "c2p"],
+        position_biased_input=False,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+    disc_cfg = DebertaV2Config(**common_kwargs, z_steps=0)
+    gen_cfg = DebertaV2Config(**common_kwargs, z_steps=2)
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaV2Model(disc_cfg),
+        generator_backbone=DebertaV2Model(gen_cfg),
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        embedding_sharing="none",
+    )
+
+    def _raise_if_called(*args, **kwargs) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("EnhancedMaskDecoder should be skipped when generator z_steps>1.")
+
+    monkeypatch.setattr(model.enhanced_mask_decoder, "forward", _raise_if_called)
+
+    input_ids = torch.tensor([[1, 7, 8, 9, 2, 0]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, 2] = input_ids[0, 2]
+
+    out = model.forward_generator_phase(
+        input_ids=input_ids,
+        attention_mask=input_ids.ne(0).long(),
+        labels=labels,
+        sampling_temperature=1.0,
+    )
+
+    assert torch.isfinite(out.gen_loss_raw)
+    assert int(out.gen_token_count.item()) == 1
+
+
 def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
     import pytest
 

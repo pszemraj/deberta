@@ -960,8 +960,13 @@ class DebertaV3RTDPretrainer(nn.Module):
         gen_token_count = masked_flat.sum().to(dtype=torch.float32)
 
         # EMD is only applicable for DeBERTa-v2/v3 when position_biased_input=False.
+        #
+        # When the generator backbone already applies iterative last-layer passes
+        # via z_steps>1, its output is already in the EMD-style regime; running the
+        # standalone EMD module again would double-apply that path.
         pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
-        use_emd = bool(self.use_enhanced_mask_decoder) and (not pos_biased)
+        z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
+        use_emd = bool(self.use_enhanced_mask_decoder) and (not pos_biased) and z_steps <= 1
 
         gen_forward_kwargs: dict[str, Any] = {
             "input_ids": input_ids,
