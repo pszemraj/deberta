@@ -28,6 +28,8 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
     except Exception as e:  # pragma: no cover
         raise RuntimeError("datasets is required. Install with `pip install datasets`.") from e
 
+    cache_dir = getattr(cfg, "cache_dir", None)
+
     if cfg.load_from_disk:
         if streaming:
             raise ValueError(
@@ -49,7 +51,7 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
         load_kwargs: dict[str, Any] = {
             "split": split,
             "streaming": streaming,
-            "cache_dir": cfg.cache_dir,
+            "cache_dir": cache_dir,
         }
         if cfg.dataset_config_name:
             load_kwargs["name"] = cfg.dataset_config_name
@@ -63,7 +65,7 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
             data_files=_files,
             split=split,
             streaming=streaming,
-            cache_dir=cfg.cache_dir,
+            cache_dir=cache_dir,
         )
 
     raise ValueError(

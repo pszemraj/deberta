@@ -60,6 +60,7 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
+from deberta.data.loading import load_hf_dataset
 from deberta.export_cli import add_export_arguments
 from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.mask_utils import normalize_keep_mask
@@ -207,6 +208,30 @@ def test_load_json_nested_and_flat(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
         _load_json(flat)
+
+
+def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_load_dataset(name: str, **kwargs: Any) -> list[dict[str, str]]:
+        calls.append((str(name), dict(kwargs)))
+        return [{"text": "ok"}]
+
+    fake_datasets = types.SimpleNamespace(
+        load_dataset=_fake_load_dataset,
+        load_from_disk=lambda _path: [],
+        DatasetDict=dict,
+    )
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+    cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    out = load_hf_dataset(cfg=cfg, split="train", streaming=True)
+
+    assert out == [{"text": "ok"}]
+    assert calls
+    assert calls[0][0] == "hf-internal-testing/librispeech_asr_dummy"
+    assert "cache_dir" in calls[0][1]
+    assert calls[0][1]["cache_dir"] is None
 
 
 def test_load_yaml_resolves_variables(tmp_path: Path):
