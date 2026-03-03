@@ -35,6 +35,65 @@ from deberta.modeling.export_utils import (
 logger = logging.getLogger(__name__)
 
 
+class ExportArgumentDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Argparse formatter with clearer defaults for paired ``--foo``/``--no-foo`` flags."""
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        """Render help text while suppressing misleading defaults on ``--no-*`` flags.
+
+        :param argparse.Action action: Parser action.
+        :return str: Help text.
+        """
+        help_text = action.help or ""
+        if isinstance(action, argparse._StoreFalseAction) or any(
+            str(opt).startswith("--no-") for opt in action.option_strings
+        ):
+            return help_text
+        return super()._get_help_string(action)
+
+
+class _ConflictAwareChoiceAction(argparse.Action):
+    """Reject conflicting repeated values for aliased choice flags."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        """Apply parsed value while rejecting conflicting duplicate assignments.
+
+        :param argparse.ArgumentParser parser: Active parser.
+        :param argparse.Namespace namespace: Namespace being populated.
+        :param Any values: Parsed value.
+        :param str | None option_string: Triggering option string.
+        """
+        seen_attr = f"__seen_{self.dest}"
+        if bool(getattr(namespace, seen_attr, False)):
+            previous = getattr(namespace, self.dest, None)
+            if previous != values:
+                parser.error(
+                    f"Conflicting values for --what/--export-what: {previous!r} then {values!r}. "
+                    "Provide only one value."
+                )
+        setattr(namespace, self.dest, values)
+        setattr(namespace, seen_attr, True)
+
+
+def _normalize_export_target(value: str) -> str:
+    """Normalize and validate export target selection.
+
+    :param str value: Raw export target.
+    :raises ValueError: If value is not one of discriminator|generator|both.
+    :return str: Canonical lower-case export target.
+    """
+    normalized = str(value or "").strip().lower()
+    if normalized not in {"discriminator", "generator", "both"}:
+        raise ValueError("export_what must be discriminator|generator|both")
+    return normalized
+
+
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
     """Infer parent run directory from checkpoint path.
 
@@ -127,6 +186,7 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         dest="export_what",
         default="discriminator",
         choices=("discriminator", "generator", "both"),
+        action=_ConflictAwareChoiceAction,
         help="Which component(s) to export.",
     )
     safe_group = parser.add_mutually_exclusive_group()
@@ -149,13 +209,16 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         "--offload-to-cpu",
         dest="offload_to_cpu",
         action="store_true",
-        help="Offload consolidated full state dict to CPU under FSDP export.",
+        help=("Offload consolidated full state dict to CPU under FSDP export. Ignored for non-FSDP exports."),
     )
     offload_group.add_argument(
         "--no-offload-to-cpu",
         dest="offload_to_cpu",
         action="store_false",
-        help="Keep consolidated full state dict on accelerator memory under FSDP export.",
+        help=(
+            "Keep consolidated full state dict on accelerator memory under FSDP export. "
+            "Ignored for non-FSDP exports."
+        ),
     )
     parser.set_defaults(offload_to_cpu=True)
 
@@ -164,13 +227,13 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         "--rank0-only",
         dest="rank0",
         action="store_true",
-        help="Gather full state dict on rank 0 only under FSDP export.",
+        help="Gather full state dict on rank 0 only under FSDP export. Ignored for non-FSDP exports.",
     )
     rank0_group.add_argument(
         "--no-rank0-only",
         dest="rank0",
         action="store_false",
-        help="Gather full state dict on all ranks under FSDP export.",
+        help="Gather full state dict on all ranks under FSDP export. Ignored for non-FSDP exports.",
     )
     parser.set_defaults(rank0=True)
     parser.add_argument(
@@ -297,6 +360,8 @@ def run_export(cfg: ExportConfig) -> None:
 
     :param ExportConfig cfg: Export configuration.
     """
+    export_what = _normalize_export_target(cfg.export_what)
+
     try:
         from transformers import AutoTokenizer
     except Exception as e:  # pragma: no cover
@@ -427,6 +492,12 @@ def run_export(cfg: ExportConfig) -> None:
                 full_sd = accelerator.get_state_dict(model)
     else:
         # Non-FSDP: unwrap DDP etc.
+        if (not bool(cfg.offload_to_cpu)) or (not bool(cfg.rank0)):
+            logger.warning(
+                "--offload-to-cpu/--rank0-only only apply to FSDP export; current distributed_type=%s, "
+                "so those options are ignored.",
+                accelerator.distributed_type,
+            )
         full_sd = accelerator.unwrap_model(model).state_dict()
 
     if not accelerator.is_main_process:
@@ -440,10 +511,6 @@ def run_export(cfg: ExportConfig) -> None:
         )
 
     # Build export models (backbones only)
-    export_what = (cfg.export_what or "discriminator").lower()
-    if export_what not in {"discriminator", "generator", "both"}:
-        raise ValueError("export_what must be discriminator|generator|both")
-
     export_disc, export_gen = _build_export_backbone(model_cfg, disc_config, gen_config, export_what)
 
     stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
@@ -545,7 +612,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="deberta export",
         description="Consolidate a training checkpoint and export standalone HF artifacts.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=ExportArgumentDefaultsHelpFormatter,
     )
     add_export_arguments(parser)
     args = parser.parse_args(argv)

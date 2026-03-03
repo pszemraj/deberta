@@ -59,6 +59,14 @@ deberta train configs/pretrain_hf_deberta_v2_parity_base.yaml \
 
 All values are type-cast against dataclass field annotations (`bool`, `int`, `float`, `str`, optional types).
 
+For YAML/JSON config files, boolean fields must be true booleans (`true`/`false`), not quoted strings (for example, `"false"` is rejected). Numeric fields accept numeric literals and numeric strings (for example, `1e-6`).
+
+## Dry-run behavior
+
+`deberta train --dry-run` runs validation and runtime preflight without starting optimization/training loops and without writing checkpoints.
+
+Dry-run may still access networked dataset/tokenizer sources and populate Hugging Face caches.
+
 ## Parity++ effective defaults (`model.backbone_type=hf_deberta_v2`)
 
 When these fields are not explicitly set by user config or CLI, the loader applies:
@@ -88,6 +96,8 @@ At run start, the trainer writes:
   - `config_resolved.yaml`
 
 If `logging.output_dir` is unset, it defaults to `train.checkpoint.output_dir`.
+
+By default `train.checkpoint.export_hf_final=true`, so successful training also performs a final export pass into `<train.checkpoint.output_dir>/final_hf`.
 
 For W&B runs, the trainer uploads:
 

@@ -45,7 +45,12 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.export_cli import add_export_arguments, namespace_to_export_config, run_export
+from deberta.export_cli import (
+    ExportArgumentDefaultsHelpFormatter,
+    add_export_arguments,
+    namespace_to_export_config,
+    run_export,
+)
 from deberta.training import run_pretraining, run_pretraining_dry_run
 
 # Nested canonical presets. With a config file, presets still only apply model overrides.
@@ -299,7 +304,8 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         action="store_true",
         help=(
             "Run non-destructive preflight checks (config validation, output/resume checks, "
-            "tokenizer+dataset+collator probe, backbone-config build) and exit without training."
+            "tokenizer+dataset+collator probe, backbone-config build) and exit without "
+            "training/checkpoint writes. May still access network and populate tokenizer/dataset caches."
         ),
     )
     return _add_dotflags(train)
@@ -313,7 +319,7 @@ def _build_export_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     export = subparsers.add_parser(
         "export",
         help="Consolidate and export checkpoint to standalone HF artifacts.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=ExportArgumentDefaultsHelpFormatter,
     )
     add_export_arguments(export)
 

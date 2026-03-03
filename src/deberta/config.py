@@ -2256,6 +2256,7 @@ def _replace_from_mapping_recursive(cfg_obj: Any, mapping: dict[str, Any], *, se
         raise ValueError(f"Unknown keys in section {section_name!r}: {', '.join(rendered)}")
 
     updates: dict[str, Any] = {}
+    type_hints = get_type_hints(type(cfg_obj))
     for key, value in mapping.items():
         cur = getattr(cfg_obj, key)
         if dataclasses.is_dataclass(cur):
@@ -2267,9 +2268,73 @@ def _replace_from_mapping_recursive(cfg_obj: Any, mapping: dict[str, Any], *, se
                 section_name=f"{section_name}.{key}",
             )
         else:
-            updates[str(key)] = value
+            field_type = type_hints.get(str(key), Any)
+            updates[str(key)] = _coerce_config_mapping_scalar_value(
+                raw_value=value,
+                field_type=field_type,
+                field_path=f"{section_name}.{key}",
+            )
 
     return replace(cfg_obj, **updates)
+
+
+def _coerce_config_mapping_scalar_value(*, raw_value: Any, field_type: Any, field_path: str) -> Any:
+    """Validate config-file scalar values against dataclass field annotations.
+
+    :param Any raw_value: Parsed YAML/JSON scalar value.
+    :param Any field_type: Dataclass field type annotation.
+    :param str field_path: Dotted field path for error context.
+    :raises ValueError: If a scalar value does not match the declared field type.
+    :return Any: Type-checked (and numeric-normalized) scalar value.
+    """
+    target_t, allows_none = _unwrap_optional_type(field_type)
+    value = raw_value
+    path = str(field_path)
+
+    if value is None:
+        if allows_none:
+            return None
+        raise ValueError(f"Config field {path} cannot be null.")
+
+    if target_t is bool:
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            f"Config field {path} must be a boolean true/false, got {type(value).__name__}: {value!r}."
+        )
+
+    if target_t is int:
+        if isinstance(value, bool):
+            raise ValueError(f"Config field {path} must be an integer, got bool: {value!r}.")
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, str):
+            text = str(value).strip()
+            try:
+                return int(text)
+            except ValueError as exc:
+                raise ValueError(f"Config field {path} must be an integer, got string: {value!r}.") from exc
+        raise ValueError(f"Config field {path} must be an integer, got {type(value).__name__}: {value!r}.")
+
+    if target_t is float:
+        if isinstance(value, bool):
+            raise ValueError(f"Config field {path} must be a number, got bool: {value!r}.")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = str(value).strip()
+            try:
+                return float(text)
+            except ValueError as exc:
+                raise ValueError(f"Config field {path} must be a number, got string: {value!r}.") from exc
+        raise ValueError(f"Config field {path} must be a number, got {type(value).__name__}: {value!r}.")
+
+    if target_t is str:
+        if not isinstance(value, str):
+            raise ValueError(f"Config field {path} must be a string, got {type(value).__name__}: {value!r}.")
+        return str(value)
+
+    return value
 
 
 def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]]) -> Config:

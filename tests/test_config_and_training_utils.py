@@ -62,7 +62,7 @@ from deberta.config import (
     validate_training_workflow_options,
 )
 from deberta.data.loading import load_hf_dataset
-from deberta.export_cli import add_export_arguments
+from deberta.export_cli import ExportArgumentDefaultsHelpFormatter, add_export_arguments
 from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.rtd import attention_mask_to_active_tokens
@@ -346,6 +346,46 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
     assert str(cfg.train.report_to) == "wandb"
     assert str(cfg.train.wandb_watch) == "all"
     assert bool(cfg.train.debug_metrics) is True
+
+
+def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -> None:
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "bad_bool.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "    streaming: 'false'",
+                "train:",
+                "  max_steps: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="data.source.streaming must be a boolean"):
+        load_config(cfg_path)
+
+
+def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumulation(tmp_path: Path) -> None:
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "bad_bool_train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 1",
+                "  token_weighted_gradient_accumulation: 'false'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="train.token_weighted_gradient_accumulation must be a boolean"):
+        load_config(cfg_path)
 
 
 def test_apply_dotted_override_supports_nested_section_paths() -> None:
@@ -5521,6 +5561,45 @@ def test_readme_cli_examples_are_parseable():
 
     for cmd in examples:
         parser.parse_args(shlex.split(cmd))
+
+
+def test_export_help_does_not_show_misleading_defaults_on_no_flags() -> None:
+    parser = argparse.ArgumentParser(
+        prog="deberta export",
+        formatter_class=ExportArgumentDefaultsHelpFormatter,
+    )
+    add_export_arguments(parser)
+    help_text = parser.format_help()
+    assert "--safe-serialization" in help_text and "(default: True)" in help_text
+    for opt in ("--no-safe-serialization", "--no-offload-to-cpu", "--no-rank0-only"):
+        line = next((ln for ln in help_text.splitlines() if opt in ln), "")
+        assert "(default:" not in line
+
+
+def test_docs_use_current_nested_key_paths() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    docs = [
+        repo_root / "docs" / "advanced" / "torch-compile.md",
+        repo_root / "docs" / "advanced" / "distributed-training.md",
+        repo_root / "docs" / "guides" / "data-pipeline.md",
+    ]
+    merged = "\n".join(path.read_text(encoding="utf-8") for path in docs)
+
+    stale_tokens = (
+        "train.torch_compile",
+        "train.torch_compile_mode",
+        "train.torch_compile_scope",
+        "train.torch_compile_backend",
+        "train.report_to",
+        "train.resume_data_strategy",
+        "train.resume_replay_max_micro_batches",
+        "data.block_cross_document_attention",
+        "train.mlm_max_ngram",
+        "train.mask_token_prob",
+        "train.random_token_prob",
+    )
+    for token in stale_tokens:
+        assert token not in merged
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ If none are provided, config validation fails.
 
 ## Packed streaming path
 
-`PackedStreamingDataset` (default when `pack_sequences=true`) does:
+`PackedStreamingDataset` (default when `data.packing.enabled=true`) does:
 
 1. tokenize documents without auto special tokens
 2. insert internal `[SEP]` between documents
@@ -28,24 +28,24 @@ Outputs:
 
 ## Cross-document attention blocking
 
-`data.block_cross_document_attention` controls pairwise document masking for packed samples.
+`data.packing.block_cross_document_attention` controls pairwise document masking for packed samples.
 
 - `false`: no 3D pairwise mask path
 - `true`: collator emits `doc_ids (B,S)` and training materializes a `(B,S,S)` keep-mask
 
-This mode is only valid with `pack_sequences=true`.
+This mode is only valid with `data.packing.enabled=true`.
 
 ## Collator masking behavior
 
 `DebertaV3ElectraCollator` applies dynamic MLM masking:
 
-- `train.mlm_max_ngram=1`: token-level masking (parity path)
-- `train.mlm_max_ngram>1`: whole-word n-gram masking
+- `train.objective.mlm_max_ngram=1`: token-level masking (parity path)
+- `train.objective.mlm_max_ngram>1`: whole-word n-gram masking
 
 Mask replacement controls:
 
-- `train.mask_token_prob`
-- `train.random_token_prob`
+- `train.objective.mask_token_prob`
+- `train.objective.random_token_prob`
 
 Unmasked labels are `-100`; masked labels keep original token ids.
 

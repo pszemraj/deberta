@@ -46,6 +46,9 @@ deberta export runs/<run_name>/checkpoint-<step> \
   --output-dir runs/<run_name>/exported_hf
 ```
 
+By default successful training also performs a final export pass into
+`<train.checkpoint.output_dir>/final_hf` (`train.checkpoint.export_hf_final=true`).
+
 ## Docs
 
 Start here: [`docs/index.md`](docs/index.md)

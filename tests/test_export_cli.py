@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
@@ -100,6 +101,7 @@ def _install_export_fakes(
     called: dict[str, object],
     fsdp2: bool,
     provide_torch_state_dict_api: bool,
+    distributed_type: str | None = None,
     load_state_orig_mod_mismatch: bool = False,
 ) -> None:
     fake_utils = types.ModuleType("accelerate.utils")
@@ -134,7 +136,9 @@ def _install_export_fakes(
     def _accelerator_factory(**kwargs: Any) -> FakeAccelerator:
         del kwargs
         accel = FakeAccelerator(
-            distributed_type=fake_utils.DistributedType.FSDP,
+            distributed_type=distributed_type
+            if distributed_type is not None
+            else fake_utils.DistributedType.FSDP,
             is_fsdp2=bool(fsdp2),
             is_main_process=True,
         )
@@ -586,3 +590,67 @@ def test_namespace_to_export_config_maps_allow_partial_export() -> None:
         )
         cfg = export_cli.namespace_to_export_config(ns)
         assert cfg.allow_partial_export is True
+
+
+def test_export_parser_rejects_conflicting_what_alias_values() -> None:
+    parser = argparse.ArgumentParser(prog="deberta export")
+    export_cli.add_export_arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "runs/demo/checkpoint-10",
+                "--what",
+                "discriminator",
+                "--export-what",
+                "generator",
+            ]
+        )
+
+
+def test_run_export_rejects_invalid_export_what_before_runtime_imports() -> None:
+    with pytest.raises(ValueError, match="export_what must be discriminator\\|generator\\|both"):
+        export_cli.run_export(
+            export_cli.ExportConfig(
+                checkpoint_dir="runs/demo/checkpoint-10",
+                export_what="not-a-real-target",
+            )
+        )
+
+
+def test_run_export_warns_when_fsdp_only_flags_are_ignored_on_non_fsdp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+        distributed_type="NO",
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "DebertaV3RTDPretrainer",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            state_dict=lambda: {
+                "discriminator.weight": torch.tensor(1.0),
+                "generator.weight": torch.tensor(2.0),
+            }
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        export_cli.run_export(
+            export_cli.ExportConfig(
+                checkpoint_dir=str(checkpoint_dir),
+                run_dir=str(run_dir),
+                output_dir=str(tmp_path / "exported"),
+                offload_to_cpu=False,
+                rank0=False,
+            )
+        )
+    assert "only apply to FSDP export" in caplog.text

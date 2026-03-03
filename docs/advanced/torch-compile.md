@@ -4,15 +4,15 @@
 
 Set:
 
-- `train.torch_compile=true`
-- `train.torch_compile_mode` in `default|reduce-overhead|max-autotune|max-autotune-no-cudagraphs`
-- `train.torch_compile_backend` in `inductor|aot_eager`
+- `train.compile.enabled=true`
+- `train.compile.mode` in `default|reduce-overhead|max-autotune|max-autotune-no-cudagraphs`
+- `train.compile.backend` in `inductor|aot_eager`
 
 Compile failures raise errors; there is no silent eager fallback.
 
 ## Compile scope
 
-`train.torch_compile_scope` supports:
+`train.compile.scope` supports:
 
 - `auto`
 - `backbones`
@@ -27,7 +27,7 @@ The full RTD wrapper contains dynamic masking, token sampling, and corruption lo
 
 ## Special case: packed doc-block masks
 
-For `rope` with `data.block_cross_document_attention=true`, auto scope downgrades toward FFN-focused compile to avoid shape-churn recompiles from dynamic pairwise masks.
+For `rope` with `data.packing.block_cross_document_attention=true`, auto scope downgrades toward FFN-focused compile to avoid shape-churn recompiles from dynamic pairwise masks.
 
 ## Compile debugging helpers
 
