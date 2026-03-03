@@ -11,12 +11,13 @@ import math
 import os
 import re
 import time
+import types
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import torch
 from torch.utils.data import DataLoader
@@ -193,6 +194,75 @@ def _config_obj_to_mapping(config_obj: Any) -> dict[str, Any]:
     return {}
 
 
+def _coerce_bool_value(value: Any) -> bool:
+    """Coerce common bool-like values into ``bool``.
+
+    :param Any value: Raw value.
+    :raises ValueError: If value is not parseable as bool.
+    :return bool: Coerced boolean.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = str(value).strip().lower()
+        if v in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise ValueError(f"Unsupported boolean value: {value!r}")
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(int(value))
+    raise ValueError(f"Unsupported boolean value: {value!r}")
+
+
+def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
+    """Serialize a dataclass config and coerce scalar fields to declared types.
+
+    This keeps tracker payloads deterministic when YAML parsed numeric-like strings
+    (for example ``1e-6``) bypass dataclass runtime typing.
+
+    :param Any cfg_obj: Dataclass config object.
+    :return dict[str, Any]: Serialized mapping with best-effort scalar coercion.
+    """
+
+    def _unwrap_optional(t: Any) -> Any:
+        """Return the non-None member type for ``Optional[T]`` annotations.
+
+        :param Any t: Annotation type.
+        :return Any: Unwrapped type when optional, else original type.
+        """
+        origin = get_origin(t)
+        if origin in {Union, types.UnionType}:
+            args = [a for a in get_args(t) if a is not type(None)]
+            if len(args) == 1:
+                return args[0]
+        return t
+
+    payload = asdict(cfg_obj)
+    type_hints = get_type_hints(type(cfg_obj))
+    for f in fields(type(cfg_obj)):
+        name = str(f.name)
+        if name not in payload:
+            continue
+        value = payload[name]
+        if value is None:
+            continue
+        target_t = _unwrap_optional(type_hints.get(name, f.type))
+        try:
+            if target_t is bool:
+                payload[name] = _coerce_bool_value(value)
+            elif target_t is int and not isinstance(value, bool):
+                payload[name] = int(value)
+            elif target_t is float and not isinstance(value, bool):
+                payload[name] = float(value)
+            elif target_t is str:
+                payload[name] = str(value)
+        except Exception:
+            # Validation will raise on invalid values; payload coercion is best-effort.
+            continue
+    return payload
+
+
 def _build_runtime_resolved_tracker_config(
     *,
     model_cfg: ModelConfig,
@@ -213,9 +283,9 @@ def _build_runtime_resolved_tracker_config(
     :return dict[str, Any]: Null-pruned resolved config payload.
     """
     payload: dict[str, Any] = {
-        "model": asdict(model_cfg),
-        "data": asdict(data_cfg),
-        "train": asdict(train_cfg),
+        "model": _coerce_dataclass_payload_types(model_cfg),
+        "data": _coerce_dataclass_payload_types(data_cfg),
+        "train": _coerce_dataclass_payload_types(train_cfg),
     }
     model_payload = payload["model"]
     train_payload = payload["train"]

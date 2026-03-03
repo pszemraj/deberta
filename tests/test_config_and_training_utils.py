@@ -1338,6 +1338,58 @@ def test_build_runtime_resolved_tracker_config_omits_effective_backbone_payload(
     assert "effective" not in payload
 
 
+def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None:
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        hidden_size="768",  # type: ignore[arg-type]
+        num_hidden_layers="12",  # type: ignore[arg-type]
+        num_attention_heads="12",  # type: ignore[arg-type]
+        intermediate_size="3072",  # type: ignore[arg-type]
+        hidden_dropout_prob="0.0",  # type: ignore[arg-type]
+        attention_probs_dropout_prob="0.0",  # type: ignore[arg-type]
+    )
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
+    train_cfg = TrainConfig(
+        learning_rate="5e-4",  # type: ignore[arg-type]
+        adam_epsilon="1e-6",  # type: ignore[arg-type]
+        warmup_steps="1000",  # type: ignore[arg-type]
+        token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
+    )
+    disc_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "num_hidden_layers": 12,
+            "hidden_dropout_prob": 0.0,
+            "attention_probs_dropout_prob": 0.0,
+            "max_position_embeddings": 1024,
+        },
+    )
+    gen_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "num_hidden_layers": 6,
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    payload = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        tokenizer=tokenizer,
+    )
+
+    assert payload["model"]["hidden_size"] == 768
+    assert payload["data"]["max_seq_length"] == 1024
+    assert payload["train"]["warmup_steps"] == 1000
+    assert payload["train"]["learning_rate"] == pytest.approx(5e-4)
+    assert payload["train"]["adam_epsilon"] == pytest.approx(1e-6)
+    assert payload["train"]["token_weighted_gradient_accumulation"] is True
+
+
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
