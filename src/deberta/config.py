@@ -1258,7 +1258,11 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     v = v.lstrip("/")
 
     def _matches_repo_id(candidate: str) -> bool:
-        """Return whether candidate is a DeBERTa repo id or repo-scoped path."""
+        """Return whether candidate is a DeBERTa repo id or repo-scoped path.
+
+        :param str candidate: Candidate repository id or scoped path.
+        :return bool: True when candidate matches known DeBERTa HF prefixes.
+        """
         return any(
             candidate == prefix or candidate.startswith(f"{prefix}-") or candidate.startswith(f"{prefix}/")
             for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES

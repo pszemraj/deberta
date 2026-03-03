@@ -42,7 +42,12 @@ def _write_export_readme(
     """
 
     def _first_int_attr(*objs: Any, attr: str) -> int:
-        """Return the first int-coercible attribute value across candidate objects."""
+        """Return the first int-coercible attribute value across candidate objects.
+
+        :param Any objs: Candidate objects to inspect in order.
+        :param str attr: Attribute name to read from each object.
+        :return int: First coercible integer value, or 0 when none is present.
+        """
         for obj in objs:
             if obj is None:
                 continue
