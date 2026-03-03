@@ -193,6 +193,75 @@ def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
     assert called["count"] == 0
 
 
+@pytest.mark.parametrize(
+    ("from_scratch", "pretrained_generator_path", "tokenizer_vocab"),
+    [
+        (True, None, 50265),
+        (False, None, 128100),
+        (False, "gen_weights", 128100),
+    ],
+)
+def test_build_backbone_configs_hf_deberta_never_loads_external_model_config(
+    monkeypatch: pytest.MonkeyPatch,
+    from_scratch: bool,
+    pretrained_generator_path: str | None,
+    tokenizer_vocab: int,
+):
+    pytest.importorskip("transformers")
+
+    rope_called = {"count": 0}
+    hf_cfg_called = {"count": 0}
+    repo_called = {"count": 0}
+    original_repo_builder = builder_mod._build_repo_hf_deberta_v2_config
+
+    def _raise_rope_cfg_pretrained(cls, src: str):
+        del cls
+        del src
+        rope_called["count"] += 1
+        raise AssertionError("RoPE config source must not be touched for hf_deberta_v2 backbone.")
+
+    def _raise_hf_cfg_pretrained(cls, src: str, **kwargs: Any):
+        del cls
+        del src
+        del kwargs
+        hf_cfg_called["count"] += 1
+        raise AssertionError("HF config source must not be loaded; config must be repo-synthesized.")
+
+    def _count_repo_builder(*, model_cfg: ModelConfig):
+        repo_called["count"] += 1
+        return original_repo_builder(model_cfg=model_cfg)
+
+    monkeypatch.setattr(
+        builder_mod.DebertaRoPEConfig,
+        "from_pretrained",
+        classmethod(_raise_rope_cfg_pretrained),
+    )
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_raise_hf_cfg_pretrained),
+    )
+    monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _count_repo_builder)
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=from_scratch,
+        pretrained_discriminator_path=("disc_weights" if not from_scratch else ""),
+        pretrained_generator_path=pretrained_generator_path,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=DummyTokenizer(vocab_size=tokenizer_vocab),
+        max_position_embeddings=128,
+    )
+
+    assert int(repo_called["count"]) == 1
+    assert int(rope_called["count"]) == 0
+    assert int(hf_cfg_called["count"]) == 0
+    assert int(disc_cfg.hidden_size) > 0
+    assert int(gen_cfg.hidden_size) > 0
+
+
 def test_build_backbone_configs_propagates_tokenizer_special_ids_for_rope():
     pytest.importorskip("transformers")
 
@@ -880,6 +949,52 @@ def test_build_backbones_uses_resolved_hf_weight_sources(monkeypatch: pytest.Mon
     _ = builder_mod.build_backbones(model_cfg=model_cfg, disc_config=disc_cfg, gen_config=gen_cfg)
 
     assert called == [("disc_weights", disc_cfg), ("gen_weights", gen_cfg)]
+
+
+def test_build_backbones_pretrained_hf_does_not_fetch_external_config(monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("transformers")
+
+    model_calls: list[str] = []
+    cfg_calls = {"count": 0}
+
+    def _fake_model_from_pretrained(cls, src: str, config: Any):
+        del cls
+        del config
+        model_calls.append(src)
+        return object()
+
+    def _raise_cfg_from_pretrained(cls, src: str, **kwargs: Any):
+        del cls
+        del src
+        del kwargs
+        cfg_calls["count"] += 1
+        raise AssertionError(
+            "DebertaV2Config.from_pretrained must not be called when build_backbones receives explicit configs."
+        )
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Model,
+        "from_pretrained",
+        classmethod(_fake_model_from_pretrained),
+    )
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_raise_cfg_from_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained_discriminator_path="disc_weights",
+        pretrained_generator_path="gen_weights",
+    )
+    disc_cfg = types.SimpleNamespace(hidden_size=768, vocab_size=128100)
+    gen_cfg = types.SimpleNamespace(hidden_size=384, vocab_size=128100)
+    _ = builder_mod.build_backbones(model_cfg=model_cfg, disc_config=disc_cfg, gen_config=gen_cfg)
+
+    assert model_calls == ["disc_weights", "gen_weights"]
+    assert int(cfg_calls["count"]) == 0
 
 
 def test_build_backbones_hf_from_scratch_uses_native_implementation():
