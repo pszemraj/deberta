@@ -2340,6 +2340,110 @@ def test_run_pretraining_decoupled_integration(
         assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
 
 
+def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler_steps = {"gen": 0, "disc": 0}
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "generator_phase_loss_scale": 1.0,
+                "discriminator_phase_loss_scale": float("nan"),
+            },
+            **kwargs,
+        ),
+    )
+
+    scheduler_build_count = 0
+
+    def _build_counted_scheduler(optimizer: torch.optim.Optimizer, _cfg: TrainConfig):
+        nonlocal scheduler_build_count
+        phase = "gen" if scheduler_build_count == 0 else "disc"
+        scheduler_build_count += 1
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        original_step = scheduler.step
+
+        def _count_step(*args: Any, **kwargs: Any) -> Any:
+            scheduler_steps[phase] += 1
+            return original_step(*args, **kwargs)
+
+        scheduler.step = _count_step  # type: ignore[method-assign]
+        return scheduler
+
+    monkeypatch.setattr(pretrain_mod, "_build_scheduler", _build_counted_scheduler)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert scheduler_steps["gen"] == 1
+    assert scheduler_steps["disc"] == 0
+
+
+def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "generator_phase_loss_scale": 0.0,
+                "generator_phase_token_count": 0.0,
+            },
+            **kwargs,
+        ),
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    model = SimpleRTD.last_instance
+    assert model is not None
+    assert len(model.calls.get("forward_discriminator_phase", [])) == 0
+
+
 def test_run_pretraining_final_export_uses_subprocess_helper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2564,23 +2564,22 @@ def run_pretraining(
                             disc_optimizer.zero_grad(set_to_none=True)
                             break
 
-                        gen_token_count_window = (
-                            gen_token_count_window + gen_phase_out.gen_token_count.detach().float()
-                        )
+                        micro_gen_token_count = gen_phase_out.gen_token_count.detach().float()
+                        gen_token_count_window = gen_token_count_window + micro_gen_token_count
                         gen_loss_num = gen_loss_num + (
-                            gen_phase_out.gen_loss_raw.detach().float()
-                            * gen_phase_out.gen_token_count.detach().float()
+                            gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
                         )
-                        disc_phase_inputs.append(
-                            {
-                                "input_ids": batch["input_ids"],
-                                "attention_mask": batch.get("attention_mask"),
-                                "token_type_ids": batch.get("token_type_ids"),
-                                "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
-                                "disc_labels": gen_phase_out.disc_labels,
-                                "disc_count": float(disc_count),
-                            }
-                        )
+                        if float(micro_gen_token_count.item()) > 0.0:
+                            disc_phase_inputs.append(
+                                {
+                                    "input_ids": batch["input_ids"],
+                                    "attention_mask": batch.get("attention_mask"),
+                                    "token_type_ids": batch.get("token_type_ids"),
+                                    "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
+                                    "disc_labels": gen_phase_out.disc_labels,
+                                    "disc_count": float(disc_count),
+                                }
+                            )
                         if backward_loss is not None:
                             accelerator.backward(backward_loss)
 
@@ -2723,14 +2722,20 @@ def run_pretraining(
                             disc_optimizer.zero_grad(set_to_none=True)
                             did_disc_optimizer_step = True
 
+                if not skipped_window_due_nonfinite and not disc_phase_inputs:
+                    # No generator-supervised tokens were produced in this window, so there are
+                    # no discriminator targets to train on.
+                    did_disc_optimizer_step = True
+
                 did_optimizer_step = bool(did_gen_optimizer_step and did_disc_optimizer_step)
                 if not did_optimizer_step:
                     if skipped_window_due_nonfinite:
-                        # Keep scheduler state moving on skipped windows for optimizers that have stepped before.
-                        if _optimizer_has_stepped(gen_optimizer):
+                        # Keep scheduler state moving on skipped windows only for phases that
+                        # did not already step in this accumulation window.
+                        if (not did_gen_optimizer_step) and _optimizer_has_stepped(gen_optimizer):
                             with suppress(Exception):
                                 gen_lr_scheduler.step()
-                        if _optimizer_has_stepped(disc_optimizer):
+                        if (not did_disc_optimizer_step) and _optimizer_has_stepped(disc_optimizer):
                             with suppress(Exception):
                                 disc_lr_scheduler.step()
                         lr_mult, reset_state = _apply_nonfinite_recovery(
