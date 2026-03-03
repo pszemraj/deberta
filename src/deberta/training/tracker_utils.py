@@ -191,9 +191,12 @@ def _upload_wandb_original_config(
         uploaded_any = False
         for src in deduped_upload_files:
             try:
-                save_fn(str(src), policy="now")
+                save_fn(str(src), base_path=str(src.parent), policy="now")
             except TypeError:
-                save_fn(str(src))
+                try:
+                    save_fn(str(src), base_path=str(src.parent))
+                except TypeError:
+                    save_fn(str(src))
             uploaded_any = True
             logger.info("Uploaded config snapshot to W&B as run file: %s", src)
         if uploaded_any:
@@ -206,9 +209,12 @@ def _upload_wandb_original_config(
             uploaded_any = False
             for src in deduped_upload_files:
                 try:
-                    wandb.save(str(src), policy="now")
+                    wandb.save(str(src), base_path=str(src.parent), policy="now")
                 except TypeError:
-                    wandb.save(str(src))
+                    try:
+                        wandb.save(str(src), base_path=str(src.parent))
+                    except TypeError:
+                        wandb.save(str(src))
                 uploaded_any = True
                 logger.info("Uploaded config snapshot via wandb.save: %s", src)
             if uploaded_any:
