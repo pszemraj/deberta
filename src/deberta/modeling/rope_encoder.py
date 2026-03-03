@@ -581,11 +581,23 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
             )
 
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-        x, all_hidden_states = self.encoder(
-            x,
-            attention_mask,
-            output_hidden_states=output_hidden_states,
-        )
+        if output_hidden_states:
+            encoder_outputs = self.encoder(
+                x,
+                attention_mask,
+                output_hidden_states=True,
+            )
+        else:
+            # Keep compatibility with injected/wrapped encoders that implement
+            # the historical ``forward(x, attention_mask)`` contract.
+            encoder_outputs = self.encoder(x, attention_mask)
+
+        if isinstance(encoder_outputs, tuple):
+            x = encoder_outputs[0]
+            all_hidden_states = encoder_outputs[1] if len(encoder_outputs) > 1 else None
+        else:
+            x = encoder_outputs
+            all_hidden_states = None
 
         if not return_dict:
             outputs: tuple[torch.Tensor, ...] = (x,)
