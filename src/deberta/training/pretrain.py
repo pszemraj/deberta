@@ -2569,17 +2569,21 @@ def run_pretraining(
                         gen_loss_num = gen_loss_num + (
                             gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
                         )
-                        if float(micro_gen_token_count.item()) > 0.0:
-                            disc_phase_inputs.append(
-                                {
-                                    "input_ids": batch["input_ids"],
-                                    "attention_mask": batch.get("attention_mask"),
-                                    "token_type_ids": batch.get("token_type_ids"),
-                                    "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
-                                    "disc_labels": gen_phase_out.disc_labels,
-                                    "disc_count": float(disc_count),
-                                }
-                            )
+                        # Keep discriminator micro-step counts aligned across ranks:
+                        # when local generator token count is zero we still run the
+                        # corresponding discriminator pass with zero objective weight.
+                        disc_objective_weight = 1.0 if float(micro_gen_token_count.item()) > 0.0 else 0.0
+                        disc_phase_inputs.append(
+                            {
+                                "input_ids": batch["input_ids"],
+                                "attention_mask": batch.get("attention_mask"),
+                                "token_type_ids": batch.get("token_type_ids"),
+                                "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
+                                "disc_labels": gen_phase_out.disc_labels,
+                                "disc_count": float(disc_count),
+                                "disc_objective_weight": float(disc_objective_weight),
+                            }
+                        )
                         if backward_loss is not None:
                             accelerator.backward(backward_loss)
 
@@ -2609,8 +2613,29 @@ def run_pretraining(
                         did_gen_optimizer_step = True
                         _sync_discriminator_embeddings_if_available(unwrapped_model)
 
-                # Phase 2: discriminator update from cached corruption targets.
+                window_has_global_disc_targets = False
                 if not skipped_window_due_nonfinite and disc_phase_inputs:
+                    window_has_local_disc_targets = any(
+                        float(payload.get("disc_objective_weight", 0.0)) > 0.0
+                        for payload in disc_phase_inputs
+                    )
+                    # Skip all-negative discriminator windows only when every rank has
+                    # zero generator-supervised tokens; otherwise keep per-rank step
+                    # counts aligned and use zero-weight local contributions.
+                    window_has_global_disc_targets = bool(
+                        _sum_local_scalar(
+                            accelerator=accelerator,
+                            x=1.0 if window_has_local_disc_targets else 0.0,
+                        )
+                        > 0.0
+                    )
+
+                # Phase 2: discriminator update from cached corruption targets.
+                if (
+                    not skipped_window_due_nonfinite
+                    and disc_phase_inputs
+                    and bool(window_has_global_disc_targets)
+                ):
                     disc_phase_steps = len(disc_phase_inputs)
                     for step_idx, payload in enumerate(disc_phase_inputs):
                         if compile_enabled:
@@ -2626,6 +2651,7 @@ def run_pretraining(
                                 token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                             )
                             disc_loss = disc_phase_out.disc_loss_raw
+                            disc_objective_weight = float(payload.get("disc_objective_weight", 1.0))
                             if token_weighted_ga:
                                 disc_obj = disc_loss * (
                                     float(payload["disc_count"])
@@ -2633,6 +2659,7 @@ def run_pretraining(
                                 )
                             else:
                                 disc_obj = disc_loss
+                            disc_obj = disc_obj * float(disc_objective_weight)
                             loss_for_metrics = loss_for_metrics + (disc_loss_weight * disc_obj.detach())
                             offending = None
                             if not torch.isfinite(disc_phase_out.disc_loss_raw.detach()).all():
@@ -2676,20 +2703,20 @@ def run_pretraining(
                                 disc_optimizer.zero_grad(set_to_none=True)
                                 break
 
-                            disc_token_count_window = (
-                                disc_token_count_window + disc_phase_out.disc_token_count.detach().float()
+                            micro_disc_token_count = disc_phase_out.disc_token_count.detach().float() * float(
+                                disc_objective_weight
                             )
+                            disc_token_count_window = disc_token_count_window + micro_disc_token_count
                             disc_positive_count_window = (
                                 disc_positive_count_window
                                 + disc_phase_out.disc_positive_count.detach().float()
+                                * float(disc_objective_weight)
                             )
                             disc_loss_num = disc_loss_num + (
-                                disc_phase_out.disc_loss_raw.detach().float()
-                                * disc_phase_out.disc_token_count.detach().float()
+                                disc_phase_out.disc_loss_raw.detach().float() * micro_disc_token_count
                             )
                             disc_acc_num = disc_acc_num + (
-                                disc_phase_out.disc_accuracy.detach().float()
-                                * disc_phase_out.disc_token_count.detach().float()
+                                disc_phase_out.disc_accuracy.detach().float() * micro_disc_token_count
                             )
                             if backward_loss is not None:
                                 accelerator.backward(backward_loss)
@@ -2723,7 +2750,9 @@ def run_pretraining(
                             disc_optimizer.zero_grad(set_to_none=True)
                             did_disc_optimizer_step = True
 
-                if not skipped_window_due_nonfinite and not disc_phase_inputs:
+                if not skipped_window_due_nonfinite and (
+                    not disc_phase_inputs or not bool(window_has_global_disc_targets)
+                ):
                     # No generator-supervised tokens were produced in this window, so there are
                     # no discriminator targets to train on.
                     did_disc_optimizer_step = True

@@ -2367,7 +2367,8 @@ def test_run_pretraining_decoupled_integration(
         assert step_counts == {"gen": 1, "disc": 1}
         model = SimpleRTD.last_instance
         assert model is not None
-        assert len(model.calls["forward_discriminator_phase"]) == 1
+        assert len(model.calls["forward_discriminator_phase"]) == 2
+        assert accel.calls["backward"] == pytest.approx([2.0, 2.0, 0.0, 3.0], rel=0.0, abs=1e-6)
 
 
 def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
