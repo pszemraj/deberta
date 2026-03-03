@@ -7,6 +7,7 @@ model:
   profile: deberta_v3_parity
   tokenizer_name_or_path: microsoft/deberta-v3-small
   backbone_type: hf_deberta_v2
+  hf_model_size: small
   discriminator_model_name_or_path: microsoft/deberta-v3-small
   generator_model_name_or_path: null
   from_scratch: true

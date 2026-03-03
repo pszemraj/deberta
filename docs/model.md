@@ -37,6 +37,7 @@ initializer_range: 0.02
 Repo default policy:
 
 - `backbone_type=hf_deberta_v2` keeps HF architecture compatibility (same DeBERTa-v2/v3 stack).
+- `model.hf_model_size` selects repo-owned architecture presets: `xsmall`, `small`, `base`, `large`.
 - `model.ffn_type` is rope-only and defaults to `mlp`; it is not applied in `hf_deberta_v2` mode.
 - repo-wide dropout override defaults are `hidden_dropout_prob=0.0` and `attention_probs_dropout_prob=0.0`.
 - set either dropout field to `null` to preserve source/checkpoint-native dropout values (for example HF `0.1`).

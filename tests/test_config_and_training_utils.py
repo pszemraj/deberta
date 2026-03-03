@@ -3824,6 +3824,7 @@ def test_config_defaults():
     model = ModelConfig()
     assert model.hidden_dropout_prob == pytest.approx(0.0)
     assert model.attention_probs_dropout_prob == pytest.approx(0.0)
+    assert model.hf_model_size == "base"
     assert model.ffn_type == "mlp"
     assert model.swiglu_adjust_intermediate is True
 

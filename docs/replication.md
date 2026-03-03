@@ -13,6 +13,7 @@ HF-compatible backbone:
 model:
   profile: deberta_v3_parity
   backbone_type: hf_deberta_v2
+  hf_model_size: base
   tokenizer_name_or_path: microsoft/deberta-v3-base
   discriminator_model_name_or_path: microsoft/deberta-v3-base
   generator_model_name_or_path: null
@@ -44,6 +45,7 @@ train:
 Notes:
 
 - `backbone_type=hf_deberta_v2` is the key switch for disentangled attention + LayerNorm parity.
+- `hf_model_size` controls the repo-owned architecture preset (`xsmall|small|base|large`).
 - For `backbone_type=hf_deberta_v2`, this repo applies parity++ RTD defaults when unset (`mask_token_prob=1.0`, `random_token_prob=0.0`, `disc_loss_weight=10.0`, `adam_epsilon=1e-6`, `warmup_steps=10000`, `token_weighted_gradient_accumulation=false`).
 - `model.profile=deberta_v3_parity` remains available as the explicit parity profile surface; explicit YAML/CLI values always override defaults.
 - `train.decoupled_training=true` is the default and keeps two-phase RTD updates enabled.

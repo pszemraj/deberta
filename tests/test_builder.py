@@ -571,15 +571,15 @@ def _patch_repo_hf_base_config(
 ) -> None:
     """Patch repo HF base config builder for deterministic tests."""
     overrides = dict(config_overrides or {})
-    original = builder_mod._build_repo_hf_deberta_v2_base_config
+    original = builder_mod._build_repo_hf_deberta_v2_config
 
-    def _factory() -> Any:
-        cfg = original()
+    def _factory(*, model_cfg: ModelConfig) -> Any:
+        cfg = original(model_cfg=model_cfg)
         for key, value in overrides.items():
             setattr(cfg, str(key), value)
         return cfg
 
-    monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_base_config", _factory)
+    monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _factory)
 
 
 _USE_MODEL_DEFAULT = object()
@@ -634,6 +634,46 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     assert disc_cfg.attention_probs_dropout_prob == pytest.approx(expected_attn)
     assert gen_cfg.hidden_dropout_prob == pytest.approx(expected_hidden)
     assert gen_cfg.attention_probs_dropout_prob == pytest.approx(expected_attn)
+
+
+@pytest.mark.parametrize(
+    ("hf_model_size", "hidden_size", "layers", "heads", "intermediate"),
+    [
+        ("xsmall", 384, 12, 6, 1536),
+        ("small", 768, 6, 12, 3072),
+        ("base", 768, 12, 12, 3072),
+        ("large", 1024, 24, 16, 4096),
+    ],
+)
+def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
+    hf_model_size: str,
+    hidden_size: int,
+    layers: int,
+    heads: int,
+    intermediate: int,
+):
+    pytest.importorskip("transformers")
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=True,
+        hf_model_size=hf_model_size,
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=DummyTokenizer(vocab_size=50265),
+        max_position_embeddings=128,
+    )
+
+    assert int(disc_cfg.hidden_size) == hidden_size
+    assert int(disc_cfg.num_hidden_layers) == layers
+    assert int(disc_cfg.num_attention_heads) == heads
+    assert int(disc_cfg.intermediate_size) == intermediate
+    assert int(disc_cfg.hidden_size) // int(disc_cfg.num_attention_heads) == 64
+    assert int(gen_cfg.num_hidden_layers) == max(1, layers // 2)
+    assert int(gen_cfg.hidden_size) == hidden_size
+    assert int(gen_cfg.num_attention_heads) == heads
+    assert int(gen_cfg.intermediate_size) == intermediate
 
 
 def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():

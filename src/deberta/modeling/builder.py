@@ -601,17 +601,47 @@ def _apply_hf_config_normalization(
     cfg.use_rmsnorm_heads = False
 
 
-def _build_repo_hf_deberta_v2_base_config() -> DebertaV2Config:
-    """Build the repo-owned default HF-compatible DeBERTa-v3 base architecture config.
+def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Config:
+    """Build a repo-owned HF-compatible DeBERTa-v2/v3 architecture config.
 
-    :return DebertaV2Config: Fresh config object populated from repo defaults.
+    :param ModelConfig model_cfg: User model configuration.
+    :return DebertaV2Config: Fresh config object populated from repo numeric presets.
     """
+    presets: dict[str, dict[str, int]] = {
+        "xsmall": {
+            "hidden_size": 384,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 6,
+            "intermediate_size": 1536,
+        },
+        "small": {
+            "hidden_size": 768,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+        },
+        "base": {
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+        },
+        "large": {
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "intermediate_size": 4096,
+        },
+    }
+    size_key = str(model_cfg.hf_model_size).strip().lower()
+    dims = presets[size_key]
+
     return DebertaV2Config(
         vocab_size=128_100,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
+        hidden_size=int(dims["hidden_size"]),
+        num_hidden_layers=int(dims["num_hidden_layers"]),
+        num_attention_heads=int(dims["num_attention_heads"]),
+        intermediate_size=int(dims["intermediate_size"]),
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
@@ -712,7 +742,7 @@ def build_backbone_configs(
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
-        disc_cfg = _build_repo_hf_deberta_v2_base_config()
+        disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
         if model_cfg.generator_model_name_or_path:
             # Explicit generator model sources affect weight loading, not config synthesis.
             gen_cfg = copy.deepcopy(disc_cfg)

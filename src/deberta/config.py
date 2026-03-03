@@ -85,6 +85,7 @@ _TORCH_COMPILE_BACKEND_ALIASES = {
     "aot-eager": "aot_eager",
 }
 _HF_ATTN_KERNEL_CHOICES = {"dynamic", "cached_bmm", "stable"}
+_HF_MODEL_SIZE_CHOICES = {"xsmall", "small", "base", "large"}
 _HF_ATTN_KERNEL_ALIASES = {
     "default": "dynamic",
     "cache": "cached_bmm",
@@ -204,7 +205,17 @@ class ModelConfig:
         },
     )
 
-    # These are used as CONFIG SOURCES (and optionally weight sources if from_scratch=False).
+    hf_model_size: str = field(
+        default="base",
+        metadata={
+            "help": (
+                "Repo-defined hf_deberta_v2 architecture preset "
+                "(xsmall|small|base|large) used for synthesized configs."
+            )
+        },
+    )
+
+    # Model source paths are used for pretrained weight loading when from_scratch=false.
     discriminator_model_name_or_path: str = field(
         default="",
         metadata={
@@ -1167,6 +1178,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
     cfg.backbone_type = _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
     cfg.profile = _ensure_choice("model.profile", cfg.profile, _MODEL_PROFILE_CHOICES)
     cfg.hf_attention_kernel = _normalize_hf_attention_kernel(cfg.hf_attention_kernel)
+    cfg.hf_model_size = _ensure_choice("model.hf_model_size", cfg.hf_model_size, _HF_MODEL_SIZE_CHOICES)
     cfg.norm_arch = _ensure_choice("model.norm_arch", cfg.norm_arch, _NORM_ARCH_CHOICES)
     cfg.attention_implementation = _ensure_choice(
         "model.attention_implementation", cfg.attention_implementation, _ATTN_IMPL_CHOICES
@@ -1229,6 +1241,13 @@ def validate_model_config(cfg: ModelConfig) -> None:
             warnings.warn(
                 "model.hf_max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
                 f"Current value ({cfg.hf_max_position_embeddings!r}) has no effect on the rope backbone.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if cfg.hf_model_size != defaults.hf_model_size:
+            warnings.warn(
+                "model.hf_model_size only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf_model_size!r}) has no effect on the rope backbone.",
                 UserWarning,
                 stacklevel=2,
             )
