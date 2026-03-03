@@ -2611,10 +2611,11 @@ def run_pretraining(
 
                 # Phase 2: discriminator update from cached corruption targets.
                 if not skipped_window_due_nonfinite and disc_phase_inputs:
+                    disc_phase_steps = len(disc_phase_inputs)
                     for step_idx, payload in enumerate(disc_phase_inputs):
                         if compile_enabled:
                             _maybe_cudagraph_mark_step_begin()
-                        is_sync_step = step_idx == (ga_steps - 1)
+                        is_sync_step = step_idx == (disc_phase_steps - 1)
                         sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
                         with sync_ctx:
                             disc_phase_out = model.forward_discriminator_phase(

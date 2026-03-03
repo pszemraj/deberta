@@ -2159,6 +2159,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         "token_weighted_scaling",
         "branch_loss_weights",
         "skip_generator_step",
+        "partial_disc_window_sync",
     ],
 )
 def test_run_pretraining_decoupled_integration(
@@ -2266,6 +2267,30 @@ def test_run_pretraining_decoupled_integration(
             export_hf_final=False,
             decoupled_training=True,
         )
+    elif scenario == "partial_disc_window_sync":
+        behavior = {
+            "generator_phase_loss_scale": [2.0, 2.0],
+            "generator_phase_token_count": [0.0, 1.0],
+            "discriminator_phase_loss_scale": 3.0,
+        }
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=0,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=1.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
     else:  # pragma: no cover
         raise AssertionError(f"Unsupported scenario: {scenario}")
 
@@ -2338,6 +2363,11 @@ def test_run_pretraining_decoupled_integration(
     elif scenario == "skip_generator_step":
         assert step_counts == {"gen": 0, "disc": 1}
         assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
+    elif scenario == "partial_disc_window_sync":
+        assert step_counts == {"gen": 1, "disc": 1}
+        model = SimpleRTD.last_instance
+        assert model is not None
+        assert len(model.calls["forward_discriminator_phase"]) == 1
 
 
 def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
