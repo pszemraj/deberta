@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import hashlib
 import inspect
@@ -28,14 +29,19 @@ from deberta.checkpoint_utils import (
 )
 from deberta.config import (
     DataConfig,
+    LoggingConfig,
     ModelConfig,
+    OptimConfig,
     TrainConfig,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_mode,
+    _sync_legacy_train_aliases,
     apply_profile_defaults,
     normalize_mixed_precision,
     validate_data_config,
+    validate_logging_config,
     validate_model_config,
+    validate_optim_config,
     validate_train_config,
     validate_training_workflow_options,
 )
@@ -225,29 +231,49 @@ def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
                 return args[0]
         return t
 
-    payload = asdict(cfg_obj)
-    type_hints = get_type_hints(type(cfg_obj))
-    for f in fields(type(cfg_obj)):
-        name = str(f.name)
-        if name not in payload:
-            continue
-        value = payload[name]
+    def _coerce_scalar(value: Any, target_t: Any) -> Any:
+        """Best-effort scalar cast against an annotation target.
+
+        :param Any value: Raw scalar value.
+        :param Any target_t: Annotation target type.
+        :return Any: Coerced scalar when parseable, else original value.
+        """
         if value is None:
-            continue
-        target_t = _unwrap_optional(type_hints.get(name, f.type))
+            return None
         try:
             if target_t is bool:
-                payload[name] = _coerce_bool_value(value)
-            elif target_t is int and not isinstance(value, bool):
-                payload[name] = int(value)
-            elif target_t is float and not isinstance(value, bool):
-                payload[name] = float(value)
-            elif target_t is str:
-                payload[name] = str(value)
+                return _coerce_bool_value(value)
+            if target_t is int and not isinstance(value, bool):
+                return int(value)
+            if target_t is float and not isinstance(value, bool):
+                return float(value)
+            if target_t is str:
+                return str(value)
         except Exception:
-            # Validation will raise on invalid values; payload coercion is best-effort.
-            continue
-    return payload
+            return value
+        return value
+
+    def _coerce_dataclass_instance(obj: Any) -> dict[str, Any]:
+        """Recursively coerce nested dataclass payload fields.
+
+        :param Any obj: Dataclass instance.
+        :return dict[str, Any]: Serialized/coerced mapping.
+        """
+        payload: dict[str, Any] = {}
+        type_hints = get_type_hints(type(obj))
+        for f in fields(type(obj)):
+            name = str(f.name)
+            value = getattr(obj, name)
+            target_t = _unwrap_optional(type_hints.get(name, f.type))
+            if dataclasses.is_dataclass(value):
+                payload[name] = _coerce_dataclass_instance(value)
+            else:
+                payload[name] = _coerce_scalar(value, target_t)
+        return payload
+
+    if not dataclasses.is_dataclass(cfg_obj):
+        return dict(asdict(cfg_obj)) if isinstance(cfg_obj, dict) else {}
+    return _coerce_dataclass_instance(cfg_obj)
 
 
 def _build_runtime_resolved_tracker_config(
@@ -255,6 +281,8 @@ def _build_runtime_resolved_tracker_config(
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
     disc_config: Any,
     gen_config: Any,
     tokenizer: Any,
@@ -264,56 +292,69 @@ def _build_runtime_resolved_tracker_config(
     :param ModelConfig model_cfg: Effective model config used by training.
     :param DataConfig data_cfg: Effective data config used by training.
     :param TrainConfig train_cfg: Effective train config used by training.
+    :param OptimConfig optim_cfg: Effective optimizer config used by training.
+    :param LoggingConfig logging_cfg: Effective logging config used by training.
     :param Any disc_config: Runtime discriminator backbone config.
     :param Any gen_config: Runtime generator backbone config.
     :param Any tokenizer: Runtime tokenizer.
     :return dict[str, Any]: Null-pruned resolved config payload.
     """
+    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
+
     payload: dict[str, Any] = {
         "model": _coerce_dataclass_payload_types(model_cfg),
         "data": _coerce_dataclass_payload_types(data_cfg),
         "train": _coerce_dataclass_payload_types(train_cfg),
+        "optim": _coerce_dataclass_payload_types(resolved_optim_cfg),
+        "logging": _coerce_dataclass_payload_types(resolved_logging_cfg),
     }
     model_payload = payload["model"]
-    train_payload = payload["train"]
 
     disc_cfg_map = _config_obj_to_mapping(disc_config)
     gen_cfg_map = _config_obj_to_mapping(gen_config)
 
     # Populate commonly inferred model fields for easier reproducibility diffs.
-    if model_payload.get("generator_num_hidden_layers") is None and "num_hidden_layers" in gen_cfg_map:
-        model_payload["generator_num_hidden_layers"] = int(gen_cfg_map["num_hidden_layers"])
-    if model_payload.get("generator_hidden_size") is None and "hidden_size" in gen_cfg_map:
-        model_payload["generator_hidden_size"] = int(gen_cfg_map["hidden_size"])
-    if model_payload.get("generator_intermediate_size") is None and "intermediate_size" in gen_cfg_map:
-        model_payload["generator_intermediate_size"] = int(gen_cfg_map["intermediate_size"])
-    if model_payload.get("generator_num_attention_heads") is None and "num_attention_heads" in gen_cfg_map:
-        model_payload["generator_num_attention_heads"] = int(gen_cfg_map["num_attention_heads"])
-    if model_payload.get("hidden_dropout_prob") is None and "hidden_dropout_prob" in disc_cfg_map:
-        model_payload["hidden_dropout_prob"] = float(disc_cfg_map["hidden_dropout_prob"])
-    if (
-        model_payload.get("attention_probs_dropout_prob") is None
-        and "attention_probs_dropout_prob" in disc_cfg_map
-    ):
-        model_payload["attention_probs_dropout_prob"] = float(disc_cfg_map["attention_probs_dropout_prob"])
-    if model_payload.get("max_position_embeddings") is None and "max_position_embeddings" in disc_cfg_map:
-        model_payload["max_position_embeddings"] = int(disc_cfg_map["max_position_embeddings"])
+    generator_payload = dict(model_payload.get("generator", {}) or {})
+    if generator_payload.get("num_hidden_layers") is None and "num_hidden_layers" in gen_cfg_map:
+        generator_payload["num_hidden_layers"] = int(gen_cfg_map["num_hidden_layers"])
+    if generator_payload.get("hidden_size") is None and "hidden_size" in gen_cfg_map:
+        generator_payload["hidden_size"] = int(gen_cfg_map["hidden_size"])
+    if generator_payload.get("intermediate_size") is None and "intermediate_size" in gen_cfg_map:
+        generator_payload["intermediate_size"] = int(gen_cfg_map["intermediate_size"])
+    if generator_payload.get("num_attention_heads") is None and "num_attention_heads" in gen_cfg_map:
+        generator_payload["num_attention_heads"] = int(gen_cfg_map["num_attention_heads"])
+    model_payload["generator"] = generator_payload
 
-    if model_payload.get("tokenizer_vocab_target") is None:
+    dropout_payload = dict(model_payload.get("dropout", {}) or {})
+    if dropout_payload.get("hidden_prob") is None and "hidden_dropout_prob" in disc_cfg_map:
+        dropout_payload["hidden_prob"] = float(disc_cfg_map["hidden_dropout_prob"])
+    if dropout_payload.get("attention_probs_prob") is None and "attention_probs_dropout_prob" in disc_cfg_map:
+        dropout_payload["attention_probs_prob"] = float(disc_cfg_map["attention_probs_dropout_prob"])
+    model_payload["dropout"] = dropout_payload
+
+    rope_payload = dict(model_payload.get("rope", {}) or {})
+    if rope_payload.get("max_position_embeddings") is None and "max_position_embeddings" in disc_cfg_map:
+        rope_payload["max_position_embeddings"] = int(disc_cfg_map["max_position_embeddings"])
+    model_payload["rope"] = rope_payload
+
+    tokenizer_payload = dict(model_payload.get("tokenizer", {}) or {})
+    if tokenizer_payload.get("vocab_target") is None:
         with suppress(Exception):
-            model_payload["tokenizer_vocab_target"] = int(len(tokenizer))
-    if not str(model_payload.get("pretrained_discriminator_path", "")).strip():
-        model_payload["pretrained_discriminator_path"] = None
-    if not str(model_payload.get("pretrained_generator_path", "")).strip():
-        model_payload["pretrained_generator_path"] = None
+            tokenizer_payload["vocab_target"] = int(len(tokenizer))
+    model_payload["tokenizer"] = tokenizer_payload
 
-    # Resolve inherited branch LRs to effective numeric values.
-    base_lr = float(train_cfg.learning_rate)
-    gen_lr = float(train_cfg.generator_learning_rate)
-    disc_lr = float(getattr(train_cfg, "discriminator_learning_rate", -1.0))
-    train_payload["learning_rate"] = base_lr
-    train_payload["generator_learning_rate"] = gen_lr if gen_lr > 0.0 else base_lr
-    train_payload["discriminator_learning_rate"] = disc_lr if disc_lr > 0.0 else base_lr
+    pretrained_payload = dict(model_payload.get("pretrained", {}) or {})
+    if not str(pretrained_payload.get("discriminator_path", "")).strip():
+        pretrained_payload["discriminator_path"] = None
+    if not str(pretrained_payload.get("generator_path", "")).strip():
+        pretrained_payload["generator_path"] = None
+    model_payload["pretrained"] = pretrained_payload
 
     return _drop_none_recursive(payload)
 
@@ -1447,11 +1488,59 @@ def _validate_output_dir_preflight(
         )
 
 
+def _resolve_section_cfg_compat(
+    *,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None,
+    logging_cfg: LoggingConfig | None,
+) -> tuple[OptimConfig, LoggingConfig]:
+    """Resolve optional optim/logging configs with train-legacy compatibility.
+
+    :param TrainConfig train_cfg: Train config object.
+    :param OptimConfig | None optim_cfg: Optional explicit optim config.
+    :param LoggingConfig | None logging_cfg: Optional explicit logging config.
+    :return tuple[OptimConfig, LoggingConfig]: Effective optim/logging configs.
+    """
+    if optim_cfg is None:
+        resolved_optim_cfg = OptimConfig(
+            learning_rate=getattr(train_cfg, "learning_rate", 5e-4),
+            generator_learning_rate=getattr(train_cfg, "generator_learning_rate", -1.0),
+            discriminator_learning_rate=getattr(train_cfg, "discriminator_learning_rate", -1.0),
+            weight_decay=getattr(train_cfg, "weight_decay", 0.01),
+            adam_beta1=getattr(train_cfg, "adam_beta1", 0.9),
+            adam_beta2=getattr(train_cfg, "adam_beta2", 0.999),
+            adam_epsilon=getattr(train_cfg, "adam_epsilon", 1e-8),
+            lr_scheduler_type=getattr(train_cfg, "lr_scheduler_type", "linear"),
+            warmup_steps=getattr(train_cfg, "warmup_steps", 1_000),
+            max_grad_norm=getattr(train_cfg, "max_grad_norm", 1.0),
+        )
+    else:
+        resolved_optim_cfg = optim_cfg
+
+    if logging_cfg is None:
+        resolved_logging_cfg = LoggingConfig(
+            project_name=getattr(train_cfg, "project_name", "deberta-train"),
+            run_name=getattr(train_cfg, "run_name", None),
+            output_dir=getattr(train_cfg, "logging_output_dir", None),
+            logging_steps=getattr(train_cfg, "logging_steps", 50),
+            report_to=getattr(train_cfg, "report_to", "none"),
+            wandb_watch=getattr(train_cfg, "wandb_watch", "gradients"),
+            wandb_watch_log_freq=getattr(train_cfg, "wandb_watch_log_freq", 100),
+            debug_metrics=getattr(train_cfg, "debug_metrics", False),
+        )
+    else:
+        resolved_logging_cfg = logging_cfg
+
+    return resolved_optim_cfg, resolved_logging_cfg
+
+
 def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run non-destructive preflight checks for `deberta train`.
@@ -1463,29 +1552,60 @@ def run_pretraining_dry_run(
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
     :param TrainConfig train_cfg: Training configuration.
+    :param OptimConfig | None optim_cfg: Optional optimizer configuration.
+    :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path.
     :raises RuntimeError: If a preflight stage fails.
     :return dict[str, Any]: Summary of resolved dry-run checks.
     """
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    validate_optim_config(resolved_optim_cfg)
+    validate_logging_config(resolved_logging_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
 
-    output_dir = _resolve_output_dir(
+    checkpoint_output_dir = _resolve_output_dir(
         output_dir=train_cfg.output_dir,
         project_name=train_cfg.project_name,
         config_path=config_path,
         run_name=train_cfg.run_name,
     )
+    logging_output_dir = (
+        Path(str(resolved_logging_cfg.output_dir))
+        if resolved_logging_cfg.output_dir is not None and str(resolved_logging_cfg.output_dir).strip()
+        else checkpoint_output_dir
+    )
     _validate_output_dir_preflight(
-        output_dir=output_dir,
+        output_dir=checkpoint_output_dir,
         overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
     )
     ckpt = _resolve_resume_checkpoint(
-        output_dir=output_dir,
+        output_dir=checkpoint_output_dir,
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=True,
     )
@@ -1508,10 +1628,13 @@ def run_pretraining_dry_run(
 
     # Validate run snapshot compatibility in resume mode, without writing files.
     _persist_or_validate_run_configs(
-        output_dir=output_dir,
+        output_dir=checkpoint_output_dir,
+        logging_output_dir=logging_output_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
         resume_checkpoint=ckpt,
         config_path=config_path,
         is_main_process=False,
@@ -1607,7 +1730,9 @@ def run_pretraining_dry_run(
 
     return {
         "status": "ok",
-        "output_dir": str(output_dir),
+        "output_dir": str(checkpoint_output_dir),
+        "checkpoint_output_dir": str(checkpoint_output_dir),
+        "logging_output_dir": str(logging_output_dir),
         "resume_checkpoint": str(ckpt) if ckpt is not None else None,
         "effective_compile_scope": str(compile_scope) if compile_enabled else None,
         "mixed_precision": str(mixed_precision),
@@ -1624,6 +1749,8 @@ def run_pretraining(
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> None:
     """Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
@@ -1631,10 +1758,23 @@ def run_pretraining(
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
     :param TrainConfig train_cfg: Training configuration.
+    :param OptimConfig | None optim_cfg: Optional optimizer configuration.
+    :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path for auto output-dir naming.
     """
     from accelerate import Accelerator
     from accelerate.utils import set_seed
+
+    resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
@@ -1650,12 +1790,25 @@ def run_pretraining(
     )
 
     setup_process_logging(accelerator.is_main_process)
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     # Validate config contract up-front before side effects (filesystem/network/model loading).
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    validate_optim_config(resolved_optim_cfg)
+    validate_logging_config(resolved_logging_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
     compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
     compile_scope = compile_scope_requested
@@ -1700,11 +1853,27 @@ def run_pretraining(
         config_path=config_path,
         run_name=train_cfg.run_name,
     )
-    object.__setattr__(train_cfg, "output_dir", str(output_dir))
+    object.__setattr__(train_cfg.checkpoint, "output_dir", str(output_dir))
+    if resolved_logging_cfg.output_dir is None or not str(resolved_logging_cfg.output_dir).strip():
+        logging_output_dir = output_dir
+    else:
+        logging_output_dir = Path(str(resolved_logging_cfg.output_dir)).expanduser().resolve()
+    object.__setattr__(resolved_logging_cfg, "output_dir", str(logging_output_dir))
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     if accelerator.is_main_process and (
         configured_output_dir is None or not str(configured_output_dir).strip()
     ):
         logger.info("train.output_dir unset; auto-selected output_dir=%s", output_dir)
+    if accelerator.is_main_process and logging_output_dir != output_dir:
+        logger.info(
+            "logging.output_dir explicitly set to %s (checkpoint output_dir=%s)",
+            logging_output_dir,
+            output_dir,
+        )
 
     # Make/validate output dir on main.
     _prepare_output_dir(
@@ -1713,6 +1882,9 @@ def run_pretraining(
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=accelerator.is_main_process,
     )
+    if accelerator.is_main_process:
+        logging_output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     ckpt = _resolve_resume_checkpoint_for_accelerator(
         accelerator=accelerator,
         output_dir=output_dir,
@@ -1720,9 +1892,12 @@ def run_pretraining(
     )
     _persist_or_validate_run_configs(
         output_dir=output_dir,
+        logging_output_dir=logging_output_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
         resume_checkpoint=ckpt,
         config_path=config_path,
         is_main_process=accelerator.is_main_process,
@@ -1930,13 +2105,15 @@ def run_pretraining(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
         disc_config=disc_config,
         gen_config=gen_config,
         tokenizer=tokenizer,
     )
     if accelerator.is_main_process:
         try:
-            _dump_yaml_mapping(tracker_cfg_runtime, output_dir / "config_resolved.yaml")
+            _dump_yaml_mapping(tracker_cfg_runtime, logging_output_dir / "config_resolved.yaml")
         except Exception:
             logger.exception("Failed to write runtime-resolved config snapshot.")
 
@@ -1953,7 +2130,7 @@ def run_pretraining(
     crash_step: int | None = None
     exit_code = 0
     train_started_at = time.perf_counter()
-    metrics_path = output_dir / "metrics.jsonl.gz"
+    metrics_path = logging_output_dir / "metrics.jsonl.gz"
     debug_metrics_enabled = bool(train_cfg.debug_metrics)
     wandb_run: Any | None = None
     max_tracker_step_logged = 0
@@ -1985,7 +2162,7 @@ def run_pretraining(
             if train_cfg.run_name is not None and str(train_cfg.run_name).strip():
                 tracker_run_name = str(train_cfg.run_name).strip()
             else:
-                tracker_run_name = output_dir.name
+                tracker_run_name = logging_output_dir.name
             _init_trackers(
                 accelerator=accelerator,
                 project_name=str(train_cfg.project_name).strip(),
@@ -2004,16 +2181,16 @@ def run_pretraining(
                     uploaded_config = _upload_wandb_original_config(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
-                        config_original_path=output_dir / "config_original.yaml",
+                        config_original_path=logging_output_dir / "config_original.yaml",
                         run_name=tracker_run_name,
-                        config_resolved_path=output_dir / "config_resolved.yaml",
+                        config_resolved_path=logging_output_dir / "config_resolved.yaml",
                         config_source_path=config_path,
                     )
                     if not uploaded_config:
                         logger.warning(
                             "W&B config snapshot upload skipped; expected paths: %s, %s (source=%s).",
-                            output_dir / "config_original.yaml",
-                            output_dir / "config_resolved.yaml",
+                            logging_output_dir / "config_original.yaml",
+                            logging_output_dir / "config_resolved.yaml",
                             config_path,
                         )
                 except Exception:
@@ -2361,7 +2538,7 @@ def run_pretraining(
                             nonfinite_reason = str(offending)
                             lr_now = _scheduler_current_lr(gen_lr_scheduler)
                             nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=output_dir,
+                                output_dir=logging_output_dir,
                                 step=int(global_step + 1),
                                 micro_step_idx=int(step_idx),
                                 offending=offending,
@@ -2471,7 +2648,7 @@ def run_pretraining(
                                 nonfinite_reason = str(offending)
                                 lr_now = _scheduler_current_lr(disc_lr_scheduler)
                                 nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                    output_dir=output_dir,
+                                    output_dir=logging_output_dir,
                                     step=int(global_step + 1),
                                     micro_step_idx=int(step_idx),
                                     offending=offending,
@@ -2851,7 +3028,7 @@ def run_pretraining(
                         nonfinite_reason = str(offending)
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=output_dir,
+                            output_dir=logging_output_dir,
                             step=int(global_step + 1),
                             micro_step_idx=int(step_idx),
                             offending=offending,
@@ -2901,7 +3078,7 @@ def run_pretraining(
                         nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=output_dir,
+                            output_dir=logging_output_dir,
                             step=int(global_step + 1),
                             micro_step_idx=int(step_idx),
                             offending=str(nonfinite_reason),
@@ -2942,7 +3119,7 @@ def run_pretraining(
                             nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
                             lr_now = _scheduler_current_lr(lr_scheduler)
                             nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=output_dir,
+                                output_dir=logging_output_dir,
                                 step=int(global_step + 1),
                                 micro_step_idx=int(step_idx),
                                 offending=str(nonfinite_reason),

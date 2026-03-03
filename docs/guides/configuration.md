@@ -8,11 +8,9 @@ The loader accepts nested YAML/JSON with these top-level sections:
 - `data`
 - `train`
 - `optim`
-- `checkpoint`
 - `logging`
-- `debug`
 
-Runtime training is driven by `ModelConfig`, `DataConfig`, and `TrainConfig`. The additional sections are parsed for strict top-level schema support and projected onto runtime train/logging knobs where applicable.
+There is no flat/legacy mode and no extra top-level sections.
 
 ## Load pipeline
 
@@ -20,12 +18,11 @@ Runtime training is driven by `ModelConfig`, `DataConfig`, and `TrainConfig`. Th
 
 1. parse YAML/JSON
 2. resolve variables (`$variables.*`, `{$variables.*}`, `${variables.*}`)
-3. build dataclasses
+3. build nested frozen dataclasses
 4. apply preset defaults (`--preset`, if provided)
-5. apply explicit CLI flags (`--max_steps`, `--dataset_name`, ...)
-6. apply typed dotted overrides (`--override section.field=value`)
-7. apply profile/backbone effective defaults (`apply_profile_defaults`)
-8. run validation (`validate_model_config`, `validate_data_config`, `validate_train_config`, workflow checks)
+5. apply direct dotted CLI flags (`--train.max_steps 2000`, `--optim.scheduler.warmup_steps 500`, ...)
+6. apply profile/backbone effective defaults (`apply_profile_defaults`)
+7. run validation (`validate_model_config`, `validate_data_config`, `validate_train_config`, `validate_optim_config`, `validate_logging_config`, workflow checks)
 
 Invalid keys, bad types, and incompatible combinations raise immediately.
 
@@ -33,11 +30,10 @@ Invalid keys, bad types, and incompatible combinations raise immediately.
 
 Highest priority wins:
 
-1. `--override section.field=value`
-2. explicit CLI field flags
-3. config file values
-4. preset-injected values
-5. dataclass defaults
+1. direct dotted CLI flags (`--section.path value`)
+2. config file values
+3. preset-injected values
+4. dataclass defaults
 
 When a value from the source config file is changed later by preset/CLI/default normalization, the CLI emits explicit mutation warnings to stderr.
 
@@ -50,41 +46,51 @@ Supported forms:
 
 Circular references and unknown variable paths fail fast.
 
-## Dotted overrides
-
-Examples:
+## Dotflag examples
 
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_base.yaml \
-  --override train.max_steps=2000 \
-  --override model.hf_model_size=small \
-  --override data.max_seq_length=1024
+  --train.max_steps 2000 \
+  --optim.scheduler.warmup_steps 200 \
+  --data.packing.max_seq_length 1024 \
+  --logging.wandb.enabled true \
+  --logging.backend none
 ```
 
-Overrides are type-cast against dataclass field annotations (`bool`, `int`, `float`, `str`, optional types).
+All values are type-cast against dataclass field annotations (`bool`, `int`, `float`, `str`, optional types).
 
-## Parity++ effective defaults (`backbone_type=hf_deberta_v2`)
+## Parity++ effective defaults (`model.backbone_type=hf_deberta_v2`)
 
 When these fields are not explicitly set by user config or CLI, the loader applies:
 
-- `train.mask_token_prob = 1.0`
-- `train.random_token_prob = 0.0`
-- `train.disc_loss_weight = 10.0`
-- `train.adam_epsilon = 1e-6`
-- `train.warmup_steps = 10000`
+- `train.objective.mask_token_prob = 1.0`
+- `train.objective.random_token_prob = 0.0`
+- `train.objective.disc_loss_weight = 10.0`
+- `optim.adam.epsilon = 1e-6`
+- `optim.scheduler.warmup_steps = 10000`
 - `train.token_weighted_gradient_accumulation = true`
 
-`train.learning_rate` is not auto-changed by parity++ defaults.
+`optim.lr.base` is not auto-changed by parity++ defaults.
 
 ## Snapshot files and reproducibility
 
 At run start, the trainer writes:
 
-- `config_original.yaml`: exact source file when available, otherwise resolved payload fallback
-- `config_resolved.yaml`: runtime-resolved payload used for tracking/logging
+- checkpoint output dir:
+  - `model_config.json`
+  - `data_config.json`
+  - `train_config.json`
+  - `optim_config.json`
+  - `logging_config.json`
+  - `run_metadata.json`
+- logging output dir:
+  - `config_original.yaml`
+  - `config_resolved.yaml`
+
+If `logging.output_dir` is unset, it defaults to `train.checkpoint.output_dir`.
 
 For W&B runs, the trainer uploads:
 
 - `config_resolved.yaml`
-- source config file path payload when available
+- source config file payload when available
 - `config_original.yaml` fallback when no source file is available

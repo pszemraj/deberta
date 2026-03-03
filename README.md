@@ -34,6 +34,12 @@ deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml
 # preset starter (no config file)
 deberta train --preset deberta-v3-base
 
+# direct dotted overrides (no --override flag)
+deberta train --preset deberta-v3-base \
+  --train.max_steps 2000 \
+  --optim.scheduler.warmup_steps 500 \
+  --logging.wandb.enabled true
+
 # export one checkpoint
 deberta export runs/<run_name>/checkpoint-<step> \
   --what discriminator \

@@ -16,9 +16,10 @@ Use the provided small parity config and shorten the run with dotted overrides:
 
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
-  --override train.max_steps=500 \
-  --override train.output_dir=runs/quickstart_hfv2_small \
-  --override train.report_to=none
+  --train.max_steps 500 \
+  --train.checkpoint.output_dir runs/quickstart_hfv2_small \
+  --logging.backend none \
+  --logging.wandb.enabled false
 ```
 
 Distributed launch (single node FSDP2 config):
@@ -44,3 +45,6 @@ Each run directory includes:
 - `config_resolved.yaml`
 - `model_config.json`
 - `data_config.json`
+- `train_config.json`
+- `optim_config.json`
+- `logging_config.json`
