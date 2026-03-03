@@ -21,7 +21,7 @@ The `rope` backbone is an experimental modern encoder path that uses the DeBERTa
 
 ## HF Reference Defaults vs Repo Defaults
 
-For `model.discriminator_model_name_or_path=microsoft/deberta-v3-base`, the HF config includes:
+The reference DeBERTa-v3-base architecture includes:
 
 ```yaml
 hidden_act: gelu
@@ -55,7 +55,7 @@ Builder behavior is intentionally deterministic and split into two phases:
 |---|---|---|
 | `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
 | `backbone_type=rope`, `from_scratch=false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
-| `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
+| `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | repo-owned synthesized config from `model.hf_model_size` + runtime overrides | derived from discriminator config (same width/heads/ffn, reduced depth) |
 
 ### Weight Sources
 
@@ -182,7 +182,7 @@ With `backbone_type=hf_deberta_v2`, training uses the repo-native DeBERTa-v2 imp
 [`src/deberta/modeling/deberta_v2_native.py`](../src/deberta/modeling/deberta_v2_native.py).
 Training does not instantiate `transformers.DebertaV2Model` directly.
 
-HF checkpoints/configs are still used as sources (`AutoConfig`/`from_pretrained`) for compatibility.
+HF configs are synthesized in-repo; only pretrained weights (when `model.from_scratch=false`) come from model sources.
 
 Context length for this mode should be configured directly in YAML with
 `model.hf_max_position_embeddings` (supported when `model.from_scratch=true`).

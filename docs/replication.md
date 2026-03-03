@@ -15,7 +15,6 @@ model:
   backbone_type: hf_deberta_v2
   hf_model_size: base
   tokenizer_name_or_path: microsoft/deberta-v3-base
-  discriminator_model_name_or_path: microsoft/deberta-v3-base
   generator_model_name_or_path: null
   from_scratch: true
   embedding_sharing: gdes

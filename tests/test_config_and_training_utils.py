@@ -241,15 +241,14 @@ def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    ("config_name", "expected_disc_source"),
+    "config_name",
     [
-        ("pretrain_hf_deberta_v2_parity_base.yaml", "microsoft/deberta-v3-base"),
-        ("pretrain_hf_deberta_v2_parity_small.yaml", "microsoft/deberta-v3-small"),
+        "pretrain_hf_deberta_v2_parity_base.yaml",
+        "pretrain_hf_deberta_v2_parity_small.yaml",
     ],
 )
 def test_parity_yaml_configs_parse_and_validate(
     config_name: str,
-    expected_disc_source: str,
 ) -> None:
     pytest.importorskip("yaml")
 
@@ -269,7 +268,7 @@ def test_parity_yaml_configs_parse_and_validate(
 
     assert model_cfg.profile == "deberta_v3_parity"
     assert model_cfg.backbone_type == "hf_deberta_v2"
-    assert model_cfg.discriminator_model_name_or_path == expected_disc_source
+    assert model_cfg.discriminator_model_name_or_path == ""
     assert bool(train_cfg.decoupled_training) is True
 
 
