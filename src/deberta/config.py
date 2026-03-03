@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import TypeVar
+from typing import Any, TypeVar
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
@@ -1506,36 +1506,71 @@ def apply_profile_defaults(*, model_cfg: ModelConfig, train_cfg: TrainConfig) ->
     :param ModelConfig model_cfg: Model config to update in-place.
     :param TrainConfig train_cfg: Train config to update in-place.
     """
+
+    def _explicit_fields(cfg_obj: Any) -> set[str]:
+        """Return explicitly provided field names attached to a config object.
+
+        :param Any cfg_obj: Config dataclass object.
+        :return set[str]: Explicitly provided field names.
+        """
+        raw = getattr(cfg_obj, "_explicit_fields", None)
+        if raw is None:
+            return set()
+        if isinstance(raw, set):
+            return {str(x) for x in raw}
+        if isinstance(raw, (list, tuple, frozenset)):
+            return {str(x) for x in raw}
+        return set()
+
+    explicit_model_fields = _explicit_fields(model_cfg)
+    explicit_train_fields = _explicit_fields(train_cfg)
+
     profile = str(model_cfg.profile).strip().lower()
     model_defaults = ModelConfig()
     train_defaults = TrainConfig()
 
     if profile == "deberta_v3_parity":
         # Profile intends parity defaults on HF DeBERTa-v2 path unless user picked otherwise.
-        if str(model_cfg.backbone_type) == str(model_defaults.backbone_type):
+        if "backbone_type" not in explicit_model_fields and str(model_cfg.backbone_type) == str(
+            model_defaults.backbone_type
+        ):
             model_cfg.backbone_type = "hf_deberta_v2"
 
-        if str(model_cfg.embedding_sharing) == str(model_defaults.embedding_sharing):
+        if "embedding_sharing" not in explicit_model_fields and str(model_cfg.embedding_sharing) == str(
+            model_defaults.embedding_sharing
+        ):
             model_cfg.embedding_sharing = "gdes"
 
-        if str(model_cfg.hf_attention_kernel) == str(model_defaults.hf_attention_kernel):
+        if "hf_attention_kernel" not in explicit_model_fields and str(model_cfg.hf_attention_kernel) == str(
+            model_defaults.hf_attention_kernel
+        ):
             model_cfg.hf_attention_kernel = "dynamic"
 
     # Parity++ defaults apply to hf_deberta_v2 unless explicitly overridden.
     if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
-        if float(train_cfg.mask_token_prob) == float(train_defaults.mask_token_prob):
-            train_cfg.mask_token_prob = 1.0
-        if float(train_cfg.random_token_prob) == float(train_defaults.random_token_prob):
-            train_cfg.random_token_prob = 0.0
-        if float(train_cfg.disc_loss_weight) == float(train_defaults.disc_loss_weight):
-            train_cfg.disc_loss_weight = 10.0
-        if float(train_cfg.adam_epsilon) == float(train_defaults.adam_epsilon):
-            train_cfg.adam_epsilon = 1e-6
-        if int(train_cfg.warmup_steps) == int(train_defaults.warmup_steps):
-            train_cfg.warmup_steps = 10_000
-        if bool(train_cfg.token_weighted_gradient_accumulation) == bool(
-            train_defaults.token_weighted_gradient_accumulation
+        if "mask_token_prob" not in explicit_train_fields and float(train_cfg.mask_token_prob) == float(
+            train_defaults.mask_token_prob
         ):
+            train_cfg.mask_token_prob = 1.0
+        if "random_token_prob" not in explicit_train_fields and float(train_cfg.random_token_prob) == float(
+            train_defaults.random_token_prob
+        ):
+            train_cfg.random_token_prob = 0.0
+        if "disc_loss_weight" not in explicit_train_fields and float(train_cfg.disc_loss_weight) == float(
+            train_defaults.disc_loss_weight
+        ):
+            train_cfg.disc_loss_weight = 10.0
+        if "adam_epsilon" not in explicit_train_fields and float(train_cfg.adam_epsilon) == float(
+            train_defaults.adam_epsilon
+        ):
+            train_cfg.adam_epsilon = 1e-6
+        if "warmup_steps" not in explicit_train_fields and int(train_cfg.warmup_steps) == int(
+            train_defaults.warmup_steps
+        ):
+            train_cfg.warmup_steps = 10_000
+        if "token_weighted_gradient_accumulation" not in explicit_train_fields and bool(
+            train_cfg.token_weighted_gradient_accumulation
+        ) == bool(train_defaults.token_weighted_gradient_accumulation):
             train_cfg.token_weighted_gradient_accumulation = False
 
 

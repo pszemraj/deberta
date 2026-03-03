@@ -4553,6 +4553,81 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
     assert seen["config_path"] == cfg_path
 
 
+def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  profile: deberta_v3_parity",
+                "  backbone_type: hf_deberta_v2",
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+                "  warmup_steps: 1000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path)])
+
+    assert "train_cfg" in seen
+    assert int(seen["train_cfg"].warmup_steps) == 1000
+    assert seen["config_path"] == cfg_path
+    err = capsys.readouterr().err
+    assert "train.warmup_steps" not in err
+
+
+def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path), "--max_steps", "7"])
+
+    assert "train_cfg" in seen
+    assert int(seen["train_cfg"].max_steps) == 7
+    err = capsys.readouterr().err
+    assert "train.max_steps: 5 -> 7 (CLI override (--max-steps))" in err
+
+
 def test_main_cli_train_with_config_and_preset_applies_model_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -4871,6 +4946,37 @@ def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
     assert train_cfg.adam_epsilon == pytest.approx(5e-6)
     assert train_cfg.warmup_steps == 2_000
     assert train_cfg.token_weighted_gradient_accumulation is False
+
+
+def test_apply_profile_defaults_honors_explicit_fields_even_when_matching_raw_defaults() -> None:
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        embedding_sharing="es",
+        hf_attention_kernel="auto",
+    )
+    train_cfg = TrainConfig(
+        mask_token_prob=0.8,
+        random_token_prob=0.1,
+        disc_loss_weight=50.0,
+        adam_epsilon=1e-8,
+        warmup_steps=1_000,
+        token_weighted_gradient_accumulation=True,
+    )
+    model_cfg._explicit_fields = {"backbone_type", "embedding_sharing", "hf_attention_kernel"}
+    train_cfg._explicit_fields = {"mask_token_prob", "random_token_prob", "disc_loss_weight", "adam_epsilon", "warmup_steps", "token_weighted_gradient_accumulation"}
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.embedding_sharing == "es"
+    assert model_cfg.hf_attention_kernel == "auto"
+    assert train_cfg.mask_token_prob == pytest.approx(0.8)
+    assert train_cfg.random_token_prob == pytest.approx(0.1)
+    assert train_cfg.disc_loss_weight == pytest.approx(50.0)
+    assert train_cfg.adam_epsilon == pytest.approx(1e-8)
+    assert train_cfg.warmup_steps == 1_000
+    assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
