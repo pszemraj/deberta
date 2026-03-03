@@ -1127,7 +1127,7 @@ def test_build_backbone_configs_rejects_invalid_model_options_early():
         from_scratch=True,
         norm_arch="not-valid",
     )
-    with pytest.raises(ValueError, match="model.norm_arch must be one of"):
+    with pytest.raises(ValueError, match="model.rope.norm_arch must be one of"):
         builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=DummyTokenizer(vocab_size=50265),

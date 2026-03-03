@@ -1671,7 +1671,7 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
     )
 
     cfg.hf_attention_kernel = "bad_kernel"
-    with pytest.raises(ValueError, match="hf_attention_kernel must be one of"):
+    with pytest.raises(ValueError, match="model.hf.attention_kernel must be one of"):
         _ = DebertaV2Model(cfg)
 
 

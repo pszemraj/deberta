@@ -37,7 +37,9 @@ from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
     Config,
     DataConfig,
+    LoggingConfig,
     ModelConfig,
+    OptimConfig,
     TrainConfig,
     _normalize_hf_attention_kernel,
     _normalize_sdpa_kernel,
@@ -52,7 +54,9 @@ from deberta.config import (
     load_model_config_snapshot,
     normalize_mixed_precision,
     validate_data_config,
+    validate_logging_config,
     validate_model_config,
+    validate_optim_config,
     validate_train_config,
     validate_training_workflow_options,
 )
@@ -127,19 +131,25 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
             [
                 "model:",
                 "  backbone_type: rope",
-                "  ffn_type: swiglu",
+                "  rope:",
+                "    ffn_type: swiglu",
                 "data:",
-                "  max_seq_length: 128",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "  packing:",
+                "    max_seq_length: 128",
                 "train:",
-                "  overwrite_output_dir: true",
-                "  mlm_max_ngram: 3",
+                "  checkpoint:",
+                "    overwrite_output_dir: true",
+                "  objective:",
+                "    mlm_max_ngram: 3",
             ]
         ),
         encoding="utf-8",
     )
     model_nested, data_nested, train_nested = _load_yaml(nested)
-    assert model_nested.ffn_type == "swiglu"
-    assert data_nested.max_seq_length == 128
+    assert model_nested.rope.ffn_type == "swiglu"
+    assert data_nested.packing.max_seq_length == 128
     assert train_nested.overwrite_output_dir is True
     assert train_nested.mlm_max_ngram == 3
     assert train_nested.mixed_precision == "bf16"
@@ -157,11 +167,8 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    _, data_flat, train_flat = _load_yaml(flat)
-    assert data_flat.max_seq_length == 64
-    assert train_flat.overwrite_output_dir is False
-    assert train_flat.mlm_max_ngram == 1
-    assert normalize_mixed_precision(train_flat.mixed_precision) == "no"
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
+        _load_yaml(flat)
 
 
 def test_load_json_nested_and_flat(tmp_path: Path):
@@ -169,16 +176,20 @@ def test_load_json_nested_and_flat(tmp_path: Path):
     nested.write_text(
         json.dumps(
             {
-                "model": {"backbone_type": "rope", "ffn_type": "mlp"},
-                "data": {"max_seq_length": 96},
-                "train": {"generator_learning_rate": 3.0e-4, "disc_loss_weight": 50.0},
+                "model": {"backbone_type": "rope", "rope": {"ffn_type": "mlp"}},
+                "data": {
+                    "source": {"dataset_name": "HuggingFaceFW/fineweb-edu"},
+                    "packing": {"max_seq_length": 96},
+                },
+                "train": {"objective": {"disc_loss_weight": 50.0}},
+                "optim": {"lr": {"generator": 3.0e-4}},
             }
         ),
         encoding="utf-8",
     )
     model_nested, data_nested, train_nested = _load_json(nested)
-    assert model_nested.ffn_type == "mlp"
-    assert data_nested.max_seq_length == 96
+    assert model_nested.rope.ffn_type == "mlp"
+    assert data_nested.packing.max_seq_length == 96
     assert train_nested.generator_learning_rate == pytest.approx(3.0e-4)
     assert train_nested.disc_loss_weight == pytest.approx(50.0)
 
@@ -194,10 +205,8 @@ def test_load_json_nested_and_flat(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    _, data_flat, train_flat = _load_json(flat)
-    assert data_flat.max_seq_length == 80
-    assert train_flat.mlm_max_ngram == 2
-    assert train_flat.mask_token_prob == pytest.approx(0.7)
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
+        _load_json(flat)
 
 
 def test_load_yaml_resolves_variables(tmp_path: Path):
@@ -213,18 +222,21 @@ def test_load_yaml_resolves_variables(tmp_path: Path):
                 "model:",
                 "  backbone_type: hf_deberta_v2",
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
-                "  max_seq_length: $variables.seq",
-                "train:",
-                "  max_steps: 10",
-                "  learning_rate: $variables.lr",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "  packing:",
+                "    max_seq_length: $variables.seq",
+                "optim:",
+                "  lr:",
+                "    base: $variables.lr",
+                "logging:",
                 "  run_name: run-{$variables.seq}",
             ]
         ),
         encoding="utf-8",
     )
     _, data_cfg, train_cfg = _load_yaml(cfg)
-    assert int(data_cfg.max_seq_length) == 256
+    assert int(data_cfg.packing.max_seq_length) == 256
     assert float(train_cfg.learning_rate) == pytest.approx(5e-4)
     assert train_cfg.run_name == "run-256"
 
@@ -240,7 +252,8 @@ def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
                 "  a: $variables.b",
                 "  b: $variables.a",
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 1",
             ]
@@ -258,7 +271,8 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 1",
             ]
@@ -270,7 +284,7 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.train = TrainConfig(max_steps=2)  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
-        cfg.optim.warmup_steps = 5  # type: ignore[misc]
+        cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
 
 
 def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
@@ -280,19 +294,22 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 5",
+                "  checkpoint:",
+                "    save_steps: 777",
                 "optim:",
-                "  warmup_steps: 222",
-                "checkpoint:",
-                "  save_steps: 777",
+                "  scheduler:",
+                "    warmup_steps: 222",
                 "logging:",
-                "  report_to: wandb",
+                "  backend: none",
                 "  wandb:",
+                "    enabled: true",
                 "    watch: all",
-                "debug:",
-                "  debug_metrics: true",
+                "  debug:",
+                "    metrics: true",
             ]
         ),
         encoding="utf-8",
@@ -307,20 +324,20 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
 
 def test_apply_dotted_override_supports_nested_section_paths() -> None:
     cfg = Config(
-        data=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+        data=DataConfig(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
         train=TrainConfig(max_steps=1),
     )
     cfg2 = apply_dotted_override(cfg, "logging.wandb.watch=all")
-    cfg2 = apply_dotted_override(cfg2, "optim.warmup_steps=123")
+    cfg2 = apply_dotted_override(cfg2, "optim.scheduler.warmup_steps=123")
     assert cfg2.logging.wandb.watch == "all"
-    assert int(cfg2.optim.warmup_steps) == 123
+    assert int(cfg2.optim.scheduler.warmup_steps) == 123
     assert int(cfg2.train.warmup_steps) == 123
 
 
 def test_load_json_unknown_key_raises(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
-    with pytest.raises(ValueError, match="Unknown keys in config file"):
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
         _load_json(bad)
 
 
@@ -414,7 +431,7 @@ def test_load_model_config_snapshot_rejects_missing_required_key() -> None:
 
 def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
     data_raw = asdict(DataConfig())
-    data_raw.pop("dataset_name")
+    data_raw.pop("source")
     with pytest.raises(ValueError, match="Missing required data_config.json keys"):
         load_data_config_snapshot(data_raw, source="data_config.json")
 
@@ -1254,6 +1271,10 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
         generator_learning_rate=-1.0,
         discriminator_learning_rate=-1.0,
     )
+    optim_cfg = OptimConfig(
+        learning_rate=5e-4, generator_learning_rate=-1.0, discriminator_learning_rate=-1.0
+    )
+    logging_cfg = LoggingConfig()
     disc_cfg = types.SimpleNamespace(
         num_hidden_layers=12,
         hidden_dropout_prob=0.1,
@@ -1284,24 +1305,25 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
         disc_config=disc_cfg,
         gen_config=gen_cfg,
         tokenizer=tokenizer,
     )
 
-    assert payload["model"]["generator_num_hidden_layers"] == 6
-    assert payload["model"]["generator_hidden_size"] == 384
-    assert payload["model"]["generator_intermediate_size"] == 1536
-    assert payload["model"]["generator_num_attention_heads"] == 6
-    assert payload["model"]["hidden_dropout_prob"] == pytest.approx(0.1)
-    assert payload["model"]["attention_probs_dropout_prob"] == pytest.approx(0.1)
-    assert payload["model"]["tokenizer_vocab_target"] == 32000
-    assert payload["train"]["generator_learning_rate"] == pytest.approx(5e-4)
-    assert payload["train"]["discriminator_learning_rate"] == pytest.approx(5e-4)
-    assert payload["model"]["pretrained_discriminator_path"] == "microsoft/deberta-v3-base"
-    assert "pretrained_generator_path" not in payload["model"]
-    assert "pretrained_ffn_type" not in payload["model"]
-    assert "resume_from_checkpoint" not in payload["train"]
+    assert payload["model"]["generator"]["num_hidden_layers"] == 6
+    assert payload["model"]["generator"]["hidden_size"] == 384
+    assert payload["model"]["generator"]["intermediate_size"] == 1536
+    assert payload["model"]["generator"]["num_attention_heads"] == 6
+    assert payload["model"]["dropout"]["hidden_prob"] == pytest.approx(0.1)
+    assert payload["model"]["dropout"]["attention_probs_prob"] == pytest.approx(0.1)
+    assert payload["model"]["tokenizer"]["vocab_target"] == 32000
+    assert payload["optim"]["lr"]["base"] == pytest.approx(5e-4)
+    assert payload["model"]["pretrained"]["discriminator_path"] == "microsoft/deberta-v3-base"
+    assert "generator_path" not in payload["model"]["pretrained"]
+    assert "resume_from_checkpoint" not in payload["train"]["checkpoint"]
+    assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
     assert "effective" not in payload
 
 
@@ -1352,7 +1374,7 @@ def test_build_runtime_resolved_tracker_config_omits_effective_backbone_payload(
         tokenizer=tokenizer,
     )
 
-    assert set(payload.keys()) == {"model", "data", "train"}
+    assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
     assert "effective" not in payload
 
 
@@ -1368,10 +1390,12 @@ def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None
     )
     data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
     train_cfg = TrainConfig(
+        token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
+    )
+    optim_cfg = OptimConfig(
         learning_rate="5e-4",  # type: ignore[arg-type]
         adam_epsilon="1e-6",  # type: ignore[arg-type]
         warmup_steps="1000",  # type: ignore[arg-type]
-        token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
     )
     disc_cfg = types.SimpleNamespace(
         to_dict=lambda: {
@@ -1395,16 +1419,17 @@ def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
         disc_config=disc_cfg,
         gen_config=gen_cfg,
         tokenizer=tokenizer,
     )
 
-    assert payload["model"]["hidden_size"] == 768
-    assert payload["data"]["max_seq_length"] == 1024
-    assert payload["train"]["warmup_steps"] == 1000
-    assert payload["train"]["learning_rate"] == pytest.approx(5e-4)
-    assert payload["train"]["adam_epsilon"] == pytest.approx(1e-6)
+    assert payload["model"]["rope"]["hidden_size"] == 768
+    assert payload["data"]["packing"]["max_seq_length"] == 1024
+    assert payload["optim"]["scheduler"]["warmup_steps"] == 1000
+    assert payload["optim"]["lr"]["base"] == pytest.approx(5e-4)
+    assert payload["optim"]["adam"]["epsilon"] == pytest.approx(1e-6)
     assert payload["train"]["token_weighted_gradient_accumulation"] is True
 
 
@@ -1618,15 +1643,36 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
 
 
 def _write_resume_source_snapshots(run_dir: Path) -> None:
-    """Write minimal model/data snapshots required for strict resume validation."""
+    """Write minimal config snapshots required for strict resume validation."""
     model_cfg = ModelConfig()
     data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
+    logging_cfg = LoggingConfig(output_dir=str(run_dir))
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
     (run_dir / "model_config.json").write_text(
         json.dumps(asdict(model_cfg), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     (run_dir / "data_config.json").write_text(
         json.dumps(asdict(data_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "train_config.json").write_text(
+        json.dumps(asdict(train_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "optim_config.json").write_text(
+        json.dumps(asdict(optim_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "logging_config.json").write_text(
+        json.dumps(asdict(logging_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION)}, indent=2, sort_keys=True)
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1915,6 +1961,21 @@ def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
         export_hf_final=False,
         decoupled_training=True,
         resume_from_checkpoint=str(checkpoint_dir),
+    )
+    (checkpoint_dir.parent / "logging_config.json").write_text(
+        json.dumps(
+            asdict(
+                LoggingConfig(
+                    output_dir=str(checkpoint_dir.parent),
+                    logging_steps=1,
+                    report_to="none",
+                )
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
     with caplog.at_level(logging.WARNING):
@@ -2747,7 +2808,7 @@ def test_persist_or_validate_run_configs_rejects_resume_when_source_snapshots_mi
 
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(ValueError, match="source run directory is missing model/data config snapshots"):
+    with pytest.raises(ValueError, match="source run directory is missing required config snapshots"):
         _persist_or_validate_run_configs(
             output_dir=out,
             model_cfg=ModelConfig(backbone_type="rope"),
@@ -3603,40 +3664,42 @@ def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
 
 
 def test_validate_train_config_normalizes_wandb_watch_aliases():
-    cfg = TrainConfig(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
-    validate_train_config(cfg)
-    assert cfg.wandb_watch == "parameters"
-    assert cfg.wandb_watch_log_freq == 25
+    cfg = LoggingConfig(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
+    validate_logging_config(cfg)
+    assert cfg.wandb.watch == "parameters"
+    assert cfg.wandb.watch_log_freq == 25
 
 
 def test_validate_train_config_rejects_invalid_wandb_watch_mode():
-    cfg = TrainConfig(wandb_watch="histogram")
-    with pytest.raises(ValueError, match="train.wandb_watch must be one of"):
-        validate_train_config(cfg)
+    cfg = LoggingConfig(wandb_watch="histogram")
+    with pytest.raises(ValueError, match="logging.wandb.watch must be one of"):
+        validate_logging_config(cfg)
 
 
 def test_validate_train_config_rejects_non_positive_wandb_watch_log_freq():
-    cfg = TrainConfig(wandb_watch_log_freq=0)
-    with pytest.raises(ValueError, match="train.wandb_watch_log_freq must be >= 1"):
-        validate_train_config(cfg)
+    cfg = LoggingConfig(wandb_watch_log_freq=0)
+    with pytest.raises(ValueError, match="logging.wandb.watch_log_freq must be >= 1"):
+        validate_logging_config(cfg)
 
 
 def test_validate_train_config_accepts_resume_data_strategy_values():
-    cfg = TrainConfig(resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=123)
+    cfg = TrainConfig(
+        checkpoint={"resume_data_strategy": "restart_epoch", "resume_replay_max_micro_batches": 123}
+    )
     validate_train_config(cfg)
-    assert cfg.resume_data_strategy == "restart_epoch"
-    assert cfg.resume_replay_max_micro_batches == 123
+    assert cfg.checkpoint.resume_data_strategy == "restart_epoch"
+    assert cfg.checkpoint.resume_replay_max_micro_batches == 123
 
 
 def test_validate_train_config_rejects_invalid_resume_data_strategy():
-    cfg = TrainConfig(resume_data_strategy="fast")
-    with pytest.raises(ValueError, match="train.resume_data_strategy must be one of"):
+    cfg = TrainConfig(checkpoint={"resume_data_strategy": "fast"})
+    with pytest.raises(ValueError, match="train.checkpoint.resume_data_strategy must be one of"):
         validate_train_config(cfg)
 
 
 def test_validate_train_config_rejects_negative_resume_replay_threshold():
-    cfg = TrainConfig(resume_replay_max_micro_batches=-1)
-    with pytest.raises(ValueError, match="train.resume_replay_max_micro_batches must be >= 0"):
+    cfg = TrainConfig(checkpoint={"resume_replay_max_micro_batches": -1})
+    with pytest.raises(ValueError, match="train.checkpoint.resume_replay_max_micro_batches must be >= 0"):
         validate_train_config(cfg)
 
 
@@ -4065,7 +4128,7 @@ def test_normalizer_aliases_and_rejection():
                 ("max-autotune-no-cudagraphs", "max-autotune-no-cudagraphs"),
             ],
             "fastest",
-            "torch_compile_mode",
+            "train.compile.mode",
         ),
         (
             _normalize_torch_compile_scope,
@@ -4081,13 +4144,13 @@ def test_normalizer_aliases_and_rejection():
                 ("disc_ffn", "disc_ffn"),
             ],
             "all",
-            "torch_compile_scope",
+            "train.compile.scope",
         ),
         (
             _normalize_torch_compile_backend,
             [("inductor", "inductor"), ("aot-eager", "aot_eager")],
             "xla",
-            "torch_compile_backend",
+            "train.compile.backend",
         ),
         (
             _normalize_wandb_watch,
@@ -4099,7 +4162,7 @@ def test_normalizer_aliases_and_rejection():
                 ("off", "none"),
             ],
             "full_histograms",
-            "wandb_watch",
+            "logging.wandb.watch",
         ),
         (
             _normalize_hf_attention_kernel,
@@ -4111,7 +4174,7 @@ def test_normalizer_aliases_and_rejection():
                 ("stable", "stable"),
             ],
             "einsum",
-            "hf_attention_kernel",
+            "model.hf.attention_kernel",
         ),
         (
             _normalize_sdpa_kernel,
@@ -4122,7 +4185,7 @@ def test_normalizer_aliases_and_rejection():
                 ("math", "math"),
             ],
             "best",
-            "sdpa_kernel",
+            "train.sdpa_kernel",
         ),
     ]
     for fn, valid_pairs, invalid_input, error_pattern in cases:
@@ -4316,8 +4379,10 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
-                "  max_seq_length: 32",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "  packing:",
+                "    max_seq_length: 32",
                 "train:",
                 "  max_steps: 5",
             ]
@@ -4327,17 +4392,19 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
-    cli_mod.main(["train", str(cfg_path), "--max_steps", "7"])
+    cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
 
     assert "train_cfg" in seen
-    assert seen["data_cfg"].max_seq_length == 32
+    assert seen["data_cfg"].packing.max_seq_length == 32
     assert seen["train_cfg"].max_steps == 7
     assert seen["config_path"] == cfg_path
 
@@ -4355,10 +4422,13 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
                 "  profile: deberta_v3_parity",
                 "  backbone_type: hf_deberta_v2",
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 5",
-                "  warmup_steps: 1000",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 1000",
             ]
         ),
         encoding="utf-8",
@@ -4366,10 +4436,12 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
@@ -4379,7 +4451,7 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
     assert int(seen["train_cfg"].warmup_steps) == 1000
     assert seen["config_path"] == cfg_path
     err = capsys.readouterr().err
-    assert "train.warmup_steps" not in err
+    assert "optim.scheduler.warmup_steps" not in err
 
 
 def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
@@ -4392,7 +4464,8 @@ def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 5",
             ]
@@ -4402,19 +4475,21 @@ def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
-    cli_mod.main(["train", str(cfg_path), "--max_steps", "7"])
+    cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
 
     assert "train_cfg" in seen
     assert int(seen["train_cfg"].max_steps) == 7
     err = capsys.readouterr().err
-    assert "train.max_steps: 5 -> 7 (CLI override (--max-steps))" in err
+    assert "train.max_steps: 5 -> 7 (CLI override (--train.max_steps))" in err
 
 
 def test_main_cli_train_supports_dotted_overrides_with_type_casting(
@@ -4427,10 +4502,13 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 5",
-                "  adam_epsilon: 1e-6",
+                "optim:",
+                "  adam:",
+                "    epsilon: 1e-6",
             ]
         ),
         encoding="utf-8",
@@ -4438,10 +4516,12 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
@@ -4449,14 +4529,12 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
         [
             "train",
             str(cfg_path),
-            "--max_steps",
-            "7",
-            "--override",
-            "train.max_steps=11",
-            "--override",
-            "train.adam_epsilon=1e-5",
-            "--override",
-            "model.hf_max_position_embeddings=640",
+            "--train.max_steps",
+            "11",
+            "--optim.adam.epsilon",
+            "1e-5",
+            "--model.hf.max_position_embeddings",
+            "640",
         ]
     )
 
@@ -4464,7 +4542,7 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
     assert float(seen["train_cfg"].adam_epsilon) == pytest.approx(1e-5)
     assert int(seen["model_cfg"].hf_max_position_embeddings) == 640
     err = capsys.readouterr().err
-    assert "train.max_steps: 5 -> 11 (CLI override (--override train.max_steps=11))" in err
+    assert "train.max_steps: 5 -> 11 (CLI override (--train.max_steps))" in err
 
 
 def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
@@ -4477,7 +4555,8 @@ def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 5",
             ]
@@ -4487,10 +4566,12 @@ def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
@@ -4498,10 +4579,10 @@ def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
         [
             "train",
             str(cfg_path),
-            "--override",
-            "optim.warmup_steps=333",
-            "--override",
-            "logging.wandb.watch=all",
+            "--optim.scheduler.warmup_steps",
+            "333",
+            "--logging.wandb.watch",
+            "all",
         ]
     )
 
@@ -4524,8 +4605,8 @@ def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypa
         encoding="utf-8",
     )
     monkeypatch.setattr(cli_mod, "run_pretraining", lambda **_: None)
-    with pytest.raises(ValueError, match="Unknown override field"):
-        cli_mod.main(["train", str(cfg_path), "--override", "train.no_such_field=1"])
+    with pytest.raises(SystemExit):
+        cli_mod.main(["train", str(cfg_path), "--train.no_such_field", "1"])
 
 
 def test_main_cli_train_with_config_and_preset_applies_model_only(
@@ -4536,7 +4617,7 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
         json.dumps(
             {
                 "model": {"backbone_type": "rope"},
-                "data": {"dataset_name": "demo-dataset", "max_seq_length": 128},
+                "data": {"source": {"dataset_name": "demo-dataset"}, "packing": {"max_seq_length": 128}},
                 "train": {"max_steps": 11},
             }
         ),
@@ -4545,10 +4626,12 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
@@ -4556,8 +4639,8 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
 
     assert "train_cfg" in seen
     assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
-    assert seen["data_cfg"].dataset_name == "demo-dataset"
-    assert seen["data_cfg"].max_seq_length == 128
+    assert seen["data_cfg"].source.dataset_name == "demo-dataset"
+    assert seen["data_cfg"].packing.max_seq_length == 128
     assert seen["train_cfg"].max_steps == 11
     assert seen["config_path"] == cfg_path
     out = capsys.readouterr().out
@@ -4569,24 +4652,26 @@ def test_main_cli_train_preset_without_config_applies_defaults_and_cli_overrides
 ):
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
-    cli_mod.main(["train", "--preset", "deberta-v3-base", "--max_steps", "123"])
+    cli_mod.main(["train", "--preset", "deberta-v3-base", "--train.max_steps", "123"])
 
     assert seen["config_path"] is None
     assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
     assert seen["model_cfg"].embedding_sharing == "gdes"
-    assert seen["data_cfg"].dataset_name == "HuggingFaceFW/fineweb-edu"
-    assert seen["data_cfg"].dataset_config_name == "default"
+    assert seen["data_cfg"].source.dataset_name == "HuggingFaceFW/fineweb-edu"
+    assert seen["data_cfg"].source.dataset_config_name == "default"
     assert seen["train_cfg"].max_steps == 123
     assert seen["train_cfg"].report_to == "none"
     out = capsys.readouterr().out
-    assert "model+data+train defaults (no config file)" in out
+    assert "model+data+train+optim+logging defaults (no config file)" in out
 
 
 def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: pytest.MonkeyPatch):
@@ -4596,13 +4681,16 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
         del args, kwargs
         raise AssertionError("run_pretraining should not be called for --dry-run")
 
-    def _fake_dry_run(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_dry_run(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
         return {
-            "output_dir": "runs/demo",
+            "checkpoint_output_dir": "runs/demo",
+            "logging_output_dir": "runs/demo",
             "resume_checkpoint": None,
             "effective_compile_scope": "ffn",
             "sample_batch_shape": (1, 8),
@@ -4616,9 +4704,9 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
     cli_mod.main(
         [
             "train",
-            "--dataset_name",
+            "--data.source.dataset_name",
             "HuggingFaceFW/fineweb-edu",
-            "--max_steps",
+            "--train.max_steps",
             "5",
             "--dry-run",
         ]
@@ -4630,8 +4718,8 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
 def test_main_cli_train_explicit_argv_skips_fast_exit(monkeypatch: pytest.MonkeyPatch):
     seen: dict[str, Any] = {"ran": False, "exit_called": False}
 
-    def _fake_run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
-        del ns, raw_train_argv
+    def _fake_run_train(ns: argparse.Namespace, *, dotflag_map: dict[str, str]) -> None:
+        del ns, dotflag_map
         seen["ran"] = True
 
     def _fake_exit(code: int) -> None:
@@ -4651,8 +4739,8 @@ def test_main_cli_train_explicit_argv_skips_fast_exit(monkeypatch: pytest.Monkey
 def test_main_cli_train_implicit_argv_fast_exit_enabled(monkeypatch: pytest.MonkeyPatch):
     seen: dict[str, Any] = {"ran": False}
 
-    def _fake_run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
-        del ns, raw_train_argv
+    def _fake_run_train(ns: argparse.Namespace, *, dotflag_map: dict[str, str]) -> None:
+        del ns, dotflag_map
         seen["ran"] = True
 
     def _fake_exit(code: int) -> None:
@@ -4673,7 +4761,14 @@ def test_main_cli_train_implicit_argv_fast_exit_enabled(monkeypatch: pytest.Monk
 def test_train_parser_accepts_dry_run_flag():
     parser = cli_mod._build_main_parser()
     ns = parser.parse_args(
-        ["train", "--dataset_name", "HuggingFaceFW/fineweb-edu", "--max_steps", "5", "--dry-run"]
+        [
+            "train",
+            "--data.source.dataset_name",
+            "HuggingFaceFW/fineweb-edu",
+            "--train.max_steps",
+            "5",
+            "--dry-run",
+        ]
     )
     assert ns.command == "train"
     assert ns.dry_run is True
@@ -4714,10 +4809,10 @@ def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.Mon
 def test_train_cli_rejects_invalid_constrained_values_at_parse_time():
     parser = cli_mod._build_main_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["train", "--norm_arch", "invalid"])
+        parser.parse_args(["train", "--model.rope.norm_arch", "invalid"])
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["train", "--report_to", "invalid"])
+        parser.parse_args(["train", "--logging.backend", "invalid"])
 
 
 def test_export_parser_rejects_conflicting_boolean_flags():
@@ -4745,7 +4840,7 @@ def test_validate_data_config_rejects_conflicting_sources():
 
 
 def test_validate_train_config_rejects_overwrite_with_resume_conflict():
-    with pytest.raises(ValueError, match="cannot be combined with train.resume_from_checkpoint"):
+    with pytest.raises(ValueError, match="cannot be combined with train.checkpoint.resume_from_checkpoint"):
         validate_train_config(
             TrainConfig(
                 overwrite_output_dir=True,
@@ -4757,13 +4852,13 @@ def test_validate_train_config_rejects_overwrite_with_resume_conflict():
 def test_validate_train_config_normalizes_blank_resume_hint_to_none():
     cfg = TrainConfig(resume_from_checkpoint="   ")
     validate_train_config(cfg)
-    assert cfg.resume_from_checkpoint is None
+    assert cfg.checkpoint.resume_from_checkpoint is None
 
 
 def test_validate_train_config_trims_resume_hint():
     cfg = TrainConfig(resume_from_checkpoint=" auto ")
     validate_train_config(cfg)
-    assert cfg.resume_from_checkpoint == "auto"
+    assert cfg.checkpoint.resume_from_checkpoint == "auto"
 
 
 def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
@@ -4774,8 +4869,9 @@ def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
 def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
     model_cfg = ModelConfig(profile="deberta_v3_parity")
     train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
 
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
 
     assert model_cfg.backbone_type == "hf_deberta_v2"
     assert model_cfg.embedding_sharing == "gdes"
@@ -4784,36 +4880,38 @@ def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
     assert train_cfg.random_token_prob == pytest.approx(0.0)
     assert train_cfg.mlm_max_ngram == 1
     assert train_cfg.disc_loss_weight == pytest.approx(10.0)
-    assert train_cfg.adam_epsilon == pytest.approx(1e-6)
-    assert train_cfg.warmup_steps == 10_000
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
+    assert optim_cfg.scheduler.warmup_steps == 10_000
     assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_apply_profile_defaults_applies_hf_parity_values_without_parity_profile() -> None:
     model_cfg = ModelConfig(profile="modern", backbone_type="hf_deberta_v2")
     train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
 
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
 
     assert train_cfg.mask_token_prob == pytest.approx(1.0)
     assert train_cfg.random_token_prob == pytest.approx(0.0)
     assert train_cfg.disc_loss_weight == pytest.approx(10.0)
-    assert train_cfg.adam_epsilon == pytest.approx(1e-6)
-    assert train_cfg.warmup_steps == 10_000
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
+    assert optim_cfg.scheduler.warmup_steps == 10_000
     assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_apply_profile_defaults_keeps_rope_modern_defaults() -> None:
     model_cfg = ModelConfig(profile="modern", backbone_type="rope")
     train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
 
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
 
     assert train_cfg.mask_token_prob == pytest.approx(0.8)
     assert train_cfg.random_token_prob == pytest.approx(0.1)
     assert train_cfg.disc_loss_weight == pytest.approx(50.0)
-    assert train_cfg.adam_epsilon == pytest.approx(1e-8)
-    assert train_cfg.warmup_steps == 1_000
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
+    assert optim_cfg.scheduler.warmup_steps == 1_000
     assert train_cfg.token_weighted_gradient_accumulation is True
 
 
@@ -4829,12 +4927,11 @@ def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
         random_token_prob=0.03,
         mlm_max_ngram=2,
         disc_loss_weight=12.5,
-        adam_epsilon=5e-6,
-        warmup_steps=2_000,
         token_weighted_gradient_accumulation=False,
     )
+    optim_cfg = OptimConfig(adam_epsilon=5e-6, warmup_steps=2_000)
 
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
 
     assert model_cfg.backbone_type == "hf_deberta_v2"
     assert model_cfg.embedding_sharing == "none"
@@ -4843,8 +4940,8 @@ def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
     assert train_cfg.random_token_prob == pytest.approx(0.03)
     assert train_cfg.mlm_max_ngram == 2
     assert train_cfg.disc_loss_weight == pytest.approx(12.5)
-    assert train_cfg.adam_epsilon == pytest.approx(5e-6)
-    assert train_cfg.warmup_steps == 2_000
+    assert optim_cfg.adam.epsilon == pytest.approx(5e-6)
+    assert optim_cfg.scheduler.warmup_steps == 2_000
     assert train_cfg.token_weighted_gradient_accumulation is False
 
 
@@ -4859,29 +4956,27 @@ def test_apply_profile_defaults_honors_explicit_fields_even_when_matching_raw_de
         mask_token_prob=0.8,
         random_token_prob=0.1,
         disc_loss_weight=50.0,
-        adam_epsilon=1e-8,
-        warmup_steps=1_000,
         token_weighted_gradient_accumulation=True,
     )
+    optim_cfg = OptimConfig(adam_epsilon=1e-8, warmup_steps=1_000)
     object.__setattr__(
         model_cfg,
         "_explicit_fields",
-        {"backbone_type", "embedding_sharing", "hf_attention_kernel"},
+        {"backbone_type", "embedding_sharing", "hf.attention_kernel"},
     )
     object.__setattr__(
         train_cfg,
         "_explicit_fields",
         {
-            "mask_token_prob",
-            "random_token_prob",
-            "disc_loss_weight",
-            "adam_epsilon",
-            "warmup_steps",
+            "objective.mask_token_prob",
+            "objective.random_token_prob",
+            "objective.disc_loss_weight",
             "token_weighted_gradient_accumulation",
         },
     )
+    object.__setattr__(optim_cfg, "_explicit_fields", {"adam.epsilon", "scheduler.warmup_steps"})
 
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
 
     assert model_cfg.backbone_type == "hf_deberta_v2"
     assert model_cfg.embedding_sharing == "es"
@@ -4889,8 +4984,8 @@ def test_apply_profile_defaults_honors_explicit_fields_even_when_matching_raw_de
     assert train_cfg.mask_token_prob == pytest.approx(0.8)
     assert train_cfg.random_token_prob == pytest.approx(0.1)
     assert train_cfg.disc_loss_weight == pytest.approx(50.0)
-    assert train_cfg.adam_epsilon == pytest.approx(1e-8)
-    assert train_cfg.warmup_steps == 1_000
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
+    assert optim_cfg.scheduler.warmup_steps == 1_000
     assert train_cfg.token_weighted_gradient_accumulation is True
 
 
@@ -4907,15 +5002,15 @@ def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
 
 @pytest.mark.parametrize("value", [-1.0, 1.0e-4, 2.5e-3])
 def test_validate_train_config_allows_discriminator_learning_rate_inherit_or_positive(value: float) -> None:
-    cfg = TrainConfig(discriminator_learning_rate=value)
-    validate_train_config(cfg)
+    cfg = OptimConfig(discriminator_learning_rate=value)
+    validate_optim_config(cfg)
 
 
 @pytest.mark.parametrize("value", [0.0, -0.5, -2.0])
 def test_validate_train_config_rejects_invalid_discriminator_learning_rate(value: float) -> None:
-    cfg = TrainConfig(discriminator_learning_rate=value)
-    with pytest.raises(ValueError, match="train.discriminator_learning_rate"):
-        validate_train_config(cfg)
+    cfg = OptimConfig(discriminator_learning_rate=value)
+    with pytest.raises(ValueError, match="optim.lr.discriminator"):
+        validate_optim_config(cfg)
 
 
 def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Path):
@@ -4944,7 +5039,7 @@ def test_validate_data_config_rejects_non_streaming_shuffle_buffer_above_one():
 
 
 def test_validate_data_config_rejects_doc_blocking_when_not_packed():
-    with pytest.raises(ValueError, match="requires data.pack_sequences=true"):
+    with pytest.raises(ValueError, match="requires data.packing.enabled=true"):
         validate_data_config(
             DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
@@ -4967,7 +5062,9 @@ def test_validate_data_config_warns_on_long_context_dense_doc_blocking():
 
 
 def test_validate_training_workflow_options_rejects_flash_with_packing():
-    with pytest.raises(ValueError, match="sdpa_kernel=flash is not supported with data.pack_sequences=true"):
+    with pytest.raises(
+        ValueError, match="train.sdpa_kernel=flash is not supported with data.packing.enabled=true"
+    ):
         validate_training_workflow_options(
             data_cfg=DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
@@ -5015,8 +5112,9 @@ def test_validate_training_workflow_options_rejects_es_with_divergent_gen_lr():
     with pytest.raises(ValueError, match="embedding_sharing='es'"):
         validate_training_workflow_options(
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+            train_cfg=TrainConfig(),
             model_cfg=ModelConfig(embedding_sharing="es"),
+            optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
         )
 
 
@@ -5024,14 +5122,16 @@ def test_validate_training_workflow_options_allows_es_with_matching_gen_lr():
     # Explicit gen LR matching disc LR — should pass.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=5e-4, decoupled_training=False),
+        train_cfg=TrainConfig(decoupled_training=False),
         model_cfg=ModelConfig(embedding_sharing="es"),
+        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=5e-4),
     )
     # Inherited gen LR (-1) — should pass.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=-1.0, decoupled_training=False),
+        train_cfg=TrainConfig(decoupled_training=False),
         model_cfg=ModelConfig(embedding_sharing="es"),
+        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=-1.0),
     )
 
 
@@ -5039,8 +5139,9 @@ def test_validate_training_workflow_options_allows_gdes_with_divergent_gen_lr():
     # GDES handles separate LR correctly — should not raise.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+        train_cfg=TrainConfig(),
         model_cfg=ModelConfig(embedding_sharing="gdes"),
+        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
     )
 
 
@@ -5074,13 +5175,13 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
 
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_multiple():
     cfg = ModelConfig(tokenizer_vocab_multiple=0)
-    with pytest.raises(ValueError, match="tokenizer_vocab_multiple"):
+    with pytest.raises(ValueError, match="model.tokenizer.vocab_multiple"):
         validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_target():
     cfg = ModelConfig(tokenizer_vocab_target=0)
-    with pytest.raises(ValueError, match="tokenizer_vocab_target"):
+    with pytest.raises(ValueError, match="model.tokenizer.vocab_target"):
         validate_model_config(cfg)
 
 
@@ -5099,7 +5200,7 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_for_rope():
         backbone_type="rope",
         hf_max_position_embeddings=1024,
     )
-    with pytest.warns(UserWarning, match="hf_max_position_embeddings only applies"):
+    with pytest.warns(UserWarning, match="model.hf.max_position_embeddings only applies"):
         validate_model_config(cfg)
 
 
@@ -5352,10 +5453,24 @@ def test_validate_model_config_inert_param_warnings(cfg_kwargs, expect_warn):
     ],
 )
 def test_validate_train_config_inert_param_warnings(cfg_kwargs, expect_warn):
-    cfg = TrainConfig(**cfg_kwargs)
+    train_keys = {
+        "torch_compile",
+        "torch_compile_scope",
+        "torch_compile_mode",
+        "torch_compile_backend",
+    }
+    logging_keys = {"report_to", "wandb_watch", "wandb_watch_log_freq"}
+
+    train_kwargs = {k: v for k, v in cfg_kwargs.items() if k in train_keys}
+    logging_kwargs = {k: v for k, v in cfg_kwargs.items() if k in logging_keys}
+
+    train_cfg = TrainConfig(**train_kwargs)
+    logging_cfg = LoggingConfig(**logging_kwargs) if logging_kwargs else None
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        validate_train_config(cfg)
+        validate_train_config(train_cfg)
+        if logging_cfg is not None:
+            validate_logging_config(logging_cfg)
     user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
     if expect_warn:
         assert len(user_warnings) >= 1, f"Expected warning for {cfg_kwargs}, got none"
