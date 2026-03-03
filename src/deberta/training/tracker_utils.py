@@ -144,10 +144,7 @@ def _upload_wandb_original_config(
         run_owner = owner.run
 
     upload_files: list[Path] = []
-    if config_original_path.exists():
-        upload_files.append(config_original_path)
-    else:
-        logger.warning("W&B config upload skipped missing file: %s", config_original_path)
+    source_uploaded = False
     if config_resolved_path is not None and config_resolved_path.exists():
         upload_files.append(config_resolved_path)
     elif config_resolved_path is not None:
@@ -161,8 +158,16 @@ def _upload_wandb_original_config(
         source_path_for_meta = str(source_candidate)
         if source_candidate.is_file():
             upload_files.append(source_candidate)
+            source_uploaded = True
         else:
             logger.warning("W&B config upload skipped missing source config path: %s", source_candidate)
+
+    # Prefer the actual source config path when available; otherwise upload config_original snapshot.
+    if config_original_path.exists():
+        if not source_uploaded:
+            upload_files.append(config_original_path)
+    else:
+        logger.warning("W&B config upload skipped missing file: %s", config_original_path)
 
     if not upload_files:
         return False

@@ -61,7 +61,7 @@ from deberta.training.loop_utils import (
     _sum_local_scalar,
     _token_weighted_micro_objective,
 )
-from deberta.training.run_config import _persist_or_validate_run_configs
+from deberta.training.run_config import _dump_yaml_mapping, _persist_or_validate_run_configs
 from deberta.training.run_management import (
     _load_checkpoint_progress_metadata,
     _parse_checkpoint_step,
@@ -137,6 +137,128 @@ def _flush_loggers() -> None:
             seen_handlers.add(hid)
             with suppress(Exception):
                 handler.flush()
+
+
+def _drop_none_recursive(value: Any) -> Any:
+    """Recursively drop ``None`` entries from mappings/lists.
+
+    :param Any value: Arbitrary nested value.
+    :return Any: Value with ``None`` keys/items removed.
+    """
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            cleaned = _drop_none_recursive(item)
+            if cleaned is None:
+                continue
+            out[str(key)] = cleaned
+        return out
+    if isinstance(value, list):
+        out_list: list[Any] = []
+        for item in value:
+            cleaned = _drop_none_recursive(item)
+            if cleaned is None:
+                continue
+            out_list.append(cleaned)
+        return out_list
+    if isinstance(value, tuple):
+        out_tuple: list[Any] = []
+        for item in value:
+            cleaned = _drop_none_recursive(item)
+            if cleaned is None:
+                continue
+            out_tuple.append(cleaned)
+        return out_tuple
+    return value
+
+
+def _config_obj_to_mapping(config_obj: Any) -> dict[str, Any]:
+    """Convert config-like objects to serializable dictionaries.
+
+    :param Any config_obj: Config object exposing ``to_dict``/``__dict__``.
+    :return dict[str, Any]: Best-effort plain mapping.
+    """
+    if config_obj is None:
+        return {}
+    if isinstance(config_obj, dict):
+        return dict(config_obj)
+    to_dict_fn = getattr(config_obj, "to_dict", None)
+    if callable(to_dict_fn):
+        raw = to_dict_fn()
+        if isinstance(raw, dict):
+            return dict(raw)
+    raw_dict = getattr(config_obj, "__dict__", None)
+    if isinstance(raw_dict, dict):
+        return dict(raw_dict)
+    return {}
+
+
+def _build_runtime_resolved_tracker_config(
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    disc_config: Any,
+    gen_config: Any,
+    tokenizer: Any,
+) -> dict[str, Any]:
+    """Build a runtime-resolved tracker payload with effective model/train values.
+
+    :param ModelConfig model_cfg: Effective model config used by training.
+    :param DataConfig data_cfg: Effective data config used by training.
+    :param TrainConfig train_cfg: Effective train config used by training.
+    :param Any disc_config: Runtime discriminator backbone config.
+    :param Any gen_config: Runtime generator backbone config.
+    :param Any tokenizer: Runtime tokenizer.
+    :return dict[str, Any]: Null-pruned resolved config payload.
+    """
+    payload: dict[str, Any] = {
+        "model": asdict(model_cfg),
+        "data": asdict(data_cfg),
+        "train": asdict(train_cfg),
+    }
+    model_payload = payload["model"]
+    train_payload = payload["train"]
+
+    disc_cfg_map = _config_obj_to_mapping(disc_config)
+    gen_cfg_map = _config_obj_to_mapping(gen_config)
+
+    # Populate commonly inferred model fields for easier reproducibility diffs.
+    if model_payload.get("generator_num_hidden_layers") is None and "num_hidden_layers" in gen_cfg_map:
+        model_payload["generator_num_hidden_layers"] = int(gen_cfg_map["num_hidden_layers"])
+    if model_payload.get("generator_hidden_size") is None and "hidden_size" in gen_cfg_map:
+        model_payload["generator_hidden_size"] = int(gen_cfg_map["hidden_size"])
+    if model_payload.get("generator_intermediate_size") is None and "intermediate_size" in gen_cfg_map:
+        model_payload["generator_intermediate_size"] = int(gen_cfg_map["intermediate_size"])
+    if model_payload.get("generator_num_attention_heads") is None and "num_attention_heads" in gen_cfg_map:
+        model_payload["generator_num_attention_heads"] = int(gen_cfg_map["num_attention_heads"])
+    if model_payload.get("hidden_dropout_prob") is None and "hidden_dropout_prob" in disc_cfg_map:
+        model_payload["hidden_dropout_prob"] = float(disc_cfg_map["hidden_dropout_prob"])
+    if (
+        model_payload.get("attention_probs_dropout_prob") is None
+        and "attention_probs_dropout_prob" in disc_cfg_map
+    ):
+        model_payload["attention_probs_dropout_prob"] = float(disc_cfg_map["attention_probs_dropout_prob"])
+    if model_payload.get("max_position_embeddings") is None and "max_position_embeddings" in disc_cfg_map:
+        model_payload["max_position_embeddings"] = int(disc_cfg_map["max_position_embeddings"])
+
+    if model_payload.get("tokenizer_vocab_target") is None:
+        with suppress(Exception):
+            model_payload["tokenizer_vocab_target"] = int(len(tokenizer))
+
+    # Resolve inherited branch LRs to effective numeric values.
+    base_lr = float(train_cfg.learning_rate)
+    gen_lr = float(train_cfg.generator_learning_rate)
+    disc_lr = float(getattr(train_cfg, "discriminator_learning_rate", -1.0))
+    train_payload["learning_rate"] = base_lr
+    train_payload["generator_learning_rate"] = gen_lr if gen_lr > 0.0 else base_lr
+    train_payload["discriminator_learning_rate"] = disc_lr if disc_lr > 0.0 else base_lr
+
+    payload["effective"] = {
+        "discriminator_backbone": disc_cfg_map,
+        "generator_backbone": gen_cfg_map,
+    }
+    return _drop_none_recursive(payload)
 
 
 def _load_resume_state_with_compile_fallback(
@@ -1747,6 +1869,20 @@ def run_pretraining(
                 f"torch.compile failed for scope={compile_scope}, mode={compile_mode}, backend={compile_backend}."
             ) from e
 
+    tracker_cfg_runtime = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        disc_config=disc_config,
+        gen_config=gen_config,
+        tokenizer=tokenizer,
+    )
+    if accelerator.is_main_process:
+        try:
+            _dump_yaml_mapping(tracker_cfg_runtime, output_dir / "config_resolved.yaml")
+        except Exception:
+            logger.exception("Failed to write runtime-resolved config snapshot.")
+
     global_step = 0
     consumed_micro_batches = 0
     consumed_micro_batches_committed = 0
@@ -1789,11 +1925,7 @@ def run_pretraining(
     try:
         # Trackers
         if train_cfg.report_to != "none":
-            tracker_cfg = {
-                "model": asdict(model_cfg),
-                "data": asdict(data_cfg),
-                "train": asdict(train_cfg),
-            }
+            tracker_cfg = dict(tracker_cfg_runtime)
             if train_cfg.run_name is not None and str(train_cfg.run_name).strip():
                 tracker_run_name = str(train_cfg.run_name).strip()
             else:

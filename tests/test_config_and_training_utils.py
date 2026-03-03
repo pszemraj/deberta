@@ -55,6 +55,7 @@ from deberta.training.pretrain import (
     _apply_nonfinite_recovery,
     _build_decoupled_optimizers,
     _build_optimizer,
+    _build_runtime_resolved_tracker_config,
     _build_training_collator,
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
@@ -1215,9 +1216,75 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
     )
     assert uploaded is True
     saved_names = {p.name for p in run.saved}
-    assert "config_original.yaml" in saved_names
+    assert "config_original.yaml" not in saved_names
     assert "config_resolved.yaml" in saved_names
     assert "passed.yaml" in saved_names
+
+
+def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        discriminator_model_name_or_path="microsoft/deberta-v3-base",
+        generator_num_hidden_layers=None,
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
+        tokenizer_vocab_target=None,
+    )
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(
+        learning_rate=5e-4,
+        generator_learning_rate=-1.0,
+        discriminator_learning_rate=-1.0,
+    )
+    disc_cfg = types.SimpleNamespace(
+        num_hidden_layers=12,
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=1024,
+        to_dict=lambda: {
+            "num_hidden_layers": 12,
+            "hidden_dropout_prob": 0.1,
+            "attention_probs_dropout_prob": 0.1,
+            "max_position_embeddings": 1024,
+        },
+    )
+    gen_cfg = types.SimpleNamespace(
+        num_hidden_layers=6,
+        hidden_size=384,
+        intermediate_size=1536,
+        num_attention_heads=6,
+        to_dict=lambda: {
+            "num_hidden_layers": 6,
+            "hidden_size": 384,
+            "intermediate_size": 1536,
+            "num_attention_heads": 6,
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    payload = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        tokenizer=tokenizer,
+    )
+
+    assert payload["model"]["generator_num_hidden_layers"] == 6
+    assert payload["model"]["generator_hidden_size"] == 384
+    assert payload["model"]["generator_intermediate_size"] == 1536
+    assert payload["model"]["generator_num_attention_heads"] == 6
+    assert payload["model"]["hidden_dropout_prob"] == pytest.approx(0.1)
+    assert payload["model"]["attention_probs_dropout_prob"] == pytest.approx(0.1)
+    assert payload["model"]["tokenizer_vocab_target"] == 32000
+    assert payload["train"]["generator_learning_rate"] == pytest.approx(5e-4)
+    assert payload["train"]["discriminator_learning_rate"] == pytest.approx(5e-4)
+    assert "generator_model_name_or_path" not in payload["model"]
+    assert "pretrained_ffn_type" not in payload["model"]
+    assert "resume_from_checkpoint" not in payload["train"]
+    assert payload["effective"]["generator_backbone"]["hidden_size"] == 384
 
 
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
