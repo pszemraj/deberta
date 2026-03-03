@@ -1814,6 +1814,8 @@ def run_pretraining(
                         wandb_run=wandb_run,
                         config_original_path=output_dir / "config_original.yaml",
                         run_name=tracker_run_name,
+                        config_resolved_path=output_dir / "config_resolved.yaml",
+                        config_source_path=config_path,
                     )
                 with suppress(Exception):
                     _setup_wandb_watch(
