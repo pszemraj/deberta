@@ -41,6 +41,12 @@ from deberta.modeling.activations import get_act_fn
 from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.norm import RMSNorm
 
+try:
+    from torch.distributed.tensor import DTensor as _TorchDTensor
+except Exception:  # pragma: no cover - optional distributed dependency
+    _TorchDTensor = None
+
+
 # -----------------------------------------------------------------------------
 # Mask utilities
 # -----------------------------------------------------------------------------
@@ -131,6 +137,18 @@ def _ensure_emd_pairwise_attention_mask(attention_mask: torch.Tensor) -> torch.T
     raise ValueError(f"Unsupported attention_mask rank for EMD: {m.ndim}")
 
 
+def _is_sharded_dtensor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor appears to be a sharded DTensor.
+
+    :param torch.Tensor tensor: Tensor candidate.
+    :return bool: True when the tensor is a DTensor-like sharded object.
+    """
+    candidate = tensor.detach()
+    if _TorchDTensor is not None and isinstance(candidate, _TorchDTensor):
+        return bool(getattr(candidate, "placements", ()))
+    return bool(hasattr(candidate, "_local_tensor") and hasattr(candidate, "placements"))
+
+
 # -----------------------------------------------------------------------------
 # Embedding sharing (ES / GDES)
 # -----------------------------------------------------------------------------
@@ -180,6 +198,11 @@ class _SyncedBufferEmbedding(nn.Module):
     @torch.no_grad()
     def sync_from(self, weight: torch.Tensor) -> None:
         """Copy generator weights into the local base buffer."""
+        if _is_sharded_dtensor(weight) or _is_sharded_dtensor(self.base_weight):
+            raise RuntimeError(
+                "sync_from received a sharded DTensor. Call this within an FSDP full-parameter "
+                "context (for example torch.distributed.fsdp.FullyShardedDataParallel.summon_full_params)."
+            )
         if weight.shape != self.base_weight.shape:
             raise ValueError(
                 f"sync_from shape mismatch: src={tuple(weight.shape)} dst={tuple(self.base_weight.shape)}"

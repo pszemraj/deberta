@@ -306,6 +306,7 @@ class DisentangledSelfAttention(nn.Module):
         query_len: int,
         key_len: int,
         att_span: int,
+        scale_factor: int,
     ) -> torch.Tensor:
         """Compute position-to-position (p2p) bias.
 
@@ -317,6 +318,7 @@ class DisentangledSelfAttention(nn.Module):
         :param int query_len: Query length.
         :param int key_len: Key length.
         :param int att_span: Relative-attention span ``A``.
+        :param int scale_factor: Attention scale factor.
         :return torch.Tensor: p2p bias tensor with shape ``(B,H,Q,K)``.
         """
 
@@ -340,6 +342,8 @@ class DisentangledSelfAttention(nn.Module):
         p2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)  # (Q, K)
         p2p_idx = p2p_idx.unsqueeze(0).expand(nheads, query_len, key_len)
         p2p_bias = p2p_query.gather(-1, p2p_idx)  # (H, Q, K)
+        p2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
+        p2p_bias = p2p_bias / p2p_scale
         return p2p_bias.unsqueeze(0).expand(bsz, nheads, query_len, key_len)
 
     def _disentangled_attention_bias_dynamic(
@@ -416,6 +420,7 @@ class DisentangledSelfAttention(nn.Module):
                 query_len=query_len,
                 key_len=key_len,
                 att_span=att_span,
+                scale_factor=scale_factor,
             )
             score = p2p_bias if score is None else score + p2p_bias
 
@@ -507,6 +512,7 @@ class DisentangledSelfAttention(nn.Module):
                 query_len=query_len,
                 key_len=key_len,
                 att_span=att_span,
+                scale_factor=scale_factor,
             )
             score = p2p_bias if score is None else score + p2p_bias
 
@@ -610,7 +616,8 @@ class DisentangledSelfAttention(nn.Module):
                 raise ValueError(
                     f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
                 )
-            attention_scores = attention_scores.masked_fill(~keep_mask, -1e4)
+            mask_fill_value = torch.finfo(attention_scores.dtype).min
+            attention_scores = attention_scores.masked_fill(~keep_mask, mask_fill_value)
             # For broadcast padding masks (B,1,1,S), query activity equals key activity —
             # transpose the key dim to get per-query (B,1,S,1).  For pairwise masks
             # (B,1,S,S), reduce across keys as before.

@@ -1407,6 +1407,30 @@ def test_synced_buffer_embedding_sync_updates_compiled_module():
     torch.testing.assert_close(out_b, expected, rtol=1e-6, atol=1e-6)
 
 
+def test_synced_buffer_embedding_rejects_sharded_dtensor_sync(monkeypatch):
+    import pytest
+
+    from deberta.modeling import rtd as rtd_mod
+
+    init_weight = torch.randn((16, 8), dtype=torch.float32)
+    tied = rtd_mod._SyncedBufferEmbedding(
+        init_weight=init_weight,
+        padding_idx=0,
+        add_bias=False,
+    )
+    new_weight = torch.randn_like(init_weight)
+    original_probe = rtd_mod._is_sharded_dtensor
+
+    def _probe(tensor: torch.Tensor) -> bool:
+        if tensor is tied.base_weight:
+            return True
+        return original_probe(tensor)
+
+    monkeypatch.setattr(rtd_mod, "_is_sharded_dtensor", _probe)
+    with pytest.raises(RuntimeError, match="sharded DTensor"):
+        tied.sync_from(new_weight)
+
+
 def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
     from deberta.modeling.rtd import _SyncedBufferEmbedding
 
@@ -1641,6 +1665,60 @@ def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
     assert score.shape == (bsz, nheads, qlen, klen)
     assert torch.isfinite(score).all()
     assert float(score.abs().sum().item()) > 0.0
+
+
+def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
+    import math
+
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="p2p",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DisentangledSelfAttention(cfg).eval()
+
+    bsz, nheads, qlen, klen = 2, 4, 8, 8
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    query = torch.randn(bsz, nheads, qlen, head_dim)
+    key = torch.randn(bsz, nheads, klen, head_dim)
+    rel_embeddings = torch.randn(2 * cfg.max_position_embeddings, cfg.hidden_size)
+
+    with torch.no_grad():
+        score_scale_2 = attn.disentangled_attention_bias(
+            query_layer=query,
+            key_layer=key,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+            scale_factor=2,
+        )
+        score_scale_8 = attn.disentangled_attention_bias(
+            query_layer=query,
+            key_layer=key,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+            scale_factor=8,
+        )
+
+    mean_abs_2 = float(score_scale_2.abs().mean().item())
+    mean_abs_8 = float(score_scale_8.abs().mean().item())
+    assert mean_abs_2 > 0.0
+    assert mean_abs_8 > 0.0
+    ratio = mean_abs_2 / mean_abs_8
+    assert ratio == pytest.approx(math.sqrt(8.0 / 2.0), rel=1e-4, abs=1e-4)
 
 
 def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic_with_p2p():
@@ -2067,7 +2145,7 @@ def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
     assert not torch.allclose(out_50, out_05)
 
 
-def test_rope_model_rejects_unknown_forward_kwargs():
+def test_rope_model_supports_output_hidden_states():
     import pytest
 
     pytest.importorskip("transformers")
@@ -2089,8 +2167,14 @@ def test_rope_model_rejects_unknown_forward_kwargs():
     model = DebertaRoPEModel(cfg).eval()
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 6), dtype=torch.long)
 
-    with pytest.raises(TypeError, match="unexpected keyword argument"):
-        _ = model(input_ids=input_ids, output_hidden_states=True)
+    with torch.no_grad():
+        out = model(input_ids=input_ids, output_hidden_states=True)
+        out_tuple = model(input_ids=input_ids, output_hidden_states=True, return_dict=False)
+
+    assert out.hidden_states is not None
+    assert len(out.hidden_states) == (cfg.num_hidden_layers + 1)
+    assert out_tuple[1] is not None
+    assert len(out_tuple[1]) == (cfg.num_hidden_layers + 1)
 
 
 def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
