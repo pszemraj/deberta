@@ -14,7 +14,7 @@ import time
 import types
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
-from dataclasses import asdict, fields
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
@@ -272,7 +272,9 @@ def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
         return payload
 
     if not dataclasses.is_dataclass(cfg_obj):
-        return dict(asdict(cfg_obj)) if isinstance(cfg_obj, dict) else {}
+        if isinstance(cfg_obj, dict):
+            return {str(key): value for key, value in cfg_obj.items()}
+        return {}
     return _coerce_dataclass_instance(cfg_obj)
 
 

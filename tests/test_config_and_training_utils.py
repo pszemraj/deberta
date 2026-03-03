@@ -74,6 +74,7 @@ from deberta.training.pretrain import (
     _build_optimizer,
     _build_runtime_resolved_tracker_config,
     _build_training_collator,
+    _coerce_dataclass_payload_types,
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
@@ -1359,6 +1360,20 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
     assert "config_original.yaml" not in saved_names
     assert "config_resolved.yaml" in saved_names
     assert "passed.yaml" in saved_names
+
+
+def test_coerce_dataclass_payload_types_accepts_mapping_inputs() -> None:
+    payload = {
+        "alpha": 1,
+        "nested": {"beta": True},
+        3: "non-string-key",
+    }
+    coerced = _coerce_dataclass_payload_types(payload)
+    assert coerced == {
+        "alpha": 1,
+        "nested": {"beta": True},
+        "3": "non-string-key",
+    }
 
 
 def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
