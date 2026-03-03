@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import types
 from dataclasses import asdict
@@ -9,7 +10,7 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer
+from _fakes import DummyTokenizer, FakeAccelerator
 
 import deberta.export_cli as export_cli
 from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
@@ -88,14 +89,15 @@ def _install_export_fakes(
     fake_utils = types.ModuleType("accelerate.utils")
     fake_utils.DistributedType = types.SimpleNamespace(FSDP="FSDP")
 
-    class _FakeAccelerator:
+    class _FakeAccelerator(FakeAccelerator):
         distributed_type = fake_utils.DistributedType.FSDP
         is_fsdp2 = fsdp2
 
-        def __init__(self) -> None:
-            self.is_main_process = True
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
 
         def prepare(self, model):
+            self.calls["prepare"].append("export")
             return model
 
         def load_state(self, _checkpoint_dir: str, **kwargs: Any) -> None:
@@ -324,8 +326,18 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
     assert called["load_state_calls"] == [{}]
 
 
-def test_run_export_fails_on_partial_backbone_load_by_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("allow_partial_export", "expect_error"),
+    [
+        (False, True),
+        (True, False),
+    ],
+)
+def test_run_export_partial_backbone_load_respects_allow_partial_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_partial_export: bool,
+    expect_error: bool,
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path)
     called = _new_export_call_counters()
@@ -346,50 +358,31 @@ def test_run_export_fails_on_partial_backbone_load_by_default(
         lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
     )
 
-    with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+    out_dir = tmp_path / f"exported-{int(allow_partial_export)}"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    if expect_error:
+        with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+            export_cli.run_export(
+                export_cli.ExportConfig(
+                    checkpoint_dir=str(checkpoint_dir),
+                    run_dir=str(run_dir),
+                    output_dir=str(out_dir),
+                    export_what="discriminator",
+                    allow_partial_export=allow_partial_export,
+                )
+            )
+    else:
         export_cli.run_export(
             export_cli.ExportConfig(
                 checkpoint_dir=str(checkpoint_dir),
                 run_dir=str(run_dir),
-                output_dir=str(tmp_path / "exported"),
+                output_dir=str(out_dir),
                 export_what="discriminator",
+                allow_partial_export=allow_partial_export,
             )
         )
-
-
-def test_run_export_allows_partial_backbone_load_with_opt_in_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called = _new_export_call_counters()
-    _install_export_fakes(
-        monkeypatch=monkeypatch,
-        called=called,
-        fsdp2=False,
-        provide_torch_state_dict_api=False,
-    )
-
-    class _BrokenBackbone(_FakeExportBackbone):
-        def __init__(self) -> None:
-            self._weights = {"other_weight": torch.tensor(0.0)}
-
-    monkeypatch.setattr(
-        export_cli,
-        "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
-    )
-
-    out_dir = tmp_path / "exported"
-    export_cli.run_export(
-        export_cli.ExportConfig(
-            checkpoint_dir=str(checkpoint_dir),
-            run_dir=str(run_dir),
-            output_dir=str(out_dir),
-            export_what="discriminator",
-            allow_partial_export=True,
-        )
-    )
-    assert (out_dir / "discriminator").exists()
+        assert (out_dir / "discriminator").exists()
 
 
 def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(

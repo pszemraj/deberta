@@ -12,6 +12,30 @@ from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset
 from deberta.training.pretrain import _build_doc_block_mask
 
 
+@pytest.fixture
+def tiny_rope_config_factory():
+    """Return a helper that builds tiny DebertaRoPEConfig instances for attention tests."""
+    pytest.importorskip("transformers")
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+
+    base = dict(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+
+    def _build(**overrides):
+        return DebertaRoPEConfig(**(base | dict(overrides)))
+
+    return _build
+
+
 def test_packed_streaming_marks_internal_sep_as_special():
     tok = DummyTokenizer(vocab_size=64)
 
@@ -363,23 +387,12 @@ def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: py
 
 
 def test_ngram_masking_does_not_split_selected_word_groups():
-    class WordPiecePairTokenizer(DummyTokenizer):
-        def tokenize(self, text: str) -> list[str]:
-            del text
-            return ["hello", "##world"]
-
-        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-            table = {
-                self.pad_token_id: "[PAD]",
-                self.cls_token_id: "[CLS]",
-                self.sep_token_id: "[SEP]",
-                self.mask_token_id: "[MASK]",
-                10: "hello",
-                11: "##world",
-            }
-            return [table.get(i, f"tok{i}") for i in ids]
-
-    tok = WordPiecePairTokenizer(vocab_size=128)
+    tok = DummyTokenizer(
+        vocab_size=128,
+        token_map={10: "hello", 11: "##world"},
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
         cfg=MLMConfig(mlm_probability=0.4, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
@@ -394,23 +407,12 @@ def test_ngram_masking_does_not_split_selected_word_groups():
 
 
 def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pytest.MonkeyPatch):
-    class WordPiecePairTokenizer(DummyTokenizer):
-        def tokenize(self, text: str) -> list[str]:
-            del text
-            return ["hello", "##world"]
-
-        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-            table = {
-                self.pad_token_id: "[PAD]",
-                self.cls_token_id: "[CLS]",
-                self.sep_token_id: "[SEP]",
-                self.mask_token_id: "[MASK]",
-                10: "hello",
-                11: "##world",
-            }
-            return [table.get(i, f"tok{i}") for i in ids]
-
-    tok = WordPiecePairTokenizer(vocab_size=256)
+    tok = DummyTokenizer(
+        vocab_size=256,
+        token_map={10: "hello", 11: "##world"},
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
         cfg=MLMConfig(mlm_probability=0.9, mask_token_prob=0.0, random_token_prob=1.0, max_ngram=3),
@@ -501,20 +503,9 @@ def test_token_level_masking_uses_fixed_budget_for_variable_length_batch():
 
 
 def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
-    class WordPieceLikeTokenizer(DummyTokenizer):
-        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-            table = {
-                self.pad_token_id: "[PAD]",
-                self.cls_token_id: "[CLS]",
-                self.sep_token_id: "[SEP]",
-                self.mask_token_id: "[MASK]",
-                10: "the",
-                11: "cat",
-                12: "sat",
-            }
-            return [table.get(i, f"tok{i}") for i in ids]
-
-    tok = WordPieceLikeTokenizer(vocab_size=128)
+    tok = DummyTokenizer(
+        vocab_size=128, token_map={10: "the", 11: "cat", 12: "sat"}, default_token_prefix="tok"
+    )
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.5, max_ngram=3))
 
     ids = [tok.cls_token_id, 10, 11, 12, tok.sep_token_id]
@@ -524,24 +515,12 @@ def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
 
 
 def test_word_boundary_scheme_detected_once_from_tokenizer_probe():
-    class ProbeWordPieceTokenizer(DummyTokenizer):
-        def tokenize(self, text: str) -> list[str]:
-            del text
-            return ["hello", "##world"]
-
-        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-            table = {
-                self.pad_token_id: "[PAD]",
-                self.cls_token_id: "[CLS]",
-                self.sep_token_id: "[SEP]",
-                self.mask_token_id: "[MASK]",
-                10: "Ġalpha",
-                11: "beta",
-                12: "Ġgamma",
-            }
-            return [table.get(i, f"tok{i}") for i in ids]
-
-    tok = ProbeWordPieceTokenizer(vocab_size=128)
+    tok = DummyTokenizer(
+        vocab_size=128,
+        token_map={10: "Ġalpha", 11: "beta", 12: "Ġgamma"},
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.5, max_ngram=3))
 
     ids = [tok.cls_token_id, 10, 11, 12, tok.sep_token_id]
@@ -551,25 +530,14 @@ def test_word_boundary_scheme_detected_once_from_tokenizer_probe():
 
 
 def test_collator_warns_when_word_boundary_scheme_is_none_for_ngram(caplog: pytest.LogCaptureFixture):
-    class NoBoundaryTokenizer(DummyTokenizer):
-        def tokenize(self, text: str) -> list[str]:
-            del text
-            return ["hello", "world"]
-
-        def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-            table = {
-                self.pad_token_id: "[PAD]",
-                self.cls_token_id: "[CLS]",
-                self.sep_token_id: "[SEP]",
-                self.mask_token_id: "[MASK]",
-                10: "hello",
-                11: "world",
-            }
-            return [table.get(i, f"tok{i}") for i in ids]
-
     with caplog.at_level(logging.WARNING):
         _ = DebertaV3ElectraCollator(
-            tokenizer=NoBoundaryTokenizer(vocab_size=128),
+            tokenizer=DummyTokenizer(
+                vocab_size=128,
+                token_map={10: "hello", 11: "world"},
+                tokenize_output=["hello", "world"],
+                default_token_prefix="tok",
+            ),
             cfg=MLMConfig(mlm_probability=0.2, max_ngram=3),
         )
 
@@ -708,18 +676,7 @@ def test_collator_random_replacement_avoids_special_ids():
 
 def test_collator_random_replacement_samples_full_vocab_including_added_tokens():
     """When len(tokenizer) > tokenizer.vocab_size, random replacement must cover the full range."""
-
-    class _ExtendedTokenizer(DummyTokenizer):
-        """Tokenizer stub where len() returns more than vocab_size (simulating added tokens)."""
-
-        def __init__(self) -> None:
-            super().__init__(vocab_size=100)
-            self._added = 10
-
-        def __len__(self) -> int:
-            return self.vocab_size + self._added
-
-    tok = _ExtendedTokenizer()
+    tok = DummyTokenizer(vocab_size=100, extra_length=10)
     assert len(tok) == 110
     assert tok.vocab_size == 100
 
@@ -743,25 +700,10 @@ def test_collator_random_replacement_samples_full_vocab_including_added_tokens()
     assert bool((replaced >= 100).any().item()), "Expected some replacement tokens from the added-token range"
 
 
-def test_self_attention_zeroes_padded_query_outputs():
-    import pytest
+def test_self_attention_zeroes_padded_query_outputs(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
-
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        attention_implementation="eager",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
+    cfg = tiny_rope_config_factory(attention_implementation="eager")
     attn = DebertaRoPESelfAttention(cfg).eval()
     x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
     attention_mask = torch.tensor(
@@ -779,25 +721,13 @@ def test_self_attention_zeroes_padded_query_outputs():
     assert torch.allclose(out[1, 5:, :], torch.zeros_like(out[1, 5:, :]), atol=1e-6)
 
 
-def test_self_attention_has_no_internal_residual_dropout():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+def test_self_attention_has_no_internal_residual_dropout(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
     torch.manual_seed(0)
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
+    cfg = tiny_rope_config_factory(
         attention_implementation="eager",
         hidden_dropout_prob=0.9,
-        attention_probs_dropout_prob=0.0,
     )
     attn = DebertaRoPESelfAttention(cfg)
     x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
@@ -812,26 +742,15 @@ def test_self_attention_has_no_internal_residual_dropout():
     torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
 
 
-def test_self_attention_handles_pairwise_mask_rows_without_keys():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+@pytest.mark.parametrize("attention_implementation", ["eager", "sdpa"])
+def test_self_attention_handles_pairwise_mask_rows_without_keys(
+    tiny_rope_config_factory,
+    attention_implementation: str,
+):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
     torch.manual_seed(0)
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        attention_implementation="eager",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
+    cfg = tiny_rope_config_factory(attention_implementation=attention_implementation)
     attn = DebertaRoPESelfAttention(cfg).eval()
     x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
     pair_keep = torch.tensor(
@@ -849,30 +768,15 @@ def test_self_attention_handles_pairwise_mask_rows_without_keys():
     with torch.no_grad():
         out = attn(x, pair_keep)
 
-    assert torch.isfinite(out).all()
+    assert torch.isfinite(out).all(), f"{attention_implementation} produced NaN for dead query row"
     assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
 
 
-def test_self_attention_eager_handles_all_masked_padding_rows():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+def test_self_attention_eager_handles_all_masked_padding_rows(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
     torch.manual_seed(0)
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        attention_implementation="eager",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
+    cfg = tiny_rope_config_factory(attention_implementation="eager")
     attn = DebertaRoPESelfAttention(cfg).eval()
     x = torch.randn((2, 4, cfg.hidden_size), dtype=torch.float32)
     # Entire batch is fully padded/inactive (no keep edges at all).
@@ -885,67 +789,10 @@ def test_self_attention_eager_handles_all_masked_padding_rows():
     assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
 
 
-def test_self_attention_sdpa_handles_pairwise_mask_with_dead_rows():
-    import pytest
+def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
-
-    torch.manual_seed(0)
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        attention_implementation="sdpa",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    attn = DebertaRoPESelfAttention(cfg).eval()
-    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
-    # Row 1 has no valid keys (all-False) — a dead query row.
-    pair_keep = torch.tensor(
-        [
-            [
-                [1, 1, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 1, 1],
-                [0, 0, 1, 1],
-            ]
-        ],
-        dtype=torch.long,
-    )
-
-    with torch.no_grad():
-        out = attn(x, pair_keep)
-
-    assert torch.isfinite(out).all(), "SDPA produced NaN for dead query row"
-    assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]), atol=1e-6)
-
-
-def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
-
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        attention_implementation="eager",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
+    cfg = tiny_rope_config_factory(attention_implementation="eager")
     attn = DebertaRoPESelfAttention(cfg).eval()
     x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
     # Last row/col correspond to pad-like token with no valid edges.
@@ -968,25 +815,10 @@ def test_self_attention_zeroes_padded_query_outputs_for_pairwise_mask():
     assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
 
 
-def test_self_attention_uses_pairwise_diagonal_for_query_activity():
-    import pytest
+def test_self_attention_uses_pairwise_diagonal_for_query_activity(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
-
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        attention_implementation="eager",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
+    cfg = tiny_rope_config_factory(attention_implementation="eager")
     attn = DebertaRoPESelfAttention(cfg).eval()
     x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
 

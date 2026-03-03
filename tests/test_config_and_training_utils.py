@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer, FakeAccelerator, SimpleRTD, setup_pretraining_mocks
+from _fakes import DummyTokenizer, FakeAccelerator, FakeWandbRun, SimpleRTD, setup_pretraining_mocks
 
 import deberta.cli as cli_mod
 from deberta.checkpoint_utils import (
@@ -511,11 +511,12 @@ def test_resolve_output_dir_keeps_explicit_path():
     assert out == Path("runs/custom/run-01")
 
 
-def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 8
+def _accel_stub(*, is_main_process: bool, num_processes: int) -> Any:
+    """Return a minimal accelerator-like object for broadcast helper tests."""
+    return types.SimpleNamespace(is_main_process=bool(is_main_process), num_processes=int(num_processes))
 
+
+def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
     called = {"count": 0}
 
     def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
@@ -523,7 +524,7 @@ def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
         called["count"] += 1
 
     out = _resolve_output_dir_for_accelerator(
-        accelerator=_FakeAccelerator(),
+        accelerator=_accel_stub(is_main_process=False, num_processes=8),
         output_dir="runs/custom/run-02",
         project_name="ignored",
         config_path="cfg.yaml",
@@ -534,16 +535,12 @@ def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
 
 
 def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 2
-
     def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
         assert from_process == 0
         payload[0] = "runs/demo/20260101_010101_shared"
 
     out = _resolve_output_dir_for_accelerator(
-        accelerator=_FakeAccelerator(),
+        accelerator=_accel_stub(is_main_process=False, num_processes=2),
         output_dir=None,
         project_name="demo",
         config_path="cfg.yaml",
@@ -553,10 +550,6 @@ def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
 
 
 def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tmp_path: Path):
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 4
-
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -570,7 +563,7 @@ def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tm
         }
 
     resolved = _resolve_resume_checkpoint_for_accelerator(
-        accelerator=_FakeAccelerator(),
+        accelerator=_accel_stub(is_main_process=False, num_processes=4),
         output_dir=out,
         resume_from_checkpoint="auto",
         broadcast_fn=_fake_broadcast,
@@ -579,10 +572,6 @@ def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tm
 
 
 def test_resolve_resume_checkpoint_for_accelerator_propagates_rank0_error(tmp_path: Path):
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 2
-
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -597,7 +586,7 @@ def test_resolve_resume_checkpoint_for_accelerator_propagates_rank0_error(tmp_pa
 
     with pytest.raises(ValueError, match="rank0 failed"):
         _resolve_resume_checkpoint_for_accelerator(
-            accelerator=_FakeAccelerator(),
+            accelerator=_accel_stub(is_main_process=False, num_processes=2),
             output_dir=out,
             resume_from_checkpoint="auto",
             broadcast_fn=_fake_broadcast,
@@ -628,27 +617,79 @@ def test_resolve_resume_checkpoint_auto_rejects_non_empty_output_dir_without_che
         )
 
 
-def test_resolve_resume_checkpoint_rejects_missing_explicit_path(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    missing = out / "checkpoint-missing"
-    with pytest.raises(FileNotFoundError, match="checkpoint path does not exist"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(missing),
-            is_main_process=True,
+def _write_mock_checkpoint(
+    path: Path,
+    *,
+    with_weights: bool = True,
+    with_data_state: bool = True,
+    with_complete: bool = True,
+    consumed_micro_batches: int = 2,
+) -> Path:
+    """Create a checkpoint directory in one call for resume-related tests."""
+    path.mkdir(parents=True, exist_ok=True)
+    if with_weights:
+        (path / "model.safetensors").write_bytes(b"weights")
+    if with_data_state:
+        (path / "data_state.json").write_text(
+            json.dumps({"consumed_micro_batches": int(consumed_micro_batches)}),
+            encoding="utf-8",
         )
+    if with_complete:
+        (path / ".complete").write_text("ok\n", encoding="utf-8")
+    return path
 
 
-def test_resolve_resume_checkpoint_rejects_non_directory_explicit_path(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("case", "exc_type", "match"),
+    [
+        ("missing_path", FileNotFoundError, "checkpoint path does not exist"),
+        ("not_directory", ValueError, "must point to a checkpoint directory"),
+        ("missing_complete", ValueError, "missing .complete marker"),
+        ("missing_data_state", ValueError, "missing/invalid data_state.json"),
+        ("missing_weights", ValueError, "model weights appear missing or empty"),
+    ],
+)
+def test_resolve_resume_checkpoint_rejects_invalid_explicit_path_states(
+    tmp_path: Path,
+    case: str,
+    exc_type: type[Exception],
+    match: str,
+):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    marker = out / "not-a-dir.txt"
-    marker.write_text("x", encoding="utf-8")
-    with pytest.raises(ValueError, match="must point to a checkpoint directory"):
+    if case == "missing_path":
+        target = out / "checkpoint-missing"
+    elif case == "not_directory":
+        target = out / "not-a-dir.txt"
+        target.write_text("x", encoding="utf-8")
+    elif case == "missing_complete":
+        target = _write_mock_checkpoint(
+            out / "checkpoint-2",
+            with_weights=True,
+            with_data_state=True,
+            with_complete=False,
+        )
+    elif case == "missing_data_state":
+        target = _write_mock_checkpoint(
+            out / "checkpoint-2",
+            with_weights=True,
+            with_data_state=False,
+            with_complete=True,
+        )
+    elif case == "missing_weights":
+        target = _write_mock_checkpoint(
+            out / "checkpoint-2",
+            with_weights=False,
+            with_data_state=True,
+            with_complete=True,
+        )
+    else:  # pragma: no cover
+        raise AssertionError(f"Unsupported case: {case}")
+
+    with pytest.raises(exc_type, match=match):
         _resolve_resume_checkpoint(
             output_dir=out,
-            resume_from_checkpoint=str(marker),
+            resume_from_checkpoint=str(target),
             is_main_process=True,
         )
 
@@ -656,14 +697,7 @@ def test_resolve_resume_checkpoint_rejects_non_directory_explicit_path(tmp_path:
 def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"weights")
-    (ckpt / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2}),
-        encoding="utf-8",
-    )
-    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
+    ckpt = _write_mock_checkpoint(out / "checkpoint-2")
     resolved = _resolve_resume_checkpoint(
         output_dir=out,
         resume_from_checkpoint=str(ckpt),
@@ -672,72 +706,11 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
     assert resolved == str(ckpt.resolve())
 
 
-def test_resolve_resume_checkpoint_rejects_explicit_path_without_complete_marker(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"weights")
-    (ckpt / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="missing .complete marker"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(ckpt),
-            is_main_process=True,
-        )
-
-
-def test_resolve_resume_checkpoint_rejects_explicit_path_without_data_state(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"weights")
-    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="missing/invalid data_state.json"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(ckpt),
-            is_main_process=True,
-        )
-
-
-def test_resolve_resume_checkpoint_rejects_explicit_path_without_model_weights(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2}),
-        encoding="utf-8",
-    )
-    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="model weights appear missing or empty"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(ckpt),
-            is_main_process=True,
-        )
-
-
 def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    ckpt1 = out / "checkpoint-1"
-    ckpt1.mkdir(parents=True, exist_ok=True)
-    (ckpt1 / "model.safetensors").write_bytes(b"weights")
-    (ckpt1 / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 10}),
-        encoding="utf-8",
-    )
-    (ckpt1 / ".complete").write_text("ok\n", encoding="utf-8")
+    ckpt1 = _write_mock_checkpoint(out / "checkpoint-1", consumed_micro_batches=10)
 
     # Simulate interrupted checkpoint write: directory exists but metadata was never written.
     ckpt2 = out / "checkpoint-2"
@@ -1217,91 +1190,51 @@ def test_init_trackers_falls_back_without_init_kwargs(caplog: pytest.LogCaptureF
 
 
 def test_setup_wandb_watch_calls_watch_with_mode_and_frequency() -> None:
-    class _FakeRun:
-        def __init__(self) -> None:
-            self.calls: list[tuple[torch.nn.Module, dict[str, Any]]] = []
-
-        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:
-            self.calls.append((model, dict(kwargs)))
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-        @staticmethod
-        def unwrap_model(model: torch.nn.Module):
-            return model
-
-        @staticmethod
-        def get_tracker(name: str, unwrap: bool = True):
-            del name, unwrap
-            return None
-
     model = torch.nn.Linear(4, 4)
-    run = _FakeRun()
+    run = FakeWandbRun()
     enabled = _setup_wandb_watch(
-        accelerator=_FakeAccelerator(),
+        accelerator=FakeAccelerator(),
         wandb_run=run,
         model=model,
         watch_mode="gradients",
         watch_log_freq=123,
     )
     assert enabled is True
-    assert run.calls
-    watched_model, kwargs = run.calls[0]
+    assert run.watch_calls
+    watched_model, kwargs = run.watch_calls[0]
     assert watched_model is model
     assert kwargs["log"] == "gradients"
     assert kwargs["log_freq"] == 123
 
 
 def test_setup_wandb_watch_returns_false_when_mode_none() -> None:
-    class _FakeRun:
-        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:  # pragma: no cover
-            del model, kwargs
-            raise AssertionError("watch must not be called when mode=none")
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-        @staticmethod
-        def unwrap_model(model: torch.nn.Module):
-            return model
-
+    run = FakeWandbRun()
     enabled = _setup_wandb_watch(
-        accelerator=_FakeAccelerator(),
-        wandb_run=_FakeRun(),
+        accelerator=FakeAccelerator(),
+        wandb_run=run,
         model=torch.nn.Linear(2, 2),
         watch_mode="none",
         watch_log_freq=100,
     )
     assert enabled is False
+    assert run.watch_calls == []
 
 
 def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Path) -> None:
     src = tmp_path / "config_original.yaml"
     src.write_text("train:\n  max_steps: 1\n", encoding="utf-8")
 
-    class _FakeRun:
-        def __init__(self) -> None:
-            self.saved: list[Path] = []
-
-        def save(self, path: str, **kwargs: Any) -> None:
-            del kwargs
-            self.saved.append(Path(path))
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-    run = _FakeRun()
+    run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=_FakeAccelerator(),
+        accelerator=types.SimpleNamespace(is_main_process=True),
         wandb_run=run,
         config_original_path=src,
         run_name="demo-run",
     )
     assert uploaded is True
-    assert run.saved
-    assert run.saved[0].name == "config_original.yaml"
-    assert run.saved[0] == src
+    assert run.saved_paths
+    assert run.saved_paths[0].name == "config_original.yaml"
+    assert run.saved_paths[0] == src
 
 
 def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path: Path) -> None:
@@ -1314,20 +1247,9 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
     src_source = tmp_path / "passed.yaml"
     src_source.write_text("model:\n  profile: deberta_v3_parity\n", encoding="utf-8")
 
-    class _FakeRun:
-        def __init__(self) -> None:
-            self.saved: list[Path] = []
-
-        def save(self, path: str, **kwargs: Any) -> None:
-            del kwargs
-            self.saved.append(Path(path))
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-    run = _FakeRun()
+    run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=_FakeAccelerator(),
+        accelerator=types.SimpleNamespace(is_main_process=True),
         wandb_run=run,
         config_original_path=src_original,
         config_resolved_path=src_resolved,
@@ -1335,7 +1257,7 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
         run_name="demo-run",
     )
     assert uploaded is True
-    saved_names = {p.name for p in run.saved}
+    saved_names = {p.name for p in run.saved_paths}
     assert "config_original.yaml" not in saved_names
     assert "config_resolved.yaml" in saved_names
     assert "passed.yaml" in saved_names
@@ -2306,20 +2228,23 @@ def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phase
     assert "decoupled_training" not in step_rows[-1]
 
 
+class _BackwardTrackingAccelerator(FakeAccelerator):
+    """Fake accelerator that records backward-loss scalars for decoupled-loop assertions."""
+
+    last_instance: _BackwardTrackingAccelerator | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.backward_losses: list[float] = []
+        _BackwardTrackingAccelerator.last_instance = self
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self.backward_losses.append(float(loss.detach().item()))
+
+
 def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_token_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _BackwardTrackingAccelerator(FakeAccelerator):
-        last_instance: _BackwardTrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.backward_losses: list[float] = []
-            _BackwardTrackingAccelerator.last_instance = self
-
-        def backward(self, loss: torch.Tensor) -> None:
-            self.backward_losses.append(float(loss.detach().item()))
-
     class _TokenWeightedDecoupledRTD(SimpleRTD):
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
@@ -2424,61 +2349,13 @@ def test_run_pretraining_decoupled_token_weighted_ga_scales_micro_losses_by_toke
 def test_run_pretraining_decoupled_applies_branch_loss_weights_to_backward_objectives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _BackwardTrackingAccelerator(FakeAccelerator):
-        last_instance: _BackwardTrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.backward_losses: list[float] = []
-            _BackwardTrackingAccelerator.last_instance = self
-
-        def backward(self, loss: torch.Tensor) -> None:
-            self.backward_losses.append(float(loss.detach().item()))
-
-    class _WeightedDecoupledRTD(SimpleRTD):
-        def forward_generator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            labels: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            sampling_temperature: float = 1.0,
-        ) -> Any:
-            del attention_mask, labels, token_type_ids, sampling_temperature
-            gen_loss = self.generator.weight.sum() * 0.0 + 2.0
-            return types.SimpleNamespace(
-                gen_loss_raw=gen_loss,
-                gen_token_count=torch.tensor(1.0),
-                corrupted_input_ids=input_ids.detach().clone(),
-                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
-            )
-
-        def forward_discriminator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            corrupted_input_ids: torch.Tensor,
-            disc_labels: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-        ) -> Any:
-            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
-            disc_loss = self.discriminator.weight.sum() * 0.0 + 3.0
-            return types.SimpleNamespace(
-                disc_loss_raw=disc_loss,
-                disc_accuracy=torch.tensor(0.5),
-                disc_token_count=torch.tensor(1.0),
-                disc_positive_count=torch.tensor(0.0),
-            )
-
-        def sync_discriminator_embeddings_from_generator(self) -> None:
-            return None
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         accelerator_cls=_BackwardTrackingAccelerator,
-        rtd_cls=_WeightedDecoupledRTD,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0},
+            **kwargs,
+        ),
     )
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
@@ -2513,62 +2390,14 @@ def test_run_pretraining_decoupled_applies_branch_loss_weights_to_backward_objec
 def test_run_pretraining_decoupled_skips_generator_optimizer_when_gen_loss_weight_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _BackwardTrackingAccelerator(FakeAccelerator):
-        last_instance: _BackwardTrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.backward_losses: list[float] = []
-            _BackwardTrackingAccelerator.last_instance = self
-
-        def backward(self, loss: torch.Tensor) -> None:
-            self.backward_losses.append(float(loss.detach().item()))
-
-    class _ZeroWeightedGenRTD(SimpleRTD):
-        def forward_generator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            labels: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            sampling_temperature: float = 1.0,
-        ) -> Any:
-            del attention_mask, labels, token_type_ids, sampling_temperature
-            gen_loss = self.generator.weight.sum() * 0.0 + 2.0
-            return types.SimpleNamespace(
-                gen_loss_raw=gen_loss,
-                gen_token_count=torch.tensor(1.0),
-                corrupted_input_ids=input_ids.detach().clone(),
-                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
-            )
-
-        def forward_discriminator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            corrupted_input_ids: torch.Tensor,
-            disc_labels: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-        ) -> Any:
-            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
-            disc_loss = self.discriminator.weight.sum() * 0.0 + 3.0
-            return types.SimpleNamespace(
-                disc_loss_raw=disc_loss,
-                disc_accuracy=torch.tensor(0.5),
-                disc_token_count=torch.tensor(1.0),
-                disc_positive_count=torch.tensor(0.0),
-            )
-
-        def sync_discriminator_embeddings_from_generator(self) -> None:
-            return None
-
     step_counts = {"gen": 0, "disc": 0}
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         accelerator_cls=_BackwardTrackingAccelerator,
-        rtd_cls=_ZeroWeightedGenRTD,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0},
+            **kwargs,
+        ),
     )
     original_build_decoupled = pretrain_mod._build_decoupled_optimizers
 

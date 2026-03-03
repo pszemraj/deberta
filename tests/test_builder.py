@@ -11,71 +11,56 @@ from deberta.config import ModelConfig
 from deberta.modeling import builder as builder_mod
 
 
-def test_build_backbone_configs_preserves_loaded_ffn_for_pretrained_rope(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-
-    def _fake_from_pretrained(cls, src: str):
-        del src
-        return cls(ffn_type="mlp", num_hidden_layers=6)
-
-    monkeypatch.setattr(
-        builder_mod.DebertaRoPEConfig,
-        "from_pretrained",
-        classmethod(_fake_from_pretrained),
-    )
-
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=False,
-        pretrained_discriminator_path="disc",
-    )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=DummyTokenizer(vocab_size=50265),
-        max_position_embeddings=128,
-    )
-
-    assert disc_cfg.ffn_type == "mlp"
-    assert gen_cfg.ffn_type == "mlp"
-
-
-def test_build_backbone_configs_applies_ffn_override_for_scratch_rope(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-
-    def _fake_from_pretrained(cls, src: str):
-        del src
-        return cls(ffn_type="mlp", num_hidden_layers=6)
-
-    monkeypatch.setattr(
-        builder_mod.DebertaRoPEConfig,
-        "from_pretrained",
-        classmethod(_fake_from_pretrained),
-    )
-
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=True,
-        pretrained_discriminator_path="disc",
-        ffn_type="swiglu",
-    )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=DummyTokenizer(vocab_size=50265),
-        max_position_embeddings=128,
-    )
-
-    assert disc_cfg.ffn_type == "swiglu"
-    assert gen_cfg.ffn_type == "swiglu"
-
-
-def test_build_backbone_configs_applies_use_bias_override_for_scratch_rope(
+@pytest.mark.parametrize(
+    ("loaded_kwargs", "model_kwargs", "expected"),
+    [
+        (
+            {"ffn_type": "mlp", "num_hidden_layers": 6},
+            {"from_scratch": False, "pretrained_discriminator_path": "disc"},
+            {"ffn_type": "mlp"},
+        ),
+        (
+            {"ffn_type": "mlp", "num_hidden_layers": 6},
+            {"from_scratch": True, "pretrained_discriminator_path": "disc", "ffn_type": "swiglu"},
+            {"ffn_type": "swiglu"},
+        ),
+        (
+            {"use_bias": True, "num_hidden_layers": 6},
+            {"from_scratch": True, "pretrained_discriminator_path": "disc", "use_bias": False},
+            {"use_bias": False},
+        ),
+        (
+            {"use_bias": True, "num_hidden_layers": 6},
+            {
+                "from_scratch": False,
+                "pretrained_discriminator_path": "custom-rope-checkpoint",
+                "use_bias": False,
+            },
+            {"use_bias": True},
+        ),
+        (
+            {"ffn_type": "mlp", "num_hidden_layers": 6, "intermediate_size": 3072},
+            {
+                "from_scratch": True,
+                "pretrained_discriminator_path": "disc",
+                "ffn_type": "swiglu",
+                "swiglu_adjust_intermediate": True,
+            },
+            {"intermediate_size": 2048},
+        ),
+    ],
+)
+def test_build_backbone_configs_rope_overrides(
     monkeypatch: pytest.MonkeyPatch,
+    loaded_kwargs: dict[str, Any],
+    model_kwargs: dict[str, Any],
+    expected: dict[str, Any],
 ):
     pytest.importorskip("transformers")
 
     def _fake_from_pretrained(cls, src: str):
         del src
-        return cls(use_bias=True, num_hidden_layers=6)
+        return cls(**loaded_kwargs)
 
     monkeypatch.setattr(
         builder_mod.DebertaRoPEConfig,
@@ -83,81 +68,16 @@ def test_build_backbone_configs_applies_use_bias_override_for_scratch_rope(
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=True,
-        pretrained_discriminator_path="disc",
-        use_bias=False,
-    )
+    model_cfg = ModelConfig(backbone_type="rope", **model_kwargs)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=DummyTokenizer(vocab_size=50265),
         max_position_embeddings=128,
     )
 
-    assert disc_cfg.use_bias is False
-    assert gen_cfg.use_bias is False
-
-
-def test_build_backbone_configs_preserves_loaded_use_bias_for_pretrained_rope(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    pytest.importorskip("transformers")
-
-    def _fake_from_pretrained(cls, src: str):
-        del src
-        return cls(use_bias=True, num_hidden_layers=6)
-
-    monkeypatch.setattr(
-        builder_mod.DebertaRoPEConfig,
-        "from_pretrained",
-        classmethod(_fake_from_pretrained),
-    )
-
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=False,
-        pretrained_discriminator_path="custom-rope-checkpoint",
-        use_bias=False,
-    )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=DummyTokenizer(vocab_size=50265),
-        max_position_embeddings=128,
-    )
-
-    assert disc_cfg.use_bias is True
-    assert gen_cfg.use_bias is True
-
-
-def test_build_backbone_configs_adjusts_swiglu_intermediate_for_scratch(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-
-    def _fake_from_pretrained(cls, src: str):
-        del src
-        return cls(ffn_type="mlp", num_hidden_layers=6, intermediate_size=3072)
-
-    monkeypatch.setattr(
-        builder_mod.DebertaRoPEConfig,
-        "from_pretrained",
-        classmethod(_fake_from_pretrained),
-    )
-
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=True,
-        pretrained_discriminator_path="disc",
-        ffn_type="swiglu",
-        swiglu_adjust_intermediate=True,
-    )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=DummyTokenizer(vocab_size=50265),
-        max_position_embeddings=128,
-    )
-
-    assert disc_cfg.intermediate_size == 2048
-    assert gen_cfg.intermediate_size == 2048
+    for key, value in expected.items():
+        assert getattr(disc_cfg, key) == value
+        assert getattr(gen_cfg, key) == value
 
 
 def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
