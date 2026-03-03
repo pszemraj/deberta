@@ -4955,7 +4955,7 @@ def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
     assert train_cfg.disc_loss_weight == pytest.approx(10.0)
     assert train_cfg.adam_epsilon == pytest.approx(1e-6)
     assert train_cfg.warmup_steps == 10_000
-    assert train_cfg.token_weighted_gradient_accumulation is False
+    assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_apply_profile_defaults_applies_hf_parity_values_without_parity_profile() -> None:
@@ -4969,7 +4969,7 @@ def test_apply_profile_defaults_applies_hf_parity_values_without_parity_profile(
     assert train_cfg.disc_loss_weight == pytest.approx(10.0)
     assert train_cfg.adam_epsilon == pytest.approx(1e-6)
     assert train_cfg.warmup_steps == 10_000
-    assert train_cfg.token_weighted_gradient_accumulation is False
+    assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_apply_profile_defaults_keeps_rope_modern_defaults() -> None:

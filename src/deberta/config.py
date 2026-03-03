@@ -1602,7 +1602,7 @@ def apply_profile_defaults(*, model_cfg: ModelConfig, train_cfg: TrainConfig) ->
         if "token_weighted_gradient_accumulation" not in explicit_train_fields and bool(
             train_cfg.token_weighted_gradient_accumulation
         ) == bool(train_defaults.token_weighted_gradient_accumulation):
-            train_cfg.token_weighted_gradient_accumulation = False
+            train_cfg.token_weighted_gradient_accumulation = True
 
 
 def validate_training_workflow_options(

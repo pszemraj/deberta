@@ -42,7 +42,7 @@ Exposed controls:
 - `train.disc_loss_weight` (raw default `50.0`; effective `10.0` for `model.backbone_type=hf_deberta_v2` when unset)
 - `train.decoupled_training` (default `true`)
 - `train.sampling_temperature`
-- `train.token_weighted_gradient_accumulation` (raw default `true`; effective `false` for `model.backbone_type=hf_deberta_v2` when unset)
+- `train.token_weighted_gradient_accumulation` (raw default `true`; effective `true` for `model.backbone_type=hf_deberta_v2` when unset)
 - `model.hidden_dropout_prob` and `model.attention_probs_dropout_prob` (default `0.0`; set `null` to preserve source/checkpoint-native dropout)
 
 For parity-profile defaults and long-run parity configs, see [replication](replication.md).

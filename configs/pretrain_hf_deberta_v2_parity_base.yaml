@@ -51,7 +51,7 @@ train:
   gen_loss_weight: 1.0
   disc_loss_weight: 10.0  # parity++ delta vs paper lambda=50
   decoupled_training: true
-  token_weighted_gradient_accumulation: false
+  token_weighted_gradient_accumulation: true
 
   logging_steps: 25
   save_steps: 1000
