@@ -8,7 +8,6 @@ import inspect
 import json
 import logging
 import math
-import os
 import re
 import time
 import types
@@ -104,18 +103,6 @@ def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
     with opener as f:
         f.write(line)
         f.flush()
-
-
-def _env_flag_true(name: str) -> bool:
-    """Return whether an environment flag should be treated as enabled.
-
-    :param str name: Environment variable name.
-    :return bool: ``True`` when set to a truthy value (e.g., ``1``, ``true``, ``yes``, ``on``).
-    """
-    raw = os.getenv(str(name))
-    if raw is None:
-        return False
-    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
 
 
 def _flush_loggers() -> None:
@@ -1967,8 +1954,7 @@ def run_pretraining(
     exit_code = 0
     train_started_at = time.perf_counter()
     metrics_path = output_dir / "metrics.jsonl.gz"
-    debug_metrics_env_enabled = _env_flag_true("DEBERTA_DEBUG")
-    debug_metrics_enabled = bool(train_cfg.debug_metrics) or bool(debug_metrics_env_enabled)
+    debug_metrics_enabled = bool(train_cfg.debug_metrics)
     wandb_run: Any | None = None
     max_tracker_step_logged = 0
     train_progress: Any | None = None
@@ -3188,7 +3174,6 @@ def run_pretraining(
                             {
                                 "step": int(global_step),
                                 "debug_metrics": True,
-                                "debug_metrics_source_env": bool(debug_metrics_env_enabled),
                                 **zero_metrics,
                             },
                         )

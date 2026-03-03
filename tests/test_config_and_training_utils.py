@@ -2706,11 +2706,7 @@ def _run_zero_token_weighted_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     debug_metrics: bool,
-    source_env_debug: bool,
 ) -> Path:
-    if source_env_debug:
-        monkeypatch.setenv("DEBERTA_DEBUG", "1")
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         accelerator_cls=_ZeroTokenTrackingAccelerator,
@@ -2808,36 +2804,28 @@ def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_debug_met
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     metrics_path = _run_zero_token_weighted_case(
-        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=True, source_env_debug=False
+        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=True
     )
     _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
 
     assert metrics_path.exists()
     last = _load_last_debug_metrics_row(metrics_path)
     assert int(last["step"]) == 1
-    assert last["debug_metrics_source_env"] is False
     assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
     assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
     assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
     assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
 
 
-def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_deberta_debug_env_is_set(
+def test_run_pretraining_does_not_log_debug_metrics_when_debug_metrics_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     metrics_path = _run_zero_token_weighted_case(
-        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=False, source_env_debug=True
+        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=False
     )
     _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
 
-    assert metrics_path.exists()
-    last = _load_last_debug_metrics_row(metrics_path)
-    assert int(last["step"]) == 1
-    assert last["debug_metrics_source_env"] is True
-    assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert not metrics_path.exists()
 
 
 def test_run_pretraining_compiles_generator_and_discriminator(
