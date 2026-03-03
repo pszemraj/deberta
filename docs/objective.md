@@ -37,10 +37,10 @@ Treat that as an objective variant, not parity mode.
 Exposed controls:
 
 - `train.gen_loss_weight`
-- `train.disc_loss_weight` (default `50.0`)
+- `train.disc_loss_weight` (raw default `50.0`; effective `10.0` for `model.backbone_type=hf_deberta_v2` when unset)
 - `train.decoupled_training` (default `true`)
 - `train.sampling_temperature`
-- `train.token_weighted_gradient_accumulation` (default `true`)
+- `train.token_weighted_gradient_accumulation` (raw default `true`; effective `false` for `model.backbone_type=hf_deberta_v2` when unset)
 
 For parity-profile defaults and long-run parity configs, see [replication](replication.md).
 

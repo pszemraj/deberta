@@ -43,8 +43,9 @@ train:
 
 Notes:
 
-- `model.profile=deberta_v3_parity` applies parity-oriented defaults where values are still unset.
 - `backbone_type=hf_deberta_v2` is the key switch for disentangled attention + LayerNorm parity.
+- For `backbone_type=hf_deberta_v2`, this repo applies parity++ RTD defaults when unset (`mask_token_prob=1.0`, `random_token_prob=0.0`, `disc_loss_weight=10.0`, `adam_epsilon=1e-6`, `warmup_steps=10000`, `token_weighted_gradient_accumulation=false`).
+- `model.profile=deberta_v3_parity` remains available as the explicit parity profile surface; explicit YAML/CLI values always override defaults.
 - `train.decoupled_training=true` is the default and keeps two-phase RTD updates enabled.
 - `train.mlm_max_ngram=1` is intentional for RTD parity and means token-level masking (not whole-word masking).
 - Decoupled mode is intentionally incompatible with `model.embedding_sharing=es`; use `gdes` (recommended) or `none`.
