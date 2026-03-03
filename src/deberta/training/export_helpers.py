@@ -26,6 +26,7 @@ def _write_export_readme(
     output_dir: Path,
     *,
     model_cfg: Any,
+    export_config: Any | None = None,
     data_cfg: Any | None = None,
     train_cfg: Any,
     embedding_sharing: str,
@@ -34,17 +35,34 @@ def _write_export_readme(
 
     :param Path output_dir: Export destination directory.
     :param Any model_cfg: Model configuration dataclass.
+    :param Any | None export_config: Optional exported backbone config (preferred source for architecture stats).
     :param Any | None data_cfg: Optional data configuration dataclass.
     :param Any train_cfg: Training configuration dataclass.
     :param str embedding_sharing: Embedding sharing mode.
     """
+
+    def _first_int_attr(*objs: Any, attr: str) -> int:
+        """Return the first int-coercible attribute value across candidate objects."""
+        for obj in objs:
+            if obj is None:
+                continue
+            value = getattr(obj, attr, None)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return 0
+
     backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
-    hidden = int(getattr(model_cfg, "hidden_size", 0))
-    layers = int(getattr(model_cfg, "num_hidden_layers", 0) or 0)
-    heads = int(getattr(model_cfg, "num_attention_heads", 0) or 0)
+    runtime_cfg = export_config if export_config is not None else model_cfg
+    hidden = _first_int_attr(runtime_cfg, model_cfg, attr="hidden_size")
+    layers = _first_int_attr(runtime_cfg, model_cfg, attr="num_hidden_layers")
+    heads = _first_int_attr(runtime_cfg, model_cfg, attr="num_attention_heads")
     seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
     if seq_len == 0:
-        seq_len = int(getattr(model_cfg, "max_position_embeddings", 0) or 0)
+        seq_len = _first_int_attr(runtime_cfg, model_cfg, attr="max_position_embeddings")
     steps = int(getattr(train_cfg, "max_steps", 0) or 0)
 
     if backbone == "rope":
@@ -213,6 +231,7 @@ def _export_discriminator_hf(
             _write_export_readme(
                 output_dir,
                 model_cfg=model_cfg,
+                export_config=getattr(export_disc, "config", None),
                 data_cfg=data_cfg,
                 train_cfg=train_cfg,
                 embedding_sharing=embedding_sharing,

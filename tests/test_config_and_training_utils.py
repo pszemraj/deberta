@@ -41,6 +41,7 @@ from deberta.config import (
     ModelConfig,
     OptimConfig,
     TrainConfig,
+    _looks_like_hf_deberta_checkpoint,
     _normalize_hf_attention_kernel,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_backend,
@@ -3624,6 +3625,31 @@ def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
     assert "| Max sequence length | 333 |" in text
 
 
+def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_path: Path):
+    out_dir = tmp_path / "hf-export-effective-config"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    export_cfg = types.SimpleNamespace(
+        hidden_size=768,
+        num_hidden_layers=6,
+        num_attention_heads=12,
+        max_position_embeddings=4096,
+    )
+
+    _write_export_readme(
+        out_dir,
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", hf_model_size="small"),
+        export_config=export_cfg,
+        data_cfg=None,
+        train_cfg=TrainConfig(max_steps=100),
+        embedding_sharing="gdes",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "# hf_deberta_v2-768h-6L-12H" in text
+    assert "| Max sequence length | 4096 |" in text
+
+
 def test_build_optimizer_supports_generator_specific_lr():
     model = TinyRTDLikeModel()
     cfg = TrainConfig(learning_rate=1.0e-3, generator_learning_rate=5.0e-4, weight_decay=0.1)
@@ -5344,6 +5370,24 @@ def test_validate_model_config_allows_pretrained_derived_generator_layer_overrid
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",
         generator_num_hidden_layers=4,
+    )
+    validate_model_config(cfg)
+
+
+def test_looks_like_hf_deberta_checkpoint_avoids_local_rope_false_positive():
+    assert _looks_like_hf_deberta_checkpoint("microsoft/deberta-v3-base")
+    assert _looks_like_hf_deberta_checkpoint("https://huggingface.co/microsoft/deberta-v3-base")
+    assert _looks_like_hf_deberta_checkpoint(
+        "/home/user/.cache/huggingface/hub/models--microsoft--deberta-v3-base/snapshots/abc"
+    )
+    assert not _looks_like_hf_deberta_checkpoint("runs/deberta-v3-rope/checkpoint-1000")
+
+
+def test_validate_model_config_allows_local_rope_checkpoint_path_with_deberta_in_name():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        pretrained_discriminator_path="runs/deberta-v3-rope/checkpoint-1000",
     )
     validate_model_config(cfg)
 

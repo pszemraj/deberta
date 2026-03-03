@@ -116,9 +116,9 @@ _MIXED_PRECISION_ALIASES = {
     "n": "no",
 }
 _HF_DEBERTA_PRETRAINED_PREFIXES = (
-    "deberta-v2",
-    "deberta-v3",
-    "mdeberta-v3",
+    "microsoft/deberta-v2",
+    "microsoft/deberta-v3",
+    "microsoft/mdeberta-v3",
 )
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
@@ -1246,8 +1246,38 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     :param str value: Model source string.
     :return bool: True when source matches known HF DeBERTa hub-id prefixes.
     """
-    v = f"/{str(value).strip().lower()}"
-    return any(f"/{prefix}" in v for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES)
+    raw = str(value).strip().lower()
+    if not raw:
+        return False
+
+    v = raw.replace("\\", "/")
+    if v.startswith("hf://"):
+        v = v[len("hf://") :]
+    if v.startswith("https://huggingface.co/") or v.startswith("http://huggingface.co/"):
+        v = v.split("huggingface.co/", 1)[1]
+    v = v.lstrip("/")
+
+    def _matches_repo_id(candidate: str) -> bool:
+        """Return whether candidate is a DeBERTa repo id or repo-scoped path."""
+        return any(
+            candidate == prefix or candidate.startswith(f"{prefix}-") or candidate.startswith(f"{prefix}/")
+            for prefix in _HF_DEBERTA_PRETRAINED_PREFIXES
+        )
+
+    if _matches_repo_id(v):
+        return True
+
+    # Common local Hugging Face cache layout:
+    # .../models--microsoft--deberta-v3-base/snapshots/<rev>/...
+    cache_path = f"/{v}/"
+    return any(
+        marker in cache_path
+        for marker in (
+            "/models--microsoft--deberta-v2",
+            "/models--microsoft--deberta-v3",
+            "/models--microsoft--mdeberta-v3",
+        )
+    )
 
 
 def validate_model_config(cfg: ModelConfig) -> None:
