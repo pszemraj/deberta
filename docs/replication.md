@@ -52,6 +52,27 @@ Notes:
 - Keep RoPE-only knobs at defaults (they do not apply on the HF-compatible backbone).
 - This repo keeps RTD objective semantics and GDES behavior explicit and tested; it does not guarantee bit-identical reproduction of original Microsoft training pipelines.
 
+## HF `deberta-v3-base` Reference and Explicit Deltas
+
+Reference HF config values (`microsoft/deberta-v3-base`):
+
+```yaml
+hidden_act: gelu
+hidden_size: 768
+intermediate_size: 3072
+num_hidden_layers: 12
+num_attention_heads: 12
+hidden_dropout_prob: 0.1
+attention_probs_dropout_prob: 0.1
+initializer_range: 0.02
+```
+
+Intentional repo differences:
+
+- dropout defaults are `0.0` (`model.hidden_dropout_prob`, `model.attention_probs_dropout_prob`) as a repo-wide standard.
+- set either dropout field to `null` if you want to preserve HF/source dropout (`0.1`) instead of overriding.
+- rope-only FFN knob `model.ffn_type` defaults to `mlp` and is ignored on `backbone_type=hf_deberta_v2`.
+
 ## Canonical Configs
 
 Use the default long-run parity configs in `configs/`:

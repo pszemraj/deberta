@@ -1,6 +1,6 @@
 # deberta: a modern refresh
 
-A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with a default `hf_deberta_v2` backbone plus optional RoPE/KEEL experimental tracks, Accelerate, and FSDP2 workflows. The `hf_deberta_v2` path applies parity++ RTD defaults when values are unset, while `rope` keeps the modern experimental defaults.
+A PyTorch-first modern refresh of [DeBERTa pretraining](https://github.com/microsoft/DeBERTa), focused on [DeBERTaV3](https://arxiv.org/abs/2111.09543)-style replaced token detection with a default `hf_deberta_v2` backbone plus optional RoPE/KEEL experimental tracks, Accelerate, and FSDP2 workflows. The `hf_deberta_v2` path applies parity++ RTD defaults when values are unset, while `rope` keeps the modern experimental defaults. Repo-wide dropout defaults are `0.0` unless you explicitly set them to `null` to preserve source/checkpoint values.
 
 ## Install
 

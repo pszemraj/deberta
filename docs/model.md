@@ -11,13 +11,35 @@ See also: [replication guide](replication.md), [data pipeline](data.md), [RTD ob
 | **Attention** | Disentangled (C2C + C2P + P2C + optional P2P relative-position bias) | Standard multi-head (QKV → RoPE → SDPA) |
 | **Position encoding** | Learned relative-position embeddings + bucket indices | Rotary embeddings (geometric, no learned table) |
 | **Normalization** | LayerNorm | RMSNorm |
-| **FFN** | MLP only (GELU) | SwiGLU (default) or MLP |
+| **FFN** | MLP only (GELU) | MLP (default) or SwiGLU (opt-in) |
 | **Bias** | Hardcoded per layer | Configurable (`use_bias`) |
 | **Pretraining objective** | RTD (ELECTRA-style) + GDES | RTD (ELECTRA-style) + GDES |
 
 The `hf_deberta_v2` backbone faithfully implements the DeBERTa-v2/v3 architecture including disentangled attention with content-to-position (C2P), position-to-content (P2C), and optional position-to-position (P2P) bias terms via separate `pos_key_proj`/`pos_query_proj` projections.
 
 The `rope` backbone is an experimental modern encoder path that uses the DeBERTa-v3 RTD pretraining recipe and GDES embedding sharing but does **not** implement disentangled attention. Position information is encoded geometrically via rotary embeddings in Q/K vectors.
+
+## HF Reference Defaults vs Repo Defaults
+
+For `model.discriminator_model_name_or_path=microsoft/deberta-v3-base`, the HF config includes:
+
+```yaml
+hidden_act: gelu
+hidden_size: 768
+intermediate_size: 3072
+num_hidden_layers: 12
+num_attention_heads: 12
+hidden_dropout_prob: 0.1
+attention_probs_dropout_prob: 0.1
+initializer_range: 0.02
+```
+
+Repo default policy:
+
+- `backbone_type=hf_deberta_v2` keeps HF architecture compatibility (same DeBERTa-v2/v3 stack).
+- `model.ffn_type` is rope-only and defaults to `mlp`; it is not applied in `hf_deberta_v2` mode.
+- repo-wide dropout override defaults are `hidden_dropout_prob=0.0` and `attention_probs_dropout_prob=0.0`.
+- set either dropout field to `null` to preserve source/checkpoint-native dropout values (for example HF `0.1`).
 
 ## Source Resolution Contract
 
@@ -95,11 +117,10 @@ Key options in `ModelConfig`:
 - attention:
   - `attention_implementation`: `sdpa` (recommended) or `eager`
 - dropout:
-  - `hidden_dropout_prob` and `attention_probs_dropout_prob` default to `null` (no override)
-  - set a numeric value (including `0.0`) to explicitly override discriminator/generator dropout
-  - leaving them `null` preserves checkpoint-native dropout values for pretrained loads
+  - `hidden_dropout_prob` and `attention_probs_dropout_prob` default to `0.0` (repo-wide standard override)
+  - set either field to `null` to preserve checkpoint-native dropout values for pretrained loads
 - FFN block:
-  - `ffn_type`: `swiglu` (default) or `mlp`
+  - `ffn_type`: `mlp` (default) or `swiglu`
   - `use_bias`: whether attention/FFN projections use bias (`false` by default for scratch RoPE builds)
   - `swiglu_adjust_intermediate` (default `true`) scales `intermediate_size` by `2/3` for scratch RoPE + SwiGLU builds so FFN parameter budget stays comparable to MLP settings
   - derived generator configs inherit discriminator scaling; explicit `generator_intermediate_size` remains explicit (not auto-rescaled)

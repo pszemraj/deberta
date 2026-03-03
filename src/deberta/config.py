@@ -326,10 +326,10 @@ class ModelConfig:
     )
 
     ffn_type: str = field(
-        default="swiglu",
+        default="mlp",
         metadata={
             "help": (
-                "FFN block type for rope backbone: 'swiglu' (default) or 'mlp'. "
+                "FFN block type for rope backbone: 'mlp' (default) or 'swiglu'. "
                 "Applied when model.from_scratch=true; pretrained rope loads preserve checkpoint ffn_type."
             )
         },
@@ -470,23 +470,23 @@ class ModelConfig:
     )
 
     hidden_dropout_prob: float | None = field(
-        default=None,
+        default=0.0,
         metadata={
             "help": (
                 "Hidden dropout probability for discriminator/generator configs. "
-                "Default is null (no override). Set a numeric value (including 0.0) to "
-                "explicitly override discriminator/generator dropout."
+                "Default is 0.0 (repo standard override). Set null to preserve "
+                "source/checkpoint-native dropout."
             )
         },
     )
 
     attention_probs_dropout_prob: float | None = field(
-        default=None,
+        default=0.0,
         metadata={
             "help": (
                 "Attention dropout probability for discriminator/generator configs. "
-                "Default is null (no override). Set a numeric value (including 0.0) to "
-                "explicitly override discriminator/generator dropout."
+                "Default is 0.0 (repo standard override). Set null to preserve "
+                "source/checkpoint-native dropout."
             )
         },
     )

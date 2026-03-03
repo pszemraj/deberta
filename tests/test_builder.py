@@ -28,7 +28,6 @@ def test_build_backbone_configs_preserves_loaded_ffn_for_pretrained_rope(monkeyp
         backbone_type="rope",
         from_scratch=False,
         discriminator_model_name_or_path="disc",
-        ffn_type="swiglu",
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -607,8 +606,8 @@ _USE_MODEL_DEFAULT = object()
         "expected_attn",
     ),
     [
-        (False, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.1, 0.2),
-        (True, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.1, 0.2),
+        (False, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.0, 0.0),
+        (True, _USE_MODEL_DEFAULT, _USE_MODEL_DEFAULT, 0.0, 0.0),
         (False, None, None, 0.1, 0.2),
         (True, None, None, 0.1, 0.2),
         (False, 0.5, 0.25, 0.5, 0.25),

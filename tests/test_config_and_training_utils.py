@@ -3822,8 +3822,9 @@ def test_config_defaults():
     assert train.token_weighted_gradient_accumulation is True
 
     model = ModelConfig()
-    assert model.hidden_dropout_prob is None
-    assert model.attention_probs_dropout_prob is None
+    assert model.hidden_dropout_prob == pytest.approx(0.0)
+    assert model.attention_probs_dropout_prob == pytest.approx(0.0)
+    assert model.ffn_type == "mlp"
     assert model.swiglu_adjust_intermediate is True
 
     data = DataConfig()
@@ -5031,7 +5032,14 @@ def test_apply_profile_defaults_honors_explicit_fields_even_when_matching_raw_de
         token_weighted_gradient_accumulation=True,
     )
     model_cfg._explicit_fields = {"backbone_type", "embedding_sharing", "hf_attention_kernel"}
-    train_cfg._explicit_fields = {"mask_token_prob", "random_token_prob", "disc_loss_weight", "adam_epsilon", "warmup_steps", "token_weighted_gradient_accumulation"}
+    train_cfg._explicit_fields = {
+        "mask_token_prob",
+        "random_token_prob",
+        "disc_loss_weight",
+        "adam_epsilon",
+        "warmup_steps",
+        "token_weighted_gradient_accumulation",
+    }
 
     apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
 
@@ -5406,6 +5414,8 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
         backbone_type="rope",
         from_scratch=False,
         discriminator_model_name_or_path="local-rope-disc",
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
     )
 
     disc_cfg, _ = build_backbone_configs(
