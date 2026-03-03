@@ -832,6 +832,8 @@ class DebertaV3RTDPretrainer(nn.Module):
                 if gen_mod is None or disc_mod is None:
                     continue
                 gw = _validate(attr, gen_mod, disc_mod)
+                # Keep a true Parameter alias for strict ES semantics; optimizer
+                # grouping deduplicates by parameter identity.
                 disc_mod.weight = gw  # type: ignore[assignment]
             return
 

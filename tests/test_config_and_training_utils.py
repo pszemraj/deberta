@@ -88,6 +88,7 @@ from deberta.training.pretrain import (
     _load_resume_state_with_compile_fallback,
     _normalize_resume_consumed_micro_batches,
     _optimizer_param_order_digest,
+    _partition_optimizer_params,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _resolve_data_resume_policy,
@@ -938,6 +939,27 @@ def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
     m[0].bias.requires_grad_(False)
     d_partial = _optimizer_param_order_digest(m)
     assert d_all != d_partial, "Freezing params changes the trainable param set and digest"
+
+
+def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
+    class _SharedRTDLike(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = torch.nn.Module()
+            self.discriminator = torch.nn.Module()
+            shared = torch.nn.Parameter(torch.randn(3, 3))
+            self.generator.shared = shared
+            self.discriminator.shared = shared
+
+    model = _SharedRTDLike()
+    parts = _partition_optimizer_params(model)
+    ordered = ("gen_decay", "gen_no_decay", "disc_decay", "disc_no_decay")
+    params = [p for key in ordered for p in parts[key]["params"]]
+    names = [n for key in ordered for n in parts[key]["names"]]
+
+    assert len(params) == 1
+    assert len(names) == 1
+    assert len({id(p) for p in params}) == 1
 
 
 def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:

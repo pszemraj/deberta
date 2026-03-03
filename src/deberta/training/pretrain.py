@@ -1041,10 +1041,17 @@ def _partition_optimizer_params(model: torch.nn.Module) -> dict[str, dict[str, l
         "disc_decay": {"params": [], "names": []},
         "disc_no_decay": {"params": [], "names": []},
     }
+    seen_param_ids: set[int] = set()
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        # Guard against shared-parameter aliasing (for example ES embedding sharing)
+        # to keep each Parameter in exactly one optimizer group.
+        pid = id(param)
+        if pid in seen_param_ids:
+            continue
+        seen_param_ids.add(pid)
 
         no_decay = _is_no_decay_param(name=name, param=param)
         is_gen = _is_generator_param(name)

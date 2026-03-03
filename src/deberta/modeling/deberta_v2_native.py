@@ -596,7 +596,6 @@ class DisentangledSelfAttention(nn.Module):
         # Keep score-path numerics in fp32 under compile for improved stability.
         query_layer_f = query_layer.float()
         key_layer_f = key_layer.float()
-        value_layer_f = value_layer.float()
         attention_scores = torch.matmul(query_layer_f, key_layer_f.transpose(-1, -2)) / scale
 
         if self.relative_attention and rel_embeddings is not None:
@@ -633,7 +632,10 @@ class DisentangledSelfAttention(nn.Module):
         if attention_mask is not None:
             probs = probs * live_queries.to(dtype=probs.dtype)
 
-        context_layer = torch.matmul(probs, value_layer_f)
+        # Keep value/context path at model dtype to avoid unnecessary fp32 activation
+        # expansion; only score-path numerics require fp32 stabilization.
+        probs = probs.to(dtype=value_layer.dtype)
+        context_layer = torch.matmul(probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         bsz, seq_len, _, _ = context_layer.shape
         context_layer = context_layer.view(bsz, seq_len, self.all_head_size).to(dtype=model_dtype)
