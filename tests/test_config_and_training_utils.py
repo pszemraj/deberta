@@ -122,6 +122,16 @@ class _TinyRTDLikeModel(torch.nn.Module):
         self.discriminator_norm = torch.nn.LayerNorm(8)
 
 
+class _LastInstanceAccelerator(FakeAccelerator):
+    """Fake accelerator that exposes the most recently created instance."""
+
+    last_instance: _LastInstanceAccelerator | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        _LastInstanceAccelerator.last_instance = self
+
+
 def test_load_yaml_nested_and_flat(tmp_path: Path):
     pytest.importorskip("yaml")
 
@@ -1438,13 +1448,6 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
-    class _TrackingAccelerator(FakeAccelerator):
-        last_instance: _TrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            _TrackingAccelerator.last_instance = self
-
     saved_checkpoints: list[tuple[str, int, str]] = []
 
     def _fake_save_checkpoint(
@@ -1462,7 +1465,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_TrackingAccelerator,
+        accelerator_cls=_LastInstanceAccelerator,
         save_checkpoint_fn=_fake_save_checkpoint,
         extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
@@ -1508,7 +1511,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert saved_checkpoints[-1][1] == 1
     assert saved_checkpoints[-1][2] == "final"
 
-    accel = _TrackingAccelerator.last_instance
+    accel = _LastInstanceAccelerator.last_instance
     assert accel is not None
     assert accel.wandb_run.summary["crashed"] is True
     assert accel.wandb_run.summary["crash_type"] == "KeyboardInterrupt"
@@ -1666,14 +1669,6 @@ def _write_resume_source_snapshots(run_dir: Path) -> None:
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.loaded.append((ckpt, dict(kwargs)))
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1695,7 +1690,7 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
+        accelerator_cls=FakeAccelerator,
         cycle_fn=_fail_cycle,
     )
     train_cfg = TrainConfig(
@@ -1725,14 +1720,6 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.loaded.append((ckpt, dict(kwargs)))
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1753,7 +1740,7 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
+        accelerator_cls=FakeAccelerator,
     )
     monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
 
@@ -1786,14 +1773,6 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.loaded.append((ckpt, dict(kwargs)))
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1820,7 +1799,7 @@ def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
+        accelerator_cls=FakeAccelerator,
     )
     monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
 
@@ -1928,50 +1907,6 @@ def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            del ckpt, kwargs
-
-    class _DecoupledRTD(SimpleRTD):
-        def forward_generator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            labels: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            sampling_temperature: float = 1.0,
-        ) -> Any:
-            del attention_mask, labels, token_type_ids, sampling_temperature
-            gen_loss = self.generator.weight.sum() * 0.0 + 1.0
-            return types.SimpleNamespace(
-                gen_loss_raw=gen_loss,
-                gen_token_count=torch.tensor(1.0),
-                corrupted_input_ids=input_ids.detach().clone(),
-                disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
-            )
-
-        def forward_discriminator_phase(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            corrupted_input_ids: torch.Tensor,
-            disc_labels: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-        ) -> Any:
-            del input_ids, corrupted_input_ids, disc_labels, attention_mask, token_type_ids
-            disc_loss = self.discriminator.weight.sum() * 0.0 + 1.0
-            return types.SimpleNamespace(
-                disc_loss_raw=disc_loss,
-                disc_accuracy=torch.tensor(0.5),
-                disc_token_count=torch.tensor(1.0),
-                disc_positive_count=torch.tensor(0.0),
-            )
-
-        def sync_discriminator_embeddings_from_generator(self) -> None:
-            return None
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-0"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1995,8 +1930,8 @@ def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
-        rtd_cls=_DecoupledRTD,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
     )
 
     train_cfg = TrainConfig(
@@ -2033,13 +1968,6 @@ def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
 def test_run_pretraining_logs_window_averaged_rtd_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _TrackingAccelerator(FakeAccelerator):
-        last_instance: _TrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            _TrackingAccelerator.last_instance = self
-
     class _WindowMetricRTD(SimpleRTD):
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
@@ -2069,7 +1997,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_TrackingAccelerator,
+        accelerator_cls=_LastInstanceAccelerator,
         rtd_cls=_WindowMetricRTD,
     )
     train_cfg = TrainConfig(
@@ -2095,7 +2023,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         train_cfg=train_cfg,
     )
 
-    accel = _TrackingAccelerator.last_instance
+    accel = _LastInstanceAccelerator.last_instance
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
@@ -2111,13 +2039,6 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
 def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _TrackingAccelerator(FakeAccelerator):
-        last_instance: _TrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            _TrackingAccelerator.last_instance = self
-
     call_order: list[str] = []
 
     class _DecoupledRTD(SimpleRTD):
@@ -2164,7 +2085,7 @@ def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phase
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_TrackingAccelerator,
+        accelerator_cls=_LastInstanceAccelerator,
         rtd_cls=_DecoupledRTD,
     )
 
@@ -2221,7 +2142,7 @@ def test_run_pretraining_decoupled_steps_both_optimizers_and_syncs_between_phase
     disc_step_idx = call_order.index("disc_step")
     assert gen_forward_idx < gen_step_idx < sync_after_gen_idx < disc_forward_idx < disc_step_idx
 
-    accel = _TrackingAccelerator.last_instance
+    accel = _LastInstanceAccelerator.last_instance
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
