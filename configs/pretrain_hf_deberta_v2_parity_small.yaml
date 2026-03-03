@@ -8,7 +8,6 @@ model:
   tokenizer_name_or_path: microsoft/deberta-v3-small
   backbone_type: hf_deberta_v2
   hf_model_size: small
-  generator_model_name_or_path: null
   from_scratch: true
   embedding_sharing: gdes
   hf_attention_kernel: dynamic

@@ -53,8 +53,8 @@ Builder behavior is intentionally deterministic and split into two phases:
 
 | Mode | Discriminator config | Generator config |
 |---|---|---|
-| `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
-| `backbone_type=rope`, `from_scratch=false` | `model.discriminator_model_name_or_path` | explicit `model.generator_model_name_or_path` if set; otherwise derived from discriminator config |
+| `backbone_type=rope`, `from_scratch=true` | synthetic config built from `model.*` rope scratch fields | explicit `model.pretrained_generator_path` if set; otherwise derived from discriminator config |
+| `backbone_type=rope`, `from_scratch=false` | `model.pretrained_discriminator_path` | explicit `model.pretrained_generator_path` if set; otherwise derived from discriminator config |
 | `backbone_type=hf_deberta_v2`, `from_scratch=true|false` | repo-owned synthesized config from `model.hf_model_size` + runtime overrides | derived from discriminator config (same width/heads/ffn, reduced depth) |
 
 ### Weight Sources
@@ -62,12 +62,12 @@ Builder behavior is intentionally deterministic and split into two phases:
 | Mode | Discriminator weights | Generator weights |
 |---|---|---|
 | `from_scratch=true` | random init (`from_config`) | random init (`from_config`) |
-| `from_scratch=false` + explicit generator model source | `model.discriminator_model_name_or_path` | `model.generator_model_name_or_path` |
-| `from_scratch=false` + no generator source (derived generator exception) | `model.discriminator_model_name_or_path` | discriminator fallback (`model.discriminator_model_name_or_path`) |
+| `from_scratch=false` + explicit generator model source | `model.pretrained_discriminator_path` | `model.pretrained_generator_path` |
+| `from_scratch=false` + no generator source (derived generator exception) | `model.pretrained_discriminator_path` | discriminator fallback (`model.pretrained_discriminator_path`) |
 
 Generator-source rule:
 
-- set `model.generator_model_name_or_path` to use explicit generator config+weights from that source
+- set `model.pretrained_generator_path` to use explicit generator config+weights from that source
 - leave it unset to use derived-generator fallback from discriminator source
 
 ### Tokenizer Compatibility Policy
@@ -159,7 +159,7 @@ RTD uses separate generator and discriminator backbones.
   - `generator_intermediate_size`
   - `generator_num_attention_heads`
 
-If `generator_model_name_or_path` is set, the derived-generator sizing knobs above must be unset.
+If `pretrained_generator_path` is set, the derived-generator sizing knobs above must be unset.
 
 ## Embedding Sharing
 

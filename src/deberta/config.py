@@ -117,7 +117,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 2
+RUN_CONFIG_SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -216,7 +216,7 @@ class ModelConfig:
     )
 
     # Model source paths are used for pretrained weight loading when from_scratch=false.
-    discriminator_model_name_or_path: str = field(
+    pretrained_discriminator_path: str = field(
         default="",
         metadata={
             "help": (
@@ -226,7 +226,7 @@ class ModelConfig:
         },
     )
 
-    generator_model_name_or_path: str | None = field(
+    pretrained_generator_path: str | None = field(
         default=None,
         metadata={"help": "Optional HF model name/path for generator (config and weights)."},
     )
@@ -1188,15 +1188,15 @@ def validate_model_config(cfg: ModelConfig) -> None:
         "model.embedding_sharing", cfg.embedding_sharing, _EMBED_SHARING_CHOICES
     )
     cfg.tokenizer_name_or_path = str(cfg.tokenizer_name_or_path).strip()
-    cfg.discriminator_model_name_or_path = str(cfg.discriminator_model_name_or_path or "").strip()
-    if cfg.generator_model_name_or_path is not None:
-        cfg.generator_model_name_or_path = str(cfg.generator_model_name_or_path).strip() or None
+    cfg.pretrained_discriminator_path = str(cfg.pretrained_discriminator_path or "").strip()
+    if cfg.pretrained_generator_path is not None:
+        cfg.pretrained_generator_path = str(cfg.pretrained_generator_path).strip() or None
 
     if not cfg.tokenizer_name_or_path:
         raise ValueError("model.tokenizer_name_or_path must be a non-empty tokenizer source.")
-    if not bool(cfg.from_scratch) and not cfg.discriminator_model_name_or_path:
+    if not bool(cfg.from_scratch) and not cfg.pretrained_discriminator_path:
         raise ValueError(
-            "model.discriminator_model_name_or_path must be set when model.from_scratch=false "
+            "model.pretrained_discriminator_path must be set when model.from_scratch=false "
             "(weights are loaded from this source)."
         )
 
@@ -1261,7 +1261,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
 
     if cfg.backbone_type == "rope" and not bool(cfg.from_scratch):
         invalid_sources: list[str] = []
-        for field_name in ("discriminator_model_name_or_path", "generator_model_name_or_path"):
+        for field_name in ("pretrained_discriminator_path", "pretrained_generator_path"):
             src = getattr(cfg, field_name, None)
             if src and _looks_like_hf_deberta_checkpoint(str(src)):
                 invalid_sources.append(f"{field_name}={src}")
@@ -1301,7 +1301,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "model.pretrained_ffn_type", cfg.pretrained_ffn_type, _FFN_CHOICES
             )
 
-    if cfg.generator_model_name_or_path:
+    if cfg.pretrained_generator_path:
         derived_knobs = []
         for name in (
             "generator_num_hidden_layers",
@@ -1314,10 +1314,10 @@ def validate_model_config(cfg: ModelConfig) -> None:
         if derived_knobs:
             raise ValueError(
                 "These options are only used when deriving generator config and must be unset when "
-                "model.generator_model_name_or_path is provided: " + ", ".join(sorted(derived_knobs))
+                "model.pretrained_generator_path is provided: " + ", ".join(sorted(derived_knobs))
             )
 
-    if not bool(cfg.from_scratch) and not cfg.generator_model_name_or_path:
+    if not bool(cfg.from_scratch) and not cfg.pretrained_generator_path:
         pretrained_shape_overrides = []
         for name in (
             "generator_hidden_size",
@@ -1328,9 +1328,9 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 pretrained_shape_overrides.append(name)
         if pretrained_shape_overrides:
             raise ValueError(
-                "model.from_scratch=false with derived generator weights (generator_model_name_or_path unset) "
+                "model.from_scratch=false with derived generator weights (pretrained_generator_path unset) "
                 "cannot use generator shape overrides because generator weights are loaded from the "
-                "discriminator source. Set model.generator_model_name_or_path to an explicit generator "
+                "discriminator source. Set model.pretrained_generator_path to an explicit generator "
                 "checkpoint or unset: " + ", ".join(sorted(pretrained_shape_overrides))
             )
 

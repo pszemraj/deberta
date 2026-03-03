@@ -27,7 +27,7 @@ def test_build_backbone_configs_preserves_loaded_ffn_for_pretrained_rope(monkeyp
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -55,7 +55,7 @@ def test_build_backbone_configs_applies_ffn_override_for_scratch_rope(monkeypatc
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         ffn_type="swiglu",
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
@@ -86,7 +86,7 @@ def test_build_backbone_configs_applies_use_bias_override_for_scratch_rope(
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         use_bias=False,
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
@@ -117,7 +117,7 @@ def test_build_backbone_configs_preserves_loaded_use_bias_for_pretrained_rope(
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="custom-rope-checkpoint",
+        pretrained_discriminator_path="custom-rope-checkpoint",
         use_bias=False,
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
@@ -146,7 +146,7 @@ def test_build_backbone_configs_adjusts_swiglu_intermediate_for_scratch(monkeypa
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         ffn_type="swiglu",
         swiglu_adjust_intermediate=True,
     )
@@ -182,7 +182,7 @@ def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     _ = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -199,7 +199,7 @@ def test_build_backbone_configs_propagates_tokenizer_special_ids_for_rope():
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     tokenizer = DummyTokenizer(vocab_size=50265)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
@@ -239,7 +239,7 @@ def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monke
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         ffn_type="swiglu",
         swiglu_adjust_intermediate=False,
     )
@@ -259,7 +259,7 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         ffn_type="swiglu",
         intermediate_size=4096,
         swiglu_adjust_intermediate=True,
@@ -315,7 +315,7 @@ def test_build_backbone_configs_respects_explicit_generator_intermediate_with_sw
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         ffn_type="swiglu",
         swiglu_adjust_intermediate=True,
         generator_intermediate_size=1024,
@@ -348,8 +348,8 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="disc",
-        generator_model_name_or_path="gen",
+        pretrained_discriminator_path="disc",
+        pretrained_generator_path="gen",
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -365,7 +365,7 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
     (
         "backbone_type",
         "from_scratch",
-        "generator_model_name_or_path",
+        "pretrained_generator_path",
         "expected_disc_cfg_src",
         "expected_disc_weight_src",
         "expected_gen_cfg_src",
@@ -385,7 +385,7 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
 def test_resolve_backbone_sources_matrix(
     backbone_type: str,
     from_scratch: bool,
-    generator_model_name_or_path: str | None,
+    pretrained_generator_path: str | None,
     expected_disc_cfg_src: str | None,
     expected_disc_weight_src: str | None,
     expected_gen_cfg_src: str | None,
@@ -395,8 +395,8 @@ def test_resolve_backbone_sources_matrix(
     cfg = ModelConfig(
         backbone_type=backbone_type,
         from_scratch=from_scratch,
-        discriminator_model_name_or_path="disc",
-        generator_model_name_or_path=generator_model_name_or_path,
+        pretrained_discriminator_path="disc",
+        pretrained_generator_path=pretrained_generator_path,
     )
     resolved = builder_mod._resolve_backbone_sources(cfg)
 
@@ -411,7 +411,7 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_in_pretrained_
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="microsoft/deberta-v3-base",
+        pretrained_discriminator_path="microsoft/deberta-v3-base",
         hf_max_position_embeddings=1024,
     )
     with pytest.raises(ValueError, match="only supported when model.from_scratch=true"):
@@ -445,8 +445,8 @@ def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritativ
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
-        generator_model_name_or_path="gen_model",
+        pretrained_discriminator_path="disc",
+        pretrained_generator_path="gen_model",
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
@@ -484,7 +484,7 @@ def test_build_backbone_configs_rejects_pretrained_rope_vocab_mismatch(monkeypat
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
     )
     with pytest.raises(ValueError, match="Tokenizer/checkpoint vocab mismatch for discriminator"):
         _ = builder_mod.build_backbone_configs(
@@ -510,7 +510,7 @@ def test_build_backbone_configs_rejects_pretrained_rope_special_id_mismatch(monk
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
     )
     with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
         _ = builder_mod.build_backbone_configs(
@@ -546,7 +546,7 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         pretrained_rope_theta=50_000.0,
         pretrained_rotary_pct=0.5,
         pretrained_norm_arch="keel",
@@ -616,7 +616,7 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     model_kwargs: dict[str, object] = dict(
         backbone_type="hf_deberta_v2",
         from_scratch=from_scratch,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     if hidden_dropout_prob is not _USE_MODEL_DEFAULT:
         model_kwargs["hidden_dropout_prob"] = hidden_dropout_prob
@@ -729,7 +729,7 @@ def test_build_backbone_configs_pretrained_hf_can_auto_grow_tokenizer_to_config_
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         tokenizer_allow_vocab_resize=True,
     )
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
@@ -752,7 +752,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
         tokenizer_allow_vocab_resize=True,
         tokenizer_vocab_multiple=128,
     )
@@ -771,7 +771,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     with pytest.raises(ValueError, match="Tokenizer/checkpoint vocab mismatch for discriminator"):
         _ = builder_mod.build_backbone_configs(
@@ -788,7 +788,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkey
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
         _ = builder_mod.build_backbone_configs(
@@ -814,8 +814,8 @@ def test_build_backbones_uses_resolved_rope_weight_sources(monkeypatch: pytest.M
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="disc_weights",
-        generator_model_name_or_path="gen_weights",
+        pretrained_discriminator_path="disc_weights",
+        pretrained_generator_path="gen_weights",
     )
     disc_cfg = builder_mod.DebertaRoPEConfig(hidden_size=768, num_hidden_layers=2)
     gen_cfg = builder_mod.DebertaRoPEConfig(hidden_size=384, num_hidden_layers=1)
@@ -843,8 +843,8 @@ def test_build_backbones_uses_discriminator_fallback_for_derived_pretrained_rope
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="disc_weights",
-        generator_model_name_or_path=None,
+        pretrained_discriminator_path="disc_weights",
+        pretrained_generator_path=None,
     )
     disc_cfg = builder_mod.DebertaRoPEConfig(hidden_size=768, num_hidden_layers=2)
     gen_cfg = builder_mod.DebertaRoPEConfig(hidden_size=768, num_hidden_layers=1)
@@ -872,8 +872,8 @@ def test_build_backbones_uses_resolved_hf_weight_sources(monkeypatch: pytest.Mon
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc_weights",
-        generator_model_name_or_path="gen_weights",
+        pretrained_discriminator_path="disc_weights",
+        pretrained_generator_path="gen_weights",
     )
     disc_cfg = types.SimpleNamespace(hidden_size=768)
     gen_cfg = types.SimpleNamespace(hidden_size=384)
@@ -889,7 +889,7 @@ def test_build_backbones_hf_from_scratch_uses_native_implementation():
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=True,
-        discriminator_model_name_or_path="disc",
+        pretrained_discriminator_path="disc",
     )
     disc_cfg = DebertaV2Config(
         vocab_size=128,
@@ -934,8 +934,8 @@ def test_build_backbones_uses_discriminator_fallback_for_derived_pretrained_hf(
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc_weights",
-        generator_model_name_or_path=None,
+        pretrained_discriminator_path="disc_weights",
+        pretrained_generator_path=None,
     )
     disc_cfg = types.SimpleNamespace(hidden_size=768)
     gen_cfg = types.SimpleNamespace(hidden_size=384)
@@ -965,7 +965,7 @@ def test_build_backbones_pretrained_rope_can_skip_pretrained_weight_loading(
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="disc_weights",
+        pretrained_discriminator_path="disc_weights",
     )
     disc_cfg = builder_mod.DebertaRoPEConfig(
         vocab_size=128,
@@ -1017,7 +1017,7 @@ def test_build_backbones_pretrained_hf_can_skip_pretrained_weight_loading(
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
-        discriminator_model_name_or_path="disc_weights",
+        pretrained_discriminator_path="disc_weights",
     )
     disc_cfg = DebertaV2Config(
         vocab_size=128,
@@ -1088,7 +1088,7 @@ def test_build_backbone_configs_rejects_hf_deberta_sources_for_pretrained_rope()
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="microsoft/deberta-v3-base",
+        pretrained_discriminator_path="microsoft/deberta-v3-base",
     )
     with pytest.raises(ValueError, match="requires DebertaRoPE checkpoints"):
         builder_mod.build_backbone_configs(

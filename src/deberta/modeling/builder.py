@@ -196,8 +196,8 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
             component="discriminator",
             config_source=None,
             config_origin="repo_hf_defaults",
-            weight_source=(None if from_scratch else model_cfg.discriminator_model_name_or_path),
-            weight_origin=("scratch" if from_scratch else "discriminator_model_name_or_path"),
+            weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
+            weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
         )
         if from_scratch:
@@ -207,16 +207,14 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 config_origin="derived_from_discriminator_config",
                 weight_source=None,
                 weight_origin="scratch",
-                derived_from_discriminator=not bool(model_cfg.generator_model_name_or_path),
+                derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
             )
         else:
-            gen_weight_src = (
-                model_cfg.generator_model_name_or_path or model_cfg.discriminator_model_name_or_path
-            )
+            gen_weight_src = model_cfg.pretrained_generator_path or model_cfg.pretrained_discriminator_path
             gen_weight_origin = (
-                "generator_model_name_or_path"
-                if model_cfg.generator_model_name_or_path
-                else "derived_from_discriminator_model_name_or_path"
+                "pretrained_generator_path"
+                if model_cfg.pretrained_generator_path
+                else "derived_from_pretrained_discriminator_path"
             )
             generator = _ResolvedComponentSources(
                 component="generator",
@@ -224,11 +222,11 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 config_origin="derived_from_discriminator_config",
                 weight_source=gen_weight_src,
                 weight_origin=gen_weight_origin,
-                derived_from_discriminator=not bool(model_cfg.generator_model_name_or_path),
+                derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
             )
         return _ResolvedBackboneSources(discriminator=discriminator, generator=generator)
 
-    disc_cfg_source = model_cfg.discriminator_model_name_or_path
+    disc_cfg_source = model_cfg.pretrained_discriminator_path
     if bt == "rope" and from_scratch:
         discriminator = _ResolvedComponentSources(
             component="discriminator",
@@ -242,18 +240,18 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
         discriminator = _ResolvedComponentSources(
             component="discriminator",
             config_source=disc_cfg_source,
-            config_origin="discriminator_model_name_or_path",
-            weight_source=(None if from_scratch else model_cfg.discriminator_model_name_or_path),
-            weight_origin=("scratch" if from_scratch else "discriminator_model_name_or_path"),
+            config_origin="pretrained_discriminator_path",
+            weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
+            weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
         )
 
     if from_scratch:
-        if model_cfg.generator_model_name_or_path:
+        if model_cfg.pretrained_generator_path:
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=model_cfg.generator_model_name_or_path,
-                config_origin="generator_model_name_or_path",
+                config_source=model_cfg.pretrained_generator_path,
+                config_origin="pretrained_generator_path",
                 weight_source=None,
                 weight_origin="scratch",
                 derived_from_discriminator=False,
@@ -268,13 +266,13 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 derived_from_discriminator=True,
             )
     else:
-        if model_cfg.generator_model_name_or_path:
+        if model_cfg.pretrained_generator_path:
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=model_cfg.generator_model_name_or_path,
-                config_origin="generator_model_name_or_path",
-                weight_source=model_cfg.generator_model_name_or_path,
-                weight_origin="generator_model_name_or_path",
+                config_source=model_cfg.pretrained_generator_path,
+                config_origin="pretrained_generator_path",
+                weight_source=model_cfg.pretrained_generator_path,
+                weight_origin="pretrained_generator_path",
                 derived_from_discriminator=False,
             )
         else:
@@ -282,8 +280,8 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 component="generator",
                 config_source=None,
                 config_origin="derived_from_discriminator_config",
-                weight_source=model_cfg.discriminator_model_name_or_path,
-                weight_origin="derived_from_discriminator_model_name_or_path",
+                weight_source=model_cfg.pretrained_discriminator_path,
+                weight_origin="derived_from_pretrained_discriminator_path",
                 derived_from_discriminator=True,
             )
 
@@ -748,7 +746,7 @@ def build_backbone_configs(
 
     if bt == "hf_deberta_v2":
         disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
-        if model_cfg.generator_model_name_or_path:
+        if model_cfg.pretrained_generator_path:
             # Explicit generator model sources affect weight loading, not config synthesis.
             gen_cfg = copy.deepcopy(disc_cfg)
         else:

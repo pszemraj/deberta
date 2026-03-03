@@ -268,7 +268,7 @@ def test_parity_yaml_configs_parse_and_validate(
 
     assert model_cfg.profile == "deberta_v3_parity"
     assert model_cfg.backbone_type == "hf_deberta_v2"
-    assert model_cfg.discriminator_model_name_or_path == ""
+    assert model_cfg.pretrained_discriminator_path == ""
     assert bool(train_cfg.decoupled_training) is True
 
 
@@ -1224,7 +1224,7 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
     model_cfg = ModelConfig(
         profile="deberta_v3_parity",
         backbone_type="hf_deberta_v2",
-        discriminator_model_name_or_path="microsoft/deberta-v3-base",
+        pretrained_discriminator_path="microsoft/deberta-v3-base",
         generator_num_hidden_layers=None,
         hidden_dropout_prob=None,
         attention_probs_dropout_prob=None,
@@ -1280,7 +1280,7 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
     assert payload["model"]["tokenizer_vocab_target"] == 32000
     assert payload["train"]["generator_learning_rate"] == pytest.approx(5e-4)
     assert payload["train"]["discriminator_learning_rate"] == pytest.approx(5e-4)
-    assert "generator_model_name_or_path" not in payload["model"]
+    assert "pretrained_generator_path" not in payload["model"]
     assert "pretrained_ffn_type" not in payload["model"]
     assert "resume_from_checkpoint" not in payload["train"]
     assert payload["effective"]["generator_backbone"]["hidden_size"] == 384
@@ -5248,7 +5248,7 @@ def test_validate_model_config_rejects_non_positive_tokenizer_vocab_target():
 def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
     cfg = ModelConfig(
         backbone_type="rope",
-        generator_model_name_or_path="microsoft/deberta-v3-small",
+        pretrained_generator_path="microsoft/deberta-v3-small",
         generator_hidden_size=256,
     )
     with pytest.raises(ValueError, match="only used when deriving generator config"):
@@ -5277,7 +5277,7 @@ def test_validate_model_config_rejects_pretrained_derived_generator_shape_overri
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         generator_hidden_size=256,
     )
     with pytest.raises(ValueError, match="derived generator weights"):
@@ -5288,7 +5288,7 @@ def test_validate_model_config_allows_pretrained_derived_generator_layer_overrid
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         generator_num_hidden_layers=4,
     )
     validate_model_config(cfg)
@@ -5298,7 +5298,7 @@ def test_validate_model_config_rejects_scratch_rope_knobs_in_pretrained_mode():
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         rope_theta=50_000.0,
     )
     with pytest.raises(ValueError, match="only affect scratch RoPE initialization"):
@@ -5309,7 +5309,7 @@ def test_validate_model_config_allows_explicit_pretrained_rope_overrides():
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         pretrained_rope_theta=50_000.0,
         pretrained_norm_arch="keel",
     )
@@ -5400,7 +5400,7 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         hidden_dropout_prob=None,
         attention_probs_dropout_prob=None,
     )
