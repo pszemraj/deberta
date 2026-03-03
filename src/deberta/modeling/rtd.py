@@ -1099,23 +1099,57 @@ class DebertaV3RTDPretrainer(nn.Module):
         *,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor,
+        labels: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
         gen_loss_weight: float = 1.0,
         disc_loss_weight: float = 50.0,
-    ) -> RTDOutput:
-        """Run one RTD forward pass with generator corruption and discriminator scoring.
+        phase: str = "both",
+        corrupted_input_ids: torch.Tensor | None = None,
+        disc_labels: torch.Tensor | None = None,
+    ) -> RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
+        """Run RTD forward in combined or phase-specific mode.
 
         :param torch.Tensor input_ids: Masked input ids.
         :param torch.Tensor | None attention_mask: Optional attention mask.
-        :param torch.Tensor labels: MLM labels with ``-100`` ignore index.
+        :param torch.Tensor | None labels: MLM labels with ``-100`` ignore index.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param float sampling_temperature: Generator sampling temperature.
         :param float gen_loss_weight: Generator loss weight.
         :param float disc_loss_weight: Discriminator loss weight.
-        :return RTDOutput: Combined loss and detached metrics.
+        :param str phase: One of ``both|generator|discriminator``.
+        :param torch.Tensor | None corrupted_input_ids: Precomputed corrupted ids for ``phase='discriminator'``.
+        :param torch.Tensor | None disc_labels: Precomputed RTD labels for ``phase='discriminator'``.
+        :return RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
+            Combined output for ``phase='both'``; phase-local outputs otherwise.
         """
+        phase_norm = str(phase or "both").strip().lower()
+        if phase_norm == "generator":
+            if labels is None:
+                raise ValueError("labels must be provided for phase='generator'.")
+            return self.forward_generator_phase(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                token_type_ids=token_type_ids,
+                sampling_temperature=sampling_temperature,
+            )
+        if phase_norm == "discriminator":
+            if corrupted_input_ids is None:
+                raise ValueError("corrupted_input_ids must be provided for phase='discriminator'.")
+            if disc_labels is None:
+                raise ValueError("disc_labels must be provided for phase='discriminator'.")
+            return self.forward_discriminator_phase(
+                input_ids=input_ids,
+                corrupted_input_ids=corrupted_input_ids,
+                disc_labels=disc_labels,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+            )
+        if phase_norm != "both":
+            raise ValueError("phase must be one of: both|generator|discriminator.")
+        if labels is None:
+            raise ValueError("labels must be provided for phase='both'.")
 
         gen_phase = self.forward_generator_phase(
             input_ids=input_ids,

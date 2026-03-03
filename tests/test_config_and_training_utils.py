@@ -2490,6 +2490,46 @@ def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens
     assert len(model.calls.get("forward_discriminator_phase", [])) == 0
 
 
+def test_run_pretraining_decoupled_routes_phase_calls_through_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    model = SimpleRTD.last_instance
+    assert model is not None
+    # One generator and one discriminator phase should each route through model(...)
+    # so distributed wrappers keep their forward-path bookkeeping/autocast hooks.
+    assert len(model.calls.get("forward", [])) == 2
+    assert len(model.calls.get("forward_generator_phase", [])) == 1
+    assert len(model.calls.get("forward_discriminator_phase", [])) == 1
+
+
 def test_run_pretraining_final_export_uses_subprocess_helper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -335,12 +335,32 @@ class SimpleRTD(torch.nn.Module):
         return float(value)
 
     def forward(self, **kwargs: Any) -> Any:
-        del kwargs
+        phase = str(kwargs.pop("phase", "both")).strip().lower()
         self._forward_calls += 1
         call_idx = int(self._forward_calls)
         self.calls["forward"].append(call_idx)
         if callable(self.behavior.get("on_forward")):
             self.behavior["on_forward"](self, call_idx)
+
+        if phase == "generator":
+            return self.forward_generator_phase(
+                input_ids=kwargs["input_ids"],
+                attention_mask=kwargs.get("attention_mask"),
+                labels=kwargs["labels"],
+                token_type_ids=kwargs.get("token_type_ids"),
+                sampling_temperature=float(kwargs.get("sampling_temperature", 1.0)),
+            )
+        if phase == "discriminator":
+            return self.forward_discriminator_phase(
+                input_ids=kwargs["input_ids"],
+                corrupted_input_ids=kwargs["corrupted_input_ids"],
+                disc_labels=kwargs["disc_labels"],
+                attention_mask=kwargs.get("attention_mask"),
+                token_type_ids=kwargs.get("token_type_ids"),
+            )
+        if phase != "both":
+            raise ValueError(f"Unsupported phase: {phase}")
+
         base = self._behavior_value("loss", 1.0, call_idx=call_idx)
         gen_loss_v = self._behavior_value("gen_loss", base, call_idx=call_idx)
         disc_loss_v = self._behavior_value("disc_loss", base, call_idx=call_idx)

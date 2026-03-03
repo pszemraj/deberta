@@ -606,6 +606,22 @@ def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> 
     return local_flag > 0
 
 
+def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
+    """Return whether any rank set ``flag=True``.
+
+    :param Any accelerator: Accelerator-like runtime object.
+    :param bool flag: Local boolean flag.
+    :return bool: True when at least one rank set the flag.
+    """
+    device = getattr(accelerator, "device", torch.device("cpu"))
+    local = torch.tensor([1 if bool(flag) else 0], device=device, dtype=torch.int32)
+    with suppress(Exception):
+        reduced = accelerator.reduce(local, reduction="sum")
+        count = int(reduced.reshape(-1)[0].item())
+        return count > 0
+    return bool(flag)
+
+
 def _apply_lr_mult(optimizer: torch.optim.Optimizer, lr_mult: float) -> None:
     """Scale all optimizer param-group LRs by a persistent multiplier.
 
@@ -667,15 +683,32 @@ def _optimizer_has_stepped(optimizer: torch.optim.Optimizer) -> bool:
     return False
 
 
-def _sync_discriminator_embeddings_if_available(model: torch.nn.Module) -> None:
+def _sync_discriminator_embeddings_if_available(
+    model: torch.nn.Module, *, accelerator: Any | None = None
+) -> None:
     """Sync discriminator embedding buffers if the model exposes the hook.
 
-    :param torch.nn.Module model: Unwrapped runtime model.
+    :param torch.nn.Module model: Runtime model (wrapped or unwrapped).
+    :param Any | None accelerator: Optional Accelerator runtime for unwrapping.
     """
-    fn = getattr(model, "sync_discriminator_embeddings_from_generator", None)
-    if callable(fn):
-        with torch.no_grad():
-            fn()
+    wrapped_model = model
+    target_model = model
+    if accelerator is not None:
+        with suppress(Exception):
+            target_model = unwrap_compiled_model(accelerator, model)
+
+    fsdp_sync_ctx = nullcontext()
+    with suppress(Exception):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
+
+        if isinstance(wrapped_model, FSDP):
+            fsdp_sync_ctx = FSDP.summon_full_params(wrapped_model, recurse=True, writeback=True)
+
+    with fsdp_sync_ctx:
+        fn = getattr(target_model, "sync_discriminator_embeddings_from_generator", None)
+        if callable(fn):
+            with torch.no_grad():
+                fn()
 
 
 def _write_nonfinite_debug_artifact(
@@ -1775,6 +1808,11 @@ def run_pretraining(
     from accelerate import Accelerator
     from accelerate.utils import set_seed
 
+    try:
+        from accelerate import DistributedDataParallelKwargs
+    except Exception:  # pragma: no cover
+        DistributedDataParallelKwargs = None  # type: ignore[assignment]
+
     resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
         train_cfg=train_cfg,
         optim_cfg=optim_cfg,
@@ -1793,10 +1831,17 @@ def run_pretraining(
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
     object.__setattr__(train_cfg, "mixed_precision", mixed_precision)
+    accelerator_kwargs: dict[str, Any] = {
+        "gradient_accumulation_steps": train_cfg.gradient_accumulation_steps,
+        "log_with": log_with,
+        "mixed_precision": mixed_precision,
+    }
+    if bool(train_cfg.decoupled_training) and DistributedDataParallelKwargs is not None:
+        # Generator/discriminator phases each touch only a subset of parameters.
+        # DDP must track unused params to avoid cross-rank reducer stalls.
+        accelerator_kwargs["kwargs_handlers"] = [DistributedDataParallelKwargs(find_unused_parameters=True)]
     accelerator = Accelerator(
-        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
-        log_with=log_with,
-        mixed_precision=mixed_precision,
+        **accelerator_kwargs,
     )
 
     setup_process_logging(accelerator.is_main_process)
@@ -2053,7 +2098,7 @@ def run_pretraining(
     # GDES embedding sharing uses synced non-trainable base weights inside discriminator embeddings.
     # Those tensors must be initialized/synced from generator weights before any compiled forward runs.
     with suppress(Exception):
-        _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
+        _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
     # torch.compile
     #
@@ -2228,7 +2273,7 @@ def run_pretraining(
 
             # GDES base weights are non-persistent and must be refreshed after loading a checkpoint.
             with suppress(Exception):
-                _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
+                _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
             (
                 restored,
@@ -2510,12 +2555,13 @@ def run_pretraining(
                     is_sync_step = step_idx == (ga_steps - 1)
                     sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
                     with sync_ctx:
-                        gen_phase_out = model.forward_generator_phase(
+                        gen_phase_out = model(
                             input_ids=batch["input_ids"],
                             attention_mask=batch.get("attention_mask"),
                             labels=batch["labels"],
                             token_type_ids=batch.get("token_type_ids"),
                             sampling_temperature=train_cfg.sampling_temperature,
+                            phase="generator",
                         )
                         gen_loss = gen_phase_out.gen_loss_raw
                         if token_weighted_ga:
@@ -2541,17 +2587,23 @@ def run_pretraining(
                             if not torch.isfinite(backward_loss.detach()).all():
                                 offending = "gen_backward_loss"
 
-                        if offending is not None:
+                        if _any_rank_flag_true(
+                            accelerator=accelerator,
+                            flag=(offending is not None),
+                        ):
+                            offending_effective = (
+                                str(offending) if offending is not None else "other_rank_nonfinite"
+                            )
                             skipped_window_due_nonfinite = True
                             nonfinite_skip_total += 1
                             nonfinite_skip_streak += 1
-                            nonfinite_reason = str(offending)
+                            nonfinite_reason = str(offending_effective)
                             lr_now = _scheduler_current_lr(gen_lr_scheduler)
                             nonfinite_debug_path = _write_nonfinite_debug_artifact(
                                 output_dir=logging_output_dir,
                                 step=int(global_step + 1),
                                 micro_step_idx=int(step_idx),
-                                offending=offending,
+                                offending=str(offending_effective),
                                 gen_loss_raw=gen_phase_out.gen_loss_raw,
                                 disc_loss_raw=None,
                                 forward_loss=gen_phase_out.gen_loss_raw,
@@ -2613,7 +2665,7 @@ def run_pretraining(
                             _apply_lr_mult(gen_optimizer, lr_mult)
                         gen_optimizer.zero_grad(set_to_none=True)
                         did_gen_optimizer_step = True
-                        _sync_discriminator_embeddings_if_available(unwrapped_model)
+                        _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
                 window_has_global_disc_targets = False
                 if not skipped_window_due_nonfinite and disc_phase_inputs:
@@ -2645,12 +2697,13 @@ def run_pretraining(
                         is_sync_step = step_idx == (disc_phase_steps - 1)
                         sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
                         with sync_ctx:
-                            disc_phase_out = model.forward_discriminator_phase(
+                            disc_phase_out = model(
                                 input_ids=payload["input_ids"],  # type: ignore[arg-type]
                                 corrupted_input_ids=payload["corrupted_input_ids"],  # type: ignore[arg-type]
                                 disc_labels=payload["disc_labels"],  # type: ignore[arg-type]
                                 attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
                                 token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
+                                phase="discriminator",
                             )
                             disc_loss = disc_phase_out.disc_loss_raw
                             disc_objective_weight = float(payload.get("disc_objective_weight", 1.0))
@@ -2678,17 +2731,23 @@ def run_pretraining(
                                 if not torch.isfinite(backward_loss.detach()).all():
                                     offending = "disc_backward_loss"
 
-                            if offending is not None:
+                            if _any_rank_flag_true(
+                                accelerator=accelerator,
+                                flag=(offending is not None),
+                            ):
+                                offending_effective = (
+                                    str(offending) if offending is not None else "other_rank_nonfinite"
+                                )
                                 skipped_window_due_nonfinite = True
                                 nonfinite_skip_total += 1
                                 nonfinite_skip_streak += 1
-                                nonfinite_reason = str(offending)
+                                nonfinite_reason = str(offending_effective)
                                 lr_now = _scheduler_current_lr(disc_lr_scheduler)
                                 nonfinite_debug_path = _write_nonfinite_debug_artifact(
                                     output_dir=logging_output_dir,
                                     step=int(global_step + 1),
                                     micro_step_idx=int(step_idx),
-                                    offending=offending,
+                                    offending=str(offending_effective),
                                     gen_loss_raw=gen_phase_out.gen_loss_raw
                                     if gen_phase_out is not None
                                     else None,
@@ -3066,17 +3125,23 @@ def run_pretraining(
                     elif not torch.isfinite(backward_loss.detach()).all():
                         offending = "backward_loss"
 
-                    if offending is not None:
+                    if _any_rank_flag_true(
+                        accelerator=accelerator,
+                        flag=(offending is not None),
+                    ):
+                        offending_effective = (
+                            str(offending) if offending is not None else "other_rank_nonfinite"
+                        )
                         skipped_window_due_nonfinite = True
                         nonfinite_skip_total += 1
                         nonfinite_skip_streak += 1
-                        nonfinite_reason = str(offending)
+                        nonfinite_reason = str(offending_effective)
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_debug_artifact(
                             output_dir=logging_output_dir,
                             step=int(global_step + 1),
                             micro_step_idx=int(step_idx),
-                            offending=offending,
+                            offending=str(offending_effective),
                             gen_loss_raw=out.gen_loss_raw,
                             disc_loss_raw=out.disc_loss_raw,
                             forward_loss=out.loss,
@@ -3090,7 +3155,7 @@ def run_pretraining(
                         logger.warning(
                             "Skipping accumulation window due non-finite %s "
                             "(step=%d, micro_step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                            offending,
+                            offending_effective,
                             int(global_step + 1),
                             int(step_idx),
                             int(nonfinite_skip_streak),
@@ -3205,7 +3270,7 @@ def run_pretraining(
                     # so syncing here is sufficient (and avoids per-microbatch copies). This means
                     # discriminator base weights intentionally lag inside each GA window and catch up
                     # immediately after the optimizer step.
-                    _sync_discriminator_embeddings_if_available(unwrapped_model)
+                    _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
