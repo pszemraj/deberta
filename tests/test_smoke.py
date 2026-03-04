@@ -2332,6 +2332,54 @@ def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
     assert torch.isfinite(out).all()
 
 
+def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        relative_attention=False,
+        pos_att_type="",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    attn = DisentangledSelfAttention(cfg).eval()
+    x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+
+    # Row 3 has a CLS fallback edge but diagonal=False; packed-mask semantics
+    # require this query to stay inactive and produce zero output/probs.
+    pair_keep = torch.tensor(
+        [
+            [
+                [
+                    [1, 1, 0, 0],
+                    [1, 1, 0, 0],
+                    [0, 0, 1, 0],
+                    [1, 0, 0, 0],
+                ]
+            ]
+        ],
+        dtype=torch.bool,
+    )
+
+    with torch.no_grad():
+        out, probs = attn(x, pair_keep, output_attentions=True)
+
+    assert probs is not None
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(probs).all()
+    assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
+    assert torch.allclose(probs[0, :, 3, :], torch.zeros_like(probs[0, :, 3, :]), atol=1e-6)
+    assert not torch.allclose(out[0, 0], torch.zeros_like(out[0, 0]), atol=1e-6)
+
+
 def test_native_hf_deberta_v2_stable_compile_step_is_finite():
     import pytest
 

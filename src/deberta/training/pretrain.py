@@ -750,7 +750,9 @@ def _sync_discriminator_embeddings_if_available(
 
     if fsdp_cls is not None and isinstance(wrapped_model, fsdp_cls):
         # FSDP1 wrapper path: summon only root-level params to avoid recursive
-        # all-gathering of nested transformer shards.
+        # all-gathering of nested transformer shards. Nested FSDP1 wrapping is
+        # not a supported path here; if nested params stay sharded, the sync hook
+        # fails loudly on DTensor checks instead of silently desynchronizing.
         with fsdp_cls.summon_full_params(wrapped_model, recurse=False, writeback=True):
             with torch.no_grad():
                 fn()

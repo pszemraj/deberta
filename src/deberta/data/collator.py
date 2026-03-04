@@ -739,6 +739,10 @@ class DebertaV3ElectraCollator:
                     break
 
             if not selected_positions:
+                # Fallback intentionally picks one full group (bounded by
+                # max_preds_per_seq) to preserve whole-word integrity; this may
+                # exceed num_to_predict for long groups and matches DeBERTa's
+                # practical masking behavior.
                 candidates = [
                     group
                     for do_mask, group in zip(mask_grams, groups, strict=True)

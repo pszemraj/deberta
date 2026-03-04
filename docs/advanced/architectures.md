@@ -12,7 +12,7 @@
 | FFN | MLP | MLP or SwiGLU |
 | Primary use | DeBERTa-v2/v3 parity path | experimental modernized path |
 
-For `hf_deberta_v2`, backbone configs are synthesized in-repo from `model.hf.model_size` + explicit overrides. The trainer does not load architecture config JSON from HF model hubs.
+For `hf_deberta_v2`, scratch runs synthesize backbone configs in-repo from `model.hf.model_size` + explicit overrides. Pretrained runs load discriminator config from `model.pretrained.discriminator_path`, and load generator config from `model.pretrained.generator_path` when provided (otherwise generator config is derived from discriminator config).
 
 ## HF-size presets (`model.hf.model_size`)
 
@@ -40,6 +40,7 @@ Use explicit config values when you want different behavior.
 
 - Intentional divergence: generator sampling excludes special/control token ids via a forbidden vocabulary mask (for example PAD/CLS/SEP/MASK). This differs from original DeBERTa sampling and is kept intentionally.
 - TODO (strict parity follow-up): evaluate narrowing discriminator embedding sharing to only word+position embeddings; current sharing also includes `token_type_embeddings`.
+- TODO (architecture follow-up): evaluate defaulting `generator_intermediate_size` from `generator_hidden_size` when only width is overridden; current behavior inherits discriminator FFN width unless explicitly set.
 
 ## RoPE-specific controls
 
