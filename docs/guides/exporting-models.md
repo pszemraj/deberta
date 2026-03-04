@@ -31,6 +31,13 @@ Key knobs:
 
 Default output path is `<run_dir>/exported_hf` and must be empty if it already exists.
 
+## Output layout
+
+- `--what discriminator` or `--what generator`: writes a single HF model in a flat directory at `--output-dir`.
+- `--what both`: writes `--output-dir/discriminator/` and `--output-dir/generator/` (each a standalone HF model dir).
+
+Single-model exports are ready for direct Hub upload from `--output-dir`.
+
 ## GDES merge behavior
 
 When training used `embedding_sharing=gdes`, discriminator embedding weights are represented as base + bias components.
@@ -47,4 +54,4 @@ By default export is strict on state-dict compatibility. Use `--allow-partial-ex
 
 ## Config/tokenizer artifacts
 
-Export writes tokenizer files and cleaned `config.json` artifacts. Training-internal keys are stripped from exported model configs.
+Export writes tokenizer files, cleaned `config.json` artifacts, and model-card artifacts (`README.md`, `LICENSE`). Training-internal keys are stripped from exported model configs.

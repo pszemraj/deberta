@@ -16,6 +16,7 @@ import torch
 from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, load_state_with_compile_fallback
 from deberta.config import (
     ModelConfig,
+    TrainConfig,
     load_data_config_snapshot,
     load_model_config_snapshot,
     validate_data_config,
@@ -30,6 +31,7 @@ from deberta.modeling.export_utils import (
     load_intersection_state_dict,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
+    write_export_readme_and_license,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,6 +138,24 @@ def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path
                 "Choose a new --output-dir or clear the directory."
             )
     return resolved
+
+
+def _load_optional_train_config(run_dir: Path) -> TrainConfig | None:
+    """Best-effort load of ``train_config.json`` for export metadata rendering.
+
+    :param Path run_dir: Run directory potentially containing ``train_config.json``.
+    :return TrainConfig | None: Parsed train config when present/valid, otherwise ``None``.
+    """
+    train_cfg_path = run_dir / "train_config.json"
+    if not train_cfg_path.exists():
+        return None
+
+    try:
+        raw = load_json_mapping(train_cfg_path)
+        return TrainConfig(**raw)
+    except Exception as exc:
+        logger.warning("Failed to parse optional train config at %s: %s", train_cfg_path, exc)
+        return None
 
 
 @dataclass
@@ -390,6 +410,7 @@ def run_export(cfg: ExportConfig) -> None:
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
     _validate_run_metadata_if_present(run_dir)
+    train_cfg = _load_optional_train_config(run_dir)
 
     # Pre-stable policy: export does not coerce legacy snapshot keys.
     # Stored configs must match current dataclass schemas.
@@ -560,10 +581,17 @@ def run_export(cfg: ExportConfig) -> None:
                     fp32_accumulate=True,
                 )
 
-            export_disc.save_pretrained(
-                str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
+            disc_out_dir = stage_dir if export_what == "discriminator" else (stage_dir / "discriminator")
+            export_disc.save_pretrained(str(disc_out_dir), safe_serialization=bool(cfg.safe_serialization))
+            clean_exported_config(disc_out_dir / "config.json", strict=True)
+            write_export_readme_and_license(
+                disc_out_dir,
+                model_cfg=model_cfg,
+                export_config=getattr(export_disc, "config", None),
+                data_cfg=data_cfg,
+                train_cfg=train_cfg,
+                embedding_sharing=embedding_sharing,
             )
-            clean_exported_config(stage_dir / "discriminator" / "config.json", strict=True)
             meta["exported_discriminator"] = True
 
         # Generator
@@ -584,10 +612,17 @@ def run_export(cfg: ExportConfig) -> None:
                         len(missing),
                         len(unexpected),
                     )
-            export_gen.save_pretrained(
-                str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
+            gen_out_dir = stage_dir if export_what == "generator" else (stage_dir / "generator")
+            export_gen.save_pretrained(str(gen_out_dir), safe_serialization=bool(cfg.safe_serialization))
+            clean_exported_config(gen_out_dir / "config.json", strict=True)
+            write_export_readme_and_license(
+                gen_out_dir,
+                model_cfg=model_cfg,
+                export_config=getattr(export_gen, "config", None),
+                data_cfg=data_cfg,
+                train_cfg=train_cfg,
+                embedding_sharing=embedding_sharing,
             )
-            clean_exported_config(stage_dir / "generator" / "config.json", strict=True)
             meta["exported_generator"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:

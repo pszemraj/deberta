@@ -413,7 +413,8 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
                 allow_partial_export=allow_partial_export,
             )
         )
-        assert (out_dir / "discriminator").exists()
+        assert out_dir.exists()
+        assert not (out_dir / "discriminator").exists()
 
 
 def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
@@ -468,7 +469,8 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
         )
     )
 
-    assert (out_dir / "discriminator").exists()
+    assert out_dir.exists()
+    assert not (out_dir / "discriminator").exists()
     assert len(merge_calls) == 1
     assert "embeddings.word_embeddings.bias" in merge_calls[0]["disc_sd"]
 
@@ -547,7 +549,7 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
         )
     )
 
-    config_path = out_dir / "discriminator" / "config.json"
+    config_path = out_dir / "config.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert "hf_attention_kernel" not in data
     assert "use_rmsnorm_heads" not in data
@@ -555,6 +557,44 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     assert data["model_type"] == "deberta-v2"
     assert data["hidden_size"] == 768
     assert data["legacy"] is True
+    assert (out_dir / "README.md").exists()
+
+
+def test_run_export_both_targets_save_into_component_subdirectories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
+            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
+        ),
+    )
+
+    out_dir = tmp_path / "exported-both"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="both",
+        )
+    )
+
+    assert (out_dir / "discriminator" / "config.json").exists()
+    assert (out_dir / "generator" / "config.json").exists()
+    assert (out_dir / "discriminator" / "README.md").exists()
+    assert (out_dir / "generator" / "README.md").exists()
 
 
 def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
