@@ -89,6 +89,7 @@ from deberta.training.pretrain import (
     _normalize_resume_consumed_micro_batches,
     _optimizer_param_order_digest,
     _partition_optimizer_params,
+    _record_unscaled_lrs,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _resolve_data_resume_policy,
@@ -3031,6 +3032,21 @@ def test_apply_lr_mult_scales_all_param_groups() -> None:
     optimizer = torch.optim.AdamW([param], lr=1e-3)
     _apply_lr_mult(optimizer, 0.5)
     assert abs(float(optimizer.param_groups[0]["lr"]) - 5e-4) < 1e-12
+
+
+def test_apply_lr_mult_uses_unscaled_reference_without_compounding() -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    _record_unscaled_lrs(optimizer, scheduler)
+
+    _apply_lr_mult(optimizer, 0.5)
+    assert float(optimizer.param_groups[0]["lr"]) == pytest.approx(5e-4, abs=1e-12)
+
+    # Applying a new multiplier must be absolute against scheduler LR (1e-3),
+    # not multiplicative against the already-scaled group LR (5e-4).
+    _apply_lr_mult(optimizer, 0.25)
+    assert float(optimizer.param_groups[0]["lr"]) == pytest.approx(2.5e-4, abs=1e-12)
 
 
 def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):

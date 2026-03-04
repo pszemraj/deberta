@@ -622,14 +622,38 @@ def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
     return bool(flag)
 
 
+def _record_unscaled_lrs(optimizer: torch.optim.Optimizer, scheduler: Any | None) -> None:
+    """Record unscaled scheduler LRs into optimizer param groups.
+
+    This stores the scheduler-computed LR (before non-finite recovery scaling)
+    in ``group["_lr_unscaled"]`` so recovery scaling can be applied absolutely.
+
+    :param torch.optim.Optimizer optimizer: Runtime optimizer.
+    :param Any | None scheduler: Scheduler-like object.
+    """
+    scheduler_lrs: list[float] | None = None
+    if scheduler is not None and hasattr(scheduler, "get_last_lr"):
+        with suppress(Exception):
+            raw = scheduler.get_last_lr()
+            if isinstance(raw, (list, tuple)) and len(raw) == len(optimizer.param_groups):
+                scheduler_lrs = [float(x) for x in raw]
+    if scheduler_lrs is None:
+        scheduler_lrs = [float(group.get("_lr_unscaled", group["lr"])) for group in optimizer.param_groups]
+
+    for group, lr in zip(optimizer.param_groups, scheduler_lrs, strict=True):
+        group["_lr_unscaled"] = float(lr)
+
+
 def _apply_lr_mult(optimizer: torch.optim.Optimizer, lr_mult: float) -> None:
-    """Scale all optimizer param-group LRs by a persistent multiplier.
+    """Apply persistent LR multiplier against recorded unscaled scheduler LRs.
 
     :param torch.optim.Optimizer optimizer: Runtime optimizer.
     :param float lr_mult: Multiplier to apply (typically in (0, 1]).
     """
+    mult = float(lr_mult)
     for group in optimizer.param_groups:
-        group["lr"] = float(group["lr"]) * float(lr_mult)
+        base_lr = float(group.get("_lr_unscaled", group["lr"]))
+        group["lr"] = base_lr * mult
 
 
 def _apply_nonfinite_recovery(
@@ -2128,6 +2152,8 @@ def run_pretraining(
         model, gen_optimizer, disc_optimizer, gen_lr_scheduler, disc_lr_scheduler = accelerator.prepare(
             model, gen_optimizer, disc_optimizer, gen_lr_scheduler, disc_lr_scheduler
         )
+        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+        _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
     else:
         optimizer = _build_optimizer(
             model,
@@ -2140,6 +2166,7 @@ def run_pretraining(
         param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
         lr_scheduler = _build_scheduler(optimizer, train_cfg)
         model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        _record_unscaled_lrs(optimizer, lr_scheduler)
 
     # GDES embedding sharing uses synced non-trainable base weights inside discriminator embeddings.
     # Those tensors must be initialized/synced from generator weights before any compiled forward runs.
@@ -2316,6 +2343,14 @@ def run_pretraining(
                 model=model,
                 checkpoint_dir=ckpt,
             )
+            if effective_decoupled_training:
+                if gen_optimizer is not None and gen_lr_scheduler is not None:
+                    _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+                if disc_optimizer is not None and disc_lr_scheduler is not None:
+                    _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
+            else:
+                if optimizer is not None and lr_scheduler is not None:
+                    _record_unscaled_lrs(optimizer, lr_scheduler)
 
             # GDES base weights are non-persistent and must be refreshed after loading a checkpoint.
             with suppress(Exception):
@@ -2707,6 +2742,7 @@ def run_pretraining(
                             accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
                         gen_optimizer.step()
                         gen_lr_scheduler.step()
+                        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
                         if lr_mult < 1.0:
                             _apply_lr_mult(gen_optimizer, lr_mult)
                         gen_optimizer.zero_grad(set_to_none=True)
@@ -2852,6 +2888,7 @@ def run_pretraining(
                                 )
                             disc_optimizer.step()
                             disc_lr_scheduler.step()
+                            _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
                             if lr_mult < 1.0:
                                 _apply_lr_mult(disc_optimizer, lr_mult)
                             disc_optimizer.zero_grad(set_to_none=True)
@@ -2875,6 +2912,8 @@ def run_pretraining(
                         if (not did_disc_optimizer_step) and _optimizer_has_stepped(disc_optimizer):
                             with suppress(Exception):
                                 disc_lr_scheduler.step()
+                        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+                        _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
                         lr_mult, reset_state = _apply_nonfinite_recovery(
                             lr_mult=lr_mult,
                             skip_streak=int(nonfinite_skip_streak),
@@ -3302,6 +3341,7 @@ def run_pretraining(
 
                     optimizer.step()
                     lr_scheduler.step()
+                    _record_unscaled_lrs(optimizer, lr_scheduler)
                     if lr_mult < 1.0:
                         _apply_lr_mult(optimizer, lr_mult)
                     optimizer.zero_grad(set_to_none=True)
@@ -3326,6 +3366,7 @@ def run_pretraining(
                     if _optimizer_has_stepped(optimizer):
                         with suppress(Exception):
                             lr_scheduler.step()
+                    _record_unscaled_lrs(optimizer, lr_scheduler)
                     lr_mult, reset_state = _apply_nonfinite_recovery(
                         lr_mult=lr_mult,
                         skip_streak=int(nonfinite_skip_streak),

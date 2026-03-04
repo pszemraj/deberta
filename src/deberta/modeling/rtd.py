@@ -481,10 +481,9 @@ class EnhancedMaskDecoder(nn.Module):
 
         # Build/normalize attention mask.
         if attention_mask is None:
-            # If the caller didn't provide a mask, assume unpadded input.
-            # We still build an all-True keep mask for simplicity.
-            keep_2d = torch.ones((bsz, seq_len), dtype=torch.bool, device=kv_states.device)
-            attn = _ensure_emd_pairwise_attention_mask(keep_2d)
+            # Keep true unmasked fast-path behavior. Materializing an explicit
+            # all-True (B,1,S,S) keep mask is equivalent but needlessly O(S^2).
+            attn = None
         else:
             attn = _ensure_emd_pairwise_attention_mask(attention_mask)
 
