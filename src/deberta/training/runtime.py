@@ -158,18 +158,12 @@ def _build_optimizer(
     model: torch.nn.Module,
     cfg: TrainConfig,
     *,
-    backbone_type: str = "",
-    compile_enabled: bool = False,
-    compile_scope: str = "backbones",
     mixed_precision: str = "no",
 ) -> torch.optim.Optimizer:
     """Create AdamW with parameter grouping for RTD training.
 
     :param torch.nn.Module model: RTD model.
     :param TrainConfig cfg: Training configuration.
-    :param str backbone_type: Backbone type used by the runtime model.
-    :param bool compile_enabled: Whether torch.compile is enabled at runtime.
-    :param str compile_scope: Effective torch.compile scope.
     :param str mixed_precision: Effective mixed-precision mode.
     :return torch.optim.Optimizer: Configured AdamW optimizer.
     """

@@ -66,10 +66,8 @@ from deberta.training.checkpointing import (
     _resolve_data_resume_policy,
 )
 from deberta.training.compile import (
-    _full_backbone_hf_inductor_warning,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
-    _should_force_legacy_tf32_for_compile,
     _stabilize_compile_attention_mask,
 )
 from deberta.training.entrypoint import run_pretraining_dry_run
@@ -2689,7 +2687,6 @@ def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
         compile_enabled: bool,
         compile_scope: str,
         backbone_type: str,
-        block_cross_document_attention: bool = False,
     ) -> dict[str, Any]:
         mask = batch.get("attention_mask")
         if isinstance(mask, torch.Tensor):
@@ -2699,7 +2696,6 @@ def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
             compile_enabled=compile_enabled,
             compile_scope=compile_scope,
             backbone_type=backbone_type,
-            block_cross_document_attention=block_cross_document_attention,
         )
 
     monkeypatch.setattr(pretrain_mod, "_stabilize_compile_attention_mask", _stabilize_spy)
@@ -3769,7 +3765,7 @@ def test_build_decoupled_optimizers_support_discriminator_specific_lr():
         assert float(group["lr"]) == pytest.approx(2.0e-4)
 
 
-def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
+def test_build_optimizer_keeps_fused_in_bf16_mode(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.runtime as runtime_mod
 
     model = TinyRTDLikeModel()
@@ -3779,28 +3775,6 @@ def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: 
     opt = runtime_mod._build_optimizer(
         model,
         cfg,
-        backbone_type="hf_deberta_v2",
-        compile_enabled=True,
-        compile_scope="backbones",
-        mixed_precision="bf16",
-    )
-
-    assert bool(opt.defaults.get("fused", False)) is True
-
-
-def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: pytest.MonkeyPatch):
-    import deberta.training.runtime as runtime_mod
-
-    model = TinyRTDLikeModel()
-    cfg = TrainConfig()
-
-    monkeypatch.setattr(runtime_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
-    opt = runtime_mod._build_optimizer(
-        model,
-        cfg,
-        backbone_type="rope",
-        compile_enabled=True,
-        compile_scope="backbones",
         mixed_precision="bf16",
     )
 
@@ -4610,16 +4584,6 @@ def test_normalizer_aliases_and_rejection():
             fn(invalid_input)
 
 
-def test_force_legacy_tf32_for_compile_modes():
-    assert _should_force_legacy_tf32_for_compile(torch_compile=False, compile_mode="max-autotune") is False
-    assert _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="default") is False
-    assert _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="max-autotune") is True
-    assert (
-        _should_force_legacy_tf32_for_compile(torch_compile=True, compile_mode="max-autotune-no-cudagraphs")
-        is True
-    )
-
-
 def test_stabilize_compile_attention_mask_hf_deberta_v2():
     # Missing mask stays absent — backbone handles None via no-mask fast path.
     batch1 = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)}
@@ -4667,7 +4631,6 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
         compile_enabled=True,
         compile_scope="backbones",
         backbone_type="rope",
-        block_cross_document_attention=True,
     )
     assert "attention_mask" not in out1
 
@@ -4678,7 +4641,6 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
         compile_enabled=True,
         compile_scope="backbones",
         backbone_type="rope",
-        block_cross_document_attention=False,
     )
     assert "attention_mask" not in out2
 
@@ -4689,7 +4651,6 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
         compile_enabled=False,
         compile_scope="backbones",
         backbone_type="rope",
-        block_cross_document_attention=True,
     )
     assert "attention_mask" not in out3
 
@@ -4698,8 +4659,6 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        compile_mode="default",
-        compile_backend="inductor",
     )
     assert scope == "backbones"
     assert reason is None
@@ -4707,8 +4666,6 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
         model_cfg=ModelConfig(backbone_type="rope"),
-        compile_mode="default",
-        compile_backend="inductor",
     )
     assert scope == "backbones"
     assert reason is None
@@ -4717,8 +4674,6 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
         model_cfg=ModelConfig(backbone_type="rope"),
-        compile_mode="default",
-        compile_backend="inductor",
         block_cross_document_attention=True,
     )
     assert scope == "ffn"
@@ -4727,8 +4682,6 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        compile_mode="default",
-        compile_backend="aot_eager",
     )
     assert scope == "backbones"
     assert reason is None
@@ -4736,41 +4689,9 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     scope, reason = _resolve_compile_scope(
         requested_scope="backbones",
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        compile_mode="default",
-        compile_backend="inductor",
     )
     assert scope == "backbones"
     assert reason is None
-
-
-def test_full_backbone_hf_inductor_warning_is_disabled():
-    assert (
-        _full_backbone_hf_inductor_warning(
-            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-            compile_enabled=True,
-            compile_scope="backbones",
-            compile_backend="inductor",
-        )
-        is None
-    )
-    assert (
-        _full_backbone_hf_inductor_warning(
-            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-            compile_enabled=True,
-            compile_scope="backbones",
-            compile_backend="aot_eager",
-        )
-        is None
-    )
-    assert (
-        _full_backbone_hf_inductor_warning(
-            model_cfg=ModelConfig(backbone_type="rope"),
-            compile_enabled=True,
-            compile_scope="backbones",
-            compile_backend="inductor",
-        )
-        is None
-    )
 
 
 def test_compile_controls_do_not_reference_environment_variables():

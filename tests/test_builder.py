@@ -606,22 +606,6 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
         assert cfg.use_bias is True
 
 
-def _patch_repo_hf_base_config(
-    monkeypatch: pytest.MonkeyPatch, *, config_overrides: dict[str, object] | None = None
-) -> None:
-    """Patch repo HF base config builder for deterministic tests."""
-    overrides = dict(config_overrides or {})
-    original = builder_mod._build_repo_hf_deberta_v2_config
-
-    def _factory(*, model_cfg: ModelConfig) -> Any:
-        cfg = original(model_cfg=model_cfg)
-        for key, value in overrides.items():
-            setattr(cfg, str(key), value)
-        return cfg
-
-    monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _factory)
-
-
 def _patch_hf_pretrained_config_loader(
     monkeypatch: pytest.MonkeyPatch, *, config_overrides: dict[str, object] | None = None
 ) -> None:

@@ -14,13 +14,11 @@ _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 
 
-def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
+def _maybe_enable_tf32(enabled: bool) -> None:
     """Configure TF32 compute policy for CUDA matmul/cudnn.
 
     :param bool enabled: Whether to enable TF32.
-    :param bool force_legacy: Whether to force legacy ``allow_tf32`` flags.
     """
-    del force_legacy
     torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
     torch.backends.cudnn.allow_tf32 = bool(enabled)
 
@@ -128,40 +126,22 @@ def _maybe_cudagraph_mark_step_begin() -> None:
         pass
 
 
-def _should_force_legacy_tf32_for_compile(*, torch_compile: bool, compile_mode: str) -> bool:
-    """Return whether TF32 should use legacy flags for compile compatibility.
-
-    :param bool torch_compile: Whether ``torch.compile`` is enabled.
-    :param str compile_mode: Canonical compile mode.
-    :return bool: True when legacy TF32 flags are preferred.
-    """
-    if not torch_compile:
-        return False
-    return compile_mode.startswith("max-autotune")
-
-
 def _resolve_compile_scope(
     *,
     requested_scope: str,
     model_cfg: ModelConfig,
-    compile_mode: str,
-    compile_backend: str,
     block_cross_document_attention: bool = False,
 ) -> tuple[str, str | None]:
     """Resolve effective compile scope for auto compile mode.
 
     :param str requested_scope: Requested canonical compile scope.
     :param ModelConfig model_cfg: Model configuration.
-    :param str compile_mode: Canonical torch.compile mode.
-    :param str compile_backend: Compile backend name.
     :param bool block_cross_document_attention: Whether doc-blocking is enabled.
     :return tuple[str, str | None]: Effective scope and optional reason message.
     """
     if requested_scope != "auto":
         return requested_scope, None
 
-    del compile_mode
-    del compile_backend
     backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
     if bool(block_cross_document_attention) and backbone_type == "rope":
         return (
@@ -169,28 +149,6 @@ def _resolve_compile_scope(
             "auto scope selected FFN-only for rope + doc-blocking (mask shape churn under compile)",
         )
     return "backbones", None
-
-
-def _full_backbone_hf_inductor_warning(
-    *,
-    model_cfg: ModelConfig,
-    compile_enabled: bool,
-    compile_scope: str,
-    compile_backend: str,
-) -> str | None:
-    """Return warning text for unsupported full-backbone compile combinations.
-
-    :param ModelConfig model_cfg: Model configuration.
-    :param bool compile_enabled: Whether compile is active.
-    :param str compile_scope: Effective compile scope.
-    :param str compile_backend: Compile backend.
-    :return str | None: Warning message for unstable configuration, else ``None``.
-    """
-    del model_cfg
-    del compile_enabled
-    del compile_scope
-    del compile_backend
-    return None
 
 
 def _compile_backbones_for_scope(
@@ -397,7 +355,6 @@ def _stabilize_compile_attention_mask(
     compile_enabled: bool,
     compile_scope: str,
     backbone_type: str,
-    block_cross_document_attention: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Canonicalize attention-mask dtype for compiled attention paths.
 
@@ -412,7 +369,6 @@ def _stabilize_compile_attention_mask(
     :param bool compile_enabled: Whether torch.compile is active.
     :param str compile_scope: Effective compile scope.
     :param str backbone_type: Model backbone type.
-    :param bool block_cross_document_attention: Whether doc-blocking is enabled.
     :return dict[str, torch.Tensor]: Possibly updated batch mapping.
     """
     if not bool(compile_enabled):

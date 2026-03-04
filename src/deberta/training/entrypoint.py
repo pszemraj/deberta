@@ -35,14 +35,12 @@ from deberta.training.compile import (
     _build_doc_block_mask,
     _compile_backbones_for_scope,
     _dtype_for_mixed_precision,
-    _full_backbone_hf_inductor_warning,
     _maybe_configure_sdpa_kernels,
     _maybe_cudagraph_mark_step_begin,
     _maybe_enable_tf32,
     _prefill_rotary_caches_for_compile,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
-    _should_force_legacy_tf32_for_compile,
     _stabilize_compile_attention_mask,
 )
 from deberta.training.export_helpers import _export_discriminator_hf_subprocess
@@ -173,18 +171,14 @@ def run_pretraining_dry_run(
         train_cfg.mixed_precision,
         bf16_sanity_check=_bf16_runtime_sanity_check,
     )
-    compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
-    compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
     compile_scope = compile_scope_requested
     compile_scope_reason: str | None = None
     if compile_enabled:
         compile_scope, compile_scope_reason = _resolve_compile_scope(
             requested_scope=compile_scope_requested,
             model_cfg=model_cfg,
-            compile_mode=compile_mode,
-            compile_backend=compile_backend,
             block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
         )
 
@@ -368,29 +362,9 @@ def run_pretraining(
         compile_scope, compile_scope_reason = _resolve_compile_scope(
             requested_scope=compile_scope_requested,
             model_cfg=model_cfg,
-            compile_mode=compile_mode,
-            compile_backend=compile_backend,
             block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
         )
-        full_backbone_warn = _full_backbone_hf_inductor_warning(
-            model_cfg=model_cfg,
-            compile_enabled=compile_enabled,
-            compile_scope=compile_scope,
-            compile_backend=compile_backend,
-        )
-        if full_backbone_warn is not None and accelerator.is_main_process:
-            logger.warning(full_backbone_warn)
-
-    force_legacy_tf32 = _should_force_legacy_tf32_for_compile(
-        torch_compile=bool(train_cfg.torch_compile),
-        compile_mode=compile_mode,
-    )
-    if force_legacy_tf32 and accelerator.is_main_process:
-        logger.info(
-            "Using legacy TF32 backend flags for torch.compile max-autotune mode "
-            "to avoid known TF32 API conflicts on some PyTorch builds."
-        )
-    _maybe_enable_tf32(train_cfg.tf32, force_legacy=force_legacy_tf32)
+    _maybe_enable_tf32(train_cfg.tf32)
     _maybe_configure_sdpa_kernels(str(train_cfg.sdpa_kernel), is_main=accelerator.is_main_process)
 
     logger.info(f"Accelerate state: {accelerator.state}")
@@ -572,9 +546,6 @@ def run_pretraining(
         optimizer = _build_optimizer(
             model,
             train_cfg,
-            backbone_type=str(model_cfg.backbone_type),
-            compile_enabled=compile_enabled,
-            compile_scope=compile_scope,
             mixed_precision=mixed_precision,
         )
         param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
@@ -1141,7 +1112,6 @@ def run_pretraining(
                         compile_enabled=compile_enabled,
                         compile_scope=compile_scope,
                         backbone_type=str(model_cfg.backbone_type),
-                        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                     )
                     if compile_enabled:
                         _maybe_cudagraph_mark_step_begin()
@@ -1596,7 +1566,6 @@ def run_pretraining(
                     compile_enabled=compile_enabled,
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
-                    block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                 )
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()

@@ -55,14 +55,8 @@ def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> 
     :param float grad_norm: Local gradient L2 norm.
     :return bool: True when at least one rank reports non-finite norm.
     """
-    local_flag = 0 if math.isfinite(float(grad_norm)) else 1
-    device = getattr(accelerator, "device", torch.device("cpu"))
-    local = torch.tensor([local_flag], device=device, dtype=torch.int32)
-    if int(getattr(accelerator, "num_processes", 1)) <= 1:
-        return local_flag > 0
-    reduced = accelerator.reduce(local, reduction="sum")
-    count = int(reduced.reshape(-1)[0].item())
-    return count > 0
+    local_flag = not math.isfinite(float(grad_norm))
+    return _any_rank_flag_true(accelerator=accelerator, flag=local_flag)
 
 
 def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
