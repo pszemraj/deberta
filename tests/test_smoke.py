@@ -9,7 +9,7 @@ from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
-from deberta.training.pretrain import _build_doc_block_mask
+from deberta.training.compile import _build_doc_block_mask
 
 
 @pytest.fixture

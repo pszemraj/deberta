@@ -61,40 +61,33 @@ from deberta.export_cli import ExportArgumentDefaultsHelpFormatter, add_export_a
 from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.rtd import attention_mask_to_active_tokens
-from deberta.training.pretrain import (
-    _any_rank_flag_true,
-    _append_metrics_jsonl_row,
-    _apply_lr_mult,
-    _apply_nonfinite_recovery,
-    _build_decoupled_optimizers,
-    _build_optimizer,
-    _build_runtime_resolved_tracker_config,
-    _build_training_collator,
-    _coerce_dataclass_payload_types,
-    _count_input_tokens_for_batch,
-    _count_rtd_tokens_for_batch,
-    _cycle_dataloader,
-    _export_discriminator_hf_subprocess,
-    _finalize_window_metric_loss,
-    _flush_loggers,
-    _full_backbone_hf_inductor_warning,
-    _global_grad_l2_norm,
-    _has_nonfinite_grad_norm_any_rank,
+from deberta.training.checkpointing import (
     _normalize_resume_consumed_micro_batches,
-    _optimizer_param_order_digest,
-    _partition_optimizer_params,
-    _record_unscaled_lrs,
+    _resolve_data_resume_policy,
+)
+from deberta.training.compile import (
+    _full_backbone_hf_inductor_warning,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
-    _resolve_data_resume_policy,
+    _should_force_legacy_tf32_for_compile,
+    _stabilize_compile_attention_mask,
+)
+from deberta.training.entrypoint import run_pretraining_dry_run
+from deberta.training.export_helpers import _export_discriminator_hf_subprocess
+from deberta.training.loop_utils import (
+    _count_input_tokens_for_batch,
+    _count_rtd_tokens_for_batch,
+    _finalize_window_metric_loss,
     _resolve_window_token_denominators,
     _scale_loss_for_backward,
     _should_clip_gradients,
-    _should_force_legacy_tf32_for_compile,
-    _stabilize_compile_attention_mask,
-    _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
-    run_pretraining_dry_run,
+)
+from deberta.training.metrics import (
+    _append_metrics_jsonl_row,
+    _build_runtime_resolved_tracker_config,
+    _coerce_dataclass_payload_types,
+    _flush_loggers,
 )
 from deberta.training.run_config import (
     _build_run_metadata,
@@ -111,6 +104,23 @@ from deberta.training.run_management import (
     _resolve_resume_checkpoint_for_accelerator,
     _save_checkpoint_data_progress,
     _save_training_checkpoint,
+)
+from deberta.training.runtime import (
+    _build_decoupled_optimizers,
+    _build_optimizer,
+    _build_training_collator,
+    _cycle_dataloader,
+    _optimizer_param_order_digest,
+    _partition_optimizer_params,
+)
+from deberta.training.steps import (
+    _any_rank_flag_true,
+    _apply_lr_mult,
+    _apply_nonfinite_recovery,
+    _global_grad_l2_norm,
+    _has_nonfinite_grad_norm_any_rank,
+    _record_unscaled_lrs,
+    _sync_discriminator_embeddings_if_available,
 )
 from deberta.training.tracker_utils import (
     _init_trackers,
@@ -3760,13 +3770,13 @@ def test_build_decoupled_optimizers_support_discriminator_specific_lr():
 
 
 def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.runtime as runtime_mod
 
     model = TinyRTDLikeModel()
     cfg = TrainConfig()
 
-    monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
-    opt = pretrain_mod._build_optimizer(
+    monkeypatch.setattr(runtime_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
+    opt = runtime_mod._build_optimizer(
         model,
         cfg,
         backbone_type="hf_deberta_v2",
@@ -3779,13 +3789,13 @@ def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: 
 
 
 def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: pytest.MonkeyPatch):
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.runtime as runtime_mod
 
     model = TinyRTDLikeModel()
     cfg = TrainConfig()
 
-    monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
-    opt = pretrain_mod._build_optimizer(
+    monkeypatch.setattr(runtime_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
+    opt = runtime_mod._build_optimizer(
         model,
         cfg,
         backbone_type="rope",
@@ -4497,14 +4507,14 @@ def test_normalize_mixed_precision_accepts_bool_and_synonyms():
 def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.compile as compile_mod
 
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: False)
+    monkeypatch.setattr(compile_mod, "_bf16_runtime_sanity_check", lambda: False)
     with pytest.raises(RuntimeError, match="mixed_precision=no explicitly"):
-        resolve_effective_mixed_precision("bf16", bf16_sanity_check=pretrain_mod._bf16_runtime_sanity_check)
+        resolve_effective_mixed_precision("bf16", bf16_sanity_check=compile_mod._bf16_runtime_sanity_check)
 
     assert (
-        resolve_effective_mixed_precision("no", bf16_sanity_check=pretrain_mod._bf16_runtime_sanity_check)
+        resolve_effective_mixed_precision("no", bf16_sanity_check=compile_mod._bf16_runtime_sanity_check)
         == "no"
     )
 
@@ -4512,9 +4522,9 @@ def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
 def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.compile as compile_mod
 
-    monkeypatch.delattr(pretrain_mod.torch, "compile", raising=False)
+    monkeypatch.delattr(compile_mod.torch, "compile", raising=False)
     with pytest.raises(RuntimeError, match="does not expose torch.compile"):
         _resolve_compile_enabled_or_raise(True)
 
@@ -4766,12 +4776,13 @@ def test_full_backbone_hf_inductor_warning_is_disabled():
 def test_compile_controls_do_not_reference_environment_variables():
     import inspect
 
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.compile as compile_mod
+    import deberta.training.entrypoint as entrypoint_mod
 
-    source = inspect.getsource(pretrain_mod)
-    assert "DEBERTA_COMPILE_SCOPE" not in source
-    assert "DEBERTA_COMPILE_BACKEND" not in source
-    assert "DEBERTA_HF_ATTN_KERNEL" not in source
+    for source in (inspect.getsource(entrypoint_mod), inspect.getsource(compile_mod)):
+        assert "DEBERTA_COMPILE_SCOPE" not in source
+        assert "DEBERTA_COMPILE_BACKEND" not in source
+        assert "DEBERTA_HF_ATTN_KERNEL" not in source
 
 
 def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(

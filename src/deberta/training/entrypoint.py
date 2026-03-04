@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import logging
 import time
-from collections.abc import Iterator
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
@@ -24,17 +23,12 @@ from deberta.config import (
     _sync_legacy_train_aliases,
     resolve_effective_mixed_precision,
 )
-from deberta.data import PackedStreamingDataset, SequentialStreamingDataset
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.training import checkpointing as _checkpointing
-from deberta.training import loop_utils as _loop_utils
-from deberta.training import metrics as _metrics
-from deberta.training import runtime as _runtime
-from deberta.training import steps as _steps
 from deberta.training.checkpointing import (
     _normalize_resume_consumed_micro_batches,
     _resolve_data_resume_policy,
+    _save_periodic_checkpoint_if_due,
 )
 from deberta.training.compile import (
     _bf16_runtime_sanity_check,
@@ -79,10 +73,11 @@ from deberta.training.run_management import (
 )
 from deberta.training.runtime import (
     _apply_profile_and_validate_training_configs,
+    _build_decoupled_optimizers,
+    _build_optimizer,
     _build_scheduler,
-    _build_training_collator,
+    _build_train_dataset_and_collator,
     _cycle_dataloader,
-    _maybe_fused_adamw_kwargs,
     _optimizer_param_order_digest,
     _resolve_section_cfg_compat,
     _validate_output_dir_preflight,
@@ -92,11 +87,13 @@ from deberta.training.steps import (
     _any_rank_flag_true,
     _apply_lr_mult,
     _apply_nonfinite_recovery,
+    _collect_ga_window,
     _global_grad_l2_norm,
     _has_nonfinite_grad_norm_any_rank,
     _move_batch_to_device,
     _optimizer_has_stepped,
     _record_unscaled_lrs,
+    _resolve_window_token_weights,
     _scheduler_current_lr,
     _sync_discriminator_embeddings_if_available,
 )
@@ -105,191 +102,6 @@ from deberta.utils.checkpoint import load_state_with_compile_fallback, unwrap_co
 from deberta.utils.log import setup_process_logging
 
 logger = logging.getLogger(__name__)
-
-# Compatibility aliases for existing imports from ``deberta.training.pretrain``.
-_count_rtd_tokens_for_batch = _loop_utils._count_rtd_tokens_for_batch
-_resolve_window_token_denominators = _loop_utils._resolve_window_token_denominators
-_coerce_dataclass_payload_types = _metrics._coerce_dataclass_payload_types
-_digest_param_name_order = _runtime._digest_param_name_order
-_is_generator_param = _runtime._is_generator_param
-_is_no_decay_param = _runtime._is_no_decay_param
-_partition_optimizer_params = _runtime._partition_optimizer_params
-
-
-def _collect_ga_window(
-    *,
-    train_iter: Iterator[dict[str, torch.Tensor]],
-    ga_steps: int,
-    token_weighted_ga: bool,
-    disc_pad_token_id: int | None,
-    include_has_gen_targets: bool,
-    default_unweighted_token_count: float,
-) -> tuple[list[Any], int, float, float, float]:
-    """Collect one accumulation window with entrypoint-level monkeypatch hooks.
-
-    :param Iterator[dict[str, torch.Tensor]] train_iter: Batch iterator.
-    :param int ga_steps: Accumulation steps per window.
-    :param bool token_weighted_ga: Token-weighted GA toggle.
-    :param int | None disc_pad_token_id: Optional discriminator pad token id.
-    :param bool include_has_gen_targets: Whether to append generator-target flags.
-    :param float default_unweighted_token_count: Fallback token count for unweighted GA.
-    :return tuple[list[Any], int, float, float, float]: Window payload and local token counters.
-    """
-    _steps._count_input_tokens_for_batch = _count_input_tokens_for_batch
-    _steps._count_rtd_tokens_for_batch = _count_rtd_tokens_for_batch
-    return _steps._collect_ga_window(
-        train_iter=train_iter,
-        ga_steps=ga_steps,
-        token_weighted_ga=token_weighted_ga,
-        disc_pad_token_id=disc_pad_token_id,
-        include_has_gen_targets=include_has_gen_targets,
-        default_unweighted_token_count=default_unweighted_token_count,
-    )
-
-
-def _resolve_window_token_weights(
-    *,
-    accelerator: Any,
-    token_weighted_ga: bool,
-    local_gen_tokens: float,
-    local_disc_tokens: float,
-    next_step: int,
-) -> tuple[float, float, bool, bool]:
-    """Resolve per-window token denominators with monkeypatch-aware hooks.
-
-    :param Any accelerator: Accelerator runtime.
-    :param bool token_weighted_ga: Token-weighted GA toggle.
-    :param float local_gen_tokens: Local generator-token count for the window.
-    :param float local_disc_tokens: Local discriminator-token count for the window.
-    :param int next_step: Step number used in zero-token warnings.
-    :return tuple[float, float, bool, bool]: Generator/discriminator denominators and zero-token flags.
-    """
-    _steps._resolve_window_token_denominators = _resolve_window_token_denominators
-    return _steps._resolve_window_token_weights(
-        accelerator=accelerator,
-        token_weighted_ga=token_weighted_ga,
-        local_gen_tokens=local_gen_tokens,
-        local_disc_tokens=local_disc_tokens,
-        next_step=next_step,
-    )
-
-
-def _build_optimizer(
-    model: torch.nn.Module,
-    cfg: TrainConfig,
-    *,
-    backbone_type: str = "",
-    compile_enabled: bool = False,
-    compile_scope: str = "backbones",
-    mixed_precision: str = "no",
-) -> torch.optim.Optimizer:
-    """Build optimizer while preserving entrypoint-level monkeypatch hooks.
-
-    :param torch.nn.Module model: RTD model.
-    :param TrainConfig cfg: Training configuration.
-    :param str backbone_type: Backbone type used by the runtime model.
-    :param bool compile_enabled: Whether torch.compile is enabled at runtime.
-    :param str compile_scope: Effective torch.compile scope.
-    :param str mixed_precision: Effective mixed-precision mode.
-    :return torch.optim.Optimizer: Configured optimizer.
-    """
-    _runtime._maybe_fused_adamw_kwargs = _maybe_fused_adamw_kwargs
-    return _runtime._build_optimizer(
-        model,
-        cfg,
-        backbone_type=backbone_type,
-        compile_enabled=compile_enabled,
-        compile_scope=compile_scope,
-        mixed_precision=mixed_precision,
-    )
-
-
-def _build_decoupled_optimizers(
-    model: torch.nn.Module,
-    cfg: TrainConfig,
-    *,
-    mixed_precision: str = "no",
-) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
-    """Build decoupled optimizers while preserving monkeypatch hooks.
-
-    :param torch.nn.Module model: RTD model.
-    :param TrainConfig cfg: Training configuration.
-    :param str mixed_precision: Effective mixed-precision mode.
-    :return tuple[torch.optim.Optimizer, torch.optim.Optimizer]: Generator/discriminator optimizers.
-    """
-    _runtime._maybe_fused_adamw_kwargs = _maybe_fused_adamw_kwargs
-    return _runtime._build_decoupled_optimizers(model, cfg, mixed_precision=mixed_precision)
-
-
-def _build_train_dataset_and_collator(
-    *,
-    raw_train: Any,
-    tokenizer: Any,
-    data_cfg: DataConfig,
-    train_cfg: TrainConfig,
-    process_index: int,
-    num_processes: int,
-) -> tuple[Any, Any]:
-    """Build dataset/collator while preserving entrypoint-level monkeypatch hooks.
-
-    :param Any raw_train: Loaded HF dataset split.
-    :param Any tokenizer: Runtime tokenizer.
-    :param DataConfig data_cfg: Data config.
-    :param TrainConfig train_cfg: Train config.
-    :param int process_index: Current process index.
-    :param int num_processes: Total process count.
-    :return tuple[Any, Any]: ``(train_dataset, collator)``.
-    """
-    _runtime.PackedStreamingDataset = PackedStreamingDataset
-    _runtime.SequentialStreamingDataset = SequentialStreamingDataset
-    _runtime._build_training_collator = _build_training_collator
-    return _runtime._build_train_dataset_and_collator(
-        raw_train=raw_train,
-        tokenizer=tokenizer,
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        process_index=process_index,
-        num_processes=num_processes,
-    )
-
-
-def _save_periodic_checkpoint_if_due(
-    *,
-    accelerator: Any,
-    train_cfg: TrainConfig,
-    output_dir: Path,
-    global_step: int,
-    consumed_micro_batches_committed: int,
-    lr_mult: float,
-    optimizer_param_digest: str | dict[str, str],
-    gradient_accumulation_steps: int,
-    last_saved_step: int,
-) -> int:
-    """Save periodic checkpoints while preserving monkeypatch hooks.
-
-    :param Any accelerator: Accelerator runtime.
-    :param TrainConfig train_cfg: Training config.
-    :param Path output_dir: Output directory containing checkpoints.
-    :param int global_step: Current global step.
-    :param int consumed_micro_batches_committed: Committed micro-batch progress.
-    :param float lr_mult: Persistent recovery LR multiplier.
-    :param str | dict[str, str] optimizer_param_digest: Trainable-parameter digest payload.
-    :param int gradient_accumulation_steps: Active accumulation steps.
-    :param int last_saved_step: Last checkpoint step already saved.
-    :return int: Updated ``last_saved_step`` value.
-    """
-    _checkpointing._save_training_checkpoint = _save_training_checkpoint
-    return _checkpointing._save_periodic_checkpoint_if_due(
-        accelerator=accelerator,
-        train_cfg=train_cfg,
-        output_dir=output_dir,
-        global_step=global_step,
-        consumed_micro_batches_committed=consumed_micro_batches_committed,
-        lr_mult=lr_mult,
-        optimizer_param_digest=optimizer_param_digest,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        last_saved_step=last_saved_step,
-    )
 
 
 def run_pretraining_dry_run(
