@@ -272,7 +272,8 @@ def check_repo_layout(repo_root: Path) -> CheckResult:
     required = [
         repo_root / "src" / "deberta" / "data" / "collator.py",
         repo_root / "src" / "deberta" / "modeling" / "rtd.py",
-        repo_root / "src" / "deberta" / "training" / "pretrain.py",
+        repo_root / "src" / "deberta" / "training" / "entrypoint.py",
+        repo_root / "src" / "deberta" / "training" / "compile.py",
         repo_root / "src" / "deberta" / "export_cli.py",
     ]
     missing = [str(p) for p in required if not p.exists()]
@@ -417,8 +418,9 @@ def check_optimizer_state_ordering_risk(repo_root: Path) -> CheckResult:
     If the codebase has a param-order digest mechanism (persist + validate on resume), this is
     mitigated; otherwise it is a silent risk.
     """
-    path = repo_root / "src" / "deberta" / "training" / "pretrain.py"
-    src = _read_text(path)
+    runtime_path = repo_root / "src" / "deberta" / "training" / "runtime.py"
+    entrypoint_path = repo_root / "src" / "deberta" / "training" / "entrypoint.py"
+    src = _read_text(runtime_path) + "\n" + _read_text(entrypoint_path)
 
     # Check if param-order digest mechanism is present.
     has_digest = "_optimizer_param_order_digest" in src and "optimizer_param_digest" in src
@@ -457,7 +459,7 @@ def _exec_extracted_function(path: Path, func_name: str, globals_dict: dict[str,
 
 
 def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
-    path = repo_root / "src" / "deberta" / "training" / "pretrain.py"
+    path = repo_root / "src" / "deberta" / "training" / "compile.py"
     g = {
         "torch": torch,
         "_DOC_BLOCK_EYE_CACHE": {},
@@ -469,7 +471,7 @@ def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
         return _fail(
             "doc_block_mask_contract",
             f"Failed to load _build_doc_block_mask via AST exec: {type(e).__name__}: {e}",
-            hint="This harness expects src/deberta/training/pretrain.py to define _build_doc_block_mask(doc_ids).",
+            hint="This harness expects src/deberta/training/compile.py to define _build_doc_block_mask(doc_ids).",
         )
 
     # Build a small doc-id batch.
@@ -755,7 +757,7 @@ def check_rope_attention_mask_leak(repo_root: Path) -> CheckResult:
     build_mask = None
     try:
         build_mask = _exec_extracted_function(
-            repo_root / "src" / "deberta" / "training" / "pretrain.py",
+            repo_root / "src" / "deberta" / "training" / "compile.py",
             "_build_doc_block_mask",
             {"torch": torch, "_DOC_BLOCK_EYE_CACHE": {}, "_DOC_BLOCK_CLS_KEY_CACHE": {}},
         )
