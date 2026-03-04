@@ -5879,7 +5879,7 @@ def test_validate_training_workflow_options_allows_gdes_with_divergent_gen_lr():
 
 
 def test_validate_training_workflow_options_rejects_decoupled_with_es_embedding_sharing():
-    with pytest.raises(ValueError, match="incompatible with model.embedding_sharing='es'"):
+    with pytest.raises(ValueError, match="gradients.*dropped"):
         validate_training_workflow_options(
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
             train_cfg=TrainConfig(decoupled_training=True),

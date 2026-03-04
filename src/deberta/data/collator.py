@@ -566,6 +566,10 @@ class DebertaV3ElectraCollator:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply token-level (independent) MLM masking.
 
+        This helper is retained for targeted unit tests and optional ablation
+        workflows. The default collator path intentionally uses DeBERTa-style
+        windowed masking for ``max_ngram>=1`` via ``_mask_tokens``.
+
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.

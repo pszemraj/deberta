@@ -1751,7 +1751,9 @@ def validate_training_workflow_options(
         if bool(train_cfg.decoupled_training) and embed_sharing == "es":
             raise ValueError(
                 "train.decoupled_training is incompatible with model.embedding_sharing='es' because "
-                "shared embedding parameters would be stepped in both generator and discriminator phases. "
+                "shared embedding parameters are assigned to the generator optimizer only. "
+                "Discriminator-phase gradients on shared embeddings would be dropped at discriminator "
+                "optimizer zero_grad() because discriminator optimizer param groups do not own those shared params. "
                 "Use embedding_sharing='gdes' or 'none' for decoupled training."
             )
 

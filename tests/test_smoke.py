@@ -484,6 +484,32 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
     assert set(counts) == {1}
 
 
+def test_mask_tokens_dispatch_uses_windowed_unigram_not_bert(monkeypatch: pytest.MonkeyPatch):
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+
+    input_ids = torch.tensor([[tok.cls_token_id, 11, 12, tok.sep_token_id]], dtype=torch.long)
+    special = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
+
+    calls = {"windowed": 0}
+
+    def _windowed(_input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor):
+        del special_tokens_mask
+        calls["windowed"] += 1
+        labels = torch.full_like(_input_ids, -100)
+        return _input_ids.clone(), labels
+
+    def _bert(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("_mask_tokens_bert should not be called from _mask_tokens dispatch")
+
+    monkeypatch.setattr(coll, "_mask_tokens_unigram_windowed", _windowed)
+    monkeypatch.setattr(coll, "_mask_tokens_bert", _bert)
+
+    _ = coll._mask_tokens(input_ids, special_tokens_mask=special)
+    assert int(calls["windowed"]) == 1
+
+
 def test_token_level_masking_uses_fixed_budget_for_variable_length_batch():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.4, max_ngram=1))
@@ -1886,6 +1912,70 @@ def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
 
     assert out.shape == (bsz, nheads, qlen, klen)
     assert bmm_dtypes
+
+
+def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = "dynamic"
+    attn = DisentangledSelfAttention(cfg).eval()
+
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+
+    def _fake_project_rel(_rel_embeddings: torch.Tensor, *, use_query: bool) -> torch.Tensor:
+        del _rel_embeddings, use_query
+        return torch.randn(
+            (cfg.num_attention_heads, 2 * cfg.max_position_embeddings, head_dim),
+            dtype=torch.bfloat16,
+        )
+
+    monkeypatch.setattr(attn, "_project_rel", _fake_project_rel)
+
+    einsum_dtypes: list[tuple[str, tuple[torch.dtype, ...]]] = []
+    original_einsum = torch.einsum
+
+    def _checked_einsum(equation: str, *operands: torch.Tensor) -> torch.Tensor:
+        if equation in {"bhqd,hkd->bhqk", "bhkd,hqd->bhkq"}:
+            einsum_dtypes.append((equation, tuple(t.dtype for t in operands)))
+            assert all(t.dtype == torch.float32 for t in operands)
+        return original_einsum(equation, *operands)
+
+    monkeypatch.setattr(torch, "einsum", _checked_einsum)
+
+    bsz, nheads, qlen, klen = 2, cfg.num_attention_heads, 4, 4
+    query = torch.randn((bsz, nheads, qlen, head_dim), dtype=torch.float32)
+    key = torch.randn((bsz, nheads, klen, head_dim), dtype=torch.float32)
+    rel_embeddings = torch.randn((2 * cfg.max_position_embeddings, cfg.hidden_size), dtype=torch.float32)
+
+    out = attn.disentangled_attention_bias(
+        query_layer=query,
+        key_layer=key,
+        relative_pos=None,
+        rel_embeddings=rel_embeddings,
+        scale_factor=3,
+    )
+
+    assert out.shape == (bsz, nheads, qlen, klen)
+    assert {eq for eq, _ in einsum_dtypes} == {"bhqd,hkd->bhqk", "bhkd,hqd->bhkq"}
 
 
 def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
