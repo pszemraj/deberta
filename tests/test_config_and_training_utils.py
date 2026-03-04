@@ -5118,6 +5118,48 @@ def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
     assert "train.max_steps: 5 -> 7 (CLI override (--train.max_steps))" in err
 
 
+def test_main_cli_train_reports_when_runtime_mutation_changes_loaded_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_apply_profile_defaults(*, model_cfg, train_cfg, optim_cfg):
+        del model_cfg, optim_cfg
+        object.__setattr__(train_cfg, "max_steps", int(train_cfg.max_steps) + 1)
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "apply_profile_defaults", _fake_apply_profile_defaults)
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path)])
+
+    assert int(seen["train_cfg"].max_steps) == 6
+    err = capsys.readouterr().err
+    assert "train.max_steps: 5 -> 6 (runtime normalization/defaulting)" in err
+
+
 def test_main_cli_train_supports_dotted_overrides_with_type_casting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -5169,6 +5211,55 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
     assert int(seen["model_cfg"].hf_max_position_embeddings) == 640
     err = capsys.readouterr().err
     assert "train.max_steps: 5 -> 11 (CLI override (--train.max_steps))" in err
+
+
+def test_main_cli_train_supports_null_for_optional_numeric_dotted_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  hf:",
+                "    max_position_embeddings: 640",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--model.hf.max_position_embeddings",
+            "null",
+        ]
+    )
+
+    assert seen["model_cfg"].hf_max_position_embeddings is None
+    err = capsys.readouterr().err
+    assert (
+        "model.hf.max_position_embeddings: 640 -> None (CLI override (--model.hf.max_position_embeddings))"
+    ) in err
 
 
 def test_main_cli_train_supports_dotted_overrides_for_extended_sections(

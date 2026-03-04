@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 import types
@@ -150,18 +151,20 @@ def _should_fast_exit_after_train(*, explicit_argv: bool) -> bool:
     return raw not in {"0", "false", "f", "no", "n", "off"}
 
 
-def _unwrap_optional(field_type: Any) -> Any:
+def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
     """Unwrap Optional[T] style annotations.
 
     :param Any field_type: Type annotation.
-    :return Any: Base type when optional, otherwise original type.
+    :return tuple[Any, bool]: Base type and whether the field allows ``None``.
     """
     origin = get_origin(field_type)
     if origin in {Union, types.UnionType}:
-        args = [a for a in get_args(field_type) if a is not type(None)]
-        if len(args) == 1:
-            return args[0]
-    return field_type
+        args = get_args(field_type)
+        non_none = [a for a in args if a is not type(None)]
+        allows_none = any(a is type(None) for a in args)
+        if len(non_none) == 1:
+            return non_none[0], allows_none
+    return field_type, False
 
 
 def _argparse_type(field_type: Any) -> Any:
@@ -170,7 +173,41 @@ def _argparse_type(field_type: Any) -> Any:
     :param Any field_type: Dataclass field type.
     :return Any: Callable/type for argparse.
     """
-    t = _unwrap_optional(field_type)
+    t, allows_none = _unwrap_optional(field_type)
+    if allows_none:
+
+        def _parse_optional(value: str) -> Any:
+            """Parse optional scalar CLI values.
+
+            :param str value: Raw CLI value.
+            :raises argparse.ArgumentTypeError: On incompatible scalar conversion.
+            :return Any: Parsed value (or ``None`` for ``null``/``none``).
+            """
+            text = str(value).strip()
+            if text.lower() in {"null", "none"}:
+                return None
+            if t is bool:
+                return _parse_bool(text)
+            if t is int:
+                try:
+                    return int(text)
+                except ValueError as exc:
+                    raise argparse.ArgumentTypeError(
+                        f"Expected an integer value or null/none, got: {value}"
+                    ) from exc
+            if t is float:
+                try:
+                    return float(text)
+                except ValueError as exc:
+                    raise argparse.ArgumentTypeError(
+                        f"Expected a numeric value or null/none, got: {value}"
+                    ) from exc
+            if t is str:
+                return text
+            return value
+
+        return _parse_optional
+
     if t is bool:
         return _parse_bool
     if t in {str, int, float}:
@@ -463,7 +500,7 @@ def _run_train(
         if suffix not in {".json", ".yaml", ".yml"}:
             raise ValueError("Config file must end with .json, .yaml, or .yml")
         cfg = load_config(cfg_path)
-        baseline_cfg = cfg
+        baseline_cfg = copy.deepcopy(cfg)
     else:
         cfg = Config()
         baseline_cfg = Config()
