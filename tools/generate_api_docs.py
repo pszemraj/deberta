@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import inspect
+import re
 import warnings
 from pathlib import Path
 from types import ModuleType
@@ -28,7 +29,7 @@ def _format_docstring(value: Any) -> str:
     doc = inspect.getdoc(value)
     if not doc:
         return "No docstring available."
-    return doc.strip()
+    return _render_docstring_markdown(doc.strip())
 
 
 def _format_signature(value: Any, *, prefix: str = "") -> str | None:
@@ -36,7 +37,220 @@ def _format_signature(value: Any, *, prefix: str = "") -> str | None:
         sig = inspect.signature(value)
     except (TypeError, ValueError):
         return None
-    return f"`{prefix}{sig}`" if prefix else f"`{sig}`"
+    return f"{prefix}{sig}" if prefix else f"{sig}"
+
+
+def _render_signature_block(signature: str) -> list[str]:
+    return ["```python", signature, "```", ""]
+
+
+def _clean_doc_lines(doc: str) -> list[str]:
+    return [line.rstrip() for line in doc.splitlines()]
+
+
+def _consume_indented_continuation(lines: list[str], start: int) -> tuple[list[str], int]:
+    """Consume indented continuation lines for a docstring field."""
+    extras: list[str] = []
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if line.lstrip().startswith(":"):
+            break
+        # Continuation lines in dedented docstrings still carry leading spaces.
+        if len(line) > len(line.lstrip()):
+            extras.append(line.strip())
+            i += 1
+            continue
+        break
+    return extras, i
+
+
+def _join_fragments(parts: list[str]) -> str:
+    return " ".join(part for part in parts if part).strip()
+
+
+def _parse_hf_arguments_block(lines: list[str], start: int) -> tuple[list[str], int]:
+    """Parse Hugging Face-style ``Arguments:`` docstring blocks into Markdown bullets."""
+    entries: list[tuple[str, str, str]] = []
+    i = start + 1
+    arg_re = re.compile(r"^\s{4}([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*:\s*(.*)$")
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if not line.startswith("    "):
+            break
+
+        m = arg_re.match(line)
+        if m is None:
+            i += 1
+            continue
+
+        name, meta, desc = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        desc_parts = [desc] if desc else []
+        i += 1
+        while i < len(lines):
+            nxt = lines[i]
+            if not nxt.strip():
+                i += 1
+                continue
+            if arg_re.match(nxt):
+                break
+            if nxt.startswith("        ") or nxt.startswith("    "):
+                desc_parts.append(nxt.strip())
+                i += 1
+                continue
+            break
+        entries.append((name, meta, _join_fragments(desc_parts)))
+
+    rendered: list[str] = ["### Arguments", ""]
+    for name, meta, desc in entries:
+        bullet = f"- `{name}` ({meta})"
+        if desc:
+            bullet += f": {desc}"
+        rendered.append(bullet)
+    rendered.append("")
+    return rendered, i
+
+
+def _parse_sphinx_param(line: str) -> tuple[str, str | None, str]:
+    """Parse ``:param`` lines supporting typed and untyped forms."""
+    m = re.match(r"^:param\s+(.+?)\s*:\s*(.*)$", line.strip())
+    if m is None:
+        raise ValueError(f"Invalid :param line: {line!r}")
+    lhs = m.group(1).strip()
+    desc = m.group(2).strip()
+    parts = lhs.rsplit(" ", maxsplit=1)
+    if len(parts) == 2:
+        type_part, name = parts[0].strip(), parts[1].strip()
+        if name:
+            return name, type_part or None, desc
+    return lhs, None, desc
+
+
+def _parse_sphinx_raises(line: str) -> tuple[str, str]:
+    m = re.match(r"^:raises\s+(.+?)\s*:\s*(.*)$", line.strip())
+    if m is None:
+        raise ValueError(f"Invalid :raises line: {line!r}")
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _parse_sphinx_return(line: str) -> tuple[str | None, str]:
+    stripped = line.strip()
+    m_typed = re.match(r"^:return\s+(.+?)\s*:\s*(.*)$", stripped)
+    if m_typed is not None:
+        return m_typed.group(1).strip(), m_typed.group(2).strip()
+    m_untyped = re.match(r"^:return:\s*(.*)$", stripped)
+    if m_untyped is not None:
+        return None, m_untyped.group(1).strip()
+    raise ValueError(f"Invalid :return line: {line!r}")
+
+
+def _render_docstring_markdown(doc: str) -> str:
+    """Convert docstrings into GitHub-friendly Markdown blocks."""
+    lines = _clean_doc_lines(doc)
+    out: list[str] = []
+    current_field_section: str | None = None
+
+    def _ensure_field_section(section: str) -> None:
+        nonlocal current_field_section
+        if current_field_section == section:
+            return
+        if out and out[-1] != "":
+            out.append("")
+        heading = {
+            "params": "### Parameters",
+            "returns": "### Returns",
+            "raises": "### Raises",
+        }[section]
+        out.extend([heading, ""])
+        current_field_section = section
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if stripped == "Arguments:":
+            block, i = _parse_hf_arguments_block(lines, i)
+            if out and out[-1] != "":
+                out.append("")
+            out.extend(block)
+            current_field_section = None
+            continue
+
+        if stripped in {"Example:", "Examples:"}:
+            if out and out[-1] != "":
+                out.append("")
+            out.extend([f"### {stripped[:-1]}", ""])
+            current_field_section = None
+            i += 1
+            continue
+
+        if stripped.startswith(":param "):
+            name, param_type, desc = _parse_sphinx_param(stripped)
+            continuation, next_i = _consume_indented_continuation(lines, i + 1)
+            desc_all = _join_fragments(([desc] if desc else []) + continuation)
+            _ensure_field_section("params")
+            bullet = f"- `{name}`"
+            if param_type:
+                bullet += f" (`{param_type}`)"
+            if desc_all:
+                bullet += f": {desc_all}"
+            out.append(bullet)
+            i = next_i
+            continue
+
+        if stripped.startswith(":raises "):
+            exc, desc = _parse_sphinx_raises(stripped)
+            continuation, next_i = _consume_indented_continuation(lines, i + 1)
+            desc_all = _join_fragments(([desc] if desc else []) + continuation)
+            _ensure_field_section("raises")
+            bullet = f"- `{exc}`"
+            if desc_all:
+                bullet += f": {desc_all}"
+            out.append(bullet)
+            i = next_i
+            continue
+
+        if stripped.startswith(":return"):
+            return_type, desc = _parse_sphinx_return(stripped)
+            continuation, next_i = _consume_indented_continuation(lines, i + 1)
+            desc_all = _join_fragments(([desc] if desc else []) + continuation)
+            _ensure_field_section("returns")
+            bullet = "- "
+            if return_type:
+                bullet += f"`{return_type}`"
+                if desc_all:
+                    bullet += f": {desc_all}"
+            else:
+                bullet += desc_all or "Return value."
+            out.append(bullet)
+            i = next_i
+            continue
+
+        if stripped.startswith(":rtype:"):
+            rtype = stripped.split(":", maxsplit=2)[-1].strip()
+            _ensure_field_section("returns")
+            out.append(f"- Type: `{rtype}`")
+            i += 1
+            continue
+
+        if current_field_section is not None and stripped:
+            out.append("")
+            current_field_section = None
+
+        out.append(stripped)
+        i += 1
+
+    # Trim duplicate trailing blank lines while preserving paragraph separation.
+    while len(out) >= 2 and out[-1] == "" and out[-2] == "":
+        out.pop()
+    return "\n".join(out).strip()
 
 
 def _iter_public_names(module: ModuleType) -> list[str]:
@@ -66,7 +280,7 @@ def _render_class(name: str, cls: type[Any]) -> list[str]:
     lines = [f"## `{name}`", ""]
     signature = _format_signature(cls, prefix=f"class {name}")
     if signature:
-        lines.extend([signature, ""])
+        lines.extend(_render_signature_block(signature))
 
     lines.extend([_format_docstring(cls), ""])
 
@@ -93,8 +307,7 @@ def _render_class(name: str, cls: type[Any]) -> list[str]:
         lines.append(f"#### `{member_name}`")
         lines.append("")
         if signature:
-            lines.append(signature)
-            lines.append("")
+            lines.extend(_render_signature_block(signature))
         lines.append(f"`{kind}`")
         lines.append("")
         lines.append(_format_docstring(target))
@@ -107,7 +320,7 @@ def _render_function(name: str, fn: Any) -> list[str]:
     lines = [f"## `{name}`", ""]
     signature = _format_signature(fn, prefix=name)
     if signature:
-        lines.extend([signature, ""])
+        lines.extend(_render_signature_block(signature))
     lines.extend([_format_docstring(fn), ""])
     return lines
 

@@ -8,20 +8,26 @@ Training entry points.
 
 ## `run_pretraining`
 
-`run_pretraining(*, model_cfg: 'ModelConfig', data_cfg: 'DataConfig', train_cfg: 'TrainConfig', optim_cfg: 'OptimConfig | None' = None, logging_cfg: 'LoggingConfig | None' = None, config_path: 'str | Path | None' = None) -> 'None'`
+```python
+run_pretraining(*, model_cfg: 'ModelConfig', data_cfg: 'DataConfig', train_cfg: 'TrainConfig', optim_cfg: 'OptimConfig | None' = None, logging_cfg: 'LoggingConfig | None' = None, config_path: 'str | Path | None' = None) -> 'None'
+```
 
 Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
 
-:param ModelConfig model_cfg: Model configuration.
-:param DataConfig data_cfg: Data configuration.
-:param TrainConfig train_cfg: Training configuration.
-:param OptimConfig | None optim_cfg: Optional optimizer configuration.
-:param LoggingConfig | None logging_cfg: Optional logging configuration.
-:param str | Path | None config_path: Optional source config path for auto output-dir naming.
+### Parameters
+
+- `model_cfg` (`ModelConfig`): Model configuration.
+- `data_cfg` (`DataConfig`): Data configuration.
+- `train_cfg` (`TrainConfig`): Training configuration.
+- `optim_cfg` (`OptimConfig | None`): Optional optimizer configuration.
+- `logging_cfg` (`LoggingConfig | None`): Optional logging configuration.
+- `config_path` (`str | Path | None`): Optional source config path for auto output-dir naming.
 
 ## `run_pretraining_dry_run`
 
-`run_pretraining_dry_run(*, model_cfg: 'ModelConfig', data_cfg: 'DataConfig', train_cfg: 'TrainConfig', optim_cfg: 'OptimConfig | None' = None, logging_cfg: 'LoggingConfig | None' = None, config_path: 'str | Path | None' = None) -> 'dict[str, Any]'`
+```python
+run_pretraining_dry_run(*, model_cfg: 'ModelConfig', data_cfg: 'DataConfig', train_cfg: 'TrainConfig', optim_cfg: 'OptimConfig | None' = None, logging_cfg: 'LoggingConfig | None' = None, config_path: 'str | Path | None' = None) -> 'dict[str, Any]'
+```
 
 Run non-destructive preflight checks for `deberta train`.
 
@@ -29,11 +35,19 @@ This validates configuration contracts and probes core runtime dependencies
 (tokenizer, dataset access, collator output, model config construction)
 without starting optimization/training loops.
 
-:param ModelConfig model_cfg: Model configuration.
-:param DataConfig data_cfg: Data configuration.
-:param TrainConfig train_cfg: Training configuration.
-:param OptimConfig | None optim_cfg: Optional optimizer configuration.
-:param LoggingConfig | None logging_cfg: Optional logging configuration.
-:param str | Path | None config_path: Optional source config path.
-:raises RuntimeError: If a preflight stage fails.
-:return dict[str, Any]: Summary of resolved dry-run checks.
+### Parameters
+
+- `model_cfg` (`ModelConfig`): Model configuration.
+- `data_cfg` (`DataConfig`): Data configuration.
+- `train_cfg` (`TrainConfig`): Training configuration.
+- `optim_cfg` (`OptimConfig | None`): Optional optimizer configuration.
+- `logging_cfg` (`LoggingConfig | None`): Optional logging configuration.
+- `config_path` (`str | Path | None`): Optional source config path.
+
+### Raises
+
+- `RuntimeError`: If a preflight stage fails.
+
+### Returns
+
+- `dict[str, Any]`: Summary of resolved dry-run checks.
