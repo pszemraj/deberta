@@ -599,11 +599,11 @@ def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> 
     local_flag = 0 if math.isfinite(float(grad_norm)) else 1
     device = getattr(accelerator, "device", torch.device("cpu"))
     local = torch.tensor([local_flag], device=device, dtype=torch.int32)
-    with suppress(Exception):
-        reduced = accelerator.reduce(local, reduction="sum")
-        count = int(reduced.reshape(-1)[0].item())
-        return count > 0
-    return local_flag > 0
+    if int(getattr(accelerator, "num_processes", 1)) <= 1:
+        return local_flag > 0
+    reduced = accelerator.reduce(local, reduction="sum")
+    count = int(reduced.reshape(-1)[0].item())
+    return count > 0
 
 
 def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
@@ -615,11 +615,11 @@ def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
     """
     device = getattr(accelerator, "device", torch.device("cpu"))
     local = torch.tensor([1 if bool(flag) else 0], device=device, dtype=torch.int32)
-    with suppress(Exception):
-        reduced = accelerator.reduce(local, reduction="sum")
-        count = int(reduced.reshape(-1)[0].item())
-        return count > 0
-    return bool(flag)
+    if int(getattr(accelerator, "num_processes", 1)) <= 1:
+        return bool(flag)
+    reduced = accelerator.reduce(local, reduction="sum")
+    count = int(reduced.reshape(-1)[0].item())
+    return count > 0
 
 
 def _record_unscaled_lrs(optimizer: torch.optim.Optimizer, scheduler: Any | None) -> None:

@@ -449,6 +449,8 @@ class DisentangledSelfAttention(nn.Module):
         :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
         """
 
+        # Intentionally avoid cross-call score caching here: c2p/p2c terms depend
+        # on runtime query/key activations and must be recomputed every forward.
         bsz, nheads, query_len, _ = query_layer.shape
         _, _, key_len, _ = key_layer.shape
         rel_pos = self._normalize_relative_pos(

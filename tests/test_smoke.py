@@ -1850,6 +1850,57 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
     torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])
+def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: str):
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = kernel
+    attn = DisentangledSelfAttention(cfg).eval()
+
+    bsz, nheads, qlen, klen = 2, cfg.num_attention_heads, 4, 4
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    query_a = torch.randn((bsz, nheads, qlen, head_dim), dtype=torch.float32)
+    key_a = torch.randn((bsz, nheads, klen, head_dim), dtype=torch.float32)
+    query_b = torch.randn((bsz, nheads, qlen, head_dim), dtype=torch.float32)
+    key_b = torch.randn((bsz, nheads, klen, head_dim), dtype=torch.float32)
+    rel_embeddings = torch.randn((2 * cfg.max_position_embeddings, cfg.hidden_size), dtype=torch.float32)
+
+    with torch.no_grad():
+        score_a = attn.disentangled_attention_bias(
+            query_layer=query_a,
+            key_layer=key_a,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+            scale_factor=3,
+        )
+        score_b = attn.disentangled_attention_bias(
+            query_layer=query_b,
+            key_layer=key_b,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+            scale_factor=3,
+        )
+
+    assert score_a.shape == score_b.shape
+    assert not torch.allclose(score_a, score_b, rtol=0.0, atol=0.0)
+    assert float((score_a - score_b).abs().max().item()) > 0.0
+
+
 def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2070,6 +2121,58 @@ def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
     assert mean_abs_8 > 0.0
     ratio = mean_abs_2 / mean_abs_8
     assert ratio == pytest.approx(math.sqrt(8.0 / 2.0), rel=1e-4, abs=1e-4)
+
+
+@pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])
+def test_native_hf_deberta_v2_c2p_p2c_bias_respects_scale_factor(kernel: str):
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = kernel
+    attn = DisentangledSelfAttention(cfg).eval()
+
+    bsz, nheads, qlen, klen = 2, cfg.num_attention_heads, 8, 8
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    query = torch.randn((bsz, nheads, qlen, head_dim), dtype=torch.float32)
+    key = torch.randn((bsz, nheads, klen, head_dim), dtype=torch.float32)
+    rel_embeddings = torch.randn((2 * cfg.max_position_embeddings, cfg.hidden_size), dtype=torch.float32)
+
+    with torch.no_grad():
+        score_scale_3 = attn.disentangled_attention_bias(
+            query_layer=query,
+            key_layer=key,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+            scale_factor=3,
+        )
+        score_scale_12 = attn.disentangled_attention_bias(
+            query_layer=query,
+            key_layer=key,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+            scale_factor=12,
+        )
+
+    mean_abs_3 = float(score_scale_3.abs().mean().item())
+    mean_abs_12 = float(score_scale_12.abs().mean().item())
+    assert mean_abs_3 > 0.0
+    assert mean_abs_12 > 0.0
+    ratio = mean_abs_3 / mean_abs_12
+    assert ratio == pytest.approx(math.sqrt(12.0 / 3.0), rel=1e-4, abs=1e-4)
 
 
 def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic_with_p2p():

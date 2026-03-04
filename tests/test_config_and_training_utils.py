@@ -67,6 +67,7 @@ from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.rtd import attention_mask_to_active_tokens
 from deberta.training.pretrain import (
+    _any_rank_flag_true,
     _append_metrics_jsonl_row,
     _apply_lr_mult,
     _apply_nonfinite_recovery,
@@ -4297,7 +4298,7 @@ def test_should_clip_gradients_on_sync_steps():
 
 
 def test_has_nonfinite_grad_norm_any_rank_uses_reduced_flag():
-    accel = FakeAccelerator()
+    accel = FakeAccelerator(num_processes=2)
 
     def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
         assert reduction == "sum"
@@ -4306,6 +4307,66 @@ def test_has_nonfinite_grad_norm_any_rank_uses_reduced_flag():
     accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
     assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is True
     assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
+
+
+def test_has_nonfinite_grad_norm_any_rank_single_process_uses_local_flag():
+    accel = FakeAccelerator(num_processes=1)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise AssertionError("reduce() should not be called in single-process mode")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is False
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
+
+
+def test_has_nonfinite_grad_norm_any_rank_propagates_reduce_errors_on_multi_process():
+    accel = FakeAccelerator(num_processes=2)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise RuntimeError("collective failed")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="collective failed"):
+        _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0)
+
+
+def test_any_rank_flag_true_uses_reduced_flag():
+    accel = FakeAccelerator(num_processes=2)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        assert reduction == "sum"
+        return tensor + 1
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    assert _any_rank_flag_true(accelerator=accel, flag=False) is True
+    assert _any_rank_flag_true(accelerator=accel, flag=True) is True
+
+
+def test_any_rank_flag_true_single_process_uses_local_flag():
+    accel = FakeAccelerator(num_processes=1)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise AssertionError("reduce() should not be called in single-process mode")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    assert _any_rank_flag_true(accelerator=accel, flag=False) is False
+    assert _any_rank_flag_true(accelerator=accel, flag=True) is True
+
+
+def test_any_rank_flag_true_propagates_reduce_errors_on_multi_process():
+    accel = FakeAccelerator(num_processes=2)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise RuntimeError("collective failed")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="collective failed"):
+        _any_rank_flag_true(accelerator=accel, flag=False)
 
 
 def test_sync_discriminator_embeddings_if_available_is_noop_without_hook():
