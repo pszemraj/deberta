@@ -32,7 +32,6 @@ from deberta.checkpoint_utils import (
     load_checkpoint_model_state_dict,
     load_model_state_with_compile_key_remap,
 )
-from deberta.cli import _load_json, _load_yaml
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
     Config,
@@ -79,7 +78,6 @@ from deberta.training.pretrain import (
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
-    _export_discriminator_hf,
     _export_discriminator_hf_subprocess,
     _finalize_window_metric_loss,
     _flush_loggers,
@@ -102,7 +100,6 @@ from deberta.training.pretrain import (
     _stabilize_compile_attention_mask,
     _sync_discriminator_embeddings_if_available,
     _token_weighted_micro_objective,
-    _write_export_readme,
     run_pretraining_dry_run,
 )
 from deberta.training.run_config import (
@@ -128,93 +125,6 @@ from deberta.training.tracker_utils import (
 )
 
 
-def test_load_yaml_nested_and_flat(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    nested = tmp_path / "nested.yaml"
-    nested.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  backbone_type: rope",
-                "  rope:",
-                "    ffn_type: swiglu",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "  packing:",
-                "    max_seq_length: 128",
-                "train:",
-                "  checkpoint:",
-                "    overwrite_output_dir: true",
-                "  objective:",
-                "    mlm_max_ngram: 3",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    model_nested, data_nested, train_nested = _load_yaml(nested)
-    assert model_nested.rope.ffn_type == "swiglu"
-    assert data_nested.packing.max_seq_length == 128
-    assert train_nested.overwrite_output_dir is True
-    assert train_nested.mlm_max_ngram == 3
-    assert train_nested.mixed_precision == "bf16"
-
-    flat = tmp_path / "flat.yaml"
-    flat.write_text(
-        "\n".join(
-            [
-                "backbone_type: rope",
-                "max_seq_length: 64",
-                "overwrite_output_dir: false",
-                "mixed_precision: no",
-                "mlm_max_ngram: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
-        _load_yaml(flat)
-
-
-def test_load_json_nested_and_flat(tmp_path: Path):
-    nested = tmp_path / "nested.json"
-    nested.write_text(
-        json.dumps(
-            {
-                "model": {"backbone_type": "rope", "rope": {"ffn_type": "mlp"}},
-                "data": {
-                    "source": {"dataset_name": "HuggingFaceFW/fineweb-edu"},
-                    "packing": {"max_seq_length": 96},
-                },
-                "train": {"objective": {"disc_loss_weight": 50.0}},
-                "optim": {"lr": {"generator": 3.0e-4}},
-            }
-        ),
-        encoding="utf-8",
-    )
-    model_nested, data_nested, train_nested = _load_json(nested)
-    assert model_nested.rope.ffn_type == "mlp"
-    assert data_nested.packing.max_seq_length == 96
-    assert train_nested.generator_learning_rate == pytest.approx(3.0e-4)
-    assert train_nested.disc_loss_weight == pytest.approx(50.0)
-
-    flat = tmp_path / "flat.json"
-    flat.write_text(
-        json.dumps(
-            {
-                "backbone_type": "rope",
-                "max_seq_length": 80,
-                "mlm_max_ngram": 2,
-                "mask_token_prob": 0.7,
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
-        _load_json(flat)
-
-
 def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -237,61 +147,6 @@ def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.Monk
     assert calls[0][0] == "hf-internal-testing/librispeech_asr_dummy"
     assert "cache_dir" in calls[0][1]
     assert calls[0][1]["cache_dir"] is None
-
-
-def test_load_yaml_resolves_variables(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    cfg = tmp_path / "vars.yaml"
-    cfg.write_text(
-        "\n".join(
-            [
-                "variables:",
-                "  seq: 256",
-                "  lr: 5e-4",
-                "model:",
-                "  backbone_type: hf_deberta_v2",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "  packing:",
-                "    max_seq_length: $variables.seq",
-                "optim:",
-                "  lr:",
-                "    base: $variables.lr",
-                "logging:",
-                "  run_name: run-{$variables.seq}",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    _, data_cfg, train_cfg = _load_yaml(cfg)
-    assert int(data_cfg.packing.max_seq_length) == 256
-    assert float(train_cfg.learning_rate) == pytest.approx(5e-4)
-    assert train_cfg.run_name == "run-256"
-
-
-def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    cfg = tmp_path / "vars_cycle.yaml"
-    cfg.write_text(
-        "\n".join(
-            [
-                "variables:",
-                "  a: $variables.b",
-                "  b: $variables.a",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Circular variable reference"):
-        _load_yaml(cfg)
 
 
 def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
@@ -415,78 +270,6 @@ def test_apply_dotted_override_preserves_existing_explicit_fields_per_section() 
 
     apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
     assert cfg.train.mask_token_prob == pytest.approx(0.8)
-
-
-def test_load_json_unknown_key_raises(tmp_path: Path):
-    bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
-        _load_json(bad)
-
-
-def test_load_json_nested_unknown_top_level_key_raises(tmp_path: Path):
-    bad = tmp_path / "bad_nested.json"
-    bad.write_text(
-        json.dumps(
-            {
-                "model": {"backbone_type": "rope"},
-                "unexpected_top_level_key": 1,
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
-        _load_json(bad)
-
-
-def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    bad = tmp_path / "bad_nested.yaml"
-    bad.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  backbone_type: rope",
-                "unexpected_top_level_key: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
-        _load_yaml(bad)
-
-
-@pytest.mark.parametrize(
-    "config_name",
-    [
-        "pretrain_hf_deberta_v2_parity_base.yaml",
-        "pretrain_hf_deberta_v2_parity_small.yaml",
-    ],
-)
-def test_parity_yaml_configs_parse_and_validate(
-    config_name: str,
-) -> None:
-    pytest.importorskip("yaml")
-
-    repo_root = Path(__file__).resolve().parents[1]
-    config_path = repo_root / "configs" / config_name
-    model_cfg, data_cfg, train_cfg = _load_yaml(config_path)
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
-
-    validate_model_config(model_cfg)
-    validate_data_config(data_cfg)
-    validate_train_config(train_cfg)
-    validate_training_workflow_options(
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        model_cfg=model_cfg,
-    )
-
-    assert model_cfg.profile == "deberta_v3_parity"
-    assert model_cfg.backbone_type == "hf_deberta_v2"
-    assert model_cfg.pretrained_discriminator_path == ""
-    assert bool(train_cfg.decoupled_training) is True
 
 
 def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
@@ -1602,7 +1385,6 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
         monkeypatch,
         accelerator_cls=FakeAccelerator,
         save_checkpoint_fn=_fake_save_checkpoint,
-        extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
 
     # Override cycle to interrupt after first batch.
@@ -1687,7 +1469,6 @@ def test_run_pretraining_logs_crash_save_failure(
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         save_checkpoint_fn=_fake_save_checkpoint,
-        extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
 
     def _interrupt_cycle(_loader, *, start_epoch: int = 0):
@@ -1745,7 +1526,6 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         save_checkpoint_fn=_fake_save_checkpoint,
-        extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
 
     # Complete one accumulation window (2 micro-batches), then interrupt in the next
@@ -3438,10 +3218,10 @@ def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
     resolved_path = out / "config_resolved.yaml"
     assert original_path.read_text(encoding="utf-8") == src_text
     assert resolved_path.exists()
-    loaded_resolved = _load_yaml(resolved_path)
-    assert loaded_resolved[0].backbone_type == model_cfg.backbone_type
-    assert loaded_resolved[1].dataset_name == data_cfg.dataset_name
-    assert loaded_resolved[2].max_steps == train_cfg.max_steps
+    loaded_resolved = load_config(resolved_path)
+    assert loaded_resolved.model.backbone_type == model_cfg.backbone_type
+    assert loaded_resolved.data.dataset_name == data_cfg.dataset_name
+    assert loaded_resolved.train.max_steps == train_cfg.max_steps
 
 
 def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matching_resume(tmp_path: Path):
@@ -3891,108 +3671,6 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
     torch.testing.assert_close(out.disc_positive_count, torch.zeros((), dtype=out.disc_positive_count.dtype))
 
 
-def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import deberta.training.export_helpers as export_mod
-
-    class _Inner(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.discriminator = torch.nn.Linear(2, 2)
-            self.generator = torch.nn.Linear(2, 2)
-            self.disc_config = object()
-
-    inner = _Inner()
-
-    class _Wrapped(torch.nn.Module):
-        def __init__(self, wrapped: torch.nn.Module) -> None:
-            super().__init__()
-            self.module = wrapped
-
-    wrapped = _Wrapped(inner)
-    called_targets: list[torch.nn.Module] = []
-
-    class _FakeExportModel:
-        def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
-            del safe_serialization
-            Path(path).mkdir(parents=True, exist_ok=True)
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModel = types.SimpleNamespace(from_config=lambda _cfg: _FakeExportModel())
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(
-        export_mod,
-        "load_intersection_state_dict",
-        lambda _model, _state: types.SimpleNamespace(missing_keys=[]),
-    )
-    monkeypatch.setattr(
-        export_mod,
-        "merge_embeddings_into_export_backbone",
-        lambda **_kwargs: None,
-    )
-
-    def _unwrap_model(model: torch.nn.Module, **_kwargs: Any) -> torch.nn.Module:
-        assert model is wrapped
-        return inner
-
-    def _get_state_dict(model: torch.nn.Module, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
-        del unwrap
-        called_targets.append(model)
-        return {}
-
-    accelerator = FakeAccelerator(
-        is_main_process=True,
-        unwrap_model_hook=_unwrap_model,
-        get_state_dict_hook=_get_state_dict,
-    )
-    _export_discriminator_hf(
-        accelerator=accelerator,
-        model=wrapped,  # type: ignore[arg-type]
-        tokenizer=DummyTokenizer(),
-        output_dir=tmp_path / "export",
-        embedding_sharing="none",
-    )
-
-    assert called_targets == [inner.discriminator, inner.generator]
-
-
-def test_export_discriminator_hf_collects_state_dicts_on_non_main_rank(tmp_path: Path) -> None:
-    class _Inner(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.discriminator = torch.nn.Linear(2, 2)
-            self.generator = torch.nn.Linear(2, 2)
-            self.disc_config = object()
-
-    inner = _Inner()
-    called_targets: list[torch.nn.Module] = []
-
-    def _unwrap_model(model: torch.nn.Module, **_kwargs: Any) -> torch.nn.Module:
-        assert model is inner
-        return model
-
-    def _get_state_dict(model: torch.nn.Module, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
-        del unwrap
-        called_targets.append(model)
-        return {}
-
-    accelerator = FakeAccelerator(
-        is_main_process=False,
-        unwrap_model_hook=_unwrap_model,
-        get_state_dict_hook=_get_state_dict,
-    )
-
-    _export_discriminator_hf(
-        accelerator=accelerator,
-        model=inner,  # type: ignore[arg-type]
-        tokenizer=DummyTokenizer(),
-        output_dir=tmp_path / "export",
-        embedding_sharing="none",
-    )
-
-    assert called_targets == [inner.discriminator, inner.generator]
-    assert not (tmp_path / "export").exists()
-
-
 def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4028,68 +3706,6 @@ def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
     assert cmd[0] == sys.executable
     assert cmd[1:5] == ["-m", "deberta", "export", "runs/demo/checkpoint-1"]
     assert "--allow-partial-export" in cmd
-
-
-def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Path):
-    out_dir = tmp_path / "rope-export"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    _write_export_readme(
-        out_dir,
-        model_cfg=ModelConfig(backbone_type="rope"),
-        data_cfg=DataConfig(max_seq_length=777),
-        train_cfg=TrainConfig(max_steps=100),
-        embedding_sharing="gdes",
-    )
-
-    text = (out_dir / "README.md").read_text(encoding="utf-8")
-    assert "DebertaRoPEModel.from_pretrained" in text
-    assert 'model = AutoModel.from_pretrained("path/to/this/dir")' not in text
-    assert "model_type" in text
-    assert "| Max sequence length | 777 |" in text
-
-
-def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
-    out_dir = tmp_path / "hf-export"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    _write_export_readme(
-        out_dir,
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        data_cfg=DataConfig(max_seq_length=333),
-        train_cfg=TrainConfig(max_steps=100),
-        embedding_sharing="gdes",
-    )
-
-    text = (out_dir / "README.md").read_text(encoding="utf-8")
-    assert "AutoModel.from_pretrained" in text
-    assert "DebertaRoPEModel.from_pretrained" not in text
-    assert "| Max sequence length | 333 |" in text
-
-
-def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_path: Path):
-    out_dir = tmp_path / "hf-export-effective-config"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    export_cfg = types.SimpleNamespace(
-        hidden_size=768,
-        num_hidden_layers=6,
-        num_attention_heads=12,
-        max_position_embeddings=4096,
-    )
-
-    _write_export_readme(
-        out_dir,
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", hf_model_size="small"),
-        export_config=export_cfg,
-        data_cfg=None,
-        train_cfg=TrainConfig(max_steps=100),
-        embedding_sharing="gdes",
-    )
-
-    text = (out_dir / "README.md").read_text(encoding="utf-8")
-    assert "# hf_deberta_v2-768h-6L-12H" in text
-    assert "| Max sequence length | 4096 |" in text
 
 
 def test_build_optimizer_supports_generator_specific_lr():

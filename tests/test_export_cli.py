@@ -16,6 +16,7 @@ from _fakes import DummyTokenizer, FakeAccelerator
 
 import deberta.export_cli as export_cli
 from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
+from deberta.run_layout import validate_run_metadata_file
 
 
 class _FakeExportBackbone:
@@ -597,13 +598,13 @@ def test_run_export_both_targets_save_into_component_subdirectories(
     assert (out_dir / "generator" / "README.md").exists()
 
 
-def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
+def test_validate_run_metadata_file_accepts_missing_metadata(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    export_cli._validate_run_metadata_if_present(run_dir)
+    validate_run_metadata_file(run_dir, required=False)
 
 
-def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path):
+def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "run_metadata.json").write_text(
@@ -611,7 +612,7 @@ def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path)
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unsupported run metadata schema"):
-        export_cli._validate_run_metadata_if_present(run_dir)
+        validate_run_metadata_file(run_dir, required=False)
 
 
 def test_namespace_to_export_config_maps_allow_partial_export() -> None:
