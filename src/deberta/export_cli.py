@@ -36,12 +36,12 @@ from deberta.run_layout import (
     infer_run_dir_from_checkpoint,
     validate_run_metadata_file,
 )
-from deberta.utils.checkpoint_utils import (
+from deberta.utils.checkpoint import (
     load_model_state_with_compile_key_remap,
     load_state_with_compile_fallback,
 )
-from deberta.utils.io_utils import load_json_mapping
-from deberta.utils.log_utils import setup_process_logging
+from deberta.utils.io import load_json_mapping
+from deberta.utils.log import setup_process_logging
 
 logger = logging.getLogger(__name__)
 

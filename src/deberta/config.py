@@ -10,9 +10,9 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
 
-from deberta.utils.io_utils import load_json_mapping
-from deberta.utils.mapping_utils import flatten_mapping
-from deberta.utils.type_utils import coerce_scalar, unwrap_optional_type
+from deberta.utils.io import load_json_mapping
+from deberta.utils.mapping import flatten_mapping
+from deberta.utils.types import coerce_scalar, unwrap_optional_type
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}

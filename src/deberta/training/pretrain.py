@@ -68,13 +68,13 @@ from deberta.training.run_management import (
     _save_training_checkpoint,
 )
 from deberta.training.tracker_utils import _init_trackers, _setup_wandb_watch, _upload_wandb_original_config
-from deberta.utils.checkpoint_utils import (
+from deberta.utils.checkpoint import (
     load_state_with_compile_fallback,
     unwrap_compiled_model,
 )
-from deberta.utils.io_utils import dump_json
-from deberta.utils.log_utils import setup_process_logging
-from deberta.utils.type_utils import coerce_scalar, unwrap_optional_type
+from deberta.utils.io import dump_json
+from deberta.utils.log import setup_process_logging
+from deberta.utils.types import coerce_scalar, unwrap_optional_type
 
 logger = logging.getLogger(__name__)
 _NONFINITE_LR_BACKOFF = 0.5

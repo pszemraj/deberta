@@ -35,7 +35,7 @@ from deberta.run_layout import (
     infer_run_dir_from_checkpoint,
     validate_run_metadata_file,
 )
-from deberta.utils.io_utils import dump_json, load_json_mapping
+from deberta.utils.io import dump_json, load_json_mapping
 
 logger = logging.getLogger(__name__)
 

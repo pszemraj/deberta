@@ -117,7 +117,7 @@ from deberta.training.tracker_utils import (
     _setup_wandb_watch,
     _upload_wandb_original_config,
 )
-from deberta.utils.checkpoint_utils import (
+from deberta.utils.checkpoint import (
     canonical_compile_state_key,
     load_checkpoint_model_state_dict,
     load_model_state_with_compile_key_remap,
@@ -687,7 +687,7 @@ def test_load_checkpoint_data_progress_warns_on_invalid_json(
 
 
 def test_dump_json_is_atomic_on_serialization_failure(tmp_path: Path) -> None:
-    from deberta.utils.io_utils import dump_json
+    from deberta.utils.io import dump_json
 
     target = tmp_path / "state.json"
     with pytest.raises(TypeError):
@@ -6173,7 +6173,7 @@ def test_persist_run_configs_writes_compile_scope_to_metadata(tmp_path: Path):
         effective_compile_scope="ffn",
         compile_scope_reason="auto scope selected FFN-only",
     )
-    from deberta.utils.io_utils import load_json_mapping
+    from deberta.utils.io import load_json_mapping
 
     meta = load_json_mapping(out / "run_metadata.json")
     assert meta["effective_compile_scope"] == "ffn"

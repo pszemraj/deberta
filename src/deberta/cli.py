@@ -52,8 +52,8 @@ from deberta.export_cli import (
     run_export,
 )
 from deberta.training import run_pretraining, run_pretraining_dry_run
-from deberta.utils.mapping_utils import flatten_mapping
-from deberta.utils.type_utils import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap_optional_type
+from deberta.utils.mapping import flatten_mapping
+from deberta.utils.types import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap_optional_type
 
 # Nested canonical presets. With a config file, presets still only apply model overrides.
 _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {

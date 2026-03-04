@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from deberta.utils.io_utils import dump_json, load_json_mapping
+from deberta.utils.io import dump_json, load_json_mapping
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
