@@ -5381,6 +5381,61 @@ def test_main_cli_train_supports_null_for_optional_numeric_dotted_override(
     ) in err
 
 
+def test_main_cli_train_supports_null_for_optional_constrained_dotted_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  backbone_type: rope",
+                "  from_scratch: false",
+                "  pretrained:",
+                "    discriminator_path: /tmp/rope-disc",
+                "  rope:",
+                "    pretrained:",
+                "      norm_arch: keel",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--model.rope.pretrained.norm_arch",
+            "none",
+        ]
+    )
+
+    assert seen["model_cfg"].pretrained_norm_arch is None
+    err = capsys.readouterr().err
+    assert (
+        "model.rope.pretrained.norm_arch: 'keel' -> None (CLI override (--model.rope.pretrained.norm_arch))"
+        in err
+    )
+
+
 def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -269,6 +269,27 @@ def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
     :param argparse.ArgumentParser parser: Target parser.
     :return dict[str, str]: Mapping of dotted path to argparse destination.
     """
+
+    def _choices_for_path(path: str, field_type: Any) -> tuple[Any, ...] | None:
+        """Return argparse choices for one dotflag, including ``None`` when optional.
+
+        Optional constrained fields should accept ``none``/``null`` so users can
+        clear values loaded from config files.
+
+        :param str path: Dotted field path.
+        :param Any field_type: Dataclass field type annotation.
+        :return tuple[Any, ...] | None: Argparse choices or ``None`` when unconstrained.
+        """
+        base = _DOTFLAG_CHOICES.get(str(path))
+        if base is None:
+            return None
+        _target_t, allows_none = _unwrap_optional(field_type)
+        if not allows_none:
+            return base
+        if any(choice is None for choice in base):
+            return base
+        return tuple(base) + (None,)
+
     dest_by_path: dict[str, str] = {}
     group = parser.add_argument_group("Config Dotflags")
 
@@ -280,7 +301,7 @@ def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
             dest=dest,
             default=argparse.SUPPRESS,
             type=_argparse_type(field_type),
-            choices=_DOTFLAG_CHOICES.get(str(path)),
+            choices=_choices_for_path(str(path), field_type),
             help=f"Set {path}",
         )
     return dest_by_path
