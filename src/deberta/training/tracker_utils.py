@@ -15,6 +15,22 @@ from deberta.training.run_management import _sanitize_run_label
 logger = logging.getLogger(__name__)
 
 
+def _wandb_save_with_fallback(save_fn: Any, src: Path) -> None:
+    """Call ``wandb.save``-style APIs across signature variants.
+
+    :param Any save_fn: Callable save function.
+    :param Path src: Source file path.
+    :return None: None.
+    """
+    try:
+        save_fn(str(src), base_path=str(src.parent), policy="now")
+    except TypeError:
+        try:
+            save_fn(str(src), base_path=str(src.parent))
+        except TypeError:
+            save_fn(str(src))
+
+
 def _init_trackers(
     *,
     accelerator: Any,
@@ -195,13 +211,7 @@ def _upload_wandb_original_config(
     if callable(save_fn):
         uploaded_any = False
         for src in deduped_upload_files:
-            try:
-                save_fn(str(src), base_path=str(src.parent), policy="now")
-            except TypeError:
-                try:
-                    save_fn(str(src), base_path=str(src.parent))
-                except TypeError:
-                    save_fn(str(src))
+            _wandb_save_with_fallback(save_fn, src)
             uploaded_any = True
             logger.info("Uploaded config snapshot to W&B as run file: %s", src)
         if uploaded_any:
@@ -213,13 +223,7 @@ def _upload_wandb_original_config(
         if wandb.run is not None and callable(getattr(wandb, "save", None)):
             uploaded_any = False
             for src in deduped_upload_files:
-                try:
-                    wandb.save(str(src), base_path=str(src.parent), policy="now")
-                except TypeError:
-                    try:
-                        wandb.save(str(src), base_path=str(src.parent))
-                    except TypeError:
-                        wandb.save(str(src))
+                _wandb_save_with_fallback(wandb.save, src)
                 uploaded_any = True
                 logger.info("Uploaded config snapshot via wandb.save: %s", src)
             if uploaded_any:

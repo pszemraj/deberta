@@ -140,26 +140,6 @@ def canonical_compile_state_key(key: str) -> str:
     return ".".join(parts)
 
 
-def canonicalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Return a state dict with compile-wrapper key segments normalized.
-
-    :param dict[str, torch.Tensor] state_dict: Raw state dictionary.
-    :raises RuntimeError: If two distinct source keys collide after canonicalization.
-    :return dict[str, torch.Tensor]: Canonicalized state dictionary.
-    """
-    canonical: dict[str, tuple[str, torch.Tensor]] = {}
-    for key, value in state_dict.items():
-        key_norm = canonical_compile_state_key(key)
-        prev = canonical.get(key_norm)
-        if prev is not None and prev[0] != key:
-            raise RuntimeError(
-                "Ambiguous state-dict keys after compile canonicalization: "
-                f"{prev[0]!r} and {key!r} -> {key_norm!r}"
-            )
-        canonical[key_norm] = (key, value)
-    return {key_norm: entry[1] for key_norm, entry in canonical.items()}
-
-
 def load_checkpoint_model_state_dict(
     checkpoint_dir: Path,
     *,

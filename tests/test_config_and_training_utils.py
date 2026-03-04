@@ -31,6 +31,7 @@ from deberta.checkpoint_utils import (
     canonical_compile_state_key,
     load_checkpoint_model_state_dict,
     load_model_state_with_compile_key_remap,
+    load_state_with_compile_fallback,
 )
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
@@ -84,7 +85,6 @@ from deberta.training.pretrain import (
     _full_backbone_hf_inductor_warning,
     _global_grad_l2_norm,
     _has_nonfinite_grad_norm_any_rank,
-    _load_resume_state_with_compile_fallback,
     _normalize_resume_consumed_micro_batches,
     _optimizer_param_order_digest,
     _partition_optimizer_params,
@@ -994,7 +994,12 @@ def test_load_resume_state_with_compile_fallback_retries_strict_false_and_remaps
             raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
 
     accel = FakeAccelerator(load_state_hook=_load_state_hook)
-    _load_resume_state_with_compile_fallback(accel, model, str(checkpoint))
+    load_state_with_compile_fallback(
+        accelerator=accel,
+        model=model,
+        checkpoint_dir=str(checkpoint),
+        context="resume",
+    )
 
     assert len(calls) == 2
     assert calls[0][1] == {}
@@ -4289,20 +4294,6 @@ def test_count_input_tokens_for_batch_with_various_mask_shapes():
         "attention_mask": pair_3d.unsqueeze(1),
     }
     assert _count_input_tokens_for_batch(batch_4d) == pytest.approx(2.0)
-
-
-def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
-    from deberta.training.loop_utils import _compute_disc_active_mask
-
-    mask = _compute_disc_active_mask(
-        input_ids=torch.tensor([[1, 11, 2, 13, 0]], dtype=torch.long),
-        labels=torch.tensor([[-100, 99, -100, 77, -100]], dtype=torch.long),
-        attention_mask=torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long),
-        pad_token_id=0,
-    )
-
-    expected = torch.tensor([[True, True, True, True, True]], dtype=torch.bool)
-    assert torch.equal(mask, expected)
 
 
 def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_3d_masks():

@@ -308,25 +308,6 @@ def _build_runtime_resolved_tracker_config(
     return _drop_none_recursive(payload)
 
 
-def _load_resume_state_with_compile_fallback(
-    accelerator: Any, model: torch.nn.Module, checkpoint_dir: str
-) -> None:
-    """Load resume state with fallback for ``torch.compile`` wrapper key mismatches.
-
-    :param Any accelerator: Accelerator instance.
-    :param torch.nn.Module model: Potentially wrapped training model.
-    :param str checkpoint_dir: Resume checkpoint directory.
-    :raises RuntimeError: If both normal and fallback load paths fail.
-    :return None: None.
-    """
-    load_state_with_compile_fallback(
-        accelerator=accelerator,
-        model=model,
-        checkpoint_dir=checkpoint_dir,
-        context="resume",
-    )
-
-
 def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     """Configure TF32 compute policy for CUDA matmul/cudnn.
 
@@ -1598,6 +1579,84 @@ def _resolve_section_cfg_compat(
     return resolved_optim_cfg, resolved_logging_cfg
 
 
+def _apply_profile_and_validate_training_configs(
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig,
+    logging_cfg: LoggingConfig,
+) -> None:
+    """Apply profile defaults and validate full training config contract.
+
+    :param ModelConfig model_cfg: Model config.
+    :param DataConfig data_cfg: Data config.
+    :param TrainConfig train_cfg: Train config.
+    :param OptimConfig optim_cfg: Effective optimizer config.
+    :param LoggingConfig logging_cfg: Effective logging config.
+    :return None: None.
+    """
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_optim_config(optim_cfg)
+    validate_logging_config(logging_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+
+
+def _build_train_dataset_and_collator(
+    *,
+    raw_train: Any,
+    tokenizer: Any,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    process_index: int,
+    num_processes: int,
+) -> tuple[Any, Any]:
+    """Build streaming train dataset and collator.
+
+    :param Any raw_train: Loaded HF dataset split.
+    :param Any tokenizer: Runtime tokenizer.
+    :param DataConfig data_cfg: Data config.
+    :param TrainConfig train_cfg: Train config.
+    :param int process_index: Current process index.
+    :param int num_processes: Total process count.
+    :return tuple[Any, Any]: ``(train_dataset, collator)``.
+    """
+    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
+    train_dataset = dataset_cls(
+        hf_dataset=raw_train,
+        tokenizer=tokenizer,
+        cfg=PackedStreamingConfig(
+            text_column_name=data_cfg.text_column_name,
+            max_seq_length=data_cfg.max_seq_length,
+            seed=train_cfg.seed,
+            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
+        ),
+        process_index=process_index,
+        num_processes=num_processes,
+    )
+    collator = _build_training_collator(
+        tokenizer=tokenizer,
+        train_cfg=train_cfg,
+        packed_sequences=bool(data_cfg.pack_sequences),
+        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+    )
+    return train_dataset, collator
+
+
 def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
@@ -1633,21 +1692,10 @@ def run_pretraining_dry_run(
         logging_cfg=resolved_logging_cfg,
     )
 
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=resolved_optim_cfg,
-        logging_cfg=resolved_logging_cfg,
-    )
-    validate_model_config(model_cfg)
-    validate_data_config(data_cfg)
-    validate_train_config(train_cfg)
-    validate_optim_config(resolved_optim_cfg)
-    validate_logging_config(resolved_logging_cfg)
-    validate_training_workflow_options(
+    _apply_profile_and_validate_training_configs(
+        model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
-        model_cfg=model_cfg,
         optim_cfg=resolved_optim_cfg,
         logging_cfg=resolved_logging_cfg,
     )
@@ -1733,24 +1781,13 @@ def run_pretraining_dry_run(
             "split, and network/auth settings."
         ) from exc
 
-    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
-    train_dataset = dataset_cls(
-        hf_dataset=raw_train,
+    train_dataset, collator = _build_train_dataset_and_collator(
+        raw_train=raw_train,
         tokenizer=tokenizer,
-        cfg=PackedStreamingConfig(
-            text_column_name=data_cfg.text_column_name,
-            max_seq_length=data_cfg.max_seq_length,
-            seed=train_cfg.seed,
-            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
-        ),
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
         process_index=0,
         num_processes=1,
-    )
-    collator = _build_training_collator(
-        tokenizer=tokenizer,
-        train_cfg=train_cfg,
-        packed_sequences=bool(data_cfg.pack_sequences),
-        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
     )
 
     example_iter = iter(train_dataset)
@@ -1866,22 +1903,10 @@ def run_pretraining(
     )
 
     setup_process_logging(accelerator.is_main_process)
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=resolved_optim_cfg,
-        logging_cfg=resolved_logging_cfg,
-    )
-    # Validate config contract up-front before side effects (filesystem/network/model loading).
-    validate_model_config(model_cfg)
-    validate_data_config(data_cfg)
-    validate_train_config(train_cfg)
-    validate_optim_config(resolved_optim_cfg)
-    validate_logging_config(resolved_logging_cfg)
-    validate_training_workflow_options(
+    _apply_profile_and_validate_training_configs(
+        model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
-        model_cfg=model_cfg,
         optim_cfg=resolved_optim_cfg,
         logging_cfg=resolved_logging_cfg,
     )
@@ -2004,25 +2029,13 @@ def run_pretraining(
     # Data
     raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
 
-    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
-    train_dataset = dataset_cls(
-        hf_dataset=raw_train,
+    train_dataset, collator = _build_train_dataset_and_collator(
+        raw_train=raw_train,
         tokenizer=tokenizer,
-        cfg=PackedStreamingConfig(
-            text_column_name=data_cfg.text_column_name,
-            max_seq_length=data_cfg.max_seq_length,
-            seed=train_cfg.seed,
-            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
-        ),
-        process_index=accelerator.process_index,
-        num_processes=accelerator.num_processes,
-    )
-
-    collator = _build_training_collator(
-        tokenizer=tokenizer,
+        data_cfg=data_cfg,
         train_cfg=train_cfg,
-        packed_sequences=bool(data_cfg.pack_sequences),
-        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        process_index=int(accelerator.process_index),
+        num_processes=int(accelerator.num_processes),
     )
 
     # Dataloader
@@ -2289,10 +2302,11 @@ def run_pretraining(
         # Resume
         if ckpt:
             logger.info(f"Resuming from checkpoint: {ckpt}")
-            _load_resume_state_with_compile_fallback(
+            load_state_with_compile_fallback(
                 accelerator=accelerator,
                 model=model,
                 checkpoint_dir=ckpt,
+                context="resume",
             )
             if effective_decoupled_training:
                 if gen_optimizer is not None and gen_lr_scheduler is not None:

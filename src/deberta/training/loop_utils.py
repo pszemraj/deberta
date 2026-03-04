@@ -9,33 +9,6 @@ import torch
 from deberta.modeling.rtd import attention_mask_to_active_tokens
 
 
-def _compute_disc_active_mask(
-    *,
-    input_ids: torch.Tensor,
-    labels: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    pad_token_id: int | None,
-) -> torch.Tensor:
-    """Compute discriminator-active token mask before model forward.
-
-    The RTD discriminator supervises all non-padding tokens. Masked positions
-    remain active because they are part of the discriminator objective.
-
-    :param torch.Tensor input_ids: Input token ids.
-    :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
-    :param torch.Tensor | None attention_mask: Optional attention mask.
-    :param int | None pad_token_id: Padding token id.
-    :return torch.Tensor: Boolean active-token mask.
-    """
-    del labels
-    active = attention_mask_to_active_tokens(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        pad_token_id=pad_token_id,
-    )
-    return active
-
-
 def _count_rtd_tokens_for_batch(
     batch: dict[str, torch.Tensor],
     *,
@@ -49,9 +22,8 @@ def _count_rtd_tokens_for_batch(
     """
     labels = batch["labels"]
     gen_count = float(labels.ne(-100).sum().item())
-    disc_active = _compute_disc_active_mask(
+    disc_active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
-        labels=labels,
         attention_mask=batch.get("attention_mask"),
         pad_token_id=pad_token_id,
     )
