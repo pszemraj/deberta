@@ -2720,6 +2720,48 @@ def test_run_pretraining_zero_token_weighted_metrics_behavior(
         assert not metrics_path.exists()
 
 
+def test_run_pretraining_decoupled_debug_metrics_writes_local_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        decoupled_training=True,
+        debug_metrics=True,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    assert metrics_path.exists()
+    last = _load_last_debug_metrics_row(metrics_path)
+    assert int(last["step"]) == 1
+    assert float(last["zero_gen_window_total"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_total"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_gen_window_since_log"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_since_log"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+
+
 def test_run_pretraining_compiles_generator_and_discriminator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

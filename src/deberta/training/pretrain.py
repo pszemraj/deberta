@@ -3024,6 +3024,12 @@ def run_pretraining(
                     combined_loss = float(train_cfg.gen_loss_weight) * float(gen_loss_window) + float(
                         train_cfg.disc_loss_weight
                     ) * float(disc_loss_window)
+                    zero_metrics = {
+                        "zero_gen_window_total": float(zero_gen_window_total),
+                        "zero_disc_window_total": float(zero_disc_window_total),
+                        "zero_gen_window_since_log": float(zero_gen_window_since_log),
+                        "zero_disc_window_since_log": float(zero_disc_window_since_log),
+                    }
                     metrics = {
                         "step": global_step,
                         "lr": lr,
@@ -3035,6 +3041,8 @@ def run_pretraining(
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
                     }
+                    zero_gen_window_since_log = 0
+                    zero_disc_window_since_log = 0
                     if accelerator.is_main_process:
                         logger.info(
                             " | ".join(
@@ -3053,6 +3061,15 @@ def run_pretraining(
                     if train_cfg.report_to != "none":
                         _log_tracker_metrics(
                             {k: v for k, v in metrics.items() if k != "step"}, step=global_step
+                        )
+                    if debug_metrics_enabled and accelerator.is_main_process:
+                        _append_metrics_jsonl_row(
+                            metrics_path,
+                            {
+                                "step": int(global_step),
+                                "debug_metrics": True,
+                                **zero_metrics,
+                            },
                         )
 
                 if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
