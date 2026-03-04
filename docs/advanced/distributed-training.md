@@ -36,6 +36,19 @@ FSDP1 is not maintained as a first-class path in this repo; use FSDP2 configs fo
 
 ## Runtime snapshots and tracking
 
-Each run persists config snapshots in output dir and writes metrics to `metrics.jsonl.gz`.
+Run snapshot files are described in [Guides / Configuration](../guides/configuration.md#snapshot-files-and-reproducibility).
+
+`metrics.jsonl.gz` is written when `train.debug_metrics=true` (plus crash rows when training exits via an exception).
 
 When `logging.wandb.enabled=true`, tracker config and snapshot files are uploaded at startup from the main process.
+
+## Training runtime module layout
+
+Training internals are split across:
+
+- [`src/deberta/training/entrypoint.py`](../../src/deberta/training/entrypoint.py): orchestration and top-level train/dry-run entrypoints
+- [`src/deberta/training/runtime.py`](../../src/deberta/training/runtime.py): optimizer/scheduler/dataloader/runtime builders
+- [`src/deberta/training/steps.py`](../../src/deberta/training/steps.py): per-window step helpers, token-weighted window accounting, non-finite recovery utilities
+- [`src/deberta/training/checkpointing.py`](../../src/deberta/training/checkpointing.py): periodic checkpoint/save-progress and resume-progress normalization helpers
+- [`src/deberta/training/metrics.py`](../../src/deberta/training/metrics.py): tracker payload coercion, JSONL appends, non-finite debug artifacts
+- [`src/deberta/training/compile.py`](../../src/deberta/training/compile.py): compile-scope resolution, TF32/SDPA setup, compile-target helpers
