@@ -9,15 +9,13 @@ import inspect
 import json
 import logging
 import math
-import re
 import time
-import types
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, get_type_hints
 
 import torch
 from torch.utils.data import DataLoader
@@ -52,11 +50,7 @@ from deberta.data.streaming import PackedStreamingConfig
 from deberta.io_utils import dump_json
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.training.export_helpers import (
-    _export_discriminator_hf,  # noqa: F401
-    _export_discriminator_hf_subprocess,
-    _write_export_readme,  # noqa: F401
-)
+from deberta.training.export_helpers import _export_discriminator_hf_subprocess
 from deberta.training.loop_utils import (
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
@@ -76,12 +70,13 @@ from deberta.training.run_management import (
     _resolve_output_dir_for_accelerator,
     _resolve_resume_checkpoint,
     _resolve_resume_checkpoint_for_accelerator,
+    _sanitize_run_label,
     _save_training_checkpoint,
 )
 from deberta.training.tracker_utils import _init_trackers, _setup_wandb_watch, _upload_wandb_original_config
+from deberta.type_utils import coerce_scalar, unwrap_optional_type
 
 logger = logging.getLogger(__name__)
-_RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _NONFINITE_LR_BACKOFF = 0.5
 _NONFINITE_LR_MULT_FLOOR = 0.01  # persistent multiplier floor (1% of scheduled)
 _NONFINITE_LR_MULT_RECOVERY = 1.1  # gradual recovery factor per successful step
@@ -187,27 +182,6 @@ def _config_obj_to_mapping(config_obj: Any) -> dict[str, Any]:
     return {}
 
 
-def _coerce_bool_value(value: Any) -> bool:
-    """Coerce common bool-like values into ``bool``.
-
-    :param Any value: Raw value.
-    :raises ValueError: If value is not parseable as bool.
-    :return bool: Coerced boolean.
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        v = str(value).strip().lower()
-        if v in {"1", "true", "t", "yes", "y", "on"}:
-            return True
-        if v in {"0", "false", "f", "no", "n", "off"}:
-            return False
-        raise ValueError(f"Unsupported boolean value: {value!r}")
-    if isinstance(value, (int, float)) and value in {0, 1}:
-        return bool(int(value))
-    raise ValueError(f"Unsupported boolean value: {value!r}")
-
-
 def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
     """Serialize a dataclass config and coerce scalar fields to declared types.
 
@@ -217,41 +191,6 @@ def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
     :param Any cfg_obj: Dataclass config object.
     :return dict[str, Any]: Serialized mapping with best-effort scalar coercion.
     """
-
-    def _unwrap_optional(t: Any) -> Any:
-        """Return the non-None member type for ``Optional[T]`` annotations.
-
-        :param Any t: Annotation type.
-        :return Any: Unwrapped type when optional, else original type.
-        """
-        origin = get_origin(t)
-        if origin in {Union, types.UnionType}:
-            args = [a for a in get_args(t) if a is not type(None)]
-            if len(args) == 1:
-                return args[0]
-        return t
-
-    def _coerce_scalar(value: Any, target_t: Any) -> Any:
-        """Best-effort scalar cast against an annotation target.
-
-        :param Any value: Raw scalar value.
-        :param Any target_t: Annotation target type.
-        :return Any: Coerced scalar when parseable, else original value.
-        """
-        if value is None:
-            return None
-        try:
-            if target_t is bool:
-                return _coerce_bool_value(value)
-            if target_t is int and not isinstance(value, bool):
-                return int(value)
-            if target_t is float and not isinstance(value, bool):
-                return float(value)
-            if target_t is str:
-                return str(value)
-        except Exception:
-            return value
-        return value
 
     def _coerce_dataclass_instance(obj: Any) -> dict[str, Any]:
         """Recursively coerce nested dataclass payload fields.
@@ -264,11 +203,19 @@ def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
         for f in fields(type(obj)):
             name = str(f.name)
             value = getattr(obj, name)
-            target_t = _unwrap_optional(type_hints.get(name, f.type))
+            target_t, _allows_none = unwrap_optional_type(type_hints.get(name, f.type))
             if dataclasses.is_dataclass(value):
                 payload[name] = _coerce_dataclass_instance(value)
             else:
-                payload[name] = _coerce_scalar(value, target_t)
+                try:
+                    payload[name] = coerce_scalar(
+                        value,
+                        target_t,
+                        allow_none=True,
+                        allow_bool_numeric=True,
+                    )
+                except Exception:
+                    payload[name] = value
         return payload
 
     if not dataclasses.is_dataclass(cfg_obj):
@@ -809,7 +756,9 @@ def _write_nonfinite_debug_artifact(
     :param str embedding_sharing: Embedding sharing mode string.
     :return Path: Written artifact path.
     """
-    safe_offending = _RUN_LABEL_CLEAN_RE.sub("_", str(offending)).strip("._-") or "nonfinite"
+    safe_offending = _sanitize_run_label(str(offending)).replace("-", "_")
+    if safe_offending == "run":
+        safe_offending = "nonfinite"
     path = output_dir / "debug" / f"nonfinite_step_{int(step)}_{safe_offending}.json"
     payload = {
         "created_at_utc": datetime.utcnow().isoformat() + "Z",

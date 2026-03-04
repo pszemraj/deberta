@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import re
-import types
 import warnings
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, TypeVar, get_type_hints
 
 from deberta.io_utils import load_json_mapping
+from deberta.mapping_utils import flatten_mapping
+from deberta.type_utils import coerce_scalar, unwrap_optional_type
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
@@ -232,23 +233,6 @@ def _nested_get(obj: Any, path: str) -> Any:
     return cur
 
 
-def _flatten_mapping_for_init(mapping: dict[str, Any], *, prefix: str = "") -> dict[str, Any]:
-    """Flatten nested mapping keys for constructor update helpers.
-
-    :param dict[str, Any] mapping: Nested mapping payload.
-    :param str prefix: Optional prefix path.
-    :return dict[str, Any]: Flattened dotted mapping.
-    """
-    out: dict[str, Any] = {}
-    for key, value in mapping.items():
-        path = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict):
-            out.update(_flatten_mapping_for_init(value, prefix=path))
-        else:
-            out[str(path)] = value
-    return out
-
-
 def _replace_path(obj: Any, parts: list[str], value: Any) -> Any:
     """Replace one dotted path on a dataclass object.
 
@@ -296,7 +280,7 @@ def _coerce_subconfig(value: Any, cls: type[Any], *, field_name: str) -> Any:
     if isinstance(value, cls):
         return value
     if isinstance(value, dict):
-        return _apply_dotted_updates(cls(), _flatten_mapping_for_init(value))
+        return _apply_dotted_updates(cls(), flatten_mapping(value))
     raise TypeError(f"{field_name} must be a {cls.__name__} or mapping, got {type(value).__name__}.")
 
 
@@ -2293,7 +2277,7 @@ def _coerce_config_mapping_scalar_value(*, raw_value: Any, field_type: Any, fiel
     :raises ValueError: If a scalar value does not match the declared field type.
     :return Any: Type-checked (and numeric-normalized) scalar value.
     """
-    target_t, allows_none = _unwrap_optional_type(field_type)
+    target_t, allows_none = unwrap_optional_type(field_type)
     value = raw_value
     path = str(field_path)
 
@@ -2382,22 +2366,6 @@ def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]])
     return cfg
 
 
-def _unwrap_optional_type(field_type: Any) -> tuple[Any, bool]:
-    """Unwrap Optional[T] annotations.
-
-    :param Any field_type: Raw type annotation.
-    :return tuple[Any, bool]: Unwrapped type and whether None is allowed.
-    """
-    origin = get_origin(field_type)
-    if origin in {Union, types.UnionType}:
-        args = get_args(field_type)
-        allows_none = any(a is type(None) for a in args)
-        non_none = [a for a in args if a is not type(None)]
-        if len(non_none) == 1:
-            return non_none[0], allows_none
-    return field_type, False
-
-
 def _coerce_override_value(raw: str, field_type: Any) -> Any:
     """Cast a dotted-override raw string to the target dataclass field type.
 
@@ -2406,24 +2374,7 @@ def _coerce_override_value(raw: str, field_type: Any) -> Any:
     :raises ValueError: If value cannot be parsed as the target type.
     :return Any: Typed override value.
     """
-    target_t, allows_none = _unwrap_optional_type(field_type)
-    text = str(raw).strip()
-    if allows_none and text.lower() in {"none", "null"}:
-        return None
-    if target_t is bool:
-        v = text.lower()
-        if v in {"1", "true", "t", "yes", "y", "on"}:
-            return True
-        if v in {"0", "false", "f", "no", "n", "off"}:
-            return False
-        raise ValueError(f"Expected a boolean override value, got: {raw!r}")
-    if target_t is int:
-        return int(text)
-    if target_t is float:
-        return float(text)
-    if target_t is str:
-        return text
-    return raw
+    return coerce_scalar(raw, field_type, allow_none=False, allow_bool_numeric=False)
 
 
 def apply_dotted_override(cfg: Config, override: str) -> Config:
@@ -2521,26 +2472,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     return cfg
 
 
-def load_config_sections(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Load strict model/data/train mappings from a YAML or JSON file.
-
-    :param str | Path path: Config path.
-    :raises ValueError: If file content is invalid for this config schema.
-    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed section mappings.
-    """
-    raw, format_name = _load_raw_config_mapping(path)
-    resolved_raw = _resolve_variables(raw)
-    section_maps = _split_full_sections(resolved_raw, format_name=format_name)
-
-    # Validate section keys/types early while preserving explicit-key semantics.
-    _build_config_from_section_mappings(section_maps)
-
-    model_dict = dict(section_maps.get("model", {}) or {})
-    data_dict = dict(section_maps.get("data", {}) or {})
-    train_dict = dict(section_maps.get("train", {}) or {})
-    return model_dict, data_dict, train_dict
-
-
 def iter_leaf_paths_for_dataclass(cls: type[Any], *, prefix: str = "") -> list[tuple[str, Any]]:
     """List dotted leaf paths and field types for a dataclass type.
 
@@ -2553,23 +2484,12 @@ def iter_leaf_paths_for_dataclass(cls: type[Any], *, prefix: str = "") -> list[t
     for f in fields(cls):
         path = f"{prefix}.{f.name}" if prefix else str(f.name)
         field_type = type_hints.get(f.name, f.type)
-        target_t, _allows_none = _unwrap_optional_type(field_type)
+        target_t, _allows_none = unwrap_optional_type(field_type)
         if dataclasses.is_dataclass(target_t):
             out.extend(iter_leaf_paths_for_dataclass(target_t, prefix=path))
         else:
             out.append((path, field_type))
     return out
-
-
-def resolve_effective_report_to(logging_cfg: LoggingConfig) -> str:
-    """Resolve effective tracker backend from logging config.
-
-    :param LoggingConfig logging_cfg: Logging configuration.
-    :return str: Effective report_to backend.
-    """
-    if bool(logging_cfg.wandb.enabled):
-        return "wandb"
-    return str(logging_cfg.backend).strip().lower()
 
 
 def asdict_without_private(value: Any) -> Any:
@@ -2607,13 +2527,11 @@ __all__ = [
     "asdict_without_private",
     "iter_leaf_paths_for_dataclass",
     "load_config",
-    "load_config_sections",
     "load_data_config_snapshot",
     "load_logging_config_snapshot",
     "load_model_config_snapshot",
     "load_optim_config_snapshot",
     "normalize_mixed_precision",
-    "resolve_effective_report_to",
     "validate_data_config",
     "validate_logging_config",
     "validate_model_config",

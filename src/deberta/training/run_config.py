@@ -23,9 +23,13 @@ from deberta.config import (
     validate_logging_config,
     validate_model_config,
     validate_optim_config,
-    validate_run_metadata_schema,
 )
 from deberta.io_utils import dump_json, load_json_mapping
+from deberta.run_layout import (
+    RUN_METADATA_FILENAME,
+    infer_run_dir_from_checkpoint,
+    validate_run_metadata_file,
+)
 
 logger = logging.getLogger(__name__)
 _RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
@@ -34,7 +38,7 @@ _RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
     "train_config.json",
     "optim_config.json",
     "logging_config.json",
-    "run_metadata.json",
+    RUN_METADATA_FILENAME,
 )
 
 
@@ -60,16 +64,6 @@ def _build_run_metadata(
     if compile_scope_reason is not None:
         meta["compile_scope_reason"] = str(compile_scope_reason)
     return meta
-
-
-def _validate_run_metadata(path: Path) -> None:
-    """Validate on-disk run metadata schema compatibility.
-
-    :param Path path: Metadata file path.
-    :raises ValueError: If metadata is malformed or schema-incompatible.
-    """
-    raw = load_json_mapping(path)
-    validate_run_metadata_schema(raw, source=str(path))
 
 
 def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
@@ -206,16 +200,6 @@ def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str
     return payload
 
 
-def _infer_resume_run_dir(resume_checkpoint: str | Path) -> Path:
-    """Infer parent run directory from a checkpoint path.
-
-    :param str | Path resume_checkpoint: Checkpoint directory path.
-    :return Path: Parent run directory.
-    """
-    checkpoint_dir = Path(resume_checkpoint).expanduser().resolve()
-    return checkpoint_dir.parent
-
-
 def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
     """Raise when output_dir contains conflicting copied snapshots for resume provenance.
 
@@ -286,7 +270,7 @@ def _persist_or_validate_run_configs(
         source_run_dir = (
             resume_run_dir.expanduser().resolve()
             if resume_run_dir is not None
-            else _infer_resume_run_dir(resume_checkpoint)
+            else infer_run_dir_from_checkpoint(resume_checkpoint)
         )
         snapshot_dir = source_run_dir
 
@@ -294,13 +278,13 @@ def _persist_or_validate_run_configs(
     data_cfg_path = snapshot_dir / "data_config.json"
     optim_cfg_path = snapshot_dir / "optim_config.json"
     logging_cfg_path = snapshot_dir / "logging_config.json"
-    run_meta_path = snapshot_dir / "run_metadata.json"
+    run_meta_path = snapshot_dir / RUN_METADATA_FILENAME
     output_model_cfg_path = output_dir / "model_config.json"
     output_data_cfg_path = output_dir / "data_config.json"
     output_train_cfg_path = output_dir / "train_config.json"
     output_optim_cfg_path = output_dir / "optim_config.json"
     output_logging_cfg_path = output_dir / "logging_config.json"
-    output_run_meta_path = output_dir / "run_metadata.json"
+    output_run_meta_path = output_dir / RUN_METADATA_FILENAME
 
     run_meta = _build_run_metadata(
         effective_compile_scope=effective_compile_scope,
@@ -321,7 +305,7 @@ def _persist_or_validate_run_configs(
         )
     if resume_checkpoint is not None and has_saved_required:
         if run_meta_path.exists():
-            _validate_run_metadata(run_meta_path)
+            validate_run_metadata_file(snapshot_dir, required=False)
             if is_main_process and effective_compile_scope is not None:
                 saved_meta = load_json_mapping(run_meta_path)
                 saved_scope = saved_meta.get("effective_compile_scope")
@@ -464,5 +448,4 @@ __all__ = [
     "_persist_config_yaml_snapshots",
     "_persist_or_validate_run_configs",
     "_resolved_config_payload",
-    "_validate_run_metadata",
 ]

@@ -6,9 +6,8 @@ import argparse
 import copy
 import os
 import sys
-import types
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin
+from typing import Any
 
 from deberta.config import (
     _ATTN_IMPL_CHOICES,
@@ -52,7 +51,9 @@ from deberta.export_cli import (
     namespace_to_export_config,
     run_export,
 )
+from deberta.mapping_utils import flatten_mapping
 from deberta.training import run_pretraining, run_pretraining_dry_run
+from deberta.type_utils import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap_optional_type
 
 # Nested canonical presets. With a config file, presets still only apply model overrides.
 _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
@@ -131,12 +132,10 @@ def _parse_bool(value: str) -> bool:
     :param str value: Raw value.
     :return bool: Parsed boolean.
     """
-    v = str(value).strip().lower()
-    if v in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if v in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+    try:
+        return parse_bool(value, allow_numeric=False)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}") from exc
 
 
 def _should_fast_exit_after_train(*, explicit_argv: bool) -> bool:
@@ -148,23 +147,7 @@ def _should_fast_exit_after_train(*, explicit_argv: bool) -> bool:
     if explicit_argv:
         return False
     raw = str(os.getenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")).strip().lower()
-    return raw not in {"0", "false", "f", "no", "n", "off"}
-
-
-def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
-    """Unwrap Optional[T] style annotations.
-
-    :param Any field_type: Type annotation.
-    :return tuple[Any, bool]: Base type and whether the field allows ``None``.
-    """
-    origin = get_origin(field_type)
-    if origin in {Union, types.UnionType}:
-        args = get_args(field_type)
-        non_none = [a for a in args if a is not type(None)]
-        allows_none = any(a is type(None) for a in args)
-        if len(non_none) == 1:
-            return non_none[0], allows_none
-    return field_type, False
+    return raw not in FALSE_STRINGS
 
 
 def _argparse_type(field_type: Any) -> Any:
@@ -173,7 +156,7 @@ def _argparse_type(field_type: Any) -> Any:
     :param Any field_type: Dataclass field type.
     :return Any: Callable/type for argparse.
     """
-    t, allows_none = _unwrap_optional(field_type)
+    t, allows_none = unwrap_optional_type(field_type)
     if allows_none:
 
         def _parse_optional(value: str) -> Any:
@@ -183,28 +166,22 @@ def _argparse_type(field_type: Any) -> Any:
             :raises argparse.ArgumentTypeError: On incompatible scalar conversion.
             :return Any: Parsed value (or ``None`` for ``null``/``none``).
             """
-            text = str(value).strip()
-            if text.lower() in {"null", "none"}:
-                return None
-            if t is bool:
-                return _parse_bool(text)
-            if t is int:
-                try:
-                    return int(text)
-                except ValueError as exc:
+            try:
+                return coerce_scalar(value, t, allow_none=True, allow_bool_numeric=False)
+            except ValueError as exc:
+                if t is bool:
+                    raise argparse.ArgumentTypeError(
+                        f"Expected a boolean value or null/none, got: {value}"
+                    ) from exc
+                if t is int:
                     raise argparse.ArgumentTypeError(
                         f"Expected an integer value or null/none, got: {value}"
                     ) from exc
-            if t is float:
-                try:
-                    return float(text)
-                except ValueError as exc:
+                if t is float:
                     raise argparse.ArgumentTypeError(
                         f"Expected a numeric value or null/none, got: {value}"
                     ) from exc
-            if t is str:
-                return text
-            return value
+                raise argparse.ArgumentTypeError(f"Invalid value: {value}") from exc
 
         return _parse_optional
 
@@ -237,30 +214,13 @@ def _flag_value_to_override_text(value: Any) -> str:
     return str(value)
 
 
-def _flatten_mapping(mapping: dict[str, Any], *, prefix: str = "") -> dict[str, Any]:
-    """Flatten a nested mapping into dotted leaf keys.
-
-    :param dict[str, Any] mapping: Input mapping.
-    :param str prefix: Optional prefix.
-    :return dict[str, Any]: Dotted leaf key/value map.
-    """
-    out: dict[str, Any] = {}
-    for key, value in mapping.items():
-        path = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict):
-            out.update(_flatten_mapping(value, prefix=path))
-        else:
-            out[str(path)] = value
-    return out
-
-
 def _flatten_cfg(cfg: Config) -> dict[str, Any]:
     """Flatten a Config object into dotted leaf key/value pairs.
 
     :param Config cfg: Config object.
     :return dict[str, Any]: Flattened mapping.
     """
-    return _flatten_mapping(asdict_without_private(cfg))
+    return flatten_mapping(asdict_without_private(cfg))
 
 
 def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
@@ -283,7 +243,7 @@ def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
         base = _DOTFLAG_CHOICES.get(str(path))
         if base is None:
             return None
-        _target_t, allows_none = _unwrap_optional(field_type)
+        _target_t, allows_none = unwrap_optional_type(field_type)
         if not allows_none:
             return base
         if any(choice is None for choice in base):
@@ -305,26 +265,6 @@ def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
             help=f"Set {path}",
         )
     return dest_by_path
-
-
-def _load_yaml(path: Path) -> tuple[Any, Any, Any]:
-    """Load model/data/train config sections from YAML path.
-
-    :param Path path: YAML path.
-    :return tuple[Any, Any, Any]: Parsed model/data/train config objects.
-    """
-    cfg = load_config(path)
-    return cfg.model, cfg.data, cfg.train
-
-
-def _load_json(path: Path) -> tuple[Any, Any, Any]:
-    """Load model/data/train config sections from JSON path.
-
-    :param Path path: JSON path.
-    :return tuple[Any, Any, Any]: Parsed model/data/train config objects.
-    """
-    cfg = load_config(path)
-    return cfg.model, cfg.data, cfg.train
 
 
 def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> dict[str, str]:
@@ -399,20 +339,6 @@ def _build_main_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _subcommand_argv(argv: list[str], command: str) -> list[str]:
-    """Return raw argv slice after a subcommand token.
-
-    :param list[str] argv: Full argv list excluding program name.
-    :param str command: Subcommand token.
-    :return list[str]: Subcommand argv.
-    """
-    try:
-        idx = argv.index(command)
-    except ValueError:
-        return []
-    return argv[idx + 1 :]
-
-
 def _apply_preset(*, cfg: Config, preset_name: str, with_config_file: bool) -> tuple[Config, str]:
     """Apply a named preset payload to Config.
 
@@ -429,7 +355,7 @@ def _apply_preset(*, cfg: Config, preset_name: str, with_config_file: bool) -> t
 
     sections = ["model"] if with_config_file else ["model", "data", "train", "optim", "logging"]
     for section in sections:
-        for path, value in _flatten_mapping(dict(preset.get(section, {})), prefix=section).items():
+        for path, value in flatten_mapping(dict(preset.get(section, {})), prefix=section).items():
             cfg = apply_dotted_override(cfg, f"{path}={_flag_value_to_override_text(value)}")
 
     if with_config_file:

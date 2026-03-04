@@ -21,7 +21,6 @@ from deberta.config import (
     load_model_config_snapshot,
     validate_data_config,
     validate_model_config,
-    validate_run_metadata_schema,
 )
 from deberta.io_utils import load_json_mapping
 from deberta.log_utils import setup_process_logging
@@ -33,6 +32,7 @@ from deberta.modeling.export_utils import (
     split_pretrainer_state_dict,
     write_export_readme_and_license,
 )
+from deberta.run_layout import infer_run_dir_from_checkpoint, validate_run_metadata_file
 
 logger = logging.getLogger(__name__)
 
@@ -94,30 +94,6 @@ def _normalize_export_target(value: str) -> str:
     if normalized not in {"discriminator", "generator", "both"}:
         raise ValueError("export_what must be discriminator|generator|both")
     return normalized
-
-
-def _infer_run_dir(checkpoint_dir: Path) -> Path:
-    """Infer parent run directory from checkpoint path.
-
-    :param Path checkpoint_dir: Checkpoint directory path.
-    :return Path: Parent run directory.
-    """
-    # checkpoint_dir = .../checkpoint-XXXX
-    # run dir is usually parent.
-    return checkpoint_dir.parent
-
-
-def _validate_run_metadata_if_present(run_dir: Path) -> None:
-    """Validate run-metadata schema when a metadata file is present.
-
-    :param Path run_dir: Run directory potentially containing run metadata.
-    :raises ValueError: If metadata schema is malformed or incompatible.
-    """
-    meta_path = run_dir / "run_metadata.json"
-    if not meta_path.exists():
-        return
-    raw = load_json_mapping(meta_path)
-    validate_run_metadata_schema(raw, source=str(meta_path))
 
 
 def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path:
@@ -397,7 +373,11 @@ def run_export(cfg: ExportConfig) -> None:
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"checkpoint_dir not found: {checkpoint_dir}")
 
-    run_dir = Path(cfg.run_dir).expanduser().resolve() if cfg.run_dir else _infer_run_dir(checkpoint_dir)
+    run_dir = (
+        Path(cfg.run_dir).expanduser().resolve()
+        if cfg.run_dir
+        else infer_run_dir_from_checkpoint(checkpoint_dir)
+    )
     if not run_dir.exists():
         raise FileNotFoundError(f"run_dir not found: {run_dir}")
     out_dir = _resolve_export_output_dir(output_dir=cfg.output_dir, run_dir=run_dir)
@@ -409,7 +389,7 @@ def run_export(cfg: ExportConfig) -> None:
         raise FileNotFoundError(f"Expected {model_cfg_path} (produced during training)")
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
-    _validate_run_metadata_if_present(run_dir)
+    validate_run_metadata_file(run_dir, required=False)
     train_cfg = _load_optional_train_config(run_dir)
 
     # Pre-stable policy: export does not coerce legacy snapshot keys.
