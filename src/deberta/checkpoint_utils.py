@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -13,44 +14,22 @@ _FSDP_SHARDED_MODEL_PREFIX = "pytorch_model_fsdp"
 logger = logging.getLogger(__name__)
 
 
-def _clone_tensor_state_dict(template: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Clone tensor values from a flat state dict.
-
-    :param dict[str, torch.Tensor] template: Source tensor mapping.
-    :return dict[str, torch.Tensor]: Detached/cloned tensor mapping.
-    """
-    cloned: dict[str, torch.Tensor] = {}
-    for key, value in template.items():
-        if not isinstance(value, torch.Tensor):
-            raise RuntimeError(
-                f"Expected tensor value in model state template for key {key!r}; got {type(value).__name__}."
-            )
-        cloned[key] = value.detach().clone()
-    return cloned
-
-
 def _candidate_fsdp_sharded_dirs(checkpoint_dir: Path) -> list[Path]:
     """Return candidate FSDP sharded-model directories under a checkpoint path.
 
     :param Path checkpoint_dir: Checkpoint root or candidate sharded directory.
     :return list[Path]: Candidate directories in probe order.
     """
-    candidates: list[Path] = []
-    if checkpoint_dir.is_dir() and checkpoint_dir.name.startswith(_FSDP_SHARDED_MODEL_PREFIX):
-        candidates.append(checkpoint_dir)
-    if checkpoint_dir.is_dir():
-        matches = sorted(
-            (
-                p
-                for p in checkpoint_dir.iterdir()
-                if p.is_dir() and p.name.startswith(_FSDP_SHARDED_MODEL_PREFIX)
-            ),
-            key=lambda p: p.name,
-        )
-        for match in matches:
-            if match not in candidates:
-                candidates.append(match)
-    return candidates
+    if not checkpoint_dir.is_dir():
+        return []
+
+    candidates = (
+        [checkpoint_dir] if checkpoint_dir.name.startswith(_FSDP_SHARDED_MODEL_PREFIX) else []
+    ) + sorted(
+        (p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.startswith(_FSDP_SHARDED_MODEL_PREFIX)),
+        key=lambda p: p.name,
+    )
+    return list(dict.fromkeys(candidates))
 
 
 def _load_sharded_fsdp_model_state_dict(
@@ -79,7 +58,9 @@ def _load_sharded_fsdp_model_state_dict(
     last_error: BaseException | None = None
     for candidate in candidates:
         reader = dist_cp.FileSystemReader(str(candidate))
-        template_variants: list[dict[str, torch.Tensor]] = [_clone_tensor_state_dict(model_state_template)]
+        template_variants: list[dict[str, torch.Tensor]] = [
+            {key: value.detach().clone() for key, value in model_state_template.items()}
+        ]
         with suppress(Exception):
             metadata = reader.read_metadata()
             state_meta = getattr(metadata, "state_dict_metadata", None)
@@ -88,19 +69,19 @@ def _load_sharded_fsdp_model_state_dict(
                     str(key)[len("model.") :] for key in state_meta.keys() if str(key).startswith("model.")
                 ]
                 if inner_keys:
-                    key_matched: dict[str, torch.Tensor] = {}
-                    for inner_key in inner_keys:
-                        source = model_state_template.get(canonical_compile_state_key(inner_key))
-                        if source is None:
-                            raise RuntimeError(
-                                "Missing canonical model key for sharded checkpoint entry "
-                                f"{inner_key!r} in {candidate}."
-                            )
-                        if not isinstance(source, torch.Tensor):
-                            raise RuntimeError(
-                                f"Expected tensor state for key {inner_key!r}; got {type(source).__name__}."
-                            )
-                        key_matched[inner_key] = source.detach().clone()
+                    try:
+                        key_matched = {
+                            inner_key: model_state_template[canonical_compile_state_key(inner_key)]
+                            .detach()
+                            .clone()
+                            for inner_key in inner_keys
+                        }
+                    except KeyError as exc:
+                        missing = str(exc).strip("'")
+                        raise RuntimeError(
+                            "Missing canonical model key for sharded checkpoint entry "
+                            f"{missing!r} in {candidate}."
+                        ) from exc
                     if key_matched and set(key_matched) != set(template_variants[0]):
                         template_variants.append(key_matched)
 
@@ -138,6 +119,28 @@ def canonical_compile_state_key(key: str) -> str:
     """
     parts = [part for part in str(key).split(".") if part and part != "_orig_mod"]
     return ".".join(parts)
+
+
+def _index_canonical_keys(*, keys: Iterable[str], context: str) -> dict[str, str]:
+    """Index source keys by canonical compile-stripped names.
+
+    :param Iterable[str] keys: Source key iterable.
+    :param str context: Human-readable context for ambiguity errors.
+    :raises RuntimeError: If multiple source keys collapse to one canonical key.
+    :return dict[str, str]: Mapping ``canonical -> original`` key.
+    """
+    out: dict[str, str] = {}
+    ctx = str(context).strip() or "state"
+    for raw_key in keys:
+        key = str(raw_key)
+        canonical = canonical_compile_state_key(key)
+        prev = out.get(canonical)
+        if prev is not None and prev != key:
+            raise RuntimeError(
+                f"Ambiguous {ctx} keys after compile canonicalization: {prev!r} and {key!r} -> {canonical!r}"
+            )
+        out[canonical] = key
+    return out
 
 
 def load_checkpoint_model_state_dict(
@@ -195,40 +198,27 @@ def load_model_state_with_compile_key_remap(model: torch.nn.Module, checkpoint_d
         model_state_template=target_state,
     )
 
-    target_by_canonical: dict[str, str] = {}
-    for key in target_state.keys():
-        canonical = canonical_compile_state_key(key)
-        prev = target_by_canonical.get(canonical)
-        if prev is not None and prev != key:
-            raise RuntimeError(
-                "Ambiguous target model keys after compile canonicalization: "
-                f"{prev!r} and {key!r} -> {canonical!r}"
-            )
-        target_by_canonical[canonical] = key
-
-    checkpoint_by_canonical: dict[str, tuple[str, torch.Tensor]] = {}
-    for key, value in checkpoint_state.items():
-        canonical = canonical_compile_state_key(key)
-        prev = checkpoint_by_canonical.get(canonical)
-        if prev is not None and prev[0] != key:
-            raise RuntimeError(
-                "Ambiguous checkpoint keys after compile canonicalization: "
-                f"{prev[0]!r} and {key!r} -> {canonical!r}"
-            )
-        checkpoint_by_canonical[canonical] = (key, value)
+    target_by_canonical = _index_canonical_keys(
+        keys=target_state.keys(),
+        context="target model",
+    )
+    checkpoint_by_canonical = _index_canonical_keys(
+        keys=checkpoint_state.keys(),
+        context="checkpoint",
+    )
 
     remapped_state: dict[str, torch.Tensor] = {}
     missing_keys: list[str] = []
     for canonical, target_key in target_by_canonical.items():
-        source = checkpoint_by_canonical.get(canonical)
-        if source is None:
+        source_key = checkpoint_by_canonical.get(canonical)
+        if source_key is None:
             missing_keys.append(target_key)
             continue
-        remapped_state[target_key] = source[1]
+        remapped_state[target_key] = checkpoint_state[source_key]
 
     unexpected_keys = [
         source_key
-        for canonical, (source_key, _value) in checkpoint_by_canonical.items()
+        for canonical, source_key in checkpoint_by_canonical.items()
         if canonical not in target_by_canonical
     ]
 
