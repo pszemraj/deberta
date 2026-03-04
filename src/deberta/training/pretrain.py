@@ -2535,7 +2535,7 @@ def run_pretraining(
                 raise RuntimeError("Decoupled training requires generator/discriminator schedulers.")
 
             while global_step < int(train_cfg.max_steps):
-                window: list[tuple[dict[str, torch.Tensor], float, float]] = []
+                window: list[tuple[dict[str, torch.Tensor], float, float, bool]] = []
                 local_window_input_tokens = 0.0
                 local_gen_tokens = 0.0
                 local_disc_tokens = 0.0
@@ -2544,6 +2544,8 @@ def run_pretraining(
                     batch = next(train_iter)
                     consumed_micro_batches += 1
                     local_window_input_tokens += _count_input_tokens_for_batch(batch)
+                    # CPU-side flag used to avoid per-microbatch GPU syncs on gen_token_count.
+                    has_gen_targets = bool(batch["labels"].ne(-100).any().item())
                     if token_weighted_ga:
                         gen_count, disc_count = _count_rtd_tokens_for_batch(
                             batch,
@@ -2553,7 +2555,7 @@ def run_pretraining(
                         local_disc_tokens += disc_count
                     else:
                         gen_count, disc_count = 1.0, 1.0
-                    window.append((batch, gen_count, disc_count))
+                    window.append((batch, gen_count, disc_count, has_gen_targets))
 
                 local_input_tokens_seen += local_window_input_tokens
                 local_input_tokens_since_log += local_window_input_tokens
@@ -2620,7 +2622,10 @@ def run_pretraining(
                 disc_optimizer.zero_grad(set_to_none=True)
 
                 # Phase 1: generator update + corruption target construction.
-                for step_idx, (batch, gen_count, disc_count) in enumerate(window):
+                gen_window_nonfinite_local = False
+                gen_first_nonfinite_reason_local: str | None = None
+                gen_first_nonfinite_micro_step: int | None = None
+                for step_idx, (batch, gen_count, disc_count, has_gen_targets) in enumerate(window):
                     batch = _move_batch_to_device(batch, accelerator.device)
                     doc_ids = batch.pop("doc_ids", None)
                     if doc_ids is not None:
@@ -2670,12 +2675,27 @@ def run_pretraining(
                             if not torch.isfinite(backward_loss.detach()).all():
                                 offending = "gen_backward_loss"
 
-                        if _any_rank_flag_true(
+                        if offending is not None:
+                            gen_window_nonfinite_local = True
+                            if gen_first_nonfinite_reason_local is None:
+                                gen_first_nonfinite_reason_local = str(offending)
+                                gen_first_nonfinite_micro_step = int(step_idx)
+
+                        # Keep non-finite coordination out of non-sync microsteps to preserve
+                        # no_sync accumulation performance characteristics.
+                        if is_sync_step and _any_rank_flag_true(
                             accelerator=accelerator,
-                            flag=(offending is not None),
+                            flag=gen_window_nonfinite_local,
                         ):
                             offending_effective = (
-                                str(offending) if offending is not None else "other_rank_nonfinite"
+                                str(gen_first_nonfinite_reason_local)
+                                if gen_first_nonfinite_reason_local is not None
+                                else "other_rank_nonfinite"
+                            )
+                            offending_micro_step = (
+                                int(gen_first_nonfinite_micro_step)
+                                if gen_first_nonfinite_micro_step is not None
+                                else int(step_idx)
                             )
                             skipped_window_due_nonfinite = True
                             nonfinite_skip_total += 1
@@ -2685,7 +2705,7 @@ def run_pretraining(
                             nonfinite_debug_path = _write_nonfinite_debug_artifact(
                                 output_dir=logging_output_dir,
                                 step=int(global_step + 1),
-                                micro_step_idx=int(step_idx),
+                                micro_step_idx=int(offending_micro_step),
                                 offending=str(offending_effective),
                                 gen_loss_raw=gen_phase_out.gen_loss_raw,
                                 disc_loss_raw=None,
@@ -2700,6 +2720,8 @@ def run_pretraining(
                             gen_optimizer.zero_grad(set_to_none=True)
                             disc_optimizer.zero_grad(set_to_none=True)
                             break
+                        if offending is not None:
+                            continue
 
                         micro_gen_token_count = gen_phase_out.gen_token_count.detach().float()
                         gen_token_count_window = gen_token_count_window + micro_gen_token_count
@@ -2707,9 +2729,14 @@ def run_pretraining(
                             gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
                         )
                         # Keep discriminator micro-step counts aligned across ranks:
-                        # when local generator token count is zero we still run the
+                        # when local generator targets are absent we still run the
                         # corresponding discriminator pass with zero objective weight.
-                        disc_objective_weight = 1.0 if float(micro_gen_token_count.item()) > 0.0 else 0.0
+                        # Prefer explicit phase metadata when available; otherwise
+                        # fall back to CPU labels metadata gathered pre-device transfer.
+                        phase_has_targets = getattr(gen_phase_out, "has_masked_targets", None)
+                        if phase_has_targets is None:
+                            phase_has_targets = bool(has_gen_targets)
+                        disc_objective_weight = 1.0 if bool(phase_has_targets) else 0.0
                         disc_phase_inputs.append(
                             {
                                 "input_ids": batch["input_ids"],
@@ -2775,6 +2802,9 @@ def run_pretraining(
                     and bool(window_has_global_disc_targets)
                 ):
                     disc_phase_steps = len(disc_phase_inputs)
+                    disc_window_nonfinite_local = False
+                    disc_first_nonfinite_reason_local: str | None = None
+                    disc_first_nonfinite_micro_step: int | None = None
                     for step_idx, payload in enumerate(disc_phase_inputs):
                         if compile_enabled:
                             _maybe_cudagraph_mark_step_begin()
@@ -2815,12 +2845,27 @@ def run_pretraining(
                                 if not torch.isfinite(backward_loss.detach()).all():
                                     offending = "disc_backward_loss"
 
-                            if _any_rank_flag_true(
+                            if offending is not None:
+                                disc_window_nonfinite_local = True
+                                if disc_first_nonfinite_reason_local is None:
+                                    disc_first_nonfinite_reason_local = str(offending)
+                                    disc_first_nonfinite_micro_step = int(step_idx)
+
+                            # Keep non-finite coordination out of non-sync microsteps to preserve
+                            # no_sync accumulation performance characteristics.
+                            if is_sync_step and _any_rank_flag_true(
                                 accelerator=accelerator,
-                                flag=(offending is not None),
+                                flag=disc_window_nonfinite_local,
                             ):
                                 offending_effective = (
-                                    str(offending) if offending is not None else "other_rank_nonfinite"
+                                    str(disc_first_nonfinite_reason_local)
+                                    if disc_first_nonfinite_reason_local is not None
+                                    else "other_rank_nonfinite"
+                                )
+                                offending_micro_step = (
+                                    int(disc_first_nonfinite_micro_step)
+                                    if disc_first_nonfinite_micro_step is not None
+                                    else int(step_idx)
                                 )
                                 skipped_window_due_nonfinite = True
                                 nonfinite_skip_total += 1
@@ -2830,7 +2875,7 @@ def run_pretraining(
                                 nonfinite_debug_path = _write_nonfinite_debug_artifact(
                                     output_dir=logging_output_dir,
                                     step=int(global_step + 1),
-                                    micro_step_idx=int(step_idx),
+                                    micro_step_idx=int(offending_micro_step),
                                     offending=str(offending_effective),
                                     gen_loss_raw=gen_phase_out.gen_loss_raw
                                     if gen_phase_out is not None
@@ -2847,6 +2892,8 @@ def run_pretraining(
                                 gen_optimizer.zero_grad(set_to_none=True)
                                 disc_optimizer.zero_grad(set_to_none=True)
                                 break
+                            if offending is not None:
+                                continue
 
                             micro_disc_token_count = disc_phase_out.disc_token_count.detach().float() * float(
                                 disc_objective_weight
@@ -3167,6 +3214,9 @@ def run_pretraining(
             skipped_window_due_nonfinite = False
             nonfinite_reason: str | None = None
             nonfinite_debug_path: Path | None = None
+            window_nonfinite_local = False
+            first_nonfinite_reason_local: str | None = None
+            first_nonfinite_micro_step: int | None = None
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
@@ -3229,12 +3279,27 @@ def run_pretraining(
                     elif not torch.isfinite(backward_loss.detach()).all():
                         offending = "backward_loss"
 
-                    if _any_rank_flag_true(
+                    if offending is not None:
+                        window_nonfinite_local = True
+                        if first_nonfinite_reason_local is None:
+                            first_nonfinite_reason_local = str(offending)
+                            first_nonfinite_micro_step = int(step_idx)
+
+                    # Keep non-finite coordination out of non-sync microsteps to preserve
+                    # no_sync accumulation performance characteristics.
+                    if is_sync_step and _any_rank_flag_true(
                         accelerator=accelerator,
-                        flag=(offending is not None),
+                        flag=window_nonfinite_local,
                     ):
                         offending_effective = (
-                            str(offending) if offending is not None else "other_rank_nonfinite"
+                            str(first_nonfinite_reason_local)
+                            if first_nonfinite_reason_local is not None
+                            else "other_rank_nonfinite"
+                        )
+                        offending_micro_step = (
+                            int(first_nonfinite_micro_step)
+                            if first_nonfinite_micro_step is not None
+                            else int(step_idx)
                         )
                         skipped_window_due_nonfinite = True
                         nonfinite_skip_total += 1
@@ -3244,7 +3309,7 @@ def run_pretraining(
                         nonfinite_debug_path = _write_nonfinite_debug_artifact(
                             output_dir=logging_output_dir,
                             step=int(global_step + 1),
-                            micro_step_idx=int(step_idx),
+                            micro_step_idx=int(offending_micro_step),
                             offending=str(offending_effective),
                             gen_loss_raw=out.gen_loss_raw,
                             disc_loss_raw=out.disc_loss_raw,
@@ -3268,6 +3333,8 @@ def run_pretraining(
                         )
                         optimizer.zero_grad(set_to_none=True)
                         break
+                    if offending is not None:
+                        continue
                     micro_gen_tokens = out.gen_token_count.detach().float()
                     micro_disc_tokens = out.disc_token_count.detach().float()
                     gen_token_count_window = gen_token_count_window + micro_gen_tokens

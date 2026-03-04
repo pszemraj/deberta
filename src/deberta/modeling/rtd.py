@@ -654,6 +654,7 @@ class RTDGeneratorPhaseOutput:
     gen_token_count: torch.Tensor
     corrupted_input_ids: torch.Tensor
     disc_labels: torch.Tensor
+    has_masked_targets: bool
 
 
 @dataclass
@@ -753,6 +754,11 @@ class DebertaV3RTDPretrainer(nn.Module):
         valid = [int(tid) for tid in forbidden_ids if 0 <= int(tid) < vocab_size]
         if valid:
             mask[valid] = True
+        # One-time CPU validation: keep hot-path sampling free of per-step all-mask checks.
+        if bool(mask.all()):
+            raise ValueError(
+                "forbidden token mask excludes all vocabulary ids; at least one token must remain sampleable."
+            )
         return mask
 
     _SPECIAL_ID_ATTRS = (
@@ -956,10 +962,6 @@ class DebertaV3RTDPretrainer(nn.Module):
                         "forbidden_vocab_mask length must match logits vocabulary dimension: "
                         f"{int(mask.shape[0])} vs {int(x.shape[-1])}."
                     )
-                if bool(mask.all().item()):
-                    raise ValueError(
-                        "forbidden_vocab_mask excludes all vocabulary ids; at least one token must remain sampleable."
-                    )
             else:
                 if int(mask.shape[-1]) != int(x.shape[-1]):
                     raise ValueError(
@@ -967,16 +969,11 @@ class DebertaV3RTDPretrainer(nn.Module):
                         f"{int(mask.shape[-1])} vs {int(x.shape[-1])}."
                     )
                 try:
-                    expanded = mask.expand_as(x)
+                    mask = mask.expand_as(x)
                 except RuntimeError as exc:
                     raise ValueError(
                         "forbidden_vocab_mask with rank > 1 must be broadcastable to logits."
                     ) from exc
-                if bool(expanded.all(dim=-1).any().item()):
-                    raise ValueError(
-                        "forbidden_vocab_mask excludes all vocabulary ids for at least one row; "
-                        "at least one token must remain sampleable."
-                    )
             x = x.masked_fill(mask, -1e9)
 
         # Gumbel noise
@@ -1048,6 +1045,7 @@ class DebertaV3RTDPretrainer(nn.Module):
                 gen_token_count=gen_token_count.detach(),
                 corrupted_input_ids=corrupted_input_ids.detach(),
                 disc_labels=disc_labels.detach(),
+                has_masked_targets=False,
             )
 
         if use_emd:
@@ -1091,6 +1089,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             gen_token_count=gen_token_count.detach(),
             corrupted_input_ids=corrupted_input_ids.detach(),
             disc_labels=disc_labels.detach(),
+            has_masked_targets=True,
         )
 
     def forward_discriminator_phase(
@@ -1216,7 +1215,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             token_type_ids=token_type_ids,
             sampling_temperature=sampling_temperature,
         )
-        if float(gen_phase.gen_token_count.item()) <= 0.0:
+        if not bool(gen_phase.has_masked_targets):
             disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
             total = float(gen_loss_weight) * gen_phase.gen_loss_raw
             return RTDOutput(

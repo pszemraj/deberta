@@ -2410,6 +2410,59 @@ def test_run_pretraining_decoupled_integration(
         assert accel.calls["backward"] == pytest.approx([2.0, 2.0, 0.0, 3.0], rel=0.0, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("decoupled_training", "expected_nonfinite_checks"),
+    [
+        (True, 2),
+        (False, 1),
+    ],
+)
+def test_run_pretraining_nonfinite_all_reduce_only_on_sync_microstep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decoupled_training: bool,
+    expected_nonfinite_checks: int,
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
+    )
+    call_count = {"value": 0}
+    original_any_rank_flag_true = pretrain_mod._any_rank_flag_true
+
+    def _counted_any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
+        call_count["value"] += 1
+        return bool(original_any_rank_flag_true(accelerator=accelerator, flag=flag))
+
+    monkeypatch.setattr(pretrain_mod, "_any_rank_flag_true", _counted_any_rank_flag_true)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=bool(decoupled_training),
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert int(call_count["value"]) == int(expected_nonfinite_checks)
+
+
 def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3717,16 +3770,13 @@ def test_normalize_resume_consumed_micro_batches_keeps_non_legacy_mismatch():
     assert reason is None
 
 
-def test_gumbel_sample_rejects_all_forbidden_vocab_mask():
+def test_build_forbidden_token_mask_rejects_all_forbidden_vocab():
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    logits = torch.zeros((4, 8), dtype=torch.float32)
-    forbidden = torch.ones(8, dtype=torch.bool)
     with pytest.raises(ValueError, match="excludes all vocabulary ids"):
-        DebertaV3RTDPretrainer._gumbel_sample(
-            logits,
-            temperature=1.0,
-            forbidden_vocab_mask=forbidden,
+        DebertaV3RTDPretrainer._build_forbidden_token_mask(
+            vocab_size=8,
+            forbidden_ids=set(range(8)),
         )
 
 

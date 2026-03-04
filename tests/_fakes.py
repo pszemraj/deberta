@@ -415,6 +415,7 @@ class SimpleRTD(torch.nn.Module):
             gen_token_count=torch.tensor(gen_token_count),
             corrupted_input_ids=input_ids.detach().clone(),
             disc_labels=torch.zeros_like(input_ids, dtype=torch.float32),
+            has_masked_targets=bool(float(gen_token_count) > 0.0),
         )
 
     def forward_discriminator_phase(
