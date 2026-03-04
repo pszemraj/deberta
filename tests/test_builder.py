@@ -130,23 +130,30 @@ def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
 
 
 @pytest.mark.parametrize(
-    ("from_scratch", "pretrained_generator_path", "tokenizer_vocab"),
+    (
+        "from_scratch",
+        "pretrained_generator_path",
+        "tokenizer_vocab",
+        "expected_hf_cfg_calls",
+    ),
     [
-        (True, None, 50265),
-        (False, None, 128100),
-        (False, "gen_weights", 128100),
+        (True, None, 50265, 0),
+        (False, None, 128100, 0),
+        (False, "gen_weights", 128100, 1),
+        (True, "gen_weights", 50265, 1),
     ],
 )
-def test_build_backbone_configs_hf_deberta_never_loads_external_model_config(
+def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_explicit(
     monkeypatch: pytest.MonkeyPatch,
     from_scratch: bool,
     pretrained_generator_path: str | None,
     tokenizer_vocab: int,
+    expected_hf_cfg_calls: int,
 ):
     pytest.importorskip("transformers")
 
     rope_called = {"count": 0}
-    hf_cfg_called = {"count": 0}
+    hf_cfg_called = {"count": 0, "sources": []}
     repo_called = {"count": 0}
     original_repo_builder = builder_mod._build_repo_hf_deberta_v2_config
 
@@ -156,12 +163,24 @@ def test_build_backbone_configs_hf_deberta_never_loads_external_model_config(
         rope_called["count"] += 1
         raise AssertionError("RoPE config source must not be touched for hf_deberta_v2 backbone.")
 
-    def _raise_hf_cfg_pretrained(cls, src: str, **kwargs: Any):
+    def _fake_hf_cfg_pretrained(cls, src: str, **kwargs: Any):
         del cls
-        del src
         del kwargs
         hf_cfg_called["count"] += 1
-        raise AssertionError("HF config source must not be loaded; config must be repo-synthesized.")
+        hf_cfg_called["sources"].append(str(src))
+        return builder_mod.DebertaV2Config(
+            vocab_size=128100,
+            hidden_size=384,
+            num_hidden_layers=5,
+            num_attention_heads=6,
+            intermediate_size=1536,
+            max_position_embeddings=512,
+            relative_attention=True,
+            pos_att_type=["p2c", "c2p"],
+            position_biased_input=False,
+            share_att_key=True,
+            type_vocab_size=0,
+        )
 
     def _count_repo_builder(*, model_cfg: ModelConfig):
         repo_called["count"] += 1
@@ -175,7 +194,7 @@ def test_build_backbone_configs_hf_deberta_never_loads_external_model_config(
     monkeypatch.setattr(
         builder_mod.DebertaV2Config,
         "from_pretrained",
-        classmethod(_raise_hf_cfg_pretrained),
+        classmethod(_fake_hf_cfg_pretrained),
     )
     monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _count_repo_builder)
 
@@ -193,7 +212,14 @@ def test_build_backbone_configs_hf_deberta_never_loads_external_model_config(
 
     assert int(repo_called["count"]) == 1
     assert int(rope_called["count"]) == 0
-    assert int(hf_cfg_called["count"]) == 0
+    assert int(hf_cfg_called["count"]) == int(expected_hf_cfg_calls)
+    if int(expected_hf_cfg_calls) > 0:
+        assert hf_cfg_called["sources"] == [str(pretrained_generator_path)]
+        assert int(gen_cfg.hidden_size) == 384
+        assert int(gen_cfg.num_hidden_layers) == 5
+    else:
+        assert int(gen_cfg.hidden_size) == 768
+        assert int(gen_cfg.num_hidden_layers) == 6
     assert int(disc_cfg.hidden_size) > 0
     assert int(gen_cfg.hidden_size) > 0
 
@@ -384,7 +410,7 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
         ("rope", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
         ("hf_deberta_v2", True, None, None, None, None, None, True),
         ("hf_deberta_v2", False, None, None, "disc", None, "disc", True),
-        ("hf_deberta_v2", False, "gen_model", None, "disc", None, "gen_model", False),
+        ("hf_deberta_v2", False, "gen_model", None, "disc", "gen_model", "gen_model", False),
     ],
 )
 def test_resolve_backbone_sources_matrix(

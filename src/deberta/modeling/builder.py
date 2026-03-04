@@ -203,8 +203,12 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
         if from_scratch:
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=None,
-                config_origin="derived_from_discriminator_config",
+                config_source=model_cfg.pretrained_generator_path or None,
+                config_origin=(
+                    "pretrained_generator_path"
+                    if model_cfg.pretrained_generator_path
+                    else "derived_from_discriminator_config"
+                ),
                 weight_source=None,
                 weight_origin="scratch",
                 derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
@@ -218,8 +222,12 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
             )
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=None,
-                config_origin="derived_from_discriminator_config",
+                config_source=model_cfg.pretrained_generator_path or None,
+                config_origin=(
+                    "pretrained_generator_path"
+                    if model_cfg.pretrained_generator_path
+                    else "derived_from_discriminator_config"
+                ),
                 weight_source=gen_weight_src,
                 weight_origin=gen_weight_origin,
                 derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
@@ -730,7 +738,9 @@ def build_backbone_configs(
 ) -> tuple[Any, Any]:
     """Build discriminator + generator configs.
 
-    - For backbone_type='hf_deberta_v2': returns DebertaV2Config instances from repo defaults.
+    - For backbone_type='hf_deberta_v2': discriminator config is synthesized from repo defaults;
+      generator config is derived from discriminator unless
+      ``model.pretrained.generator_path`` is set, in which case that config is loaded.
     - For backbone_type='rope': returns DebertaRoPEConfig instances.
 
     Generator config is loaded if specified, otherwise derived from discriminator config.
@@ -746,11 +756,17 @@ def build_backbone_configs(
 
     if bt == "hf_deberta_v2":
         disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
-        if model_cfg.pretrained_generator_path:
-            # Explicit generator model sources affect weight loading, not config synthesis.
-            gen_cfg = copy.deepcopy(disc_cfg)
-        else:
+        if resolved.generator.config_source is None:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
+        else:
+            try:
+                gen_cfg = DebertaV2Config.from_pretrained(resolved.generator.config_source)
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to load generator HF config from source "
+                    f"'{resolved.generator.config_source}' "
+                    f"(resolved from {resolved.generator.config_origin})."
+                ) from e
 
         # Match released DeBERTa-v3 xsmall generator behavior.
         if str(model_cfg.hf_model_size).strip().lower() == "xsmall":
