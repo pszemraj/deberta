@@ -28,15 +28,18 @@ pip install -e '.[dev]'
 pip install -e '.[wandb]'
 ```
 
-## Install docs toolchain
+## Generate API markdown docs
 
 ```bash
-pip install mkdocs-material 'mkdocstrings[python]'
+python tools/generate_api_docs.py
 ```
 
-Serve docs locally:
+This writes static Markdown files to `docs/api/` directly from public package docstrings.
+
+## Optional docs site preview
 
 ```bash
+pip install -e '.[docs]'
 mkdocs serve
 ```
 

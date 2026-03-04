@@ -60,10 +60,16 @@ Start here: [`docs/index.md`](docs/index.md)
 - exporting models: [`docs/guides/exporting-models.md`](docs/guides/exporting-models.md)
 - architecture and runtime internals: [`docs/advanced/architectures.md`](docs/advanced/architectures.md), [`docs/advanced/distributed-training.md`](docs/advanced/distributed-training.md), [`docs/advanced/torch-compile.md`](docs/advanced/torch-compile.md)
 
-Serve docs locally with MkDocs:
+Regenerate API markdown from docstrings:
 
 ```bash
-pip install mkdocs-material 'mkdocstrings[python]'
+python tools/generate_api_docs.py
+```
+
+Optional local docs site preview:
+
+```bash
+pip install -e '.[docs]'
 mkdocs serve
 ```
 

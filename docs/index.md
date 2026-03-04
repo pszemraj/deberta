@@ -22,3 +22,9 @@
 - [API / Modeling](api/modeling.md)
 - [API / Data](api/data.md)
 - [API / Training](api/training.md)
+
+Regenerate API pages from package docstrings with:
+
+```bash
+python tools/generate_api_docs.py
+```
