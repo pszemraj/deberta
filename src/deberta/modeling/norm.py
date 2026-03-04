@@ -38,6 +38,7 @@ class RMSNorm(nn.Module):
         # x: (..., hidden)
         # rms = sqrt(mean(x^2))
         dtype = x.dtype
+        # Keep reduction math in fp32 under bf16/fp16 for numerical stability.
         x_float = x.float() if dtype != torch.float32 else x
         inv_rms = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         y = (x_float * inv_rms).to(dtype)

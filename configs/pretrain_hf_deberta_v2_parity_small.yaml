@@ -1,27 +1,26 @@
-# RoPE + RMSNorm + SwiGLU, 4096 context.
+# Canonical long-run DeBERTa-v2/v3 parity config (small).
 # Usage:
-#   accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
-#     deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
+#   accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
+#     deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml
 
 model:
-  profile: modern
-  backbone_type: rope
+  profile: deberta_v3_parity
+  backbone_type: hf_deberta_v2
   from_scratch: true
   embedding_sharing: gdes
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   tokenizer:
-    name_or_path: microsoft/deberta-v3-base
+    name_or_path: microsoft/deberta-v3-small
     allow_vocab_resize: false
     vocab_target: null
     vocab_multiple: 1
-  rope:
-    rope_theta: 10000.0
-    rotary_pct: 1.0
-    use_absolute_position_embeddings: false
-    norm_arch: post
-    norm_eps: 1.0e-6
-    ffn_type: swiglu
-    attention_implementation: sdpa
+  hf:
+    model_size: small
+    attention_kernel: dynamic
+    max_position_embeddings: null
+  pretrained:
+    discriminator_path: ""
+    generator_path: null
 
 data:
   source:
@@ -35,18 +34,18 @@ data:
     shuffle_buffer_size: 10000
   packing:
     enabled: true
-    max_seq_length: 4096
+    max_seq_length: 512
     block_cross_document_attention: false
 
 train:
   seed: 42
-  max_steps: 10000
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 64
+  max_steps: 500000
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 16
   token_weighted_gradient_accumulation: true
   mixed_precision: bf16
   tf32: true
-  sdpa_kernel: flash
+  sdpa_kernel: auto
   decoupled_training: true
   dataloader:
     num_workers: 2
@@ -59,13 +58,13 @@ train:
   objective:
     mlm_probability: 0.15
     mlm_max_ngram: 1
-    mask_token_prob: 0.8
-    random_token_prob: 0.1
+    mask_token_prob: 1.0
+    random_token_prob: 0.0
     sampling_temperature: 1.0
     gen_loss_weight: 1.0
-    disc_loss_weight: 50.0
+    disc_loss_weight: 10.0
   checkpoint:
-    output_dir: runs/deberta_rope_rtd_4096
+    output_dir: runs/hf_deberta_v2_parity_small
     overwrite_output_dir: false
     save_steps: 1000
     save_total_limit: 3
@@ -82,10 +81,10 @@ optim:
   adam:
     beta1: 0.9
     beta2: 0.999
-    epsilon: 1.0e-8
+    epsilon: 1.0e-6
   scheduler:
     type: linear
-    warmup_steps: 1000
+    warmup_steps: 10000
   weight_decay: 0.01
   max_grad_norm: 1.0
 

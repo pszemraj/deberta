@@ -16,6 +16,7 @@ import torch
 from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, load_state_with_compile_fallback
 from deberta.config import (
     ModelConfig,
+    TrainConfig,
     load_data_config_snapshot,
     load_model_config_snapshot,
     validate_data_config,
@@ -30,9 +31,69 @@ from deberta.modeling.export_utils import (
     load_intersection_state_dict,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
+    write_export_readme_and_license,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ExportArgumentDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Argparse formatter with clearer defaults for paired ``--foo``/``--no-foo`` flags."""
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        """Render help text while suppressing misleading defaults on ``--no-*`` flags.
+
+        :param argparse.Action action: Parser action.
+        :return str: Help text.
+        """
+        help_text = action.help or ""
+        if isinstance(action, argparse._StoreFalseAction) or any(
+            str(opt).startswith("--no-") for opt in action.option_strings
+        ):
+            return help_text
+        return super()._get_help_string(action)
+
+
+class _ConflictAwareChoiceAction(argparse.Action):
+    """Reject conflicting repeated values for aliased choice flags."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        """Apply parsed value while rejecting conflicting duplicate assignments.
+
+        :param argparse.ArgumentParser parser: Active parser.
+        :param argparse.Namespace namespace: Namespace being populated.
+        :param Any values: Parsed value.
+        :param str | None option_string: Triggering option string.
+        """
+        seen_attr = f"__seen_{self.dest}"
+        if bool(getattr(namespace, seen_attr, False)):
+            previous = getattr(namespace, self.dest, None)
+            if previous != values:
+                parser.error(
+                    f"Conflicting values for --what/--export-what: {previous!r} then {values!r}. "
+                    "Provide only one value."
+                )
+        setattr(namespace, self.dest, values)
+        setattr(namespace, seen_attr, True)
+
+
+def _normalize_export_target(value: str) -> str:
+    """Normalize and validate export target selection.
+
+    :param str value: Raw export target.
+    :raises ValueError: If value is not one of discriminator|generator|both.
+    :return str: Canonical lower-case export target.
+    """
+    normalized = str(value or "").strip().lower()
+    if normalized not in {"discriminator", "generator", "both"}:
+        raise ValueError("export_what must be discriminator|generator|both")
+    return normalized
 
 
 def _infer_run_dir(checkpoint_dir: Path) -> Path:
@@ -77,6 +138,24 @@ def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path
                 "Choose a new --output-dir or clear the directory."
             )
     return resolved
+
+
+def _load_optional_train_config(run_dir: Path) -> TrainConfig | None:
+    """Best-effort load of ``train_config.json`` for export metadata rendering.
+
+    :param Path run_dir: Run directory potentially containing ``train_config.json``.
+    :return TrainConfig | None: Parsed train config when present/valid, otherwise ``None``.
+    """
+    train_cfg_path = run_dir / "train_config.json"
+    if not train_cfg_path.exists():
+        return None
+
+    try:
+        raw = load_json_mapping(train_cfg_path)
+        return TrainConfig(**raw)
+    except Exception as exc:
+        logger.warning("Failed to parse optional train config at %s: %s", train_cfg_path, exc)
+        return None
 
 
 @dataclass
@@ -127,6 +206,7 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         dest="export_what",
         default="discriminator",
         choices=("discriminator", "generator", "both"),
+        action=_ConflictAwareChoiceAction,
         help="Which component(s) to export.",
     )
     safe_group = parser.add_mutually_exclusive_group()
@@ -149,13 +229,16 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         "--offload-to-cpu",
         dest="offload_to_cpu",
         action="store_true",
-        help="Offload consolidated full state dict to CPU under FSDP export.",
+        help=("Offload consolidated full state dict to CPU under FSDP export. Ignored for non-FSDP exports."),
     )
     offload_group.add_argument(
         "--no-offload-to-cpu",
         dest="offload_to_cpu",
         action="store_false",
-        help="Keep consolidated full state dict on accelerator memory under FSDP export.",
+        help=(
+            "Keep consolidated full state dict on accelerator memory under FSDP export. "
+            "Ignored for non-FSDP exports."
+        ),
     )
     parser.set_defaults(offload_to_cpu=True)
 
@@ -164,13 +247,13 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
         "--rank0-only",
         dest="rank0",
         action="store_true",
-        help="Gather full state dict on rank 0 only under FSDP export.",
+        help="Gather full state dict on rank 0 only under FSDP export. Ignored for non-FSDP exports.",
     )
     rank0_group.add_argument(
         "--no-rank0-only",
         dest="rank0",
         action="store_false",
-        help="Gather full state dict on all ranks under FSDP export.",
+        help="Gather full state dict on all ranks under FSDP export. Ignored for non-FSDP exports.",
     )
     parser.set_defaults(rank0=True)
     parser.add_argument(
@@ -219,7 +302,7 @@ def _build_export_backbone(
     :param str export_what: Export target (discriminator|generator|both).
     :return tuple[Any | None, Any | None]: Discriminator and generator export models.
     """
-    bt = (model_cfg.backbone_type or "rope").lower()
+    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     export_what = export_what.lower()
 
     if bt == "hf_deberta_v2":
@@ -297,6 +380,8 @@ def run_export(cfg: ExportConfig) -> None:
 
     :param ExportConfig cfg: Export configuration.
     """
+    export_what = _normalize_export_target(cfg.export_what)
+
     try:
         from transformers import AutoTokenizer
     except Exception as e:  # pragma: no cover
@@ -325,6 +410,7 @@ def run_export(cfg: ExportConfig) -> None:
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
     _validate_run_metadata_if_present(run_dir)
+    train_cfg = _load_optional_train_config(run_dir)
 
     # Pre-stable policy: export does not coerce legacy snapshot keys.
     # Stored configs must match current dataclass schemas.
@@ -427,6 +513,12 @@ def run_export(cfg: ExportConfig) -> None:
                 full_sd = accelerator.get_state_dict(model)
     else:
         # Non-FSDP: unwrap DDP etc.
+        if (not bool(cfg.offload_to_cpu)) or (not bool(cfg.rank0)):
+            logger.warning(
+                "--offload-to-cpu/--rank0-only only apply to FSDP export; current distributed_type=%s, "
+                "so those options are ignored.",
+                accelerator.distributed_type,
+            )
         full_sd = accelerator.unwrap_model(model).state_dict()
 
     if not accelerator.is_main_process:
@@ -440,10 +532,6 @@ def run_export(cfg: ExportConfig) -> None:
         )
 
     # Build export models (backbones only)
-    export_what = (cfg.export_what or "discriminator").lower()
-    if export_what not in {"discriminator", "generator", "both"}:
-        raise ValueError("export_what must be discriminator|generator|both")
-
     export_disc, export_gen = _build_export_backbone(model_cfg, disc_config, gen_config, export_what)
 
     stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
@@ -493,10 +581,17 @@ def run_export(cfg: ExportConfig) -> None:
                     fp32_accumulate=True,
                 )
 
-            export_disc.save_pretrained(
-                str(stage_dir / "discriminator"), safe_serialization=bool(cfg.safe_serialization)
+            disc_out_dir = stage_dir if export_what == "discriminator" else (stage_dir / "discriminator")
+            export_disc.save_pretrained(str(disc_out_dir), safe_serialization=bool(cfg.safe_serialization))
+            clean_exported_config(disc_out_dir / "config.json", strict=True)
+            write_export_readme_and_license(
+                disc_out_dir,
+                model_cfg=model_cfg,
+                export_config=getattr(export_disc, "config", None),
+                data_cfg=data_cfg,
+                train_cfg=train_cfg,
+                embedding_sharing=embedding_sharing,
             )
-            clean_exported_config(stage_dir / "discriminator" / "config.json", strict=True)
             meta["exported_discriminator"] = True
 
         # Generator
@@ -517,10 +612,17 @@ def run_export(cfg: ExportConfig) -> None:
                         len(missing),
                         len(unexpected),
                     )
-            export_gen.save_pretrained(
-                str(stage_dir / "generator"), safe_serialization=bool(cfg.safe_serialization)
+            gen_out_dir = stage_dir if export_what == "generator" else (stage_dir / "generator")
+            export_gen.save_pretrained(str(gen_out_dir), safe_serialization=bool(cfg.safe_serialization))
+            clean_exported_config(gen_out_dir / "config.json", strict=True)
+            write_export_readme_and_license(
+                gen_out_dir,
+                model_cfg=model_cfg,
+                export_config=getattr(export_gen, "config", None),
+                data_cfg=data_cfg,
+                train_cfg=train_cfg,
+                embedding_sharing=embedding_sharing,
             )
-            clean_exported_config(stage_dir / "generator" / "config.json", strict=True)
             meta["exported_generator"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
@@ -545,7 +647,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="deberta export",
         description="Consolidate a training checkpoint and export standalone HF artifacts.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=ExportArgumentDefaultsHelpFormatter,
     )
     add_export_arguments(parser)
     args = parser.parse_args(argv)

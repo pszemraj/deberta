@@ -2,40 +2,46 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import hashlib
 import inspect
 import json
 import logging
 import math
-import os
 import re
 import time
+import types
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
-from dataclasses import asdict
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from deberta.checkpoint_utils import (
-    canonicalize_state_dict_keys,
     load_state_with_compile_fallback,
     unwrap_compiled_model,
 )
 from deberta.config import (
     DataConfig,
+    LoggingConfig,
     ModelConfig,
+    OptimConfig,
     TrainConfig,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_mode,
+    _sync_legacy_train_aliases,
+    apply_profile_defaults,
     normalize_mixed_precision,
     validate_data_config,
+    validate_logging_config,
     validate_model_config,
+    validate_optim_config,
     validate_train_config,
     validate_training_workflow_options,
 )
@@ -46,15 +52,22 @@ from deberta.data.streaming import PackedStreamingConfig
 from deberta.io_utils import dump_json
 from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.modeling.export_utils import (
-    clean_exported_config as _clean_exported_config_impl,
+from deberta.training.export_helpers import (
+    _export_discriminator_hf,  # noqa: F401
+    _export_discriminator_hf_subprocess,
+    _write_export_readme,  # noqa: F401
 )
-from deberta.modeling.export_utils import (
-    load_intersection_state_dict,
-    merge_embeddings_into_export_backbone,
+from deberta.training.loop_utils import (
+    _count_input_tokens_for_batch,
+    _count_rtd_tokens_for_batch,
+    _finalize_window_metric_loss,
+    _resolve_window_token_denominators,
+    _scale_loss_for_backward,
+    _should_clip_gradients,
+    _sum_local_scalar,
+    _token_weighted_micro_objective,
 )
-from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
-from deberta.training.run_config import _persist_or_validate_run_configs
+from deberta.training.run_config import _dump_yaml_mapping, _persist_or_validate_run_configs
 from deberta.training.run_management import (
     _load_checkpoint_progress_metadata,
     _parse_checkpoint_step,
@@ -98,18 +111,6 @@ def _append_metrics_jsonl_row(path: Path, row: dict[str, Any]) -> None:
         f.flush()
 
 
-def _env_flag_true(name: str) -> bool:
-    """Return whether an environment flag should be treated as enabled.
-
-    :param str name: Environment variable name.
-    :return bool: ``True`` when set to a truthy value (e.g., ``1``, ``true``, ``yes``, ``on``).
-    """
-    raw = os.getenv(str(name))
-    if raw is None:
-        return False
-    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
-
-
 def _flush_loggers() -> None:
     """Flush all configured logger handlers best-effort.
 
@@ -130,6 +131,234 @@ def _flush_loggers() -> None:
             seen_handlers.add(hid)
             with suppress(Exception):
                 handler.flush()
+
+
+def _drop_none_recursive(value: Any) -> Any:
+    """Recursively drop ``None`` entries from mappings/lists.
+
+    :param Any value: Arbitrary nested value.
+    :return Any: Value with ``None`` keys/items removed.
+    """
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            cleaned = _drop_none_recursive(item)
+            if cleaned is None:
+                continue
+            out[str(key)] = cleaned
+        return out
+    if isinstance(value, list):
+        out_list: list[Any] = []
+        for item in value:
+            cleaned = _drop_none_recursive(item)
+            if cleaned is None:
+                continue
+            out_list.append(cleaned)
+        return out_list
+    if isinstance(value, tuple):
+        out_tuple: list[Any] = []
+        for item in value:
+            cleaned = _drop_none_recursive(item)
+            if cleaned is None:
+                continue
+            out_tuple.append(cleaned)
+        return out_tuple
+    return value
+
+
+def _config_obj_to_mapping(config_obj: Any) -> dict[str, Any]:
+    """Convert config-like objects to serializable dictionaries.
+
+    :param Any config_obj: Config object exposing ``to_dict``/``__dict__``.
+    :return dict[str, Any]: Best-effort plain mapping.
+    """
+    if config_obj is None:
+        return {}
+    if isinstance(config_obj, dict):
+        return dict(config_obj)
+    to_dict_fn = getattr(config_obj, "to_dict", None)
+    if callable(to_dict_fn):
+        raw = to_dict_fn()
+        if isinstance(raw, dict):
+            return dict(raw)
+    raw_dict = getattr(config_obj, "__dict__", None)
+    if isinstance(raw_dict, dict):
+        return dict(raw_dict)
+    return {}
+
+
+def _coerce_bool_value(value: Any) -> bool:
+    """Coerce common bool-like values into ``bool``.
+
+    :param Any value: Raw value.
+    :raises ValueError: If value is not parseable as bool.
+    :return bool: Coerced boolean.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = str(value).strip().lower()
+        if v in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise ValueError(f"Unsupported boolean value: {value!r}")
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(int(value))
+    raise ValueError(f"Unsupported boolean value: {value!r}")
+
+
+def _coerce_dataclass_payload_types(cfg_obj: Any) -> dict[str, Any]:
+    """Serialize a dataclass config and coerce scalar fields to declared types.
+
+    This keeps tracker payloads deterministic when YAML parsed numeric-like strings
+    (for example ``1e-6``) bypass dataclass runtime typing.
+
+    :param Any cfg_obj: Dataclass config object.
+    :return dict[str, Any]: Serialized mapping with best-effort scalar coercion.
+    """
+
+    def _unwrap_optional(t: Any) -> Any:
+        """Return the non-None member type for ``Optional[T]`` annotations.
+
+        :param Any t: Annotation type.
+        :return Any: Unwrapped type when optional, else original type.
+        """
+        origin = get_origin(t)
+        if origin in {Union, types.UnionType}:
+            args = [a for a in get_args(t) if a is not type(None)]
+            if len(args) == 1:
+                return args[0]
+        return t
+
+    def _coerce_scalar(value: Any, target_t: Any) -> Any:
+        """Best-effort scalar cast against an annotation target.
+
+        :param Any value: Raw scalar value.
+        :param Any target_t: Annotation target type.
+        :return Any: Coerced scalar when parseable, else original value.
+        """
+        if value is None:
+            return None
+        try:
+            if target_t is bool:
+                return _coerce_bool_value(value)
+            if target_t is int and not isinstance(value, bool):
+                return int(value)
+            if target_t is float and not isinstance(value, bool):
+                return float(value)
+            if target_t is str:
+                return str(value)
+        except Exception:
+            return value
+        return value
+
+    def _coerce_dataclass_instance(obj: Any) -> dict[str, Any]:
+        """Recursively coerce nested dataclass payload fields.
+
+        :param Any obj: Dataclass instance.
+        :return dict[str, Any]: Serialized/coerced mapping.
+        """
+        payload: dict[str, Any] = {}
+        type_hints = get_type_hints(type(obj))
+        for f in fields(type(obj)):
+            name = str(f.name)
+            value = getattr(obj, name)
+            target_t = _unwrap_optional(type_hints.get(name, f.type))
+            if dataclasses.is_dataclass(value):
+                payload[name] = _coerce_dataclass_instance(value)
+            else:
+                payload[name] = _coerce_scalar(value, target_t)
+        return payload
+
+    if not dataclasses.is_dataclass(cfg_obj):
+        if isinstance(cfg_obj, dict):
+            return {str(key): value for key, value in cfg_obj.items()}
+        return {}
+    return _coerce_dataclass_instance(cfg_obj)
+
+
+def _build_runtime_resolved_tracker_config(
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
+    disc_config: Any,
+    gen_config: Any,
+    tokenizer: Any,
+) -> dict[str, Any]:
+    """Build a runtime-resolved tracker payload with effective model/train values.
+
+    :param ModelConfig model_cfg: Effective model config used by training.
+    :param DataConfig data_cfg: Effective data config used by training.
+    :param TrainConfig train_cfg: Effective train config used by training.
+    :param OptimConfig optim_cfg: Effective optimizer config used by training.
+    :param LoggingConfig logging_cfg: Effective logging config used by training.
+    :param Any disc_config: Runtime discriminator backbone config.
+    :param Any gen_config: Runtime generator backbone config.
+    :param Any tokenizer: Runtime tokenizer.
+    :return dict[str, Any]: Null-pruned resolved config payload.
+    """
+    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
+
+    payload: dict[str, Any] = {
+        "model": _coerce_dataclass_payload_types(model_cfg),
+        "data": _coerce_dataclass_payload_types(data_cfg),
+        "train": _coerce_dataclass_payload_types(train_cfg),
+        "optim": _coerce_dataclass_payload_types(resolved_optim_cfg),
+        "logging": _coerce_dataclass_payload_types(resolved_logging_cfg),
+    }
+    model_payload = payload["model"]
+
+    disc_cfg_map = _config_obj_to_mapping(disc_config)
+    gen_cfg_map = _config_obj_to_mapping(gen_config)
+
+    # Populate commonly inferred model fields for easier reproducibility diffs.
+    generator_payload = dict(model_payload.get("generator", {}) or {})
+    if generator_payload.get("num_hidden_layers") is None and "num_hidden_layers" in gen_cfg_map:
+        generator_payload["num_hidden_layers"] = int(gen_cfg_map["num_hidden_layers"])
+    if generator_payload.get("hidden_size") is None and "hidden_size" in gen_cfg_map:
+        generator_payload["hidden_size"] = int(gen_cfg_map["hidden_size"])
+    if generator_payload.get("intermediate_size") is None and "intermediate_size" in gen_cfg_map:
+        generator_payload["intermediate_size"] = int(gen_cfg_map["intermediate_size"])
+    if generator_payload.get("num_attention_heads") is None and "num_attention_heads" in gen_cfg_map:
+        generator_payload["num_attention_heads"] = int(gen_cfg_map["num_attention_heads"])
+    model_payload["generator"] = generator_payload
+
+    dropout_payload = dict(model_payload.get("dropout", {}) or {})
+    if dropout_payload.get("hidden_prob") is None and "hidden_dropout_prob" in disc_cfg_map:
+        dropout_payload["hidden_prob"] = float(disc_cfg_map["hidden_dropout_prob"])
+    if dropout_payload.get("attention_probs_prob") is None and "attention_probs_dropout_prob" in disc_cfg_map:
+        dropout_payload["attention_probs_prob"] = float(disc_cfg_map["attention_probs_dropout_prob"])
+    model_payload["dropout"] = dropout_payload
+
+    rope_payload = dict(model_payload.get("rope", {}) or {})
+    if rope_payload.get("max_position_embeddings") is None and "max_position_embeddings" in disc_cfg_map:
+        rope_payload["max_position_embeddings"] = int(disc_cfg_map["max_position_embeddings"])
+    model_payload["rope"] = rope_payload
+
+    tokenizer_payload = dict(model_payload.get("tokenizer", {}) or {})
+    if tokenizer_payload.get("vocab_target") is None:
+        with suppress(Exception):
+            tokenizer_payload["vocab_target"] = int(len(tokenizer))
+    model_payload["tokenizer"] = tokenizer_payload
+
+    pretrained_payload = dict(model_payload.get("pretrained", {}) or {})
+    if not str(pretrained_payload.get("discriminator_path", "")).strip():
+        pretrained_payload["discriminator_path"] = None
+    if not str(pretrained_payload.get("generator_path", "")).strip():
+        pretrained_payload["generator_path"] = None
+    model_payload["pretrained"] = pretrained_payload
+
+    return _drop_none_recursive(payload)
 
 
 def _load_resume_state_with_compile_fallback(
@@ -157,35 +386,10 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     :param bool enabled: Whether to enable TF32.
     :param bool force_legacy: Whether to force legacy ``allow_tf32`` flags.
     """
-    if force_legacy:
-        torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
-        torch.backends.cudnn.allow_tf32 = bool(enabled)
-        return
-
-    # Prefer the modern fp32_precision API when available (PyTorch 2.9+).
-    target = "tf32" if enabled else "ieee"
-    _fp32_paths: tuple[tuple[Any, str], ...] = (
-        (torch.backends, "fp32_precision"),
-        (torch.backends.cuda.matmul, "fp32_precision"),
-        (torch.backends.cudnn, "fp32_precision"),
-    )
-    # Granular cudnn knobs on newer builds.
-    for parent_name in ("conv", "rnn"):
-        parent = getattr(torch.backends.cudnn, parent_name, None)
-        if parent is not None:
-            _fp32_paths = (*_fp32_paths, (parent, "fp32_precision"))
-
-    configured = False
-    for obj, attr in _fp32_paths:
-        with suppress(Exception):
-            if hasattr(obj, attr):
-                setattr(obj, attr, target)
-                configured = True
-
-    if not configured:
-        # Legacy fallback.
-        torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
-        torch.backends.cudnn.allow_tf32 = bool(enabled)
+    del force_legacy
+    # Use legacy flags consistently to avoid mixing legacy/new TF32 APIs in-process.
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    torch.backends.cudnn.allow_tf32 = bool(enabled)
 
 
 def _maybe_configure_sdpa_kernels(policy: str, *, is_main: bool) -> None:
@@ -395,21 +599,61 @@ def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> 
     local_flag = 0 if math.isfinite(float(grad_norm)) else 1
     device = getattr(accelerator, "device", torch.device("cpu"))
     local = torch.tensor([local_flag], device=device, dtype=torch.int32)
-    with suppress(Exception):
-        reduced = accelerator.reduce(local, reduction="sum")
-        count = int(reduced.reshape(-1)[0].item())
-        return count > 0
-    return local_flag > 0
+    if int(getattr(accelerator, "num_processes", 1)) <= 1:
+        return local_flag > 0
+    reduced = accelerator.reduce(local, reduction="sum")
+    count = int(reduced.reshape(-1)[0].item())
+    return count > 0
+
+
+def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
+    """Return whether any rank set ``flag=True``.
+
+    :param Any accelerator: Accelerator-like runtime object.
+    :param bool flag: Local boolean flag.
+    :return bool: True when at least one rank set the flag.
+    """
+    device = getattr(accelerator, "device", torch.device("cpu"))
+    local = torch.tensor([1 if bool(flag) else 0], device=device, dtype=torch.int32)
+    if int(getattr(accelerator, "num_processes", 1)) <= 1:
+        return bool(flag)
+    reduced = accelerator.reduce(local, reduction="sum")
+    count = int(reduced.reshape(-1)[0].item())
+    return count > 0
+
+
+def _record_unscaled_lrs(optimizer: torch.optim.Optimizer, scheduler: Any | None) -> None:
+    """Record unscaled scheduler LRs into optimizer param groups.
+
+    This stores the scheduler-computed LR (before non-finite recovery scaling)
+    in ``group["_lr_unscaled"]`` so recovery scaling can be applied absolutely.
+
+    :param torch.optim.Optimizer optimizer: Runtime optimizer.
+    :param Any | None scheduler: Scheduler-like object.
+    """
+    scheduler_lrs: list[float] | None = None
+    if scheduler is not None and hasattr(scheduler, "get_last_lr"):
+        with suppress(Exception):
+            raw = scheduler.get_last_lr()
+            if isinstance(raw, (list, tuple)) and len(raw) == len(optimizer.param_groups):
+                scheduler_lrs = [float(x) for x in raw]
+    if scheduler_lrs is None:
+        scheduler_lrs = [float(group.get("_lr_unscaled", group["lr"])) for group in optimizer.param_groups]
+
+    for group, lr in zip(optimizer.param_groups, scheduler_lrs, strict=True):
+        group["_lr_unscaled"] = float(lr)
 
 
 def _apply_lr_mult(optimizer: torch.optim.Optimizer, lr_mult: float) -> None:
-    """Scale all optimizer param-group LRs by a persistent multiplier.
+    """Apply persistent LR multiplier against recorded unscaled scheduler LRs.
 
     :param torch.optim.Optimizer optimizer: Runtime optimizer.
     :param float lr_mult: Multiplier to apply (typically in (0, 1]).
     """
+    mult = float(lr_mult)
     for group in optimizer.param_groups:
-        group["lr"] = float(group["lr"]) * float(lr_mult)
+        base_lr = float(group.get("_lr_unscaled", group["lr"]))
+        group["lr"] = base_lr * mult
 
 
 def _apply_nonfinite_recovery(
@@ -463,15 +707,73 @@ def _optimizer_has_stepped(optimizer: torch.optim.Optimizer) -> bool:
     return False
 
 
-def _sync_discriminator_embeddings_if_available(model: torch.nn.Module) -> None:
+def _sync_discriminator_embeddings_if_available(
+    model: torch.nn.Module, *, accelerator: Any | None = None
+) -> None:
     """Sync discriminator embedding buffers if the model exposes the hook.
 
-    :param torch.nn.Module model: Unwrapped runtime model.
+    :param torch.nn.Module model: Runtime model (wrapped or unwrapped).
+    :param Any | None accelerator: Optional Accelerator runtime for unwrapping.
     """
-    fn = getattr(model, "sync_discriminator_embeddings_from_generator", None)
-    if callable(fn):
-        with torch.no_grad():
-            fn()
+    wrapped_model = model
+    target_model = model
+    if accelerator is not None:
+        with suppress(Exception):
+            target_model = accelerator.unwrap_model(model)
+        with suppress(Exception):
+            target_model = unwrap_compiled_model(accelerator, target_model)
+
+    fn = getattr(target_model, "sync_discriminator_embeddings_from_generator", None)
+    if not callable(fn):
+        return
+
+    # Avoid paying FSDP unshard/sync overhead when embedding sync is a no-op.
+    # Keep compatibility for external models that expose the hook but not the
+    # repo-specific GDES attributes.
+    embedding_sharing = getattr(target_model, "embedding_sharing", None)
+    if embedding_sharing is not None:
+        if str(embedding_sharing).strip().lower() != "gdes":
+            return
+        if not bool(getattr(target_model, "_gdes_synced_embeddings", None)):
+            return
+
+    fsdp_cls = None
+    fsdp2_module_cls = None
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as fsdp_cls  # type: ignore
+    except ImportError:
+        fsdp_cls = None
+    try:
+        from torch.distributed.fsdp import FSDPModule as fsdp2_module_cls  # type: ignore
+    except ImportError:
+        fsdp2_module_cls = None
+
+    if fsdp_cls is not None and isinstance(wrapped_model, fsdp_cls):
+        # FSDP1 wrapper path: summon only root-level params to avoid recursive
+        # all-gathering of nested transformer shards. Nested FSDP1 wrapping is
+        # not a supported path here; if nested params stay sharded, the sync hook
+        # fails loudly on DTensor checks instead of silently desynchronizing.
+        with fsdp_cls.summon_full_params(wrapped_model, recurse=False, writeback=True):
+            with torch.no_grad():
+                fn()
+        return
+
+    if fsdp2_module_cls is not None and isinstance(wrapped_model, fsdp2_module_cls):
+        # FSDP2 (fully_shard) path: unshard/reshard around sync to avoid calling
+        # sync_from() on sharded DTensor parameters.
+        handle = wrapped_model.unshard(async_op=False)
+        if handle is not None:
+            handle.wait()
+        try:
+            with torch.no_grad():
+                fn()
+        finally:
+            wrapped_model.reshard()
+        return
+
+    # Non-FSDP path.
+    with torch.no_grad():
+        fn()
 
 
 def _write_nonfinite_debug_artifact(
@@ -551,7 +853,7 @@ def _resolve_compile_scope(
     compile_backend: str,
     block_cross_document_attention: bool = False,
 ) -> tuple[str, str | None]:
-    """Resolve effective compile scope with default-mode stability fallback.
+    """Resolve effective compile scope for auto compile mode.
 
     :param str requested_scope: Requested canonical compile scope.
     :param ModelConfig model_cfg: Model configuration.
@@ -563,15 +865,9 @@ def _resolve_compile_scope(
     if requested_scope != "auto":
         return requested_scope, None
 
+    del compile_mode
+    del compile_backend
     backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
-    # Empirically, full-backbone inductor compile on HF DeBERTa v2 defaults can drift
-    # during train-mode updates. Auto scope keeps compile on the dominant FFN FLOPs
-    # while leaving attention + embeddings eager.
-    if backbone_type == "hf_deberta_v2" and compile_mode == "default" and compile_backend == "inductor":
-        return (
-            "ffn",
-            "auto scope selected FFN-only fallback for hf_deberta_v2 (default+inductor)",
-        )
     # Doc-blocking batches alternate between None and 3D masks (single-doc vs multi-doc),
     # causing mask shape churn under compile. Downgrade to FFN-only to avoid recompilation.
     if bool(block_cross_document_attention) and backbone_type == "rope":
@@ -589,7 +885,7 @@ def _full_backbone_hf_inductor_warning(
     compile_scope: str,
     compile_backend: str,
 ) -> str | None:
-    """Return warning text for empirically unstable HFv2 full-backbone compile requests.
+    """Return warning text for unsupported full-backbone compile combinations.
 
     :param ModelConfig model_cfg: Model configuration.
     :param bool compile_enabled: Whether compile is active.
@@ -597,20 +893,11 @@ def _full_backbone_hf_inductor_warning(
     :param str compile_backend: Compile backend.
     :return str | None: Warning message for unstable configuration, else ``None``.
     """
-    if not bool(compile_enabled):
-        return None
-    if str(getattr(model_cfg, "backbone_type", "")).strip().lower() != "hf_deberta_v2":
-        return None
-    if str(compile_backend).strip().lower() != "inductor":
-        return None
-    if str(compile_scope).strip().lower() != "backbones":
-        return None
-    return (
-        "Requested full-backbone torch.compile for hf_deberta_v2 + inductor. "
-        "This path is empirically unstable and not recommended for production training. "
-        "Preferred stable path: train.torch_compile_scope=ffn, "
-        "model.hf_attention_kernel=stable, train.torch_compile_mode=default."
-    )
+    del model_cfg
+    del compile_enabled
+    del compile_scope
+    del compile_backend
+    return None
 
 
 def _compile_backbones_for_scope(
@@ -795,7 +1082,15 @@ def _is_generator_param(name: str) -> bool:
     :param str name: Parameter name.
     :return bool: True when parameter is generator-owned.
     """
-    return name.startswith("generator.") or name.startswith("generator_lm_head.")
+    # Generator-owned modules:
+    # - generator backbone
+    # - generator MLM head
+    # - enhanced mask decoder (used only on the generator path)
+    return (
+        name.startswith("generator.")
+        or name.startswith("generator_lm_head.")
+        or name.startswith("enhanced_mask_decoder.")
+    )
 
 
 def _partition_optimizer_params(model: torch.nn.Module) -> dict[str, dict[str, list[Any]]]:
@@ -811,10 +1106,17 @@ def _partition_optimizer_params(model: torch.nn.Module) -> dict[str, dict[str, l
         "disc_decay": {"params": [], "names": []},
         "disc_no_decay": {"params": [], "names": []},
     }
+    seen_param_ids: set[int] = set()
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        # Guard against shared-parameter aliasing (for example ES embedding sharing)
+        # to keep each Parameter in exactly one optimizer group.
+        pid = id(param)
+        if pid in seen_param_ids:
+            continue
+        seen_param_ids.add(pid)
 
         no_decay = _is_no_decay_param(name=name, param=param)
         is_gen = _is_generator_param(name)
@@ -895,12 +1197,21 @@ def _build_optimizer(
     :return torch.optim.Optimizer: Configured AdamW optimizer.
     """
 
+    eps = float(cfg.adam_epsilon)
+    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
+        eps = 1e-6
+        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
+
     gen_lr = (
         float(cfg.generator_learning_rate)
         if float(cfg.generator_learning_rate) > 0
         else float(cfg.learning_rate)
     )
-    disc_lr = float(cfg.learning_rate)
+    disc_lr = (
+        float(cfg.discriminator_learning_rate)
+        if float(getattr(cfg, "discriminator_learning_rate", -1.0)) > 0
+        else float(cfg.learning_rate)
+    )
     partitions = _partition_optimizer_params(model)
     gen_decay = partitions["gen_decay"]["params"]
     gen_no_decay = partitions["gen_no_decay"]["params"]
@@ -924,11 +1235,6 @@ def _build_optimizer(
 
     fused_kwargs = _maybe_fused_adamw_kwargs()
 
-    eps = float(cfg.adam_epsilon)
-    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
-        eps = 1e-6
-        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
-
     opt = torch.optim.AdamW(
         groups,
         lr=disc_lr,
@@ -938,6 +1244,88 @@ def _build_optimizer(
     )
     opt._param_order_digest = _digest_param_name_order(ordered_names)
     return opt
+
+
+def _build_decoupled_optimizers(
+    model: torch.nn.Module,
+    cfg: TrainConfig,
+    *,
+    mixed_precision: str = "no",
+) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
+    """Create separate generator/discriminator AdamW optimizers.
+
+    :param torch.nn.Module model: RTD model.
+    :param TrainConfig cfg: Training configuration.
+    :param str mixed_precision: Effective mixed-precision mode.
+    :return tuple[torch.optim.Optimizer, torch.optim.Optimizer]: (generator_optimizer, discriminator_optimizer).
+    """
+    eps = float(cfg.adam_epsilon)
+    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
+        eps = 1e-6
+        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
+
+    fused_kwargs = _maybe_fused_adamw_kwargs()
+    gen_lr = (
+        float(cfg.generator_learning_rate)
+        if float(cfg.generator_learning_rate) > 0
+        else float(cfg.learning_rate)
+    )
+    disc_lr = (
+        float(cfg.discriminator_learning_rate)
+        if float(getattr(cfg, "discriminator_learning_rate", -1.0)) > 0
+        else float(cfg.learning_rate)
+    )
+    partitions = _partition_optimizer_params(model)
+
+    gen_groups: list[dict[str, Any]] = []
+    gen_names: list[str] = []
+    if partitions["gen_decay"]["params"]:
+        gen_groups.append(
+            {
+                "params": partitions["gen_decay"]["params"],
+                "weight_decay": float(cfg.weight_decay),
+                "lr": gen_lr,
+            }
+        )
+        gen_names.extend(partitions["gen_decay"]["names"])
+    if partitions["gen_no_decay"]["params"]:
+        gen_groups.append({"params": partitions["gen_no_decay"]["params"], "weight_decay": 0.0, "lr": gen_lr})
+        gen_names.extend(partitions["gen_no_decay"]["names"])
+
+    disc_groups: list[dict[str, Any]] = []
+    disc_names: list[str] = []
+    if partitions["disc_decay"]["params"]:
+        disc_groups.append(
+            {
+                "params": partitions["disc_decay"]["params"],
+                "weight_decay": float(cfg.weight_decay),
+                "lr": disc_lr,
+            }
+        )
+        disc_names.extend(partitions["disc_decay"]["names"])
+    if partitions["disc_no_decay"]["params"]:
+        disc_groups.append(
+            {"params": partitions["disc_no_decay"]["params"], "weight_decay": 0.0, "lr": disc_lr}
+        )
+        disc_names.extend(partitions["disc_no_decay"]["names"])
+
+    gen_opt = torch.optim.AdamW(
+        gen_groups,
+        lr=gen_lr,
+        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
+        eps=eps,
+        **fused_kwargs,
+    )
+    disc_opt = torch.optim.AdamW(
+        disc_groups,
+        lr=disc_lr,
+        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
+        eps=eps,
+        **fused_kwargs,
+    )
+    gen_opt._param_order_digest = _digest_param_name_order(gen_names)
+    disc_opt._param_order_digest = _digest_param_name_order(disc_names)
+    return gen_opt, disc_opt
 
 
 def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
@@ -1184,85 +1572,6 @@ def _build_training_collator(
     )
 
 
-def _compute_disc_active_mask(
-    *,
-    input_ids: torch.Tensor,
-    labels: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    pad_token_id: int | None,
-) -> torch.Tensor:
-    """Compute discriminator-active token mask before model forward.
-
-    The RTD discriminator supervises all non-padding tokens. Masked positions
-    remain active because they are part of the discriminator objective.
-
-    :param torch.Tensor input_ids: Input token ids.
-    :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
-    :param torch.Tensor | None attention_mask: Optional attention mask.
-    :param int | None pad_token_id: Padding token id.
-    :return torch.Tensor: Boolean active-token mask.
-    """
-    del labels
-    active = attention_mask_to_active_tokens(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        pad_token_id=pad_token_id,
-    )
-    return active
-
-
-def _count_rtd_tokens_for_batch(
-    batch: dict[str, torch.Tensor],
-    *,
-    pad_token_id: int | None,
-) -> tuple[float, float]:
-    """Return generator/discriminator active-token counts for one microbatch.
-
-    :param dict[str, torch.Tensor] batch: Microbatch tensors.
-    :param int | None pad_token_id: Padding token id.
-    :return tuple[float, float]: (generator_count, discriminator_count).
-    """
-    labels = batch["labels"]
-    gen_count = float(labels.ne(-100).sum().item())
-    disc_active = _compute_disc_active_mask(
-        input_ids=batch["input_ids"],
-        labels=labels,
-        attention_mask=batch.get("attention_mask"),
-        pad_token_id=pad_token_id,
-    )
-    disc_count = float(disc_active.sum().item())
-    return gen_count, disc_count
-
-
-def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
-    """Return non-padding input-token count for one microbatch.
-
-    :param dict[str, torch.Tensor] batch: Microbatch mapping.
-    :return float: Count of active input tokens.
-    """
-    attention_mask = batch.get("attention_mask")
-    input_ids = batch.get("input_ids")
-    if isinstance(attention_mask, torch.Tensor):
-        if isinstance(input_ids, torch.Tensor):
-            active = attention_mask_to_active_tokens(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pad_token_id=None,
-            )
-            return float(active.detach().sum().item())
-
-        mask = attention_mask.detach().to(dtype=torch.bool)
-        if mask.ndim == 4:
-            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if mask.ndim == 3:
-            mask = torch.diagonal(mask, dim1=-2, dim2=-1)
-        return float(mask.sum().item())
-
-    if not isinstance(input_ids, torch.Tensor):
-        return 0.0
-    return float(input_ids.numel())
-
-
 def _validate_output_dir_preflight(
     *,
     output_dir: Path,
@@ -1294,11 +1603,59 @@ def _validate_output_dir_preflight(
         )
 
 
+def _resolve_section_cfg_compat(
+    *,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None,
+    logging_cfg: LoggingConfig | None,
+) -> tuple[OptimConfig, LoggingConfig]:
+    """Resolve optional optim/logging configs with train-legacy compatibility.
+
+    :param TrainConfig train_cfg: Train config object.
+    :param OptimConfig | None optim_cfg: Optional explicit optim config.
+    :param LoggingConfig | None logging_cfg: Optional explicit logging config.
+    :return tuple[OptimConfig, LoggingConfig]: Effective optim/logging configs.
+    """
+    if optim_cfg is None:
+        resolved_optim_cfg = OptimConfig(
+            learning_rate=getattr(train_cfg, "learning_rate", 5e-4),
+            generator_learning_rate=getattr(train_cfg, "generator_learning_rate", -1.0),
+            discriminator_learning_rate=getattr(train_cfg, "discriminator_learning_rate", -1.0),
+            weight_decay=getattr(train_cfg, "weight_decay", 0.01),
+            adam_beta1=getattr(train_cfg, "adam_beta1", 0.9),
+            adam_beta2=getattr(train_cfg, "adam_beta2", 0.999),
+            adam_epsilon=getattr(train_cfg, "adam_epsilon", 1e-8),
+            lr_scheduler_type=getattr(train_cfg, "lr_scheduler_type", "linear"),
+            warmup_steps=getattr(train_cfg, "warmup_steps", 1_000),
+            max_grad_norm=getattr(train_cfg, "max_grad_norm", 1.0),
+        )
+    else:
+        resolved_optim_cfg = optim_cfg
+
+    if logging_cfg is None:
+        resolved_logging_cfg = LoggingConfig(
+            project_name=getattr(train_cfg, "project_name", "deberta-train"),
+            run_name=getattr(train_cfg, "run_name", None),
+            output_dir=getattr(train_cfg, "logging_output_dir", None),
+            logging_steps=getattr(train_cfg, "logging_steps", 50),
+            report_to=getattr(train_cfg, "report_to", "none"),
+            wandb_watch=getattr(train_cfg, "wandb_watch", "gradients"),
+            wandb_watch_log_freq=getattr(train_cfg, "wandb_watch_log_freq", 100),
+            debug_metrics=getattr(train_cfg, "debug_metrics", False),
+        )
+    else:
+        resolved_logging_cfg = logging_cfg
+
+    return resolved_optim_cfg, resolved_logging_cfg
+
+
 def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run non-destructive preflight checks for `deberta train`.
@@ -1310,28 +1667,60 @@ def run_pretraining_dry_run(
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
     :param TrainConfig train_cfg: Training configuration.
+    :param OptimConfig | None optim_cfg: Optional optimizer configuration.
+    :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path.
     :raises RuntimeError: If a preflight stage fails.
     :return dict[str, Any]: Summary of resolved dry-run checks.
     """
+    resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    validate_optim_config(resolved_optim_cfg)
+    validate_logging_config(resolved_logging_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
 
-    output_dir = _resolve_output_dir(
+    checkpoint_output_dir = _resolve_output_dir(
         output_dir=train_cfg.output_dir,
         project_name=train_cfg.project_name,
         config_path=config_path,
         run_name=train_cfg.run_name,
     )
+    logging_output_dir = (
+        Path(str(resolved_logging_cfg.output_dir))
+        if resolved_logging_cfg.output_dir is not None and str(resolved_logging_cfg.output_dir).strip()
+        else checkpoint_output_dir
+    )
     _validate_output_dir_preflight(
-        output_dir=output_dir,
+        output_dir=checkpoint_output_dir,
         overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
     )
     ckpt = _resolve_resume_checkpoint(
-        output_dir=output_dir,
+        output_dir=checkpoint_output_dir,
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=True,
     )
@@ -1354,10 +1743,13 @@ def run_pretraining_dry_run(
 
     # Validate run snapshot compatibility in resume mode, without writing files.
     _persist_or_validate_run_configs(
-        output_dir=output_dir,
+        output_dir=checkpoint_output_dir,
+        logging_output_dir=logging_output_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
         resume_checkpoint=ckpt,
         config_path=config_path,
         is_main_process=False,
@@ -1453,7 +1845,9 @@ def run_pretraining_dry_run(
 
     return {
         "status": "ok",
-        "output_dir": str(output_dir),
+        "output_dir": str(checkpoint_output_dir),
+        "checkpoint_output_dir": str(checkpoint_output_dir),
+        "logging_output_dir": str(logging_output_dir),
         "resume_checkpoint": str(ckpt) if ckpt is not None else None,
         "effective_compile_scope": str(compile_scope) if compile_enabled else None,
         "mixed_precision": str(mixed_precision),
@@ -1465,339 +1859,13 @@ def run_pretraining_dry_run(
     }
 
 
-def _token_weighted_micro_objective(
-    *,
-    gen_loss: torch.Tensor,
-    disc_loss: torch.Tensor,
-    gen_count: float,
-    disc_count: float,
-    gen_window_tokens_per_rank: float,
-    disc_window_tokens_per_rank: float,
-    gen_loss_weight: float,
-    disc_loss_weight: float,
-    decoupled_loss_scaling: bool,
-) -> torch.Tensor:
-    """Build token-weighted microbatch objective for one accumulation window.
-
-    :param torch.Tensor gen_loss: Generator loss mean for the microbatch.
-    :param torch.Tensor disc_loss: Discriminator loss mean for the microbatch.
-    :param float gen_count: Generator token count for the microbatch.
-    :param float disc_count: Discriminator token count for the microbatch.
-    :param float gen_window_tokens_per_rank: Mean generator-token total per rank in the accumulation window.
-    :param float disc_window_tokens_per_rank: Mean discriminator-token total per rank in the accumulation window.
-    :param float gen_loss_weight: Generator loss weight.
-    :param float disc_loss_weight: Discriminator loss weight.
-    :param bool decoupled_loss_scaling: Whether to use DeBERTa-style decoupled scaling.
-    :return torch.Tensor: Unscaled microbatch objective contribution.
-    """
-    gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
-    disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
-
-    gen_term = compute_generator_loss_term(
-        gen_loss=gen_loss,
-        disc_loss=disc_loss,
-        decoupled_loss_scaling=bool(decoupled_loss_scaling),
-    )
-
-    return float(gen_loss_weight) * gen_scale * gen_term + float(disc_loss_weight) * disc_scale * disc_loss
-
-
-def _resolve_window_token_denominators(
-    *, gen_window_tokens_per_rank_raw: float, disc_window_tokens_per_rank_raw: float
-) -> tuple[float, float, bool, bool]:
-    """Resolve safe per-window token denominators for token-weighted GA.
-
-    :param float gen_window_tokens_per_rank_raw: Raw mean generator-token count per rank for the window.
-    :param float disc_window_tokens_per_rank_raw: Raw mean discriminator-token count per rank for the window.
-    :return tuple[float, float, bool, bool]: ``(gen_denom, disc_denom, gen_is_zero, disc_is_zero)``.
-    """
-    gen_zero = float(gen_window_tokens_per_rank_raw) <= 0.0
-    disc_zero = float(disc_window_tokens_per_rank_raw) <= 0.0
-    gen_denom = max(float(gen_window_tokens_per_rank_raw), 1.0)
-    disc_denom = max(float(disc_window_tokens_per_rank_raw), 1.0)
-    return float(gen_denom), float(disc_denom), bool(gen_zero), bool(disc_zero)
-
-
-def _finalize_window_metric_loss(
-    *, accumulated_loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool
-) -> torch.Tensor:
-    """Finalize per-window loss metric for logging.
-
-    :param torch.Tensor accumulated_loss: Sum of microbatch metric contributions.
-    :param int ga_steps: Gradient accumulation steps in the window.
-    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
-    :return torch.Tensor: Window-level scalar loss metric.
-    """
-    if token_weighted_ga:
-        # Token-weighted path already accumulates normalized micro objectives.
-        return accumulated_loss
-    denom = max(1, int(ga_steps))
-    return accumulated_loss / float(denom)
-
-
-def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighted_ga: bool) -> torch.Tensor:
-    """Prepare microbatch loss for ``Accelerator.backward``.
-
-    Accelerate scales all backward losses by ``1 / gradient_accumulation_steps``.
-    Token-weighted micro objectives are already normalized over the accumulation
-    window, so we cancel that scaling for the token-weighted path only.
-    This helper is intentionally coupled to ``accelerator.accumulate(...)`` semantics.
-
-    :param torch.Tensor loss: Raw microbatch loss/objective.
-    :param int ga_steps: Gradient accumulation steps.
-    :param bool token_weighted_ga: Whether token-weighted GA is enabled.
-    :return torch.Tensor: Loss to pass into ``accelerator.backward``.
-    """
-    if not token_weighted_ga:
-        return loss
-    return loss * float(max(1, int(ga_steps)))
-
-
-def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
-    """Return whether gradient clipping should run for this micro-step.
-
-    :param bool sync_gradients: Whether gradients are synchronized this step.
-    :param float | int | None max_grad_norm: Configured clipping norm.
-    :return bool: ``True`` when clipping should be applied.
-    """
-    if not bool(sync_gradients):
-        return False
-    if max_grad_norm is None:
-        return False
-    return float(max_grad_norm) > 0.0
-
-
-_REPO_URL = "https://github.com/pszemraj/deberta"
-
-
-def _write_export_readme(
-    output_dir: Path,
-    *,
-    model_cfg: Any,
-    data_cfg: Any | None = None,
-    train_cfg: Any,
-    embedding_sharing: str,
-) -> None:
-    """Write a basic README.md and LICENSE to the export directory.
-
-    :param Path output_dir: Export destination directory.
-    :param Any model_cfg: Model configuration dataclass.
-    :param Any | None data_cfg: Optional data configuration dataclass.
-    :param Any train_cfg: Training configuration dataclass.
-    :param str embedding_sharing: Embedding sharing mode.
-    """
-    backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
-    hidden = int(getattr(model_cfg, "hidden_size", 0))
-    layers = int(getattr(model_cfg, "num_hidden_layers", 0) or 0)
-    heads = int(getattr(model_cfg, "num_attention_heads", 0) or 0)
-    seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
-    if seq_len == 0:
-        seq_len = int(getattr(model_cfg, "max_position_embeddings", 0) or 0)
-    steps = int(getattr(train_cfg, "max_steps", 0) or 0)
-
-    if backbone == "rope":
-        arch_desc = "RoPE encoder (RMSNorm, SwiGLU, rotary embeddings)"
-        usage_snippet = """from transformers import AutoTokenizer
-from deberta.modeling.rope_encoder import DebertaRoPEModel
-
-model = DebertaRoPEModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
-"""
-        compatibility_note = (
-            "Note: RoPE exports use a custom `model_type` (`deberta-rope`) and are not currently "
-            "loadable via `transformers.AutoModel.from_pretrained(...)` without custom auto-class registration."
-        )
-    else:
-        arch_desc = "DeBERTa-v2 (disentangled attention, LayerNorm)"
-        usage_snippet = """from transformers import AutoModel, AutoTokenizer
-
-model = AutoModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
-"""
-        compatibility_note = ""
-
-    readme = f"""---
-library_name: transformers
-tags:
-- deberta
-- encoder
-- rtd
-- fill-mask
-license: mit
----
-
-# {backbone}-{hidden}h-{layers}L-{heads}H
-
-RTD-pretrained encoder ({arch_desc}).
-
-| Parameter | Value |
-|---|---|
-| Backbone | `{backbone}` |
-| Hidden size | {hidden} |
-| Layers | {layers} |
-| Attention heads | {heads} |
-| Max sequence length | {seq_len} |
-| Embedding sharing | `{embedding_sharing}` |
-| Training steps | {steps} |
-
-## Training
-
-Pretrained with replaced-token detection (RTD / ELECTRA-style) using
-[pszemraj/deberta]({_REPO_URL}).
-
-## Usage
-
-```python
-{usage_snippet}
-```
-{compatibility_note}
-"""
-    (output_dir / "README.md").write_text(readme, encoding="utf-8")
-
-    mit_license = (
-        "MIT License\n\n"
-        "Copyright (c) 2025-2026 Peter Szemraj\n\n"
-        "Permission is hereby granted, free of charge, to any person obtaining a copy\n"
-        'of this software and associated documentation files (the "Software"), to deal\n'
-        "in the Software without restriction, including without limitation the rights\n"
-        "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n"
-        "copies of the Software, and to permit persons to whom the Software is\n"
-        "furnished to do so, subject to the following conditions:\n\n"
-        "The above copyright notice and this permission notice shall be included in all\n"
-        "copies or substantial portions of the Software.\n\n"
-        'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n'
-        "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n"
-        "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n"
-        "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n"
-        "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n"
-        "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n"
-        "SOFTWARE.\n"
-    )
-    (output_dir / "LICENSE").write_text(mit_license, encoding="utf-8")
-
-
-def _export_discriminator_hf(
-    *,
-    accelerator: Any,
-    model: DebertaV3RTDPretrainer,
-    tokenizer: Any,
-    output_dir: Path,
-    embedding_sharing: str,
-    model_cfg: Any = None,
-    data_cfg: Any = None,
-    train_cfg: Any = None,
-) -> None:
-    """Best-effort export of a standalone discriminator model.
-
-    Why "best-effort"?
-      - Under FSDP2 + SHARDED_STATE_DICT, gathering a full state dict inside the training process
-        can fail depending on accelerate/FSDP state-dict configuration.
-      - For a *guaranteed* export from sharded checkpoints, use `deberta export` which
-        loads the checkpoint and consolidates weights with FULL_STATE_DICT on rank0.
-
-    This function is intentionally lightweight and is safe to keep enabled by default.
-
-    :param Any accelerator: Accelerate runtime object.
-    :param DebertaV3RTDPretrainer model: Wrapped RTD pretrainer.
-    :param Any tokenizer: Tokenizer to export.
-    :param Path output_dir: Export destination directory.
-    :param str embedding_sharing: Sharing mode used during training.
-    :param Any model_cfg: Optional model config for README generation.
-    :param Any data_cfg: Optional data config for README generation.
-    :param Any train_cfg: Optional training config for README generation.
-    """
-
-    try:
-        unwrapped = unwrap_compiled_model(accelerator, model)
-
-        # Try to gather state dicts via accelerator (preferred for distributed).
-        # Under sharded engines this can be collective; all ranks must participate.
-        disc_mod = getattr(unwrapped, "discriminator", None)
-        gen_mod = getattr(unwrapped, "generator", None)
-        if disc_mod is None or gen_mod is None:
-            raise RuntimeError(
-                "Unwrapped RTD model must expose discriminator and generator modules for export."
-            )
-        disc_sd_raw = accelerator.get_state_dict(disc_mod)
-        gen_sd_raw = accelerator.get_state_dict(gen_mod)
-
-        if not accelerator.is_main_process:
-            return
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            from transformers import AutoModel
-        except Exception as e:
-            logger.warning(f"Skipping HF export: transformers import failed: {e}")
-            return
-
-        try:
-            from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
-        except Exception:
-            DebertaRoPEConfig = None  # type: ignore
-            DebertaRoPEModel = None  # type: ignore
-
-        disc_sd = canonicalize_state_dict_keys(dict(disc_sd_raw))
-        gen_sd = canonicalize_state_dict_keys(dict(gen_sd_raw))
-
-        # Build a fresh model from config.
-        if DebertaRoPEConfig is not None and isinstance(
-            getattr(unwrapped, "disc_config", None), DebertaRoPEConfig
-        ):
-            export_disc = DebertaRoPEModel(unwrapped.disc_config)  # type: ignore[arg-type]
-        else:
-            export_disc = AutoModel.from_config(unwrapped.disc_config)
-
-        # Load overlap keys only to tolerate training/export module-shape differences.
-        missing = load_intersection_state_dict(export_disc, disc_sd)
-        if missing.missing_keys:
-            logger.info(
-                f"HF export: missing keys (often expected with tied embeddings): {missing.missing_keys[:5]}..."
-            )
-
-        mode = (embedding_sharing or "none").lower()
-        merge_embeddings_into_export_backbone(
-            export_model=export_disc,
-            disc_sd=disc_sd,
-            gen_sd=gen_sd,
-            mode=mode,
-            fp32_accumulate=True,
-        )
-
-        tokenizer.save_pretrained(str(output_dir))
-        export_disc.save_pretrained(str(output_dir), safe_serialization=True)
-
-        # Strip training-internal keys from the exported config.json.
-        _clean_exported_config_impl(output_dir / "config.json", strict=False)
-
-        dump_json({"embedding_sharing": embedding_sharing}, output_dir / "export_meta.json")
-
-        # Write README.md and LICENSE.
-        if model_cfg is not None and train_cfg is not None:
-            _write_export_readme(
-                output_dir,
-                model_cfg=model_cfg,
-                data_cfg=data_cfg,
-                train_cfg=train_cfg,
-                embedding_sharing=embedding_sharing,
-            )
-
-        logger.info(f"Exported discriminator to: {output_dir}")
-
-    except Exception as e:
-        logger.warning(
-            "HF export failed (common under FSDP2 + SHARDED_STATE_DICT). "
-            "Use `deberta export` after training for a guaranteed consolidation+export. "
-            f"Error: {e}"
-        )
-
-
 def run_pretraining(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> None:
     """Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
@@ -1805,10 +1873,28 @@ def run_pretraining(
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
     :param TrainConfig train_cfg: Training configuration.
+    :param OptimConfig | None optim_cfg: Optional optimizer configuration.
+    :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path for auto output-dir naming.
     """
     from accelerate import Accelerator
     from accelerate.utils import set_seed
+
+    try:
+        from accelerate import DistributedDataParallelKwargs
+    except Exception:  # pragma: no cover
+        DistributedDataParallelKwargs = None  # type: ignore[assignment]
+
+    resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
 
     # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
@@ -1816,19 +1902,40 @@ def run_pretraining(
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
-    train_cfg.mixed_precision = mixed_precision
+    object.__setattr__(train_cfg, "mixed_precision", mixed_precision)
+    accelerator_kwargs: dict[str, Any] = {
+        "gradient_accumulation_steps": train_cfg.gradient_accumulation_steps,
+        "log_with": log_with,
+        "mixed_precision": mixed_precision,
+    }
+    if bool(train_cfg.decoupled_training) and DistributedDataParallelKwargs is not None:
+        # Generator/discriminator phases each touch only a subset of parameters.
+        # DDP must track unused params to avoid cross-rank reducer stalls.
+        accelerator_kwargs["kwargs_handlers"] = [DistributedDataParallelKwargs(find_unused_parameters=True)]
     accelerator = Accelerator(
-        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
-        log_with=log_with,
-        mixed_precision=mixed_precision,
+        **accelerator_kwargs,
     )
 
     setup_process_logging(accelerator.is_main_process)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     # Validate config contract up-front before side effects (filesystem/network/model loading).
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    validate_optim_config(resolved_optim_cfg)
+    validate_logging_config(resolved_logging_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
     compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
     compile_scope = compile_scope_requested
@@ -1873,11 +1980,27 @@ def run_pretraining(
         config_path=config_path,
         run_name=train_cfg.run_name,
     )
-    train_cfg.output_dir = str(output_dir)
+    object.__setattr__(train_cfg.checkpoint, "output_dir", str(output_dir))
+    if resolved_logging_cfg.output_dir is None or not str(resolved_logging_cfg.output_dir).strip():
+        logging_output_dir = output_dir
+    else:
+        logging_output_dir = Path(str(resolved_logging_cfg.output_dir)).expanduser().resolve()
+    object.__setattr__(resolved_logging_cfg, "output_dir", str(logging_output_dir))
+    _sync_legacy_train_aliases(
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+    )
     if accelerator.is_main_process and (
         configured_output_dir is None or not str(configured_output_dir).strip()
     ):
         logger.info("train.output_dir unset; auto-selected output_dir=%s", output_dir)
+    if accelerator.is_main_process and logging_output_dir != output_dir:
+        logger.info(
+            "logging.output_dir explicitly set to %s (checkpoint output_dir=%s)",
+            logging_output_dir,
+            output_dir,
+        )
 
     # Make/validate output dir on main.
     _prepare_output_dir(
@@ -1886,6 +2009,9 @@ def run_pretraining(
         resume_from_checkpoint=train_cfg.resume_from_checkpoint,
         is_main_process=accelerator.is_main_process,
     )
+    if accelerator.is_main_process:
+        logging_output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     ckpt = _resolve_resume_checkpoint_for_accelerator(
         accelerator=accelerator,
         output_dir=output_dir,
@@ -1893,9 +2019,12 @@ def run_pretraining(
     )
     _persist_or_validate_run_configs(
         output_dir=output_dir,
+        logging_output_dir=logging_output_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
         resume_checkpoint=ckpt,
         config_path=config_path,
         is_main_process=accelerator.is_main_process,
@@ -1992,25 +2121,59 @@ def run_pretraining(
         additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
 
-    # Optimizer + scheduler
-    optimizer = _build_optimizer(
-        model,
-        train_cfg,
-        backbone_type=str(model_cfg.backbone_type),
-        compile_enabled=compile_enabled,
-        compile_scope=compile_scope,
-        mixed_precision=mixed_precision,
-    )
-    param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
-    lr_scheduler = _build_scheduler(optimizer, train_cfg)
+    effective_decoupled_training = bool(train_cfg.decoupled_training)
+    if effective_decoupled_training and (
+        not hasattr(model, "forward_generator_phase") or not hasattr(model, "forward_discriminator_phase")
+    ):
+        raise RuntimeError(
+            "train.decoupled_training=true requires runtime model methods "
+            "forward_generator_phase and forward_discriminator_phase."
+        )
 
-    # Prepare (wrap for DDP/FSDP etc)
-    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+    optimizer: torch.optim.Optimizer | None = None
+    lr_scheduler: Any | None = None
+    gen_optimizer: torch.optim.Optimizer | None = None
+    disc_optimizer: torch.optim.Optimizer | None = None
+    gen_lr_scheduler: Any | None = None
+    disc_lr_scheduler: Any | None = None
+    param_digest: str | dict[str, str]
+
+    # Optimizer + scheduler
+    if effective_decoupled_training:
+        gen_optimizer, disc_optimizer = _build_decoupled_optimizers(
+            model,
+            train_cfg,
+            mixed_precision=mixed_precision,
+        )
+        gen_lr_scheduler = _build_scheduler(gen_optimizer, train_cfg)
+        disc_lr_scheduler = _build_scheduler(disc_optimizer, train_cfg)
+        param_digest = {
+            "generator": str(getattr(gen_optimizer, "_param_order_digest", "")),
+            "discriminator": str(getattr(disc_optimizer, "_param_order_digest", "")),
+        }
+        model, gen_optimizer, disc_optimizer, gen_lr_scheduler, disc_lr_scheduler = accelerator.prepare(
+            model, gen_optimizer, disc_optimizer, gen_lr_scheduler, disc_lr_scheduler
+        )
+        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+        _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
+    else:
+        optimizer = _build_optimizer(
+            model,
+            train_cfg,
+            backbone_type=str(model_cfg.backbone_type),
+            compile_enabled=compile_enabled,
+            compile_scope=compile_scope,
+            mixed_precision=mixed_precision,
+        )
+        param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
+        lr_scheduler = _build_scheduler(optimizer, train_cfg)
+        model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        _record_unscaled_lrs(optimizer, lr_scheduler)
 
     # GDES embedding sharing uses synced non-trainable base weights inside discriminator embeddings.
     # Those tensors must be initialized/synced from generator weights before any compiled forward runs.
     with suppress(Exception):
-        _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
+        _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
     # torch.compile
     #
@@ -2068,6 +2231,22 @@ def run_pretraining(
                 f"torch.compile failed for scope={compile_scope}, mode={compile_mode}, backend={compile_backend}."
             ) from e
 
+    tracker_cfg_runtime = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
+        disc_config=disc_config,
+        gen_config=gen_config,
+        tokenizer=tokenizer,
+    )
+    if accelerator.is_main_process:
+        try:
+            _dump_yaml_mapping(tracker_cfg_runtime, logging_output_dir / "config_resolved.yaml")
+        except Exception:
+            logger.exception("Failed to write runtime-resolved config snapshot.")
+
     global_step = 0
     consumed_micro_batches = 0
     consumed_micro_batches_committed = 0
@@ -2081,9 +2260,8 @@ def run_pretraining(
     crash_step: int | None = None
     exit_code = 0
     train_started_at = time.perf_counter()
-    metrics_path = output_dir / "metrics.jsonl.gz"
-    debug_metrics_env_enabled = _env_flag_true("DEBERTA_DEBUG")
-    debug_metrics_enabled = bool(train_cfg.debug_metrics) or bool(debug_metrics_env_enabled)
+    metrics_path = logging_output_dir / "metrics.jsonl.gz"
+    debug_metrics_enabled = bool(train_cfg.debug_metrics)
     wandb_run: Any | None = None
     max_tracker_step_logged = 0
     train_progress: Any | None = None
@@ -2110,15 +2288,11 @@ def run_pretraining(
     try:
         # Trackers
         if train_cfg.report_to != "none":
-            tracker_cfg = {
-                "model": asdict(model_cfg),
-                "data": asdict(data_cfg),
-                "train": asdict(train_cfg),
-            }
+            tracker_cfg = dict(tracker_cfg_runtime)
             if train_cfg.run_name is not None and str(train_cfg.run_name).strip():
                 tracker_run_name = str(train_cfg.run_name).strip()
             else:
-                tracker_run_name = output_dir.name
+                tracker_run_name = logging_output_dir.name
             _init_trackers(
                 accelerator=accelerator,
                 project_name=str(train_cfg.project_name).strip(),
@@ -2127,16 +2301,32 @@ def run_pretraining(
                 run_name=tracker_run_name,
             )
             if str(train_cfg.report_to).lower() == "wandb":
-                with suppress(Exception):
+                try:
                     wandb_run = accelerator.get_tracker("wandb", unwrap=True)
-                with suppress(Exception):
-                    _upload_wandb_original_config(
+                except Exception:
+                    wandb_run = None
+                    logger.exception("Failed to resolve W&B tracker from Accelerator.")
+
+                try:
+                    uploaded_config = _upload_wandb_original_config(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
-                        config_original_path=output_dir / "config_original.yaml",
+                        config_original_path=logging_output_dir / "config_original.yaml",
                         run_name=tracker_run_name,
+                        config_resolved_path=logging_output_dir / "config_resolved.yaml",
+                        config_source_path=config_path,
                     )
-                with suppress(Exception):
+                    if not uploaded_config:
+                        logger.warning(
+                            "W&B config snapshot upload skipped; expected paths: %s, %s (source=%s).",
+                            logging_output_dir / "config_original.yaml",
+                            logging_output_dir / "config_resolved.yaml",
+                            config_path,
+                        )
+                except Exception:
+                    logger.exception("Failed to upload config snapshots to W&B.")
+
+                try:
                     _setup_wandb_watch(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
@@ -2144,6 +2334,8 @@ def run_pretraining(
                         watch_mode=train_cfg.wandb_watch,
                         watch_log_freq=int(train_cfg.wandb_watch_log_freq),
                     )
+                except Exception:
+                    logger.exception("Failed to initialize W&B model watch.")
 
         # Resume
         if ckpt:
@@ -2153,10 +2345,18 @@ def run_pretraining(
                 model=model,
                 checkpoint_dir=ckpt,
             )
+            if effective_decoupled_training:
+                if gen_optimizer is not None and gen_lr_scheduler is not None:
+                    _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+                if disc_optimizer is not None and disc_lr_scheduler is not None:
+                    _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
+            else:
+                if optimizer is not None and lr_scheduler is not None:
+                    _record_unscaled_lrs(optimizer, lr_scheduler)
 
             # GDES base weights are non-persistent and must be refreshed after loading a checkpoint.
             with suppress(Exception):
-                _sync_discriminator_embeddings_if_available(unwrap_compiled_model(accelerator, model))
+                _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
             (
                 restored,
@@ -2219,7 +2419,38 @@ def run_pretraining(
             consumed_micro_batches_committed = int(consumed_micro_batches)
             lr_mult = float(restored_lr_mult)
 
-            if saved_digest is not None and saved_digest != param_digest:
+            if saved_digest is None:
+                logger.warning(
+                    "Checkpoint '%s' has no optimizer_param_digest; skipping param-order "
+                    "validation. Future checkpoints will include the digest.",
+                    ckpt,
+                )
+            elif isinstance(saved_digest, dict):
+                if isinstance(param_digest, dict):
+                    mismatch = {
+                        key: (saved_digest.get(key), param_digest.get(key))
+                        for key in ("generator", "discriminator")
+                        if saved_digest.get(key) != param_digest.get(key)
+                    }
+                    if mismatch:
+                        raise RuntimeError(
+                            f"Optimizer parameter-order digest mismatch on resume from '{ckpt}'. "
+                            f"Mismatched keys: {mismatch}. Start a new run or restore with matching code."
+                        )
+                else:
+                    # Back-compat for transitioning from single optimizer to decoupled mode.
+                    logger.warning(
+                        "Checkpoint '%s' stores decoupled optimizer digests, but current run uses a single optimizer. "
+                        "Skipping strict digest validation.",
+                        ckpt,
+                    )
+            elif isinstance(param_digest, dict):
+                logger.warning(
+                    "Checkpoint '%s' stores legacy single optimizer digest while current run uses decoupled mode. "
+                    "Skipping strict digest validation for this resume.",
+                    ckpt,
+                )
+            elif saved_digest != param_digest:
                 raise RuntimeError(
                     f"Optimizer parameter-order digest mismatch on resume from '{ckpt}'. "
                     f"Saved digest: {saved_digest}, current digest: {param_digest}. "
@@ -2227,12 +2458,6 @@ def run_pretraining(
                     "checkpoint code version and the current code version. Resuming would "
                     "silently map optimizer momentum/variance to wrong parameters. "
                     "Start a new run or restore with matching code."
-                )
-            if saved_digest is None:
-                logger.warning(
-                    "Checkpoint '%s' has no optimizer_param_digest; skipping param-order "
-                    "validation. Future checkpoints will include the digest.",
-                    ckpt,
                 )
 
             max_tracker_step_logged = max(int(max_tracker_step_logged), int(global_step))
@@ -2302,6 +2527,615 @@ def run_pretraining(
         zero_disc_window_total = 0
         zero_gen_window_since_log = 0
         zero_disc_window_since_log = 0
+
+        if effective_decoupled_training:
+            if gen_optimizer is None or disc_optimizer is None:
+                raise RuntimeError("Decoupled training requires generator/discriminator optimizers.")
+            if gen_lr_scheduler is None or disc_lr_scheduler is None:
+                raise RuntimeError("Decoupled training requires generator/discriminator schedulers.")
+
+            while global_step < int(train_cfg.max_steps):
+                window: list[tuple[dict[str, torch.Tensor], float, float, bool]] = []
+                local_window_input_tokens = 0.0
+                local_gen_tokens = 0.0
+                local_disc_tokens = 0.0
+
+                for _ in range(ga_steps):
+                    batch = next(train_iter)
+                    consumed_micro_batches += 1
+                    local_window_input_tokens += _count_input_tokens_for_batch(batch)
+                    # CPU-side flag used to avoid per-microbatch GPU syncs on gen_token_count.
+                    has_gen_targets = bool(batch["labels"].ne(-100).any().item())
+                    if token_weighted_ga:
+                        gen_count, disc_count = _count_rtd_tokens_for_batch(
+                            batch,
+                            pad_token_id=disc_pad_token_id,
+                        )
+                        local_gen_tokens += gen_count
+                        local_disc_tokens += disc_count
+                    else:
+                        gen_count, disc_count = 1.0, 1.0
+                    window.append((batch, gen_count, disc_count, has_gen_targets))
+
+                local_input_tokens_seen += local_window_input_tokens
+                local_input_tokens_since_log += local_window_input_tokens
+                if token_weighted_ga:
+                    local_totals = torch.tensor(
+                        [local_gen_tokens, local_disc_tokens],
+                        device=accelerator.device,
+                        dtype=torch.float32,
+                    )
+                    mean_totals = accelerator.reduce(local_totals, reduction="mean")
+                    raw_gen_window_tokens_per_rank = float(mean_totals[0].item())
+                    raw_disc_window_tokens_per_rank = float(mean_totals[1].item())
+                    (
+                        gen_window_tokens_per_rank,
+                        disc_window_tokens_per_rank,
+                        gen_window_zero_tokens,
+                        disc_window_zero_tokens,
+                    ) = _resolve_window_token_denominators(
+                        gen_window_tokens_per_rank_raw=raw_gen_window_tokens_per_rank,
+                        disc_window_tokens_per_rank_raw=raw_disc_window_tokens_per_rank,
+                    )
+                    if gen_window_zero_tokens:
+                        zero_gen_window_total += 1
+                        zero_gen_window_since_log += 1
+                    if disc_window_zero_tokens:
+                        zero_disc_window_total += 1
+                        zero_disc_window_since_log += 1
+                    if accelerator.is_main_process and (gen_window_zero_tokens or disc_window_zero_tokens):
+                        logger.warning(
+                            "Token-weighted GA window has zero effective tokens "
+                            "(next_step=%d, gen_zero=%s, disc_zero=%s, gen_raw=%.1f, disc_raw=%.1f); "
+                            "corresponding loss term is zero-weighted for this window.",
+                            int(global_step + 1),
+                            bool(gen_window_zero_tokens),
+                            bool(disc_window_zero_tokens),
+                            float(raw_gen_window_tokens_per_rank),
+                            float(raw_disc_window_tokens_per_rank),
+                        )
+                else:
+                    gen_window_tokens_per_rank = 1.0
+                    disc_window_tokens_per_rank = 1.0
+
+                disc_phase_inputs: list[dict[str, torch.Tensor | float | None]] = []
+                loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                gen_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                disc_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                disc_acc_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                gen_token_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                disc_token_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                disc_positive_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                skipped_window_due_nonfinite = False
+                nonfinite_reason: str | None = None
+                nonfinite_debug_path: Path | None = None
+                did_gen_optimizer_step = False
+                did_disc_optimizer_step = False
+                gen_phase_out: Any | None = None
+                disc_phase_out: Any | None = None
+                gen_loss_weight = float(train_cfg.gen_loss_weight)
+                disc_loss_weight = float(train_cfg.disc_loss_weight)
+                gen_phase_enabled = gen_loss_weight != 0.0
+                disc_phase_enabled = disc_loss_weight != 0.0
+
+                gen_optimizer.zero_grad(set_to_none=True)
+                disc_optimizer.zero_grad(set_to_none=True)
+
+                # Phase 1: generator update + corruption target construction.
+                gen_window_nonfinite_local = False
+                gen_first_nonfinite_reason_local: str | None = None
+                gen_first_nonfinite_micro_step: int | None = None
+                for step_idx, (batch, gen_count, disc_count, has_gen_targets) in enumerate(window):
+                    batch = _move_batch_to_device(batch, accelerator.device)
+                    doc_ids = batch.pop("doc_ids", None)
+                    if doc_ids is not None:
+                        batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+                    batch = _stabilize_compile_attention_mask(
+                        batch=batch,
+                        compile_enabled=compile_enabled,
+                        compile_scope=compile_scope,
+                        backbone_type=str(model_cfg.backbone_type),
+                        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+                    )
+                    if compile_enabled:
+                        _maybe_cudagraph_mark_step_begin()
+
+                    is_sync_step = step_idx == (ga_steps - 1)
+                    sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
+                    with sync_ctx:
+                        gen_phase_out = model(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch.get("attention_mask"),
+                            labels=batch["labels"],
+                            token_type_ids=batch.get("token_type_ids"),
+                            sampling_temperature=train_cfg.sampling_temperature,
+                            phase="generator",
+                        )
+                        gen_loss = gen_phase_out.gen_loss_raw
+                        if token_weighted_ga:
+                            gen_obj = gen_loss * (
+                                float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
+                            )
+                        else:
+                            gen_obj = gen_loss
+                        loss_for_metrics = loss_for_metrics + (gen_loss_weight * gen_obj.detach())
+
+                        offending: str | None = None
+                        if not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all():
+                            offending = "gen_loss_raw"
+
+                        backward_loss: torch.Tensor | None = None
+                        if offending is None and gen_phase_enabled:
+                            weighted_gen_obj = gen_obj * gen_loss_weight
+                            backward_loss = _scale_loss_for_backward(
+                                loss=weighted_gen_obj,
+                                ga_steps=ga_steps,
+                                token_weighted_ga=token_weighted_ga,
+                            )
+                            if not torch.isfinite(backward_loss.detach()).all():
+                                offending = "gen_backward_loss"
+
+                        if offending is not None:
+                            gen_window_nonfinite_local = True
+                            if gen_first_nonfinite_reason_local is None:
+                                gen_first_nonfinite_reason_local = str(offending)
+                                gen_first_nonfinite_micro_step = int(step_idx)
+
+                        # Keep non-finite coordination out of non-sync microsteps to preserve
+                        # no_sync accumulation performance characteristics.
+                        if is_sync_step and _any_rank_flag_true(
+                            accelerator=accelerator,
+                            flag=gen_window_nonfinite_local,
+                        ):
+                            offending_effective = (
+                                str(gen_first_nonfinite_reason_local)
+                                if gen_first_nonfinite_reason_local is not None
+                                else "other_rank_nonfinite"
+                            )
+                            offending_micro_step = (
+                                int(gen_first_nonfinite_micro_step)
+                                if gen_first_nonfinite_micro_step is not None
+                                else int(step_idx)
+                            )
+                            skipped_window_due_nonfinite = True
+                            nonfinite_skip_total += 1
+                            nonfinite_skip_streak += 1
+                            nonfinite_reason = str(offending_effective)
+                            lr_now = _scheduler_current_lr(gen_lr_scheduler)
+                            nonfinite_debug_path = _write_nonfinite_debug_artifact(
+                                output_dir=logging_output_dir,
+                                step=int(global_step + 1),
+                                micro_step_idx=int(offending_micro_step),
+                                offending=str(offending_effective),
+                                gen_loss_raw=gen_phase_out.gen_loss_raw,
+                                disc_loss_raw=None,
+                                forward_loss=gen_phase_out.gen_loss_raw,
+                                backward_loss=backward_loss,
+                                grad_norm=None,
+                                lr=lr_now,
+                                compile_enabled=compile_enabled,
+                                compile_mode=compile_mode,
+                                embedding_sharing=str(model_cfg.embedding_sharing),
+                            )
+                            gen_optimizer.zero_grad(set_to_none=True)
+                            disc_optimizer.zero_grad(set_to_none=True)
+                            break
+                        if offending is not None:
+                            continue
+
+                        micro_gen_token_count = gen_phase_out.gen_token_count.detach().float()
+                        gen_token_count_window = gen_token_count_window + micro_gen_token_count
+                        gen_loss_num = gen_loss_num + (
+                            gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
+                        )
+                        # Keep discriminator micro-step counts aligned across ranks:
+                        # when local generator targets are absent we still run the
+                        # corresponding discriminator pass with zero objective weight.
+                        # Prefer explicit phase metadata when available; otherwise
+                        # fall back to CPU labels metadata gathered pre-device transfer.
+                        phase_has_targets = getattr(gen_phase_out, "has_masked_targets", None)
+                        if phase_has_targets is None:
+                            phase_has_targets = bool(has_gen_targets)
+                        disc_objective_weight = 1.0 if bool(phase_has_targets) else 0.0
+                        disc_phase_inputs.append(
+                            {
+                                "input_ids": batch["input_ids"],
+                                "attention_mask": batch.get("attention_mask"),
+                                "token_type_ids": batch.get("token_type_ids"),
+                                "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
+                                "disc_labels": gen_phase_out.disc_labels,
+                                "disc_count": float(disc_count),
+                                "disc_objective_weight": float(disc_objective_weight),
+                            }
+                        )
+                        if backward_loss is not None:
+                            accelerator.backward(backward_loss)
+
+                    if is_sync_step and not skipped_window_due_nonfinite:
+                        if not gen_phase_enabled:
+                            did_gen_optimizer_step = True
+                            continue
+                        grad_norm_for_check = _global_grad_l2_norm(model)
+                        if _has_nonfinite_grad_norm_any_rank(
+                            accelerator=accelerator,
+                            grad_norm=float(grad_norm_for_check),
+                        ):
+                            skipped_window_due_nonfinite = True
+                            nonfinite_skip_total += 1
+                            nonfinite_skip_streak += 1
+                            nonfinite_reason = "gen_grad_norm_nonfinite"
+                            gen_optimizer.zero_grad(set_to_none=True)
+                            disc_optimizer.zero_grad(set_to_none=True)
+                            break
+                        if _should_clip_gradients(sync_gradients=True, max_grad_norm=train_cfg.max_grad_norm):
+                            accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+                        gen_optimizer.step()
+                        gen_lr_scheduler.step()
+                        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+                        if lr_mult < 1.0:
+                            _apply_lr_mult(gen_optimizer, lr_mult)
+                        gen_optimizer.zero_grad(set_to_none=True)
+                        did_gen_optimizer_step = True
+                        _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
+
+                window_has_global_disc_targets = False
+                if not skipped_window_due_nonfinite and disc_phase_inputs:
+                    window_has_local_disc_targets = any(
+                        float(payload.get("disc_objective_weight", 0.0)) > 0.0
+                        for payload in disc_phase_inputs
+                    )
+                    # Skip all-negative discriminator windows only when every rank has
+                    # zero generator-supervised tokens; otherwise keep per-rank step
+                    # counts aligned and use zero-weight local contributions.
+                    window_has_global_disc_targets = bool(
+                        _sum_local_scalar(
+                            accelerator=accelerator,
+                            x=1.0 if window_has_local_disc_targets else 0.0,
+                        )
+                        > 0.0
+                    )
+
+                # Phase 2: discriminator update from cached corruption targets.
+                if (
+                    not skipped_window_due_nonfinite
+                    and disc_phase_inputs
+                    and bool(window_has_global_disc_targets)
+                ):
+                    disc_phase_steps = len(disc_phase_inputs)
+                    disc_window_nonfinite_local = False
+                    disc_first_nonfinite_reason_local: str | None = None
+                    disc_first_nonfinite_micro_step: int | None = None
+                    for step_idx, payload in enumerate(disc_phase_inputs):
+                        if compile_enabled:
+                            _maybe_cudagraph_mark_step_begin()
+                        is_sync_step = step_idx == (disc_phase_steps - 1)
+                        sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
+                        with sync_ctx:
+                            disc_phase_out = model(
+                                input_ids=payload["input_ids"],  # type: ignore[arg-type]
+                                corrupted_input_ids=payload["corrupted_input_ids"],  # type: ignore[arg-type]
+                                disc_labels=payload["disc_labels"],  # type: ignore[arg-type]
+                                attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
+                                token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
+                                phase="discriminator",
+                            )
+                            disc_loss = disc_phase_out.disc_loss_raw
+                            disc_objective_weight = float(payload.get("disc_objective_weight", 1.0))
+                            if token_weighted_ga:
+                                disc_obj = disc_loss * (
+                                    float(payload["disc_count"])
+                                    / max(float(disc_window_tokens_per_rank), 1.0)
+                                )
+                            else:
+                                disc_obj = disc_loss
+                            disc_obj = disc_obj * float(disc_objective_weight)
+                            loss_for_metrics = loss_for_metrics + (disc_loss_weight * disc_obj.detach())
+                            offending = None
+                            if not torch.isfinite(disc_phase_out.disc_loss_raw.detach()).all():
+                                offending = "disc_loss_raw"
+
+                            backward_loss: torch.Tensor | None = None
+                            if offending is None and disc_phase_enabled:
+                                weighted_disc_obj = disc_obj * disc_loss_weight
+                                backward_loss = _scale_loss_for_backward(
+                                    loss=weighted_disc_obj,
+                                    ga_steps=ga_steps,
+                                    token_weighted_ga=token_weighted_ga,
+                                )
+                                if not torch.isfinite(backward_loss.detach()).all():
+                                    offending = "disc_backward_loss"
+
+                            if offending is not None:
+                                disc_window_nonfinite_local = True
+                                if disc_first_nonfinite_reason_local is None:
+                                    disc_first_nonfinite_reason_local = str(offending)
+                                    disc_first_nonfinite_micro_step = int(step_idx)
+
+                            # Keep non-finite coordination out of non-sync microsteps to preserve
+                            # no_sync accumulation performance characteristics.
+                            if is_sync_step and _any_rank_flag_true(
+                                accelerator=accelerator,
+                                flag=disc_window_nonfinite_local,
+                            ):
+                                offending_effective = (
+                                    str(disc_first_nonfinite_reason_local)
+                                    if disc_first_nonfinite_reason_local is not None
+                                    else "other_rank_nonfinite"
+                                )
+                                offending_micro_step = (
+                                    int(disc_first_nonfinite_micro_step)
+                                    if disc_first_nonfinite_micro_step is not None
+                                    else int(step_idx)
+                                )
+                                skipped_window_due_nonfinite = True
+                                nonfinite_skip_total += 1
+                                nonfinite_skip_streak += 1
+                                nonfinite_reason = str(offending_effective)
+                                lr_now = _scheduler_current_lr(disc_lr_scheduler)
+                                nonfinite_debug_path = _write_nonfinite_debug_artifact(
+                                    output_dir=logging_output_dir,
+                                    step=int(global_step + 1),
+                                    micro_step_idx=int(offending_micro_step),
+                                    offending=str(offending_effective),
+                                    gen_loss_raw=gen_phase_out.gen_loss_raw
+                                    if gen_phase_out is not None
+                                    else None,
+                                    disc_loss_raw=disc_phase_out.disc_loss_raw,
+                                    forward_loss=disc_phase_out.disc_loss_raw,
+                                    backward_loss=backward_loss,
+                                    grad_norm=None,
+                                    lr=lr_now,
+                                    compile_enabled=compile_enabled,
+                                    compile_mode=compile_mode,
+                                    embedding_sharing=str(model_cfg.embedding_sharing),
+                                )
+                                gen_optimizer.zero_grad(set_to_none=True)
+                                disc_optimizer.zero_grad(set_to_none=True)
+                                break
+                            if offending is not None:
+                                continue
+
+                            micro_disc_token_count = disc_phase_out.disc_token_count.detach().float() * float(
+                                disc_objective_weight
+                            )
+                            disc_token_count_window = disc_token_count_window + micro_disc_token_count
+                            disc_positive_count_window = (
+                                disc_positive_count_window
+                                + disc_phase_out.disc_positive_count.detach().float()
+                                * float(disc_objective_weight)
+                            )
+                            disc_loss_num = disc_loss_num + (
+                                disc_phase_out.disc_loss_raw.detach().float() * micro_disc_token_count
+                            )
+                            disc_acc_num = disc_acc_num + (
+                                disc_phase_out.disc_accuracy.detach().float() * micro_disc_token_count
+                            )
+                            if backward_loss is not None:
+                                accelerator.backward(backward_loss)
+
+                        if is_sync_step and not skipped_window_due_nonfinite:
+                            if not disc_phase_enabled:
+                                did_disc_optimizer_step = True
+                                continue
+                            grad_norm_for_check = _global_grad_l2_norm(model)
+                            if _has_nonfinite_grad_norm_any_rank(
+                                accelerator=accelerator,
+                                grad_norm=float(grad_norm_for_check),
+                            ):
+                                skipped_window_due_nonfinite = True
+                                nonfinite_skip_total += 1
+                                nonfinite_skip_streak += 1
+                                nonfinite_reason = "disc_grad_norm_nonfinite"
+                                gen_optimizer.zero_grad(set_to_none=True)
+                                disc_optimizer.zero_grad(set_to_none=True)
+                                break
+                            if _should_clip_gradients(
+                                sync_gradients=True, max_grad_norm=train_cfg.max_grad_norm
+                            ):
+                                accelerator.clip_grad_norm_(
+                                    model.parameters(), float(train_cfg.max_grad_norm)
+                                )
+                            disc_optimizer.step()
+                            disc_lr_scheduler.step()
+                            _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
+                            if lr_mult < 1.0:
+                                _apply_lr_mult(disc_optimizer, lr_mult)
+                            disc_optimizer.zero_grad(set_to_none=True)
+                            did_disc_optimizer_step = True
+
+                if not skipped_window_due_nonfinite and (
+                    not disc_phase_inputs or not bool(window_has_global_disc_targets)
+                ):
+                    # No generator-supervised tokens were produced in this window, so there are
+                    # no discriminator targets to train on.
+                    did_disc_optimizer_step = True
+
+                did_optimizer_step = bool(did_gen_optimizer_step and did_disc_optimizer_step)
+                if not did_optimizer_step:
+                    if skipped_window_due_nonfinite:
+                        # Keep scheduler state moving on skipped windows only for phases that
+                        # did not already step in this accumulation window.
+                        if (not did_gen_optimizer_step) and _optimizer_has_stepped(gen_optimizer):
+                            with suppress(Exception):
+                                gen_lr_scheduler.step()
+                        if (not did_disc_optimizer_step) and _optimizer_has_stepped(disc_optimizer):
+                            with suppress(Exception):
+                                disc_lr_scheduler.step()
+                        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
+                        _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
+                        lr_mult, reset_state = _apply_nonfinite_recovery(
+                            lr_mult=lr_mult,
+                            skip_streak=int(nonfinite_skip_streak),
+                        )
+                        _apply_lr_mult(gen_optimizer, lr_mult)
+                        _apply_lr_mult(disc_optimizer, lr_mult)
+                        if reset_state:
+                            with suppress(Exception):
+                                gen_optimizer.state.clear()
+                            with suppress(Exception):
+                                disc_optimizer.state.clear()
+                        global_step += 1
+                        consumed_micro_batches_committed = int(consumed_micro_batches)
+                        if train_progress is not None:
+                            train_progress.update(1)
+                        if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
+                            ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                            _save_training_checkpoint(
+                                accelerator=accelerator,
+                                checkpoint_dir=ckpt_dir,
+                                output_dir=output_dir,
+                                consumed_micro_batches=consumed_micro_batches_committed,
+                                save_total_limit=int(train_cfg.save_total_limit),
+                                log_label="periodic",
+                                lr_mult=lr_mult,
+                                optimizer_param_digest=param_digest,
+                                global_step=int(global_step),
+                                gradient_accumulation_steps=int(ga_steps),
+                            )
+                            last_saved_step = global_step
+                        continue
+                    raise RuntimeError(
+                        "Decoupled accumulation window produced no synchronized optimization step."
+                    )
+
+                nonfinite_skip_streak = 0
+                if lr_mult < 1.0:
+                    lr_mult = min(lr_mult * float(_NONFINITE_LR_MULT_RECOVERY), 1.0)
+
+                global_step += 1
+                consumed_micro_batches_committed = int(consumed_micro_batches)
+                if train_progress is not None:
+                    train_progress.update(1)
+
+                if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
+
+                    def _mean(x: torch.Tensor) -> float:
+                        """Compute cross-rank mean for a scalar tensor.
+
+                        :param torch.Tensor x: Scalar tensor.
+                        :return float: Cross-rank mean scalar.
+                        """
+                        x = x.detach().float().reshape(1)
+                        return accelerator.gather(x).mean().item()
+
+                    log_now = time.perf_counter()
+                    elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
+                    global_input_tokens_interval = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_since_log,
+                    )
+                    global_input_tokens_seen = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_seen,
+                    )
+                    input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
+                    local_input_tokens_since_log = 0.0
+                    last_log_started_at = log_now
+
+                    lr = (
+                        disc_lr_scheduler.get_last_lr()[0]
+                        if hasattr(disc_lr_scheduler, "get_last_lr")
+                        else float("nan")
+                    )
+                    weighted_metrics = torch.stack(
+                        [
+                            gen_loss_num,
+                            gen_token_count_window,
+                            disc_loss_num,
+                            disc_acc_num,
+                            disc_token_count_window,
+                            disc_positive_count_window,
+                        ]
+                    )
+                    weighted_metrics = accelerator.reduce(weighted_metrics, reduction="sum")
+                    global_gen_loss_num = float(weighted_metrics[0].item())
+                    global_gen_tokens = float(weighted_metrics[1].item())
+                    global_disc_loss_num = float(weighted_metrics[2].item())
+                    global_disc_acc_num = float(weighted_metrics[3].item())
+                    global_disc_tokens = float(weighted_metrics[4].item())
+                    global_disc_positive = float(weighted_metrics[5].item())
+                    gen_loss_window = (
+                        global_gen_loss_num / global_gen_tokens if global_gen_tokens > 0.0 else float("nan")
+                    )
+                    disc_loss_window = (
+                        global_disc_loss_num / global_disc_tokens
+                        if global_disc_tokens > 0.0
+                        else float("nan")
+                    )
+                    disc_acc_window = (
+                        global_disc_acc_num / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
+                    )
+                    disc_pos_frac = (
+                        global_disc_positive / global_disc_tokens
+                        if global_disc_tokens > 0.0
+                        else float("nan")
+                    )
+                    combined_loss = float(train_cfg.gen_loss_weight) * float(gen_loss_window) + float(
+                        train_cfg.disc_loss_weight
+                    ) * float(disc_loss_window)
+                    zero_metrics = {
+                        "zero_gen_window_total": float(zero_gen_window_total),
+                        "zero_disc_window_total": float(zero_disc_window_total),
+                        "zero_gen_window_since_log": float(zero_gen_window_since_log),
+                        "zero_disc_window_since_log": float(zero_disc_window_since_log),
+                    }
+                    metrics = {
+                        "step": global_step,
+                        "lr": lr,
+                        "loss": float(combined_loss),
+                        "gen_loss": float(gen_loss_window),
+                        "disc_loss": float(disc_loss_window),
+                        "disc_acc": float(disc_acc_window),
+                        "disc_pos_frac": float(disc_pos_frac),
+                        "input_tokens_per_sec": float(input_tokens_per_sec),
+                        "input_tokens_seen": float(global_input_tokens_seen),
+                    }
+                    zero_gen_window_since_log = 0
+                    zero_disc_window_since_log = 0
+                    if accelerator.is_main_process:
+                        logger.info(
+                            " | ".join(
+                                [
+                                    f"step={metrics['step']}",
+                                    f"lr={metrics['lr']:.3e}",
+                                    f"loss={metrics['loss']:.4f}",
+                                    f"gen={metrics['gen_loss']:.4f}",
+                                    f"disc={metrics['disc_loss']:.4f}",
+                                    f"acc={metrics['disc_acc']:.4f}",
+                                    f"tok/s={metrics['input_tokens_per_sec']:.1f}",
+                                    f"tok_seen={metrics['input_tokens_seen']:.0f}",
+                                ]
+                            )
+                        )
+                    if train_cfg.report_to != "none":
+                        _log_tracker_metrics(
+                            {k: v for k, v in metrics.items() if k != "step"}, step=global_step
+                        )
+                    if debug_metrics_enabled and accelerator.is_main_process:
+                        _append_metrics_jsonl_row(
+                            metrics_path,
+                            {
+                                "step": int(global_step),
+                                "debug_metrics": True,
+                                **zero_metrics,
+                            },
+                        )
+
+                if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
+                    ckpt_dir = output_dir / f"checkpoint-{global_step}"
+                    _save_training_checkpoint(
+                        accelerator=accelerator,
+                        checkpoint_dir=ckpt_dir,
+                        output_dir=output_dir,
+                        consumed_micro_batches=consumed_micro_batches_committed,
+                        save_total_limit=int(train_cfg.save_total_limit),
+                        log_label="periodic",
+                        lr_mult=lr_mult,
+                        optimizer_param_digest=param_digest,
+                        global_step=int(global_step),
+                        gradient_accumulation_steps=int(ga_steps),
+                    )
+                    last_saved_step = global_step
 
         while global_step < int(train_cfg.max_steps):
             window: list[tuple[dict[str, torch.Tensor], float, float]] = []
@@ -2380,9 +3214,15 @@ def run_pretraining(
             skipped_window_due_nonfinite = False
             nonfinite_reason: str | None = None
             nonfinite_debug_path: Path | None = None
+            window_nonfinite_local = False
+            first_nonfinite_reason_local: str | None = None
+            first_nonfinite_micro_step: int | None = None
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
+                doc_ids = batch.pop("doc_ids", None)
+                if doc_ids is not None:
+                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
@@ -2390,9 +3230,6 @@ def run_pretraining(
                     backbone_type=str(model_cfg.backbone_type),
                     block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                 )
-                doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None:
-                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()
 
@@ -2408,7 +3245,6 @@ def run_pretraining(
                         sampling_temperature=train_cfg.sampling_temperature,
                         gen_loss_weight=train_cfg.gen_loss_weight,
                         disc_loss_weight=train_cfg.disc_loss_weight,
-                        decoupled_loss_scaling=train_cfg.decoupled_loss_scaling,
                     )
 
                     if token_weighted_ga:
@@ -2421,7 +3257,6 @@ def run_pretraining(
                             disc_window_tokens_per_rank=disc_window_tokens_per_rank,
                             gen_loss_weight=float(train_cfg.gen_loss_weight),
                             disc_loss_weight=float(train_cfg.disc_loss_weight),
-                            decoupled_loss_scaling=bool(train_cfg.decoupled_loss_scaling),
                         )
                         loss = micro_obj
                         loss_for_metrics = loss_for_metrics + micro_obj.detach()
@@ -2445,16 +3280,37 @@ def run_pretraining(
                         offending = "backward_loss"
 
                     if offending is not None:
+                        window_nonfinite_local = True
+                        if first_nonfinite_reason_local is None:
+                            first_nonfinite_reason_local = str(offending)
+                            first_nonfinite_micro_step = int(step_idx)
+
+                    # Keep non-finite coordination out of non-sync microsteps to preserve
+                    # no_sync accumulation performance characteristics.
+                    if is_sync_step and _any_rank_flag_true(
+                        accelerator=accelerator,
+                        flag=window_nonfinite_local,
+                    ):
+                        offending_effective = (
+                            str(first_nonfinite_reason_local)
+                            if first_nonfinite_reason_local is not None
+                            else "other_rank_nonfinite"
+                        )
+                        offending_micro_step = (
+                            int(first_nonfinite_micro_step)
+                            if first_nonfinite_micro_step is not None
+                            else int(step_idx)
+                        )
                         skipped_window_due_nonfinite = True
                         nonfinite_skip_total += 1
                         nonfinite_skip_streak += 1
-                        nonfinite_reason = str(offending)
+                        nonfinite_reason = str(offending_effective)
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=output_dir,
+                            output_dir=logging_output_dir,
                             step=int(global_step + 1),
-                            micro_step_idx=int(step_idx),
-                            offending=offending,
+                            micro_step_idx=int(offending_micro_step),
+                            offending=str(offending_effective),
                             gen_loss_raw=out.gen_loss_raw,
                             disc_loss_raw=out.disc_loss_raw,
                             forward_loss=out.loss,
@@ -2468,7 +3324,7 @@ def run_pretraining(
                         logger.warning(
                             "Skipping accumulation window due non-finite %s "
                             "(step=%d, micro_step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                            offending,
+                            offending_effective,
                             int(global_step + 1),
                             int(step_idx),
                             int(nonfinite_skip_streak),
@@ -2477,6 +3333,8 @@ def run_pretraining(
                         )
                         optimizer.zero_grad(set_to_none=True)
                         break
+                    if offending is not None:
+                        continue
                     micro_gen_tokens = out.gen_token_count.detach().float()
                     micro_disc_tokens = out.disc_token_count.detach().float()
                     gen_token_count_window = gen_token_count_window + micro_gen_tokens
@@ -2501,7 +3359,7 @@ def run_pretraining(
                         nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=output_dir,
+                            output_dir=logging_output_dir,
                             step=int(global_step + 1),
                             micro_step_idx=int(step_idx),
                             offending=str(nonfinite_reason),
@@ -2542,7 +3400,7 @@ def run_pretraining(
                             nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
                             lr_now = _scheduler_current_lr(lr_scheduler)
                             nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=output_dir,
+                                output_dir=logging_output_dir,
                                 step=int(global_step + 1),
                                 micro_step_idx=int(step_idx),
                                 offending=str(nonfinite_reason),
@@ -2569,6 +3427,7 @@ def run_pretraining(
 
                     optimizer.step()
                     lr_scheduler.step()
+                    _record_unscaled_lrs(optimizer, lr_scheduler)
                     if lr_mult < 1.0:
                         _apply_lr_mult(optimizer, lr_mult)
                     optimizer.zero_grad(set_to_none=True)
@@ -2583,7 +3442,7 @@ def run_pretraining(
                     # so syncing here is sufficient (and avoids per-microbatch copies). This means
                     # discriminator base weights intentionally lag inside each GA window and catch up
                     # immediately after the optimizer step.
-                    _sync_discriminator_embeddings_if_available(unwrapped_model)
+                    _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
@@ -2593,6 +3452,7 @@ def run_pretraining(
                     if _optimizer_has_stepped(optimizer):
                         with suppress(Exception):
                             lr_scheduler.step()
+                    _record_unscaled_lrs(optimizer, lr_scheduler)
                     lr_mult, reset_state = _apply_nonfinite_recovery(
                         lr_mult=lr_mult,
                         skip_streak=int(nonfinite_skip_streak),
@@ -2676,19 +3536,16 @@ def run_pretraining(
                         x = x.detach().float().reshape(1)
                         return accelerator.gather(x).mean().item()
 
-                    def _sum_local_scalar(x: float) -> float:
-                        """Compute global sum for a local scalar across processes.
-
-                        :param float x: Local scalar value.
-                        :return float: Summed value across all ranks.
-                        """
-                        local = torch.tensor([x], device=accelerator.device, dtype=torch.float64)
-                        return float(accelerator.reduce(local, reduction="sum")[0].item())
-
                     log_now = time.perf_counter()
                     elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
-                    global_input_tokens_interval = _sum_local_scalar(local_input_tokens_since_log)
-                    global_input_tokens_seen = _sum_local_scalar(local_input_tokens_seen)
+                    global_input_tokens_interval = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_since_log,
+                    )
+                    global_input_tokens_seen = _sum_local_scalar(
+                        accelerator=accelerator,
+                        x=local_input_tokens_seen,
+                    )
                     input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
                     local_input_tokens_since_log = 0.0
                     last_log_started_at = log_now
@@ -2744,8 +3601,6 @@ def run_pretraining(
                         "gen_loss": float(gen_loss_window),
                         "disc_loss": float(disc_loss_window),
                         "disc_acc": float(disc_acc_window),
-                        "gen_token_count": float(global_gen_tokens),
-                        "disc_token_count": float(global_disc_tokens),
                         "disc_pos_frac": float(disc_pos_frac),
                         "input_tokens_per_sec": float(input_tokens_per_sec),
                         "input_tokens_seen": float(global_input_tokens_seen),
@@ -2779,7 +3634,6 @@ def run_pretraining(
                             {
                                 "step": int(global_step),
                                 "debug_metrics": True,
-                                "debug_metrics_source_env": bool(debug_metrics_env_enabled),
                                 **zero_metrics,
                             },
                         )
@@ -2800,20 +3654,6 @@ def run_pretraining(
                         gradient_accumulation_steps=int(ga_steps),
                     )
                     last_saved_step = global_step
-
-        # Best-effort HF export
-        if train_cfg.export_hf_final:
-            accelerator.wait_for_everyone()
-            _export_discriminator_hf(
-                accelerator=accelerator,
-                model=model,
-                tokenizer=tokenizer,
-                output_dir=output_dir / "final_hf",
-                embedding_sharing=model_cfg.embedding_sharing,
-                model_cfg=model_cfg,
-                data_cfg=data_cfg,
-                train_cfg=train_cfg,
-            )
 
     except KeyboardInterrupt as exc:
         exit_code = 130
@@ -2868,6 +3708,31 @@ def run_pretraining(
                 "(num_processes=%s) to avoid potential collective deadlocks after failure.",
                 getattr(accelerator, "num_processes", "unknown"),
             )
+
+        # Final export runs from the saved checkpoint in an isolated subprocess.
+        # This avoids teardown-time crashes observed on some streaming+CUDA runs
+        # when exporting directly from the live training process.
+        if (
+            bool(train_cfg.export_hf_final)
+            and crash_reason is None
+            and bool(getattr(accelerator, "is_main_process", True))
+        ):
+            export_step = int(last_saved_step)
+            if export_step <= 0 and int(global_step) > 0:
+                export_step = int(global_step)
+            if export_step > 0:
+                checkpoint_dir = output_dir / f"checkpoint-{export_step}"
+                if checkpoint_dir.exists():
+                    with suppress(Exception):
+                        _export_discriminator_hf_subprocess(
+                            checkpoint_dir=checkpoint_dir,
+                            output_dir=output_dir / "final_hf",
+                        )
+                else:
+                    logger.warning(
+                        "Skipping final export: checkpoint directory does not exist: %s",
+                        checkpoint_dir,
+                    )
 
         if crash_reason is not None:
             crash_log_step = int(

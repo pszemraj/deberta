@@ -3,67 +3,108 @@
 #   accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta train configs/pretrain_rope_fineweb_edu.yaml
 
 model:
-  tokenizer_name_or_path: microsoft/deberta-v3-base
+  profile: modern
   backbone_type: rope
   from_scratch: true
+  embedding_sharing: gdes
+  gradient_checkpointing: false
+  tokenizer:
+    name_or_path: microsoft/deberta-v3-base
+    allow_vocab_resize: false
+    vocab_target: null
+    vocab_multiple: 1
+  hf:
+    model_size: base
+    attention_kernel: dynamic
+    max_position_embeddings: null
+  pretrained:
+    discriminator_path: ""
+    generator_path: null
+  rope:
+    rope_theta: 10000.0
+    rotary_pct: 1.0
+    use_absolute_position_embeddings: false
+    norm_arch: post
+    norm_eps: 1.0e-6
+    ffn_type: swiglu
+    attention_implementation: sdpa
 
-  # RoPE settings
-  rope_theta: 10000.0
-  rotary_pct: 1.0
-  use_absolute_position_embeddings: false
-
-  # Norm topology
-  norm_arch: post   # post | keel
-  norm_eps: 1.0e-6
-  ffn_type: swiglu  # swiglu | mlp
-
-  # RTD embedding sharing
-  embedding_sharing: gdes  # none | es | gdes
-
-  # SDPA/FlashAttention dispatch via PyTorch
-  attention_implementation: sdpa
 
 data:
-  dataset_name: HuggingFaceFW/fineweb-edu
-  dataset_config_name: default
-  train_split: train
-  streaming: true
-  pack_sequences: true
-  block_cross_document_attention: false
-  text_column_name: text
-  max_seq_length: 512
-  shuffle_buffer_size: 10000
+  source:
+    dataset_name: HuggingFaceFW/fineweb-edu
+    dataset_config_name: default
+    data_files: null
+    load_from_disk: null
+    train_split: train
+    text_column_name: text
+    streaming: true
+    shuffle_buffer_size: 10000
+  packing:
+    enabled: true
+    max_seq_length: 512
+    block_cross_document_attention: false
 
 train:
-  # Set to null to auto-create runs/<project_name>/<timestamp>_<config_stem>.
-  output_dir: runs/deberta_rope_rtd
-  overwrite_output_dir: false
-  project_name: deberta-train
-  run_name: null
+  seed: 42
   max_steps: 10000
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 16
-
-  # Optim
-  learning_rate: 5.0e-4
-  # generator_learning_rate: 2.5e-4   # optional
-  weight_decay: 0.01
-  warmup_steps: 1000
-
-  # Objective
-  mlm_probability: 0.15
-  mlm_max_ngram: 1          # set to 3 for DeBERTa-style whole-word n-gram masking
-  mask_token_prob: 0.8
-  random_token_prob: 0.1
-  sampling_temperature: 1.0
-
-  gen_loss_weight: 1.0
-  disc_loss_weight: 50.0
-  decoupled_loss_scaling: false
-
-  # SDPA backend preference: auto|flash|mem_efficient|math
+  token_weighted_gradient_accumulation: true
+  mixed_precision: bf16
+  tf32: true
   sdpa_kernel: auto
+  decoupled_training: true
+  dataloader:
+    num_workers: 2
+    pin_memory: true
+  compile:
+    enabled: false
+    mode: default
+    scope: auto
+    backend: inductor
+  objective:
+    mlm_probability: 0.15
+    mlm_max_ngram: 1
+    mask_token_prob: 0.8
+    random_token_prob: 0.1
+    sampling_temperature: 1.0
+    gen_loss_weight: 1.0
+    disc_loss_weight: 50.0
+  checkpoint:
+    output_dir: runs/deberta_rope_rtd
+    overwrite_output_dir: false
+    save_steps: 1000
+    save_total_limit: 3
+    resume_from_checkpoint: null
+    resume_data_strategy: auto
+    resume_replay_max_micro_batches: 10000
+    export_hf_final: true
 
-  # Logging
+optim:
+  lr:
+    base: 5e-4
+    generator: -1.0
+    discriminator: -1.0
+  adam:
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-8
+  scheduler:
+    type: linear
+    warmup_steps: 1000
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+logging:
+  project_name: deberta-train
+  run_name: null
+  output_dir: null
   logging_steps: 25
-  report_to: none
+  backend: none
+  wandb:
+    enabled: false
+    watch: gradients
+    watch_log_freq: 100
+  debug:
+    metrics: false

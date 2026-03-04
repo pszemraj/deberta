@@ -4,19 +4,25 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
     DataConfig,
+    LoggingConfig,
     ModelConfig,
+    OptimConfig,
     TrainConfig,
+    asdict_without_private,
     load_data_config_snapshot,
+    load_logging_config_snapshot,
     load_model_config_snapshot,
+    load_optim_config_snapshot,
     validate_data_config,
+    validate_logging_config,
     validate_model_config,
+    validate_optim_config,
     validate_run_metadata_schema,
 )
 from deberta.io_utils import dump_json, load_json_mapping
@@ -26,6 +32,8 @@ _RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
     "model_config.json",
     "data_config.json",
     "train_config.json",
+    "optim_config.json",
+    "logging_config.json",
     "run_metadata.json",
 )
 
@@ -84,48 +92,67 @@ def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
 
 
 def _resolved_config_payload(
-    *, model_cfg: ModelConfig, data_cfg: DataConfig, train_cfg: TrainConfig
+    *,
+    model_cfg: ModelConfig,
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig,
+    logging_cfg: LoggingConfig,
 ) -> dict[str, dict[str, Any]]:
     """Build resolved nested config payload for YAML snapshots.
 
     :param ModelConfig model_cfg: Resolved model config.
     :param DataConfig data_cfg: Resolved data config.
     :param TrainConfig train_cfg: Resolved train config.
+    :param OptimConfig optim_cfg: Resolved optim config.
+    :param LoggingConfig logging_cfg: Resolved logging config.
     :return dict[str, dict[str, Any]]: Nested resolved payload.
     """
     return {
-        "model": asdict(model_cfg),
-        "data": asdict(data_cfg),
-        "train": asdict(train_cfg),
+        "model": asdict_without_private(model_cfg),
+        "data": asdict_without_private(data_cfg),
+        "train": asdict_without_private(train_cfg),
+        "optim": asdict_without_private(optim_cfg),
+        "logging": asdict_without_private(logging_cfg),
     }
 
 
 def _persist_config_yaml_snapshots(
     *,
-    output_dir: Path,
+    logging_output_dir: Path,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig,
+    logging_cfg: LoggingConfig,
     config_path: str | Path | None,
     is_main_process: bool,
 ) -> None:
-    """Persist original/resolved YAML config snapshots in ``output_dir``.
+    """Persist original/resolved YAML config snapshots in logging output dir.
 
-    :param Path output_dir: Training output directory.
+    :param Path logging_output_dir: Logging output directory.
     :param ModelConfig model_cfg: Resolved model config.
     :param DataConfig data_cfg: Resolved data config.
     :param TrainConfig train_cfg: Resolved train config.
+    :param OptimConfig optim_cfg: Resolved optim config.
+    :param LoggingConfig logging_cfg: Resolved logging config.
     :param str | Path | None config_path: Optional source config file path.
     :param bool is_main_process: Whether current process owns filesystem writes.
     """
     if not bool(is_main_process):
         return
 
-    resolved_payload = _resolved_config_payload(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
-    resolved_path = output_dir / "config_resolved.yaml"
+    resolved_payload = _resolved_config_payload(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+    resolved_path = logging_output_dir / "config_resolved.yaml"
     _dump_yaml_mapping(resolved_payload, resolved_path)
 
-    original_path = output_dir / "config_original.yaml"
+    original_path = logging_output_dir / "config_original.yaml"
     if config_path is None:
         _dump_yaml_mapping(resolved_payload, original_path)
         return
@@ -148,20 +175,34 @@ def _effective_model_config_for_resume_compare(cfg: ModelConfig) -> dict[str, An
     :param ModelConfig cfg: Model config to canonicalize.
     :return dict[str, Any]: Normalized dict payload suitable for equality checks.
     """
-    payload = asdict(cfg)
+    payload = asdict_without_private(cfg)
     defaults = ModelConfig()
 
     if cfg.backbone_type == "rope":
-        payload["hf_attention_kernel"] = defaults.hf_attention_kernel
-        payload["hf_max_position_embeddings"] = defaults.hf_max_position_embeddings
+        payload["hf"] = asdict_without_private(defaults.hf)
 
-    if cfg.norm_arch == "post":
-        payload["keel_alpha_init"] = defaults.keel_alpha_init
-        payload["keel_alpha_learnable"] = defaults.keel_alpha_learnable
+    if cfg.rope.norm_arch == "post":
+        payload["rope"]["keel_alpha_init"] = defaults.rope.keel_alpha_init
+        payload["rope"]["keel_alpha_learnable"] = defaults.rope.keel_alpha_learnable
 
-    if cfg.ffn_type == "mlp":
-        payload["swiglu_adjust_intermediate"] = defaults.swiglu_adjust_intermediate
+    if cfg.rope.ffn_type == "mlp":
+        payload["rope"]["swiglu_adjust_intermediate"] = defaults.rope.swiglu_adjust_intermediate
 
+    return payload
+
+
+def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str, Any]:
+    """Build a normalized logging config snapshot for resume compatibility checks.
+
+    ``logging.output_dir`` is run-local plumbing that can legitimately differ when
+    resuming into a new output directory, so we intentionally exclude it from strict
+    resume-compat validation.
+
+    :param LoggingConfig cfg: Logging config to canonicalize.
+    :return dict[str, Any]: Normalized dict payload suitable for equality checks.
+    """
+    payload = asdict_without_private(cfg)
+    payload["output_dir"] = None
     return payload
 
 
@@ -176,7 +217,7 @@ def _infer_resume_run_dir(resume_checkpoint: str | Path) -> Path:
 
 
 def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
-    """Raise when ``output_dir`` contains conflicting copied snapshots for resume provenance.
+    """Raise when output_dir contains conflicting copied snapshots for resume provenance.
 
     :param Path source_run_dir: Source run directory inferred from the resume checkpoint.
     :param Path output_dir: Target output directory for the resumed run.
@@ -202,9 +243,12 @@ def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_d
 def _persist_or_validate_run_configs(
     *,
     output_dir: Path,
+    logging_output_dir: Path | None = None,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
+    optim_cfg: OptimConfig | None = None,
+    logging_cfg: LoggingConfig | None = None,
     resume_checkpoint: str | None,
     resume_run_dir: Path | None = None,
     config_path: str | Path | None = None,
@@ -215,19 +259,26 @@ def _persist_or_validate_run_configs(
 ) -> None:
     """Persist new config snapshots or validate existing snapshots on resume.
 
-    :param Path output_dir: Training output directory.
+    :param Path output_dir: Checkpoint output directory.
+    :param Path logging_output_dir: Logging output directory.
     :param ModelConfig model_cfg: Current model config.
     :param DataConfig data_cfg: Current data config.
     :param TrainConfig train_cfg: Current train config.
+    :param OptimConfig optim_cfg: Current optim config.
+    :param LoggingConfig logging_cfg: Current logging config.
     :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
     :param Path | None resume_run_dir: Optional explicit source run directory for resume validation.
     :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
-    :param bool preflight_only: When ``True``, perform full validation without writing/updating files.
+    :param bool preflight_only: When True, perform full validation without writing/updating files.
     :param str | None effective_compile_scope: Resolved compile scope for metadata.
     :param str | None compile_scope_reason: Reason for compile scope selection.
-    :raises ValueError: If resume mode detects incompatible model/data config snapshots.
+    :raises ValueError: If resume mode detects incompatible config snapshots.
     """
+    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
+    resolved_logging_output_dir = logging_output_dir if logging_output_dir is not None else output_dir
+
     output_dir_abs = output_dir.expanduser().resolve()
     source_run_dir: Path | None = None
     snapshot_dir = output_dir
@@ -241,10 +292,14 @@ def _persist_or_validate_run_configs(
 
     model_cfg_path = snapshot_dir / "model_config.json"
     data_cfg_path = snapshot_dir / "data_config.json"
+    optim_cfg_path = snapshot_dir / "optim_config.json"
+    logging_cfg_path = snapshot_dir / "logging_config.json"
     run_meta_path = snapshot_dir / "run_metadata.json"
     output_model_cfg_path = output_dir / "model_config.json"
     output_data_cfg_path = output_dir / "data_config.json"
     output_train_cfg_path = output_dir / "train_config.json"
+    output_optim_cfg_path = output_dir / "optim_config.json"
+    output_logging_cfg_path = output_dir / "logging_config.json"
     output_run_meta_path = output_dir / "run_metadata.json"
 
     run_meta = _build_run_metadata(
@@ -252,16 +307,21 @@ def _persist_or_validate_run_configs(
         compile_scope_reason=compile_scope_reason,
     )
 
-    has_saved_model_data = model_cfg_path.exists() and data_cfg_path.exists()
-    if resume_checkpoint is not None and not has_saved_model_data:
+    has_saved_required = (
+        model_cfg_path.exists()
+        and data_cfg_path.exists()
+        and optim_cfg_path.exists()
+        and logging_cfg_path.exists()
+    )
+    if resume_checkpoint is not None and not has_saved_required:
         raise ValueError(
-            "Resume checkpoint source run directory is missing model/data config snapshots. "
-            f"Expected both model_config.json and data_config.json under {snapshot_dir}."
+            "Resume checkpoint source run directory is missing required config snapshots. "
+            "Expected model_config.json, data_config.json, optim_config.json, and logging_config.json under "
+            f"{snapshot_dir}."
         )
-    if resume_checkpoint is not None and has_saved_model_data:
+    if resume_checkpoint is not None and has_saved_required:
         if run_meta_path.exists():
             _validate_run_metadata(run_meta_path)
-            # Check for compile scope drift on resume.
             if is_main_process and effective_compile_scope is not None:
                 saved_meta = load_json_mapping(run_meta_path)
                 saved_scope = saved_meta.get("effective_compile_scope")
@@ -272,18 +332,24 @@ def _persist_or_validate_run_configs(
                         "This may affect compiled graph caching but is recoverable."
                     )
 
-        # Pre-stable policy: do not silently coerce legacy snapshot keys during resume.
-        # Snapshots must match current dataclass schemas for correctness/simplicity.
         saved_model_cfg = load_model_config_snapshot(
             load_json_mapping(model_cfg_path), source=str(model_cfg_path)
         )
         saved_data_cfg = load_data_config_snapshot(
             load_json_mapping(data_cfg_path), source=str(data_cfg_path)
         )
+        saved_optim_cfg = load_optim_config_snapshot(
+            load_json_mapping(optim_cfg_path), source=str(optim_cfg_path)
+        )
+        saved_logging_cfg = load_logging_config_snapshot(
+            load_json_mapping(logging_cfg_path),
+            source=str(logging_cfg_path),
+        )
         validate_model_config(saved_model_cfg)
         validate_data_config(saved_data_cfg)
+        validate_optim_config(saved_optim_cfg)
+        validate_logging_config(saved_logging_cfg)
 
-        # Match on effective model semantics; inert fields are normalized by mode.
         if _effective_model_config_for_resume_compare(
             saved_model_cfg
         ) != _effective_model_config_for_resume_compare(model_cfg):
@@ -291,10 +357,22 @@ def _persist_or_validate_run_configs(
                 "Resume configuration mismatch for model_config.json. "
                 "Refusing to overwrite run metadata with incompatible model settings."
             )
-        if asdict(saved_data_cfg) != asdict(data_cfg):
+        if asdict_without_private(saved_data_cfg) != asdict_without_private(data_cfg):
             raise ValueError(
                 "Resume configuration mismatch for data_config.json. "
                 "Refusing to overwrite run metadata with incompatible data settings."
+            )
+        if asdict_without_private(saved_optim_cfg) != asdict_without_private(resolved_optim_cfg):
+            raise ValueError(
+                "Resume configuration mismatch for optim_config.json. "
+                "Refusing to overwrite run metadata with incompatible optimizer settings."
+            )
+        if _effective_logging_config_for_resume_compare(
+            saved_logging_cfg
+        ) != _effective_logging_config_for_resume_compare(resolved_logging_cfg):
+            raise ValueError(
+                "Resume configuration mismatch for logging_config.json. "
+                "Refusing to overwrite run metadata with incompatible logging settings."
             )
 
         if source_run_dir is not None and source_run_dir != output_dir_abs:
@@ -307,12 +385,10 @@ def _persist_or_validate_run_configs(
             return
 
         if is_main_process and not run_meta_path.exists():
-            # Backfill schema metadata for older runs only after compatibility checks pass.
             dump_json(run_meta, run_meta_path)
 
         if is_main_process and source_run_dir is not None and source_run_dir != output_dir_abs:
             resume_checkpoint_abs = Path(resume_checkpoint).expanduser().resolve()
-            # Copy source snapshots into output_dir to keep provenance when resuming into a new run dir.
             for filename in _RUN_SNAPSHOT_FILENAMES:
                 src = source_run_dir / filename
                 if not src.exists():
@@ -322,7 +398,6 @@ def _persist_or_validate_run_configs(
                 if dst.exists():
                     dst_text = dst.read_text(encoding="utf-8")
                     if dst_text != src_text:
-                        # Should already be guarded by _validate_resume_output_snapshot_conflicts.
                         raise RuntimeError(f"Unexpected snapshot conflict after pre-validation: {dst}")
                 else:
                     dst.write_text(src_text, encoding="utf-8")
@@ -339,12 +414,14 @@ def _persist_or_validate_run_configs(
                 source_run_dir,
             )
         elif is_main_process:
-            logger.info("Resume mode: preserving existing model/data/train config snapshots in output_dir.")
+            logger.info("Resume mode: preserving existing config snapshots in output_dir.")
         _persist_config_yaml_snapshots(
-            output_dir=output_dir,
+            logging_output_dir=resolved_logging_output_dir,
             model_cfg=model_cfg,
             data_cfg=data_cfg,
             train_cfg=train_cfg,
+            optim_cfg=resolved_optim_cfg,
+            logging_cfg=resolved_logging_cfg,
             config_path=config_path,
             is_main_process=is_main_process,
         )
@@ -354,9 +431,11 @@ def _persist_or_validate_run_configs(
         return
 
     if is_main_process:
-        dump_json(asdict(model_cfg), output_model_cfg_path)
-        dump_json(asdict(data_cfg), output_data_cfg_path)
-        dump_json(asdict(train_cfg), output_train_cfg_path)
+        dump_json(asdict_without_private(model_cfg), output_model_cfg_path)
+        dump_json(asdict_without_private(data_cfg), output_data_cfg_path)
+        dump_json(asdict_without_private(train_cfg), output_train_cfg_path)
+        dump_json(asdict_without_private(resolved_optim_cfg), output_optim_cfg_path)
+        dump_json(asdict_without_private(resolved_logging_cfg), output_logging_cfg_path)
         dump_json(run_meta, output_run_meta_path)
         if resume_checkpoint is not None and source_run_dir is not None and source_run_dir != output_dir_abs:
             dump_json(
@@ -367,10 +446,12 @@ def _persist_or_validate_run_configs(
                 output_dir / "resume_source.json",
             )
     _persist_config_yaml_snapshots(
-        output_dir=output_dir,
+        logging_output_dir=resolved_logging_output_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=resolved_optim_cfg,
+        logging_cfg=resolved_logging_cfg,
         config_path=config_path,
         is_main_process=is_main_process,
     )

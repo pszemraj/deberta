@@ -454,19 +454,30 @@ class DebertaRoPEEncoder(nn.Module):
         )
         self.gradient_checkpointing = False
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        *,
+        output_hidden_states: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
         """Run all encoder layers.
 
         :param torch.Tensor x: Input hidden states.
         :param torch.Tensor | None attention_mask: Binary attention mask.
-        :return torch.Tensor: Output hidden states.
+        :param bool output_hidden_states: Whether to collect per-layer hidden states.
+        :return tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
+            Final hidden state and optional hidden-state tuple.
         """
+        all_hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states else None
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(layer, x, attention_mask, use_reentrant=False)
             else:
                 x = layer(x, attention_mask)
-        return x
+            if output_hidden_states and all_hidden_states is not None:
+                all_hidden_states = all_hidden_states + (x,)
+        return x, all_hidden_states
 
 
 class DebertaRoPEPreTrainedModel(PreTrainedModel):
@@ -504,7 +515,7 @@ class DebertaRoPEPreTrainedModel(PreTrainedModel):
 
 
 class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
-    """Encoder-only model returning last_hidden_state."""
+    """Encoder-only model with HF-style ``BaseModelOutput`` support."""
 
     def __init__(self, config: DebertaRoPEConfig) -> None:
         """Create encoder-only model.
@@ -535,21 +546,66 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
-        return_dict: bool = True,
-    ) -> BaseModelOutput:
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
+        return_dict: bool | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run encoder forward pass.
 
         :param torch.Tensor input_ids: Input token ids.
         :param torch.Tensor | None attention_mask: Optional attention mask. ``None`` means
             unpadded input (fast path); callers must pass a mask when padding exists.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
-        :param bool return_dict: Whether to return HF output dataclass.
-        :return BaseModelOutput: Last hidden states container.
+        :param bool | None output_hidden_states: Optional hidden-state output flag.
+        :param bool | None output_attentions: Optional attention output flag.
+        :param bool | None return_dict: Optional return-dataclass flag.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model output container/tuple.
         """
+        output_hidden_states = (
+            bool(getattr(self.config, "output_hidden_states", False))
+            if output_hidden_states is None
+            else bool(output_hidden_states)
+        )
+        output_attentions = (
+            bool(getattr(self.config, "output_attentions", False))
+            if output_attentions is None
+            else bool(output_attentions)
+        )
+        return_dict = (
+            bool(getattr(self.config, "use_return_dict", True)) if return_dict is None else bool(return_dict)
+        )
+
+        if output_attentions:
+            raise NotImplementedError(
+                "DebertaRoPEModel does not currently expose attention maps; set output_attentions=False."
+            )
+
         x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-        x = self.encoder(x, attention_mask)
+        if output_hidden_states:
+            encoder_outputs = self.encoder(
+                x,
+                attention_mask,
+                output_hidden_states=True,
+            )
+        else:
+            # Keep compatibility with injected/wrapped encoders that implement
+            # the historical ``forward(x, attention_mask)`` contract.
+            encoder_outputs = self.encoder(x, attention_mask)
+
+        if isinstance(encoder_outputs, tuple):
+            x = encoder_outputs[0]
+            all_hidden_states = encoder_outputs[1] if len(encoder_outputs) > 1 else None
+        else:
+            x = encoder_outputs
+            all_hidden_states = None
 
         if not return_dict:
-            return (x,)
+            outputs: tuple[torch.Tensor, ...] = (x,)
+            if output_hidden_states:
+                outputs = outputs + (all_hidden_states,)
+            return outputs
 
-        return BaseModelOutput(last_hidden_state=x)
+        return BaseModelOutput(
+            last_hidden_state=x,
+            hidden_states=all_hidden_states if output_hidden_states else None,
+        )

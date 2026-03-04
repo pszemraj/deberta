@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
+import shutil
 import sys
+import tempfile
 import types
 from dataclasses import asdict
 from pathlib import Path
@@ -9,15 +12,23 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer
+from _fakes import DummyTokenizer, FakeAccelerator
 
 import deberta.export_cli as export_cli
 from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
 
 
 class _FakeExportBackbone:
-    def __init__(self) -> None:
-        self._weights: dict[str, torch.Tensor] = {"weight": torch.tensor(0.0)}
+    def __init__(
+        self,
+        *,
+        weight_keys: tuple[str, ...] = ("weight",),
+        forced_missing_keys: tuple[str, ...] | None = None,
+        write_config_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._weights: dict[str, torch.Tensor] = {str(key): torch.tensor(0.0) for key in weight_keys}
+        self._forced_missing_keys = list(forced_missing_keys or ())
+        self._write_config_payload = dict(write_config_payload or {})
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return self._weights
@@ -27,24 +38,26 @@ class _FakeExportBackbone:
         model_keys = set(self._weights.keys())
         source_keys = set(state_dict.keys())
         missing = sorted(model_keys - source_keys)
+        if self._forced_missing_keys:
+            missing = sorted(set(missing) | set(self._forced_missing_keys))
         unexpected = sorted(source_keys - model_keys)
         for key in model_keys & source_keys:
             self._weights[key] = state_dict[key]
         return types.SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
 
     def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
-        Path(path).mkdir(parents=True, exist_ok=True)
+        target = Path(path)
+        target.mkdir(parents=True, exist_ok=True)
+        if self._write_config_payload:
+            (target / "config.json").write_text(
+                json.dumps(self._write_config_payload),
+                encoding="utf-8",
+            )
         del safe_serialization
         return None
 
 
-class _FakeRTDModel:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        del args
-        del kwargs
-
-
-def _write_run_layout(tmp_path: Path) -> tuple[Path, Path]:
+def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     model_cfg = ModelConfig(
@@ -60,8 +73,13 @@ def _write_run_layout(tmp_path: Path) -> tuple[Path, Path]:
         json.dumps(asdict(data_cfg)),
         encoding="utf-8",
     )
-    checkpoint_dir = tmp_path / "checkpoint-10"
-    checkpoint_dir.mkdir()
+    if mock_checkpoint is None:
+        checkpoint_dir = tmp_path / "checkpoint-10"
+        checkpoint_dir.mkdir()
+    else:
+        checkpoint_dir = mock_checkpoint(
+            root=tmp_path, name="checkpoint-10", with_data_state=False, with_complete=False
+        )
     return run_dir, checkpoint_dir
 
 
@@ -83,41 +101,11 @@ def _install_export_fakes(
     called: dict[str, object],
     fsdp2: bool,
     provide_torch_state_dict_api: bool,
+    distributed_type: str | None = None,
     load_state_orig_mod_mismatch: bool = False,
 ) -> None:
     fake_utils = types.ModuleType("accelerate.utils")
     fake_utils.DistributedType = types.SimpleNamespace(FSDP="FSDP")
-
-    class _FakeAccelerator:
-        distributed_type = fake_utils.DistributedType.FSDP
-        is_fsdp2 = fsdp2
-
-        def __init__(self) -> None:
-            self.is_main_process = True
-
-        def prepare(self, model):
-            return model
-
-        def load_state(self, _checkpoint_dir: str, **kwargs: Any) -> None:
-            called["load_state_calls"] = list(called["load_state_calls"]) + [dict(kwargs)]
-            if load_state_orig_mod_mismatch and kwargs.get("strict", True):
-                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
-            return None
-
-        def wait_for_everyone(self) -> None:
-            return None
-
-        def get_state_dict(self, model):
-            del model
-            called["get_state_dict"] = int(called["get_state_dict"]) + 1
-            return {
-                "discriminator.weight": torch.tensor(1.0),
-                "generator.weight": torch.tensor(2.0),
-            }
-
-        def unwrap_model(self, model):
-            called["unwrap_model"] = int(called["unwrap_model"]) + 1
-            return model
 
     if provide_torch_state_dict_api:
 
@@ -144,7 +132,47 @@ def _install_export_fakes(
         from_pretrained=lambda *args, **kwargs: DummyTokenizer()
     )
     fake_accelerate = types.ModuleType("accelerate")
-    fake_accelerate.Accelerator = _FakeAccelerator
+
+    def _accelerator_factory(**kwargs: Any) -> FakeAccelerator:
+        del kwargs
+        accel = FakeAccelerator(
+            distributed_type=distributed_type
+            if distributed_type is not None
+            else fake_utils.DistributedType.FSDP,
+            is_fsdp2=bool(fsdp2),
+            is_main_process=True,
+        )
+
+        def _prepare(self: FakeAccelerator, model: Any) -> Any:
+            self.calls["prepare"].append("export")
+            return model
+
+        def _load_state(self: FakeAccelerator, _checkpoint_dir: str, **load_kwargs: Any) -> None:
+            called["load_state_calls"] = list(called["load_state_calls"]) + [dict(load_kwargs)]
+            if load_state_orig_mod_mismatch and load_kwargs.get("strict", True):
+                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
+            return None
+
+        def _get_state_dict(self: FakeAccelerator, model: Any) -> dict[str, torch.Tensor]:
+            del model
+            called["get_state_dict"] = int(called["get_state_dict"]) + 1
+            return {
+                "discriminator.weight": torch.tensor(1.0),
+                "generator.weight": torch.tensor(2.0),
+            }
+
+        def _unwrap_model(self: FakeAccelerator, model: Any, **unwrap_kwargs: Any) -> Any:
+            del unwrap_kwargs
+            called["unwrap_model"] = int(called["unwrap_model"]) + 1
+            return model
+
+        accel.prepare = types.MethodType(_prepare, accel)  # type: ignore[method-assign]
+        accel.load_state = types.MethodType(_load_state, accel)  # type: ignore[method-assign]
+        accel.get_state_dict = types.MethodType(_get_state_dict, accel)  # type: ignore[method-assign]
+        accel.unwrap_model = types.MethodType(_unwrap_model, accel)  # type: ignore[method-assign]
+        return accel
+
+    fake_accelerate.Accelerator = _accelerator_factory
     fake_accelerate.utils = fake_utils
 
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
@@ -158,7 +186,7 @@ def _install_export_fakes(
         return object(), object()
 
     monkeypatch.setattr(export_cli, "build_backbones", _fake_build_backbones)
-    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _FakeRTDModel())
+    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: types.SimpleNamespace())
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
@@ -177,12 +205,13 @@ def _install_export_fakes(
 def test_run_export_fsdp_state_dict_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
     fsdp2: bool,
     provide_torch_state_dict_api: bool,
     offload_to_cpu: bool,
     rank0: bool,
 ):
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -221,9 +250,9 @@ def test_run_export_fsdp_state_dict_paths(
 
 
 def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     called["remap_calls"] = []
     _install_export_fakes(
@@ -260,8 +289,9 @@ def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
 def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -324,10 +354,21 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
     assert called["load_state_calls"] == [{}]
 
 
-def test_run_export_fails_on_partial_backbone_load_by_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("allow_partial_export", "expect_error"),
+    [
+        (False, True),
+        (True, False),
+    ],
+)
+def test_run_export_partial_backbone_load_respects_allow_partial_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    allow_partial_export: bool,
+    expect_error: bool,
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -336,66 +377,50 @@ def test_run_export_fails_on_partial_backbone_load_by_default(
         provide_torch_state_dict_api=False,
     )
 
-    class _BrokenBackbone(_FakeExportBackbone):
-        def __init__(self) -> None:
-            self._weights = {"other_weight": torch.tensor(0.0)}
-
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(
+                weight_keys=("other_weight",),
+                forced_missing_keys=("weight",),
+            ),
+            None,
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+    out_dir = tmp_path / f"exported-{int(allow_partial_export)}"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    if expect_error:
+        with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+            export_cli.run_export(
+                export_cli.ExportConfig(
+                    checkpoint_dir=str(checkpoint_dir),
+                    run_dir=str(run_dir),
+                    output_dir=str(out_dir),
+                    export_what="discriminator",
+                    allow_partial_export=allow_partial_export,
+                )
+            )
+    else:
         export_cli.run_export(
             export_cli.ExportConfig(
                 checkpoint_dir=str(checkpoint_dir),
                 run_dir=str(run_dir),
-                output_dir=str(tmp_path / "exported"),
+                output_dir=str(out_dir),
                 export_what="discriminator",
+                allow_partial_export=allow_partial_export,
             )
         )
-
-
-def test_run_export_allows_partial_backbone_load_with_opt_in_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
-    called = _new_export_call_counters()
-    _install_export_fakes(
-        monkeypatch=monkeypatch,
-        called=called,
-        fsdp2=False,
-        provide_torch_state_dict_api=False,
-    )
-
-    class _BrokenBackbone(_FakeExportBackbone):
-        def __init__(self) -> None:
-            self._weights = {"other_weight": torch.tensor(0.0)}
-
-    monkeypatch.setattr(
-        export_cli,
-        "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_BrokenBackbone(), None),
-    )
-
-    out_dir = tmp_path / "exported"
-    export_cli.run_export(
-        export_cli.ExportConfig(
-            checkpoint_dir=str(checkpoint_dir),
-            run_dir=str(run_dir),
-            output_dir=str(out_dir),
-            export_what="discriminator",
-            allow_partial_export=True,
-        )
-    )
-    assert (out_dir / "discriminator").exists()
+        assert out_dir.exists()
+        assert not (out_dir / "discriminator").exists()
 
 
 def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -403,19 +428,17 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
         fsdp2=False,
         provide_torch_state_dict_api=False,
     )
-
-    class _EmbeddingWeightBackbone(_FakeExportBackbone):
-        def __init__(self) -> None:
-            self._weights = {
-                "embeddings.word_embeddings.weight": torch.tensor([0.0]),
-                "encoder.weight": torch.tensor([0.0]),
-            }
 
     merge_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_EmbeddingWeightBackbone(), None),
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(
+                weight_keys=("embeddings.word_embeddings.weight", "encoder.weight"),
+            ),
+            None,
+        ),
     )
     monkeypatch.setattr(
         export_cli,
@@ -446,15 +469,16 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
         )
     )
 
-    assert (out_dir / "discriminator").exists()
+    assert out_dir.exists()
+    assert not (out_dir / "discriminator").exists()
     assert len(merge_calls) == 1
     assert "embeddings.word_embeddings.bias" in merge_calls[0]["disc_sd"]
 
 
 def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     out_dir = tmp_path / "exported"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "stale.txt").write_text("x", encoding="utf-8")
@@ -486,9 +510,9 @@ def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
 
 
 def test_run_export_strips_training_internal_keys_from_saved_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
-    run_dir, checkpoint_dir = _write_run_layout(tmp_path)
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -497,25 +521,22 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
         provide_torch_state_dict_api=False,
     )
 
-    class _ConfigWritingBackbone(_FakeExportBackbone):
-        def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
-            del safe_serialization
-            target = Path(path)
-            target.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "model_type": "deberta-v2",
-                "hidden_size": 768,
-                "hf_attention_kernel": "stable",
-                "use_rmsnorm_heads": False,
-                "legacy": True,
-                "cls_token_id": 1,
-            }
-            (target / "config.json").write_text(json.dumps(payload), encoding="utf-8")
-
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (_ConfigWritingBackbone(), None),
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(
+                write_config_payload={
+                    "model_type": "deberta-v2",
+                    "hidden_size": 768,
+                    "hf_attention_kernel": "stable",
+                    "use_rmsnorm_heads": False,
+                    "legacy": True,
+                    "cls_token_id": 1,
+                }
+            ),
+            None,
+        ),
     )
 
     out_dir = tmp_path / "exported"
@@ -528,7 +549,7 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
         )
     )
 
-    config_path = out_dir / "discriminator" / "config.json"
+    config_path = out_dir / "config.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert "hf_attention_kernel" not in data
     assert "use_rmsnorm_heads" not in data
@@ -536,6 +557,44 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     assert data["model_type"] == "deberta-v2"
     assert data["hidden_size"] == 768
     assert data["legacy"] is True
+    assert (out_dir / "README.md").exists()
+
+
+def test_run_export_both_targets_save_into_component_subdirectories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (
+            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
+            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
+        ),
+    )
+
+    out_dir = tmp_path / "exported-both"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="both",
+        )
+    )
+
+    assert (out_dir / "discriminator" / "config.json").exists()
+    assert (out_dir / "generator" / "config.json").exists()
+    assert (out_dir / "discriminator" / "README.md").exists()
+    assert (out_dir / "generator" / "README.md").exists()
 
 
 def test_validate_run_metadata_if_present_accepts_missing_metadata(tmp_path: Path):
@@ -556,16 +615,82 @@ def test_validate_run_metadata_if_present_rejects_unknown_schema(tmp_path: Path)
 
 
 def test_namespace_to_export_config_maps_allow_partial_export() -> None:
-    ns = types.SimpleNamespace(
-        checkpoint_dir="/tmp/checkpoint-1",
-        output_dir="/tmp/exported",
-        run_dir="/tmp/run",
-        export_what="discriminator",
-        safe_serialization=True,
-        offload_to_cpu=True,
-        rank0=True,
-        embedding_sharing=None,
-        allow_partial_export=True,
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        ns = types.SimpleNamespace(
+            checkpoint_dir=str(root / "checkpoint-1"),
+            output_dir=str(root / "exported"),
+            run_dir=str(root / "run"),
+            export_what="discriminator",
+            safe_serialization=True,
+            offload_to_cpu=True,
+            rank0=True,
+            embedding_sharing=None,
+            allow_partial_export=True,
+        )
+        cfg = export_cli.namespace_to_export_config(ns)
+        assert cfg.allow_partial_export is True
+
+
+def test_export_parser_rejects_conflicting_what_alias_values() -> None:
+    parser = argparse.ArgumentParser(prog="deberta export")
+    export_cli.add_export_arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "runs/demo/checkpoint-10",
+                "--what",
+                "discriminator",
+                "--export-what",
+                "generator",
+            ]
+        )
+
+
+def test_run_export_rejects_invalid_export_what_before_runtime_imports() -> None:
+    with pytest.raises(ValueError, match="export_what must be discriminator\\|generator\\|both"):
+        export_cli.run_export(
+            export_cli.ExportConfig(
+                checkpoint_dir="runs/demo/checkpoint-10",
+                export_what="not-a-real-target",
+            )
+        )
+
+
+def test_run_export_warns_when_fsdp_only_flags_are_ignored_on_non_fsdp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+        distributed_type="NO",
     )
-    cfg = export_cli.namespace_to_export_config(ns)
-    assert cfg.allow_partial_export is True
+    monkeypatch.setattr(
+        export_cli,
+        "DebertaV3RTDPretrainer",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            state_dict=lambda: {
+                "discriminator.weight": torch.tensor(1.0),
+                "generator.weight": torch.tensor(2.0),
+            }
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        export_cli.run_export(
+            export_cli.ExportConfig(
+                checkpoint_dir=str(checkpoint_dir),
+                run_dir=str(run_dir),
+                output_dir=str(tmp_path / "exported"),
+                offload_to_cpu=False,
+                rank0=False,
+            )
+        )
+    assert "only apply to FSDP export" in caplog.text

@@ -1,4 +1,4 @@
-"""Shared export helpers for embedding-merge behavior."""
+"""Shared export helpers for embedding merges and artifact generation."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ EXPORT_CONFIG_STRIP_KEYS = frozenset(
         "eos_token_id",
     }
 )
+_REPO_URL = "https://github.com/pszemraj/deberta"
 
 
 def clean_exported_config(config_path: Path, *, strict: bool) -> None:
@@ -41,6 +42,135 @@ def clean_exported_config(config_path: Path, *, strict: bool) -> None:
 
     cleaned = {k: v for k, v in raw.items() if k not in EXPORT_CONFIG_STRIP_KEYS}
     config_path.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
+
+
+def write_export_readme_and_license(
+    output_dir: Path,
+    *,
+    model_cfg: Any,
+    export_config: Any | None = None,
+    data_cfg: Any | None = None,
+    train_cfg: Any | None = None,
+    embedding_sharing: str,
+) -> None:
+    """Write README/Licensing artifacts for a standalone exported model directory.
+
+    :param Path output_dir: Export destination directory.
+    :param Any model_cfg: Model configuration dataclass.
+    :param Any | None export_config: Optional exported backbone config (preferred source for architecture stats).
+    :param Any | None data_cfg: Optional data configuration dataclass.
+    :param Any | None train_cfg: Optional training configuration dataclass.
+    :param str embedding_sharing: Embedding sharing mode.
+    """
+
+    def _first_int_attr(*objs: Any, attr: str) -> int:
+        """Return the first int-coercible attribute value across candidate objects.
+
+        :param Any objs: Candidate objects to inspect in order.
+        :param str attr: Attribute name to read from each object.
+        :return int: First coercible integer value, or 0 when none is present.
+        """
+        for obj in objs:
+            if obj is None:
+                continue
+            value = getattr(obj, attr, None)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return 0
+
+    backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
+    runtime_cfg = export_config if export_config is not None else model_cfg
+    hidden = _first_int_attr(runtime_cfg, model_cfg, attr="hidden_size")
+    layers = _first_int_attr(runtime_cfg, model_cfg, attr="num_hidden_layers")
+    heads = _first_int_attr(runtime_cfg, model_cfg, attr="num_attention_heads")
+    seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
+    if seq_len == 0:
+        seq_len = _first_int_attr(runtime_cfg, model_cfg, attr="max_position_embeddings")
+    steps = int(getattr(train_cfg, "max_steps", 0) or 0)
+
+    if backbone == "rope":
+        arch_desc = "RoPE encoder (RMSNorm, SwiGLU, rotary embeddings)"
+        usage_snippet = """from transformers import AutoTokenizer
+from deberta.modeling.rope_encoder import DebertaRoPEModel
+
+model = DebertaRoPEModel.from_pretrained("path/to/this/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+"""
+        compatibility_note = (
+            "Note: RoPE exports use a custom `model_type` (`deberta-rope`) and are not currently "
+            "loadable via `transformers.AutoModel.from_pretrained(...)` without custom auto-class registration."
+        )
+    else:
+        arch_desc = "DeBERTa-v2 (disentangled attention, LayerNorm)"
+        usage_snippet = """from transformers import AutoModel, AutoTokenizer
+
+model = AutoModel.from_pretrained("path/to/this/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+"""
+        compatibility_note = ""
+
+    readme = f"""---
+library_name: transformers
+tags:
+- deberta
+- encoder
+- rtd
+- fill-mask
+license: mit
+---
+
+# {backbone}-{hidden}h-{layers}L-{heads}H
+
+RTD-pretrained encoder ({arch_desc}).
+
+| Parameter | Value |
+|---|---|
+| Backbone | `{backbone}` |
+| Hidden size | {hidden} |
+| Layers | {layers} |
+| Attention heads | {heads} |
+| Max sequence length | {seq_len} |
+| Embedding sharing | `{embedding_sharing}` |
+| Training steps | {steps} |
+
+## Training
+
+Pretrained with replaced-token detection (RTD / ELECTRA-style) using
+[pszemraj/deberta]({_REPO_URL}).
+
+## Usage
+
+```python
+{usage_snippet}
+```
+{compatibility_note}
+"""
+    (output_dir / "README.md").write_text(readme, encoding="utf-8")
+
+    mit_license = (
+        "MIT License\n\n"
+        "Copyright (c) 2025-2026 Peter Szemraj\n\n"
+        "Permission is hereby granted, free of charge, to any person obtaining a copy\n"
+        'of this software and associated documentation files (the "Software"), to deal\n'
+        "in the Software without restriction, including without limitation the rights\n"
+        "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n"
+        "copies of the Software, and to permit persons to whom the Software is\n"
+        "furnished to do so, subject to the following conditions:\n\n"
+        "The above copyright notice and this permission notice shall be included in all\n"
+        "copies or substantial portions of the Software.\n\n"
+        'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n'
+        "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n"
+        "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n"
+        "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n"
+        "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n"
+        "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n"
+        "SOFTWARE.\n"
+    )
+    (output_dir / "LICENSE").write_text(mit_license, encoding="utf-8")
 
 
 def split_pretrainer_state_dict(

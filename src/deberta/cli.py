@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import os
 import sys
 import types
-from dataclasses import fields
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Union, get_args, get_origin
 
 from deberta.config import (
     _ATTN_IMPL_CHOICES,
@@ -16,9 +17,11 @@ from deberta.config import (
     _FFN_CHOICES,
     _HF_ATTN_KERNEL_ALIASES,
     _HF_ATTN_KERNEL_CHOICES,
+    _HF_MODEL_SIZE_CHOICES,
+    _LOGGING_BACKEND_CHOICES,
     _LR_SCHEDULER_CHOICES,
+    _MODEL_PROFILE_CHOICES,
     _NORM_ARCH_CHOICES,
-    _REPORT_TO_CHOICES,
     _RESUME_DATA_STRATEGY_CHOICES,
     _SDPA_KERNEL_ALIASES,
     _SDPA_KERNEL_CHOICES,
@@ -28,148 +31,98 @@ from deberta.config import (
     _TORCH_COMPILE_MODE_CHOICES,
     _TORCH_COMPILE_SCOPE_ALIASES,
     _TORCH_COMPILE_SCOPE_CHOICES,
-    DataConfig,
-    ModelConfig,
-    TrainConfig,
+    _WANDB_WATCH_ALIASES,
+    _WANDB_WATCH_CHOICES,
+    Config,
+    apply_dotted_override,
+    apply_profile_defaults,
+    asdict_without_private,
+    iter_leaf_paths_for_dataclass,
+    load_config,
     validate_data_config,
+    validate_logging_config,
     validate_model_config,
+    validate_optim_config,
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.export_cli import add_export_arguments, namespace_to_export_config, run_export
-from deberta.io_utils import load_json_mapping
+from deberta.export_cli import (
+    ExportArgumentDefaultsHelpFormatter,
+    add_export_arguments,
+    namespace_to_export_config,
+    run_export,
+)
 from deberta.training import run_pretraining, run_pretraining_dry_run
 
+# Nested canonical presets. With a config file, presets still only apply model overrides.
 _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "deberta-v3-base": {
-        # Paper-faithful architecture path for DeBERTa-v3 experiments.
         "model": {
+            "profile": "deberta_v3_parity",
             "backbone_type": "hf_deberta_v2",
-            "tokenizer_name_or_path": "microsoft/deberta-v3-base",
-            "discriminator_model_name_or_path": "microsoft/deberta-v3-base",
-            "generator_model_name_or_path": None,
+            "tokenizer": {
+                "name_or_path": "microsoft/deberta-v3-base",
+            },
             "from_scratch": True,
             "embedding_sharing": "gdes",
-            "hf_attention_kernel": "dynamic",
+            "hf": {
+                "attention_kernel": "dynamic",
+            },
         },
-        # Applied only when no config path is provided.
         "data": {
-            "dataset_name": "HuggingFaceFW/fineweb-edu",
-            "dataset_config_name": "default",
-            "train_split": "train",
-            "streaming": True,
-            "pack_sequences": True,
-            "block_cross_document_attention": False,
-            "text_column_name": "text",
-            "max_seq_length": 512,
-            "shuffle_buffer_size": 10_000,
+            "source": {
+                "dataset_name": "HuggingFaceFW/fineweb-edu",
+                "dataset_config_name": "default",
+                "train_split": "train",
+                "streaming": True,
+                "text_column_name": "text",
+                "shuffle_buffer_size": 10_000,
+            },
+            "packing": {
+                "enabled": True,
+                "block_cross_document_attention": False,
+                "max_seq_length": 512,
+            },
         },
-        # Applied only when no config path is provided.
         "train": {
             "max_steps": 500_000,
-            "report_to": "none",
+        },
+        "logging": {
+            "backend": "none",
+            "wandb": {
+                "enabled": False,
+            },
         },
     }
 }
 
-
-def _split_flat_dict(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Split flat config keys into model/data/train sections.
-
-    :param dict[str, Any] raw: Flat config mapping.
-    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Parsed model/data/train dicts.
-    """
-
-    model_keys = {f.name for f in fields(ModelConfig)}
-    data_keys = {f.name for f in fields(DataConfig)}
-    train_keys = {f.name for f in fields(TrainConfig)}
-
-    model_dict: dict[str, Any] = {}
-    data_dict: dict[str, Any] = {}
-    train_dict: dict[str, Any] = {}
-
-    unknown: dict[str, Any] = {}
-
-    for k, v in raw.items():
-        if k in model_keys:
-            model_dict[k] = v
-        elif k in data_keys:
-            data_dict[k] = v
-        elif k in train_keys:
-            train_dict[k] = v
-        else:
-            unknown[k] = v
-
-    if unknown:
-        keys = ", ".join(sorted(unknown.keys()))
-        raise ValueError(f"Unknown keys in config file (not in ModelConfig/DataConfig/TrainConfig): {keys}")
-
-    return model_dict, data_dict, train_dict
-
-
-def _load_yaml(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
-    """Load model/data/train dataclasses from a YAML file.
-
-    :param Path path: YAML path.
-    :return tuple[ModelConfig, DataConfig, TrainConfig]: Parsed config dataclasses.
-    """
-    try:
-        import yaml  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
-        ) from e
-
-    raw = yaml.safe_load(path.read_text())
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("YAML config must parse to a dict.")
-
-    model_dict, data_dict, train_dict = _split_nested_or_flat_sections(raw, format_name="YAML")
-
-    return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
-
-
-def _load_json(path: Path) -> tuple[ModelConfig, DataConfig, TrainConfig]:
-    """Load model/data/train dataclasses from a JSON file.
-
-    :param Path path: JSON path.
-    :return tuple[ModelConfig, DataConfig, TrainConfig]: Parsed config dataclasses.
-    """
-    raw = load_json_mapping(path)
-    model_dict, data_dict, train_dict = _split_nested_or_flat_sections(raw, format_name="JSON")
-    return ModelConfig(**model_dict), DataConfig(**data_dict), TrainConfig(**train_dict)
-
-
-def _split_nested_or_flat_sections(
-    raw: dict[str, Any], *, format_name: str
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Split nested/flat config mappings into model/data/train sections.
-
-    :param dict[str, Any] raw: Parsed config mapping.
-    :param str format_name: Human-readable format label (e.g., JSON/YAML).
-    :return tuple[dict[str, Any], dict[str, Any], dict[str, Any]]: Section dictionaries.
-    """
-    if any(k in raw for k in ("model", "data", "train")):
-        unknown_top = sorted(k for k in raw.keys() if k not in {"model", "data", "train"})
-        if unknown_top:
-            raise ValueError(
-                f"Unknown top-level keys in nested {format_name} config "
-                f"(expected only model/data/train): {', '.join(unknown_top)}"
-            )
-        model_dict = raw.get("model", {}) or {}
-        data_dict = raw.get("data", {}) or {}
-        train_dict = raw.get("train", {}) or {}
-        if (
-            not isinstance(model_dict, dict)
-            or not isinstance(data_dict, dict)
-            or not isinstance(train_dict, dict)
-        ):
-            raise ValueError(f"{format_name} config sections model/data/train must be dicts.")
-        return model_dict, data_dict, train_dict
-
-    return _split_flat_dict(raw)
+# Parse-time choices for dotted flags.
+_DOTFLAG_CHOICES: dict[str, tuple[str, ...]] = {
+    "model.profile": tuple(sorted(_MODEL_PROFILE_CHOICES)),
+    "model.backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
+    "model.embedding_sharing": tuple(sorted(_EMBED_SHARING_CHOICES)),
+    "model.hf.model_size": tuple(sorted(_HF_MODEL_SIZE_CHOICES)),
+    "model.hf.attention_kernel": tuple(sorted(_HF_ATTN_KERNEL_CHOICES | set(_HF_ATTN_KERNEL_ALIASES.keys()))),
+    "model.rope.norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
+    "model.rope.pretrained.norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
+    "model.rope.attention_implementation": tuple(sorted(_ATTN_IMPL_CHOICES)),
+    "model.rope.ffn_type": tuple(sorted(_FFN_CHOICES)),
+    "model.rope.pretrained.ffn_type": tuple(sorted(_FFN_CHOICES)),
+    "train.sdpa_kernel": tuple(sorted(_SDPA_KERNEL_CHOICES | set(_SDPA_KERNEL_ALIASES.keys()))),
+    "train.compile.mode": tuple(
+        sorted(_TORCH_COMPILE_MODE_CHOICES | set(_TORCH_COMPILE_MODE_ALIASES.keys()))
+    ),
+    "train.compile.scope": tuple(
+        sorted(_TORCH_COMPILE_SCOPE_CHOICES | set(_TORCH_COMPILE_SCOPE_ALIASES.keys()))
+    ),
+    "train.compile.backend": tuple(
+        sorted(_TORCH_COMPILE_BACKEND_CHOICES | set(_TORCH_COMPILE_BACKEND_ALIASES.keys()))
+    ),
+    "train.checkpoint.resume_data_strategy": tuple(sorted(_RESUME_DATA_STRATEGY_CHOICES)),
+    "optim.scheduler.type": tuple(sorted(_LR_SCHEDULER_CHOICES)),
+    "logging.backend": tuple(sorted(_LOGGING_BACKEND_CHOICES)),
+    "logging.wandb.watch": tuple(sorted(_WANDB_WATCH_CHOICES | set(_WANDB_WATCH_ALIASES.keys()))),
+}
 
 
 def _parse_bool(value: str) -> bool:
@@ -186,18 +139,32 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
 
 
-def _unwrap_optional(field_type: Any) -> Any:
+def _should_fast_exit_after_train(*, explicit_argv: bool) -> bool:
+    """Decide whether train CLI should use os._exit(0) on success.
+
+    :param bool explicit_argv: True when main() was called with argv list.
+    :return bool: Whether to fast-exit.
+    """
+    if explicit_argv:
+        return False
+    raw = str(os.getenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")).strip().lower()
+    return raw not in {"0", "false", "f", "no", "n", "off"}
+
+
+def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
     """Unwrap Optional[T] style annotations.
 
     :param Any field_type: Type annotation.
-    :return Any: Base type when optional, otherwise original type.
+    :return tuple[Any, bool]: Base type and whether the field allows ``None``.
     """
     origin = get_origin(field_type)
     if origin in {Union, types.UnionType}:
-        args = [a for a in get_args(field_type) if a is not type(None)]
-        if len(args) == 1:
-            return args[0]
-    return field_type
+        args = get_args(field_type)
+        non_none = [a for a in args if a is not type(None)]
+        allows_none = any(a is type(None) for a in args)
+        if len(non_none) == 1:
+            return non_none[0], allows_none
+    return field_type, False
 
 
 def _argparse_type(field_type: Any) -> Any:
@@ -206,7 +173,41 @@ def _argparse_type(field_type: Any) -> Any:
     :param Any field_type: Dataclass field type.
     :return Any: Callable/type for argparse.
     """
-    t = _unwrap_optional(field_type)
+    t, allows_none = _unwrap_optional(field_type)
+    if allows_none:
+
+        def _parse_optional(value: str) -> Any:
+            """Parse optional scalar CLI values.
+
+            :param str value: Raw CLI value.
+            :raises argparse.ArgumentTypeError: On incompatible scalar conversion.
+            :return Any: Parsed value (or ``None`` for ``null``/``none``).
+            """
+            text = str(value).strip()
+            if text.lower() in {"null", "none"}:
+                return None
+            if t is bool:
+                return _parse_bool(text)
+            if t is int:
+                try:
+                    return int(text)
+                except ValueError as exc:
+                    raise argparse.ArgumentTypeError(
+                        f"Expected an integer value or null/none, got: {value}"
+                    ) from exc
+            if t is float:
+                try:
+                    return float(text)
+                except ValueError as exc:
+                    raise argparse.ArgumentTypeError(
+                        f"Expected a numeric value or null/none, got: {value}"
+                    ) from exc
+            if t is str:
+                return text
+            return value
+
+        return _parse_optional
+
     if t is bool:
         return _parse_bool
     if t in {str, int, float}:
@@ -214,68 +215,130 @@ def _argparse_type(field_type: Any) -> Any:
     return str
 
 
-def _add_dataclass_flags(parser: argparse.ArgumentParser, cls: Any, *, group_name: str) -> None:
-    """Add argparse flags for all dataclass fields.
+def _dest_for_path(path: str) -> str:
+    """Build argparse destination key from a dotted path.
 
-    :param argparse.ArgumentParser parser: Train subparser.
-    :param Any cls: Dataclass type.
-    :param str group_name: Group label.
+    :param str path: Dotted path.
+    :return str: Argparse destination.
     """
-    group = parser.add_argument_group(group_name)
-    type_hints = get_type_hints(cls)
-    constrained_choices: dict[str, tuple[str, ...]] = {
-        "backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
-        "norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
-        "pretrained_norm_arch": tuple(sorted(_NORM_ARCH_CHOICES)),
-        "attention_implementation": tuple(sorted(_ATTN_IMPL_CHOICES)),
-        "ffn_type": tuple(sorted(_FFN_CHOICES)),
-        "pretrained_ffn_type": tuple(sorted(_FFN_CHOICES)),
-        "hf_attention_kernel": tuple(sorted(_HF_ATTN_KERNEL_CHOICES | set(_HF_ATTN_KERNEL_ALIASES.keys()))),
-        "embedding_sharing": tuple(sorted(_EMBED_SHARING_CHOICES)),
-        "report_to": tuple(sorted(_REPORT_TO_CHOICES)),
-        "lr_scheduler_type": tuple(sorted(_LR_SCHEDULER_CHOICES)),
-        # Keep legacy aliases parseable for UX compatibility.
-        "sdpa_kernel": tuple(sorted(_SDPA_KERNEL_CHOICES | set(_SDPA_KERNEL_ALIASES.keys()))),
-        "torch_compile_mode": tuple(
-            sorted(_TORCH_COMPILE_MODE_CHOICES | set(_TORCH_COMPILE_MODE_ALIASES.keys()))
-        ),
-        "torch_compile_scope": tuple(
-            sorted(_TORCH_COMPILE_SCOPE_CHOICES | set(_TORCH_COMPILE_SCOPE_ALIASES.keys()))
-        ),
-        "torch_compile_backend": tuple(
-            sorted(_TORCH_COMPILE_BACKEND_CHOICES | set(_TORCH_COMPILE_BACKEND_ALIASES.keys()))
-        ),
-        "resume_data_strategy": tuple(sorted(_RESUME_DATA_STRATEGY_CHOICES)),
-    }
+    return f"dot__{str(path).replace('.', '__')}"
 
-    for f in fields(cls):
-        help_text = str(f.metadata.get("help", "")) if f.metadata else ""
-        default = f.default
-        field_type = type_hints.get(f.name, f.type)
-        choices = constrained_choices.get(f.name)
+
+def _flag_value_to_override_text(value: Any) -> str:
+    """Serialize a typed parsed value into apply_dotted_override text form.
+
+    :param Any value: Parsed value.
+    :return str: Serialized override value.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if bool(value) else "false"
+    return str(value)
+
+
+def _flatten_mapping(mapping: dict[str, Any], *, prefix: str = "") -> dict[str, Any]:
+    """Flatten a nested mapping into dotted leaf keys.
+
+    :param dict[str, Any] mapping: Input mapping.
+    :param str prefix: Optional prefix.
+    :return dict[str, Any]: Dotted leaf key/value map.
+    """
+    out: dict[str, Any] = {}
+    for key, value in mapping.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten_mapping(value, prefix=path))
+        else:
+            out[str(path)] = value
+    return out
+
+
+def _flatten_cfg(cfg: Config) -> dict[str, Any]:
+    """Flatten a Config object into dotted leaf key/value pairs.
+
+    :param Config cfg: Config object.
+    :return dict[str, Any]: Flattened mapping.
+    """
+    return _flatten_mapping(asdict_without_private(cfg))
+
+
+def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
+    """Register direct dotted flags for all config leaves.
+
+    :param argparse.ArgumentParser parser: Target parser.
+    :return dict[str, str]: Mapping of dotted path to argparse destination.
+    """
+
+    def _choices_for_path(path: str, field_type: Any) -> tuple[Any, ...] | None:
+        """Return argparse choices for one dotflag, including ``None`` when optional.
+
+        Optional constrained fields should accept ``none``/``null`` so users can
+        clear values loaded from config files.
+
+        :param str path: Dotted field path.
+        :param Any field_type: Dataclass field type annotation.
+        :return tuple[Any, ...] | None: Argparse choices or ``None`` when unconstrained.
+        """
+        base = _DOTFLAG_CHOICES.get(str(path))
+        if base is None:
+            return None
+        _target_t, allows_none = _unwrap_optional(field_type)
+        if not allows_none:
+            return base
+        if any(choice is None for choice in base):
+            return base
+        return tuple(base) + (None,)
+
+    dest_by_path: dict[str, str] = {}
+    group = parser.add_argument_group("Config Dotflags")
+
+    for path, field_type in iter_leaf_paths_for_dataclass(Config):
+        dest = _dest_for_path(path)
+        dest_by_path[str(path)] = dest
         group.add_argument(
-            f"--{f.name}",
-            f"--{f.name.replace('_', '-')}",
-            dest=f.name,
-            default=default,
+            f"--{path}",
+            dest=dest,
+            default=argparse.SUPPRESS,
             type=_argparse_type(field_type),
-            choices=choices,
-            help=help_text,
+            choices=_choices_for_path(str(path), field_type),
+            help=f"Set {path}",
         )
+    return dest_by_path
 
 
-def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+def _load_yaml(path: Path) -> tuple[Any, Any, Any]:
+    """Load model/data/train config sections from YAML path.
+
+    :param Path path: YAML path.
+    :return tuple[Any, Any, Any]: Parsed model/data/train config objects.
+    """
+    cfg = load_config(path)
+    return cfg.model, cfg.data, cfg.train
+
+
+def _load_json(path: Path) -> tuple[Any, Any, Any]:
+    """Load model/data/train config sections from JSON path.
+
+    :param Path path: JSON path.
+    :return tuple[Any, Any, Any]: Parsed model/data/train config objects.
+    """
+    cfg = load_config(path)
+    return cfg.model, cfg.data, cfg.train
+
+
+def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> dict[str, str]:
     """Create `deberta train` parser.
 
     :param argparse._SubParsersAction[argparse.ArgumentParser] subparsers: Parent subparsers action.
+    :return dict[str, str]: Dotted path to argparse destination mapping.
     """
     train = subparsers.add_parser(
         "train",
         help="Run pretraining.",
         description=(
-            "Run RTD pretraining from a YAML/JSON config file or from explicit CLI flags. "
-            "Examples: `deberta train configs/pretrain_rope_fineweb_edu.yaml` or "
-            "`deberta train --dataset_name HuggingFaceFW/fineweb-edu --dataset_config_name default --max_steps 1000`."
+            "Run RTD pretraining from a YAML/JSON config file and/or dotted CLI flags. "
+            "Example: deberta train cfg.yaml --train.max_steps 1000 --optim.scheduler.warmup_steps 500"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -283,7 +346,7 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         "config",
         nargs="?",
         default=None,
-        help="Optional YAML/JSON config path. CLI flags override matching config keys.",
+        help="Optional YAML/JSON config path. Dotflags override matching config keys.",
     )
     train.add_argument(
         "--preset",
@@ -291,20 +354,19 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         help=(
             "Optional training preset. With a config file, presets only override model fields. "
-            "Without a config file, presets provide model+data+train defaults."
+            "Without a config file, presets provide model+data+train+optim+logging defaults."
         ),
     )
-    _add_dataclass_flags(train, ModelConfig, group_name="Model")
-    _add_dataclass_flags(train, DataConfig, group_name="Data")
-    _add_dataclass_flags(train, TrainConfig, group_name="Train")
     train.add_argument(
         "--dry-run",
         action="store_true",
         help=(
             "Run non-destructive preflight checks (config validation, output/resume checks, "
-            "tokenizer+dataset+collator probe, backbone-config build) and exit without training."
+            "tokenizer+dataset+collator probe, backbone-config build) and exit without "
+            "training/checkpoint writes. May still access network and populate tokenizer/dataset caches."
         ),
     )
+    return _add_dotflags(train)
 
 
 def _build_export_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -315,7 +377,7 @@ def _build_export_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     export = subparsers.add_parser(
         "export",
         help="Consolidate and export checkpoint to standalone HF artifacts.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=ExportArgumentDefaultsHelpFormatter,
     )
     add_export_arguments(export)
 
@@ -331,8 +393,9 @@ def _build_main_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
-    _build_train_parser(subparsers)
+    dotflag_map = _build_train_parser(subparsers)
     _build_export_parser(subparsers)
+    parser._dotflag_map = dotflag_map  # type: ignore[attr-defined]
     return parser
 
 
@@ -350,63 +413,13 @@ def _subcommand_argv(argv: list[str], command: str) -> list[str]:
     return argv[idx + 1 :]
 
 
-def _extract_flag_names(argv: list[str]) -> set[str]:
-    """Extract provided --flag names from an argv list.
+def _apply_preset(*, cfg: Config, preset_name: str, with_config_file: bool) -> tuple[Config, str]:
+    """Apply a named preset payload to Config.
 
-    :param list[str] argv: Raw subcommand argv.
-    :return set[str]: Canonicalized flag names.
-    """
-    provided: set[str] = set()
-    for tok in argv:
-        if not tok.startswith("--") or tok == "--":
-            continue
-        name = tok[2:].split("=", 1)[0].replace("-", "_")
-        provided.add(name)
-    return provided
-
-
-def _apply_overrides(target: Any, source: argparse.Namespace, provided_flags: set[str]) -> None:
-    """Apply provided CLI flags onto an existing dataclass instance.
-
-    :param Any target: Dataclass instance to mutate.
-    :param argparse.Namespace source: Parsed CLI namespace.
-    :param set[str] provided_flags: Flags explicitly provided by the user.
-    """
-    for f in fields(type(target)):
-        if f.name in provided_flags:
-            setattr(target, f.name, getattr(source, f.name))
-
-
-def _apply_mapping_overrides(target: Any, overrides: dict[str, Any]) -> None:
-    """Apply mapping values onto a dataclass object by attribute name.
-
-    :param Any target: Dataclass instance to mutate.
-    :param dict[str, Any] overrides: Attribute/value mapping.
-    :raises ValueError: If an override key does not exist on ``target``.
-    """
-    for key, value in overrides.items():
-        if not hasattr(target, key):
-            raise ValueError(f"Preset override key {key!r} is not a valid field for {type(target).__name__}.")
-        setattr(target, key, value)
-
-
-def _apply_train_preset(
-    *,
-    preset_name: str,
-    cfg_path: Path | None,
-    model_cfg: ModelConfig,
-    data_cfg: DataConfig,
-    train_cfg: TrainConfig,
-) -> str:
-    """Apply a named train preset and return a human-readable mode label.
-
-    :param str preset_name: Preset name from CLI.
-    :param Path | None cfg_path: Optional config path (None means no config file).
-    :param ModelConfig model_cfg: Model config object to mutate.
-    :param DataConfig data_cfg: Data config object to mutate.
-    :param TrainConfig train_cfg: Train config object to mutate.
-    :raises ValueError: If preset name is unknown.
-    :return str: Mode label for CLI logging.
+    :param Config cfg: Current config.
+    :param str preset_name: Preset name.
+    :param bool with_config_file: Whether a config file was loaded.
+    :return tuple[Config, str]: Updated config and mode label.
     """
     name = str(preset_name).strip().lower()
     preset = _TRAIN_PRESETS.get(name)
@@ -414,96 +427,153 @@ def _apply_train_preset(
         allowed = ", ".join(sorted(_TRAIN_PRESETS.keys()))
         raise ValueError(f"Unknown train preset: {preset_name!r}. Available presets: {allowed}.")
 
-    _apply_mapping_overrides(model_cfg, dict(preset.get("model", {})))
-    if cfg_path is None:
-        _apply_mapping_overrides(data_cfg, dict(preset.get("data", {})))
-        _apply_mapping_overrides(train_cfg, dict(preset.get("train", {})))
-        return "model+data+train defaults (no config file)"
+    sections = ["model"] if with_config_file else ["model", "data", "train", "optim", "logging"]
+    for section in sections:
+        for path, value in _flatten_mapping(dict(preset.get(section, {})), prefix=section).items():
+            cfg = apply_dotted_override(cfg, f"{path}={_flag_value_to_override_text(value)}")
 
-    return "model-only overrides (config file provided)"
+    if with_config_file:
+        return cfg, "model-only overrides (config file provided)"
+    return cfg, "model+data+train+optim+logging defaults (no config file)"
 
 
-def _build_train_configs_from_namespace(
+def _apply_dotflags(
+    *,
+    cfg: Config,
     ns: argparse.Namespace,
-) -> tuple[ModelConfig, DataConfig, TrainConfig]:
-    """Construct model/data/train configs from a parsed namespace.
+    dotflag_map: dict[str, str],
+) -> tuple[Config, dict[str, str]]:
+    """Apply provided dotted flags onto config.
 
-    :param argparse.Namespace ns: Parsed train args.
-    :return tuple[ModelConfig, DataConfig, TrainConfig]: Config dataclasses.
+    :param Config cfg: Current config.
+    :param argparse.Namespace ns: Parsed namespace.
+    :param dict[str, str] dotflag_map: Path -> argparse destination map.
+    :return tuple[Config, dict[str, str]]: Updated config and reason mapping.
     """
-    model_kwargs = {f.name: getattr(ns, f.name) for f in fields(ModelConfig)}
-    data_kwargs = {f.name: getattr(ns, f.name) for f in fields(DataConfig)}
-    train_kwargs = {f.name: getattr(ns, f.name) for f in fields(TrainConfig)}
-    return ModelConfig(**model_kwargs), DataConfig(**data_kwargs), TrainConfig(**train_kwargs)
+    reasons: dict[str, str] = {}
+    for path, dest in dotflag_map.items():
+        if not hasattr(ns, dest):
+            continue
+        value = getattr(ns, dest)
+        cfg = apply_dotted_override(cfg, f"{path}={_flag_value_to_override_text(value)}")
+        reasons[str(path)] = f"CLI override (--{path})"
+    return cfg, reasons
 
 
-def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
+def _emit_config_mutation_warnings(
+    *,
+    cfg_path: Path | None,
+    before: Config,
+    after: Config,
+    reasons: dict[str, str],
+) -> None:
+    """Emit explicit warnings when runtime config differs from baseline values.
+
+    :param Path | None cfg_path: Optional config file path.
+    :param Config before: Baseline config.
+    :param Config after: Final config.
+    :param dict[str, str] reasons: Optional reason mapping.
+    """
+    if cfg_path is None:
+        return
+
+    flat_before = _flatten_cfg(before)
+    flat_after = _flatten_cfg(after)
+    changes: list[tuple[str, Any, Any, str]] = []
+    for key, old in flat_before.items():
+        if key not in flat_after:
+            continue
+        new = flat_after[key]
+        if new != old:
+            reason = reasons.get(str(key), "runtime normalization/defaulting")
+            changes.append((str(key), old, new, reason))
+
+    if not changes:
+        return
+
+    print(
+        f"[deberta][config-warning] Loaded config '{cfg_path}' was modified after load:",
+        file=sys.stderr,
+    )
+    for key, old, new, reason in changes:
+        print(
+            f"[deberta][config-warning] {key}: {old!r} -> {new!r} ({reason})",
+            file=sys.stderr,
+        )
+
+
+def _run_train(
+    ns: argparse.Namespace,
+    *,
+    dotflag_map: dict[str, str],
+) -> None:
     """Run train flow from parsed namespace.
 
     :param argparse.Namespace ns: Parsed train args.
-    :param list[str] raw_train_argv: Raw argv after `train`.
+    :param dict[str, str] dotflag_map: Dotted path -> argparse destination mapping.
     """
     cfg_path: Path | None = None
-    provided_flags = _extract_flag_names(raw_train_argv)
     if ns.config is not None:
         cfg_path = Path(ns.config).expanduser().resolve()
         if not cfg_path.exists():
             raise FileNotFoundError(str(cfg_path))
-
         suffix = cfg_path.suffix.lower()
         if suffix not in {".json", ".yaml", ".yml"}:
             raise ValueError("Config file must end with .json, .yaml, or .yml")
-
-        if suffix == ".json":
-            model_cfg, data_cfg, train_cfg = _load_json(cfg_path)
-        else:
-            model_cfg, data_cfg, train_cfg = _load_yaml(cfg_path)
+        cfg = load_config(cfg_path)
+        baseline_cfg = copy.deepcopy(cfg)
     else:
-        if ns.preset:
-            model_cfg, data_cfg, train_cfg = ModelConfig(), DataConfig(), TrainConfig()
-        else:
-            model_cfg, data_cfg, train_cfg = _build_train_configs_from_namespace(ns)
+        cfg = Config()
+        baseline_cfg = Config()
+
+    reason_overrides: dict[str, str] = {}
 
     if ns.preset:
-        preset_mode = _apply_train_preset(
+        cfg, preset_mode = _apply_preset(
+            cfg=cfg,
             preset_name=str(ns.preset),
-            cfg_path=cfg_path,
-            model_cfg=model_cfg,
-            data_cfg=data_cfg,
-            train_cfg=train_cfg,
+            with_config_file=cfg_path is not None,
         )
-        if cfg_path is None:
-            print(
-                f"Applying train preset '{ns.preset}': {preset_mode}. "
-                "Explicit CLI flags override preset values."
-            )
-        else:
-            print(
-                f"Applying train preset '{ns.preset}': {preset_mode}. "
-                "Data/train values remain from config unless explicitly overridden via CLI."
-            )
+        print(f"Applying train preset '{ns.preset}': {preset_mode}.")
 
-    if ns.config is not None or ns.preset:
-        _apply_overrides(model_cfg, ns, provided_flags)
-        _apply_overrides(data_cfg, ns, provided_flags)
-        _apply_overrides(train_cfg, ns, provided_flags)
+    cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns, dotflag_map=dotflag_map)
+    reason_overrides.update(cli_reasons)
 
-    # Validate after config load + CLI overrides so failures are immediate and explicit.
-    validate_model_config(model_cfg)
-    validate_data_config(data_cfg)
-    validate_train_config(train_cfg)
-    validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
+    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
+
+    validate_model_config(cfg.model)
+    validate_data_config(cfg.data)
+    validate_train_config(cfg.train)
+    validate_optim_config(cfg.optim)
+    validate_logging_config(cfg.logging)
+    validate_training_workflow_options(
+        data_cfg=cfg.data,
+        train_cfg=cfg.train,
+        model_cfg=cfg.model,
+        optim_cfg=cfg.optim,
+        logging_cfg=cfg.logging,
+    )
+
+    _emit_config_mutation_warnings(
+        cfg_path=cfg_path,
+        before=baseline_cfg,
+        after=cfg,
+        reasons=reason_overrides,
+    )
 
     if bool(getattr(ns, "dry_run", False)):
         report = run_pretraining_dry_run(
-            model_cfg=model_cfg,
-            data_cfg=data_cfg,
-            train_cfg=train_cfg,
+            model_cfg=cfg.model,
+            data_cfg=cfg.data,
+            train_cfg=cfg.train,
+            optim_cfg=cfg.optim,
+            logging_cfg=cfg.logging,
             config_path=cfg_path,
         )
         summary = (
             "Dry-run preflight OK: "
-            f"output_dir={report['output_dir']}, "
+            f"checkpoint_output_dir={report['checkpoint_output_dir']}, "
+            f"logging_output_dir={report['logging_output_dir']}, "
             f"resume_checkpoint={report['resume_checkpoint']}, "
             f"effective_compile_scope={report['effective_compile_scope']}, "
             f"sample_batch_shape={report['sample_batch_shape']}, "
@@ -514,9 +584,11 @@ def _run_train(ns: argparse.Namespace, *, raw_train_argv: list[str]) -> None:
         return
 
     run_pretraining(
-        model_cfg=model_cfg,
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
+        model_cfg=cfg.model,
+        data_cfg=cfg.data,
+        train_cfg=cfg.train,
+        optim_cfg=cfg.optim,
+        logging_cfg=cfg.logging,
         config_path=cfg_path,
     )
 
@@ -526,12 +598,16 @@ def main(argv: list[str] | None = None) -> None:
 
     :param list[str] | None argv: Optional CLI argv (excluding program name).
     """
+    explicit_argv = argv is not None
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_main_parser()
+    dotflag_map = dict(getattr(parser, "_dotflag_map", {}))
     args = parser.parse_args(argv)
 
     if args.command == "train":
-        _run_train(args, raw_train_argv=_subcommand_argv(argv, "train"))
+        _run_train(args, dotflag_map=dotflag_map)
+        if _should_fast_exit_after_train(explicit_argv=explicit_argv):
+            os._exit(0)
         return
 
     if args.command == "export":

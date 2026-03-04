@@ -427,11 +427,11 @@ def _resolve_resume_checkpoint(
 
 def _load_checkpoint_progress_metadata(
     checkpoint_dir: Path,
-) -> tuple[int | None, float, str | None, int | None, int | None]:
+) -> tuple[int | None, float, str | dict[str, str] | None, int | None, int | None]:
     """Load persisted resume metadata from ``data_state.json``.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float, str | None, int | None, int | None]:
+    :return tuple[int | None, float, str | dict[str, str] | None, int | None, int | None]:
         ``(consumed_micro_batches, lr_mult, optimizer_param_digest, global_step, gradient_accumulation_steps)``.
     """
     path = checkpoint_dir / _CHECKPOINT_DATA_STATE_FILENAME
@@ -444,9 +444,14 @@ def _load_checkpoint_progress_metadata(
         val = raw.get("consumed_micro_batches", None)
         consumed = max(0, int(val)) if val is not None else None
         lr_mult = float(raw.get("lr_mult", 1.0))
-        digest = raw.get("optimizer_param_digest", None)
-        if digest is not None:
-            digest = str(digest)
+        digest_raw = raw.get("optimizer_param_digest", None)
+        digest: str | dict[str, str] | None
+        if isinstance(digest_raw, dict):
+            digest = {str(k): str(v) for k, v in digest_raw.items()}
+        elif digest_raw is not None:
+            digest = str(digest_raw)
+        else:
+            digest = None
         global_step_raw = raw.get("global_step", None)
         global_step = max(0, int(global_step_raw)) if global_step_raw is not None else None
         ga_steps_raw = raw.get("gradient_accumulation_steps", None)
@@ -469,11 +474,13 @@ def _load_checkpoint_progress_metadata(
         return None, 1.0, None, None, None
 
 
-def _load_checkpoint_data_progress(checkpoint_dir: Path) -> tuple[int | None, float, str | None]:
+def _load_checkpoint_data_progress(
+    checkpoint_dir: Path,
+) -> tuple[int | None, float, str | dict[str, str] | None]:
     """Load persisted data progress, LR multiplier, and optimizer param digest.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float, str | None]:
+    :return tuple[int | None, float, str | dict[str, str] | None]:
         ``(consumed_micro_batches, lr_mult, optimizer_param_digest)``.
     """
     consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
@@ -485,7 +492,7 @@ def _save_checkpoint_data_progress(
     checkpoint_dir: Path,
     consumed_micro_batches: int,
     lr_mult: float = 1.0,
-    optimizer_param_digest: str | None = None,
+    optimizer_param_digest: str | dict[str, str] | None = None,
     global_step: int | None = None,
     gradient_accumulation_steps: int | None = None,
 ) -> None:
@@ -494,7 +501,7 @@ def _save_checkpoint_data_progress(
     :param Path checkpoint_dir: Checkpoint directory.
     :param int consumed_micro_batches: Number of consumed micro-batches.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
-    :param str | None optimizer_param_digest: SHA-256 prefix digest of trainable param names.
+    :param str | dict[str, str] | None optimizer_param_digest: SHA-256 prefix digest(s) of trainable param names.
     :param int | None global_step: Committed optimizer step at checkpoint save time.
     :param int | None gradient_accumulation_steps: Gradient accumulation steps at save time.
     """
@@ -503,7 +510,10 @@ def _save_checkpoint_data_progress(
         "lr_mult": float(lr_mult),
     }
     if optimizer_param_digest is not None:
-        payload["optimizer_param_digest"] = str(optimizer_param_digest)
+        if isinstance(optimizer_param_digest, dict):
+            payload["optimizer_param_digest"] = {str(k): str(v) for k, v in optimizer_param_digest.items()}
+        else:
+            payload["optimizer_param_digest"] = str(optimizer_param_digest)
     if global_step is not None:
         payload["global_step"] = int(max(0, global_step))
     if gradient_accumulation_steps is not None:
@@ -520,7 +530,7 @@ def _save_training_checkpoint(
     save_total_limit: int,
     log_label: str,
     lr_mult: float = 1.0,
-    optimizer_param_digest: str | None = None,
+    optimizer_param_digest: str | dict[str, str] | None = None,
     global_step: int | None = None,
     gradient_accumulation_steps: int | None = None,
 ) -> None:
@@ -533,7 +543,7 @@ def _save_training_checkpoint(
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
-    :param str | None optimizer_param_digest: SHA-256 prefix digest of trainable param names.
+    :param str | dict[str, str] | None optimizer_param_digest: SHA-256 prefix digest(s) of trainable param names.
     :param int | None global_step: Committed optimizer step at save time.
     :param int | None gradient_accumulation_steps: Gradient accumulation steps at save time.
     """

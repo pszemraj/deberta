@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -16,7 +17,14 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer, FakeAccelerator, SimpleRTD, setup_pretraining_mocks
+from _fakes import (
+    DummyTokenizer,
+    FakeAccelerator,
+    FakeWandbRun,
+    SimpleRTD,
+    TinyRTDLikeModel,
+    setup_pretraining_mocks,
+)
 
 import deberta.cli as cli_mod
 from deberta.checkpoint_utils import (
@@ -27,37 +35,52 @@ from deberta.checkpoint_utils import (
 from deberta.cli import _load_json, _load_yaml
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
+    Config,
     DataConfig,
+    LoggingConfig,
     ModelConfig,
+    OptimConfig,
     TrainConfig,
+    _looks_like_hf_deberta_checkpoint,
     _normalize_hf_attention_kernel,
     _normalize_sdpa_kernel,
     _normalize_torch_compile_backend,
     _normalize_torch_compile_mode,
     _normalize_torch_compile_scope,
     _normalize_wandb_watch,
+    apply_dotted_override,
+    apply_profile_defaults,
+    load_config,
     load_data_config_snapshot,
     load_model_config_snapshot,
     normalize_mixed_precision,
     validate_data_config,
+    validate_logging_config,
     validate_model_config,
+    validate_optim_config,
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.export_cli import add_export_arguments
+from deberta.data.loading import load_hf_dataset
+from deberta.export_cli import ExportArgumentDefaultsHelpFormatter, add_export_arguments
 from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.mask_utils import normalize_keep_mask
-from deberta.modeling.rtd import attention_mask_to_active_tokens, compute_generator_loss_term
+from deberta.modeling.rtd import attention_mask_to_active_tokens
 from deberta.training.pretrain import (
+    _any_rank_flag_true,
     _append_metrics_jsonl_row,
     _apply_lr_mult,
     _apply_nonfinite_recovery,
+    _build_decoupled_optimizers,
     _build_optimizer,
+    _build_runtime_resolved_tracker_config,
     _build_training_collator,
+    _coerce_dataclass_payload_types,
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
     _cycle_dataloader,
     _export_discriminator_hf,
+    _export_discriminator_hf_subprocess,
     _finalize_window_metric_loss,
     _flush_loggers,
     _full_backbone_hf_inductor_warning,
@@ -66,6 +89,8 @@ from deberta.training.pretrain import (
     _load_resume_state_with_compile_fallback,
     _normalize_resume_consumed_micro_batches,
     _optimizer_param_order_digest,
+    _partition_optimizer_params,
+    _record_unscaled_lrs,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _resolve_data_resume_policy,
@@ -103,17 +128,6 @@ from deberta.training.tracker_utils import (
 )
 
 
-class _TinyRTDLikeModel(torch.nn.Module):
-    """Minimal module exposing generator/discriminator-style parameter names."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.generator = torch.nn.Linear(8, 8)
-        self.generator_lm_head = torch.nn.Linear(8, 8)
-        self.discriminator = torch.nn.Linear(8, 8)
-        self.discriminator_norm = torch.nn.LayerNorm(8)
-
-
 def test_load_yaml_nested_and_flat(tmp_path: Path):
     pytest.importorskip("yaml")
 
@@ -123,19 +137,25 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
             [
                 "model:",
                 "  backbone_type: rope",
-                "  ffn_type: swiglu",
+                "  rope:",
+                "    ffn_type: swiglu",
                 "data:",
-                "  max_seq_length: 128",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "  packing:",
+                "    max_seq_length: 128",
                 "train:",
-                "  overwrite_output_dir: true",
-                "  mlm_max_ngram: 3",
+                "  checkpoint:",
+                "    overwrite_output_dir: true",
+                "  objective:",
+                "    mlm_max_ngram: 3",
             ]
         ),
         encoding="utf-8",
     )
     model_nested, data_nested, train_nested = _load_yaml(nested)
-    assert model_nested.ffn_type == "swiglu"
-    assert data_nested.max_seq_length == 128
+    assert model_nested.rope.ffn_type == "swiglu"
+    assert data_nested.packing.max_seq_length == 128
     assert train_nested.overwrite_output_dir is True
     assert train_nested.mlm_max_ngram == 3
     assert train_nested.mixed_precision == "bf16"
@@ -153,11 +173,8 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    _, data_flat, train_flat = _load_yaml(flat)
-    assert data_flat.max_seq_length == 64
-    assert train_flat.overwrite_output_dir is False
-    assert train_flat.mlm_max_ngram == 1
-    assert normalize_mixed_precision(train_flat.mixed_precision) == "no"
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
+        _load_yaml(flat)
 
 
 def test_load_json_nested_and_flat(tmp_path: Path):
@@ -165,16 +182,20 @@ def test_load_json_nested_and_flat(tmp_path: Path):
     nested.write_text(
         json.dumps(
             {
-                "model": {"backbone_type": "rope", "ffn_type": "mlp"},
-                "data": {"max_seq_length": 96},
-                "train": {"generator_learning_rate": 3.0e-4, "disc_loss_weight": 50.0},
+                "model": {"backbone_type": "rope", "rope": {"ffn_type": "mlp"}},
+                "data": {
+                    "source": {"dataset_name": "HuggingFaceFW/fineweb-edu"},
+                    "packing": {"max_seq_length": 96},
+                },
+                "train": {"objective": {"disc_loss_weight": 50.0}},
+                "optim": {"lr": {"generator": 3.0e-4}},
             }
         ),
         encoding="utf-8",
     )
     model_nested, data_nested, train_nested = _load_json(nested)
-    assert model_nested.ffn_type == "mlp"
-    assert data_nested.max_seq_length == 96
+    assert model_nested.rope.ffn_type == "mlp"
+    assert data_nested.packing.max_seq_length == 96
     assert train_nested.generator_learning_rate == pytest.approx(3.0e-4)
     assert train_nested.disc_loss_weight == pytest.approx(50.0)
 
@@ -190,16 +211,216 @@ def test_load_json_nested_and_flat(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    _, data_flat, train_flat = _load_json(flat)
-    assert data_flat.max_seq_length == 80
-    assert train_flat.mlm_max_ngram == 2
-    assert train_flat.mask_token_prob == pytest.approx(0.7)
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
+        _load_json(flat)
+
+
+def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_load_dataset(name: str, **kwargs: Any) -> list[dict[str, str]]:
+        calls.append((str(name), dict(kwargs)))
+        return [{"text": "ok"}]
+
+    fake_datasets = types.SimpleNamespace(
+        load_dataset=_fake_load_dataset,
+        load_from_disk=lambda _path: [],
+        DatasetDict=dict,
+    )
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+    cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    out = load_hf_dataset(cfg=cfg, split="train", streaming=True)
+
+    assert out == [{"text": "ok"}]
+    assert calls
+    assert calls[0][0] == "hf-internal-testing/librispeech_asr_dummy"
+    assert "cache_dir" in calls[0][1]
+    assert calls[0][1]["cache_dir"] is None
+
+
+def test_load_yaml_resolves_variables(tmp_path: Path):
+    pytest.importorskip("yaml")
+
+    cfg = tmp_path / "vars.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "variables:",
+                "  seq: 256",
+                "  lr: 5e-4",
+                "model:",
+                "  backbone_type: hf_deberta_v2",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "  packing:",
+                "    max_seq_length: $variables.seq",
+                "optim:",
+                "  lr:",
+                "    base: $variables.lr",
+                "logging:",
+                "  run_name: run-{$variables.seq}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _, data_cfg, train_cfg = _load_yaml(cfg)
+    assert int(data_cfg.packing.max_seq_length) == 256
+    assert float(train_cfg.learning_rate) == pytest.approx(5e-4)
+    assert train_cfg.run_name == "run-256"
+
+
+def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
+    pytest.importorskip("yaml")
+
+    cfg = tmp_path / "vars_cycle.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "variables:",
+                "  a: $variables.b",
+                "  b: $variables.a",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Circular variable reference"):
+        _load_yaml(cfg)
+
+
+def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    assert isinstance(cfg, Config)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.train = TrainConfig(max_steps=2)  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
+
+
+def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+                "  checkpoint:",
+                "    save_steps: 777",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 222",
+                "logging:",
+                "  backend: none",
+                "  wandb:",
+                "    enabled: true",
+                "    watch: all",
+                "  debug:",
+                "    metrics: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_path)
+    assert int(cfg.train.warmup_steps) == 222
+    assert int(cfg.train.save_steps) == 777
+    assert str(cfg.train.report_to) == "wandb"
+    assert str(cfg.train.wandb_watch) == "all"
+    assert bool(cfg.train.debug_metrics) is True
+
+
+def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -> None:
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "bad_bool.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "    streaming: 'false'",
+                "train:",
+                "  max_steps: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="data.source.streaming must be a boolean"):
+        load_config(cfg_path)
+
+
+def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumulation(tmp_path: Path) -> None:
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "bad_bool_train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 1",
+                "  token_weighted_gradient_accumulation: 'false'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="train.token_weighted_gradient_accumulation must be a boolean"):
+        load_config(cfg_path)
+
+
+def test_apply_dotted_override_supports_nested_section_paths() -> None:
+    cfg = Config(
+        data=DataConfig(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
+        train=TrainConfig(max_steps=1),
+    )
+    cfg2 = apply_dotted_override(cfg, "logging.wandb.watch=all")
+    cfg2 = apply_dotted_override(cfg2, "optim.scheduler.warmup_steps=123")
+    assert cfg2.logging.wandb.watch == "all"
+    assert int(cfg2.optim.scheduler.warmup_steps) == 123
+    assert int(cfg2.train.warmup_steps) == 123
+
+
+def test_apply_dotted_override_preserves_existing_explicit_fields_per_section() -> None:
+    cfg = Config()
+    cfg = apply_dotted_override(cfg, "train.objective.mask_token_prob=0.8")
+    cfg = apply_dotted_override(cfg, "train.max_steps=20")
+
+    explicit_train_fields = set(getattr(cfg.train, "_explicit_fields", set()))
+    assert "objective.mask_token_prob" in explicit_train_fields
+    assert "max_steps" in explicit_train_fields
+
+    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
+    assert cfg.train.mask_token_prob == pytest.approx(0.8)
 
 
 def test_load_json_unknown_key_raises(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
-    with pytest.raises(ValueError, match="Unknown keys in config file"):
+    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
         _load_json(bad)
 
 
@@ -236,6 +457,38 @@ def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
         _load_yaml(bad)
 
 
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "pretrain_hf_deberta_v2_parity_base.yaml",
+        "pretrain_hf_deberta_v2_parity_small.yaml",
+    ],
+)
+def test_parity_yaml_configs_parse_and_validate(
+    config_name: str,
+) -> None:
+    pytest.importorskip("yaml")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "configs" / config_name
+    model_cfg, data_cfg, train_cfg = _load_yaml(config_path)
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg)
+
+    validate_model_config(model_cfg)
+    validate_data_config(data_cfg)
+    validate_train_config(train_cfg)
+    validate_training_workflow_options(
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+    )
+
+    assert model_cfg.profile == "deberta_v3_parity"
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.pretrained_discriminator_path == ""
+    assert bool(train_cfg.decoupled_training) is True
+
+
 def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
     with pytest.raises(ValueError, match="Unsupported model_config.json keys"):
         load_model_config_snapshot(
@@ -261,7 +514,7 @@ def test_load_model_config_snapshot_rejects_missing_required_key() -> None:
 
 def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
     data_raw = asdict(DataConfig())
-    data_raw.pop("dataset_name")
+    data_raw.pop("source")
     with pytest.raises(ValueError, match="Missing required data_config.json keys"):
         load_data_config_snapshot(data_raw, source="data_config.json")
 
@@ -354,11 +607,12 @@ def test_resolve_output_dir_keeps_explicit_path():
     assert out == Path("runs/custom/run-01")
 
 
-def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 8
+def _accel_stub(*, is_main_process: bool, num_processes: int) -> Any:
+    """Return a minimal accelerator-like object for broadcast helper tests."""
+    return types.SimpleNamespace(is_main_process=bool(is_main_process), num_processes=int(num_processes))
 
+
+def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
     called = {"count": 0}
 
     def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
@@ -366,7 +620,7 @@ def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
         called["count"] += 1
 
     out = _resolve_output_dir_for_accelerator(
-        accelerator=_FakeAccelerator(),
+        accelerator=_accel_stub(is_main_process=False, num_processes=8),
         output_dir="runs/custom/run-02",
         project_name="ignored",
         config_path="cfg.yaml",
@@ -377,16 +631,12 @@ def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
 
 
 def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 2
-
     def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
         assert from_process == 0
         payload[0] = "runs/demo/20260101_010101_shared"
 
     out = _resolve_output_dir_for_accelerator(
-        accelerator=_FakeAccelerator(),
+        accelerator=_accel_stub(is_main_process=False, num_processes=2),
         output_dir=None,
         project_name="demo",
         config_path="cfg.yaml",
@@ -396,10 +646,6 @@ def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
 
 
 def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tmp_path: Path):
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 4
-
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -413,7 +659,7 @@ def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tm
         }
 
     resolved = _resolve_resume_checkpoint_for_accelerator(
-        accelerator=_FakeAccelerator(),
+        accelerator=_accel_stub(is_main_process=False, num_processes=4),
         output_dir=out,
         resume_from_checkpoint="auto",
         broadcast_fn=_fake_broadcast,
@@ -422,10 +668,6 @@ def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tm
 
 
 def test_resolve_resume_checkpoint_for_accelerator_propagates_rank0_error(tmp_path: Path):
-    class _FakeAccelerator:
-        is_main_process = False
-        num_processes = 2
-
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -440,7 +682,7 @@ def test_resolve_resume_checkpoint_for_accelerator_propagates_rank0_error(tmp_pa
 
     with pytest.raises(ValueError, match="rank0 failed"):
         _resolve_resume_checkpoint_for_accelerator(
-            accelerator=_FakeAccelerator(),
+            accelerator=_accel_stub(is_main_process=False, num_processes=2),
             output_dir=out,
             resume_from_checkpoint="auto",
             broadcast_fn=_fake_broadcast,
@@ -471,42 +713,69 @@ def test_resolve_resume_checkpoint_auto_rejects_non_empty_output_dir_without_che
         )
 
 
-def test_resolve_resume_checkpoint_rejects_missing_explicit_path(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("case", "exc_type", "match"),
+    [
+        ("missing_path", FileNotFoundError, "checkpoint path does not exist"),
+        ("not_directory", ValueError, "must point to a checkpoint directory"),
+        ("missing_complete", ValueError, "missing .complete marker"),
+        ("missing_data_state", ValueError, "missing/invalid data_state.json"),
+        ("missing_weights", ValueError, "model weights appear missing or empty"),
+    ],
+)
+def test_resolve_resume_checkpoint_rejects_invalid_explicit_path_states(
+    tmp_path: Path,
+    mock_checkpoint: Any,
+    case: str,
+    exc_type: type[Exception],
+    match: str,
+):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    missing = out / "checkpoint-missing"
-    with pytest.raises(FileNotFoundError, match="checkpoint path does not exist"):
+    if case == "missing_path":
+        target = out / "checkpoint-missing"
+    elif case == "not_directory":
+        target = out / "not-a-dir.txt"
+        target.write_text("x", encoding="utf-8")
+    elif case == "missing_complete":
+        target = mock_checkpoint(
+            root=out,
+            name="checkpoint-2",
+            with_weights=True,
+            with_data_state=True,
+            with_complete=False,
+        )
+    elif case == "missing_data_state":
+        target = mock_checkpoint(
+            root=out,
+            name="checkpoint-2",
+            with_weights=True,
+            with_data_state=False,
+            with_complete=True,
+        )
+    elif case == "missing_weights":
+        target = mock_checkpoint(
+            root=out,
+            name="checkpoint-2",
+            with_weights=False,
+            with_data_state=True,
+            with_complete=True,
+        )
+    else:  # pragma: no cover
+        raise AssertionError(f"Unsupported case: {case}")
+
+    with pytest.raises(exc_type, match=match):
         _resolve_resume_checkpoint(
             output_dir=out,
-            resume_from_checkpoint=str(missing),
+            resume_from_checkpoint=str(target),
             is_main_process=True,
         )
 
 
-def test_resolve_resume_checkpoint_rejects_non_directory_explicit_path(tmp_path: Path):
+def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path, mock_checkpoint: Any):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    marker = out / "not-a-dir.txt"
-    marker.write_text("x", encoding="utf-8")
-    with pytest.raises(ValueError, match="must point to a checkpoint directory"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(marker),
-            is_main_process=True,
-        )
-
-
-def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"weights")
-    (ckpt / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2}),
-        encoding="utf-8",
-    )
-    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
+    ckpt = mock_checkpoint(root=out, name="checkpoint-2", consumed_micro_batches=2)
     resolved = _resolve_resume_checkpoint(
         output_dir=out,
         resume_from_checkpoint=str(ckpt),
@@ -515,72 +784,13 @@ def test_resolve_resume_checkpoint_returns_resolved_explicit_path(tmp_path: Path
     assert resolved == str(ckpt.resolve())
 
 
-def test_resolve_resume_checkpoint_rejects_explicit_path_without_complete_marker(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"weights")
-    (ckpt / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="missing .complete marker"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(ckpt),
-            is_main_process=True,
-        )
-
-
-def test_resolve_resume_checkpoint_rejects_explicit_path_without_data_state(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"weights")
-    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="missing/invalid data_state.json"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(ckpt),
-            is_main_process=True,
-        )
-
-
-def test_resolve_resume_checkpoint_rejects_explicit_path_without_model_weights(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-2"
-    ckpt.mkdir()
-    (ckpt / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2}),
-        encoding="utf-8",
-    )
-    (ckpt / ".complete").write_text("ok\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="model weights appear missing or empty"):
-        _resolve_resume_checkpoint(
-            output_dir=out,
-            resume_from_checkpoint=str(ckpt),
-            is_main_process=True,
-        )
-
-
-def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(tmp_path: Path):
+def test_resolve_resume_checkpoint_auto_skips_latest_non_resumable_checkpoint(
+    tmp_path: Path, mock_checkpoint: Any
+):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    ckpt1 = out / "checkpoint-1"
-    ckpt1.mkdir(parents=True, exist_ok=True)
-    (ckpt1 / "model.safetensors").write_bytes(b"weights")
-    (ckpt1 / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 10}),
-        encoding="utf-8",
-    )
-    (ckpt1 / ".complete").write_text("ok\n", encoding="utf-8")
+    ckpt1 = mock_checkpoint(root=out, name="checkpoint-1", consumed_micro_batches=10)
 
     # Simulate interrupted checkpoint write: directory exists but metadata was never written.
     ckpt2 = out / "checkpoint-2"
@@ -650,6 +860,33 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert digest_old is None
 
 
+def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path: Path):
+    ckpt = tmp_path / "checkpoint-12"
+    ckpt.mkdir(parents=True, exist_ok=True)
+
+    dual_digest = {"generator": "aaaabbbbccccdddd", "discriminator": "1111222233334444"}
+    _save_checkpoint_data_progress(
+        checkpoint_dir=ckpt,
+        consumed_micro_batches=77,
+        lr_mult=0.75,
+        optimizer_param_digest=dual_digest,
+        global_step=9,
+        gradient_accumulation_steps=3,
+    )
+
+    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    assert consumed == 77
+    assert lr_mult == pytest.approx(0.75)
+    assert isinstance(digest, dict)
+    assert digest == dual_digest
+
+    _, _, digest_meta, saved_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
+    assert isinstance(digest_meta, dict)
+    assert digest_meta == dual_digest
+    assert saved_step == 9
+    assert saved_ga == 3
+
+
 def test_load_checkpoint_data_progress_warns_on_invalid_json(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -706,8 +943,29 @@ def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
     assert d_all != d_partial, "Freezing params changes the trainable param set and digest"
 
 
+def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
+    class _SharedRTDLike(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = torch.nn.Module()
+            self.discriminator = torch.nn.Module()
+            shared = torch.nn.Parameter(torch.randn(3, 3))
+            self.generator.shared = shared
+            self.discriminator.shared = shared
+
+    model = _SharedRTDLike()
+    parts = _partition_optimizer_params(model)
+    ordered = ("gen_decay", "gen_no_decay", "disc_decay", "disc_no_decay")
+    params = [p for key in ordered for p in parts[key]["params"]]
+    names = [n for key in ordered for n in parts[key]["names"]]
+
+    assert len(params) == 1
+    assert len(names) == 1
+    assert len({id(p) for p in params}) == 1
+
+
 def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig()
     opt = _build_optimizer(model, cfg)
 
@@ -721,13 +979,64 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
     assert str(opt._param_order_digest) == expected
 
 
+def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
+    model = TinyRTDLikeModel()
+    cfg = TrainConfig(
+        learning_rate=5.0e-4,
+        generator_learning_rate=2.5e-4,
+        weight_decay=0.01,
+        mixed_precision="no",
+    )
+    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
+
+    assert gen_opt.param_groups
+    assert disc_opt.param_groups
+    for group in gen_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(2.5e-4)
+    for group in disc_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(5.0e-4)
+
+    assert isinstance(getattr(gen_opt, "_param_order_digest", ""), str)
+    assert isinstance(getattr(disc_opt, "_param_order_digest", ""), str)
+    assert len(str(gen_opt._param_order_digest)) == 16
+    assert len(str(disc_opt._param_order_digest)) == 16
+    assert str(gen_opt._param_order_digest) != str(disc_opt._param_order_digest)
+
+
+def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_optimizer() -> None:
+    class _ModelWithEmd(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = torch.nn.Linear(8, 8)
+            self.generator_lm_head = torch.nn.Linear(8, 8)
+            self.enhanced_mask_decoder = torch.nn.Linear(8, 8)
+            self.discriminator = torch.nn.Linear(8, 8)
+
+    model = _ModelWithEmd()
+    cfg = TrainConfig(
+        learning_rate=5.0e-4,
+        generator_learning_rate=2.5e-4,
+        weight_decay=0.01,
+        mixed_precision="no",
+    )
+    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
+
+    gen_param_ids = {id(p) for group in gen_opt.param_groups for p in group["params"]}
+    disc_param_ids = {id(p) for group in disc_opt.param_groups for p in group["params"]}
+    emd_param_ids = {id(p) for p in model.enhanced_mask_decoder.parameters() if p.requires_grad}
+
+    assert emd_param_ids
+    assert emd_param_ids.issubset(gen_param_ids)
+    assert emd_param_ids.isdisjoint(disc_param_ids)
+
+
 def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     """_save_training_checkpoint forwards optimizer_param_digest to data_state.json."""
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-5"
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -739,6 +1048,27 @@ def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     )
     _, _, digest = _load_checkpoint_data_progress(ckpt)
     assert digest == "deadbeef12345678"
+
+
+def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path):
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint-6"
+
+    dual_digest = {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"}
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    _save_training_checkpoint(
+        accelerator=accel,
+        checkpoint_dir=ckpt,
+        output_dir=out,
+        consumed_micro_batches=15,
+        save_total_limit=3,
+        log_label="test",
+        optimizer_param_digest=dual_digest,
+    )
+    _, _, digest = _load_checkpoint_data_progress(ckpt)
+    assert isinstance(digest, dict)
+    assert digest == dual_digest
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
@@ -873,24 +1203,19 @@ def test_load_resume_state_with_compile_fallback_retries_strict_false_and_remaps
         model[0].weight.zero_()
         model[0].bias.zero_()
 
-    class _ResumeAccelerator:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, dict[str, Any]]] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
 
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.calls.append((ckpt, dict(kwargs)))
-            if kwargs.get("strict", True):
-                raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
+    def _load_state_hook(ckpt: str, kwargs: dict[str, Any]) -> None:
+        calls.append((str(ckpt), dict(kwargs)))
+        if kwargs.get("strict", True):
+            raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
 
-        def unwrap_model(self, wrapped: torch.nn.Module) -> torch.nn.Module:
-            return wrapped
-
-    accel = _ResumeAccelerator()
+    accel = FakeAccelerator(load_state_hook=_load_state_hook)
     _load_resume_state_with_compile_fallback(accel, model, str(checkpoint))
 
-    assert len(accel.calls) == 2
-    assert accel.calls[0][1] == {}
-    assert accel.calls[1][1] == {"strict": False}
+    assert len(calls) == 2
+    assert calls[0][1] == {}
+    assert calls[1][1] == {"strict": False}
     assert torch.allclose(model[0].weight, saved["0.weight"])
     assert torch.allclose(model[0].bias, saved["0.bias"])
 
@@ -988,103 +1313,275 @@ def test_init_trackers_falls_back_without_init_kwargs(caplog: pytest.LogCaptureF
 
 
 def test_setup_wandb_watch_calls_watch_with_mode_and_frequency() -> None:
-    class _FakeRun:
-        def __init__(self) -> None:
-            self.calls: list[tuple[torch.nn.Module, dict[str, Any]]] = []
-
-        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:
-            self.calls.append((model, dict(kwargs)))
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-        @staticmethod
-        def unwrap_model(model: torch.nn.Module):
-            return model
-
-        @staticmethod
-        def get_tracker(name: str, unwrap: bool = True):
-            del name, unwrap
-            return None
-
     model = torch.nn.Linear(4, 4)
-    run = _FakeRun()
+    run = FakeWandbRun()
     enabled = _setup_wandb_watch(
-        accelerator=_FakeAccelerator(),
+        accelerator=FakeAccelerator(),
         wandb_run=run,
         model=model,
         watch_mode="gradients",
         watch_log_freq=123,
     )
     assert enabled is True
-    assert run.calls
-    watched_model, kwargs = run.calls[0]
+    assert run.watch_calls
+    watched_model, kwargs = run.watch_calls[0]
     assert watched_model is model
     assert kwargs["log"] == "gradients"
     assert kwargs["log_freq"] == 123
 
 
 def test_setup_wandb_watch_returns_false_when_mode_none() -> None:
-    class _FakeRun:
-        def watch(self, model: torch.nn.Module, **kwargs: Any) -> None:  # pragma: no cover
-            del model, kwargs
-            raise AssertionError("watch must not be called when mode=none")
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-        @staticmethod
-        def unwrap_model(model: torch.nn.Module):
-            return model
-
+    run = FakeWandbRun()
     enabled = _setup_wandb_watch(
-        accelerator=_FakeAccelerator(),
-        wandb_run=_FakeRun(),
+        accelerator=FakeAccelerator(),
+        wandb_run=run,
         model=torch.nn.Linear(2, 2),
         watch_mode="none",
         watch_log_freq=100,
     )
     assert enabled is False
+    assert run.watch_calls == []
 
 
 def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Path) -> None:
     src = tmp_path / "config_original.yaml"
     src.write_text("train:\n  max_steps: 1\n", encoding="utf-8")
 
-    class _FakeRun:
-        def __init__(self) -> None:
-            self.saved: list[Path] = []
-
-        def save(self, path: str, **kwargs: Any) -> None:
-            del kwargs
-            self.saved.append(Path(path))
-
-    class _FakeAccelerator:
-        is_main_process = True
-
-    run = _FakeRun()
+    run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=_FakeAccelerator(),
+        accelerator=types.SimpleNamespace(is_main_process=True),
         wandb_run=run,
         config_original_path=src,
         run_name="demo-run",
     )
     assert uploaded is True
-    assert run.saved
-    assert run.saved[0].name == "config_deberta_demo-run"
+    assert run.saved_paths
+    assert run.saved_paths[0].name == "config_original.yaml"
+    assert run.saved_paths[0] == src
+
+
+def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path: Path) -> None:
+    src_original = tmp_path / "config_original.yaml"
+    src_original.write_text("model:\n  backbone_type: hf_deberta_v2\n", encoding="utf-8")
+    src_resolved = tmp_path / "config_resolved.yaml"
+    src_resolved.write_text(
+        "model:\n  backbone_type: hf_deberta_v2\ntrain:\n  warmup_steps: 10000\n", encoding="utf-8"
+    )
+    src_source = tmp_path / "passed.yaml"
+    src_source.write_text("model:\n  profile: deberta_v3_parity\n", encoding="utf-8")
+
+    run = FakeWandbRun()
+    uploaded = _upload_wandb_original_config(
+        accelerator=types.SimpleNamespace(is_main_process=True),
+        wandb_run=run,
+        config_original_path=src_original,
+        config_resolved_path=src_resolved,
+        config_source_path=src_source,
+        run_name="demo-run",
+    )
+    assert uploaded is True
+    saved_names = {p.name for p in run.saved_paths}
+    assert "config_original.yaml" not in saved_names
+    assert "config_resolved.yaml" in saved_names
+    assert "passed.yaml" in saved_names
+
+
+def test_coerce_dataclass_payload_types_accepts_mapping_inputs() -> None:
+    payload = {
+        "alpha": 1,
+        "nested": {"beta": True},
+        3: "non-string-key",
+    }
+    coerced = _coerce_dataclass_payload_types(payload)
+    assert coerced == {
+        "alpha": 1,
+        "nested": {"beta": True},
+        "3": "non-string-key",
+    }
+
+
+def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        pretrained_discriminator_path="microsoft/deberta-v3-base",
+        generator_num_hidden_layers=None,
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
+        tokenizer_vocab_target=None,
+    )
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(
+        learning_rate=5e-4,
+        generator_learning_rate=-1.0,
+        discriminator_learning_rate=-1.0,
+    )
+    optim_cfg = OptimConfig(
+        learning_rate=5e-4, generator_learning_rate=-1.0, discriminator_learning_rate=-1.0
+    )
+    logging_cfg = LoggingConfig()
+    disc_cfg = types.SimpleNamespace(
+        num_hidden_layers=12,
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=1024,
+        to_dict=lambda: {
+            "num_hidden_layers": 12,
+            "hidden_dropout_prob": 0.1,
+            "attention_probs_dropout_prob": 0.1,
+            "max_position_embeddings": 1024,
+        },
+    )
+    gen_cfg = types.SimpleNamespace(
+        num_hidden_layers=6,
+        hidden_size=384,
+        intermediate_size=1536,
+        num_attention_heads=6,
+        to_dict=lambda: {
+            "num_hidden_layers": 6,
+            "hidden_size": 384,
+            "intermediate_size": 1536,
+            "num_attention_heads": 6,
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    payload = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        tokenizer=tokenizer,
+    )
+
+    assert payload["model"]["generator"]["num_hidden_layers"] == 6
+    assert payload["model"]["generator"]["hidden_size"] == 384
+    assert payload["model"]["generator"]["intermediate_size"] == 1536
+    assert payload["model"]["generator"]["num_attention_heads"] == 6
+    assert payload["model"]["dropout"]["hidden_prob"] == pytest.approx(0.1)
+    assert payload["model"]["dropout"]["attention_probs_prob"] == pytest.approx(0.1)
+    assert payload["model"]["tokenizer"]["vocab_target"] == 32000
+    assert payload["optim"]["lr"]["base"] == pytest.approx(5e-4)
+    assert payload["model"]["pretrained"]["discriminator_path"] == "microsoft/deberta-v3-base"
+    assert "generator_path" not in payload["model"]["pretrained"]
+    assert "resume_from_checkpoint" not in payload["train"]["checkpoint"]
+    assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
+    assert "effective" not in payload
+
+
+def test_build_runtime_resolved_tracker_config_omits_effective_backbone_payload() -> None:
+    model_cfg = ModelConfig(profile="deberta_v3_parity", backbone_type="hf_deberta_v2")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig()
+    disc_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "model_type": "deberta-v2",
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "vocab_size": 32000,
+            "max_position_embeddings": 1024,
+            "pad_token_id": 3,
+            "max_length": 20,
+            "top_k": 50,
+            "id2label": {"0": "LABEL_0"},
+            "_name_or_path": "",
+        },
+    )
+    gen_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "model_type": "deberta-v2",
+            "hidden_size": 768,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "vocab_size": 32000,
+            "max_position_embeddings": 1024,
+            "pad_token_id": 3,
+            "max_length": 20,
+            "top_k": 50,
+            "id2label": {"0": "LABEL_0"},
+            "_name_or_path": "",
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    payload = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        tokenizer=tokenizer,
+    )
+
+    assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
+    assert "effective" not in payload
+
+
+def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None:
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        hidden_size="768",  # type: ignore[arg-type]
+        num_hidden_layers="12",  # type: ignore[arg-type]
+        num_attention_heads="12",  # type: ignore[arg-type]
+        intermediate_size="3072",  # type: ignore[arg-type]
+        hidden_dropout_prob="0.0",  # type: ignore[arg-type]
+        attention_probs_dropout_prob="0.0",  # type: ignore[arg-type]
+    )
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
+    train_cfg = TrainConfig(
+        token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
+    )
+    optim_cfg = OptimConfig(
+        learning_rate="5e-4",  # type: ignore[arg-type]
+        adam_epsilon="1e-6",  # type: ignore[arg-type]
+        warmup_steps="1000",  # type: ignore[arg-type]
+    )
+    disc_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "num_hidden_layers": 12,
+            "hidden_dropout_prob": 0.0,
+            "attention_probs_dropout_prob": 0.0,
+            "max_position_embeddings": 1024,
+        },
+    )
+    gen_cfg = types.SimpleNamespace(
+        to_dict=lambda: {
+            "num_hidden_layers": 6,
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    payload = _build_runtime_resolved_tracker_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+        tokenizer=tokenizer,
+    )
+
+    assert payload["model"]["rope"]["hidden_size"] == 768
+    assert payload["data"]["packing"]["max_seq_length"] == 1024
+    assert payload["optim"]["scheduler"]["warmup_steps"] == 1000
+    assert payload["optim"]["lr"]["base"] == pytest.approx(5e-4)
+    assert payload["optim"]["adam"]["epsilon"] == pytest.approx(1e-6)
+    assert payload["train"]["token_weighted_gradient_accumulation"] is True
 
 
 def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
-
-    class _TrackingAccelerator(FakeAccelerator):
-        last_instance: _TrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            _TrackingAccelerator.last_instance = self
 
     saved_checkpoints: list[tuple[str, int, str]] = []
 
@@ -1103,7 +1600,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_TrackingAccelerator,
+        accelerator_cls=FakeAccelerator,
         save_checkpoint_fn=_fake_save_checkpoint,
         extra_patches={"_export_discriminator_hf": lambda **kwargs: None},
     )
@@ -1149,7 +1646,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert saved_checkpoints[-1][1] == 1
     assert saved_checkpoints[-1][2] == "final"
 
-    accel = _TrackingAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
     assert accel.wandb_run.summary["crashed"] is True
     assert accel.wandb_run.summary["crash_type"] == "KeyboardInterrupt"
@@ -1157,7 +1654,9 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert accel.wandb_run.logged
     assert accel.wandb_run.watch_calls
     assert accel.wandb_run.saved_paths
-    assert accel.wandb_run.saved_paths[0].name == "config_deberta_run"
+    saved_names = {p.name for p in accel.wandb_run.saved_paths}
+    assert "config_original.yaml" in saved_names
+    assert "config_resolved.yaml" in saved_names
     assert accel.wandb_run.watch_calls[0][1]["log"] == "gradients"
     assert accel.tracker_init_calls
     first_tracker_call = accel.tracker_init_calls[0]
@@ -1289,9 +1788,13 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
 
 
 def _write_resume_source_snapshots(run_dir: Path) -> None:
-    """Write minimal model/data snapshots required for strict resume validation."""
+    """Write minimal config snapshots required for strict resume validation."""
     model_cfg = ModelConfig()
     data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
+    logging_cfg = LoggingConfig(output_dir=str(run_dir))
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
     (run_dir / "model_config.json").write_text(
         json.dumps(asdict(model_cfg), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1300,19 +1803,28 @@ def _write_resume_source_snapshots(run_dir: Path) -> None:
         json.dumps(asdict(data_cfg), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    (run_dir / "train_config.json").write_text(
+        json.dumps(asdict(train_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "optim_config.json").write_text(
+        json.dumps(asdict(optim_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "logging_config.json").write_text(
+        json.dumps(asdict(logging_cfg), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION)}, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.loaded.append((ckpt, dict(kwargs)))
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-2"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1334,7 +1846,7 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
+        accelerator_cls=FakeAccelerator,
         cycle_fn=_fail_cycle,
     )
     train_cfg = TrainConfig(
@@ -1364,14 +1876,6 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.loaded.append((ckpt, dict(kwargs)))
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1392,7 +1896,7 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
+        accelerator_cls=FakeAccelerator,
     )
     monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
 
@@ -1425,14 +1929,6 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _ResumeAccelerator(FakeAccelerator):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.loaded: list[tuple[str, dict[str, Any]]] = []
-
-        def load_state(self, ckpt: str, **kwargs: Any) -> None:
-            self.loaded.append((ckpt, dict(kwargs)))
-
     checkpoint_dir = tmp_path / "run" / "checkpoint-1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_resume_source_snapshots(checkpoint_dir.parent)
@@ -1459,7 +1955,7 @@ def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ResumeAccelerator,
+        accelerator_cls=FakeAccelerator,
     )
     monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
 
@@ -1562,47 +2058,102 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
         )
 
 
-def test_run_pretraining_logs_window_averaged_rtd_metrics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class _TrackingAccelerator(FakeAccelerator):
-        last_instance: _TrackingAccelerator | None = None
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            _TrackingAccelerator.last_instance = self
-
-    class _WindowMetricRTD(SimpleRTD):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self._call_idx = 0
-
-        def forward(self, **kwargs: Any) -> Any:
-            del kwargs
-            self._call_idx += 1
-            t = self.weight * 0.0 + 1.0
-            if self._call_idx % 2 == 1:
-                gen_loss, disc_loss, disc_acc = 1.0, 10.0, 0.2
-                gen_tokens, disc_tokens, disc_pos = 1.0, 10.0, 7.0
-            else:
-                gen_loss, disc_loss, disc_acc = 9.0, 2.0, 0.8
-                gen_tokens, disc_tokens, disc_pos = 9.0, 2.0, 1.0
-            return types.SimpleNamespace(
-                loss=t,
-                gen_loss=torch.tensor(gen_loss, dtype=torch.float32),
-                disc_loss=torch.tensor(disc_loss, dtype=torch.float32),
-                disc_accuracy=torch.tensor(disc_acc, dtype=torch.float32),
-                gen_token_count=torch.tensor(gen_tokens, dtype=torch.float32),
-                disc_token_count=torch.tensor(disc_tokens, dtype=torch.float32),
-                disc_positive_count=torch.tensor(disc_pos, dtype=torch.float32),
-                gen_loss_raw=t,
-                disc_loss_raw=t,
-            )
+    checkpoint_dir = tmp_path / "run" / "checkpoint-0"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_resume_source_snapshots(checkpoint_dir.parent)
+    (checkpoint_dir.parent / "model_config.json").write_text(
+        json.dumps(asdict(ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes")), indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+    (checkpoint_dir / "data_state.json").write_text(
+        json.dumps(
+            {
+                "consumed_micro_batches": 0,
+                "global_step": 0,
+                "optimizer_param_digest": "legacydeadbeef000",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_TrackingAccelerator,
-        rtd_cls=_WindowMetricRTD,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
+    )
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=1,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+        resume_from_checkpoint=str(checkpoint_dir),
+    )
+    (checkpoint_dir.parent / "logging_config.json").write_text(
+        json.dumps(
+            asdict(
+                LoggingConfig(
+                    output_dir=str(checkpoint_dir.parent),
+                    logging_steps=1,
+                    report_to="none",
+                )
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        pretrain_mod.run_pretraining(
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
+
+    assert any(
+        "legacy single optimizer digest while current run uses decoupled mode" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_run_pretraining_logs_window_averaged_rtd_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "loss": 1.0,
+                "gen_loss": [1.0, 9.0],
+                "disc_loss": [10.0, 2.0],
+                "disc_accuracy": [0.2, 0.8],
+                "gen_token_count": [1.0, 9.0],
+                "disc_token_count": [10.0, 2.0],
+                "disc_positive_count": [7.0, 1.0],
+            },
+            **kwargs,
+        ),
     )
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
@@ -1616,6 +2167,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
     )
@@ -1626,7 +2178,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         train_cfg=train_cfg,
     )
 
-    accel = _TrackingAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
@@ -1634,34 +2186,479 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert metrics["gen_loss"] == pytest.approx(8.2, rel=0.0, abs=1e-6)
     assert metrics["disc_loss"] == pytest.approx(104.0 / 12.0, rel=0.0, abs=1e-6)
     assert metrics["disc_acc"] == pytest.approx(0.3, rel=0.0, abs=1e-6)
-    assert metrics["gen_token_count"] == pytest.approx(10.0, rel=0.0, abs=1e-6)
-    assert metrics["disc_token_count"] == pytest.approx(12.0, rel=0.0, abs=1e-6)
+    assert "gen_token_count" not in metrics
+    assert "disc_token_count" not in metrics
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
 
 
-class _ZeroTokenTrackingAccelerator(FakeAccelerator):
-    last_instance: _ZeroTokenTrackingAccelerator | None = None
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "steps_and_sync",
+        "token_weighted_scaling",
+        "branch_loss_weights",
+        "skip_generator_step",
+        "partial_disc_window_sync",
+    ],
+)
+def test_run_pretraining_decoupled_integration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    call_order: list[str] = []
+    step_counts = {"gen": 0, "disc": 0}
+    behavior: dict[str, Any] = {}
+    extra_patches: dict[str, Any] | None = None
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        _ZeroTokenTrackingAccelerator.last_instance = self
-
-
-class _ZeroTokenScalarLossRTD(SimpleRTD):
-    def forward(self, **kwargs: Any) -> Any:
-        del kwargs
-        t = self.weight.sum() * 0.0 + 1.0
-        return types.SimpleNamespace(
-            loss=t,
-            gen_loss=t.detach(),
-            disc_loss=t.detach(),
-            disc_accuracy=t.detach(),
-            gen_token_count=torch.tensor(1.0),
-            disc_token_count=torch.tensor(1.0),
-            disc_positive_count=torch.tensor(1.0),
-            gen_loss_raw=t,
-            disc_loss_raw=t,
+    if scenario == "steps_and_sync":
+        behavior = {
+            "generator_phase_loss_scale": 1.0,
+            "discriminator_phase_loss_scale": 2.0,
+            "on_generator_phase": lambda _m, _i: call_order.append("gen_forward"),
+            "on_discriminator_phase": lambda _m, _i: call_order.append("disc_forward"),
+            "on_sync_discriminator_embeddings": lambda _m: call_order.append("sync"),
+        }
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=1,
+            save_steps=0,
+            report_to="tensorboard",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=1.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
         )
+    elif scenario == "token_weighted_scaling":
+        behavior = {
+            "generator_phase_loss_scale": [10.0, 20.0],
+            "discriminator_phase_loss_scale": [5.0, 7.0],
+            "discriminator_phase_accuracy": 0.5,
+            "discriminator_phase_positive_count": 0.0,
+        }
+        micro_counts = iter([(1.0, 4.0), (3.0, 2.0)])
+
+        def _count_tokens_for_microbatch(*_args: Any, **_kwargs: Any) -> tuple[float, float]:
+            return next(micro_counts)
+
+        extra_patches = {"_count_rtd_tokens_for_batch": _count_tokens_for_microbatch}
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=1,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            token_weighted_gradient_accumulation=True,
+            gen_loss_weight=1.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    elif scenario == "branch_loss_weights":
+        behavior = {"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0}
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=0,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=0.25,
+            disc_loss_weight=4.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    elif scenario == "skip_generator_step":
+        behavior = {"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0}
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=0,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=0.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    elif scenario == "partial_disc_window_sync":
+        behavior = {
+            "generator_phase_loss_scale": [2.0, 2.0],
+            "generator_phase_token_count": [0.0, 1.0],
+            "discriminator_phase_loss_scale": 3.0,
+        }
+        train_cfg = TrainConfig(
+            output_dir=str(tmp_path / "run"),
+            max_steps=1,
+            logging_steps=0,
+            save_steps=0,
+            report_to="none",
+            mixed_precision="no",
+            tf32=False,
+            dataloader_num_workers=0,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            token_weighted_gradient_accumulation=False,
+            gen_loss_weight=1.0,
+            disc_loss_weight=1.0,
+            torch_compile=False,
+            export_hf_final=False,
+            decoupled_training=True,
+        )
+    else:  # pragma: no cover
+        raise AssertionError(f"Unsupported scenario: {scenario}")
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(behavior=behavior, **kwargs),
+        extra_patches=extra_patches,
+    )
+    original_build_decoupled = pretrain_mod._build_decoupled_optimizers
+
+    def _build_logged_decoupled(model: torch.nn.Module, cfg: TrainConfig, *, mixed_precision: str = "no"):
+        gen_opt, disc_opt = original_build_decoupled(model, cfg, mixed_precision=mixed_precision)
+        original_gen_step = gen_opt.step
+        original_disc_step = disc_opt.step
+
+        def _gen_step(_opt_self: Any, *args: Any, **kwargs: Any):
+            step_counts["gen"] += 1
+            if scenario == "steps_and_sync":
+                call_order.append("gen_step")
+            return original_gen_step(*args, **kwargs)
+
+        def _disc_step(_opt_self: Any, *args: Any, **kwargs: Any):
+            step_counts["disc"] += 1
+            if scenario == "steps_and_sync":
+                call_order.append("disc_step")
+            return original_disc_step(*args, **kwargs)
+
+        gen_opt.step = types.MethodType(_gen_step, gen_opt)  # type: ignore[method-assign]
+        disc_opt.step = types.MethodType(_disc_step, disc_opt)  # type: ignore[method-assign]
+        return gen_opt, disc_opt
+
+    monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    accel = FakeAccelerator.last_instance
+    assert accel is not None
+
+    if scenario == "steps_and_sync":
+        assert step_counts == {"gen": 1, "disc": 1}
+        gen_forward_idx = call_order.index("gen_forward")
+        gen_step_idx = call_order.index("gen_step")
+        sync_after_gen_idx = call_order.index("sync", gen_step_idx + 1)
+        disc_forward_idx = call_order.index("disc_forward")
+        disc_step_idx = call_order.index("disc_step")
+        assert gen_forward_idx < gen_step_idx < sync_after_gen_idx < disc_forward_idx < disc_step_idx
+        step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+        assert step_rows
+        assert "decoupled_training" not in step_rows[-1]
+    elif scenario == "token_weighted_scaling":
+        assert step_counts == {"gen": 1, "disc": 1}
+        assert accel.calls["backward"] == pytest.approx(
+            [
+                10.0 * (1.0 / 4.0) * 2.0,
+                20.0 * (3.0 / 4.0) * 2.0,
+                5.0 * (4.0 / 6.0) * 2.0,
+                7.0 * (2.0 / 6.0) * 2.0,
+            ],
+            rel=0.0,
+            abs=1e-6,
+        )
+    elif scenario == "branch_loss_weights":
+        assert step_counts == {"gen": 1, "disc": 1}
+        assert accel.calls["backward"] == pytest.approx([2.0 * 0.25, 3.0 * 4.0], rel=0.0, abs=1e-6)
+    elif scenario == "skip_generator_step":
+        assert step_counts == {"gen": 0, "disc": 1}
+        assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
+    elif scenario == "partial_disc_window_sync":
+        assert step_counts == {"gen": 1, "disc": 1}
+        model = SimpleRTD.last_instance
+        assert model is not None
+        assert len(model.calls["forward_discriminator_phase"]) == 2
+        assert accel.calls["backward"] == pytest.approx([2.0, 2.0, 0.0, 3.0], rel=0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("decoupled_training", "expected_nonfinite_checks"),
+    [
+        (True, 2),
+        (False, 1),
+    ],
+)
+def test_run_pretraining_nonfinite_all_reduce_only_on_sync_microstep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decoupled_training: bool,
+    expected_nonfinite_checks: int,
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
+    )
+    call_count = {"value": 0}
+    original_any_rank_flag_true = pretrain_mod._any_rank_flag_true
+
+    def _counted_any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
+        call_count["value"] += 1
+        return bool(original_any_rank_flag_true(accelerator=accelerator, flag=flag))
+
+    monkeypatch.setattr(pretrain_mod, "_any_rank_flag_true", _counted_any_rank_flag_true)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=bool(decoupled_training),
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert int(call_count["value"]) == int(expected_nonfinite_checks)
+
+
+def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler_steps = {"gen": 0, "disc": 0}
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "generator_phase_loss_scale": 1.0,
+                "discriminator_phase_loss_scale": float("nan"),
+            },
+            **kwargs,
+        ),
+    )
+
+    scheduler_build_count = 0
+
+    def _build_counted_scheduler(optimizer: torch.optim.Optimizer, _cfg: TrainConfig):
+        nonlocal scheduler_build_count
+        phase = "gen" if scheduler_build_count == 0 else "disc"
+        scheduler_build_count += 1
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        original_step = scheduler.step
+
+        def _count_step(*args: Any, **kwargs: Any) -> Any:
+            scheduler_steps[phase] += 1
+            return original_step(*args, **kwargs)
+
+        scheduler.step = _count_step  # type: ignore[method-assign]
+        return scheduler
+
+    monkeypatch.setattr(pretrain_mod, "_build_scheduler", _build_counted_scheduler)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert scheduler_steps["gen"] == 1
+    assert scheduler_steps["disc"] == 0
+
+
+def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "generator_phase_loss_scale": 0.0,
+                "generator_phase_token_count": 0.0,
+            },
+            **kwargs,
+        ),
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    model = SimpleRTD.last_instance
+    assert model is not None
+    assert len(model.calls.get("forward_discriminator_phase", [])) == 0
+
+
+def test_run_pretraining_decoupled_routes_phase_calls_through_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+        decoupled_training=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    model = SimpleRTD.last_instance
+    assert model is not None
+    # One generator and one discriminator phase should each route through model(...)
+    # so distributed wrappers keep their forward-path bookkeeping/autocast hooks.
+    assert len(model.calls.get("forward", [])) == 2
+    assert len(model.calls.get("forward_generator_phase", [])) == 1
+    assert len(model.calls.get("forward_discriminator_phase", [])) == 1
+
+
+def test_run_pretraining_final_export_uses_subprocess_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    export_calls: list[tuple[str, str]] = []
+
+    def _fake_export_subprocess(*, checkpoint_dir: Path, output_dir: Path) -> None:
+        export_calls.append((str(checkpoint_dir), str(output_dir)))
+
+    def _fake_save_checkpoint(
+        *,
+        accelerator: Any,
+        checkpoint_dir: Path,
+        output_dir: Path,
+        consumed_micro_batches: int,
+        save_total_limit: int,
+        log_label: str,
+        **kwargs: Any,
+    ) -> None:
+        del accelerator, output_dir, consumed_micro_batches, save_total_limit, log_label, kwargs
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        save_checkpoint_fn=_fake_save_checkpoint,
+        extra_patches={"_export_discriminator_hf_subprocess": _fake_export_subprocess},
+    )
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
+    )
+
+    assert export_calls
+    ckpt_path, export_path = export_calls[-1]
+    assert ckpt_path.endswith("checkpoint-1")
+    assert export_path.endswith("final_hf")
 
 
 def _run_zero_token_weighted_case(
@@ -1669,15 +2666,22 @@ def _run_zero_token_weighted_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     debug_metrics: bool,
-    source_env_debug: bool,
 ) -> Path:
-    if source_env_debug:
-        monkeypatch.setenv("DEBERTA_DEBUG", "1")
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ZeroTokenTrackingAccelerator,
-        rtd_cls=_ZeroTokenScalarLossRTD,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={
+                "loss": 1.0,
+                "gen_loss": 1.0,
+                "disc_loss": 1.0,
+                "disc_accuracy": 1.0,
+                "gen_token_count": 1.0,
+                "disc_token_count": 1.0,
+                "disc_positive_count": 1.0,
+            },
+            **kwargs,
+        ),
         extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
     )
     train_cfg = TrainConfig(
@@ -1692,12 +2696,13 @@ def _run_zero_token_weighted_case(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=True,
+        decoupled_training=False,
         debug_metrics=bool(debug_metrics),
         torch_compile=False,
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
+        model_cfg=ModelConfig(backbone_type="rope"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -1705,7 +2710,7 @@ def _run_zero_token_weighted_case(
 
 
 def _latest_zero_token_tracker_metrics() -> dict[str, Any]:
-    accel = _ZeroTokenTrackingAccelerator.last_instance
+    accel = FakeAccelerator.last_instance
     assert accel is not None
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
@@ -1728,77 +2733,86 @@ def _load_last_debug_metrics_row(metrics_path: Path) -> dict[str, Any]:
     return debug_rows[-1]
 
 
-def test_run_pretraining_warns_and_excludes_zero_token_weighted_metrics_from_trackers_by_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("debug_metrics", "expect_metrics_file", "expect_warning"),
+    [
+        (False, False, True),
+        (True, True, False),
+    ],
+)
+def test_run_pretraining_zero_token_weighted_metrics_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    debug_metrics: bool,
+    expect_metrics_file: bool,
+    expect_warning: bool,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        metrics_path = _run_zero_token_weighted_case(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            debug_metrics=bool(debug_metrics),
+        )
+    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
+
+    if expect_warning:
+        assert any(
+            "Token-weighted GA window has zero effective tokens" in rec.message for rec in caplog.records
+        )
+
+    if expect_metrics_file:
+        assert metrics_path.exists()
+        last = _load_last_debug_metrics_row(metrics_path)
+        assert int(last["step"]) == 1
+        assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+        assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+        assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+        assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    else:
+        assert not metrics_path.exists()
+
+
+def test_run_pretraining_decoupled_debug_metrics_writes_local_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        accelerator_cls=_ZeroTokenTrackingAccelerator,
-        rtd_cls=_ZeroTokenScalarLossRTD,
-        extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=SimpleRTD,
     )
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
         logging_steps=1,
         save_steps=0,
-        report_to="tensorboard",
+        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        token_weighted_gradient_accumulation=True,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        decoupled_training=True,
+        debug_metrics=True,
         torch_compile=False,
         export_hf_final=False,
     )
-
-    with caplog.at_level(logging.WARNING):
-        pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-            train_cfg=train_cfg,
-        )
-
-    assert any("Token-weighted GA window has zero effective tokens" in rec.message for rec in caplog.records)
-    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
-    assert not (Path(train_cfg.output_dir) / "metrics.jsonl.gz").exists()
-
-
-def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_debug_metrics_enabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    metrics_path = _run_zero_token_weighted_case(
-        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=True, source_env_debug=False
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        train_cfg=train_cfg,
     )
-    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
 
+    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
     assert metrics_path.exists()
     last = _load_last_debug_metrics_row(metrics_path)
     assert int(last["step"]) == 1
-    assert last["debug_metrics_source_env"] is False
-    assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-
-
-def test_run_pretraining_logs_zero_token_weighted_metrics_locally_when_deberta_debug_env_is_set(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    metrics_path = _run_zero_token_weighted_case(
-        tmp_path=tmp_path, monkeypatch=monkeypatch, debug_metrics=False, source_env_debug=True
-    )
-    _assert_zero_window_metrics_hidden_from_trackers(_latest_zero_token_tracker_metrics())
-
-    assert metrics_path.exists()
-    last = _load_last_debug_metrics_row(metrics_path)
-    assert int(last["step"]) == 1
-    assert last["debug_metrics_source_env"] is True
-    assert float(last["zero_gen_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_total"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_gen_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
-    assert float(last["zero_disc_window_since_log"]) == pytest.approx(1.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_gen_window_total"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_total"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_gen_window_since_log"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
+    assert float(last["zero_disc_window_since_log"]) == pytest.approx(0.0, rel=0.0, abs=1e-6)
 
 
 def test_run_pretraining_compiles_generator_and_discriminator(
@@ -1831,7 +2845,7 @@ def test_run_pretraining_compiles_generator_and_discriminator(
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
+        model_cfg=ModelConfig(backbone_type="rope"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
@@ -1846,7 +2860,88 @@ def test_run_pretraining_compiles_generator_and_discriminator(
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
-def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
+def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes import _PRETRAINING_BATCH
+
+    pretrain_mod = setup_pretraining_mocks(monkeypatch)
+
+    batch_with_doc_ids: dict[str, torch.Tensor] = {
+        k: v.clone() for k, v in _PRETRAINING_BATCH.items() if isinstance(v, torch.Tensor)
+    }
+    batch_with_doc_ids["doc_ids"] = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+    expected_mask = pretrain_mod._build_doc_block_mask(batch_with_doc_ids["doc_ids"])
+
+    def _cycle_with_doc_ids(_loader: Any, *, start_epoch: int = 0):
+        del _loader, start_epoch
+        while True:
+            yield {k: v.clone() for k, v in batch_with_doc_ids.items()}
+
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _cycle_with_doc_ids)
+    monkeypatch.setattr(
+        pretrain_mod.torch,
+        "compile",
+        lambda target, *, mode="default", backend="inductor", dynamic=None: target,
+    )
+
+    seen_masks: list[torch.Tensor] = []
+    original_stabilize = pretrain_mod._stabilize_compile_attention_mask
+
+    def _stabilize_spy(
+        *,
+        batch: dict[str, Any],
+        compile_enabled: bool,
+        compile_scope: str,
+        backbone_type: str,
+        block_cross_document_attention: bool = False,
+    ) -> dict[str, Any]:
+        mask = batch.get("attention_mask")
+        if isinstance(mask, torch.Tensor):
+            seen_masks.append(mask.detach().clone())
+        return original_stabilize(
+            batch=batch,
+            compile_enabled=compile_enabled,
+            compile_scope=compile_scope,
+            backbone_type=backbone_type,
+            block_cross_document_attention=block_cross_document_attention,
+        )
+
+    monkeypatch.setattr(pretrain_mod, "_stabilize_compile_attention_mask", _stabilize_spy)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=True,
+        torch_compile_scope="backbones",
+        export_hf_final=False,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope"),
+        data_cfg=DataConfig(
+            dataset_name="hf-internal-testing/librispeech_asr_dummy",
+            block_cross_document_attention=True,
+        ),
+        train_cfg=train_cfg,
+    )
+
+    assert seen_masks
+    assert seen_masks[0].ndim == 3
+    assert seen_masks[0].dtype == torch.bool
+    assert torch.equal(seen_masks[0], expected_mask)
+
+
+def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class _FakeLayer(torch.nn.Module):
@@ -1863,12 +2958,6 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
             self.encoder = torch.nn.Module()
             self.encoder.layer = torch.nn.ModuleList([_FakeLayer()])
 
-    class _FFNScopeRTD(SimpleRTD):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.generator = _FakeBackbone()
-            self.discriminator = _FakeBackbone()
-
     compile_calls: list[tuple[Any, dict[str, Any]]] = []
 
     def _fake_compile(
@@ -1877,9 +2966,18 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
         compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
         return target
 
+    created_models: list[SimpleRTD] = []
+
+    def _make_scope_rtd(**kwargs: Any) -> SimpleRTD:
+        model = SimpleRTD(**kwargs)
+        model.generator = _FakeBackbone()
+        model.discriminator = _FakeBackbone()
+        created_models.append(model)
+        return model
+
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        rtd_cls=_FFNScopeRTD,
+        rtd_cls=_make_scope_rtd,
         build_backbones_fn=lambda **kwargs: (_FakeBackbone(), _FakeBackbone()),
     )
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
@@ -1905,17 +3003,15 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_ffn(
         train_cfg=train_cfg,
     )
 
-    instance = _FFNScopeRTD.last_instance
+    assert created_models
+    instance = created_models[-1]
     assert instance is not None
-    assert len(compile_calls) == 4
-    for i in range(4):
+    assert len(compile_calls) == 2
+    for i in range(2):
         assert callable(compile_calls[i][0])
         assert compile_calls[i][1] == {"mode": "default", "backend": "inductor", "dynamic": False}
-    assert getattr(compile_calls[0][0], "__self__", None) is instance.generator.encoder.layer[0].intermediate
-    assert getattr(compile_calls[1][0], "__self__", None) is instance.generator.encoder.layer[0].output
-    disc_layer = instance.discriminator.encoder.layer[0]
-    assert getattr(compile_calls[2][0], "__self__", None) is disc_layer.intermediate
-    assert getattr(compile_calls[3][0], "__self__", None) is disc_layer.output
+    assert getattr(compile_calls[0][0], "__self__", None) is instance.generator
+    assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
 def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
@@ -1938,6 +3034,7 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
         max_grad_norm=1.0,
@@ -1990,6 +3087,7 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
         max_grad_norm=1.0,
@@ -2030,6 +3128,21 @@ def test_apply_lr_mult_scales_all_param_groups() -> None:
     optimizer = torch.optim.AdamW([param], lr=1e-3)
     _apply_lr_mult(optimizer, 0.5)
     assert abs(float(optimizer.param_groups[0]["lr"]) - 5e-4) < 1e-12
+
+
+def test_apply_lr_mult_uses_unscaled_reference_without_compounding() -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    _record_unscaled_lrs(optimizer, scheduler)
+
+    _apply_lr_mult(optimizer, 0.5)
+    assert float(optimizer.param_groups[0]["lr"]) == pytest.approx(5e-4, abs=1e-12)
+
+    # Applying a new multiplier must be absolute against scheduler LR (1e-3),
+    # not multiplicative against the already-scaled group LR (5e-4).
+    _apply_lr_mult(optimizer, 0.25)
+    assert float(optimizer.param_groups[0]["lr"]) == pytest.approx(2.5e-4, abs=1e-12)
 
 
 def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_path: Path):
@@ -2165,6 +3278,55 @@ def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_di
     ).read_text(encoding="utf-8")
 
 
+def test_persist_or_validate_run_configs_allows_resume_when_only_logging_output_dir_differs(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source-run"
+    source_run.mkdir(parents=True, exist_ok=True)
+    source_logging_dir = source_run / "logs"
+    source_logging_dir.mkdir(parents=True, exist_ok=True)
+
+    model_cfg = ModelConfig(backbone_type="rope")
+    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = TrainConfig(max_steps=10)
+    source_logging_cfg = LoggingConfig(output_dir=str(source_logging_dir))
+    _persist_or_validate_run_configs(
+        output_dir=source_run,
+        logging_output_dir=source_logging_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        logging_cfg=source_logging_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    checkpoint_dir = source_run / "checkpoint-10"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    new_output_dir = tmp_path / "new-run"
+    new_output_dir.mkdir(parents=True, exist_ok=True)
+    new_logging_dir = new_output_dir / "logs"
+    new_logging_dir.mkdir(parents=True, exist_ok=True)
+    resumed_logging_cfg = LoggingConfig(output_dir=str(new_logging_dir))
+    _persist_or_validate_run_configs(
+        output_dir=new_output_dir,
+        logging_output_dir=new_logging_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        logging_cfg=resumed_logging_cfg,
+        resume_checkpoint=str(checkpoint_dir),
+        is_main_process=True,
+    )
+
+    resume_source = json.loads((new_output_dir / "resume_source.json").read_text(encoding="utf-8"))
+    assert resume_source["resume_checkpoint"] == str(checkpoint_dir.resolve())
+    assert resume_source["resume_run_dir"] == str(source_run.resolve())
+    assert (new_output_dir / "logging_config.json").read_text(encoding="utf-8") == (
+        source_run / "logging_config.json"
+    ).read_text(encoding="utf-8")
+
+
 def test_persist_or_validate_run_configs_preflight_rejects_conflicting_resume_snapshot(tmp_path: Path):
     source_run = tmp_path / "source-run"
     source_run.mkdir(parents=True, exist_ok=True)
@@ -2206,7 +3368,7 @@ def test_persist_or_validate_run_configs_rejects_resume_when_source_snapshots_mi
 
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(ValueError, match="source run directory is missing model/data config snapshots"):
+    with pytest.raises(ValueError, match="source run directory is missing required config snapshots"):
         _persist_or_validate_run_configs(
             output_dir=out,
             model_cfg=ModelConfig(backbone_type="rope"),
@@ -2345,22 +3507,27 @@ def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(tmp
         )
 
 
-class _FakeAccelerator:
-    def __init__(self, *, is_main_process: bool) -> None:
-        self.is_main_process = bool(is_main_process)
-        self.wait_count = 0
-        self.save_paths: list[str] = []
+def _checkpoint_saving_accelerator(
+    *,
+    is_main_process: bool,
+    write_weights: bool = True,
+) -> FakeAccelerator:
+    """Build a fake accelerator whose ``save_state`` writes checkpoint-like files."""
 
-    def wait_for_everyone(self) -> None:
-        self.wait_count += 1
+    accel = FakeAccelerator(is_main_process=bool(is_main_process))
 
-    def save_state(self, path: str) -> None:
-        self.save_paths.append(path)
-        p = Path(path)
+    def _save_state(output_dir: str | None) -> None:
+        if output_dir is None:
+            return
+        p = Path(output_dir)
         p.mkdir(parents=True, exist_ok=True)
-        (p / "model.safetensors").write_bytes(b"weights")
-        marker = "main" if self.is_main_process else "worker"
+        if write_weights:
+            (p / "model.safetensors").write_bytes(b"weights")
+        marker = "main" if accel.is_main_process else "worker"
         (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
+
+    accel.save_state_hook = _save_state
+    return accel
 
 
 def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_path: Path):
@@ -2369,7 +3536,7 @@ def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_pat
     ckpt = out / "checkpoint-1"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    accel = _FakeAccelerator(is_main_process=False)
+    accel = _checkpoint_saving_accelerator(is_main_process=False)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -2379,11 +3546,11 @@ def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_pat
         log_label="periodic",
     )
 
-    assert len(accel.save_paths) == 1
-    staged = Path(accel.save_paths[0])
+    assert len(accel.calls["save_state"]) == 1
+    staged = Path(str(accel.calls["save_state"][0]))
     assert staged.parent == out
     assert staged.name.startswith(f".{ckpt.name}.tmp-")
-    assert accel.wait_count >= 3
+    assert len(accel.calls["wait_for_everyone"]) >= 3
     assert not (ckpt / "data_state.json").exists()
 
 
@@ -2392,7 +3559,7 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-3"
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -2402,8 +3569,8 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
         log_label="final",
     )
 
-    assert len(accel.save_paths) == 1
-    staged = Path(accel.save_paths[0])
+    assert len(accel.calls["save_state"]) == 1
+    staged = Path(str(accel.calls["save_state"][0]))
     assert staged.parent == out
     assert staged.name.startswith(f".{ckpt.name}.tmp-")
     consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
@@ -2420,7 +3587,7 @@ def test_save_training_checkpoint_rejects_overwrite_of_nonempty_checkpoint_dir(t
     ckpt.mkdir(parents=True, exist_ok=True)
     (ckpt / "stale.bin").write_bytes(b"stale")
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     with pytest.raises(RuntimeError, match="Refusing to overwrite non-empty checkpoint directory"):
         _save_training_checkpoint(
             accelerator=accel,
@@ -2445,7 +3612,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
     (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
-    accel = _FakeAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=new_ckpt,
@@ -2460,9 +3627,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
     assert (new_ckpt / ".complete").exists()
 
 
-def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_invalid(
-    tmp_path: Path,
-) -> None:
+def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_invalid(tmp_path: Path) -> None:
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     old_ckpt = out / "checkpoint-1"
@@ -2475,14 +3640,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
     (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
-    class _BrokenSaveAccelerator(_FakeAccelerator):
-        def save_state(self, path: str) -> None:
-            self.save_paths.append(path)
-            p = Path(path)
-            p.mkdir(parents=True, exist_ok=True)
-            (p / "main.txt").write_text("ok", encoding="utf-8")
-
-    accel = _BrokenSaveAccelerator(is_main_process=True)
+    accel = _checkpoint_saving_accelerator(is_main_process=True, write_weights=False)
     with pytest.raises(RuntimeError, match="Post-save structural validation failed"):
         _save_training_checkpoint(
             accelerator=accel,
@@ -2612,16 +3770,13 @@ def test_normalize_resume_consumed_micro_batches_keeps_non_legacy_mismatch():
     assert reason is None
 
 
-def test_gumbel_sample_rejects_all_forbidden_vocab_mask():
+def test_build_forbidden_token_mask_rejects_all_forbidden_vocab():
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    logits = torch.zeros((4, 8), dtype=torch.float32)
-    forbidden = torch.ones(8, dtype=torch.bool)
     with pytest.raises(ValueError, match="excludes all vocabulary ids"):
-        DebertaV3RTDPretrainer._gumbel_sample(
-            logits,
-            temperature=1.0,
-            forbidden_vocab_mask=forbidden,
+        DebertaV3RTDPretrainer._build_forbidden_token_mask(
+            vocab_size=8,
+            forbidden_ids=set(range(8)),
         )
 
 
@@ -2737,7 +3892,7 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
 
 
 def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.export_helpers as export_mod
 
     class _Inner(torch.nn.Module):
         def __init__(self) -> None:
@@ -2756,17 +3911,6 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
     wrapped = _Wrapped(inner)
     called_targets: list[torch.nn.Module] = []
 
-    class _FakeAccelerator:
-        is_main_process = True
-
-        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-            assert model is wrapped
-            return inner
-
-        def get_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-            called_targets.append(model)
-            return {}
-
     class _FakeExportModel:
         def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
             del safe_serialization
@@ -2776,18 +3920,32 @@ def test_export_discriminator_hf_uses_unwrapped_submodules(tmp_path: Path, monke
     fake_transformers.AutoModel = types.SimpleNamespace(from_config=lambda _cfg: _FakeExportModel())
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
     monkeypatch.setattr(
-        pretrain_mod,
+        export_mod,
         "load_intersection_state_dict",
         lambda _model, _state: types.SimpleNamespace(missing_keys=[]),
     )
     monkeypatch.setattr(
-        pretrain_mod,
+        export_mod,
         "merge_embeddings_into_export_backbone",
         lambda **_kwargs: None,
     )
 
+    def _unwrap_model(model: torch.nn.Module, **_kwargs: Any) -> torch.nn.Module:
+        assert model is wrapped
+        return inner
+
+    def _get_state_dict(model: torch.nn.Module, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
+        del unwrap
+        called_targets.append(model)
+        return {}
+
+    accelerator = FakeAccelerator(
+        is_main_process=True,
+        unwrap_model_hook=_unwrap_model,
+        get_state_dict_hook=_get_state_dict,
+    )
     _export_discriminator_hf(
-        accelerator=_FakeAccelerator(),
+        accelerator=accelerator,
         model=wrapped,  # type: ignore[arg-type]
         tokenizer=DummyTokenizer(),
         output_dir=tmp_path / "export",
@@ -2808,19 +3966,23 @@ def test_export_discriminator_hf_collects_state_dicts_on_non_main_rank(tmp_path:
     inner = _Inner()
     called_targets: list[torch.nn.Module] = []
 
-    class _FakeAccelerator:
-        is_main_process = False
+    def _unwrap_model(model: torch.nn.Module, **_kwargs: Any) -> torch.nn.Module:
+        assert model is inner
+        return model
 
-        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-            assert model is inner
-            return model
+    def _get_state_dict(model: torch.nn.Module, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
+        del unwrap
+        called_targets.append(model)
+        return {}
 
-        def get_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-            called_targets.append(model)
-            return {}
+    accelerator = FakeAccelerator(
+        is_main_process=False,
+        unwrap_model_hook=_unwrap_model,
+        get_state_dict_hook=_get_state_dict,
+    )
 
     _export_discriminator_hf(
-        accelerator=_FakeAccelerator(),
+        accelerator=accelerator,
         model=inner,  # type: ignore[arg-type]
         tokenizer=DummyTokenizer(),
         output_dir=tmp_path / "export",
@@ -2829,6 +3991,43 @@ def test_export_discriminator_hf_collects_state_dicts_on_non_main_rank(tmp_path:
 
     assert called_targets == [inner.discriminator, inner.generator]
     assert not (tmp_path / "export").exists()
+
+
+def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+
+    def _fake_run(
+        cmd: list[str],
+        *,
+        stdout: Any,
+        stderr: Any,
+        text: bool,
+        check: bool,
+    ) -> _Proc:
+        del stdout, stderr, text, check
+        calls.append(list(cmd))
+        return _Proc()
+
+    import deberta.training.export_helpers as export_mod
+
+    monkeypatch.setattr(export_mod.subprocess, "run", _fake_run)
+
+    _export_discriminator_hf_subprocess(
+        checkpoint_dir=Path("runs/demo/checkpoint-1"),
+        output_dir=Path("runs/demo/final_hf"),
+    )
+
+    assert calls
+    cmd = calls[-1]
+    assert cmd[0] == sys.executable
+    assert cmd[1:5] == ["-m", "deberta", "export", "runs/demo/checkpoint-1"]
+    assert "--allow-partial-export" in cmd
 
 
 def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Path):
@@ -2868,8 +4067,33 @@ def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path):
     assert "| Max sequence length | 333 |" in text
 
 
+def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_path: Path):
+    out_dir = tmp_path / "hf-export-effective-config"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    export_cfg = types.SimpleNamespace(
+        hidden_size=768,
+        num_hidden_layers=6,
+        num_attention_heads=12,
+        max_position_embeddings=4096,
+    )
+
+    _write_export_readme(
+        out_dir,
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", hf_model_size="small"),
+        export_config=export_cfg,
+        data_cfg=None,
+        train_cfg=TrainConfig(max_steps=100),
+        embedding_sharing="gdes",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "# hf_deberta_v2-768h-6L-12H" in text
+    assert "| Max sequence length | 4096 |" in text
+
+
 def test_build_optimizer_supports_generator_specific_lr():
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(learning_rate=1.0e-3, generator_learning_rate=5.0e-4, weight_decay=0.1)
     opt = _build_optimizer(model, cfg)
 
@@ -2881,10 +4105,43 @@ def test_build_optimizer_supports_generator_specific_lr():
     assert wds == {0.0, 0.1}
 
 
+def test_build_optimizer_supports_discriminator_specific_lr():
+    model = TinyRTDLikeModel()
+    cfg = TrainConfig(
+        learning_rate=1.0e-3,
+        generator_learning_rate=5.0e-4,
+        discriminator_learning_rate=2.0e-4,
+        weight_decay=0.1,
+    )
+    opt = _build_optimizer(model, cfg)
+
+    lrs = {float(g["lr"]) for g in opt.param_groups}
+    assert lrs == {5.0e-4, 2.0e-4}
+
+
+def test_build_decoupled_optimizers_support_discriminator_specific_lr():
+    model = TinyRTDLikeModel()
+    cfg = TrainConfig(
+        learning_rate=1.0e-3,
+        generator_learning_rate=5.0e-4,
+        discriminator_learning_rate=2.0e-4,
+        weight_decay=0.1,
+        mixed_precision="no",
+    )
+    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
+
+    assert gen_opt.param_groups
+    assert disc_opt.param_groups
+    for group in gen_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(5.0e-4)
+    for group in disc_opt.param_groups:
+        assert float(group["lr"]) == pytest.approx(2.0e-4)
+
+
 def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig()
 
     monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
@@ -2903,7 +4160,7 @@ def test_build_optimizer_keeps_fused_for_hf_backbones_compile_bf16(monkeypatch: 
 def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.pretrain as pretrain_mod
 
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig()
 
     monkeypatch.setattr(pretrain_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
@@ -2920,7 +4177,7 @@ def test_build_optimizer_keeps_fused_outside_hf_compile_bf16_risk(monkeypatch: p
 
 
 def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
-    model = _TinyRTDLikeModel()
+    model = TinyRTDLikeModel()
     cfg = TrainConfig(adam_epsilon=1e-8)
 
     opt = _build_optimizer(model, cfg, mixed_precision="bf16")
@@ -2938,8 +4195,10 @@ def test_config_defaults():
     assert train.token_weighted_gradient_accumulation is True
 
     model = ModelConfig()
-    assert model.hidden_dropout_prob is None
-    assert model.attention_probs_dropout_prob is None
+    assert model.hidden_dropout_prob == pytest.approx(0.0)
+    assert model.attention_probs_dropout_prob == pytest.approx(0.0)
+    assert model.hf_model_size == "base"
+    assert model.ffn_type == "mlp"
     assert model.swiglu_adjust_intermediate is True
 
     data = DataConfig()
@@ -2987,40 +4246,42 @@ def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
 
 
 def test_validate_train_config_normalizes_wandb_watch_aliases():
-    cfg = TrainConfig(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
-    validate_train_config(cfg)
-    assert cfg.wandb_watch == "parameters"
-    assert cfg.wandb_watch_log_freq == 25
+    cfg = LoggingConfig(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
+    validate_logging_config(cfg)
+    assert cfg.wandb.watch == "parameters"
+    assert cfg.wandb.watch_log_freq == 25
 
 
 def test_validate_train_config_rejects_invalid_wandb_watch_mode():
-    cfg = TrainConfig(wandb_watch="histogram")
-    with pytest.raises(ValueError, match="train.wandb_watch must be one of"):
-        validate_train_config(cfg)
+    cfg = LoggingConfig(wandb_watch="histogram")
+    with pytest.raises(ValueError, match="logging.wandb.watch must be one of"):
+        validate_logging_config(cfg)
 
 
 def test_validate_train_config_rejects_non_positive_wandb_watch_log_freq():
-    cfg = TrainConfig(wandb_watch_log_freq=0)
-    with pytest.raises(ValueError, match="train.wandb_watch_log_freq must be >= 1"):
-        validate_train_config(cfg)
+    cfg = LoggingConfig(wandb_watch_log_freq=0)
+    with pytest.raises(ValueError, match="logging.wandb.watch_log_freq must be >= 1"):
+        validate_logging_config(cfg)
 
 
 def test_validate_train_config_accepts_resume_data_strategy_values():
-    cfg = TrainConfig(resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=123)
+    cfg = TrainConfig(
+        checkpoint={"resume_data_strategy": "restart_epoch", "resume_replay_max_micro_batches": 123}
+    )
     validate_train_config(cfg)
-    assert cfg.resume_data_strategy == "restart_epoch"
-    assert cfg.resume_replay_max_micro_batches == 123
+    assert cfg.checkpoint.resume_data_strategy == "restart_epoch"
+    assert cfg.checkpoint.resume_replay_max_micro_batches == 123
 
 
 def test_validate_train_config_rejects_invalid_resume_data_strategy():
-    cfg = TrainConfig(resume_data_strategy="fast")
-    with pytest.raises(ValueError, match="train.resume_data_strategy must be one of"):
+    cfg = TrainConfig(checkpoint={"resume_data_strategy": "fast"})
+    with pytest.raises(ValueError, match="train.checkpoint.resume_data_strategy must be one of"):
         validate_train_config(cfg)
 
 
 def test_validate_train_config_rejects_negative_resume_replay_threshold():
-    cfg = TrainConfig(resume_replay_max_micro_batches=-1)
-    with pytest.raises(ValueError, match="train.resume_replay_max_micro_batches must be >= 0"):
+    cfg = TrainConfig(checkpoint={"resume_replay_max_micro_batches": -1})
+    with pytest.raises(ValueError, match="train.checkpoint.resume_replay_max_micro_batches must be >= 0"):
         validate_train_config(cfg)
 
 
@@ -3044,7 +4305,6 @@ def test_token_weighted_micro_objective_matches_full_batch_normalization():
         disc_window_tokens_per_rank=disc_total,
         gen_loss_weight=gen_w,
         disc_loss_weight=disc_w,
-        decoupled_loss_scaling=False,
     )
     micro_1 = _token_weighted_micro_objective(
         gen_loss=gen_losses[1],
@@ -3055,7 +4315,6 @@ def test_token_weighted_micro_objective_matches_full_batch_normalization():
         disc_window_tokens_per_rank=disc_total,
         gen_loss_weight=gen_w,
         disc_loss_weight=disc_w,
-        decoupled_loss_scaling=False,
     )
 
     combined = micro_0 + micro_1
@@ -3085,30 +4344,6 @@ def test_resolve_window_token_denominators_clamps_and_flags_zero_windows():
     assert disc_zero is True
 
 
-def test_compute_generator_loss_term_matches_decoupled_formula():
-    gen_loss = torch.tensor(2.0)
-    disc_loss = torch.tensor(10.0)
-
-    term = compute_generator_loss_term(
-        gen_loss=gen_loss,
-        disc_loss=disc_loss,
-        decoupled_loss_scaling=True,
-    )
-    expected = (disc_loss / gen_loss) * gen_loss
-    torch.testing.assert_close(term, expected)
-
-
-def test_compute_generator_loss_term_passthrough_when_disabled():
-    gen_loss = torch.tensor(1.5)
-    disc_loss = torch.tensor(7.0)
-    term = compute_generator_loss_term(
-        gen_loss=gen_loss,
-        disc_loss=disc_loss,
-        decoupled_loss_scaling=False,
-    )
-    torch.testing.assert_close(term, gen_loss)
-
-
 def test_finalize_window_metric_loss_averages_non_token_weighted_windows():
     total = torch.tensor(3.0)
     out = _finalize_window_metric_loss(accumulated_loss=total, ga_steps=3, token_weighted_ga=False)
@@ -3134,18 +4369,10 @@ def test_scale_loss_for_backward_cancels_accelerate_ga_division_for_token_weight
 
 
 def test_build_training_collator_propagates_packed_sequences_flag():
-    class _Tokenizer:
-        mask_token_id = 3
-        pad_token_id = 0
-        vocab_size = 64
-        all_special_ids = [0, 1, 2, 3]
-
-        def tokenize(self, text: str) -> list[str]:
-            return text.split()
-
+    tokenizer = DummyTokenizer(vocab_size=64)
     train_cfg = TrainConfig(mlm_probability=0.2, mlm_max_ngram=2)
     collator = _build_training_collator(
-        tokenizer=_Tokenizer(),
+        tokenizer=tokenizer,
         train_cfg=train_cfg,
         packed_sequences=True,
         block_cross_document_attention=True,
@@ -3163,17 +4390,75 @@ def test_should_clip_gradients_on_sync_steps():
 
 
 def test_has_nonfinite_grad_norm_any_rank_uses_reduced_flag():
-    class _FakeAccelerator:
-        device = torch.device("cpu")
+    accel = FakeAccelerator(num_processes=2)
 
-        def reduce(self, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-            assert reduction == "sum"
-            # Simulate another rank reporting a non-finite norm.
-            return tensor + 1
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        assert reduction == "sum"
+        return tensor + 1
 
-    accel = _FakeAccelerator()
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
     assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is True
     assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
+
+
+def test_has_nonfinite_grad_norm_any_rank_single_process_uses_local_flag():
+    accel = FakeAccelerator(num_processes=1)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise AssertionError("reduce() should not be called in single-process mode")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is False
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
+
+
+def test_has_nonfinite_grad_norm_any_rank_propagates_reduce_errors_on_multi_process():
+    accel = FakeAccelerator(num_processes=2)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise RuntimeError("collective failed")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="collective failed"):
+        _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0)
+
+
+def test_any_rank_flag_true_uses_reduced_flag():
+    accel = FakeAccelerator(num_processes=2)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        assert reduction == "sum"
+        return tensor + 1
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    assert _any_rank_flag_true(accelerator=accel, flag=False) is True
+    assert _any_rank_flag_true(accelerator=accel, flag=True) is True
+
+
+def test_any_rank_flag_true_single_process_uses_local_flag():
+    accel = FakeAccelerator(num_processes=1)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise AssertionError("reduce() should not be called in single-process mode")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    assert _any_rank_flag_true(accelerator=accel, flag=False) is False
+    assert _any_rank_flag_true(accelerator=accel, flag=True) is True
+
+
+def test_any_rank_flag_true_propagates_reduce_errors_on_multi_process():
+    accel = FakeAccelerator(num_processes=2)
+
+    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del tensor, reduction
+        raise RuntimeError("collective failed")
+
+    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="collective failed"):
+        _any_rank_flag_true(accelerator=accel, flag=False)
 
 
 def test_sync_discriminator_embeddings_if_available_is_noop_without_hook():
@@ -3193,6 +4478,159 @@ def test_sync_discriminator_embeddings_if_available_calls_hook_once():
     model = _Model()
     _sync_discriminator_embeddings_if_available(model)
     assert model.calls == 1
+
+
+def test_sync_discriminator_embeddings_if_available_skips_fsdp_summon_when_not_gdes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeFSDP(torch.nn.Module):
+        summon_calls = 0
+
+        @staticmethod
+        def summon_full_params(_module: torch.nn.Module, *, recurse: bool, writeback: bool):
+            del recurse, writeback
+            _FakeFSDP.summon_calls += 1
+            return _FakeCtx()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.embedding_sharing = "es"
+            self._gdes_synced_embeddings = [object()]
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    model = _FakeFSDP()
+    _sync_discriminator_embeddings_if_available(model)
+
+    assert model.calls == 0
+    assert _FakeFSDP.summon_calls == 0
+
+
+def test_sync_discriminator_embeddings_if_available_uses_non_recursive_fsdp_summon(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeFSDP(torch.nn.Module):
+        recurse_args: list[bool] = []
+        writeback_args: list[bool] = []
+
+        @staticmethod
+        def summon_full_params(_module: torch.nn.Module, *, recurse: bool, writeback: bool):
+            _FakeFSDP.recurse_args.append(bool(recurse))
+            _FakeFSDP.writeback_args.append(bool(writeback))
+            return _FakeCtx()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.embedding_sharing = "gdes"
+            self._gdes_synced_embeddings = [object()]
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    model = _FakeFSDP()
+    _sync_discriminator_embeddings_if_available(model)
+
+    assert model.calls == 1
+    assert _FakeFSDP.recurse_args == [False]
+    assert _FakeFSDP.writeback_args == [True]
+
+
+def test_sync_discriminator_embeddings_if_available_propagates_fsdp_summon_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeFSDP(torch.nn.Module):
+        @staticmethod
+        def summon_full_params(_module: torch.nn.Module, *, recurse: bool, writeback: bool):
+            del recurse, writeback
+            raise RuntimeError("boom")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding_sharing = "gdes"
+            self._gdes_synced_embeddings = [object()]
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            raise AssertionError("sync hook should not run when summon_full_params fails")
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _sync_discriminator_embeddings_if_available(_FakeFSDP())
+
+
+def test_sync_discriminator_embeddings_if_available_supports_fsdp2_unshard_reshard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _Handle:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self) -> None:
+            self.wait_calls += 1
+
+    class _FakeFSDPModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.unshard_calls = 0
+            self.reshard_calls = 0
+            self.handle = _Handle()
+            self.embedding_sharing = "gdes"
+            self._gdes_synced_embeddings = [object()]
+
+        def unshard(self, async_op: bool = False):
+            assert bool(async_op) is False
+            self.unshard_calls += 1
+            return self.handle
+
+        def reshard(self) -> None:
+            self.reshard_calls += 1
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    class _DummyFSDP(torch.nn.Module):
+        pass
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _DummyFSDP
+    fake_fsdp.FSDPModule = _FakeFSDPModule
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    model = _FakeFSDPModule()
+    _sync_discriminator_embeddings_if_available(model)
+
+    assert model.calls == 1
+    assert model.unshard_calls == 1
+    assert model.handle.wait_calls == 1
+    assert model.reshard_calls == 1
 
 
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():
@@ -3238,7 +4676,7 @@ def test_count_input_tokens_for_batch_with_various_mask_shapes():
 
 
 def test_compute_disc_active_mask_preserves_masked_non_special_tokens():
-    from deberta.training.pretrain import _compute_disc_active_mask
+    from deberta.training.loop_utils import _compute_disc_active_mask
 
     mask = _compute_disc_active_mask(
         input_ids=torch.tensor([[1, 11, 2, 13, 0]], dtype=torch.long),
@@ -3485,7 +4923,7 @@ def test_normalizer_aliases_and_rejection():
                 ("max-autotune-no-cudagraphs", "max-autotune-no-cudagraphs"),
             ],
             "fastest",
-            "torch_compile_mode",
+            "train.compile.mode",
         ),
         (
             _normalize_torch_compile_scope,
@@ -3501,13 +4939,13 @@ def test_normalizer_aliases_and_rejection():
                 ("disc_ffn", "disc_ffn"),
             ],
             "all",
-            "torch_compile_scope",
+            "train.compile.scope",
         ),
         (
             _normalize_torch_compile_backend,
             [("inductor", "inductor"), ("aot-eager", "aot_eager")],
             "xla",
-            "torch_compile_backend",
+            "train.compile.backend",
         ),
         (
             _normalize_wandb_watch,
@@ -3519,7 +4957,7 @@ def test_normalizer_aliases_and_rejection():
                 ("off", "none"),
             ],
             "full_histograms",
-            "wandb_watch",
+            "logging.wandb.watch",
         ),
         (
             _normalize_hf_attention_kernel,
@@ -3531,7 +4969,7 @@ def test_normalizer_aliases_and_rejection():
                 ("stable", "stable"),
             ],
             "einsum",
-            "hf_attention_kernel",
+            "model.hf.attention_kernel",
         ),
         (
             _normalize_sdpa_kernel,
@@ -3542,7 +4980,7 @@ def test_normalizer_aliases_and_rejection():
                 ("math", "math"),
             ],
             "best",
-            "sdpa_kernel",
+            "train.sdpa_kernel",
         ),
     ]
     for fn, valid_pairs, invalid_input, error_pattern in cases:
@@ -3636,15 +5074,15 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
     assert "attention_mask" not in out3
 
 
-def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
+def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking():
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         compile_mode="default",
         compile_backend="inductor",
     )
-    assert scope == "ffn"
-    assert reason is not None
+    assert scope == "backbones"
+    assert reason is None
 
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
@@ -3685,21 +5123,12 @@ def test_resolve_compile_scope_uses_hf_deberta_v2_default_inductor_fallback():
     assert reason is None
 
 
-def test_full_backbone_hf_inductor_warning_for_unstable_combo():
-    msg = _full_backbone_hf_inductor_warning(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        compile_enabled=True,
-        compile_scope="backbones",
-        compile_backend="inductor",
-    )
-    assert msg is not None
-    assert "ffn" in msg
-
+def test_full_backbone_hf_inductor_warning_is_disabled():
     assert (
         _full_backbone_hf_inductor_warning(
             model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
             compile_enabled=True,
-            compile_scope="ffn",
+            compile_scope="backbones",
             compile_backend="inductor",
         )
         is None
@@ -3745,8 +5174,10 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
         "\n".join(
             [
                 "data:",
-                "  dataset_name: HuggingFaceFW/fineweb-edu",
-                "  max_seq_length: 32",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "  packing:",
+                "    max_seq_length: 32",
                 "train:",
                 "  max_steps: 5",
             ]
@@ -3756,19 +5187,367 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
-    cli_mod.main(["train", str(cfg_path), "--max_steps", "7"])
+    cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
 
     assert "train_cfg" in seen
-    assert seen["data_cfg"].max_seq_length == 32
+    assert seen["data_cfg"].packing.max_seq_length == 32
     assert seen["train_cfg"].max_steps == 7
     assert seen["config_path"] == cfg_path
+
+
+def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  profile: deberta_v3_parity",
+                "  backbone_type: hf_deberta_v2",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 1000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path)])
+
+    assert "train_cfg" in seen
+    assert int(seen["train_cfg"].warmup_steps) == 1000
+    assert seen["config_path"] == cfg_path
+    err = capsys.readouterr().err
+    assert "optim.scheduler.warmup_steps" not in err
+
+
+def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
+
+    assert "train_cfg" in seen
+    assert int(seen["train_cfg"].max_steps) == 7
+    err = capsys.readouterr().err
+    assert "train.max_steps: 5 -> 7 (CLI override (--train.max_steps))" in err
+
+
+def test_main_cli_train_reports_when_runtime_mutation_changes_loaded_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_apply_profile_defaults(*, model_cfg, train_cfg, optim_cfg):
+        del model_cfg, optim_cfg
+        object.__setattr__(train_cfg, "max_steps", int(train_cfg.max_steps) + 1)
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "apply_profile_defaults", _fake_apply_profile_defaults)
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(["train", str(cfg_path)])
+
+    assert int(seen["train_cfg"].max_steps) == 6
+    err = capsys.readouterr().err
+    assert "train.max_steps: 5 -> 6 (runtime normalization/defaulting)" in err
+
+
+def test_main_cli_train_supports_dotted_overrides_with_type_casting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+                "optim:",
+                "  adam:",
+                "    epsilon: 1e-6",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--train.max_steps",
+            "11",
+            "--optim.adam.epsilon",
+            "1e-5",
+            "--model.hf.max_position_embeddings",
+            "640",
+        ]
+    )
+
+    assert int(seen["train_cfg"].max_steps) == 11
+    assert float(seen["train_cfg"].adam_epsilon) == pytest.approx(1e-5)
+    assert int(seen["model_cfg"].hf_max_position_embeddings) == 640
+    err = capsys.readouterr().err
+    assert "train.max_steps: 5 -> 11 (CLI override (--train.max_steps))" in err
+
+
+def test_main_cli_train_supports_null_for_optional_numeric_dotted_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  hf:",
+                "    max_position_embeddings: 640",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--model.hf.max_position_embeddings",
+            "null",
+        ]
+    )
+
+    assert seen["model_cfg"].hf_max_position_embeddings is None
+    err = capsys.readouterr().err
+    assert (
+        "model.hf.max_position_embeddings: 640 -> None (CLI override (--model.hf.max_position_embeddings))"
+    ) in err
+
+
+def test_main_cli_train_supports_null_for_optional_constrained_dotted_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  backbone_type: rope",
+                "  from_scratch: false",
+                "  pretrained:",
+                "    discriminator_path: /tmp/rope-disc",
+                "  rope:",
+                "    pretrained:",
+                "      norm_arch: keel",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--model.rope.pretrained.norm_arch",
+            "none",
+        ]
+    )
+
+    assert seen["model_cfg"].pretrained_norm_arch is None
+    err = capsys.readouterr().err
+    assert (
+        "model.rope.pretrained.norm_arch: 'keel' -> None (CLI override (--model.rope.pretrained.norm_arch))"
+        in err
+    )
+
+
+def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    pytest.importorskip("yaml")
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    cli_mod.main(
+        [
+            "train",
+            str(cfg_path),
+            "--optim.scheduler.warmup_steps",
+            "333",
+            "--logging.wandb.watch",
+            "all",
+        ]
+    )
+
+    assert int(seen["train_cfg"].warmup_steps) == 333
+    assert seen["train_cfg"].wandb_watch == "all"
+
+
+def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("yaml")
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_mod, "run_pretraining", lambda **_: None)
+    with pytest.raises(SystemExit):
+        cli_mod.main(["train", str(cfg_path), "--train.no_such_field", "1"])
 
 
 def test_main_cli_train_with_config_and_preset_applies_model_only(
@@ -3779,7 +5558,7 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
         json.dumps(
             {
                 "model": {"backbone_type": "rope"},
-                "data": {"dataset_name": "demo-dataset", "max_seq_length": 128},
+                "data": {"source": {"dataset_name": "demo-dataset"}, "packing": {"max_seq_length": 128}},
                 "train": {"max_steps": 11},
             }
         ),
@@ -3788,10 +5567,12 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
 
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
@@ -3799,8 +5580,8 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
 
     assert "train_cfg" in seen
     assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
-    assert seen["data_cfg"].dataset_name == "demo-dataset"
-    assert seen["data_cfg"].max_seq_length == 128
+    assert seen["data_cfg"].source.dataset_name == "demo-dataset"
+    assert seen["data_cfg"].packing.max_seq_length == 128
     assert seen["train_cfg"].max_steps == 11
     assert seen["config_path"] == cfg_path
     out = capsys.readouterr().out
@@ -3812,24 +5593,26 @@ def test_main_cli_train_preset_without_config_applies_defaults_and_cli_overrides
 ):
     seen: dict[str, Any] = {}
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
-    cli_mod.main(["train", "--preset", "deberta-v3-base", "--max_steps", "123"])
+    cli_mod.main(["train", "--preset", "deberta-v3-base", "--train.max_steps", "123"])
 
     assert seen["config_path"] is None
     assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
     assert seen["model_cfg"].embedding_sharing == "gdes"
-    assert seen["data_cfg"].dataset_name == "HuggingFaceFW/fineweb-edu"
-    assert seen["data_cfg"].dataset_config_name == "default"
+    assert seen["data_cfg"].source.dataset_name == "HuggingFaceFW/fineweb-edu"
+    assert seen["data_cfg"].source.dataset_config_name == "default"
     assert seen["train_cfg"].max_steps == 123
     assert seen["train_cfg"].report_to == "none"
     out = capsys.readouterr().out
-    assert "model+data+train defaults (no config file)" in out
+    assert "model+data+train+optim+logging defaults (no config file)" in out
 
 
 def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: pytest.MonkeyPatch):
@@ -3839,13 +5622,16 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
         del args, kwargs
         raise AssertionError("run_pretraining should not be called for --dry-run")
 
-    def _fake_dry_run(*, model_cfg, data_cfg, train_cfg, config_path=None):
+    def _fake_dry_run(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
         seen["model_cfg"] = model_cfg
         seen["data_cfg"] = data_cfg
         seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
         return {
-            "output_dir": "runs/demo",
+            "checkpoint_output_dir": "runs/demo",
+            "logging_output_dir": "runs/demo",
             "resume_checkpoint": None,
             "effective_compile_scope": "ffn",
             "sample_batch_shape": (1, 8),
@@ -3859,9 +5645,9 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
     cli_mod.main(
         [
             "train",
-            "--dataset_name",
+            "--data.source.dataset_name",
             "HuggingFaceFW/fineweb-edu",
-            "--max_steps",
+            "--train.max_steps",
             "5",
             "--dry-run",
         ]
@@ -3870,10 +5656,60 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
     assert int(seen["train_cfg"].max_steps) == 5
 
 
+def test_main_cli_train_explicit_argv_skips_fast_exit(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, Any] = {"ran": False, "exit_called": False}
+
+    def _fake_run_train(ns: argparse.Namespace, *, dotflag_map: dict[str, str]) -> None:
+        del ns, dotflag_map
+        seen["ran"] = True
+
+    def _fake_exit(code: int) -> None:
+        del code
+        seen["exit_called"] = True
+        raise AssertionError("os._exit should not be called when main(argv=...) is used.")
+
+    monkeypatch.setattr(cli_mod, "_run_train", _fake_run_train)
+    monkeypatch.setattr(cli_mod.os, "_exit", _fake_exit)
+
+    cli_mod.main(["train", "--dry-run"])
+
+    assert seen["ran"] is True
+    assert seen["exit_called"] is False
+
+
+def test_main_cli_train_implicit_argv_fast_exit_enabled(monkeypatch: pytest.MonkeyPatch):
+    seen: dict[str, Any] = {"ran": False}
+
+    def _fake_run_train(ns: argparse.Namespace, *, dotflag_map: dict[str, str]) -> None:
+        del ns, dotflag_map
+        seen["ran"] = True
+
+    def _fake_exit(code: int) -> None:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(cli_mod, "_run_train", _fake_run_train)
+    monkeypatch.setattr(cli_mod.os, "_exit", _fake_exit)
+    monkeypatch.setenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")
+    monkeypatch.setattr(cli_mod.sys, "argv", ["deberta", "train", "--dry-run"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main()
+
+    assert int(exc_info.value.code) == 0
+    assert seen["ran"] is True
+
+
 def test_train_parser_accepts_dry_run_flag():
     parser = cli_mod._build_main_parser()
     ns = parser.parse_args(
-        ["train", "--dataset_name", "HuggingFaceFW/fineweb-edu", "--max_steps", "5", "--dry-run"]
+        [
+            "train",
+            "--data.source.dataset_name",
+            "HuggingFaceFW/fineweb-edu",
+            "--train.max_steps",
+            "5",
+            "--dry-run",
+        ]
     )
     assert ns.command == "train"
     assert ns.dry_run is True
@@ -3914,10 +5750,10 @@ def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.Mon
 def test_train_cli_rejects_invalid_constrained_values_at_parse_time():
     parser = cli_mod._build_main_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["train", "--norm_arch", "invalid"])
+        parser.parse_args(["train", "--model.rope.norm_arch", "invalid"])
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["train", "--report_to", "invalid"])
+        parser.parse_args(["train", "--logging.backend", "invalid"])
 
 
 def test_export_parser_rejects_conflicting_boolean_flags():
@@ -3945,7 +5781,7 @@ def test_validate_data_config_rejects_conflicting_sources():
 
 
 def test_validate_train_config_rejects_overwrite_with_resume_conflict():
-    with pytest.raises(ValueError, match="cannot be combined with train.resume_from_checkpoint"):
+    with pytest.raises(ValueError, match="cannot be combined with train.checkpoint.resume_from_checkpoint"):
         validate_train_config(
             TrainConfig(
                 overwrite_output_dir=True,
@@ -3957,13 +5793,165 @@ def test_validate_train_config_rejects_overwrite_with_resume_conflict():
 def test_validate_train_config_normalizes_blank_resume_hint_to_none():
     cfg = TrainConfig(resume_from_checkpoint="   ")
     validate_train_config(cfg)
-    assert cfg.resume_from_checkpoint is None
+    assert cfg.checkpoint.resume_from_checkpoint is None
 
 
 def test_validate_train_config_trims_resume_hint():
     cfg = TrainConfig(resume_from_checkpoint=" auto ")
     validate_train_config(cfg)
-    assert cfg.resume_from_checkpoint == "auto"
+    assert cfg.checkpoint.resume_from_checkpoint == "auto"
+
+
+def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
+    cfg = ModelConfig()
+    assert cfg.backbone_type == "hf_deberta_v2"
+
+
+def test_apply_profile_defaults_applies_parity_values_when_unset() -> None:
+    model_cfg = ModelConfig(profile="deberta_v3_parity")
+    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.embedding_sharing == "gdes"
+    assert model_cfg.hf_attention_kernel == "dynamic"
+    assert train_cfg.mask_token_prob == pytest.approx(1.0)
+    assert train_cfg.random_token_prob == pytest.approx(0.0)
+    assert train_cfg.mlm_max_ngram == 1
+    assert train_cfg.disc_loss_weight == pytest.approx(10.0)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
+    assert optim_cfg.scheduler.warmup_steps == 10_000
+    assert train_cfg.token_weighted_gradient_accumulation is True
+
+
+def test_apply_profile_defaults_applies_hf_parity_values_without_parity_profile() -> None:
+    model_cfg = ModelConfig(profile="modern", backbone_type="hf_deberta_v2")
+    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+
+    assert train_cfg.mask_token_prob == pytest.approx(1.0)
+    assert train_cfg.random_token_prob == pytest.approx(0.0)
+    assert train_cfg.disc_loss_weight == pytest.approx(10.0)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
+    assert optim_cfg.scheduler.warmup_steps == 10_000
+    assert train_cfg.token_weighted_gradient_accumulation is True
+
+
+def test_apply_profile_defaults_keeps_rope_modern_defaults() -> None:
+    model_cfg = ModelConfig(profile="modern", backbone_type="rope")
+    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+
+    assert train_cfg.mask_token_prob == pytest.approx(0.8)
+    assert train_cfg.random_token_prob == pytest.approx(0.1)
+    assert train_cfg.disc_loss_weight == pytest.approx(50.0)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
+    assert optim_cfg.scheduler.warmup_steps == 1_000
+    assert train_cfg.token_weighted_gradient_accumulation is True
+
+
+def test_apply_profile_defaults_keeps_explicit_non_default_values() -> None:
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        embedding_sharing="none",
+        hf_attention_kernel="stable",
+    )
+    train_cfg = TrainConfig(
+        mask_token_prob=0.95,
+        random_token_prob=0.03,
+        mlm_max_ngram=2,
+        disc_loss_weight=12.5,
+        token_weighted_gradient_accumulation=False,
+    )
+    optim_cfg = OptimConfig(adam_epsilon=5e-6, warmup_steps=2_000)
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.embedding_sharing == "none"
+    assert model_cfg.hf_attention_kernel == "stable"
+    assert train_cfg.mask_token_prob == pytest.approx(0.95)
+    assert train_cfg.random_token_prob == pytest.approx(0.03)
+    assert train_cfg.mlm_max_ngram == 2
+    assert train_cfg.disc_loss_weight == pytest.approx(12.5)
+    assert optim_cfg.adam.epsilon == pytest.approx(5e-6)
+    assert optim_cfg.scheduler.warmup_steps == 2_000
+    assert train_cfg.token_weighted_gradient_accumulation is False
+
+
+def test_apply_profile_defaults_honors_explicit_fields_even_when_matching_raw_defaults() -> None:
+    model_cfg = ModelConfig(
+        profile="deberta_v3_parity",
+        backbone_type="hf_deberta_v2",
+        embedding_sharing="es",
+        hf_attention_kernel="auto",
+    )
+    train_cfg = TrainConfig(
+        mask_token_prob=0.8,
+        random_token_prob=0.1,
+        disc_loss_weight=50.0,
+        token_weighted_gradient_accumulation=True,
+    )
+    optim_cfg = OptimConfig(adam_epsilon=1e-8, warmup_steps=1_000)
+    object.__setattr__(
+        model_cfg,
+        "_explicit_fields",
+        {"backbone_type", "embedding_sharing", "hf.attention_kernel"},
+    )
+    object.__setattr__(
+        train_cfg,
+        "_explicit_fields",
+        {
+            "objective.mask_token_prob",
+            "objective.random_token_prob",
+            "objective.disc_loss_weight",
+            "token_weighted_gradient_accumulation",
+        },
+    )
+    object.__setattr__(optim_cfg, "_explicit_fields", {"adam.epsilon", "scheduler.warmup_steps"})
+
+    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+
+    assert model_cfg.backbone_type == "hf_deberta_v2"
+    assert model_cfg.embedding_sharing == "es"
+    assert model_cfg.hf_attention_kernel == "auto"
+    assert train_cfg.mask_token_prob == pytest.approx(0.8)
+    assert train_cfg.random_token_prob == pytest.approx(0.1)
+    assert train_cfg.disc_loss_weight == pytest.approx(50.0)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
+    assert optim_cfg.scheduler.warmup_steps == 1_000
+    assert train_cfg.token_weighted_gradient_accumulation is True
+
+
+def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
+    assert bool(TrainConfig().decoupled_training) is True
+    assert bool(TrainConfig(decoupled_training=False).decoupled_training) is False
+
+
+def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
+    cfg = TrainConfig(decoupled_training=None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="train.decoupled_training must be a boolean"):
+        validate_train_config(cfg)
+
+
+@pytest.mark.parametrize("value", [-1.0, 1.0e-4, 2.5e-3])
+def test_validate_train_config_allows_discriminator_learning_rate_inherit_or_positive(value: float) -> None:
+    cfg = OptimConfig(discriminator_learning_rate=value)
+    validate_optim_config(cfg)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, -2.0])
+def test_validate_train_config_rejects_invalid_discriminator_learning_rate(value: float) -> None:
+    cfg = OptimConfig(discriminator_learning_rate=value)
+    with pytest.raises(ValueError, match="optim.lr.discriminator"):
+        validate_optim_config(cfg)
 
 
 def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Path):
@@ -3992,7 +5980,7 @@ def test_validate_data_config_rejects_non_streaming_shuffle_buffer_above_one():
 
 
 def test_validate_data_config_rejects_doc_blocking_when_not_packed():
-    with pytest.raises(ValueError, match="requires data.pack_sequences=true"):
+    with pytest.raises(ValueError, match="requires data.packing.enabled=true"):
         validate_data_config(
             DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
@@ -4015,7 +6003,9 @@ def test_validate_data_config_warns_on_long_context_dense_doc_blocking():
 
 
 def test_validate_training_workflow_options_rejects_flash_with_packing():
-    with pytest.raises(ValueError, match="sdpa_kernel=flash is not supported with data.pack_sequences=true"):
+    with pytest.raises(
+        ValueError, match="train.sdpa_kernel=flash is not supported with data.packing.enabled=true"
+    ):
         validate_training_workflow_options(
             data_cfg=DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
@@ -4063,8 +6053,9 @@ def test_validate_training_workflow_options_rejects_es_with_divergent_gen_lr():
     with pytest.raises(ValueError, match="embedding_sharing='es'"):
         validate_training_workflow_options(
             data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+            train_cfg=TrainConfig(),
             model_cfg=ModelConfig(embedding_sharing="es"),
+            optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
         )
 
 
@@ -4072,14 +6063,16 @@ def test_validate_training_workflow_options_allows_es_with_matching_gen_lr():
     # Explicit gen LR matching disc LR — should pass.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=5e-4),
+        train_cfg=TrainConfig(decoupled_training=False),
         model_cfg=ModelConfig(embedding_sharing="es"),
+        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=5e-4),
     )
     # Inherited gen LR (-1) — should pass.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=-1.0),
+        train_cfg=TrainConfig(decoupled_training=False),
         model_cfg=ModelConfig(embedding_sharing="es"),
+        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=-1.0),
     )
 
 
@@ -4087,9 +6080,19 @@ def test_validate_training_workflow_options_allows_gdes_with_divergent_gen_lr():
     # GDES handles separate LR correctly — should not raise.
     validate_training_workflow_options(
         data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+        train_cfg=TrainConfig(),
         model_cfg=ModelConfig(embedding_sharing="gdes"),
+        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
     )
+
+
+def test_validate_training_workflow_options_rejects_decoupled_with_es_embedding_sharing():
+    with pytest.raises(ValueError, match="gradients.*dropped"):
+        validate_training_workflow_options(
+            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=TrainConfig(decoupled_training=True),
+            model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="es"),
+        )
 
 
 def test_validate_model_config_rejects_rope_knobs_in_hf_mode():
@@ -4113,20 +6116,20 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
 
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_multiple():
     cfg = ModelConfig(tokenizer_vocab_multiple=0)
-    with pytest.raises(ValueError, match="tokenizer_vocab_multiple"):
+    with pytest.raises(ValueError, match="model.tokenizer.vocab_multiple"):
         validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_target():
     cfg = ModelConfig(tokenizer_vocab_target=0)
-    with pytest.raises(ValueError, match="tokenizer_vocab_target"):
+    with pytest.raises(ValueError, match="model.tokenizer.vocab_target"):
         validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
     cfg = ModelConfig(
         backbone_type="rope",
-        generator_model_name_or_path="microsoft/deberta-v3-small",
+        pretrained_generator_path="microsoft/deberta-v3-small",
         generator_hidden_size=256,
     )
     with pytest.raises(ValueError, match="only used when deriving generator config"):
@@ -4138,7 +6141,7 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_for_rope():
         backbone_type="rope",
         hf_max_position_embeddings=1024,
     )
-    with pytest.warns(UserWarning, match="hf_max_position_embeddings only applies"):
+    with pytest.warns(UserWarning, match="model.hf.max_position_embeddings only applies"):
         validate_model_config(cfg)
 
 
@@ -4155,7 +6158,7 @@ def test_validate_model_config_rejects_pretrained_derived_generator_shape_overri
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         generator_hidden_size=256,
     )
     with pytest.raises(ValueError, match="derived generator weights"):
@@ -4166,8 +6169,26 @@ def test_validate_model_config_allows_pretrained_derived_generator_layer_overrid
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         generator_num_hidden_layers=4,
+    )
+    validate_model_config(cfg)
+
+
+def test_looks_like_hf_deberta_checkpoint_avoids_local_rope_false_positive():
+    assert _looks_like_hf_deberta_checkpoint("microsoft/deberta-v3-base")
+    assert _looks_like_hf_deberta_checkpoint("https://huggingface.co/microsoft/deberta-v3-base")
+    assert _looks_like_hf_deberta_checkpoint(
+        "/home/user/.cache/huggingface/hub/models--microsoft--deberta-v3-base/snapshots/abc"
+    )
+    assert not _looks_like_hf_deberta_checkpoint("runs/deberta-v3-rope/checkpoint-1000")
+
+
+def test_validate_model_config_allows_local_rope_checkpoint_path_with_deberta_in_name():
+    cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        pretrained_discriminator_path="runs/deberta-v3-rope/checkpoint-1000",
     )
     validate_model_config(cfg)
 
@@ -4176,7 +6197,7 @@ def test_validate_model_config_rejects_scratch_rope_knobs_in_pretrained_mode():
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         rope_theta=50_000.0,
     )
     with pytest.raises(ValueError, match="only affect scratch RoPE initialization"):
@@ -4187,7 +6208,7 @@ def test_validate_model_config_allows_explicit_pretrained_rope_overrides():
     cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
         pretrained_rope_theta=50_000.0,
         pretrained_norm_arch="keel",
     )
@@ -4204,37 +6225,14 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
         validate_model_config(cfg)
 
 
-def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    class _FakeHFConfig:
-        def __init__(self) -> None:
-            self.vocab_size = 64
-            self.hidden_size = 32
-            self.num_hidden_layers = 2
-            self.num_attention_heads = 4
-            self.intermediate_size = 64
-            self.hidden_act = "gelu"
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=lambda _src: _FakeHFConfig())
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    class _Tokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-        bos_token_id = 4
-        eos_token_id = 5
-
-        def __len__(self) -> int:
-            return 128
+def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs():
+    pytest.importorskip("transformers")
+    tokenizer = DummyTokenizer(vocab_size=128)
 
     model_cfg = ModelConfig(backbone_type="hf_deberta_v2", from_scratch=True)
     disc_cfg, gen_cfg = build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_Tokenizer(),
+        tokenizer=tokenizer,
         max_position_embeddings=128,
     )
 
@@ -4278,25 +6276,19 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
         "deberta.modeling.builder.DebertaRoPEConfig.from_pretrained",
         lambda _src: checkpoint_cfg,
     )
-
-    class _Tokenizer:
-        pad_token_id = 0
-        cls_token_id = 1
-        sep_token_id = 2
-        mask_token_id = 3
-
-        def __len__(self) -> int:
-            return 32000
+    tokenizer = DummyTokenizer(vocab_size=32000)
 
     model_cfg = ModelConfig(
         backbone_type="rope",
         from_scratch=False,
-        discriminator_model_name_or_path="local-rope-disc",
+        pretrained_discriminator_path="local-rope-disc",
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
     )
 
     disc_cfg, _ = build_backbone_configs(
         model_cfg=model_cfg,
-        tokenizer=_Tokenizer(),
+        tokenizer=tokenizer,
         max_position_embeddings=512,
     )
 
@@ -4330,6 +6322,45 @@ def test_readme_cli_examples_are_parseable():
 
     for cmd in examples:
         parser.parse_args(shlex.split(cmd))
+
+
+def test_export_help_does_not_show_misleading_defaults_on_no_flags() -> None:
+    parser = argparse.ArgumentParser(
+        prog="deberta export",
+        formatter_class=ExportArgumentDefaultsHelpFormatter,
+    )
+    add_export_arguments(parser)
+    help_text = parser.format_help()
+    assert "--safe-serialization" in help_text and "(default: True)" in help_text
+    for opt in ("--no-safe-serialization", "--no-offload-to-cpu", "--no-rank0-only"):
+        line = next((ln for ln in help_text.splitlines() if opt in ln), "")
+        assert "(default:" not in line
+
+
+def test_docs_use_current_nested_key_paths() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    docs = [
+        repo_root / "docs" / "advanced" / "torch-compile.md",
+        repo_root / "docs" / "advanced" / "distributed-training.md",
+        repo_root / "docs" / "guides" / "data-pipeline.md",
+    ]
+    merged = "\n".join(path.read_text(encoding="utf-8") for path in docs)
+
+    stale_tokens = (
+        "train.torch_compile",
+        "train.torch_compile_mode",
+        "train.torch_compile_scope",
+        "train.torch_compile_backend",
+        "train.report_to",
+        "train.resume_data_strategy",
+        "train.resume_replay_max_micro_batches",
+        "data.block_cross_document_attention",
+        "train.mlm_max_ngram",
+        "train.mask_token_prob",
+        "train.random_token_prob",
+    )
+    for token in stale_tokens:
+        assert token not in merged
 
 
 # ---------------------------------------------------------------------------
@@ -4420,10 +6451,24 @@ def test_validate_model_config_inert_param_warnings(cfg_kwargs, expect_warn):
     ],
 )
 def test_validate_train_config_inert_param_warnings(cfg_kwargs, expect_warn):
-    cfg = TrainConfig(**cfg_kwargs)
+    train_keys = {
+        "torch_compile",
+        "torch_compile_scope",
+        "torch_compile_mode",
+        "torch_compile_backend",
+    }
+    logging_keys = {"report_to", "wandb_watch", "wandb_watch_log_freq"}
+
+    train_kwargs = {k: v for k, v in cfg_kwargs.items() if k in train_keys}
+    logging_kwargs = {k: v for k, v in cfg_kwargs.items() if k in logging_keys}
+
+    train_cfg = TrainConfig(**train_kwargs)
+    logging_cfg = LoggingConfig(**logging_kwargs) if logging_kwargs else None
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        validate_train_config(cfg)
+        validate_train_config(train_cfg)
+        if logging_cfg is not None:
+            validate_logging_config(logging_cfg)
     user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
     if expect_warn:
         assert len(user_warnings) >= 1, f"Expected warning for {cfg_kwargs}, got none"

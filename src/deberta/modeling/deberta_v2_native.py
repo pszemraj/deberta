@@ -59,18 +59,24 @@ def _make_log_bucket_position(
     :return torch.Tensor: Bucketized relative-position ids.
     """
 
-    sign = torch.sign(relative_pos)
+    # Match original DeBERTa behavior: clamp representable distances before
+    # bucketing so extreme relative offsets saturate instead of drifting.
+    rel = relative_pos
+    if int(max_position) > 0:
+        rel = rel.clamp(min=-int(max_position) + 1, max=int(max_position) - 1)
+
+    sign = torch.sign(rel)
     mid = int(bucket_size // 2)
     if mid <= 1:
-        return relative_pos
+        return rel
 
-    abs_pos = relative_pos.abs().clamp_min(1)
+    abs_pos = rel.abs().clamp_min(1)
     near = abs_pos < mid
 
     # Match HF semantics while avoiding scripted helper branches in forward.
     log_base = math.log(max(float(max_position - 1), float(mid + 1)) / float(mid))
     if log_base <= 0.0:
-        return relative_pos
+        return rel
 
     log_pos = torch.ceil(torch.log(abs_pos.float() / float(mid)) / log_base * float(mid - 1)) + float(mid)
     bucket = torch.where(near, abs_pos.to(log_pos.dtype), log_pos)
@@ -201,11 +207,11 @@ class DisentangledSelfAttention(nn.Module):
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
 
         if self.relative_attention and (not self.share_att_key):
-            if "c2p" in self.pos_att_type:
+            if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
                 self.pos_key_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_key_proj = None
-            if "p2c" in self.pos_att_type:
+            if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
                 self.pos_query_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_query_proj = None
@@ -289,6 +295,57 @@ class DisentangledSelfAttention(nn.Module):
         projected = projected.view(2 * att_span, self.num_attention_heads, self.attention_head_size)
         return projected.permute(1, 0, 2).contiguous()
 
+    def _p2p_bias(
+        self,
+        *,
+        rel_pos: torch.Tensor,
+        pos_query_layer: torch.Tensor,
+        pos_key_layer: torch.Tensor,
+        bsz: int,
+        nheads: int,
+        query_len: int,
+        key_len: int,
+        att_span: int,
+        scale_factor: int,
+    ) -> torch.Tensor:
+        """Compute position-to-position (p2p) bias.
+
+        :param torch.Tensor rel_pos: Relative ids with shape ``(Q,K)``.
+        :param torch.Tensor pos_query_layer: Relative query projections ``(H,2A,D)``.
+        :param torch.Tensor pos_key_layer: Relative key projections ``(H,2A,D)``.
+        :param int bsz: Batch size.
+        :param int nheads: Number of attention heads.
+        :param int query_len: Query length.
+        :param int key_len: Key length.
+        :param int att_span: Relative-attention span ``A``.
+        :param int scale_factor: Attention scale factor.
+        :return torch.Tensor: p2p bias tensor with shape ``(B,H,Q,K)``.
+        """
+
+        # Mirror reference behavior: use positive-half relative query table.
+        pos_query = pos_query_layer[:, att_span:, :]  # (H, A, D)
+        if pos_query.shape[1] == 0:
+            return torch.zeros(
+                (bsz, nheads, query_len, key_len),
+                device=rel_pos.device,
+                dtype=pos_query_layer.dtype,
+            )
+
+        # (H, A, 2A)
+        p2p_table = torch.einsum("hqd,hkd->hqk", pos_query, pos_key_layer)
+
+        # Map runtime query positions to available p2p rows.
+        q_index = torch.arange(query_len, device=rel_pos.device, dtype=torch.long)
+        q_index = q_index.clamp(max=int(p2p_table.shape[1]) - 1)
+        p2p_query = p2p_table.index_select(1, q_index)  # (H, Q, 2A)
+
+        p2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)  # (Q, K)
+        p2p_idx = p2p_idx.unsqueeze(0).expand(nheads, query_len, key_len)
+        p2p_bias = p2p_query.gather(-1, p2p_idx)  # (H, Q, K)
+        p2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
+        p2p_bias = p2p_bias / p2p_scale
+        return p2p_bias.unsqueeze(0).expand(bsz, nheads, query_len, key_len)
+
     def _disentangled_attention_bias_dynamic(
         self,
         query_layer: torch.Tensor,
@@ -320,9 +377,18 @@ class DisentangledSelfAttention(nn.Module):
         rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
 
         score: torch.Tensor | None = None
+        pos_key_layer: torch.Tensor | None = None
+        pos_query_layer: torch.Tensor | None = None
+
+        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            # Keep dynamic path on the same explicit dtype contract as cached_bmm/stable.
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
+        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
 
         if "c2p" in self.pos_att_type:
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)
+            if pos_key_layer is None:
+                raise RuntimeError("p2p/c2p path requires pos_key projection.")
             c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
             c2p_att = torch.einsum("bhqd,hkd->bhqk", query_layer, pos_key_layer)
 
@@ -332,7 +398,8 @@ class DisentangledSelfAttention(nn.Module):
             score = c2p_bias if score is None else score + c2p_bias
 
         if "p2c" in self.pos_att_type:
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)
+            if pos_query_layer is None:
+                raise RuntimeError("p2p/p2c path requires pos_query projection.")
             p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
             p2c_att = torch.einsum("bhkd,hqd->bhkq", key_layer, pos_query_layer)
 
@@ -341,6 +408,22 @@ class DisentangledSelfAttention(nn.Module):
             p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
             p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
             score = p2c_bias if score is None else score + p2c_bias
+
+        if "p2p" in self.pos_att_type:
+            if pos_key_layer is None or pos_query_layer is None:
+                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
+            p2p_bias = self._p2p_bias(
+                rel_pos=rel_pos,
+                pos_query_layer=pos_query_layer,
+                pos_key_layer=pos_key_layer,
+                bsz=bsz,
+                nheads=nheads,
+                query_len=query_len,
+                key_len=key_len,
+                att_span=att_span,
+                scale_factor=scale_factor,
+            )
+            score = p2p_bias if score is None else score + p2p_bias
 
         if score is None:
             score = torch.zeros(
@@ -366,6 +449,8 @@ class DisentangledSelfAttention(nn.Module):
         :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
         """
 
+        # Intentionally avoid cross-call score caching here: c2p/p2c terms depend
+        # on runtime query/key activations and must be recomputed every forward.
         bsz, nheads, query_len, _ = query_layer.shape
         _, _, key_len, _ = key_layer.shape
         rel_pos = self._normalize_relative_pos(
@@ -378,9 +463,19 @@ class DisentangledSelfAttention(nn.Module):
         att_span = int(self.pos_ebd_size)
         rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
         score: torch.Tensor | None = None
+        pos_key_layer: torch.Tensor | None = None
+        pos_query_layer: torch.Tensor | None = None
+
+        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            # Keep relative-bias kernels on the same dtype contract as the caller's
+            # query/key score path (fp32 in stabilized attention forward).
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
+        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
 
         if "c2p" in self.pos_att_type:
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)  # (H,2A,D)
+            if pos_key_layer is None:
+                raise RuntimeError("p2p/c2p path requires pos_key projection.")
             c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
 
             q_flat = query_layer.permute(1, 0, 2, 3).reshape(
@@ -396,7 +491,8 @@ class DisentangledSelfAttention(nn.Module):
             score = c2p_bias if score is None else score + c2p_bias
 
         if "p2c" in self.pos_att_type:
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)  # (H,2A,D)
+            if pos_query_layer is None:
+                raise RuntimeError("p2p/p2c path requires pos_query projection.")
             p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
 
             k_flat = key_layer.permute(1, 0, 2, 3).reshape(nheads, bsz * key_len, self.attention_head_size)
@@ -408,6 +504,22 @@ class DisentangledSelfAttention(nn.Module):
             p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
             p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
             score = p2c_bias if score is None else score + p2c_bias
+
+        if "p2p" in self.pos_att_type:
+            if pos_key_layer is None or pos_query_layer is None:
+                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
+            p2p_bias = self._p2p_bias(
+                rel_pos=rel_pos,
+                pos_query_layer=pos_query_layer,
+                pos_key_layer=pos_key_layer,
+                bsz=bsz,
+                nheads=nheads,
+                query_len=query_len,
+                key_len=key_len,
+                att_span=att_span,
+                scale_factor=scale_factor,
+            )
+            score = p2p_bias if score is None else score + p2p_bias
 
         if score is None:
             score = torch.zeros(
@@ -482,12 +594,13 @@ class DisentangledSelfAttention(nn.Module):
             scale_factor += 1
         if "p2c" in self.pos_att_type:
             scale_factor += 1
+        if "p2p" in self.pos_att_type:
+            scale_factor += 1
 
         scale = math.sqrt(float(self.attention_head_size * scale_factor))
         # Keep score-path numerics in fp32 under compile for improved stability.
         query_layer_f = query_layer.float()
         key_layer_f = key_layer.float()
-        value_layer_f = value_layer.float()
         attention_scores = torch.matmul(query_layer_f, key_layer_f.transpose(-1, -2)) / scale
 
         if self.relative_attention and rel_embeddings is not None:
@@ -507,14 +620,16 @@ class DisentangledSelfAttention(nn.Module):
                 raise ValueError(
                     f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
                 )
-            attention_scores = attention_scores.masked_fill(~keep_mask, -1e4)
+            mask_fill_value = torch.finfo(attention_scores.dtype).min
+            attention_scores = attention_scores.masked_fill(~keep_mask, mask_fill_value)
             # For broadcast padding masks (B,1,1,S), query activity equals key activity —
-            # transpose the key dim to get per-query (B,1,S,1).  For pairwise masks
-            # (B,1,S,S), reduce across keys as before.
+            # transpose the key dim to get per-query (B,1,S,1). For pairwise masks
+            # (B,1,S,S), query activity is encoded on the diagonal (inactive queries
+            # may still keep a CLS fallback edge to avoid all-False rows).
             if keep_mask.shape[-2] == 1:
                 live_queries = keep_mask.transpose(-2, -1)  # (B,1,S,1)
             else:
-                live_queries = keep_mask.any(dim=-1, keepdim=True)  # (B,1,S,1)
+                live_queries = torch.diagonal(keep_mask, dim1=-2, dim2=-1).unsqueeze(-1)  # (B,1,S,1)
             attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
         probs = torch.softmax(attention_scores, dim=-1)
@@ -523,7 +638,10 @@ class DisentangledSelfAttention(nn.Module):
         if attention_mask is not None:
             probs = probs * live_queries.to(dtype=probs.dtype)
 
-        context_layer = torch.matmul(probs, value_layer_f)
+        # Keep value/context path at model dtype to avoid unnecessary fp32 activation
+        # expansion; only score-path numerics require fp32 stabilization.
+        probs = probs.to(dtype=value_layer.dtype)
+        context_layer = torch.matmul(probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         bsz, seq_len, _, _ = context_layer.shape
         context_layer = context_layer.view(bsz, seq_len, self.all_head_size).to(dtype=model_dtype)
@@ -760,11 +878,15 @@ class DebertaV2Embeddings(nn.Module):
             padding_idx=pad_token_id,
         )
 
+        # NOTE: DeBERTa-v2/v3 often set position_biased_input=False (no learned absolute
+        # positions added to the input). The original Microsoft implementation STILL
+        # instantiates position_embeddings because they are consumed by the Enhanced
+        # Mask Decoder (EMD) during RTD pretraining.
+        #
+        # We therefore ALWAYS create position_embeddings, but only ADD them in forward
+        # when position_biased_input=True.
         self.position_biased_input = bool(getattr(config, "position_biased_input", True))
-        if self.position_biased_input:
-            self.position_embeddings = nn.Embedding(int(config.max_position_embeddings), self.embedding_size)
-        else:
-            self.position_embeddings = None
+        self.position_embeddings = nn.Embedding(int(config.max_position_embeddings), self.embedding_size)
 
         if int(config.type_vocab_size) > 0:
             self.token_type_embeddings = nn.Embedding(int(config.type_vocab_size), self.embedding_size)
@@ -1152,7 +1274,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         super().__init__(config)
         self.embeddings = DebertaV2Embeddings(config)
         self.encoder = DebertaV2Encoder(config)
-        self.z_steps = 0
+        self.z_steps = int(getattr(config, "z_steps", 0))
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
@@ -1253,27 +1375,55 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             inputs_embeds=inputs_embeds,
         )
 
+        need_hidden_states_for_z = int(self.z_steps) > 1
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=(output_hidden_states or need_hidden_states_for_z),
             output_attentions=output_attentions,
             return_dict=True,
         )
 
         sequence_output = encoder_outputs.last_hidden_state
+        hidden_states = encoder_outputs.hidden_states
+
+        if int(self.z_steps) > 1:
+            if hidden_states is None or len(hidden_states) < 2:
+                raise RuntimeError("z_steps>1 requires encoder hidden states.")
+            z_base_states = hidden_states[-2]
+            z_query_states = hidden_states[-1]
+            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            attn_mask = (
+                self.encoder.get_attention_mask(attention_mask) if attention_mask is not None else None
+            )
+            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            z_extras: list[torch.Tensor] = []
+            for layer in layers[1:]:
+                z_query_states, _ = layer(
+                    z_base_states,
+                    attn_mask,
+                    output_attentions=False,
+                    query_states=z_query_states,
+                    relative_pos=rel_pos,
+                    rel_embeddings=rel_embeddings,
+                )
+                z_extras.append(z_query_states)
+            sequence_output = z_query_states
+            if output_hidden_states and z_extras:
+                hidden_states = tuple(hidden_states) + tuple(z_extras)
 
         if not return_dict:
             out: list[torch.Tensor | tuple[torch.Tensor, ...] | None] = [sequence_output]
             if output_hidden_states:
-                out.append(encoder_outputs.hidden_states)
+                out.append(hidden_states)
             if output_attentions:
                 out.append(encoder_outputs.attentions)
             return tuple(x for x in out if x is not None)
 
         return BaseModelOutput(
             last_hidden_state=sequence_output,
-            hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
+            hidden_states=hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions if output_attentions else None,
         )
 
