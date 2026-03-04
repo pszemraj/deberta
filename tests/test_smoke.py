@@ -395,7 +395,9 @@ def test_ngram_masking_does_not_split_selected_word_groups():
     )
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.4, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
+        # S=4 and p=0.2 -> num_to_predict=1 token budget. Whole-word masking must
+        # still mask the full two-piece word group (allowing bounded overshoot).
+        cfg=MLMConfig(mlm_probability=0.2, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
     )
     input_ids = torch.tensor([[tok.cls_token_id, 10, 11, tok.sep_token_id]], dtype=torch.long)
     special = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
@@ -1299,6 +1301,54 @@ def test_rtd_head_applies_cls_conditioning_before_dense_projection():
     assert dense_spy.seen is not None
     torch.testing.assert_close(norm_spy.seen, expected_norm_input)
     torch.testing.assert_close(dense_spy.seen, expected_norm_input)
+    assert logits.shape == (2, 3)
+
+
+def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import RTDHead
+
+    class _Spy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: torch.Tensor | None = None
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.seen = x.detach().clone()
+            return x
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+    )
+    head = RTDHead(cfg)
+
+    norm_spy = _Spy()
+    dense_spy = _Spy()
+    head.norm = norm_spy
+    head.dense = dense_spy
+    head.act = torch.nn.Identity()
+    head.classifier = torch.nn.Linear(cfg.hidden_size, 1, bias=False)
+    with torch.no_grad():
+        head.classifier.weight.fill_(1.0)
+
+    hidden = torch.arange(0, 2 * 3 * cfg.hidden_size, dtype=torch.float32).view(2, 3, cfg.hidden_size)
+    pairwise_mask = torch.ones((2, 3, 3), dtype=torch.bool)
+    logits = head(hidden, attention_mask=pairwise_mask)
+
+    assert norm_spy.seen is not None
+    assert dense_spy.seen is not None
+    torch.testing.assert_close(norm_spy.seen, hidden)
+    torch.testing.assert_close(dense_spy.seen, hidden)
     assert logits.shape == (2, 3)
 
 

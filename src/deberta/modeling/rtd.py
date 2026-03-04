@@ -579,15 +579,44 @@ class RTDHead(nn.Module):
 
         self.classifier = nn.Linear(hidden_size, 1)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _use_global_cls_context(attention_mask: torch.Tensor | None) -> bool:
+        """Return whether global CLS conditioning is safe for this attention mask.
+
+        Pairwise masks with an explicit query axis encode per-query visibility
+        (for example packed doc-block masks). In that regime, adding one global
+        CLS vector to all tokens would reintroduce cross-segment information flow.
+
+        :param torch.Tensor | None attention_mask: Optional attention keep mask.
+        :return bool: ``True`` when global CLS conditioning should be applied.
+        """
+        if attention_mask is None:
+            return True
+
+        mask = attention_mask
+        if mask.ndim == 4:
+            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
+        if mask.ndim == 3 and mask.shape[-2] != 1:
+            return False
+        return True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute per-token replacement logits.
 
         :param torch.Tensor hidden_states: Discriminator hidden states ``(B,S,H)``.
+        :param torch.Tensor | None attention_mask: Optional discriminator attention mask.
         :return torch.Tensor: Per-token logits ``(B,S)``.
         """
         # hidden_states: (B,S,H)
-        ctx = hidden_states[:, 0:1, :]  # (B,1,H)
-        x = self.norm(hidden_states + ctx)
+        if self._use_global_cls_context(attention_mask):
+            ctx = hidden_states[:, 0:1, :]  # (B,1,H)
+            x = self.norm(hidden_states + ctx)
+        else:
+            x = self.norm(hidden_states)
         x = self.dense(x)
         x = self.act(x)
         return self.classifier(x).squeeze(-1)  # (B,S)
@@ -1086,7 +1115,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             return_dict=True,
         )
         disc_hidden = disc_out.last_hidden_state
-        disc_logits = self.discriminator_head(disc_hidden)
+        disc_logits = self.discriminator_head(disc_hidden, attention_mask=attention_mask)
 
         pad_token_id = getattr(self.disc_config, "pad_token_id", None)
         active = attention_mask_to_active_tokens(

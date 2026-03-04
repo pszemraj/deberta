@@ -715,17 +715,35 @@ class DebertaV3ElectraCollator:
                     mask_grams[i] = True
 
             selected_positions: list[int] = []
-            remaining = int(num_to_predict)
+            budget = int(num_to_predict)
+            max_budget = int(max_preds_per_seq)
+            used = 0
             for do_mask, group in zip(mask_grams, groups, strict=True):
                 if not do_mask:
                     continue
-                if remaining <= 0:
+                g_len = len(group)
+                if g_len <= 0:
+                    continue
+                # Keep whole-word integrity: never partially mask one word group.
+                if used + g_len > max_budget:
                     break
-                take = min(len(group), remaining)
-                if take > 0:
-                    selected_positions.extend(group[:take])
-                    remaining -= take
+                if used + g_len > budget and used > 0:
+                    continue
+                selected_positions.extend(group)
+                used += g_len
+                if used >= budget:
+                    break
 
+            if not selected_positions:
+                candidates = [
+                    group
+                    for do_mask, group in zip(mask_grams, groups, strict=True)
+                    if do_mask and 0 < len(group) <= max_budget
+                ]
+                if not candidates:
+                    candidates = [group for group in groups if 0 < len(group) <= max_budget]
+                if candidates:
+                    selected_positions.extend(candidates[0])
             if not selected_positions:
                 continue
 
