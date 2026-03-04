@@ -279,6 +279,5 @@ def merge_embeddings_into_export_backbone(
         if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
             emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
 
-    merge_attr("word_embeddings")
-    merge_attr("position_embeddings")
-    merge_attr("token_type_embeddings")
+    for attr in ("word_embeddings", "position_embeddings", "token_type_embeddings"):
+        merge_attr(attr)

@@ -145,11 +145,11 @@ def _upload_wandb_original_config(
 
     owner = wandb_run
     if owner is None:
-        with suppress(Exception):
-            owner = accelerator.get_tracker("wandb", unwrap=True)
-    if owner is None:
-        with suppress(Exception):
-            owner = accelerator.get_tracker("wandb", unwrap=False)
+        for unwrap in (True, False):
+            with suppress(Exception):
+                owner = accelerator.get_tracker("wandb", unwrap=unwrap)
+            if owner is not None:
+                break
     if owner is None:
         return False
 
@@ -207,27 +207,26 @@ def _upload_wandb_original_config(
         "config_original_snapshot": str(config_original_path),
         "config_resolved_snapshot": str(config_resolved_path) if config_resolved_path is not None else None,
     }
-    save_fn = getattr(run_owner, "save", None)
-    if callable(save_fn):
-        uploaded_any = False
-        for src in deduped_upload_files:
-            _wandb_save_with_fallback(save_fn, src)
-            uploaded_any = True
-            logger.info("Uploaded config snapshot to W&B as run file: %s", src)
-        if uploaded_any:
-            return True
-
+    save_fallback: Any | None = None
     with suppress(Exception):
         import wandb  # type: ignore
 
         if wandb.run is not None and callable(getattr(wandb, "save", None)):
-            uploaded_any = False
-            for src in deduped_upload_files:
-                _wandb_save_with_fallback(wandb.save, src)
-                uploaded_any = True
-                logger.info("Uploaded config snapshot via wandb.save: %s", src)
-            if uploaded_any:
-                return True
+            save_fallback = wandb.save
+
+    for save_fn, log_template in (
+        (getattr(run_owner, "save", None), "Uploaded config snapshot to W&B as run file: %s"),
+        (save_fallback, "Uploaded config snapshot via wandb.save: %s"),
+    ):
+        if not callable(save_fn):
+            continue
+        uploaded_any = False
+        for src in deduped_upload_files:
+            _wandb_save_with_fallback(save_fn, src)
+            uploaded_any = True
+            logger.info(log_template, src)
+        if uploaded_any:
+            return True
 
     log_artifact_fn = getattr(run_owner, "log_artifact", None)
     if callable(log_artifact_fn):
