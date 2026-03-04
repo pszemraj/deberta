@@ -36,13 +36,6 @@ python tools/generate_api_docs.py
 
 This writes static Markdown files to `docs/api/` directly from public package docstrings.
 
-## Optional docs site preview
-
-```bash
-pip install -e '.[docs]'
-mkdocs serve
-```
-
 ## Verify CLI
 
 ```bash

@@ -49,9 +49,6 @@ tensorboard = ["tensorboard>=2.16.0"]
 # Dev quality-of-life
 dev = ["ruff>=0.6.0", "black>=24.8.0", "mypy>=1.11.0", "pytest>=8.0.0"]
 
-# Docs
-docs = ["mkdocs<2", "mkdocs-material>=9.6.0"]
-
 [project.scripts]
 # Unified subcommand-style CLI entrypoint
 "deberta" = "deberta.cli:main"

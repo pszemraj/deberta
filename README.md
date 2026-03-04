@@ -66,13 +66,6 @@ Regenerate API markdown from docstrings:
 python tools/generate_api_docs.py
 ```
 
-Optional local docs site preview:
-
-```bash
-pip install -e '.[docs]'
-mkdocs serve
-```
-
 ## Configs
 
 - parity: [`configs/pretrain_hf_deberta_v2_parity_base.yaml`](configs/pretrain_hf_deberta_v2_parity_base.yaml), [`configs/pretrain_hf_deberta_v2_parity_small.yaml`](configs/pretrain_hf_deberta_v2_parity_small.yaml)
