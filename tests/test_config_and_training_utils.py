@@ -54,6 +54,7 @@ from deberta.config import (
     load_data_config_snapshot,
     load_model_config_snapshot,
     normalize_mixed_precision,
+    resolve_effective_mixed_precision,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
@@ -92,7 +93,6 @@ from deberta.training.pretrain import (
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _resolve_data_resume_policy,
-    _resolve_effective_mixed_precision_or_raise,
     _resolve_window_token_denominators,
     _scale_loss_for_backward,
     _should_clip_gradients,
@@ -4494,16 +4494,19 @@ def test_normalize_mixed_precision_accepts_bool_and_synonyms():
         normalize_mixed_precision("fp16")
 
 
-def test_resolve_effective_mixed_precision_or_raise_errors_for_bf16_preflight_failure(
+def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import deberta.training.pretrain as pretrain_mod
 
     monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: False)
     with pytest.raises(RuntimeError, match="mixed_precision=no explicitly"):
-        _resolve_effective_mixed_precision_or_raise("bf16")
+        resolve_effective_mixed_precision("bf16", bf16_sanity_check=pretrain_mod._bf16_runtime_sanity_check)
 
-    assert _resolve_effective_mixed_precision_or_raise("no") == "no"
+    assert (
+        resolve_effective_mixed_precision("no", bf16_sanity_check=pretrain_mod._bf16_runtime_sanity_check)
+        == "no"
+    )
 
 
 def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(

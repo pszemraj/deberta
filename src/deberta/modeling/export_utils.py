@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import torch
+
+from deberta.io_utils import dump_json, load_json_mapping
 
 EXPORT_CONFIG_STRIP_KEYS = frozenset(
     {
@@ -32,16 +33,14 @@ def clean_exported_config(config_path: Path, *, strict: bool) -> None:
     if not config_path.exists():
         return
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError(f"Expected JSON object at {config_path}, got {type(raw).__name__}.")
+        raw = load_json_mapping(config_path)
     except Exception as exc:
         if strict:
             raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from exc
         return
 
     cleaned = {k: v for k, v in raw.items() if k not in EXPORT_CONFIG_STRIP_KEYS}
-    config_path.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
+    dump_json(cleaned, config_path)
 
 
 def write_export_readme_and_license(

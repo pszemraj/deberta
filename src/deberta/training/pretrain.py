@@ -35,7 +35,7 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     _sync_legacy_train_aliases,
     apply_profile_defaults,
-    normalize_mixed_precision,
+    resolve_effective_mixed_precision,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
@@ -268,7 +268,6 @@ def _build_runtime_resolved_tracker_config(
     disc_cfg_map = _config_obj_to_mapping(disc_config)
     gen_cfg_map = _config_obj_to_mapping(gen_config)
 
-    # Populate commonly inferred model fields for easier reproducibility diffs.
     generator_payload = dict(model_payload.get("generator", {}) or {})
     if generator_payload.get("num_hidden_layers") is None and "num_hidden_layers" in gen_cfg_map:
         generator_payload["num_hidden_layers"] = int(gen_cfg_map["num_hidden_layers"])
@@ -315,7 +314,6 @@ def _maybe_enable_tf32(enabled: bool, *, force_legacy: bool = False) -> None:
     :param bool force_legacy: Whether to force legacy ``allow_tf32`` flags.
     """
     del force_legacy
-    # Use legacy flags consistently to avoid mixing legacy/new TF32 APIs in-process.
     torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
     torch.backends.cudnn.allow_tf32 = bool(enabled)
 
@@ -391,22 +389,6 @@ def _bf16_runtime_sanity_check() -> bool:
     except Exception:
         logger.error("bf16 autocast preflight failed.", exc_info=True)
         return False
-
-
-def _resolve_effective_mixed_precision_or_raise(requested: str) -> str:
-    """Normalize mixed precision and fail fast when bf16 is unavailable.
-
-    :param str requested: User-requested mixed precision mode.
-    :raises RuntimeError: If bf16 is requested but runtime preflight fails.
-    :return str: Effective mixed precision mode.
-    """
-    mixed_precision = normalize_mixed_precision(requested)
-    if mixed_precision == "bf16" and not _bf16_runtime_sanity_check():
-        raise RuntimeError(
-            "train.mixed_precision=bf16 requested but bf16 preflight failed. "
-            "Set train.mixed_precision=no explicitly if you want to continue in full precision."
-        )
-    return mixed_precision
 
 
 def _resolve_compile_enabled_or_raise(requested: bool) -> bool:
@@ -655,9 +637,6 @@ def _sync_discriminator_embeddings_if_available(
     if not callable(fn):
         return
 
-    # Avoid paying FSDP unshard/sync overhead when embedding sync is a no-op.
-    # Keep compatibility for external models that expose the hook but not the
-    # repo-specific GDES attributes.
     embedding_sharing = getattr(target_model, "embedding_sharing", None)
     if embedding_sharing is not None:
         if str(embedding_sharing).strip().lower() != "gdes":
@@ -770,8 +749,6 @@ def _should_force_legacy_tf32_for_compile(*, torch_compile: bool, compile_mode: 
     """
     if not torch_compile:
         return False
-    # On some PyTorch builds, max-autotune paths still query legacy allow_tf32
-    # and can error if only the new fp32_precision API has been configured.
     return compile_mode.startswith("max-autotune")
 
 
@@ -798,8 +775,6 @@ def _resolve_compile_scope(
     del compile_mode
     del compile_backend
     backbone_type = str(getattr(model_cfg, "backbone_type", "")).strip().lower()
-    # Doc-blocking batches alternate between None and 3D masks (single-doc vs multi-doc),
-    # causing mask shape churn under compile. Downgrade to FFN-only to avoid recompilation.
     if bool(block_cross_document_attention) and backbone_type == "rope":
         return (
             "ffn",
@@ -1376,6 +1351,120 @@ def _normalize_resume_consumed_micro_batches(
     return int(consumed), None
 
 
+def _collect_ga_window(
+    *,
+    train_iter: Iterator[dict[str, torch.Tensor]],
+    ga_steps: int,
+    token_weighted_ga: bool,
+    disc_pad_token_id: int | None,
+    include_has_gen_targets: bool,
+    default_unweighted_token_count: float,
+) -> tuple[list[Any], int, float, float, float]:
+    """Collect one accumulation window and per-window token counts.
+
+    :param Iterator[dict[str, torch.Tensor]] train_iter: Batch iterator.
+    :param int ga_steps: Accumulation steps per window.
+    :param bool token_weighted_ga: Token-weighted GA toggle.
+    :param int | None disc_pad_token_id: Optional discriminator pad token id.
+    :param bool include_has_gen_targets: Whether to append per-batch generator-target flags.
+    :param float default_unweighted_token_count: Fallback token count when token weighting is disabled.
+    :return tuple[list[Any], int, float, float, float]: Window payload and local token counters.
+    """
+    window: list[Any] = []
+    consumed_in_window = 0
+    local_window_input_tokens = 0.0
+    local_gen_tokens = 0.0
+    local_disc_tokens = 0.0
+
+    for _ in range(max(1, int(ga_steps))):
+        batch = next(train_iter)
+        consumed_in_window += 1
+        local_window_input_tokens += _count_input_tokens_for_batch(batch)
+
+        if token_weighted_ga:
+            gen_count, disc_count = _count_rtd_tokens_for_batch(
+                batch,
+                pad_token_id=disc_pad_token_id,
+            )
+            local_gen_tokens += gen_count
+            local_disc_tokens += disc_count
+        else:
+            gen_count = float(default_unweighted_token_count)
+            disc_count = float(default_unweighted_token_count)
+
+        if include_has_gen_targets:
+            has_gen_targets = bool(batch["labels"].ne(-100).any().item())
+            window.append((batch, gen_count, disc_count, has_gen_targets))
+        else:
+            window.append((batch, gen_count, disc_count))
+
+    return (
+        window,
+        int(consumed_in_window),
+        float(local_window_input_tokens),
+        float(local_gen_tokens),
+        float(local_disc_tokens),
+    )
+
+
+def _resolve_window_token_weights(
+    *,
+    accelerator: Any,
+    token_weighted_ga: bool,
+    local_gen_tokens: float,
+    local_disc_tokens: float,
+    next_step: int,
+) -> tuple[float, float, bool, bool]:
+    """Resolve per-window token denominators and zero-token flags.
+
+    :param Any accelerator: Accelerator runtime.
+    :param bool token_weighted_ga: Token-weighted GA toggle.
+    :param float local_gen_tokens: Local generator-token count for the window.
+    :param float local_disc_tokens: Local discriminator-token count for the window.
+    :param int next_step: Step number used in zero-token warnings.
+    :return tuple[float, float, bool, bool]: Generator/discriminator denominators and zero-token flags.
+    """
+    if not token_weighted_ga:
+        return 1.0, 1.0, False, False
+
+    local_totals = torch.tensor(
+        [local_gen_tokens, local_disc_tokens],
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
+    mean_totals = accelerator.reduce(local_totals, reduction="mean")
+    raw_gen_window_tokens_per_rank = float(mean_totals[0].item())
+    raw_disc_window_tokens_per_rank = float(mean_totals[1].item())
+    (
+        gen_window_tokens_per_rank,
+        disc_window_tokens_per_rank,
+        gen_window_zero_tokens,
+        disc_window_zero_tokens,
+    ) = _resolve_window_token_denominators(
+        gen_window_tokens_per_rank_raw=raw_gen_window_tokens_per_rank,
+        disc_window_tokens_per_rank_raw=raw_disc_window_tokens_per_rank,
+    )
+    if bool(getattr(accelerator, "is_main_process", False)) and (
+        gen_window_zero_tokens or disc_window_zero_tokens
+    ):
+        logger.warning(
+            "Token-weighted GA window has zero effective tokens "
+            "(next_step=%d, gen_zero=%s, disc_zero=%s, gen_raw=%.1f, disc_raw=%.1f); "
+            "corresponding loss term is zero-weighted for this window.",
+            int(next_step),
+            bool(gen_window_zero_tokens),
+            bool(disc_window_zero_tokens),
+            float(raw_gen_window_tokens_per_rank),
+            float(raw_disc_window_tokens_per_rank),
+        )
+    return (
+        float(gen_window_tokens_per_rank),
+        float(disc_window_tokens_per_rank),
+        bool(gen_window_zero_tokens),
+        bool(disc_window_zero_tokens),
+    )
+
+
 def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     """Move all batch tensors onto a device.
 
@@ -1657,6 +1746,50 @@ def _build_train_dataset_and_collator(
     return train_dataset, collator
 
 
+def _save_periodic_checkpoint_if_due(
+    *,
+    accelerator: Any,
+    train_cfg: TrainConfig,
+    output_dir: Path,
+    global_step: int,
+    consumed_micro_batches_committed: int,
+    lr_mult: float,
+    optimizer_param_digest: str | dict[str, str],
+    gradient_accumulation_steps: int,
+    last_saved_step: int,
+) -> int:
+    """Persist a periodic checkpoint when ``global_step`` hits ``train.save_steps``.
+
+    :param Any accelerator: Accelerator runtime.
+    :param TrainConfig train_cfg: Training config.
+    :param Path output_dir: Output directory containing checkpoints.
+    :param int global_step: Current global step.
+    :param int consumed_micro_batches_committed: Committed micro-batch progress.
+    :param float lr_mult: Persistent recovery LR multiplier.
+    :param str | dict[str, str] optimizer_param_digest: Trainable-parameter digest payload.
+    :param int gradient_accumulation_steps: Active accumulation steps.
+    :param int last_saved_step: Last checkpoint step already saved.
+    :return int: Updated ``last_saved_step`` value.
+    """
+    if not train_cfg.save_steps or (global_step % int(train_cfg.save_steps) != 0):
+        return int(last_saved_step)
+
+    ckpt_dir = output_dir / f"checkpoint-{int(global_step)}"
+    _save_training_checkpoint(
+        accelerator=accelerator,
+        checkpoint_dir=ckpt_dir,
+        output_dir=output_dir,
+        consumed_micro_batches=consumed_micro_batches_committed,
+        save_total_limit=int(train_cfg.save_total_limit),
+        log_label="periodic",
+        lr_mult=float(lr_mult),
+        optimizer_param_digest=optimizer_param_digest,
+        global_step=int(global_step),
+        gradient_accumulation_steps=int(gradient_accumulation_steps),
+    )
+    return int(global_step)
+
+
 def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
@@ -1722,7 +1855,10 @@ def run_pretraining_dry_run(
         is_main_process=True,
     )
 
-    mixed_precision = _resolve_effective_mixed_precision_or_raise(train_cfg.mixed_precision)
+    mixed_precision = resolve_effective_mixed_precision(
+        train_cfg.mixed_precision,
+        bf16_sanity_check=_bf16_runtime_sanity_check,
+    )
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
@@ -1738,7 +1874,6 @@ def run_pretraining_dry_run(
             block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
         )
 
-    # Validate run snapshot compatibility in resume mode, without writing files.
     _persist_or_validate_run_configs(
         output_dir=checkpoint_output_dir,
         logging_output_dir=logging_output_dir,
@@ -1882,12 +2017,13 @@ def run_pretraining(
         logging_cfg=resolved_logging_cfg,
     )
 
-    # Accelerator first so we know ranks.
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
-    mixed_precision = _resolve_effective_mixed_precision_or_raise(train_cfg.mixed_precision)
+    mixed_precision = resolve_effective_mixed_precision(
+        train_cfg.mixed_precision,
+        bf16_sanity_check=_bf16_runtime_sanity_check,
+    )
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
-    # Keep persisted config/tracker snapshots aligned with the effective runtime mode.
     object.__setattr__(train_cfg, "mixed_precision", mixed_precision)
     accelerator_kwargs: dict[str, Any] = {
         "gradient_accumulation_steps": train_cfg.gradient_accumulation_steps,
@@ -2137,22 +2273,12 @@ def run_pretraining(
     with suppress(Exception):
         _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
-    # torch.compile
-    #
-    # Compiling the *entire* RTD wrapper (generator sampling + corruption + discriminator)
-    # is high-risk: it contains dynamic indexing, RNG sampling, and Python-side caching.
-    # Those patterns are frequent sources of graph breaks, cudagraph partitioning, and
-    # (in some PyTorch builds) silent numerical miscompiles.
-    #
-    # The stable + fast approach is to compile only the heavy transformer backbones.
     if compile_enabled:
         try:
             if compile_scope_reason:
                 logger.warning(compile_scope_reason)
 
             compile_kwargs: dict[str, Any] = {"mode": compile_mode, "backend": compile_backend}
-            # Backbones run with fixed sequence length (packing) and stable shapes.
-            # Prefer static compilation for better perf and fewer guards.
             try:
                 compile_params = inspect.signature(torch.compile).parameters  # type: ignore[attr-defined]
                 if "dynamic" in compile_params:
@@ -2491,6 +2617,135 @@ def run_pretraining(
         zero_gen_window_since_log = 0
         zero_disc_window_since_log = 0
 
+        def _maybe_log_training_metrics(
+            *,
+            lr_scheduler: Any,
+            gen_loss_num: torch.Tensor,
+            gen_token_count_window: torch.Tensor,
+            disc_loss_num: torch.Tensor,
+            disc_acc_num: torch.Tensor,
+            disc_token_count_window: torch.Tensor,
+            disc_positive_count_window: torch.Tensor,
+            loss_override: float | None = None,
+        ) -> None:
+            """Emit per-window metrics when ``logging_steps`` interval is reached.
+
+            :param Any lr_scheduler: Scheduler used for LR reporting.
+            :param torch.Tensor gen_loss_num: Window numerator for generator loss.
+            :param torch.Tensor gen_token_count_window: Window denominator for generator loss.
+            :param torch.Tensor disc_loss_num: Window numerator for discriminator loss.
+            :param torch.Tensor disc_acc_num: Window numerator for discriminator accuracy.
+            :param torch.Tensor disc_token_count_window: Window denominator for discriminator metrics.
+            :param torch.Tensor disc_positive_count_window: Window numerator for discriminator positive fraction.
+            :param float | None loss_override: Optional explicit loss scalar for metrics.
+            :return None: None.
+            """
+            nonlocal local_input_tokens_since_log
+            nonlocal last_log_started_at
+            nonlocal zero_gen_window_since_log
+            nonlocal zero_disc_window_since_log
+            if not train_cfg.logging_steps or (global_step % int(train_cfg.logging_steps) != 0):
+                return
+
+            log_now = time.perf_counter()
+            elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
+            global_input_tokens_interval = _sum_local_scalar(
+                accelerator=accelerator,
+                x=local_input_tokens_since_log,
+            )
+            global_input_tokens_seen = _sum_local_scalar(
+                accelerator=accelerator,
+                x=local_input_tokens_seen,
+            )
+            input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
+            local_input_tokens_since_log = 0.0
+            last_log_started_at = log_now
+
+            lr_raw = _scheduler_current_lr(lr_scheduler)
+            lr = float(lr_raw) if lr_raw is not None else float("nan")
+            weighted_metrics = accelerator.reduce(
+                torch.stack(
+                    [
+                        gen_loss_num,
+                        gen_token_count_window,
+                        disc_loss_num,
+                        disc_acc_num,
+                        disc_token_count_window,
+                        disc_positive_count_window,
+                    ]
+                ),
+                reduction="sum",
+            )
+            global_gen_loss_num = float(weighted_metrics[0].item())
+            global_gen_tokens = float(weighted_metrics[1].item())
+            global_disc_loss_num = float(weighted_metrics[2].item())
+            global_disc_acc_num = float(weighted_metrics[3].item())
+            global_disc_tokens = float(weighted_metrics[4].item())
+            global_disc_positive = float(weighted_metrics[5].item())
+            gen_loss_window = (
+                global_gen_loss_num / global_gen_tokens if global_gen_tokens > 0.0 else float("nan")
+            )
+            disc_loss_window = (
+                global_disc_loss_num / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
+            )
+            disc_acc_window = (
+                global_disc_acc_num / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
+            )
+            disc_pos_frac = (
+                global_disc_positive / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
+            )
+            loss = float(train_cfg.gen_loss_weight) * float(gen_loss_window) + float(
+                train_cfg.disc_loss_weight
+            ) * float(disc_loss_window)
+            if loss_override is not None:
+                loss = float(loss_override)
+
+            zero_metrics = {
+                "zero_gen_window_total": float(zero_gen_window_total),
+                "zero_disc_window_total": float(zero_disc_window_total),
+                "zero_gen_window_since_log": float(zero_gen_window_since_log),
+                "zero_disc_window_since_log": float(zero_disc_window_since_log),
+            }
+            metrics = {
+                "step": int(global_step),
+                "lr": float(lr),
+                "loss": float(loss),
+                "gen_loss": float(gen_loss_window),
+                "disc_loss": float(disc_loss_window),
+                "disc_acc": float(disc_acc_window),
+                "disc_pos_frac": float(disc_pos_frac),
+                "input_tokens_per_sec": float(input_tokens_per_sec),
+                "input_tokens_seen": float(global_input_tokens_seen),
+            }
+            zero_gen_window_since_log = 0
+            zero_disc_window_since_log = 0
+            if accelerator.is_main_process:
+                logger.info(
+                    " | ".join(
+                        [
+                            f"step={int(metrics['step'])}",
+                            f"lr={metrics['lr']:.3e}",
+                            f"loss={metrics['loss']:.4f}",
+                            f"gen={metrics['gen_loss']:.4f}",
+                            f"disc={metrics['disc_loss']:.4f}",
+                            f"acc={metrics['disc_acc']:.4f}",
+                            f"tok/s={metrics['input_tokens_per_sec']:.1f}",
+                            f"tok_seen={metrics['input_tokens_seen']:.0f}",
+                        ]
+                    )
+                )
+            if train_cfg.report_to != "none":
+                _log_tracker_metrics({k: v for k, v in metrics.items() if k != "step"}, step=global_step)
+            if debug_metrics_enabled and accelerator.is_main_process:
+                _append_metrics_jsonl_row(
+                    metrics_path,
+                    {
+                        "step": int(global_step),
+                        "debug_metrics": True,
+                        **zero_metrics,
+                    },
+                )
+
         if effective_decoupled_training:
             if gen_optimizer is None or disc_optimizer is None:
                 raise RuntimeError("Decoupled training requires generator/discriminator optimizers.")
@@ -2498,68 +2753,42 @@ def run_pretraining(
                 raise RuntimeError("Decoupled training requires generator/discriminator schedulers.")
 
             while global_step < int(train_cfg.max_steps):
-                window: list[tuple[dict[str, torch.Tensor], float, float, bool]] = []
-                local_window_input_tokens = 0.0
-                local_gen_tokens = 0.0
-                local_disc_tokens = 0.0
-
-                for _ in range(ga_steps):
-                    batch = next(train_iter)
-                    consumed_micro_batches += 1
-                    local_window_input_tokens += _count_input_tokens_for_batch(batch)
-                    # CPU-side flag used to avoid per-microbatch GPU syncs on gen_token_count.
-                    has_gen_targets = bool(batch["labels"].ne(-100).any().item())
-                    if token_weighted_ga:
-                        gen_count, disc_count = _count_rtd_tokens_for_batch(
-                            batch,
-                            pad_token_id=disc_pad_token_id,
-                        )
-                        local_gen_tokens += gen_count
-                        local_disc_tokens += disc_count
-                    else:
-                        gen_count, disc_count = 1.0, 1.0
-                    window.append((batch, gen_count, disc_count, has_gen_targets))
+                (
+                    window,
+                    consumed_in_window,
+                    local_window_input_tokens,
+                    local_gen_tokens,
+                    local_disc_tokens,
+                ) = _collect_ga_window(
+                    train_iter=train_iter,
+                    ga_steps=ga_steps,
+                    token_weighted_ga=token_weighted_ga,
+                    disc_pad_token_id=disc_pad_token_id,
+                    include_has_gen_targets=True,
+                    default_unweighted_token_count=1.0,
+                )
+                consumed_micro_batches += int(consumed_in_window)
 
                 local_input_tokens_seen += local_window_input_tokens
                 local_input_tokens_since_log += local_window_input_tokens
-                if token_weighted_ga:
-                    local_totals = torch.tensor(
-                        [local_gen_tokens, local_disc_tokens],
-                        device=accelerator.device,
-                        dtype=torch.float32,
-                    )
-                    mean_totals = accelerator.reduce(local_totals, reduction="mean")
-                    raw_gen_window_tokens_per_rank = float(mean_totals[0].item())
-                    raw_disc_window_tokens_per_rank = float(mean_totals[1].item())
-                    (
-                        gen_window_tokens_per_rank,
-                        disc_window_tokens_per_rank,
-                        gen_window_zero_tokens,
-                        disc_window_zero_tokens,
-                    ) = _resolve_window_token_denominators(
-                        gen_window_tokens_per_rank_raw=raw_gen_window_tokens_per_rank,
-                        disc_window_tokens_per_rank_raw=raw_disc_window_tokens_per_rank,
-                    )
-                    if gen_window_zero_tokens:
-                        zero_gen_window_total += 1
-                        zero_gen_window_since_log += 1
-                    if disc_window_zero_tokens:
-                        zero_disc_window_total += 1
-                        zero_disc_window_since_log += 1
-                    if accelerator.is_main_process and (gen_window_zero_tokens or disc_window_zero_tokens):
-                        logger.warning(
-                            "Token-weighted GA window has zero effective tokens "
-                            "(next_step=%d, gen_zero=%s, disc_zero=%s, gen_raw=%.1f, disc_raw=%.1f); "
-                            "corresponding loss term is zero-weighted for this window.",
-                            int(global_step + 1),
-                            bool(gen_window_zero_tokens),
-                            bool(disc_window_zero_tokens),
-                            float(raw_gen_window_tokens_per_rank),
-                            float(raw_disc_window_tokens_per_rank),
-                        )
-                else:
-                    gen_window_tokens_per_rank = 1.0
-                    disc_window_tokens_per_rank = 1.0
+                (
+                    gen_window_tokens_per_rank,
+                    disc_window_tokens_per_rank,
+                    gen_window_zero_tokens,
+                    disc_window_zero_tokens,
+                ) = _resolve_window_token_weights(
+                    accelerator=accelerator,
+                    token_weighted_ga=token_weighted_ga,
+                    local_gen_tokens=local_gen_tokens,
+                    local_disc_tokens=local_disc_tokens,
+                    next_step=int(global_step + 1),
+                )
+                if gen_window_zero_tokens:
+                    zero_gen_window_total += 1
+                    zero_gen_window_since_log += 1
+                if disc_window_zero_tokens:
+                    zero_disc_window_total += 1
+                    zero_disc_window_since_log += 1
 
                 disc_phase_inputs: list[dict[str, torch.Tensor | float | None]] = []
                 loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -2941,21 +3170,17 @@ def run_pretraining(
                         consumed_micro_batches_committed = int(consumed_micro_batches)
                         if train_progress is not None:
                             train_progress.update(1)
-                        if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                            ckpt_dir = output_dir / f"checkpoint-{global_step}"
-                            _save_training_checkpoint(
-                                accelerator=accelerator,
-                                checkpoint_dir=ckpt_dir,
-                                output_dir=output_dir,
-                                consumed_micro_batches=consumed_micro_batches_committed,
-                                save_total_limit=int(train_cfg.save_total_limit),
-                                log_label="periodic",
-                                lr_mult=lr_mult,
-                                optimizer_param_digest=param_digest,
-                                global_step=int(global_step),
-                                gradient_accumulation_steps=int(ga_steps),
-                            )
-                            last_saved_step = global_step
+                        last_saved_step = _save_periodic_checkpoint_if_due(
+                            accelerator=accelerator,
+                            train_cfg=train_cfg,
+                            output_dir=output_dir,
+                            global_step=int(global_step),
+                            consumed_micro_batches_committed=int(consumed_micro_batches_committed),
+                            lr_mult=float(lr_mult),
+                            optimizer_param_digest=param_digest,
+                            gradient_accumulation_steps=int(ga_steps),
+                            last_saved_step=int(last_saved_step),
+                        )
                         continue
                     raise RuntimeError(
                         "Decoupled accumulation window produced no synchronized optimization step."
@@ -2970,200 +3195,66 @@ def run_pretraining(
                 if train_progress is not None:
                     train_progress.update(1)
 
-                if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
+                _maybe_log_training_metrics(
+                    lr_scheduler=disc_lr_scheduler,
+                    gen_loss_num=gen_loss_num,
+                    gen_token_count_window=gen_token_count_window,
+                    disc_loss_num=disc_loss_num,
+                    disc_acc_num=disc_acc_num,
+                    disc_token_count_window=disc_token_count_window,
+                    disc_positive_count_window=disc_positive_count_window,
+                )
 
-                    def _mean(x: torch.Tensor) -> float:
-                        """Compute cross-rank mean for a scalar tensor.
-
-                        :param torch.Tensor x: Scalar tensor.
-                        :return float: Cross-rank mean scalar.
-                        """
-                        x = x.detach().float().reshape(1)
-                        return accelerator.gather(x).mean().item()
-
-                    log_now = time.perf_counter()
-                    elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
-                    global_input_tokens_interval = _sum_local_scalar(
-                        accelerator=accelerator,
-                        x=local_input_tokens_since_log,
-                    )
-                    global_input_tokens_seen = _sum_local_scalar(
-                        accelerator=accelerator,
-                        x=local_input_tokens_seen,
-                    )
-                    input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
-                    local_input_tokens_since_log = 0.0
-                    last_log_started_at = log_now
-
-                    lr = (
-                        disc_lr_scheduler.get_last_lr()[0]
-                        if hasattr(disc_lr_scheduler, "get_last_lr")
-                        else float("nan")
-                    )
-                    weighted_metrics = torch.stack(
-                        [
-                            gen_loss_num,
-                            gen_token_count_window,
-                            disc_loss_num,
-                            disc_acc_num,
-                            disc_token_count_window,
-                            disc_positive_count_window,
-                        ]
-                    )
-                    weighted_metrics = accelerator.reduce(weighted_metrics, reduction="sum")
-                    global_gen_loss_num = float(weighted_metrics[0].item())
-                    global_gen_tokens = float(weighted_metrics[1].item())
-                    global_disc_loss_num = float(weighted_metrics[2].item())
-                    global_disc_acc_num = float(weighted_metrics[3].item())
-                    global_disc_tokens = float(weighted_metrics[4].item())
-                    global_disc_positive = float(weighted_metrics[5].item())
-                    gen_loss_window = (
-                        global_gen_loss_num / global_gen_tokens if global_gen_tokens > 0.0 else float("nan")
-                    )
-                    disc_loss_window = (
-                        global_disc_loss_num / global_disc_tokens
-                        if global_disc_tokens > 0.0
-                        else float("nan")
-                    )
-                    disc_acc_window = (
-                        global_disc_acc_num / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
-                    )
-                    disc_pos_frac = (
-                        global_disc_positive / global_disc_tokens
-                        if global_disc_tokens > 0.0
-                        else float("nan")
-                    )
-                    combined_loss = float(train_cfg.gen_loss_weight) * float(gen_loss_window) + float(
-                        train_cfg.disc_loss_weight
-                    ) * float(disc_loss_window)
-                    zero_metrics = {
-                        "zero_gen_window_total": float(zero_gen_window_total),
-                        "zero_disc_window_total": float(zero_disc_window_total),
-                        "zero_gen_window_since_log": float(zero_gen_window_since_log),
-                        "zero_disc_window_since_log": float(zero_disc_window_since_log),
-                    }
-                    metrics = {
-                        "step": global_step,
-                        "lr": lr,
-                        "loss": float(combined_loss),
-                        "gen_loss": float(gen_loss_window),
-                        "disc_loss": float(disc_loss_window),
-                        "disc_acc": float(disc_acc_window),
-                        "disc_pos_frac": float(disc_pos_frac),
-                        "input_tokens_per_sec": float(input_tokens_per_sec),
-                        "input_tokens_seen": float(global_input_tokens_seen),
-                    }
-                    zero_gen_window_since_log = 0
-                    zero_disc_window_since_log = 0
-                    if accelerator.is_main_process:
-                        logger.info(
-                            " | ".join(
-                                [
-                                    f"step={metrics['step']}",
-                                    f"lr={metrics['lr']:.3e}",
-                                    f"loss={metrics['loss']:.4f}",
-                                    f"gen={metrics['gen_loss']:.4f}",
-                                    f"disc={metrics['disc_loss']:.4f}",
-                                    f"acc={metrics['disc_acc']:.4f}",
-                                    f"tok/s={metrics['input_tokens_per_sec']:.1f}",
-                                    f"tok_seen={metrics['input_tokens_seen']:.0f}",
-                                ]
-                            )
-                        )
-                    if train_cfg.report_to != "none":
-                        _log_tracker_metrics(
-                            {k: v for k, v in metrics.items() if k != "step"}, step=global_step
-                        )
-                    if debug_metrics_enabled and accelerator.is_main_process:
-                        _append_metrics_jsonl_row(
-                            metrics_path,
-                            {
-                                "step": int(global_step),
-                                "debug_metrics": True,
-                                **zero_metrics,
-                            },
-                        )
-
-                if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                    ckpt_dir = output_dir / f"checkpoint-{global_step}"
-                    _save_training_checkpoint(
-                        accelerator=accelerator,
-                        checkpoint_dir=ckpt_dir,
-                        output_dir=output_dir,
-                        consumed_micro_batches=consumed_micro_batches_committed,
-                        save_total_limit=int(train_cfg.save_total_limit),
-                        log_label="periodic",
-                        lr_mult=lr_mult,
-                        optimizer_param_digest=param_digest,
-                        global_step=int(global_step),
-                        gradient_accumulation_steps=int(ga_steps),
-                    )
-                    last_saved_step = global_step
+                last_saved_step = _save_periodic_checkpoint_if_due(
+                    accelerator=accelerator,
+                    train_cfg=train_cfg,
+                    output_dir=output_dir,
+                    global_step=int(global_step),
+                    consumed_micro_batches_committed=int(consumed_micro_batches_committed),
+                    lr_mult=float(lr_mult),
+                    optimizer_param_digest=param_digest,
+                    gradient_accumulation_steps=int(ga_steps),
+                    last_saved_step=int(last_saved_step),
+                )
 
         while global_step < int(train_cfg.max_steps):
-            window: list[tuple[dict[str, torch.Tensor], float, float]] = []
-            local_window_input_tokens = 0.0
-            local_gen_tokens = 0.0
-            local_disc_tokens = 0.0
-
-            for _ in range(ga_steps):
-                batch = next(train_iter)
-                consumed_micro_batches += 1
-                local_window_input_tokens += _count_input_tokens_for_batch(batch)
-                if token_weighted_ga:
-                    gen_count, disc_count = _count_rtd_tokens_for_batch(
-                        batch,
-                        pad_token_id=disc_pad_token_id,
-                    )
-                    local_gen_tokens += gen_count
-                    local_disc_tokens += disc_count
-                else:
-                    gen_count, disc_count = 0.0, 0.0
-                window.append((batch, gen_count, disc_count))
+            (
+                window,
+                consumed_in_window,
+                local_window_input_tokens,
+                local_gen_tokens,
+                local_disc_tokens,
+            ) = _collect_ga_window(
+                train_iter=train_iter,
+                ga_steps=ga_steps,
+                token_weighted_ga=token_weighted_ga,
+                disc_pad_token_id=disc_pad_token_id,
+                include_has_gen_targets=False,
+                default_unweighted_token_count=0.0,
+            )
+            consumed_micro_batches += int(consumed_in_window)
 
             local_input_tokens_seen += local_window_input_tokens
             local_input_tokens_since_log += local_window_input_tokens
 
-            if token_weighted_ga:
-                local_totals = torch.tensor(
-                    [local_gen_tokens, local_disc_tokens],
-                    device=accelerator.device,
-                    dtype=torch.float32,
-                )
-                # DDP/FSDP gradients are averaged across ranks. Mean token totals per rank
-                # preserve global token-normalized scaling when used with local micro counts.
-                mean_totals = accelerator.reduce(local_totals, reduction="mean")
-                raw_gen_window_tokens_per_rank = float(mean_totals[0].item())
-                raw_disc_window_tokens_per_rank = float(mean_totals[1].item())
-                (
-                    gen_window_tokens_per_rank,
-                    disc_window_tokens_per_rank,
-                    gen_window_zero_tokens,
-                    disc_window_zero_tokens,
-                ) = _resolve_window_token_denominators(
-                    gen_window_tokens_per_rank_raw=raw_gen_window_tokens_per_rank,
-                    disc_window_tokens_per_rank_raw=raw_disc_window_tokens_per_rank,
-                )
-                if gen_window_zero_tokens:
-                    zero_gen_window_total += 1
-                    zero_gen_window_since_log += 1
-                if disc_window_zero_tokens:
-                    zero_disc_window_total += 1
-                    zero_disc_window_since_log += 1
-                if accelerator.is_main_process and (gen_window_zero_tokens or disc_window_zero_tokens):
-                    logger.warning(
-                        "Token-weighted GA window has zero effective tokens "
-                        "(next_step=%d, gen_zero=%s, disc_zero=%s, gen_raw=%.1f, disc_raw=%.1f); "
-                        "corresponding loss term is zero-weighted for this window.",
-                        int(global_step + 1),
-                        bool(gen_window_zero_tokens),
-                        bool(disc_window_zero_tokens),
-                        float(raw_gen_window_tokens_per_rank),
-                        float(raw_disc_window_tokens_per_rank),
-                    )
-            else:
-                gen_window_tokens_per_rank = 1.0
-                disc_window_tokens_per_rank = 1.0
+            (
+                gen_window_tokens_per_rank,
+                disc_window_tokens_per_rank,
+                gen_window_zero_tokens,
+                disc_window_zero_tokens,
+            ) = _resolve_window_token_weights(
+                accelerator=accelerator,
+                token_weighted_ga=token_weighted_ga,
+                local_gen_tokens=local_gen_tokens,
+                local_disc_tokens=local_disc_tokens,
+                next_step=int(global_step + 1),
+            )
+            if gen_window_zero_tokens:
+                zero_gen_window_total += 1
+                zero_gen_window_since_log += 1
+            if disc_window_zero_tokens:
+                zero_disc_window_total += 1
+                zero_disc_window_since_log += 1
 
             out = None
             loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -3396,22 +3487,13 @@ def run_pretraining(
                     optimizer.zero_grad(set_to_none=True)
                     did_optimizer_step = True
                     nonfinite_skip_streak = 0
-                    # Gradually recover lr_mult toward 1.0 on successful steps.
                     if lr_mult < 1.0:
                         lr_mult = min(lr_mult * float(_NONFINITE_LR_MULT_RECOVERY), 1.0)
 
-                    # If embedding_sharing=gdes, the discriminator embedding base weights must track the
-                    # generator embedding weights. Generator embeddings update only on optimizer steps,
-                    # so syncing here is sufficient (and avoids per-microbatch copies). This means
-                    # discriminator base weights intentionally lag inside each GA window and catch up
-                    # immediately after the optimizer step.
                     _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
-                    # Recovery path: ratchet down persistent lr_mult and optionally reset
-                    # optimizer state.  The scheduler advances normally; lr_mult is applied
-                    # after every lr_scheduler.step() so it cannot be overwritten.
                     if _optimizer_has_stepped(optimizer):
                         with suppress(Exception):
                             lr_scheduler.step()
@@ -3420,7 +3502,6 @@ def run_pretraining(
                         lr_mult=lr_mult,
                         skip_streak=int(nonfinite_skip_streak),
                     )
-                    # Apply lr_mult after scheduler step so recovery is persistent.
                     _apply_lr_mult(optimizer, lr_mult)
                     if reset_state:
                         with suppress(Exception):
@@ -3454,21 +3535,17 @@ def run_pretraining(
                             str(nonfinite_debug_path) if nonfinite_debug_path is not None else "n/a",
                         )
 
-                    if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                        ckpt_dir = output_dir / f"checkpoint-{global_step}"
-                        _save_training_checkpoint(
-                            accelerator=accelerator,
-                            checkpoint_dir=ckpt_dir,
-                            output_dir=output_dir,
-                            consumed_micro_batches=consumed_micro_batches_committed,
-                            save_total_limit=int(train_cfg.save_total_limit),
-                            log_label="periodic",
-                            lr_mult=lr_mult,
-                            optimizer_param_digest=param_digest,
-                            global_step=int(global_step),
-                            gradient_accumulation_steps=int(ga_steps),
-                        )
-                        last_saved_step = global_step
+                    last_saved_step = _save_periodic_checkpoint_if_due(
+                        accelerator=accelerator,
+                        train_cfg=train_cfg,
+                        output_dir=output_dir,
+                        global_step=int(global_step),
+                        consumed_micro_batches_committed=int(consumed_micro_batches_committed),
+                        lr_mult=float(lr_mult),
+                        optimizer_param_digest=param_digest,
+                        gradient_accumulation_steps=int(ga_steps),
+                        last_saved_step=int(last_saved_step),
+                    )
                     continue
                 raise RuntimeError("Accumulation window produced no synchronized optimization step.")
 
@@ -3478,8 +3555,6 @@ def run_pretraining(
                 token_weighted_ga=token_weighted_ga,
             )
 
-            # We count accumulation windows as global steps (successful optimizer step or
-            # recovered non-finite skip window).
             if did_optimizer_step:
                 if out is None:
                     raise RuntimeError("Accumulation window produced no forward pass outputs.")
@@ -3488,135 +3563,30 @@ def run_pretraining(
                 if train_progress is not None:
                     train_progress.update(1)
 
-                if train_cfg.logging_steps and (global_step % int(train_cfg.logging_steps) == 0):
-                    # Reduce scalar metrics across processes.
-                    def _mean(x: torch.Tensor) -> float:
-                        """Compute global mean scalar across processes.
+                _maybe_log_training_metrics(
+                    lr_scheduler=lr_scheduler,
+                    gen_loss_num=gen_loss_num,
+                    gen_token_count_window=gen_token_count_window,
+                    disc_loss_num=disc_loss_num,
+                    disc_acc_num=disc_acc_num,
+                    disc_token_count_window=disc_token_count_window,
+                    disc_positive_count_window=disc_positive_count_window,
+                    loss_override=float(
+                        accelerator.gather(loss_for_metrics.detach().float().reshape(1)).mean().item()
+                    ),
+                )
 
-                        :param torch.Tensor x: Scalar-like tensor.
-                        :return float: Process-aggregated mean value.
-                        """
-                        x = x.detach().float().reshape(1)
-                        return accelerator.gather(x).mean().item()
-
-                    log_now = time.perf_counter()
-                    elapsed_since_log = max(log_now - last_log_started_at, 1e-9)
-                    global_input_tokens_interval = _sum_local_scalar(
-                        accelerator=accelerator,
-                        x=local_input_tokens_since_log,
-                    )
-                    global_input_tokens_seen = _sum_local_scalar(
-                        accelerator=accelerator,
-                        x=local_input_tokens_seen,
-                    )
-                    input_tokens_per_sec = global_input_tokens_interval / elapsed_since_log
-                    local_input_tokens_since_log = 0.0
-                    last_log_started_at = log_now
-
-                    lr = (
-                        lr_scheduler.get_last_lr()[0]
-                        if hasattr(lr_scheduler, "get_last_lr")
-                        else float("nan")
-                    )
-                    weighted_metrics = torch.stack(
-                        [
-                            gen_loss_num,
-                            gen_token_count_window,
-                            disc_loss_num,
-                            disc_acc_num,
-                            disc_token_count_window,
-                            disc_positive_count_window,
-                        ]
-                    )
-                    weighted_metrics = accelerator.reduce(weighted_metrics, reduction="sum")
-                    global_gen_loss_num = float(weighted_metrics[0].item())
-                    global_gen_tokens = float(weighted_metrics[1].item())
-                    global_disc_loss_num = float(weighted_metrics[2].item())
-                    global_disc_acc_num = float(weighted_metrics[3].item())
-                    global_disc_tokens = float(weighted_metrics[4].item())
-                    global_disc_positive = float(weighted_metrics[5].item())
-                    gen_loss_window = (
-                        global_gen_loss_num / global_gen_tokens if global_gen_tokens > 0.0 else float("nan")
-                    )
-                    disc_loss_window = (
-                        global_disc_loss_num / global_disc_tokens
-                        if global_disc_tokens > 0.0
-                        else float("nan")
-                    )
-                    disc_acc_window = (
-                        global_disc_acc_num / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
-                    )
-                    disc_pos_frac = (
-                        global_disc_positive / global_disc_tokens
-                        if global_disc_tokens > 0.0
-                        else float("nan")
-                    )
-                    zero_metrics = {
-                        "zero_gen_window_total": float(zero_gen_window_total),
-                        "zero_disc_window_total": float(zero_disc_window_total),
-                        "zero_gen_window_since_log": float(zero_gen_window_since_log),
-                        "zero_disc_window_since_log": float(zero_disc_window_since_log),
-                    }
-                    metrics = {
-                        "step": global_step,
-                        "lr": lr,
-                        "loss": _mean(loss_for_metrics),
-                        "gen_loss": float(gen_loss_window),
-                        "disc_loss": float(disc_loss_window),
-                        "disc_acc": float(disc_acc_window),
-                        "disc_pos_frac": float(disc_pos_frac),
-                        "input_tokens_per_sec": float(input_tokens_per_sec),
-                        "input_tokens_seen": float(global_input_tokens_seen),
-                    }
-                    zero_gen_window_since_log = 0
-                    zero_disc_window_since_log = 0
-
-                    if accelerator.is_main_process:
-                        logger.info(
-                            " | ".join(
-                                [
-                                    f"step={metrics['step']}",
-                                    f"lr={metrics['lr']:.3e}",
-                                    f"loss={metrics['loss']:.4f}",
-                                    f"gen={metrics['gen_loss']:.4f}",
-                                    f"disc={metrics['disc_loss']:.4f}",
-                                    f"acc={metrics['disc_acc']:.4f}",
-                                    f"tok/s={metrics['input_tokens_per_sec']:.1f}",
-                                    f"tok_seen={metrics['input_tokens_seen']:.0f}",
-                                ]
-                            )
-                        )
-
-                    if train_cfg.report_to != "none":
-                        _log_tracker_metrics(
-                            {k: v for k, v in metrics.items() if k != "step"}, step=global_step
-                        )
-                    if debug_metrics_enabled and accelerator.is_main_process:
-                        _append_metrics_jsonl_row(
-                            metrics_path,
-                            {
-                                "step": int(global_step),
-                                "debug_metrics": True,
-                                **zero_metrics,
-                            },
-                        )
-
-                # Checkpoint
-                if train_cfg.save_steps and (global_step % int(train_cfg.save_steps) == 0):
-                    ckpt_dir = output_dir / f"checkpoint-{global_step}"
-                    _save_training_checkpoint(
-                        accelerator=accelerator,
-                        checkpoint_dir=ckpt_dir,
-                        output_dir=output_dir,
-                        consumed_micro_batches=consumed_micro_batches_committed,
-                        save_total_limit=int(train_cfg.save_total_limit),
-                        log_label="periodic",
-                        lr_mult=lr_mult,
-                        optimizer_param_digest=param_digest,
-                        global_step=int(global_step),
-                        gradient_accumulation_steps=int(ga_steps),
-                    )
-                    last_saved_step = global_step
+                last_saved_step = _save_periodic_checkpoint_if_due(
+                    accelerator=accelerator,
+                    train_cfg=train_cfg,
+                    output_dir=output_dir,
+                    global_step=int(global_step),
+                    consumed_micro_batches_committed=int(consumed_micro_batches_committed),
+                    lr_mult=float(lr_mult),
+                    optimizer_param_digest=param_digest,
+                    gradient_accumulation_steps=int(ga_steps),
+                    last_saved_step=int(last_saved_step),
+                )
 
     except KeyboardInterrupt as exc:
         exit_code = 130
@@ -3672,9 +3642,6 @@ def run_pretraining(
                 getattr(accelerator, "num_processes", "unknown"),
             )
 
-        # Final export runs from the saved checkpoint in an isolated subprocess.
-        # This avoids teardown-time crashes observed on some streaming+CUDA runs
-        # when exporting directly from the live training process.
         if (
             bool(train_cfg.export_hf_final)
             and crash_reason is None

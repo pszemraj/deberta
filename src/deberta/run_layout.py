@@ -8,6 +8,20 @@ from deberta.config import validate_run_metadata_schema
 from deberta.io_utils import load_json_mapping
 
 RUN_METADATA_FILENAME = "run_metadata.json"
+MODEL_CONFIG_FILENAME = "model_config.json"
+DATA_CONFIG_FILENAME = "data_config.json"
+TRAIN_CONFIG_FILENAME = "train_config.json"
+OPTIM_CONFIG_FILENAME = "optim_config.json"
+LOGGING_CONFIG_FILENAME = "logging_config.json"
+RESUME_SOURCE_FILENAME = "resume_source.json"
+RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
+    MODEL_CONFIG_FILENAME,
+    DATA_CONFIG_FILENAME,
+    TRAIN_CONFIG_FILENAME,
+    OPTIM_CONFIG_FILENAME,
+    LOGGING_CONFIG_FILENAME,
+    RUN_METADATA_FILENAME,
+)
 
 
 def infer_run_dir_from_checkpoint(checkpoint_dir: str | Path) -> Path:
@@ -35,6 +49,3 @@ def validate_run_metadata_file(run_dir: Path, *, required: bool) -> None:
 
     raw = load_json_mapping(meta_path)
     validate_run_metadata_schema(raw, source=str(meta_path))
-
-
-__all__ = ["RUN_METADATA_FILENAME", "infer_run_dir_from_checkpoint", "validate_run_metadata_file"]

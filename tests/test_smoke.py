@@ -478,13 +478,13 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
     counts = []
     for seed in range(10):
         torch.manual_seed(seed)
-        _, labels = coll._mask_tokens_bert(input_ids, special_tokens_mask=special)
+        _, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
         counts.append(int(labels.ne(-100).sum().item()))
 
     assert set(counts) == {1}
 
 
-def test_mask_tokens_dispatch_uses_windowed_unigram_not_bert(monkeypatch: pytest.MonkeyPatch):
+def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
 
@@ -499,12 +499,12 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_bert(monkeypatch: pytest
         labels = torch.full_like(_input_ids, -100)
         return _input_ids.clone(), labels
 
-    def _bert(*args, **kwargs):
+    def _ngram(*args, **kwargs):
         del args, kwargs
-        raise AssertionError("_mask_tokens_bert should not be called from _mask_tokens dispatch")
+        raise AssertionError("_mask_tokens_ngram should not be called from _mask_tokens dispatch")
 
     monkeypatch.setattr(coll, "_mask_tokens_unigram_windowed", _windowed)
-    monkeypatch.setattr(coll, "_mask_tokens_bert", _bert)
+    monkeypatch.setattr(coll, "_mask_tokens_ngram", _ngram)
 
     _ = coll._mask_tokens(input_ids, special_tokens_mask=special)
     assert int(calls["windowed"]) == 1
@@ -693,7 +693,7 @@ def test_collator_random_replacement_avoids_special_ids():
     input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
     special = torch.zeros_like(input_ids, dtype=torch.bool)
 
-    masked, labels = coll._mask_tokens_bert(input_ids, special_tokens_mask=special)
+    masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
     changed = labels.ne(-100)
     assert bool(changed.any().item())
 
@@ -722,7 +722,7 @@ def test_collator_random_replacement_samples_full_vocab_including_added_tokens()
     torch.manual_seed(42)
     input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
     special = torch.zeros_like(input_ids, dtype=torch.bool)
-    masked, labels = coll._mask_tokens_bert(input_ids, special_tokens_mask=special)
+    masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
     changed = labels.ne(-100)
     replaced = masked[changed]
     assert bool((replaced >= 100).any().item()), "Expected some replacement tokens from the added-token range"

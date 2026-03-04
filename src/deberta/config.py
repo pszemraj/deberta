@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
@@ -233,6 +234,31 @@ def _nested_get(obj: Any, path: str) -> Any:
     return cur
 
 
+def _legacy_getattr_from_map(
+    *,
+    obj: Any,
+    name: str,
+    legacy_map: dict[str, str],
+    dynamic_defaults: dict[str, Any] | None = None,
+) -> Any:
+    """Resolve legacy flat config attributes via dotted compatibility maps.
+
+    :param Any obj: Config object.
+    :param str name: Requested attribute name.
+    :param dict[str, str] legacy_map: Mapping of legacy flat names to dotted paths.
+    :param dict[str, Any] | None dynamic_defaults: Optional dynamic fallback values.
+    :raises AttributeError: If ``name`` is not mapped.
+    :return Any: Resolved attribute value.
+    """
+    key = str(name)
+    path = legacy_map.get(key)
+    if path is not None:
+        return _nested_get(obj, path)
+    if dynamic_defaults is not None and key in dynamic_defaults:
+        return dynamic_defaults[key]
+    raise AttributeError(name)
+
+
 def _replace_path(obj: Any, parts: list[str], value: Any) -> Any:
     """Replace one dotted path on a dataclass object.
 
@@ -458,10 +484,7 @@ class ModelConfig:
         :param str name: Attribute name.
         :return Any: Legacy flat value when mapped.
         """
-        path = self._LEGACY_MAP.get(str(name))
-        if path is None:
-            raise AttributeError(name)
-        return _nested_get(self, path)
+        return _legacy_getattr_from_map(obj=self, name=name, legacy_map=self._LEGACY_MAP)
 
 
 @dataclass(frozen=True)
@@ -559,10 +582,7 @@ class DataConfig:
         :param str name: Attribute name.
         :return Any: Legacy flat value when mapped.
         """
-        path = self._LEGACY_MAP.get(str(name))
-        if path is None:
-            raise AttributeError(name)
-        return _nested_get(self, path)
+        return _legacy_getattr_from_map(obj=self, name=name, legacy_map=self._LEGACY_MAP)
 
 
 @dataclass(frozen=True)
@@ -796,12 +816,12 @@ class TrainConfig:
         :param str name: Attribute name.
         :return Any: Legacy flat value when mapped.
         """
-        path = self._LEGACY_MAP.get(str(name))
-        if path is not None:
-            return _nested_get(self, path)
-        if str(name) in self._LEGACY_DYNAMIC_DEFAULTS:
-            return self._LEGACY_DYNAMIC_DEFAULTS[str(name)]
-        raise AttributeError(name)
+        return _legacy_getattr_from_map(
+            obj=self,
+            name=name,
+            legacy_map=self._LEGACY_MAP,
+            dynamic_defaults=self._LEGACY_DYNAMIC_DEFAULTS,
+        )
 
 
 @dataclass(frozen=True)
@@ -1212,6 +1232,27 @@ def normalize_mixed_precision(value: object) -> str:
             "train.mixed_precision must be one of: bf16|no (or aliases true|false|yes|no|on|off|1|0)."
         )
     return mp
+
+
+def resolve_effective_mixed_precision(
+    value: object,
+    *,
+    bf16_sanity_check: Callable[[], bool] | None = None,
+) -> str:
+    """Normalize mixed precision and optionally enforce bf16 runtime sanity.
+
+    :param object value: Raw mixed-precision value/alias.
+    :param Callable[[], bool] | None bf16_sanity_check: Optional bf16 runtime probe callback.
+    :raises RuntimeError: If ``bf16`` is requested and the sanity check fails.
+    :return str: Effective mixed precision mode.
+    """
+    mixed_precision = normalize_mixed_precision(value)
+    if mixed_precision == "bf16" and bf16_sanity_check is not None and not bf16_sanity_check():
+        raise RuntimeError(
+            "train.mixed_precision=bf16 requested but bf16 preflight failed. "
+            "Set train.mixed_precision=no explicitly if you want to continue in full precision."
+        )
+    return mixed_precision
 
 
 def _cfg_set(cfg_obj: Any, field_name: str, value: Any) -> None:
@@ -2532,6 +2573,7 @@ __all__ = [
     "load_model_config_snapshot",
     "load_optim_config_snapshot",
     "normalize_mixed_precision",
+    "resolve_effective_mixed_precision",
     "validate_data_config",
     "validate_logging_config",
     "validate_model_config",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -14,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from deberta.io_utils import dump_json
+from deberta.io_utils import dump_json, load_json_mapping
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -61,6 +60,37 @@ def _resolve_output_dir(
     return Path("runs") / project / f"{stamp}_{run_name}"
 
 
+def _broadcast_rank0_payload(
+    *,
+    broadcast_fn: Any | None,
+    payload: list[Any],
+    purpose: str,
+    error_message: str,
+) -> Any:
+    """Broadcast one payload list from rank 0 and return the broadcasted object.
+
+    :param Any | None broadcast_fn: Optional broadcast callable.
+    :param list[Any] payload: Mutable single-item payload list.
+    :param str purpose: Human-readable operation purpose.
+    :param str error_message: RuntimeError message for broadcast failures.
+    :raises RuntimeError: If broadcast fails or returns an empty payload list.
+    :return Any: Broadcast payload item from rank 0.
+    """
+    fn = broadcast_fn
+    if fn is None:
+        try:
+            from accelerate.utils import broadcast_object_list as fn  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"{purpose} requires accelerate.utils.broadcast_object_list.") from exc
+    try:
+        fn(payload, from_process=0)
+    except Exception as exc:
+        raise RuntimeError(error_message) from exc
+    if not payload:
+        raise RuntimeError(f"{error_message.rstrip('.')} (empty broadcast payload).")
+    return payload[0]
+
+
 def _resolve_output_dir_for_accelerator(
     *,
     accelerator: Any,
@@ -95,14 +125,6 @@ def _resolve_output_dir_for_accelerator(
             run_name=run_name,
         )
 
-    if broadcast_fn is None:
-        try:
-            from accelerate.utils import broadcast_object_list as broadcast_fn  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "Distributed auto output_dir resolution requires accelerate.utils.broadcast_object_list."
-            ) from exc
-
     shared: list[str | None] = [None]
     if bool(getattr(accelerator, "is_main_process", False)):
         shared[0] = str(
@@ -114,12 +136,12 @@ def _resolve_output_dir_for_accelerator(
             )
         )
 
-    try:
-        broadcast_fn(shared, from_process=0)
-    except Exception as exc:
-        raise RuntimeError("Failed to broadcast auto-resolved output_dir across ranks.") from exc
-
-    resolved = shared[0]
+    resolved = _broadcast_rank0_payload(
+        broadcast_fn=broadcast_fn,
+        purpose="Distributed auto output_dir resolution",
+        payload=shared,
+        error_message="Failed to broadcast auto-resolved output_dir across ranks.",
+    )
     if resolved is None or not str(resolved).strip():
         raise RuntimeError("Broadcasted output_dir is empty in distributed auto-output-dir resolution.")
     return Path(str(resolved))
@@ -157,14 +179,6 @@ def _resolve_resume_checkpoint_for_accelerator(
             is_main_process=is_main,
         )
 
-    if broadcast_fn is None:
-        try:
-            from accelerate.utils import broadcast_object_list as broadcast_fn  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "Distributed resume resolution requires accelerate.utils.broadcast_object_list."
-            ) from exc
-
     shared: list[dict[str, Any]] = [
         {
             "ok": True,
@@ -188,12 +202,12 @@ def _resolve_resume_checkpoint_for_accelerator(
                 "error_message": str(exc),
             }
 
-    try:
-        broadcast_fn(shared, from_process=0)
-    except Exception as exc:
-        raise RuntimeError("Failed to broadcast resolved resume checkpoint across ranks.") from exc
-
-    payload = shared[0] if shared else None
+    payload = _broadcast_rank0_payload(
+        broadcast_fn=broadcast_fn,
+        purpose="Distributed resume resolution",
+        payload=shared,
+        error_message="Failed to broadcast resolved resume checkpoint across ranks.",
+    )
     if not isinstance(payload, dict):
         raise RuntimeError("Broadcasted resume checkpoint payload is malformed.")
     if not bool(payload.get("ok", False)):
@@ -438,9 +452,7 @@ def _load_checkpoint_progress_metadata(
     if not path.exists():
         return None, 1.0, None, None, None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise TypeError(f"Expected JSON object in {path}, got {type(raw).__name__}")
+        raw = load_json_mapping(path)
         val = raw.get("consumed_micro_batches", None)
         consumed = max(0, int(val)) if val is not None else None
         lr_mult = float(raw.get("lr_mult", 1.0))
@@ -457,7 +469,7 @@ def _load_checkpoint_progress_metadata(
         ga_steps_raw = raw.get("gradient_accumulation_steps", None)
         ga_steps = max(1, int(ga_steps_raw)) if ga_steps_raw is not None else None
         return consumed, lr_mult, digest, global_step, ga_steps
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         logger.warning(
             "Checkpoint %s has invalid data_state.json (%s: %s); treating as unresumable.",
             checkpoint_dir,

@@ -274,14 +274,6 @@ class DebertaV3ElectraCollator:
         idx = torch.randint(low=0, high=int(ids.numel()), size=shape, device=device)
         return ids[idx]
 
-    def _sample_one_random_word(self, device: torch.device) -> int:
-        """Sample one random replacement id.
-
-        :param torch.device device: Target device.
-        :return int: Sampled token id.
-        """
-        return int(self._sample_random_words((1,), device=device)[0].item())
-
     def _special_ids_tensor_for_device(self, device: torch.device) -> torch.Tensor | None:
         """Return cached special-token id tensor on the requested device.
 
@@ -559,76 +551,6 @@ class DebertaV3ElectraCollator:
                 rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
                 input_ids[b, selected[rand_sel]] = rand_ids
 
-        return input_ids, labels
-
-    def _mask_tokens_bert(
-        self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply token-level (independent) MLM masking.
-
-        This helper is retained for targeted unit tests and optional ablation
-        workflows. The default collator path intentionally uses DeBERTa-style
-        windowed masking for ``max_ngram>=1`` via ``_mask_tokens``.
-
-        :param torch.Tensor input_ids: Input token ids of shape (B, S).
-        :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
-        :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
-        """
-        if input_ids.dtype != torch.long:
-            input_ids = input_ids.long()
-
-        input_ids = input_ids.clone()
-        labels = torch.full_like(input_ids, -100)
-
-        mask_prob = float(self.cfg.mask_token_prob)
-        random_prob = float(self.cfg.random_token_prob)
-        mlm_prob = float(self.cfg.mlm_probability)
-        pad_token_id = self.tokenizer.pad_token_id
-        mask_token_id = int(self.tokenizer.mask_token_id)
-
-        # Use a fixed budget per sequence (rounded from maskable count) to stabilize
-        # effective masked-token counts across microbatches. This executes in eager
-        # collator workers (not under torch.compile graph capture).
-        maskable = ~special_tokens_mask
-        if pad_token_id is not None:
-            maskable = maskable & input_ids.ne(int(pad_token_id))
-
-        candidate_counts = maskable.sum(dim=1)
-        num_to_mask = torch.round(candidate_counts.to(torch.float32) * mlm_prob).to(torch.long)
-        num_to_mask = torch.where(
-            candidate_counts > 0,
-            torch.clamp(num_to_mask, min=1),
-            torch.zeros_like(num_to_mask),
-        )
-        num_to_mask = torch.minimum(num_to_mask, candidate_counts)
-
-        max_to_mask = int(num_to_mask.max().item()) if int(num_to_mask.numel()) > 0 else 0
-        if max_to_mask <= 0:
-            return input_ids, labels
-
-        # Row-wise random ranking over candidate positions, then take per-row top-k.
-        scores = torch.rand(input_ids.shape, device=input_ids.device, dtype=torch.float32)
-        scores = scores.masked_fill(~maskable, 2.0)
-        topk_idx = torch.topk(scores, k=max_to_mask, dim=1, largest=False).indices
-        topk_rank = torch.arange(max_to_mask, device=input_ids.device).unsqueeze(0)
-        topk_valid = topk_rank < num_to_mask.unsqueeze(1)
-
-        masked_indices = torch.zeros_like(maskable)
-        masked_indices.scatter_(1, topk_idx, topk_valid)
-
-        labels[masked_indices] = input_ids[masked_indices]
-
-        repl_roll = torch.rand(input_ids.shape, device=input_ids.device, dtype=torch.float32)
-        mask_sel = masked_indices & (repl_roll < mask_prob)
-        rand_sel = masked_indices & (repl_roll >= mask_prob) & (repl_roll < (mask_prob + random_prob))
-
-        if bool(mask_sel.any().item()):
-            input_ids[mask_sel] = mask_token_id
-        if bool(rand_sel.any().item()):
-            rand_words = self._sample_random_words(input_ids.shape, device=input_ids.device)
-            input_ids[rand_sel] = rand_words[rand_sel]
-
-        # Remaining masked positions keep original token.
         return input_ids, labels
 
     def _mask_tokens_ngram(
