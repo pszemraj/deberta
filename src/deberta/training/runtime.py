@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -369,37 +368,6 @@ def _build_training_collator(
         packed_sequences=bool(packed_sequences),
         block_cross_document_attention=bool(block_cross_document_attention),
     )
-
-
-def _validate_output_dir_preflight(
-    *,
-    output_dir: Path,
-    overwrite_output_dir: bool,
-    resume_from_checkpoint: str | None,
-) -> None:
-    """Validate output-dir preconditions without mutating filesystem state.
-
-    :param Path output_dir: Resolved output directory.
-    :param bool overwrite_output_dir: Whether training is configured to delete non-empty output_dir.
-    :param str | None resume_from_checkpoint: Resume setting.
-    :raises ValueError: If output-dir settings are contradictory or unsafe.
-    """
-    if bool(overwrite_output_dir) and bool(resume_from_checkpoint):
-        raise ValueError(
-            "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
-            "Overwrite would delete checkpoints before resume. Disable overwrite or unset resume."
-        )
-
-    if (
-        output_dir.exists()
-        and any(output_dir.iterdir())
-        and (not overwrite_output_dir)
-        and (not resume_from_checkpoint)
-    ):
-        raise ValueError(
-            f"Output directory exists and is not empty: {output_dir}. "
-            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
-        )
 
 
 def _resolve_section_cfg_compat(

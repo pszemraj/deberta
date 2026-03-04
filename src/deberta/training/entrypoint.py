@@ -78,7 +78,6 @@ from deberta.training.runtime import (
     _cycle_dataloader,
     _optimizer_param_order_digest,
     _resolve_section_cfg_compat,
-    _validate_output_dir_preflight,
 )
 from deberta.training.steps import (
     _NONFINITE_LR_MULT_RECOVERY,
@@ -98,6 +97,7 @@ from deberta.training.steps import (
 from deberta.training.tracker_utils import _init_trackers, _setup_wandb_watch, _upload_wandb_original_config
 from deberta.utils.checkpoint import load_state_with_compile_fallback, unwrap_compiled_model
 from deberta.utils.log import setup_process_logging
+from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -156,10 +156,22 @@ def run_pretraining_dry_run(
         if resolved_logging_cfg.output_dir is not None and str(resolved_logging_cfg.output_dir).strip()
         else checkpoint_output_dir
     )
-    _validate_output_dir_preflight(
+    resume_hint = (
+        str(train_cfg.resume_from_checkpoint).strip() if train_cfg.resume_from_checkpoint is not None else ""
+    )
+    if bool(train_cfg.overwrite_output_dir) and bool(resume_hint):
+        raise ValueError(
+            "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
+            "Overwrite would delete checkpoints before resume. Disable overwrite or unset resume."
+        )
+    validate_existing_output_dir(
         output_dir=checkpoint_output_dir,
-        overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
-        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        allow_nonempty=bool(train_cfg.overwrite_output_dir) or bool(resume_hint),
+        nonempty_error=(
+            f"Output directory exists and is not empty: {checkpoint_output_dir}. "
+            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+        ),
+        nondir_error=f"Output directory exists and is not a directory: {checkpoint_output_dir}",
     )
     ckpt = _resolve_resume_checkpoint(
         output_dir=checkpoint_output_dir,

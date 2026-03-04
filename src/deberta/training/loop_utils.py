@@ -35,35 +35,19 @@ def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
     """Return non-padding input-token count for one microbatch.
 
     :param dict[str, torch.Tensor] batch: Microbatch mapping.
+    :raises KeyError: If ``input_ids`` is absent.
     :return float: Count of active input tokens.
     """
-    attention_mask = batch.get("attention_mask")
     input_ids = batch.get("input_ids")
-    if isinstance(attention_mask, torch.Tensor):
-        if isinstance(input_ids, torch.Tensor):
-            active = attention_mask_to_active_tokens(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pad_token_id=None,
-            )
-            return float(active.detach().sum().item())
+    if not isinstance(input_ids, torch.Tensor):
+        raise KeyError("batch['input_ids'] is required for input-token counting.")
 
-        mask = attention_mask.detach().to(dtype=torch.bool)
-        if mask.ndim == 4:
-            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if mask.ndim == 3:
-            if mask.shape[-2] == 1:
-                mask = mask[:, 0, :]
-            else:
-                mask = torch.diagonal(mask, dim1=-2, dim2=-1)
-        if mask.ndim == 2:
-            return float(mask.sum().item())
-        return float(mask.reshape(-1).sum().item())
-
-    if isinstance(input_ids, torch.Tensor):
-        return float(input_ids.numel())
-
-    return 0.0
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=batch.get("attention_mask"),
+        pad_token_id=None,
+    )
+    return float(active.detach().sum().item())
 
 
 def _token_weighted_micro_objective(

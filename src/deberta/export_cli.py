@@ -42,6 +42,7 @@ from deberta.utils.checkpoint import (
 )
 from deberta.utils.io import load_json_mapping
 from deberta.utils.log import setup_process_logging
+from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -114,14 +115,15 @@ def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path
     :return Path: Resolved output path.
     """
     resolved = Path(output_dir).expanduser().resolve() if output_dir else (run_dir / "exported_hf")
-    if resolved.exists():
-        if not resolved.is_dir():
-            raise ValueError(f"output_dir exists and is not a directory: {resolved}")
-        if any(resolved.iterdir()):
-            raise ValueError(
-                f"output_dir already exists and is not empty: {resolved}. "
-                "Choose a new --output-dir or clear the directory."
-            )
+    validate_existing_output_dir(
+        output_dir=resolved,
+        allow_nonempty=False,
+        nonempty_error=(
+            f"output_dir already exists and is not empty: {resolved}. "
+            "Choose a new --output-dir or clear the directory."
+        ),
+        nondir_error=f"output_dir exists and is not a directory: {resolved}",
+    )
     return resolved
 
 

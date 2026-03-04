@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from deberta.utils.io import dump_json, load_json_mapping
+from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -642,14 +643,17 @@ def _prepare_output_dir(
         return
 
     resume_value = str(resume_from_checkpoint).strip() if resume_from_checkpoint is not None else ""
-    if output_dir.exists() and any(output_dir.iterdir()):
-        if overwrite_output_dir:
-            shutil.rmtree(output_dir)
-        elif not resume_value:
-            raise ValueError(
-                f"Output directory exists and is not empty: {output_dir}. "
-                "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
-            )
+    is_nonempty = validate_existing_output_dir(
+        output_dir=output_dir,
+        allow_nonempty=bool(overwrite_output_dir) or bool(resume_value),
+        nonempty_error=(
+            f"Output directory exists and is not empty: {output_dir}. "
+            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+        ),
+        nondir_error=f"Output directory exists and is not a directory: {output_dir}",
+    )
+    if is_nonempty and bool(overwrite_output_dir):
+        shutil.rmtree(output_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

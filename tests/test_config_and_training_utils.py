@@ -316,14 +316,6 @@ def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
     keep = out / "existing.txt"
     keep.write_text("x", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Output directory exists and is not empty"):
-        _prepare_output_dir(
-            output_dir=out,
-            overwrite_output_dir=False,
-            resume_from_checkpoint=None,
-            is_main_process=True,
-        )
-
     _prepare_output_dir(
         output_dir=out,
         overwrite_output_dir=False,
@@ -342,7 +334,10 @@ def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
     assert not any(out.iterdir())
 
 
-def test_prepare_output_dir_rejects_blank_resume_hint_on_nonempty_dir(tmp_path: Path):
+@pytest.mark.parametrize("resume_hint", [None, "   "], ids=["unset", "blank"])
+def test_prepare_output_dir_rejects_nonempty_without_overwrite_or_resume(
+    tmp_path: Path, resume_hint: str | None
+):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     (out / "existing.txt").write_text("x", encoding="utf-8")
@@ -351,7 +346,7 @@ def test_prepare_output_dir_rejects_blank_resume_hint_on_nonempty_dir(tmp_path: 
         _prepare_output_dir(
             output_dir=out,
             overwrite_output_dir=False,
-            resume_from_checkpoint="   ",
+            resume_from_checkpoint=resume_hint,
             is_main_process=True,
         )
 
