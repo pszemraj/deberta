@@ -9,8 +9,8 @@ from typing import Any
 
 import torch
 
-from deberta.checkpoint_utils import unwrap_compiled_model
 from deberta.training.run_management import _sanitize_run_label
+from deberta.utils.checkpoint_utils import unwrap_compiled_model
 
 logger = logging.getLogger(__name__)
 

@@ -27,6 +27,3 @@ def flatten_mapping(
         else:
             out[str(path)] = value
     return out
-
-
-__all__ = ["flatten_mapping"]

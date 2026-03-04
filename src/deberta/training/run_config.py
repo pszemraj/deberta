@@ -23,7 +23,6 @@ from deberta.config import (
     validate_model_config,
     validate_optim_config,
 )
-from deberta.io_utils import dump_json, load_json_mapping
 from deberta.run_layout import (
     DATA_CONFIG_FILENAME,
     LOGGING_CONFIG_FILENAME,
@@ -36,6 +35,7 @@ from deberta.run_layout import (
     infer_run_dir_from_checkpoint,
     validate_run_metadata_file,
 )
+from deberta.utils.io_utils import dump_json, load_json_mapping
 
 logger = logging.getLogger(__name__)
 

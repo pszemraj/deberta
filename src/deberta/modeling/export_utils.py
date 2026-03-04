@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from deberta.io_utils import dump_json, load_json_mapping
+from deberta.utils.io_utils import dump_json, load_json_mapping
 
 EXPORT_CONFIG_STRIP_KEYS = frozenset(
     {

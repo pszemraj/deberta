@@ -21,10 +21,6 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from deberta.checkpoint_utils import (
-    load_state_with_compile_fallback,
-    unwrap_compiled_model,
-)
 from deberta.config import (
     DataConfig,
     LoggingConfig,
@@ -47,8 +43,6 @@ from deberta.data import DebertaV3ElectraCollator, PackedStreamingDataset, Seque
 from deberta.data.collator import MLMConfig
 from deberta.data.loading import load_hf_dataset
 from deberta.data.streaming import PackedStreamingConfig
-from deberta.io_utils import dump_json
-from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.training.export_helpers import _export_discriminator_hf_subprocess
 from deberta.training.loop_utils import (
@@ -74,7 +68,13 @@ from deberta.training.run_management import (
     _save_training_checkpoint,
 )
 from deberta.training.tracker_utils import _init_trackers, _setup_wandb_watch, _upload_wandb_original_config
-from deberta.type_utils import coerce_scalar, unwrap_optional_type
+from deberta.utils.checkpoint_utils import (
+    load_state_with_compile_fallback,
+    unwrap_compiled_model,
+)
+from deberta.utils.io_utils import dump_json
+from deberta.utils.log_utils import setup_process_logging
+from deberta.utils.type_utils import coerce_scalar, unwrap_optional_type
 
 logger = logging.getLogger(__name__)
 _NONFINITE_LR_BACKOFF = 0.5

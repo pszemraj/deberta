@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from deberta.config import validate_run_metadata_schema
-from deberta.io_utils import load_json_mapping
+from deberta.utils.io_utils import load_json_mapping
 
 RUN_METADATA_FILENAME = "run_metadata.json"
 MODEL_CONFIG_FILENAME = "model_config.json"
