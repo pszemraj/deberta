@@ -695,20 +695,36 @@ def _sync_discriminator_embeddings_if_available(
     target_model = model
     if accelerator is not None:
         with suppress(Exception):
-            target_model = unwrap_compiled_model(accelerator, model)
+            target_model = accelerator.unwrap_model(model)
+        with suppress(Exception):
+            target_model = unwrap_compiled_model(accelerator, target_model)
+
+    fn = getattr(target_model, "sync_discriminator_embeddings_from_generator", None)
+    if not callable(fn):
+        return
+
+    # Avoid paying FSDP unshard/sync overhead when embedding sync is a no-op.
+    # Keep compatibility for external models that expose the hook but not the
+    # repo-specific GDES attributes.
+    embedding_sharing = getattr(target_model, "embedding_sharing", None)
+    if embedding_sharing is not None:
+        if str(embedding_sharing).strip().lower() != "gdes":
+            return
+        if not bool(getattr(target_model, "_gdes_synced_embeddings", None)):
+            return
 
     fsdp_sync_ctx = nullcontext()
     with suppress(Exception):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
 
         if isinstance(wrapped_model, FSDP):
-            fsdp_sync_ctx = FSDP.summon_full_params(wrapped_model, recurse=True, writeback=True)
+            # Summon only root-level parameters for GDES embedding sync to avoid
+            # recursive all-gathering of nested transformer FSDP shards.
+            fsdp_sync_ctx = FSDP.summon_full_params(wrapped_model, recurse=False, writeback=True)
 
     with fsdp_sync_ctx:
-        fn = getattr(target_model, "sync_discriminator_embeddings_from_generator", None)
-        if callable(fn):
-            with torch.no_grad():
-                fn()
+        with torch.no_grad():
+            fn()
 
 
 def _write_nonfinite_debug_artifact(

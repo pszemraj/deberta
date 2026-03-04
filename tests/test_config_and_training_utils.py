@@ -4230,6 +4230,86 @@ def test_sync_discriminator_embeddings_if_available_calls_hook_once():
     assert model.calls == 1
 
 
+def test_sync_discriminator_embeddings_if_available_skips_fsdp_summon_when_not_gdes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeFSDP(torch.nn.Module):
+        summon_calls = 0
+
+        @staticmethod
+        def summon_full_params(_module: torch.nn.Module, *, recurse: bool, writeback: bool):
+            del recurse, writeback
+            _FakeFSDP.summon_calls += 1
+            return _FakeCtx()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.embedding_sharing = "es"
+            self._gdes_synced_embeddings = [object()]
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    model = _FakeFSDP()
+    _sync_discriminator_embeddings_if_available(model)
+
+    assert model.calls == 0
+    assert _FakeFSDP.summon_calls == 0
+
+
+def test_sync_discriminator_embeddings_if_available_uses_non_recursive_fsdp_summon(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeFSDP(torch.nn.Module):
+        recurse_args: list[bool] = []
+        writeback_args: list[bool] = []
+
+        @staticmethod
+        def summon_full_params(_module: torch.nn.Module, *, recurse: bool, writeback: bool):
+            _FakeFSDP.recurse_args.append(bool(recurse))
+            _FakeFSDP.writeback_args.append(bool(writeback))
+            return _FakeCtx()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.embedding_sharing = "gdes"
+            self._gdes_synced_embeddings = [object()]
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    model = _FakeFSDP()
+    _sync_discriminator_embeddings_if_available(model)
+
+    assert model.calls == 1
+    assert _FakeFSDP.recurse_args == [False]
+    assert _FakeFSDP.writeback_args == [True]
+
+
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():
     batch = {
         "input_ids": torch.tensor([[1, 3, 11, 2, 0]], dtype=torch.long),
