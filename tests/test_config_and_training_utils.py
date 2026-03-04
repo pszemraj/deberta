@@ -2763,6 +2763,87 @@ def test_run_pretraining_compiles_generator_and_discriminator(
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
+def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes import _PRETRAINING_BATCH
+
+    pretrain_mod = setup_pretraining_mocks(monkeypatch)
+
+    batch_with_doc_ids: dict[str, torch.Tensor] = {
+        k: v.clone() for k, v in _PRETRAINING_BATCH.items() if isinstance(v, torch.Tensor)
+    }
+    batch_with_doc_ids["doc_ids"] = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+    expected_mask = pretrain_mod._build_doc_block_mask(batch_with_doc_ids["doc_ids"])
+
+    def _cycle_with_doc_ids(_loader: Any, *, start_epoch: int = 0):
+        del _loader, start_epoch
+        while True:
+            yield {k: v.clone() for k, v in batch_with_doc_ids.items()}
+
+    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _cycle_with_doc_ids)
+    monkeypatch.setattr(
+        pretrain_mod.torch,
+        "compile",
+        lambda target, *, mode="default", backend="inductor", dynamic=None: target,
+    )
+
+    seen_masks: list[torch.Tensor] = []
+    original_stabilize = pretrain_mod._stabilize_compile_attention_mask
+
+    def _stabilize_spy(
+        *,
+        batch: dict[str, Any],
+        compile_enabled: bool,
+        compile_scope: str,
+        backbone_type: str,
+        block_cross_document_attention: bool = False,
+    ) -> dict[str, Any]:
+        mask = batch.get("attention_mask")
+        if isinstance(mask, torch.Tensor):
+            seen_masks.append(mask.detach().clone())
+        return original_stabilize(
+            batch=batch,
+            compile_enabled=compile_enabled,
+            compile_scope=compile_scope,
+            backbone_type=backbone_type,
+            block_cross_document_attention=block_cross_document_attention,
+        )
+
+    monkeypatch.setattr(pretrain_mod, "_stabilize_compile_attention_mask", _stabilize_spy)
+
+    train_cfg = TrainConfig(
+        output_dir=str(tmp_path / "run"),
+        max_steps=1,
+        logging_steps=0,
+        save_steps=0,
+        report_to="none",
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=True,
+        torch_compile_scope="backbones",
+        export_hf_final=False,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=ModelConfig(backbone_type="rope"),
+        data_cfg=DataConfig(
+            dataset_name="hf-internal-testing/librispeech_asr_dummy",
+            block_cross_document_attention=True,
+        ),
+        train_cfg=train_cfg,
+    )
+
+    assert seen_masks
+    assert seen_masks[0].ndim == 3
+    assert seen_masks[0].dtype == torch.bool
+    assert torch.equal(seen_masks[0], expected_mask)
+
+
 def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4308,6 +4389,79 @@ def test_sync_discriminator_embeddings_if_available_uses_non_recursive_fsdp_summ
     assert model.calls == 1
     assert _FakeFSDP.recurse_args == [False]
     assert _FakeFSDP.writeback_args == [True]
+
+
+def test_sync_discriminator_embeddings_if_available_propagates_fsdp_summon_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeFSDP(torch.nn.Module):
+        @staticmethod
+        def summon_full_params(_module: torch.nn.Module, *, recurse: bool, writeback: bool):
+            del recurse, writeback
+            raise RuntimeError("boom")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding_sharing = "gdes"
+            self._gdes_synced_embeddings = [object()]
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            raise AssertionError("sync hook should not run when summon_full_params fails")
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _FakeFSDP
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _sync_discriminator_embeddings_if_available(_FakeFSDP())
+
+
+def test_sync_discriminator_embeddings_if_available_supports_fsdp2_unshard_reshard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _Handle:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self) -> None:
+            self.wait_calls += 1
+
+    class _FakeFSDPModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.unshard_calls = 0
+            self.reshard_calls = 0
+            self.handle = _Handle()
+            self.embedding_sharing = "gdes"
+            self._gdes_synced_embeddings = [object()]
+
+        def unshard(self, async_op: bool = False):
+            assert bool(async_op) is False
+            self.unshard_calls += 1
+            return self.handle
+
+        def reshard(self) -> None:
+            self.reshard_calls += 1
+
+        def sync_discriminator_embeddings_from_generator(self) -> None:
+            self.calls += 1
+
+    class _DummyFSDP(torch.nn.Module):
+        pass
+
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.FullyShardedDataParallel = _DummyFSDP
+    fake_fsdp.FSDPModule = _FakeFSDPModule
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    model = _FakeFSDPModule()
+    _sync_discriminator_embeddings_if_available(model)
+
+    assert model.calls == 1
+    assert model.unshard_calls == 1
+    assert model.handle.wait_calls == 1
+    assert model.reshard_calls == 1
 
 
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():

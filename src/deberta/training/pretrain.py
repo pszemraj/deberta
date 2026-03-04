@@ -713,18 +713,41 @@ def _sync_discriminator_embeddings_if_available(
         if not bool(getattr(target_model, "_gdes_synced_embeddings", None)):
             return
 
-    fsdp_sync_ctx = nullcontext()
-    with suppress(Exception):
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
+    fsdp_cls = None
+    fsdp2_module_cls = None
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as fsdp_cls  # type: ignore
+    except ImportError:
+        fsdp_cls = None
+    try:
+        from torch.distributed.fsdp import FSDPModule as fsdp2_module_cls  # type: ignore
+    except ImportError:
+        fsdp2_module_cls = None
 
-        if isinstance(wrapped_model, FSDP):
-            # Summon only root-level parameters for GDES embedding sync to avoid
-            # recursive all-gathering of nested transformer FSDP shards.
-            fsdp_sync_ctx = FSDP.summon_full_params(wrapped_model, recurse=False, writeback=True)
+    if fsdp_cls is not None and isinstance(wrapped_model, fsdp_cls):
+        # FSDP1 wrapper path: summon only root-level params to avoid recursive
+        # all-gathering of nested transformer shards.
+        with fsdp_cls.summon_full_params(wrapped_model, recurse=False, writeback=True):
+            with torch.no_grad():
+                fn()
+        return
 
-    with fsdp_sync_ctx:
-        with torch.no_grad():
-            fn()
+    if fsdp2_module_cls is not None and isinstance(wrapped_model, fsdp2_module_cls):
+        # FSDP2 (fully_shard) path: unshard/reshard around sync to avoid calling
+        # sync_from() on sharded DTensor parameters.
+        handle = wrapped_model.unshard(async_op=False)
+        if handle is not None:
+            handle.wait()
+        try:
+            with torch.no_grad():
+                fn()
+        finally:
+            wrapped_model.reshard()
+        return
+
+    # Non-FSDP path.
+    with torch.no_grad():
+        fn()
 
 
 def _write_nonfinite_debug_artifact(
@@ -2562,6 +2585,9 @@ def run_pretraining(
                 # Phase 1: generator update + corruption target construction.
                 for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                     batch = _move_batch_to_device(batch, accelerator.device)
+                    doc_ids = batch.pop("doc_ids", None)
+                    if doc_ids is not None:
+                        batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                     batch = _stabilize_compile_attention_mask(
                         batch=batch,
                         compile_enabled=compile_enabled,
@@ -2569,9 +2595,6 @@ def run_pretraining(
                         backbone_type=str(model_cfg.backbone_type),
                         block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                     )
-                    doc_ids = batch.pop("doc_ids", None)
-                    if doc_ids is not None:
-                        batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                     if compile_enabled:
                         _maybe_cudagraph_mark_step_begin()
 
@@ -3089,6 +3112,9 @@ def run_pretraining(
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
+                doc_ids = batch.pop("doc_ids", None)
+                if doc_ids is not None:
+                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
@@ -3096,9 +3122,6 @@ def run_pretraining(
                     backbone_type=str(model_cfg.backbone_type),
                     block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
                 )
-                doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None:
-                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()
 

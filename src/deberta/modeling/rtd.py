@@ -498,6 +498,11 @@ class EnhancedMaskDecoder(nn.Module):
         z_states = self._position_states(
             embeddings=embeddings, position_ids=position_ids, hidden_size=hidden_size
         )
+        # Parity with upstream DeBERTa EMD path: normalize position states with
+        # embedding LayerNorm before combining with penultimate hidden states.
+        emb_ln = getattr(embeddings, "LayerNorm", None)
+        if callable(emb_ln):
+            z_states = emb_ln(z_states)
 
         # Initial query = z + KV (matches original `z_states += hidden_states`).
         query_states = z_states + kv_states

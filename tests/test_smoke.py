@@ -1125,6 +1125,86 @@ def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_act
     assert int(out.gen_token_count.item()) == 1
 
 
+def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rtd import EnhancedMaskDecoder
+
+    class _Cfg:
+        position_biased_input = False
+
+    class _PositionEmbeddings(torch.nn.Module):
+        def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+            bsz, seq_len = position_ids.shape
+            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
+
+    class _ShiftNorm(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return x + 5.0
+
+    class _Embeddings(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.position_embeddings = _PositionEmbeddings()
+            self.LayerNorm = _ShiftNorm()
+
+    class _LastLayer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_states_seen: torch.Tensor | None = None
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            *,
+            output_attentions: bool = False,
+            query_states: torch.Tensor | None = None,
+            relative_pos: torch.Tensor | None = None,
+            rel_embeddings: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, None]:
+            del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
+            assert query_states is not None
+            self.query_states_seen = query_states.detach().clone()
+            return query_states, None
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self, layer: torch.nn.Module) -> None:
+            super().__init__()
+            self.layer = torch.nn.ModuleList([layer])
+
+    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
+    last_layer = _LastLayer()
+    encoder = _Encoder(last_layer)
+    embeddings = _Embeddings()
+
+    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
+    encoder_hidden_states = [kv_states, kv_states + 1.0]
+    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    attention_mask = torch.ones((1, 3), dtype=torch.bool)
+
+    masked = decoder(
+        encoder_hidden_states=encoder_hidden_states,
+        masked_positions=masked_positions,
+        attention_mask=attention_mask,
+        embeddings=embeddings,
+        encoder=encoder,
+    )
+
+    expected_query = kv_states + 5.0
+    assert embeddings.LayerNorm.calls == 1
+    assert last_layer.query_states_seen is not None
+    torch.testing.assert_close(last_layer.query_states_seen, expected_query, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(masked, expected_query[:, 1:2, :].reshape(1, 4), rtol=0.0, atol=0.0)
+
+
 def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
     import pytest
 
@@ -1675,6 +1755,70 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
 
     torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
+
+
+def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = DebertaV2Config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type="c2p",
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = "cached_bmm"
+    attn = DisentangledSelfAttention(cfg).eval()
+
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+
+    def _fake_project_rel(_rel_embeddings: torch.Tensor, *, use_query: bool) -> torch.Tensor:
+        del _rel_embeddings, use_query
+        return torch.randn(
+            (cfg.num_attention_heads, 2 * cfg.max_position_embeddings, head_dim),
+            dtype=torch.bfloat16,
+        )
+
+    monkeypatch.setattr(attn, "_project_rel", _fake_project_rel)
+
+    bmm_dtypes: list[tuple[torch.dtype, torch.dtype]] = []
+    original_bmm = torch.bmm
+
+    def _checked_bmm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        bmm_dtypes.append((lhs.dtype, rhs.dtype))
+        assert lhs.dtype == torch.float32
+        assert rhs.dtype == torch.float32
+        return original_bmm(lhs, rhs)
+
+    monkeypatch.setattr(torch, "bmm", _checked_bmm)
+
+    bsz, nheads, qlen, klen = 2, cfg.num_attention_heads, 4, 4
+    query = torch.randn((bsz, nheads, qlen, head_dim), dtype=torch.float32)
+    key = torch.randn((bsz, nheads, klen, head_dim), dtype=torch.float32)
+    rel_embeddings = torch.randn((2 * cfg.max_position_embeddings, cfg.hidden_size), dtype=torch.float32)
+
+    out = attn.disentangled_attention_bias(
+        query_layer=query,
+        key_layer=key,
+        relative_pos=None,
+        rel_embeddings=rel_embeddings,
+        scale_factor=2,
+    )
+
+    assert out.shape == (bsz, nheads, qlen, klen)
+    assert bmm_dtypes
 
 
 def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():

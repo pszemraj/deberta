@@ -464,9 +464,11 @@ class DisentangledSelfAttention(nn.Module):
         pos_query_layer: torch.Tensor | None = None
 
         if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False)  # (H,2A,D)
+            # Keep relative-bias kernels on the same dtype contract as the caller's
+            # query/key score path (fp32 in stabilized attention forward).
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
         if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True)  # (H,2A,D)
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
 
         if "c2p" in self.pos_att_type:
             if pos_key_layer is None:
