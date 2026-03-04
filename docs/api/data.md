@@ -9,7 +9,14 @@ Data utilities for DeBERTaV3 pretraining.
 ## `DebertaV3ElectraCollator`
 
 ```python
-class DebertaV3ElectraCollator(*, tokenizer: 'Any', cfg: 'MLMConfig', packed_sequences: 'bool' = False, block_cross_document_attention: 'bool' = True, pad_to_multiple_of: 'int | None' = None) -> 'None'
+class DebertaV3ElectraCollator(
+    *,
+    tokenizer: 'Any',
+    cfg: 'MLMConfig',
+    packed_sequences: 'bool' = False,
+    block_cross_document_attention: 'bool' = True,
+    pad_to_multiple_of: 'int | None' = None,
+) -> 'None'
 ```
 
 Dynamic MLM masking collator suitable for RTD/ELECTRA-style pretraining.
@@ -29,7 +36,12 @@ special ids so upstream partial masks cannot unprotect tokenizer specials.
 ## `load_hf_dataset`
 
 ```python
-load_hf_dataset(*, cfg: 'Any', split: 'str', streaming: 'bool') -> 'Any'
+load_hf_dataset(
+    *,
+    cfg: 'Any',
+    split: 'str',
+    streaming: 'bool',
+) -> 'Any'
 ```
 
 Load a dataset split using 🤗 Datasets.
@@ -55,7 +67,14 @@ to ``datasets.load_dataset`` for builders that support local files (for example 
 ## `PackedStreamingDataset`
 
 ```python
-class PackedStreamingDataset(*, hf_dataset: 'Any', tokenizer: 'Any', cfg: 'PackedStreamingConfig', process_index: 'int' = 0, num_processes: 'int' = 1) -> 'None'
+class PackedStreamingDataset(
+    *,
+    hf_dataset: 'Any',
+    tokenizer: 'Any',
+    cfg: 'PackedStreamingConfig',
+    process_index: 'int' = 0,
+    num_processes: 'int' = 1,
+) -> 'None'
 ```
 
 Packs a streaming HF IterableDataset of text into fixed-length token blocks.
@@ -89,7 +108,14 @@ Forward epoch to underlying dataset when supported.
 ## `SequentialStreamingDataset`
 
 ```python
-class SequentialStreamingDataset(*, hf_dataset: 'Any', tokenizer: 'Any', cfg: 'PackedStreamingConfig', process_index: 'int' = 0, num_processes: 'int' = 1) -> 'None'
+class SequentialStreamingDataset(
+    *,
+    hf_dataset: 'Any',
+    tokenizer: 'Any',
+    cfg: 'PackedStreamingConfig',
+    process_index: 'int' = 0,
+    num_processes: 'int' = 1,
+) -> 'None'
 ```
 
 One-document-per-sequence dataset (reference mode without cross-document packing).

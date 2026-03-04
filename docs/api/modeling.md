@@ -9,7 +9,17 @@ Model components for DeBERTaV3 RTD pretraining.
 ## `DebertaV3RTDPretrainer`
 
 ```python
-class DebertaV3RTDPretrainer(*, discriminator_backbone: 'nn.Module', generator_backbone: 'nn.Module', disc_config: 'Any', gen_config: 'Any', embedding_sharing: 'str' = 'gdes', tie_generator_word_embeddings: 'bool' = True, use_enhanced_mask_decoder: 'bool' = True, additional_forbidden_token_ids: 'Iterable[int] | None' = None) -> 'None'
+class DebertaV3RTDPretrainer(
+    *,
+    discriminator_backbone: 'nn.Module',
+    generator_backbone: 'nn.Module',
+    disc_config: 'Any',
+    gen_config: 'Any',
+    embedding_sharing: 'str' = 'gdes',
+    tie_generator_word_embeddings: 'bool' = True,
+    use_enhanced_mask_decoder: 'bool' = True,
+    additional_forbidden_token_ids: 'Iterable[int] | None' = None,
+) -> 'None'
 ```
 
 Generator + discriminator pretraining module (DeBERTaV3 / ELECTRA objective).
@@ -31,7 +41,15 @@ Must be called after each optimizer step and after checkpoint load.
 #### `forward_generator_phase`
 
 ```python
-forward_generator_phase(self, *, input_ids: 'torch.Tensor', attention_mask: 'torch.Tensor | None' = None, labels: 'torch.Tensor', token_type_ids: 'torch.Tensor | None' = None, sampling_temperature: 'float' = 1.0) -> 'RTDGeneratorPhaseOutput'
+forward_generator_phase(
+    self,
+    *,
+    input_ids: 'torch.Tensor',
+    attention_mask: 'torch.Tensor | None' = None,
+    labels: 'torch.Tensor',
+    token_type_ids: 'torch.Tensor | None' = None,
+    sampling_temperature: 'float' = 1.0,
+) -> 'RTDGeneratorPhaseOutput'
 ```
 
 `method`
@@ -53,7 +71,15 @@ Run generator forward/corruption only, returning discriminator targets.
 #### `forward_discriminator_phase`
 
 ```python
-forward_discriminator_phase(self, *, input_ids: 'torch.Tensor', corrupted_input_ids: 'torch.Tensor', disc_labels: 'torch.Tensor', attention_mask: 'torch.Tensor | None' = None, token_type_ids: 'torch.Tensor | None' = None) -> 'RTDDiscriminatorPhaseOutput'
+forward_discriminator_phase(
+    self,
+    *,
+    input_ids: 'torch.Tensor',
+    corrupted_input_ids: 'torch.Tensor',
+    disc_labels: 'torch.Tensor',
+    attention_mask: 'torch.Tensor | None' = None,
+    token_type_ids: 'torch.Tensor | None' = None,
+) -> 'RTDDiscriminatorPhaseOutput'
 ```
 
 `method`
@@ -75,7 +101,20 @@ Run discriminator scoring only, given prebuilt corrupted ids/labels.
 #### `forward`
 
 ```python
-forward(self, *, input_ids: 'torch.Tensor', attention_mask: 'torch.Tensor | None' = None, labels: 'torch.Tensor | None' = None, token_type_ids: 'torch.Tensor | None' = None, sampling_temperature: 'float' = 1.0, gen_loss_weight: 'float' = 1.0, disc_loss_weight: 'float' = 50.0, phase: 'str' = 'both', corrupted_input_ids: 'torch.Tensor | None' = None, disc_labels: 'torch.Tensor | None' = None) -> 'RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput'
+forward(
+    self,
+    *,
+    input_ids: 'torch.Tensor',
+    attention_mask: 'torch.Tensor | None' = None,
+    labels: 'torch.Tensor | None' = None,
+    token_type_ids: 'torch.Tensor | None' = None,
+    sampling_temperature: 'float' = 1.0,
+    gen_loss_weight: 'float' = 1.0,
+    disc_loss_weight: 'float' = 50.0,
+    phase: 'str' = 'both',
+    corrupted_input_ids: 'torch.Tensor | None' = None,
+    disc_labels: 'torch.Tensor | None' = None,
+) -> 'RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput'
 ```
 
 `method`
@@ -102,7 +141,12 @@ Run RTD forward in combined or phase-specific mode.
 ## `build_backbone_configs`
 
 ```python
-build_backbone_configs(*, model_cfg: 'ModelConfig', tokenizer: 'Any', max_position_embeddings: 'int') -> 'tuple[Any, Any]'
+build_backbone_configs(
+    *,
+    model_cfg: 'ModelConfig',
+    tokenizer: 'Any',
+    max_position_embeddings: 'int',
+) -> 'tuple[Any, Any]'
 ```
 
 Build discriminator + generator configs.
@@ -128,7 +172,13 @@ Generator config is loaded if specified, otherwise derived from discriminator co
 ## `build_backbones`
 
 ```python
-build_backbones(*, model_cfg: 'ModelConfig', disc_config: 'Any', gen_config: 'Any', load_pretrained_weights: 'bool' = True) -> 'tuple[Any, Any]'
+build_backbones(
+    *,
+    model_cfg: 'ModelConfig',
+    disc_config: 'Any',
+    gen_config: 'Any',
+    load_pretrained_weights: 'bool' = True,
+) -> 'tuple[Any, Any]'
 ```
 
 Instantiate discriminator + generator backbones.
@@ -147,7 +197,29 @@ Instantiate discriminator + generator backbones.
 ## `DebertaV2Config`
 
 ```python
-class DebertaV2Config(vocab_size=128100, hidden_size=1536, num_hidden_layers=24, num_attention_heads=24, intermediate_size=6144, hidden_act='gelu', hidden_dropout_prob=0.1, attention_probs_dropout_prob=0.1, max_position_embeddings=512, type_vocab_size=0, initializer_range=0.02, layer_norm_eps=1e-07, relative_attention=False, max_relative_positions=-1, pad_token_id=0, position_biased_input=True, pos_att_type=None, pooler_dropout=0, pooler_hidden_act='gelu', legacy=True, **kwargs)
+class DebertaV2Config(
+    vocab_size=128100,
+    hidden_size=1536,
+    num_hidden_layers=24,
+    num_attention_heads=24,
+    intermediate_size=6144,
+    hidden_act='gelu',
+    hidden_dropout_prob=0.1,
+    attention_probs_dropout_prob=0.1,
+    max_position_embeddings=512,
+    type_vocab_size=0,
+    initializer_range=0.02,
+    layer_norm_eps=1e-07,
+    relative_attention=False,
+    max_relative_positions=-1,
+    pad_token_id=0,
+    position_biased_input=True,
+    pos_att_type=None,
+    pooler_dropout=0,
+    pooler_hidden_act='gelu',
+    legacy=True,
+    **kwargs,
+)
 ```
 
 This is the configuration class to store the configuration of a [`DebertaV2Model`]. It is used to instantiate a
@@ -237,7 +309,17 @@ Replace input word embedding module.
 #### `forward`
 
 ```python
-forward(self, input_ids: 'torch.Tensor | None' = None, attention_mask: 'torch.Tensor | None' = None, token_type_ids: 'torch.Tensor | None' = None, position_ids: 'torch.Tensor | None' = None, inputs_embeds: 'torch.Tensor | None' = None, output_attentions: 'bool | None' = None, output_hidden_states: 'bool | None' = None, return_dict: 'bool | None' = None) -> 'BaseModelOutput | tuple[torch.Tensor, ...]'
+forward(
+    self,
+    input_ids: 'torch.Tensor | None' = None,
+    attention_mask: 'torch.Tensor | None' = None,
+    token_type_ids: 'torch.Tensor | None' = None,
+    position_ids: 'torch.Tensor | None' = None,
+    inputs_embeds: 'torch.Tensor | None' = None,
+    output_attentions: 'bool | None' = None,
+    output_hidden_states: 'bool | None' = None,
+    return_dict: 'bool | None' = None,
+) -> 'BaseModelOutput | tuple[torch.Tensor, ...]'
 ```
 
 `method`
@@ -266,7 +348,32 @@ Run DeBERTa-v2 encoder forward pass.
 ## `DebertaRoPEConfig`
 
 ```python
-class DebertaRoPEConfig(*, vocab_size: 'int' = 50265, hidden_size: 'int' = 768, num_hidden_layers: 'int' = 12, num_attention_heads: 'int' = 12, intermediate_size: 'int' = 3072, hidden_act: 'str' = 'gelu', ffn_type: 'str' = 'swiglu', use_bias: 'bool' = False, hidden_dropout_prob: 'float' = 0.0, attention_probs_dropout_prob: 'float' = 0.0, max_position_embeddings: 'int' = 512, type_vocab_size: 'int' = 2, pad_token_id: 'int' = 0, rope_theta: 'float' = 10000.0, rotary_pct: 'float' = 1.0, use_absolute_position_embeddings: 'bool' = False, norm_eps: 'float' = 1e-06, norm_arch: 'str' = 'post', keel_alpha_init: 'float | None' = None, keel_alpha_learnable: 'bool' = False, attention_implementation: 'str' = 'sdpa', initializer_range: 'float' = 0.02, **kwargs: 'Any') -> 'None'
+class DebertaRoPEConfig(
+    *,
+    vocab_size: 'int' = 50265,
+    hidden_size: 'int' = 768,
+    num_hidden_layers: 'int' = 12,
+    num_attention_heads: 'int' = 12,
+    intermediate_size: 'int' = 3072,
+    hidden_act: 'str' = 'gelu',
+    ffn_type: 'str' = 'swiglu',
+    use_bias: 'bool' = False,
+    hidden_dropout_prob: 'float' = 0.0,
+    attention_probs_dropout_prob: 'float' = 0.0,
+    max_position_embeddings: 'int' = 512,
+    type_vocab_size: 'int' = 2,
+    pad_token_id: 'int' = 0,
+    rope_theta: 'float' = 10000.0,
+    rotary_pct: 'float' = 1.0,
+    use_absolute_position_embeddings: 'bool' = False,
+    norm_eps: 'float' = 1e-06,
+    norm_arch: 'str' = 'post',
+    keel_alpha_init: 'float | None' = None,
+    keel_alpha_learnable: 'bool' = False,
+    attention_implementation: 'str' = 'sdpa',
+    initializer_range: 'float' = 0.02,
+    **kwargs: 'Any',
+) -> 'None'
 ```
 
 Config for the modernized RoPE encoder backbone.
@@ -312,7 +419,15 @@ Replace input word embedding module.
 #### `forward`
 
 ```python
-forward(self, input_ids: 'torch.Tensor', attention_mask: 'torch.Tensor | None' = None, token_type_ids: 'torch.Tensor | None' = None, output_hidden_states: 'bool | None' = None, output_attentions: 'bool | None' = None, return_dict: 'bool | None' = None) -> 'BaseModelOutput | tuple[torch.Tensor, ...]'
+forward(
+    self,
+    input_ids: 'torch.Tensor',
+    attention_mask: 'torch.Tensor | None' = None,
+    token_type_ids: 'torch.Tensor | None' = None,
+    output_hidden_states: 'bool | None' = None,
+    output_attentions: 'bool | None' = None,
+    return_dict: 'bool | None' = None,
+) -> 'BaseModelOutput | tuple[torch.Tensor, ...]'
 ```
 
 `method`

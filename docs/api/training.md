@@ -9,7 +9,15 @@ Training entry points.
 ## `run_pretraining`
 
 ```python
-run_pretraining(*, model_cfg: 'ModelConfig', data_cfg: 'DataConfig', train_cfg: 'TrainConfig', optim_cfg: 'OptimConfig | None' = None, logging_cfg: 'LoggingConfig | None' = None, config_path: 'str | Path | None' = None) -> 'None'
+run_pretraining(
+    *,
+    model_cfg: 'ModelConfig',
+    data_cfg: 'DataConfig',
+    train_cfg: 'TrainConfig',
+    optim_cfg: 'OptimConfig | None' = None,
+    logging_cfg: 'LoggingConfig | None' = None,
+    config_path: 'str | Path | None' = None,
+) -> 'None'
 ```
 
 Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
@@ -26,7 +34,15 @@ Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
 ## `run_pretraining_dry_run`
 
 ```python
-run_pretraining_dry_run(*, model_cfg: 'ModelConfig', data_cfg: 'DataConfig', train_cfg: 'TrainConfig', optim_cfg: 'OptimConfig | None' = None, logging_cfg: 'LoggingConfig | None' = None, config_path: 'str | Path | None' = None) -> 'dict[str, Any]'
+run_pretraining_dry_run(
+    *,
+    model_cfg: 'ModelConfig',
+    data_cfg: 'DataConfig',
+    train_cfg: 'TrainConfig',
+    optim_cfg: 'OptimConfig | None' = None,
+    logging_cfg: 'LoggingConfig | None' = None,
+    config_path: 'str | Path | None' = None,
+) -> 'dict[str, Any]'
 ```
 
 Run non-destructive preflight checks for `deberta train`.

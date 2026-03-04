@@ -40,8 +40,138 @@ def _format_signature(value: Any, *, prefix: str = "") -> str | None:
     return f"{prefix}{sig}" if prefix else f"{sig}"
 
 
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    in_single = False
+    in_double = False
+    escape_next = False
+
+    for ch in value:
+        if escape_next:
+            current.append(ch)
+            escape_next = False
+            continue
+
+        if ch == "\\":
+            current.append(ch)
+            if in_single or in_double:
+                escape_next = True
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+            continue
+
+        if in_single or in_double:
+            current.append(ch)
+            continue
+
+        if ch == "(":
+            paren_depth += 1
+            current.append(ch)
+            continue
+        if ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+            current.append(ch)
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            current.append(ch)
+            continue
+        if ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            current.append(ch)
+            continue
+        if ch == "{":
+            brace_depth += 1
+            current.append(ch)
+            continue
+        if ch == "}":
+            brace_depth = max(0, brace_depth - 1)
+            current.append(ch)
+            continue
+
+        if ch == "," and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+
+        current.append(ch)
+
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _format_signature_multiline(
+    signature: str,
+    *,
+    max_width: int = 100,
+    indent: int = 4,
+    min_params_for_wrap: int = 4,
+) -> list[str]:
+    text = signature.strip()
+    if not text:
+        return [text]
+
+    open_idx = text.find("(")
+    if open_idx < 0:
+        return [text]
+    close_idx = _find_matching_paren(text, open_idx)
+    if close_idx < 0:
+        return [text]
+
+    params_blob = text[open_idx + 1 : close_idx].strip()
+    params = _split_top_level_commas(params_blob) if params_blob else []
+    suffix = text[close_idx + 1 :].strip()
+
+    should_wrap = len(text) > max_width or len(params) >= min_params_for_wrap
+    if not should_wrap:
+        return [text]
+
+    lines: list[str] = [f"{text[: open_idx + 1]}"]
+    pad = " " * int(indent)
+    for param in params:
+        lines.append(f"{pad}{param},")
+
+    closing = ")"
+    suffix_line = f"{closing} {suffix}".rstrip()
+    if suffix and len(suffix_line) > max_width:
+        lines.append(closing)
+        lines.append(f"{pad}{suffix}")
+    else:
+        lines.append(suffix_line if suffix else closing)
+    return lines
+
+
 def _render_signature_block(signature: str) -> list[str]:
-    return ["```python", signature, "```", ""]
+    lines = ["```python"]
+    lines.extend(_format_signature_multiline(signature))
+    lines.extend(["```", ""])
+    return lines
 
 
 def _clean_doc_lines(doc: str) -> list[str]:
