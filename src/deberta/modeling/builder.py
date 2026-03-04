@@ -192,10 +192,13 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     from_scratch = bool(model_cfg.from_scratch)
 
     if bt == "hf_deberta_v2":
+        disc_cfg_source = None if from_scratch else model_cfg.pretrained_discriminator_path
         discriminator = _ResolvedComponentSources(
             component="discriminator",
-            config_source=None,
-            config_origin="repo_hf_defaults",
+            config_source=disc_cfg_source,
+            config_origin=(
+                "repo_hf_defaults" if disc_cfg_source is None else "pretrained_discriminator_path"
+            ),
             weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
             weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
@@ -738,9 +741,10 @@ def build_backbone_configs(
 ) -> tuple[Any, Any]:
     """Build discriminator + generator configs.
 
-    - For backbone_type='hf_deberta_v2': discriminator config is synthesized from repo defaults;
-      generator config is derived from discriminator unless
-      ``model.pretrained.generator_path`` is set, in which case that config is loaded.
+    - For backbone_type='hf_deberta_v2': discriminator config is synthesized from repo defaults
+      for scratch runs, or loaded from ``model.pretrained.discriminator_path`` for pretrained runs.
+      Generator config is derived from discriminator unless ``model.pretrained.generator_path``
+      is set, in which case that config is loaded.
     - For backbone_type='rope': returns DebertaRoPEConfig instances.
 
     Generator config is loaded if specified, otherwise derived from discriminator config.
@@ -755,8 +759,20 @@ def build_backbone_configs(
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
-        disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
-        if resolved.generator.config_source is None:
+        if resolved.discriminator.config_source is None:
+            disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
+        else:
+            try:
+                disc_cfg = DebertaV2Config.from_pretrained(resolved.discriminator.config_source)
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to load discriminator HF config from source "
+                    f"'{resolved.discriminator.config_source}' "
+                    f"(resolved from {resolved.discriminator.config_origin})."
+                ) from e
+
+        generator_from_explicit_source = resolved.generator.config_source is not None
+        if not generator_from_explicit_source:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
         else:
             try:
@@ -768,11 +784,13 @@ def build_backbone_configs(
                     f"(resolved from {resolved.generator.config_origin})."
                 ) from e
 
-        # Match released DeBERTa-v3 xsmall generator behavior.
-        if str(model_cfg.hf_model_size).strip().lower() == "xsmall":
-            gen_cfg.z_steps = 2
-        else:
-            gen_cfg.z_steps = 0
+        # Match released DeBERTa-v3 xsmall generator behavior for derived configs.
+        # Explicit generator configs keep their own z_steps contract.
+        if not generator_from_explicit_source:
+            if str(model_cfg.hf_model_size).strip().lower() == "xsmall":
+                gen_cfg.z_steps = 2
+            else:
+                gen_cfg.z_steps = 0
 
         _apply_hf_config_normalization(
             disc_cfg,

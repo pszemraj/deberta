@@ -134,13 +134,14 @@ def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
         "from_scratch",
         "pretrained_generator_path",
         "tokenizer_vocab",
-        "expected_hf_cfg_calls",
+        "expected_repo_calls",
+        "expected_hf_cfg_sources",
     ),
     [
-        (True, None, 50265, 0),
-        (False, None, 128100, 0),
-        (False, "gen_weights", 128100, 1),
-        (True, "gen_weights", 50265, 1),
+        (True, None, 50265, 1, []),
+        (False, None, 128100, 0, ["disc_weights"]),
+        (False, "gen_weights", 128100, 0, ["disc_weights", "gen_weights"]),
+        (True, "gen_weights", 50265, 1, ["gen_weights"]),
     ],
 )
 def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_explicit(
@@ -148,7 +149,8 @@ def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_expl
     from_scratch: bool,
     pretrained_generator_path: str | None,
     tokenizer_vocab: int,
-    expected_hf_cfg_calls: int,
+    expected_repo_calls: int,
+    expected_hf_cfg_sources: list[str],
 ):
     pytest.importorskip("transformers")
 
@@ -210,17 +212,23 @@ def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_expl
         max_position_embeddings=128,
     )
 
-    assert int(repo_called["count"]) == 1
+    assert int(repo_called["count"]) == int(expected_repo_calls)
     assert int(rope_called["count"]) == 0
-    assert int(hf_cfg_called["count"]) == int(expected_hf_cfg_calls)
-    if int(expected_hf_cfg_calls) > 0:
-        assert hf_cfg_called["sources"] == [str(pretrained_generator_path)]
+    assert int(hf_cfg_called["count"]) == len(expected_hf_cfg_sources)
+    if expected_hf_cfg_sources:
+        assert hf_cfg_called["sources"] == [str(src) for src in expected_hf_cfg_sources]
         assert int(gen_cfg.hidden_size) == 384
-        assert int(gen_cfg.num_hidden_layers) == 5
-    else:
+        if pretrained_generator_path is not None:
+            assert int(gen_cfg.num_hidden_layers) == 5
+        else:
+            assert int(gen_cfg.num_hidden_layers) == 2
+    elif from_scratch:
         assert int(gen_cfg.hidden_size) == 768
         assert int(gen_cfg.num_hidden_layers) == 6
-    assert int(disc_cfg.hidden_size) > 0
+    if from_scratch:
+        assert int(disc_cfg.hidden_size) == 768
+    else:
+        assert int(disc_cfg.hidden_size) == 384
     assert int(gen_cfg.hidden_size) > 0
 
 
@@ -409,8 +417,8 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
         ("rope", False, None, "disc", "disc", None, "disc", True),
         ("rope", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
         ("hf_deberta_v2", True, None, None, None, None, None, True),
-        ("hf_deberta_v2", False, None, None, "disc", None, "disc", True),
-        ("hf_deberta_v2", False, "gen_model", None, "disc", "gen_model", "gen_model", False),
+        ("hf_deberta_v2", False, None, "disc", "disc", None, "disc", True),
+        ("hf_deberta_v2", False, "gen_model", "disc", "disc", "gen_model", "gen_model", False),
     ],
 )
 def test_resolve_backbone_sources_matrix(
@@ -614,6 +622,40 @@ def _patch_repo_hf_base_config(
     monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _factory)
 
 
+def _patch_hf_pretrained_config_loader(
+    monkeypatch: pytest.MonkeyPatch, *, config_overrides: dict[str, object] | None = None
+) -> None:
+    """Patch ``DebertaV2Config.from_pretrained`` for deterministic pretrained-HF tests."""
+    overrides = dict(config_overrides or {})
+
+    def _loader(cls, src: str, **kwargs: Any) -> Any:
+        del cls
+        del src
+        del kwargs
+        cfg = builder_mod.DebertaV2Config(
+            vocab_size=128100,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            max_position_embeddings=512,
+            relative_attention=True,
+            pos_att_type=["p2c", "c2p"],
+            position_biased_input=False,
+            share_att_key=True,
+            type_vocab_size=0,
+        )
+        for key, value in overrides.items():
+            setattr(cfg, str(key), value)
+        return cfg
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_loader),
+    )
+
+
 _USE_MODEL_DEFAULT = object()
 
 
@@ -643,6 +685,7 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     expected_attn: float,
 ):
     pytest.importorskip("transformers")
+    _patch_hf_pretrained_config_loader(monkeypatch)
 
     model_kwargs: dict[str, object] = dict(
         backbone_type="hf_deberta_v2",
@@ -711,6 +754,53 @@ def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
     assert int(getattr(gen_cfg, "z_steps", 0)) == gen_z_steps
 
 
+def test_build_backbone_configs_hf_deberta_preserves_explicit_generator_z_steps(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("transformers")
+
+    def _fake_hf_cfg_pretrained(cls, src: str, **kwargs: Any):
+        del cls
+        del kwargs
+        if str(src) != "gen_model":
+            raise AssertionError(f"Unexpected HF config source: {src}")
+        return builder_mod.DebertaV2Config(
+            vocab_size=50265,
+            hidden_size=384,
+            num_hidden_layers=5,
+            num_attention_heads=6,
+            intermediate_size=1536,
+            max_position_embeddings=512,
+            relative_attention=True,
+            pos_att_type=["p2c", "c2p"],
+            position_biased_input=False,
+            share_att_key=True,
+            type_vocab_size=0,
+            z_steps=7,
+        )
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_hf_cfg_pretrained),
+    )
+
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=True,
+        hf_model_size="xsmall",
+        pretrained_generator_path="gen_model",
+    )
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=DummyTokenizer(vocab_size=50265),
+        max_position_embeddings=128,
+    )
+
+    assert int(getattr(disc_cfg, "z_steps", 0)) == 0
+    assert int(getattr(gen_cfg, "z_steps", 0)) == 7
+
+
 def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():
     pytest.importorskip("transformers")
 
@@ -754,7 +844,7 @@ def test_build_backbone_configs_pretrained_hf_can_auto_grow_tokenizer_to_config_
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
-    _patch_repo_hf_base_config(monkeypatch, config_overrides={"vocab_size": 512})
+    _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"vocab_size": 512})
 
     tokenizer = DummyTokenizer(vocab_size=500)
     model_cfg = ModelConfig(
@@ -778,7 +868,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
-    _patch_repo_hf_base_config(monkeypatch, config_overrides={"vocab_size": 500})
+    _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"vocab_size": 500})
 
     model_cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -797,7 +887,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
 
 def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
-    _patch_repo_hf_base_config(monkeypatch, config_overrides={"vocab_size": 777})
+    _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"vocab_size": 777})
 
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
@@ -814,7 +904,7 @@ def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch
 
 def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("transformers")
-    _patch_repo_hf_base_config(monkeypatch, config_overrides={"cls_token_id": 404})
+    _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"cls_token_id": 404})
 
     cfg = ModelConfig(
         backbone_type="hf_deberta_v2",
