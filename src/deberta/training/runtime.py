@@ -153,6 +153,59 @@ def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
     return {}
 
 
+def _resolve_optimizer_hyperparams(
+    *,
+    cfg: TrainConfig,
+    mixed_precision: str,
+) -> tuple[float, tuple[float, float], float, float, dict[str, Any]]:
+    """Resolve shared AdamW hyperparameters for optimizer construction.
+
+    :param TrainConfig cfg: Training configuration.
+    :param str mixed_precision: Effective mixed-precision mode.
+    :return tuple[float, tuple[float, float], float, float, dict[str, Any]]:
+        ``(eps, betas, gen_lr, disc_lr, fused_kwargs)``.
+    """
+    eps = float(cfg.adam_epsilon)
+    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
+        eps = 1e-6
+        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
+
+    base_lr = float(cfg.learning_rate)
+    gen_lr_raw = float(cfg.generator_learning_rate)
+    disc_lr_raw = float(getattr(cfg, "discriminator_learning_rate", -1.0))
+    gen_lr = gen_lr_raw if gen_lr_raw > 0 else base_lr
+    disc_lr = disc_lr_raw if disc_lr_raw > 0 else base_lr
+    betas = (float(cfg.adam_beta1), float(cfg.adam_beta2))
+    fused_kwargs = _maybe_fused_adamw_kwargs()
+    return eps, betas, gen_lr, disc_lr, fused_kwargs
+
+
+def _build_branch_param_groups(
+    *,
+    partitions: dict[str, dict[str, list[Any]]],
+    branch_key: str,
+    lr: float,
+    weight_decay: float,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build ordered AdamW groups for one model branch.
+
+    :param dict[str, dict[str, list[Any]]] partitions: Partitioned model parameters.
+    :param str branch_key: Branch prefix (``gen`` or ``disc``).
+    :param float lr: Branch learning rate.
+    :param float weight_decay: Weight decay for decay groups.
+    :return tuple[list[dict[str, Any]], list[str]]: ``(groups, ordered_names)``.
+    """
+    groups: list[dict[str, Any]] = []
+    ordered_names: list[str] = []
+    for key, decay in ((f"{branch_key}_decay", weight_decay), (f"{branch_key}_no_decay", 0.0)):
+        params = partitions[key]["params"]
+        if not params:
+            continue
+        groups.append({"params": params, "weight_decay": decay, "lr": lr})
+        ordered_names.extend(partitions[key]["names"])
+    return groups, ordered_names
+
+
 def _build_optimizer(
     model: torch.nn.Module,
     cfg: TrainConfig,
@@ -166,54 +219,32 @@ def _build_optimizer(
     :param str mixed_precision: Effective mixed-precision mode.
     :return torch.optim.Optimizer: Configured AdamW optimizer.
     """
-
-    eps = float(cfg.adam_epsilon)
-    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
-        eps = 1e-6
-        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
-
-    gen_lr = (
-        float(cfg.generator_learning_rate)
-        if float(cfg.generator_learning_rate) > 0
-        else float(cfg.learning_rate)
-    )
-    disc_lr = (
-        float(cfg.discriminator_learning_rate)
-        if float(getattr(cfg, "discriminator_learning_rate", -1.0)) > 0
-        else float(cfg.learning_rate)
+    eps, betas, gen_lr, disc_lr, fused_kwargs = _resolve_optimizer_hyperparams(
+        cfg=cfg,
+        mixed_precision=mixed_precision,
     )
     partitions = _partition_optimizer_params(model)
-    gen_decay = partitions["gen_decay"]["params"]
-    gen_no_decay = partitions["gen_no_decay"]["params"]
-    disc_decay = partitions["disc_decay"]["params"]
-    disc_no_decay = partitions["disc_no_decay"]["params"]
-
-    groups: list[dict[str, Any]] = []
-    ordered_names: list[str] = []
-    if gen_decay:
-        groups.append({"params": gen_decay, "weight_decay": float(cfg.weight_decay), "lr": gen_lr})
-        ordered_names.extend(partitions["gen_decay"]["names"])
-    if gen_no_decay:
-        groups.append({"params": gen_no_decay, "weight_decay": 0.0, "lr": gen_lr})
-        ordered_names.extend(partitions["gen_no_decay"]["names"])
-    if disc_decay:
-        groups.append({"params": disc_decay, "weight_decay": float(cfg.weight_decay), "lr": disc_lr})
-        ordered_names.extend(partitions["disc_decay"]["names"])
-    if disc_no_decay:
-        groups.append({"params": disc_no_decay, "weight_decay": 0.0, "lr": disc_lr})
-        ordered_names.extend(partitions["disc_no_decay"]["names"])
-
-    fused_kwargs = _maybe_fused_adamw_kwargs()
-
-    opt = torch.optim.AdamW(
-        groups,
+    gen_groups, gen_names = _build_branch_param_groups(
+        partitions=partitions,
+        branch_key="gen",
+        lr=gen_lr,
+        weight_decay=float(cfg.weight_decay),
+    )
+    disc_groups, disc_names = _build_branch_param_groups(
+        partitions=partitions,
+        branch_key="disc",
         lr=disc_lr,
-        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
+        weight_decay=float(cfg.weight_decay),
+    )
+    optimizer = torch.optim.AdamW(
+        [*gen_groups, *disc_groups],
+        lr=disc_lr,
+        betas=betas,
         eps=eps,
         **fused_kwargs,
     )
-    opt._param_order_digest = _digest_param_name_order(ordered_names)
-    return opt
+    optimizer._param_order_digest = _digest_param_name_order([*gen_names, *disc_names])
+    return optimizer
 
 
 def _build_decoupled_optimizers(
@@ -229,67 +260,34 @@ def _build_decoupled_optimizers(
     :param str mixed_precision: Effective mixed-precision mode.
     :return tuple[torch.optim.Optimizer, torch.optim.Optimizer]: (generator_optimizer, discriminator_optimizer).
     """
-    eps = float(cfg.adam_epsilon)
-    if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
-        eps = 1e-6
-        logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
-
-    fused_kwargs = _maybe_fused_adamw_kwargs()
-    gen_lr = (
-        float(cfg.generator_learning_rate)
-        if float(cfg.generator_learning_rate) > 0
-        else float(cfg.learning_rate)
-    )
-    disc_lr = (
-        float(cfg.discriminator_learning_rate)
-        if float(getattr(cfg, "discriminator_learning_rate", -1.0)) > 0
-        else float(cfg.learning_rate)
+    eps, betas, gen_lr, disc_lr, fused_kwargs = _resolve_optimizer_hyperparams(
+        cfg=cfg,
+        mixed_precision=mixed_precision,
     )
     partitions = _partition_optimizer_params(model)
-
-    gen_groups: list[dict[str, Any]] = []
-    gen_names: list[str] = []
-    if partitions["gen_decay"]["params"]:
-        gen_groups.append(
-            {
-                "params": partitions["gen_decay"]["params"],
-                "weight_decay": float(cfg.weight_decay),
-                "lr": gen_lr,
-            }
-        )
-        gen_names.extend(partitions["gen_decay"]["names"])
-    if partitions["gen_no_decay"]["params"]:
-        gen_groups.append({"params": partitions["gen_no_decay"]["params"], "weight_decay": 0.0, "lr": gen_lr})
-        gen_names.extend(partitions["gen_no_decay"]["names"])
-
-    disc_groups: list[dict[str, Any]] = []
-    disc_names: list[str] = []
-    if partitions["disc_decay"]["params"]:
-        disc_groups.append(
-            {
-                "params": partitions["disc_decay"]["params"],
-                "weight_decay": float(cfg.weight_decay),
-                "lr": disc_lr,
-            }
-        )
-        disc_names.extend(partitions["disc_decay"]["names"])
-    if partitions["disc_no_decay"]["params"]:
-        disc_groups.append(
-            {"params": partitions["disc_no_decay"]["params"], "weight_decay": 0.0, "lr": disc_lr}
-        )
-        disc_names.extend(partitions["disc_no_decay"]["names"])
-
+    gen_groups, gen_names = _build_branch_param_groups(
+        partitions=partitions,
+        branch_key="gen",
+        lr=gen_lr,
+        weight_decay=float(cfg.weight_decay),
+    )
+    disc_groups, disc_names = _build_branch_param_groups(
+        partitions=partitions,
+        branch_key="disc",
+        lr=disc_lr,
+        weight_decay=float(cfg.weight_decay),
+    )
     gen_opt = torch.optim.AdamW(
         gen_groups,
         lr=gen_lr,
-        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
+        betas=betas,
         eps=eps,
         **fused_kwargs,
     )
     disc_opt = torch.optim.AdamW(
         disc_groups,
         lr=disc_lr,
-        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
+        betas=betas,
         eps=eps,
         **fused_kwargs,
     )

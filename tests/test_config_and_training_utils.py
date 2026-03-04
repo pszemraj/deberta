@@ -330,8 +330,7 @@ def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
         resume_from_checkpoint=None,
         is_main_process=True,
     )
-    assert out.exists()
-    assert not any(out.iterdir())
+    assert out.exists() and (not any(out.iterdir()))
 
 
 @pytest.mark.parametrize("resume_hint", [None, "   "], ids=["unset", "blank"])
@@ -3714,31 +3713,34 @@ def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
     assert "--allow-partial-export" in cmd
 
 
-def test_build_optimizer_supports_generator_specific_lr():
+@pytest.mark.parametrize(
+    ("discriminator_lr", "expected_lrs"),
+    [
+        (None, {1.0e-3, 5.0e-4}),
+        (2.0e-4, {5.0e-4, 2.0e-4}),
+    ],
+    ids=["generator_override_only", "generator_and_discriminator_overrides"],
+)
+def test_build_optimizer_supports_branch_specific_lrs(
+    discriminator_lr: float | None, expected_lrs: set[float]
+):
     model = TinyRTDLikeModel()
-    cfg = TrainConfig(learning_rate=1.0e-3, generator_learning_rate=5.0e-4, weight_decay=0.1)
+    cfg_kwargs: dict[str, float] = {
+        "learning_rate": 1.0e-3,
+        "generator_learning_rate": 5.0e-4,
+        "weight_decay": 0.1,
+    }
+    if discriminator_lr is not None:
+        cfg_kwargs["discriminator_learning_rate"] = float(discriminator_lr)
+    cfg = TrainConfig(**cfg_kwargs)
     opt = _build_optimizer(model, cfg)
 
     lrs = {float(g["lr"]) for g in opt.param_groups}
-    assert lrs == {1.0e-3, 5.0e-4}
+    assert lrs == expected_lrs
 
     # We should have both decay and no-decay groups present.
     wds = {float(g["weight_decay"]) for g in opt.param_groups}
     assert wds == {0.0, 0.1}
-
-
-def test_build_optimizer_supports_discriminator_specific_lr():
-    model = TinyRTDLikeModel()
-    cfg = TrainConfig(
-        learning_rate=1.0e-3,
-        generator_learning_rate=5.0e-4,
-        discriminator_learning_rate=2.0e-4,
-        weight_decay=0.1,
-    )
-    opt = _build_optimizer(model, cfg)
-
-    lrs = {float(g["lr"]) for g in opt.param_groups}
-    assert lrs == {5.0e-4, 2.0e-4}
 
 
 def test_build_decoupled_optimizers_support_discriminator_specific_lr():
@@ -4405,6 +4407,14 @@ def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_4d_
     assert torch.equal(active, expected)
 
 
+def _weight_decay_for_param(opt: torch.optim.Optimizer, param: torch.nn.Parameter) -> float:
+    for group in opt.param_groups:
+        for grouped_param in group["params"]:
+            if grouped_param is param:
+                return float(group["weight_decay"])
+    raise AssertionError("Parameter missing from optimizer groups")
+
+
 def test_build_optimizer_marks_scalar_params_as_no_decay():
     train_cfg = TrainConfig()
 
@@ -4421,17 +4431,10 @@ def test_build_optimizer_marks_scalar_params_as_no_decay():
     model = _RegressionModel()
     opt = _build_optimizer(model, train_cfg)
 
-    def _group_for(param: torch.nn.Parameter) -> float:
-        for g in opt.param_groups:
-            for p in g["params"]:
-                if p is param:
-                    return float(g["weight_decay"])
-        raise AssertionError("Parameter missing from optimizer groups")
-
-    assert _group_for(model.generator.alpha) == pytest.approx(0.0)
-    assert _group_for(model.discriminator.alpha) == pytest.approx(0.0)
-    assert _group_for(model.discriminator_norm.weight) == pytest.approx(0.0)
-    assert _group_for(model.generator.weight) == pytest.approx(train_cfg.weight_decay)
+    assert _weight_decay_for_param(opt, model.generator.alpha) == pytest.approx(0.0)
+    assert _weight_decay_for_param(opt, model.discriminator.alpha) == pytest.approx(0.0)
+    assert _weight_decay_for_param(opt, model.discriminator_norm.weight) == pytest.approx(0.0)
+    assert _weight_decay_for_param(opt, model.generator.weight) == pytest.approx(train_cfg.weight_decay)
 
 
 def test_build_optimizer_applies_decay_to_high_rank_bias_parameters():
@@ -4453,14 +4456,7 @@ def test_build_optimizer_applies_decay_to_high_rank_bias_parameters():
     model = _RegressionModel()
     opt = _build_optimizer(model, train_cfg)
 
-    def _group_for(param: torch.nn.Parameter) -> float:
-        for g in opt.param_groups:
-            for p in g["params"]:
-                if p is param:
-                    return float(g["weight_decay"])
-        raise AssertionError("Parameter missing from optimizer groups")
-
-    assert _group_for(model.generator_bias.bias) == pytest.approx(train_cfg.weight_decay)
+    assert _weight_decay_for_param(opt, model.generator_bias.bias) == pytest.approx(train_cfg.weight_decay)
 
 
 def test_normalize_mixed_precision_accepts_bool_and_synonyms():
