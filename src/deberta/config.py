@@ -12,6 +12,7 @@ from typing import Any, TypeVar, get_type_hints
 
 from deberta.utils.io import load_json_mapping
 from deberta.utils.mapping import flatten_mapping
+from deberta.utils.serialize import asdict_without_private as _asdict_without_private
 from deberta.utils.types import coerce_scalar, unwrap_optional_type
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
@@ -2533,26 +2534,7 @@ def iter_leaf_paths_for_dataclass(cls: type[Any], *, prefix: str = "") -> list[t
     return out
 
 
-def asdict_without_private(value: Any) -> Any:
-    """Convert nested dataclasses to dicts while skipping private fields.
-
-    :param Any value: Dataclass or nested value.
-    :return Any: Mapping/list/scalar payload.
-    """
-    if dataclasses.is_dataclass(value):
-        out: dict[str, Any] = {}
-        for f in fields(value):
-            if str(f.name).startswith("_"):
-                continue
-            out[str(f.name)] = asdict_without_private(getattr(value, f.name))
-        return out
-    if isinstance(value, dict):
-        return {k: asdict_without_private(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [asdict_without_private(v) for v in value]
-    if isinstance(value, tuple):
-        return [asdict_without_private(v) for v in value]
-    return value
+asdict_without_private = _asdict_without_private
 
 
 __all__ = [
