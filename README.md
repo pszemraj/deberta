@@ -5,7 +5,7 @@ PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The defau
 ## Install
 
 ```bash
-git clone https://github.com/pszemraj/deberta.git
+git clone <repo-url> deberta
 cd deberta
 pip install -e .
 ```
@@ -17,15 +17,7 @@ pip install -e '.[dev]'
 pip install -e '.[wandb]'
 ```
 
-## CLI
-
-- `deberta train`
-- `deberta export`
-- `python -m deberta`
-
-Use `--help` for full flags.
-
-## Quickstart
+## Train and export
 
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
@@ -42,13 +34,10 @@ By default successful training also performs a final export pass into
 
 ## Docs
 
-Start with [`docs/index.md`](docs/index.md).
-
-Regenerate API markdown from docstrings:
-
-```bash
-python tools/generate_api_docs.py
-```
+Start with [`docs/index.md`](docs/index.md), then use:
+- [Getting Started / Installation](docs/getting-started/installation.md)
+- [Getting Started / Quickstart](docs/getting-started/quickstart.md)
+- [Guides / Configuration](docs/guides/configuration.md)
 
 ## Citation
 

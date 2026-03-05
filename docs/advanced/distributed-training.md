@@ -44,11 +44,5 @@ When `logging.wandb.enabled=true`, tracker config and snapshot files are uploade
 
 ## Training runtime module layout
 
-Training internals are split across:
-
-- [`src/deberta/training/entrypoint.py`](../../src/deberta/training/entrypoint.py): orchestration and top-level train/dry-run entrypoints
-- [`src/deberta/training/runtime.py`](../../src/deberta/training/runtime.py): optimizer/scheduler/dataloader/runtime builders
-- [`src/deberta/training/steps.py`](../../src/deberta/training/steps.py): per-window step helpers, token-weighted window accounting, non-finite recovery utilities
-- [`src/deberta/training/checkpointing.py`](../../src/deberta/training/checkpointing.py): periodic checkpoint/save-progress and resume-progress normalization helpers
-- [`src/deberta/training/metrics.py`](../../src/deberta/training/metrics.py): tracker payload coercion, JSONL appends, non-finite debug artifacts
-- [`src/deberta/training/compile.py`](../../src/deberta/training/compile.py): compile-scope resolution, TF32/SDPA setup, compile-target helpers
+Runtime internals live under [`src/deberta/training/`](../../src/deberta/training/).
+Public entrypoints and signatures are listed in [API / Training](../api/training.md).
