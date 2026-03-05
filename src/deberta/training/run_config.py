@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -23,19 +22,22 @@ from deberta.config import (
     validate_logging_config,
     validate_model_config,
     validate_optim_config,
-    validate_run_metadata_schema,
 )
-from deberta.io_utils import dump_json, load_json_mapping
+from deberta.run_layout import (
+    DATA_CONFIG_FILENAME,
+    LOGGING_CONFIG_FILENAME,
+    MODEL_CONFIG_FILENAME,
+    OPTIM_CONFIG_FILENAME,
+    RESUME_SOURCE_FILENAME,
+    RUN_METADATA_FILENAME,
+    RUN_SNAPSHOT_FILENAMES,
+    TRAIN_CONFIG_FILENAME,
+    infer_run_dir_from_checkpoint,
+    validate_run_metadata_file,
+)
+from deberta.utils.io import dump_json, load_json_mapping
 
 logger = logging.getLogger(__name__)
-_RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
-    "model_config.json",
-    "data_config.json",
-    "train_config.json",
-    "optim_config.json",
-    "logging_config.json",
-    "run_metadata.json",
-)
 
 
 def _build_run_metadata(
@@ -62,16 +64,6 @@ def _build_run_metadata(
     return meta
 
 
-def _validate_run_metadata(path: Path) -> None:
-    """Validate on-disk run metadata schema compatibility.
-
-    :param Path path: Metadata file path.
-    :raises ValueError: If metadata is malformed or schema-incompatible.
-    """
-    raw = load_json_mapping(path)
-    validate_run_metadata_schema(raw, source=str(path))
-
-
 def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
     """Write a mapping payload to YAML, with JSON fallback if PyYAML is unavailable.
 
@@ -82,9 +74,7 @@ def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
     try:
         import yaml  # type: ignore
     except Exception:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-            f.write("\n")
+        dump_json(payload, path)
         return
 
     with path.open("w", encoding="utf-8") as f:
@@ -206,16 +196,6 @@ def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str
     return payload
 
 
-def _infer_resume_run_dir(resume_checkpoint: str | Path) -> Path:
-    """Infer parent run directory from a checkpoint path.
-
-    :param str | Path resume_checkpoint: Checkpoint directory path.
-    :return Path: Parent run directory.
-    """
-    checkpoint_dir = Path(resume_checkpoint).expanduser().resolve()
-    return checkpoint_dir.parent
-
-
 def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
     """Raise when output_dir contains conflicting copied snapshots for resume provenance.
 
@@ -223,7 +203,7 @@ def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_d
     :param Path output_dir: Target output directory for the resumed run.
     :raises ValueError: If any persisted snapshot file exists in both locations with different content.
     """
-    for filename in _RUN_SNAPSHOT_FILENAMES:
+    for filename in RUN_SNAPSHOT_FILENAMES:
         src = source_run_dir / filename
         if not src.exists():
             continue
@@ -286,21 +266,21 @@ def _persist_or_validate_run_configs(
         source_run_dir = (
             resume_run_dir.expanduser().resolve()
             if resume_run_dir is not None
-            else _infer_resume_run_dir(resume_checkpoint)
+            else infer_run_dir_from_checkpoint(resume_checkpoint)
         )
         snapshot_dir = source_run_dir
 
-    model_cfg_path = snapshot_dir / "model_config.json"
-    data_cfg_path = snapshot_dir / "data_config.json"
-    optim_cfg_path = snapshot_dir / "optim_config.json"
-    logging_cfg_path = snapshot_dir / "logging_config.json"
-    run_meta_path = snapshot_dir / "run_metadata.json"
-    output_model_cfg_path = output_dir / "model_config.json"
-    output_data_cfg_path = output_dir / "data_config.json"
-    output_train_cfg_path = output_dir / "train_config.json"
-    output_optim_cfg_path = output_dir / "optim_config.json"
-    output_logging_cfg_path = output_dir / "logging_config.json"
-    output_run_meta_path = output_dir / "run_metadata.json"
+    model_cfg_path = snapshot_dir / MODEL_CONFIG_FILENAME
+    data_cfg_path = snapshot_dir / DATA_CONFIG_FILENAME
+    optim_cfg_path = snapshot_dir / OPTIM_CONFIG_FILENAME
+    logging_cfg_path = snapshot_dir / LOGGING_CONFIG_FILENAME
+    run_meta_path = snapshot_dir / RUN_METADATA_FILENAME
+    output_model_cfg_path = output_dir / MODEL_CONFIG_FILENAME
+    output_data_cfg_path = output_dir / DATA_CONFIG_FILENAME
+    output_train_cfg_path = output_dir / TRAIN_CONFIG_FILENAME
+    output_optim_cfg_path = output_dir / OPTIM_CONFIG_FILENAME
+    output_logging_cfg_path = output_dir / LOGGING_CONFIG_FILENAME
+    output_run_meta_path = output_dir / RUN_METADATA_FILENAME
 
     run_meta = _build_run_metadata(
         effective_compile_scope=effective_compile_scope,
@@ -321,7 +301,7 @@ def _persist_or_validate_run_configs(
         )
     if resume_checkpoint is not None and has_saved_required:
         if run_meta_path.exists():
-            _validate_run_metadata(run_meta_path)
+            validate_run_metadata_file(snapshot_dir, required=False)
             if is_main_process and effective_compile_scope is not None:
                 saved_meta = load_json_mapping(run_meta_path)
                 saved_scope = saved_meta.get("effective_compile_scope")
@@ -389,7 +369,7 @@ def _persist_or_validate_run_configs(
 
         if is_main_process and source_run_dir is not None and source_run_dir != output_dir_abs:
             resume_checkpoint_abs = Path(resume_checkpoint).expanduser().resolve()
-            for filename in _RUN_SNAPSHOT_FILENAMES:
+            for filename in RUN_SNAPSHOT_FILENAMES:
                 src = source_run_dir / filename
                 if not src.exists():
                     continue
@@ -407,7 +387,7 @@ def _persist_or_validate_run_configs(
                     "resume_checkpoint": str(resume_checkpoint_abs),
                     "resume_run_dir": str(source_run_dir),
                 },
-                output_dir / "resume_source.json",
+                output_dir / RESUME_SOURCE_FILENAME,
             )
             logger.info(
                 "Resume mode: validated snapshots from source run_dir=%s and synchronized provenance into output_dir.",
@@ -443,7 +423,7 @@ def _persist_or_validate_run_configs(
                     "resume_checkpoint": str(Path(resume_checkpoint).expanduser().resolve()),
                     "resume_run_dir": str(source_run_dir),
                 },
-                output_dir / "resume_source.json",
+                output_dir / RESUME_SOURCE_FILENAME,
             )
     _persist_config_yaml_snapshots(
         logging_output_dir=resolved_logging_output_dir,
@@ -464,5 +444,4 @@ __all__ = [
     "_persist_config_yaml_snapshots",
     "_persist_or_validate_run_configs",
     "_resolved_config_payload",
-    "_validate_run_metadata",
 ]

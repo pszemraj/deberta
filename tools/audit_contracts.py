@@ -119,148 +119,53 @@ def _extract_function_source(path: Path, func_name: str) -> str:
 # -----------------------------
 
 
-class TinyTokenizer:
+def TinyTokenizer(vocab_size: int = 128) -> Any:
+    """Build shared tokenizer stub for audit checks.
+
+    :param int vocab_size: Vocabulary size.
+    :return Any: Tokenizer-like stub.
     """
-    A tiny tokenizer stub implementing the minimal HuggingFace tokenizer surface used by
-    DebertaV3ElectraCollator.
+    repo_root = _repo_root_from_script()
+    tests_path = str(repo_root / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from _fakes import DummyTokenizer
 
-    It is *not* intended for real training. It exists only so the audit harness can run
-    without downloading a tokenizer.
-    """
+    token_map: dict[int, str] = {}
+    for idx in range(5, int(vocab_size)):
+        if idx % 11 == 0:
+            token_map[idx] = "##ing"
+        elif idx % 7 == 0:
+            token_map[idx] = "##ly"
+        else:
+            token_map[idx] = f"t{idx}"
+    tok = DummyTokenizer(
+        vocab_size=vocab_size,
+        token_map=token_map,
+        default_token_prefix="##",
+        vocab_type="wordpiece",
+    )
+    tok.unk_token = "[UNK]"
+    tok.unk_token_id = 4
+    tok._id_to_tok[tok.unk_token_id] = tok.unk_token
+    tok.all_special_ids = [
+        tok.pad_token_id,
+        tok.cls_token_id,
+        tok.sep_token_id,
+        tok.mask_token_id,
+        tok.unk_token_id,
+    ]
+    tok.all_special_tokens = ["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"]
 
-    def __init__(self, vocab_size: int = 128) -> None:
-        if vocab_size < 16:
-            raise ValueError("vocab_size must be >= 16 for TinyTokenizer")
-        self._vocab_size = int(vocab_size)
-
-        # Reserve a few special tokens at the front.
-        self.pad_token = "[PAD]"
-        self.cls_token = "[CLS]"
-        self.sep_token = "[SEP]"
-        self.mask_token = "[MASK]"
-        self.unk_token = "[UNK]"
-
-        self.pad_token_id = 0
-        self.cls_token_id = 1
-        self.sep_token_id = 2
-        self.mask_token_id = 3
-        self.unk_token_id = 4
-
-        self.all_special_ids = [
-            self.pad_token_id,
-            self.cls_token_id,
-            self.sep_token_id,
-            self.mask_token_id,
-            self.unk_token_id,
-        ]
-        self.all_special_tokens = [
-            self.pad_token,
-            self.cls_token,
-            self.sep_token,
-            self.mask_token,
-            self.unk_token,
-        ]
-
-        # Build id->token table.
-        # Include some WordPiece-like continuations to exercise whole-word grouping.
-        self._id_to_tok: list[str] = [
-            self.pad_token,
-            self.cls_token,
-            self.sep_token,
-            self.mask_token,
-            self.unk_token,
-        ]
-        extra = []
-        for i in range(5, self._vocab_size):
-            if i % 11 == 0:
-                extra.append("##ing")
-            elif i % 7 == 0:
-                extra.append("##ly")
-            else:
-                extra.append(f"t{i}")
-        self._id_to_tok.extend(extra)
-        self._id_to_tok = self._id_to_tok[: self._vocab_size]
-
-    @property
-    def vocab_size(self) -> int:
-        return self._vocab_size
-
-    def __len__(self) -> int:
-        return self._vocab_size
-
-    def tokenize(self, text: str) -> list[str]:
-        # Ensure scheme inference sees WordPiece continuations.
-        # This is deliberately simplistic.
-        toks = []
-        for w in str(text).strip().split():
-            toks.append(w)
-            toks.append("##x")
-        return toks
-
-    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
-        out = []
-        for tid in ids:
-            i = int(tid)
-            if 0 <= i < len(self._id_to_tok):
-                out.append(self._id_to_tok[i])
-            else:
-                out.append(self.unk_token)
+    def _tokenize_wordpiece_probe(text: str) -> list[str]:
+        out: list[str] = []
+        for word in str(text).strip().split():
+            out.append(word)
+            out.append("##x")
         return out
 
-    def get_special_tokens_mask(
-        self, token_ids_0: list[int], already_has_special_tokens: bool = True
-    ) -> list[int]:
-        special = set(self.all_special_ids)
-        return [1 if int(t) in special else 0 for t in token_ids_0]
-
-    def pad(
-        self,
-        features: list[dict[str, Any]],
-        padding: bool = True,
-        max_length: int | None = None,
-        pad_to_multiple_of: int | None = None,
-        return_tensors: str = "pt",
-        **_: Any,
-    ) -> dict[str, Any]:
-        if return_tensors != "pt":
-            raise ValueError("TinyTokenizer.pad only supports return_tensors='pt'")
-
-        # Determine target length.
-        lengths = [len(f["input_ids"]) for f in features]
-        tgt = max_length if max_length is not None else max(lengths)
-        if pad_to_multiple_of:
-            m = int(pad_to_multiple_of)
-            if m > 0 and tgt % m != 0:
-                tgt = ((tgt + m - 1) // m) * m
-
-        def _pad_list(xs: list[int], pad_id: int) -> list[int]:
-            if len(xs) > tgt:
-                xs = xs[:tgt]
-            return xs + [pad_id] * (tgt - len(xs))
-
-        input_ids = torch.tensor(
-            [_pad_list(list(f["input_ids"]), self.pad_token_id) for f in features], dtype=torch.long
-        )
-        attention_mask = (input_ids != int(self.pad_token_id)).to(torch.long)
-
-        batch: dict[str, Any] = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
-
-        if "token_type_ids" in features[0]:
-            token_type = torch.tensor(
-                [_pad_list(list(f["token_type_ids"]), 0) for f in features], dtype=torch.long
-            )
-            batch["token_type_ids"] = token_type
-
-        if "special_tokens_mask" in features[0]:
-            stm = torch.tensor(
-                [_pad_list(list(f["special_tokens_mask"]), 1) for f in features], dtype=torch.long
-            )
-            batch["special_tokens_mask"] = stm
-
-        return batch
+    tok.tokenize = _tokenize_wordpiece_probe  # type: ignore[assignment]
+    return tok
 
 
 # -----------------------------
@@ -272,7 +177,8 @@ def check_repo_layout(repo_root: Path) -> CheckResult:
     required = [
         repo_root / "src" / "deberta" / "data" / "collator.py",
         repo_root / "src" / "deberta" / "modeling" / "rtd.py",
-        repo_root / "src" / "deberta" / "training" / "pretrain.py",
+        repo_root / "src" / "deberta" / "training" / "entrypoint.py",
+        repo_root / "src" / "deberta" / "training" / "compile.py",
         repo_root / "src" / "deberta" / "export_cli.py",
     ]
     missing = [str(p) for p in required if not p.exists()]
@@ -417,8 +323,9 @@ def check_optimizer_state_ordering_risk(repo_root: Path) -> CheckResult:
     If the codebase has a param-order digest mechanism (persist + validate on resume), this is
     mitigated; otherwise it is a silent risk.
     """
-    path = repo_root / "src" / "deberta" / "training" / "pretrain.py"
-    src = _read_text(path)
+    runtime_path = repo_root / "src" / "deberta" / "training" / "runtime.py"
+    entrypoint_path = repo_root / "src" / "deberta" / "training" / "entrypoint.py"
+    src = _read_text(runtime_path) + "\n" + _read_text(entrypoint_path)
 
     # Check if param-order digest mechanism is present.
     has_digest = "_optimizer_param_order_digest" in src and "optimizer_param_digest" in src
@@ -457,7 +364,7 @@ def _exec_extracted_function(path: Path, func_name: str, globals_dict: dict[str,
 
 
 def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
-    path = repo_root / "src" / "deberta" / "training" / "pretrain.py"
+    path = repo_root / "src" / "deberta" / "training" / "compile.py"
     g = {
         "torch": torch,
         "_DOC_BLOCK_EYE_CACHE": {},
@@ -469,7 +376,7 @@ def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
         return _fail(
             "doc_block_mask_contract",
             f"Failed to load _build_doc_block_mask via AST exec: {type(e).__name__}: {e}",
-            hint="This harness expects src/deberta/training/pretrain.py to define _build_doc_block_mask(doc_ids).",
+            hint="This harness expects src/deberta/training/compile.py to define _build_doc_block_mask(doc_ids).",
         )
 
     # Build a small doc-id batch.
@@ -755,7 +662,7 @@ def check_rope_attention_mask_leak(repo_root: Path) -> CheckResult:
     build_mask = None
     try:
         build_mask = _exec_extracted_function(
-            repo_root / "src" / "deberta" / "training" / "pretrain.py",
+            repo_root / "src" / "deberta" / "training" / "compile.py",
             "_build_doc_block_mask",
             {"torch": torch, "_DOC_BLOCK_EYE_CACHE": {}, "_DOC_BLOCK_CLS_KEY_CACHE": {}},
         )

@@ -36,6 +36,13 @@ FSDP1 is not maintained as a first-class path in this repo; use FSDP2 configs fo
 
 ## Runtime snapshots and tracking
 
-Each run persists config snapshots in output dir and writes metrics to `metrics.jsonl.gz`.
+Run snapshot files are described in [Guides / Configuration](../guides/configuration.md#snapshot-files-and-reproducibility).
+
+`metrics.jsonl.gz` is written when `train.debug_metrics=true` (plus crash rows when training exits via an exception).
 
 When `logging.wandb.enabled=true`, tracker config and snapshot files are uploaded at startup from the main process.
+
+## Training runtime module layout
+
+Runtime internals live under [`src/deberta/training/`](../../src/deberta/training/).
+Public entrypoints and signatures are listed in [API / Training](../api/training.md).

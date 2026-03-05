@@ -31,8 +31,8 @@ Invalid keys, bad types, and incompatible combinations raise immediately.
 Highest priority wins:
 
 1. direct dotted CLI flags (`--section.path value`)
-2. config file values
-3. preset-injected values
+2. preset-injected values (only model fields when a config file is provided; full preset payload when no config file is provided)
+3. config file values
 4. dataclass defaults
 
 When a value from the source config file is changed later by preset/CLI/default normalization, the CLI emits explicit mutation warnings to stderr.

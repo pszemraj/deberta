@@ -9,33 +9,6 @@ import torch
 from deberta.modeling.rtd import attention_mask_to_active_tokens
 
 
-def _compute_disc_active_mask(
-    *,
-    input_ids: torch.Tensor,
-    labels: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    pad_token_id: int | None,
-) -> torch.Tensor:
-    """Compute discriminator-active token mask before model forward.
-
-    The RTD discriminator supervises all non-padding tokens. Masked positions
-    remain active because they are part of the discriminator objective.
-
-    :param torch.Tensor input_ids: Input token ids.
-    :param torch.Tensor labels: MLM labels (-100 for non-masked positions).
-    :param torch.Tensor | None attention_mask: Optional attention mask.
-    :param int | None pad_token_id: Padding token id.
-    :return torch.Tensor: Boolean active-token mask.
-    """
-    del labels
-    active = attention_mask_to_active_tokens(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        pad_token_id=pad_token_id,
-    )
-    return active
-
-
 def _count_rtd_tokens_for_batch(
     batch: dict[str, torch.Tensor],
     *,
@@ -49,9 +22,8 @@ def _count_rtd_tokens_for_batch(
     """
     labels = batch["labels"]
     gen_count = float(labels.ne(-100).sum().item())
-    disc_active = _compute_disc_active_mask(
+    disc_active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
-        labels=labels,
         attention_mask=batch.get("attention_mask"),
         pad_token_id=pad_token_id,
     )
@@ -63,35 +35,19 @@ def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
     """Return non-padding input-token count for one microbatch.
 
     :param dict[str, torch.Tensor] batch: Microbatch mapping.
+    :raises KeyError: If ``input_ids`` is absent.
     :return float: Count of active input tokens.
     """
-    attention_mask = batch.get("attention_mask")
     input_ids = batch.get("input_ids")
-    if isinstance(attention_mask, torch.Tensor):
-        if isinstance(input_ids, torch.Tensor):
-            active = attention_mask_to_active_tokens(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pad_token_id=None,
-            )
-            return float(active.detach().sum().item())
+    if not isinstance(input_ids, torch.Tensor):
+        raise KeyError("batch['input_ids'] is required for input-token counting.")
 
-        mask = attention_mask.detach().to(dtype=torch.bool)
-        if mask.ndim == 4:
-            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if mask.ndim == 3:
-            if mask.shape[-2] == 1:
-                mask = mask[:, 0, :]
-            else:
-                mask = torch.diagonal(mask, dim1=-2, dim2=-1)
-        if mask.ndim == 2:
-            return float(mask.sum().item())
-        return float(mask.reshape(-1).sum().item())
-
-    if isinstance(input_ids, torch.Tensor):
-        return float(input_ids.numel())
-
-    return 0.0
+    active = attention_mask_to_active_tokens(
+        input_ids=input_ids,
+        attention_mask=batch.get("attention_mask"),
+        pad_token_id=None,
+    )
+    return float(active.detach().sum().item())
 
 
 def _token_weighted_micro_objective(
@@ -166,9 +122,7 @@ def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighte
     :param bool token_weighted_ga: Whether token-weighted GA is enabled.
     :return torch.Tensor: Loss to pass into ``accelerator.backward``.
     """
-    if not token_weighted_ga:
-        return loss
-    return loss * float(max(1, int(ga_steps)))
+    return loss if not token_weighted_ga else (loss * float(max(1, int(ga_steps))))
 
 
 def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
@@ -178,11 +132,7 @@ def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int |
     :param float | int | None max_grad_norm: Configured clipping norm.
     :return bool: ``True`` when clipping should be applied.
     """
-    if not bool(sync_gradients):
-        return False
-    if max_grad_norm is None:
-        return False
-    return float(max_grad_norm) > 0.0
+    return bool(sync_gradients) and max_grad_norm is not None and float(max_grad_norm) > 0.0
 
 
 def _sum_local_scalar(*, accelerator: Any, x: float) -> float:

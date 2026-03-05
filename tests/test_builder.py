@@ -507,54 +507,67 @@ def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritativ
     assert gen_cfg.max_position_embeddings == 256
 
 
-def test_build_backbone_configs_rejects_pretrained_rope_vocab_mismatch(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    ("backbone_type", "config_overrides", "tokenizer_vocab_size", "error_match"),
+    [
+        (
+            "rope",
+            {"vocab_size": 1234},
+            50265,
+            "Tokenizer/checkpoint vocab mismatch for discriminator",
+        ),
+        (
+            "rope",
+            {"vocab_size": 50265, "cls_token_id": 999},
+            50265,
+            "Tokenizer/config special-token mismatch",
+        ),
+        (
+            "hf_deberta_v2",
+            {"vocab_size": 777},
+            50265,
+            "Tokenizer/checkpoint vocab mismatch for discriminator",
+        ),
+        (
+            "hf_deberta_v2",
+            {"cls_token_id": 404},
+            128100,
+            "Tokenizer/config special-token mismatch",
+        ),
+    ],
+    ids=["rope_vocab_mismatch", "rope_special_id_mismatch", "hf_vocab_mismatch", "hf_special_id_mismatch"],
+)
+def test_build_backbone_configs_rejects_pretrained_config_contract_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+    backbone_type: str,
+    config_overrides: dict[str, int],
+    tokenizer_vocab_size: int,
+    error_match: str,
+):
     pytest.importorskip("transformers")
+    pretrained_path = "disc"
+    if backbone_type == "rope":
+        pretrained_path = "local-rope-disc"
 
-    def _fake_from_pretrained(cls, src: str):
-        del src
-        return cls(vocab_size=1234, num_hidden_layers=6)
+        def _fake_rope_from_pretrained(cls, src: str):
+            del src
+            return cls(num_hidden_layers=6, **config_overrides)
 
-    monkeypatch.setattr(
-        builder_mod.DebertaRoPEConfig,
-        "from_pretrained",
-        classmethod(_fake_from_pretrained),
-    )
-
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=False,
-        pretrained_discriminator_path="local-rope-disc",
-    )
-    with pytest.raises(ValueError, match="Tokenizer/checkpoint vocab mismatch for discriminator"):
-        _ = builder_mod.build_backbone_configs(
-            model_cfg=model_cfg,
-            tokenizer=DummyTokenizer(vocab_size=50265),
-            max_position_embeddings=128,
+        monkeypatch.setattr(
+            builder_mod.DebertaRoPEConfig,
+            "from_pretrained",
+            classmethod(_fake_rope_from_pretrained),
         )
-
-
-def test_build_backbone_configs_rejects_pretrained_rope_special_id_mismatch(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-
-    def _fake_from_pretrained(cls, src: str):
-        del src
-        return cls(vocab_size=50265, cls_token_id=999, num_hidden_layers=6)
-
-    monkeypatch.setattr(
-        builder_mod.DebertaRoPEConfig,
-        "from_pretrained",
-        classmethod(_fake_from_pretrained),
-    )
+    else:
+        _patch_hf_pretrained_config_loader(monkeypatch, config_overrides=config_overrides)
 
     model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=False,
-        pretrained_discriminator_path="local-rope-disc",
+        backbone_type=backbone_type, from_scratch=False, pretrained_discriminator_path=pretrained_path
     )
-    with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
+    with pytest.raises(ValueError, match=error_match):
         _ = builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
-            tokenizer=DummyTokenizer(vocab_size=50265),
+            tokenizer=DummyTokenizer(vocab_size=tokenizer_vocab_size),
             max_position_embeddings=128,
         )
 
@@ -604,22 +617,6 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
         assert cfg.norm_arch == "keel"
         assert cfg.ffn_type == "mlp"
         assert cfg.use_bias is True
-
-
-def _patch_repo_hf_base_config(
-    monkeypatch: pytest.MonkeyPatch, *, config_overrides: dict[str, object] | None = None
-) -> None:
-    """Patch repo HF base config builder for deterministic tests."""
-    overrides = dict(config_overrides or {})
-    original = builder_mod._build_repo_hf_deberta_v2_config
-
-    def _factory(*, model_cfg: ModelConfig) -> Any:
-        cfg = original(model_cfg=model_cfg)
-        for key, value in overrides.items():
-            setattr(cfg, str(key), value)
-        return cfg
-
-    monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _factory)
 
 
 def _patch_hf_pretrained_config_loader(
@@ -881,40 +878,6 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
         _ = builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=DummyTokenizer(vocab_size=489),
-            max_position_embeddings=128,
-        )
-
-
-def test_build_backbone_configs_rejects_pretrained_hf_vocab_mismatch(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-    _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"vocab_size": 777})
-
-    cfg = ModelConfig(
-        backbone_type="hf_deberta_v2",
-        from_scratch=False,
-        pretrained_discriminator_path="disc",
-    )
-    with pytest.raises(ValueError, match="Tokenizer/checkpoint vocab mismatch for discriminator"):
-        _ = builder_mod.build_backbone_configs(
-            model_cfg=cfg,
-            tokenizer=DummyTokenizer(vocab_size=50265),
-            max_position_embeddings=128,
-        )
-
-
-def test_build_backbone_configs_rejects_pretrained_hf_special_id_mismatch(monkeypatch: pytest.MonkeyPatch):
-    pytest.importorskip("transformers")
-    _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"cls_token_id": 404})
-
-    cfg = ModelConfig(
-        backbone_type="hf_deberta_v2",
-        from_scratch=False,
-        pretrained_discriminator_path="disc",
-    )
-    with pytest.raises(ValueError, match="Tokenizer/config special-token mismatch"):
-        _ = builder_mod.build_backbone_configs(
-            model_cfg=cfg,
-            tokenizer=DummyTokenizer(vocab_size=128100),
             max_position_embeddings=128,
         )
 

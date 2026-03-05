@@ -13,7 +13,6 @@ from typing import Any
 
 import torch
 
-from deberta.checkpoint_utils import load_model_state_with_compile_key_remap, load_state_with_compile_fallback
 from deberta.config import (
     ModelConfig,
     TrainConfig,
@@ -21,10 +20,7 @@ from deberta.config import (
     load_model_config_snapshot,
     validate_data_config,
     validate_model_config,
-    validate_run_metadata_schema,
 )
-from deberta.io_utils import load_json_mapping
-from deberta.log_utils import setup_process_logging
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import (
     clean_exported_config,
@@ -33,6 +29,20 @@ from deberta.modeling.export_utils import (
     split_pretrainer_state_dict,
     write_export_readme_and_license,
 )
+from deberta.run_layout import (
+    DATA_CONFIG_FILENAME,
+    MODEL_CONFIG_FILENAME,
+    TRAIN_CONFIG_FILENAME,
+    infer_run_dir_from_checkpoint,
+    validate_run_metadata_file,
+)
+from deberta.utils.checkpoint import (
+    load_model_state_with_compile_key_remap,
+    load_state_with_compile_fallback,
+)
+from deberta.utils.io import load_json_mapping
+from deberta.utils.log import setup_process_logging
+from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -96,30 +106,6 @@ def _normalize_export_target(value: str) -> str:
     return normalized
 
 
-def _infer_run_dir(checkpoint_dir: Path) -> Path:
-    """Infer parent run directory from checkpoint path.
-
-    :param Path checkpoint_dir: Checkpoint directory path.
-    :return Path: Parent run directory.
-    """
-    # checkpoint_dir = .../checkpoint-XXXX
-    # run dir is usually parent.
-    return checkpoint_dir.parent
-
-
-def _validate_run_metadata_if_present(run_dir: Path) -> None:
-    """Validate run-metadata schema when a metadata file is present.
-
-    :param Path run_dir: Run directory potentially containing run metadata.
-    :raises ValueError: If metadata schema is malformed or incompatible.
-    """
-    meta_path = run_dir / "run_metadata.json"
-    if not meta_path.exists():
-        return
-    raw = load_json_mapping(meta_path)
-    validate_run_metadata_schema(raw, source=str(meta_path))
-
-
 def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path:
     """Resolve and preflight-validate export output directory.
 
@@ -129,14 +115,15 @@ def _resolve_export_output_dir(*, output_dir: str | None, run_dir: Path) -> Path
     :return Path: Resolved output path.
     """
     resolved = Path(output_dir).expanduser().resolve() if output_dir else (run_dir / "exported_hf")
-    if resolved.exists():
-        if not resolved.is_dir():
-            raise ValueError(f"output_dir exists and is not a directory: {resolved}")
-        if any(resolved.iterdir()):
-            raise ValueError(
-                f"output_dir already exists and is not empty: {resolved}. "
-                "Choose a new --output-dir or clear the directory."
-            )
+    validate_existing_output_dir(
+        output_dir=resolved,
+        allow_nonempty=False,
+        nonempty_error=(
+            f"output_dir already exists and is not empty: {resolved}. "
+            "Choose a new --output-dir or clear the directory."
+        ),
+        nondir_error=f"output_dir exists and is not a directory: {resolved}",
+    )
     return resolved
 
 
@@ -146,7 +133,7 @@ def _load_optional_train_config(run_dir: Path) -> TrainConfig | None:
     :param Path run_dir: Run directory potentially containing ``train_config.json``.
     :return TrainConfig | None: Parsed train config when present/valid, otherwise ``None``.
     """
-    train_cfg_path = run_dir / "train_config.json"
+    train_cfg_path = run_dir / TRAIN_CONFIG_FILENAME
     if not train_cfg_path.exists():
         return None
 
@@ -333,18 +320,13 @@ def _prepare_discriminator_state_for_strict_load(
     embedding_sharing: str,
     strict_export_load: bool,
 ) -> dict[str, torch.Tensor]:
-    """Normalize discriminator checkpoint keys for strict export loading.
+    """Map GDES discriminator embedding keys into strict export-backbone shape.
 
-    In ``embedding_sharing='gdes'``, discriminator checkpoints store embedding
-    tensors as ``embeddings.<attr>.base_weight`` + ``embeddings.<attr>.bias``.
-    Export backbones expect ``embeddings.<attr>.weight``; bias tensors are
-    merged afterward via ``merge_embeddings_into_export_backbone``.
-
-    :param Any export_disc: Export discriminator backbone module.
-    :param dict[str, torch.Tensor] disc_sd: Raw discriminator checkpoint state dict.
-    :param str embedding_sharing: Effective embedding sharing mode.
-    :param bool strict_export_load: Whether strict export load is enabled.
-    :return dict[str, torch.Tensor]: State dict prepared for strict backbone load.
+    :param Any export_disc: Export discriminator module.
+    :param dict[str, torch.Tensor] disc_sd: Discriminator state dict.
+    :param str embedding_sharing: Effective embedding-sharing mode.
+    :param bool strict_export_load: Whether strict export-load checks are enabled.
+    :return dict[str, torch.Tensor]: Prepared state dict for export-model loading.
     """
     if not strict_export_load or str(embedding_sharing).lower() != "gdes":
         return dict(disc_sd)
@@ -375,6 +357,95 @@ def _prepare_discriminator_state_for_strict_load(
     return prepared
 
 
+def _export_component(
+    *,
+    component: str,
+    export_model: Any | None,
+    stage_dir: Path,
+    export_what: str,
+    safe_serialization: bool,
+    strict_export_load: bool,
+    model_cfg: ModelConfig,
+    data_cfg: Any,
+    train_cfg: Any,
+    embedding_sharing: str,
+    state_dict: dict[str, torch.Tensor],
+    disc_sd: dict[str, torch.Tensor],
+    gen_sd: dict[str, torch.Tensor],
+) -> bool:
+    """Load, merge, and save one exported component.
+
+    :param str component: Component key (``discriminator`` or ``generator``).
+    :param Any | None export_model: Target export model instance.
+    :param Path stage_dir: Export staging directory.
+    :param str export_what: Effective target selection.
+    :param bool safe_serialization: Safetensors toggle for ``save_pretrained``.
+    :param bool strict_export_load: Strict source-state loading toggle.
+    :param ModelConfig model_cfg: Model config used to render README metadata.
+    :param Any data_cfg: Data config used to render README metadata.
+    :param Any train_cfg: Train config used to render README metadata.
+    :param str embedding_sharing: Effective embedding-sharing mode.
+    :param dict[str, torch.Tensor] state_dict: Component source state dict for loading.
+    :param dict[str, torch.Tensor] disc_sd: Full discriminator source state dict.
+    :param dict[str, torch.Tensor] gen_sd: Full generator source state dict.
+    :return bool: True when export completed for this component.
+    """
+    if export_model is None:
+        return False
+
+    component_key = str(component).strip().lower()
+    if component_key not in {"discriminator", "generator"}:
+        raise ValueError(f"Unsupported export component: {component!r}")
+
+    state_for_load = state_dict
+    if component_key == "discriminator":
+        state_for_load = _prepare_discriminator_state_for_strict_load(
+            export_disc=export_model,
+            disc_sd=state_dict,
+            embedding_sharing=embedding_sharing,
+            strict_export_load=bool(strict_export_load),
+        )
+
+    incompatible = load_intersection_state_dict(
+        export_model,
+        state_for_load,
+        strict=bool(strict_export_load),
+        context=f"export.{component_key}",
+    )
+    if not bool(strict_export_load):
+        missing = list(getattr(incompatible, "missing_keys", []))
+        unexpected = list(getattr(incompatible, "unexpected_keys", []))
+        if missing or unexpected:
+            logger.warning(
+                "%s export loaded partial state due --allow-partial-export: missing=%d unexpected=%d",
+                component_key.capitalize(),
+                len(missing),
+                len(unexpected),
+            )
+
+    if component_key == "discriminator" and embedding_sharing in {"es", "gdes"}:
+        merge_embeddings_into_export_backbone(
+            export_model=export_model,
+            disc_sd=disc_sd,
+            gen_sd=gen_sd,
+            mode=embedding_sharing,
+            fp32_accumulate=True,
+        )
+
+    out_dir = stage_dir if export_what == component_key else (stage_dir / component_key)
+    export_model.save_pretrained(str(out_dir), safe_serialization=bool(safe_serialization))
+    clean_exported_config(out_dir / "config.json", strict=True)
+    write_export_readme_and_license(
+        out_dir,
+        model_cfg=model_cfg,
+        export_config=getattr(export_model, "config", None),
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        embedding_sharing=embedding_sharing,
+    )
+    return True
+
+
 def run_export(cfg: ExportConfig) -> None:
     """Run checkpoint export flow.
 
@@ -397,19 +468,23 @@ def run_export(cfg: ExportConfig) -> None:
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"checkpoint_dir not found: {checkpoint_dir}")
 
-    run_dir = Path(cfg.run_dir).expanduser().resolve() if cfg.run_dir else _infer_run_dir(checkpoint_dir)
+    run_dir = (
+        Path(cfg.run_dir).expanduser().resolve()
+        if cfg.run_dir
+        else infer_run_dir_from_checkpoint(checkpoint_dir)
+    )
     if not run_dir.exists():
         raise FileNotFoundError(f"run_dir not found: {run_dir}")
     out_dir = _resolve_export_output_dir(output_dir=cfg.output_dir, run_dir=run_dir)
 
-    model_cfg_path = run_dir / "model_config.json"
-    data_cfg_path = run_dir / "data_config.json"
+    model_cfg_path = run_dir / MODEL_CONFIG_FILENAME
+    data_cfg_path = run_dir / DATA_CONFIG_FILENAME
 
     if not model_cfg_path.exists():
         raise FileNotFoundError(f"Expected {model_cfg_path} (produced during training)")
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
-    _validate_run_metadata_if_present(run_dir)
+    validate_run_metadata_file(run_dir, required=False)
     train_cfg = _load_optional_train_config(run_dir)
 
     # Pre-stable policy: export does not coerce legacy snapshot keys.
@@ -548,81 +623,38 @@ def run_export(cfg: ExportConfig) -> None:
         # Always export tokenizer at root for convenience
         tokenizer.save_pretrained(str(stage_dir))
 
-        # Discriminator
-        if export_disc is not None:
-            disc_sd_for_load = _prepare_discriminator_state_for_strict_load(
-                export_disc=export_disc,
-                disc_sd=disc_sd,
-                embedding_sharing=embedding_sharing,
-                strict_export_load=bool(strict_export_load),
-            )
-            incompat_disc = load_intersection_state_dict(
-                export_disc,
-                disc_sd_for_load,
-                strict=strict_export_load,
-                context="export.discriminator",
-            )
-            if not strict_export_load:
-                missing = list(getattr(incompat_disc, "missing_keys", []))
-                unexpected = list(getattr(incompat_disc, "unexpected_keys", []))
-                if missing or unexpected:
-                    logger.warning(
-                        "Discriminator export loaded partial state due --allow-partial-export: "
-                        "missing=%d unexpected=%d",
-                        len(missing),
-                        len(unexpected),
-                    )
-            if embedding_sharing in {"es", "gdes"}:
-                merge_embeddings_into_export_backbone(
-                    export_model=export_disc,
-                    disc_sd=disc_sd,
-                    gen_sd=gen_sd,
-                    mode=embedding_sharing,
-                    fp32_accumulate=True,
-                )
-
-            disc_out_dir = stage_dir if export_what == "discriminator" else (stage_dir / "discriminator")
-            export_disc.save_pretrained(str(disc_out_dir), safe_serialization=bool(cfg.safe_serialization))
-            clean_exported_config(disc_out_dir / "config.json", strict=True)
-            write_export_readme_and_license(
-                disc_out_dir,
-                model_cfg=model_cfg,
-                export_config=getattr(export_disc, "config", None),
-                data_cfg=data_cfg,
-                train_cfg=train_cfg,
-                embedding_sharing=embedding_sharing,
-            )
+        if _export_component(
+            component="discriminator",
+            export_model=export_disc,
+            stage_dir=stage_dir,
+            export_what=export_what,
+            safe_serialization=bool(cfg.safe_serialization),
+            strict_export_load=bool(strict_export_load),
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            embedding_sharing=embedding_sharing,
+            state_dict=disc_sd,
+            disc_sd=disc_sd,
+            gen_sd=gen_sd,
+        ):
             meta["exported_discriminator"] = True
 
-        # Generator
-        if export_gen is not None:
-            incompat_gen = load_intersection_state_dict(
-                export_gen,
-                gen_sd,
-                strict=strict_export_load,
-                context="export.generator",
-            )
-            if not strict_export_load:
-                missing = list(getattr(incompat_gen, "missing_keys", []))
-                unexpected = list(getattr(incompat_gen, "unexpected_keys", []))
-                if missing or unexpected:
-                    logger.warning(
-                        "Generator export loaded partial state due --allow-partial-export: "
-                        "missing=%d unexpected=%d",
-                        len(missing),
-                        len(unexpected),
-                    )
-            gen_out_dir = stage_dir if export_what == "generator" else (stage_dir / "generator")
-            export_gen.save_pretrained(str(gen_out_dir), safe_serialization=bool(cfg.safe_serialization))
-            clean_exported_config(gen_out_dir / "config.json", strict=True)
-            write_export_readme_and_license(
-                gen_out_dir,
-                model_cfg=model_cfg,
-                export_config=getattr(export_gen, "config", None),
-                data_cfg=data_cfg,
-                train_cfg=train_cfg,
-                embedding_sharing=embedding_sharing,
-            )
+        if _export_component(
+            component="generator",
+            export_model=export_gen,
+            stage_dir=stage_dir,
+            export_what=export_what,
+            safe_serialization=bool(cfg.safe_serialization),
+            strict_export_load=bool(strict_export_load),
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            embedding_sharing=embedding_sharing,
+            state_dict=gen_sd,
+            disc_sd=disc_sd,
+            gen_sd=gen_sd,
+        ):
             meta["exported_generator"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:

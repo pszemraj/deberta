@@ -39,12 +39,5 @@ deberta export runs/quickstart_hfv2_small/checkpoint-500 \
 
 ## 4) Check run snapshots
 
-Each run directory includes:
-
-- `config_original.yaml`
-- `config_resolved.yaml`
-- `model_config.json`
-- `data_config.json`
-- `train_config.json`
-- `optim_config.json`
-- `logging_config.json`
+Snapshot files and metadata are documented in
+[Guides / Configuration](../guides/configuration.md#snapshot-files-and-reproducibility).

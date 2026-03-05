@@ -500,9 +500,12 @@ def setup_pretraining_mocks(
 ) -> Any:
     """Apply monkeypatches for ``run_pretraining`` integration tests.
 
-    :return: The patched ``deberta.training.pretrain`` module.
+    :return: The patched ``deberta.training.entrypoint`` module.
     """
-    import deberta.training.pretrain as pretrain_mod
+    import deberta.training.checkpointing as checkpointing_mod
+    import deberta.training.entrypoint as entrypoint_mod
+    import deberta.training.loop_utils as loop_utils_mod
+    import deberta.training.steps as steps_mod
 
     accelerator_cls = accelerator_cls or FakeAccelerator
     rtd_cls = rtd_cls or SimpleRTD
@@ -523,36 +526,47 @@ def setup_pretraining_mocks(
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    monkeypatch.setattr(pretrain_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(pretrain_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pretrain_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
-    monkeypatch.setattr(pretrain_mod, "PackedStreamingDataset", lambda **kwargs: [_PRETRAINING_BATCH])
-    monkeypatch.setattr(pretrain_mod, "SequentialStreamingDataset", lambda **kwargs: [_PRETRAINING_BATCH])
-    monkeypatch.setattr(pretrain_mod, "_build_training_collator", lambda **kwargs: lambda rows: rows[0])
+    monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
+    monkeypatch.setattr(entrypoint_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
+    monkeypatch.setattr(entrypoint_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
+    monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
     monkeypatch.setattr(
-        pretrain_mod,
+        entrypoint_mod,
+        "_build_train_dataset_and_collator",
+        lambda **kwargs: ([_PRETRAINING_BATCH], lambda rows: rows[0]),
+    )
+    monkeypatch.setattr(
+        entrypoint_mod,
         "build_backbone_configs",
         lambda **kwargs: (_types.SimpleNamespace(pad_token_id=0), _types.SimpleNamespace()),
     )
-    monkeypatch.setattr(pretrain_mod, "build_backbones", build_backbones_fn)
-    monkeypatch.setattr(pretrain_mod, "DebertaV3RTDPretrainer", rtd_cls)
+    monkeypatch.setattr(entrypoint_mod, "build_backbones", build_backbones_fn)
+    monkeypatch.setattr(entrypoint_mod, "DebertaV3RTDPretrainer", rtd_cls)
     monkeypatch.setattr(
-        pretrain_mod,
+        entrypoint_mod,
         "_build_optimizer",
         lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
     )
     monkeypatch.setattr(
-        pretrain_mod,
+        entrypoint_mod,
         "_build_scheduler",
         lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
     )
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", cycle_fn)
-    monkeypatch.setattr(pretrain_mod, "_move_batch_to_device", lambda b, _device: b)
-    monkeypatch.setattr(pretrain_mod, "_save_training_checkpoint", save_checkpoint_fn)
+    monkeypatch.setattr(entrypoint_mod, "_cycle_dataloader", cycle_fn)
+    monkeypatch.setattr(entrypoint_mod, "_move_batch_to_device", lambda b, _device: b)
+    monkeypatch.setattr(entrypoint_mod, "_save_training_checkpoint", save_checkpoint_fn)
+    monkeypatch.setattr(checkpointing_mod, "_save_training_checkpoint", save_checkpoint_fn)
 
     if extra_patches:
         for attr, val in extra_patches.items():
-            monkeypatch.setattr(pretrain_mod, attr, val)
+            if attr == "_count_rtd_tokens_for_batch":
+                monkeypatch.setattr(steps_mod, "_count_rtd_tokens_for_batch", val)
+                monkeypatch.setattr(loop_utils_mod, "_count_rtd_tokens_for_batch", val)
+                continue
+            if attr == "_resolve_window_token_denominators":
+                monkeypatch.setattr(steps_mod, "_resolve_window_token_denominators", val)
+                monkeypatch.setattr(loop_utils_mod, "_resolve_window_token_denominators", val)
+                continue
+            monkeypatch.setattr(entrypoint_mod, attr, val)
 
-    return pretrain_mod
+    return entrypoint_mod
