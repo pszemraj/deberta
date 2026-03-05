@@ -16,7 +16,7 @@ For GPU training, use a CUDA-capable PyTorch build compatible with your driver/t
 ## Install package
 
 ```bash
-git clone <repo-url> deberta
+git clone https://github.com/pszemraj/deberta.git deberta
 cd deberta
 pip install -e .
 ```

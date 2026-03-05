@@ -4,33 +4,12 @@ PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The defau
 
 ## Install
 
-```bash
-git clone <repo-url> deberta
-cd deberta
-pip install -e .
-```
-
-Optional extras:
-
-```bash
-pip install -e '.[dev]'
-pip install -e '.[wandb]'
-```
+Use [Getting Started / Installation](docs/getting-started/installation.md).
 
 ## Train and export
 
-```bash
-deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
-  --train.max_steps 500 \
-  --train.checkpoint.output_dir runs/quickstart_hfv2_small
-
-deberta export runs/quickstart_hfv2_small/checkpoint-500 \
-  --what discriminator \
-  --output-dir runs/quickstart_hfv2_small/exported_hf
-```
-
-By default successful training also performs a final export pass into
-`<train.checkpoint.output_dir>/final_hf` (`train.checkpoint.export_hf_final=true`).
+Use [Getting Started / Quickstart](docs/getting-started/quickstart.md) for first runs and
+[Guides / Exporting Models](docs/guides/exporting-models.md) for checkpoint consolidation and HF artifacts.
 
 ## Docs
 
