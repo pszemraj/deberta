@@ -29,6 +29,15 @@ accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml -
   deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml
 ```
 
+Optional FlashDeBERTa trial run:
+
+```bash
+accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml \
+  tools/train_flashdeberta.py train configs/pretrain_hf_deberta_v2_parity_small.yaml
+```
+
+Use the flash wrapper only after installing the optional flash runtime, and keep `data.packing.block_cross_document_attention=false`.
+
 ## 3) Export discriminator for downstream use
 
 ```bash

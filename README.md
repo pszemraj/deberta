@@ -2,6 +2,8 @@
 
 PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The default path is `backbone_type=hf_deberta_v2` (native DeBERTa-v2/v3 architecture in this repo) with optional `rope` experiments.
 
+Optional FlashDeBERTa acceleration is available as a runtime patch for the native `hf_deberta_v2` backbone. Install the extra with `pip install -e '.[flash]'` and launch training through `tools/train_flashdeberta.py`.
+
 ## Install
 
 Use [Getting Started / Installation](docs/getting-started/installation.md).

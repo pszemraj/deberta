@@ -45,6 +45,7 @@ Documentation = "https://github.com/pszemraj/deberta/tree/main/docs"
 # Logging
 wandb = ["wandb>=0.17.0"]
 tensorboard = ["tensorboard>=2.16.0"]
+flash = ["flashdeberta", "triton"]
 
 # Dev quality-of-life
 dev = ["ruff>=0.6.0", "black>=24.8.0", "mypy>=1.11.0", "pytest>=8.0.0"]
