@@ -170,20 +170,40 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "device",
                 "FlashDeBERTa attention requires CUDA tensors; using eager attention.",
             )
-        if hidden_states.dtype not in _FLASH_SUPPORTED_DTYPES:
-            return (
-                "dtype",
-                "FlashDeBERTa attention currently supports float16/bfloat16 activations; using eager attention.",
-            )
-        if query_states.dtype != hidden_states.dtype:
-            return (
-                "mixed_qkv_dtype",
-                "FlashDeBERTa attention requires query/key/value activations to share one dtype; using eager attention.",
-            )
         if query_len != key_len:
             return (
                 "query_key_length_mismatch",
                 "FlashDeBERTa attention integration currently expects self-attention with matching query/key lengths; using eager attention.",
+            )
+        return None
+
+    def _projected_qkv_fallback_reason(
+        self,
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+    ) -> tuple[str, str] | None:
+        """Return whether projected QKV tensors are unsupported by the flash kernel.
+
+        :param torch.Tensor query_layer: Projected query tensor.
+        :param torch.Tensor key_layer: Projected key tensor.
+        :param torch.Tensor value_layer: Projected value tensor.
+        :return tuple[str, str] | None: Reason key and warning message, or ``None``.
+        """
+
+        qkv_dtypes = {query_layer.dtype, key_layer.dtype, value_layer.dtype}
+        if len(qkv_dtypes) != 1:
+            return (
+                "mixed_qkv_dtype",
+                "FlashDeBERTa attention requires projected query/key/value tensors to share one dtype; using eager attention.",
+            )
+
+        qkv_dtype = query_layer.dtype
+        if qkv_dtype not in _FLASH_SUPPORTED_DTYPES:
+            return (
+                "dtype",
+                "FlashDeBERTa attention currently supports float16/bfloat16 projected QKV activations; using eager attention.",
             )
         return None
 
@@ -238,6 +258,23 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_layer = self._shape(self.query_proj(query_states)).contiguous()
         key_layer = self._shape(self.key_proj(hidden_states)).contiguous()
         value_layer = self._shape(self.value_proj(hidden_states)).contiguous()
+
+        projected_reason = self._projected_qkv_fallback_reason(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+        )
+        if projected_reason is not None:
+            key, message = projected_reason
+            self._warn_once(reason=key, message=message)
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+            )
 
         pos_key: torch.Tensor | None = None
         pos_query: torch.Tensor | None = None

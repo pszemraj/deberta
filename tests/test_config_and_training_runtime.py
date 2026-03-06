@@ -1046,6 +1046,29 @@ def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
     )
 
 
+def test_maybe_prefer_cublaslt_uses_cuda_backend_api(monkeypatch: pytest.MonkeyPatch):
+    import deberta.training.compile as compile_mod
+
+    calls: list[str] = []
+
+    def _preferred_blas_library(choice: str | None = None) -> object:
+        if choice is None:
+            return "_BlasBackend.Cublas"
+        calls.append(str(choice))
+        return "_BlasBackend.Cublaslt"
+
+    monkeypatch.setattr(compile_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        compile_mod.torch.backends,
+        "cuda",
+        types.SimpleNamespace(preferred_blas_library=_preferred_blas_library),
+    )
+
+    compile_mod._maybe_prefer_cublaslt(is_main=True)
+
+    assert calls == ["cublaslt"]
+
+
 def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -156,6 +156,15 @@ def test_enable_flashdeberta_attention_strict_false_is_noop_when_missing(
 
     from deberta.modeling import deberta_v2_native as dv2
 
+    original_import_module = patch_mod.importlib.import_module
+
+    def _fake_import_module(name: str, package: str | None = None):
+        if name == "flashdeberta":
+            raise ImportError("simulated missing flashdeberta")
+        return original_import_module(name, package)
+
+    monkeypatch.setattr(patch_mod.importlib, "import_module", _fake_import_module)
+
     patch_mod.disable_flashdeberta_attention()
     orig_attention = dv2.DisentangledSelfAttention
     patch_mod.enable_flashdeberta_attention(strict=False)
@@ -204,6 +213,33 @@ def test_flash_attention_pairwise_mask_falls_back_to_eager(monkeypatch: pytest.M
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
     assert "kwargs" in seen
     assert seen["kwargs"]["attention_mask"] is pairwise_mask
+
+
+def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    bf16_qkv = torch.zeros((1, cfg.num_attention_heads, 4, head_dim), dtype=torch.bfloat16)
+    fp32_qkv = bf16_qkv.float()
+
+    assert (
+        attention._projected_qkv_fallback_reason(
+            query_layer=bf16_qkv,
+            key_layer=bf16_qkv,
+            value_layer=bf16_qkv,
+        )
+        is None
+    )
+    reason = attention._projected_qkv_fallback_reason(
+        query_layer=fp32_qkv,
+        key_layer=fp32_qkv,
+        value_layer=fp32_qkv,
+    )
+    assert reason is not None
+    assert reason[0] == "dtype"
 
 
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
