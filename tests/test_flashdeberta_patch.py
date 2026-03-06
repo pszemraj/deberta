@@ -10,10 +10,11 @@ import pytest
 import torch
 
 
-def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> None:
+def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Install a minimal in-memory FlashDeBERTa module tree for tests.
 
     :param pytest.MonkeyPatch monkeypatch: Pytest monkeypatch fixture.
+    :return dict[str, int]: Mutable call counters for fake flash operators.
     """
 
     flash_pkg = types.ModuleType("flashdeberta")
@@ -21,6 +22,8 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> None:
     ops_pkg = types.ModuleType("flashdeberta.ops")
     ops_pkg.__path__ = []  # type: ignore[attr-defined]
     flash_attention_mod = types.ModuleType("flashdeberta.ops.flash_attention")
+    flash_attention_varlen_mod = types.ModuleType("flashdeberta.ops.flash_attention_varlen")
+    calls = {"fixed": 0, "varlen": 0}
 
     def _fake_flash_attention_with_disentangled(
         q: torch.Tensor,
@@ -49,16 +52,73 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> None:
         :return torch.Tensor: Zero tensor shaped like ``q``.
         """
 
+        calls["fixed"] += 1
         del k, v, seq_lengths, k_pos, q_pos, causal, sm_scale, position_buckets, max_relative_distance
         return torch.zeros_like(q)
 
+    def _fake_flash_attention_with_disentangled_varlen(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_pos: torch.Tensor | None,
+        q_pos: torch.Tensor | None,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        causal: bool = False,
+        sm_scale: float | None = None,
+        position_buckets: int = 0,
+        max_relative_distance: int = 0,
+    ) -> torch.Tensor:
+        """Return value-shaped zeros for varlen adapter tests.
+
+        :param torch.Tensor q: Unpadded query tensor.
+        :param torch.Tensor k: Unpadded key tensor.
+        :param torch.Tensor v: Unpadded value tensor.
+        :param torch.Tensor | None k_pos: Optional c2p tensor.
+        :param torch.Tensor | None q_pos: Optional p2c tensor.
+        :param torch.Tensor cu_seqlens_q: Query cumulative lengths.
+        :param torch.Tensor cu_seqlens_k: Key cumulative lengths.
+        :param int max_seqlen_q: Max query length in batch.
+        :param int max_seqlen_k: Max key length in batch.
+        :param bool causal: Unused causal flag.
+        :param float | None sm_scale: Optional softmax scale.
+        :param int position_buckets: Optional bucket count.
+        :param int max_relative_distance: Optional max relative distance.
+        :return torch.Tensor: Zero tensor shaped like ``q``.
+        """
+
+        calls["varlen"] += 1
+        del (
+            k,
+            v,
+            k_pos,
+            q_pos,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal,
+            sm_scale,
+            position_buckets,
+            max_relative_distance,
+        )
+        return torch.zeros_like(q)
+
     flash_attention_mod.flash_attention_with_disentangled = _fake_flash_attention_with_disentangled
+    flash_attention_varlen_mod.flash_attention_with_disentangled_varlen = (
+        _fake_flash_attention_with_disentangled_varlen
+    )
     flash_pkg.ops = ops_pkg  # type: ignore[attr-defined]
     ops_pkg.flash_attention = flash_attention_mod  # type: ignore[attr-defined]
+    ops_pkg.flash_attention_varlen = flash_attention_varlen_mod  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "flashdeberta", flash_pkg)
     monkeypatch.setitem(sys.modules, "flashdeberta.ops", ops_pkg)
     monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention", flash_attention_mod)
+    monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention_varlen", flash_attention_varlen_mod)
+    return calls
 
 
 def _reload_flash_modules() -> tuple[types.ModuleType, types.ModuleType]:
@@ -240,6 +300,40 @@ def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatc
     )
     assert reason is not None
     assert reason[0] == "dtype"
+
+
+def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+
+    monkeypatch.setenv("FLASHDEBERTA_FORCE_VARLEN", "1")
+    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+    )
+
+    assert probs is None
+    assert tuple(output.shape) == (1, 4, cfg.hidden_size)
+    assert calls == {"fixed": 0, "varlen": 1}
+
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["forward_calls"] == 1
+    assert stats["flash_eligible_calls"] == 1
+    assert stats["flash_varlen_calls"] == 1
+    assert stats.get("flash_fixed_calls", 0) == 0
+    assert stats.get("fallback_calls", 0) == 0
 
 
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

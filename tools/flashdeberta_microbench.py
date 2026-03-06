@@ -110,7 +110,11 @@ def _build_batch(args: argparse.Namespace, *, device: torch.device, pad_token_id
 
     attention_mask: torch.Tensor | None
     if active_len >= seq_len:
-        attention_mask = None if bool(args.drop_all_ones_mask) else torch.ones((batch, seq_len), device=device, dtype=torch.bool)
+        attention_mask = (
+            None
+            if bool(args.drop_all_ones_mask)
+            else torch.ones((batch, seq_len), device=device, dtype=torch.bool)
+        )
     else:
         attention_mask = torch.zeros((batch, seq_len), device=device, dtype=torch.bool)
         attention_mask[:, :active_len] = True
@@ -183,12 +187,14 @@ def main() -> None:
     mean_ms = statistics.mean(times_ms)
     p50_ms = statistics.median(times_ms)
     p90_ms = statistics.quantiles(times_ms, n=10)[8] if len(times_ms) >= 10 else max(times_ms)
-    max_mem_gib = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+    max_mem_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
 
     stats = flashdeberta_stats_snapshot() if callable(flashdeberta_stats_snapshot) else None
 
     print(f"mode={args.mode}")
-    print(f"seq_len={args.seq_len} batch_size={args.batch_size} pad_ratio={args.pad_ratio:.3f} dtype={args.dtype}")
+    print(
+        f"seq_len={args.seq_len} batch_size={args.batch_size} pad_ratio={args.pad_ratio:.3f} dtype={args.dtype}"
+    )
     print(f"mean_ms={mean_ms:.2f} p50_ms={p50_ms:.2f} p90_ms={p90_ms:.2f}")
     print(f"active_tok_per_s={active_tok_s:.2f}")
     print(f"slot_tok_per_s={slot_tok_s:.2f}")

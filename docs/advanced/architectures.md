@@ -42,6 +42,11 @@ Use explicit config values when you want different behavior.
 - TODO (strict parity follow-up): evaluate narrowing discriminator embedding sharing to only word+position embeddings; current sharing also includes `token_type_embeddings`.
 - TODO (architecture follow-up): evaluate defaulting `generator_intermediate_size` from `generator_hidden_size` when only width is overridden; current behavior inherits discriminator FFN width unless explicitly set.
 
+## FlashDeBERTa follow-ups
+
+- TODO (flash optimization follow-up): benchmark and, only if warranted, add the upstream small-batch local-bias path for `512 < seq_len < 1024` with very small training batches.
+- TODO (flash feature follow-up): add packed doc-block-aware flash attention for `hf_deberta_v2` only after the simpler padding-style flash path is proven worthwhile in longer-context runs.
+
 ## RoPE-specific controls
 
 `rope` adds controls not used by `hf_deberta_v2`:

@@ -76,7 +76,13 @@ try:  # pragma: no cover - version-compat fallback
     _compiler_disable = torch.compiler.disable
 except Exception:  # pragma: no cover
 
-    def _compiler_disable(fn):  # type: ignore[no-redef]
+    def _compiler_disable(fn: Any) -> Any:  # type: ignore[no-redef]
+        """Return the function unchanged when ``torch.compiler.disable`` is unavailable.
+
+        :param Any fn: Callable to return unchanged.
+        :return Any: The original callable.
+        """
+
         return fn
 
 
@@ -85,13 +91,18 @@ def flashdeberta_import_error() -> Exception | None:
 
     The runtime patch requires the fixed kernel. The varlen kernel is optional and
     only affects padding-heavy workloads.
+
+    :return Exception | None: Stored fixed-kernel import failure, if one occurred.
     """
 
     return _FLASH_FIXED_IMPORT_ERROR
 
 
 def flashdeberta_stats_snapshot() -> dict[str, int]:
-    """Return a copy of lightweight flash-path counters for benchmarking."""
+    """Return a copy of the in-process flash path counters.
+
+    :return dict[str, int]: Counter snapshot keyed by path or fallback name.
+    """
 
     return dict(_FLASH_STATS)
 
@@ -103,19 +114,33 @@ def reset_flashdeberta_stats() -> None:
 
 
 def _record_stat(name: str, value: int = 1) -> None:
-    """Increment a small in-process counter."""
+    """Increment an in-process flash path counter.
+
+    :param str name: Counter key.
+    :param int value: Increment amount, defaults to ``1``.
+    """
 
     _FLASH_STATS[name] += int(value)
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
-    """Parse a boolean-ish environment variable."""
+    """Parse a boolean-ish environment variable.
+
+    :param str name: Environment variable name.
+    :param str default: Default string to parse when the variable is unset.
+    :return bool: Whether the value matches the repo's truthy set.
+    """
 
     return os.environ.get(name, default).strip().lower() in _TRUTHY
 
 
 def _int_env(name: str, default: int) -> int:
-    """Parse an integer environment variable with safe fallback."""
+    """Parse an integer environment variable with safe fallback.
+
+    :param str name: Environment variable name.
+    :param int default: Default integer value.
+    :return int: Parsed integer or the default on parse failure.
+    """
 
     raw = os.environ.get(name)
     if raw is None:
@@ -132,6 +157,10 @@ def _mask4d_to_seqlens(attention_mask: torch.Tensor, *, seq_len: int) -> torch.T
     Supported mask shapes:
     - ``(B, S)``
     - ``(B, 1, 1, S)``
+
+    :param torch.Tensor attention_mask: Padding-style keep mask.
+    :param int seq_len: Expected sequence length.
+    :return torch.Tensor: Per-example sequence lengths with dtype ``int32``.
     """
 
     key_mask = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
@@ -143,6 +172,11 @@ def _mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torc
 
     This function intentionally rejects pairwise masks because the varlen path in
     this adapter is for standard padding masks only.
+
+    :param torch.Tensor attention_mask: Broadcast or 2D keep mask.
+    :param int seq_len: Expected sequence length.
+    :raises ValueError: If the mask is not 2D or broadcast 4D.
+    :return torch.Tensor: Boolean mask with shape ``(B, S)``.
     """
 
     mask = normalize_keep_mask(attention_mask)
@@ -161,7 +195,13 @@ def _mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torc
 
 
 def _is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
-    """Return whether a mask encodes per-query pairwise constraints."""
+    """Return whether a mask encodes per-query pairwise constraints.
+
+    :param torch.Tensor attention_mask: Candidate attention mask.
+    :param int query_len: Expected query length.
+    :param int key_len: Expected key length.
+    :return bool: True when the mask has per-query pairwise structure.
+    """
 
     mask = normalize_keep_mask(attention_mask)
     if mask.ndim == 3:
@@ -172,7 +212,12 @@ def _is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: 
 
 
 def _is_dense_batch(attention_mask: torch.Tensor | None, *, seq_len: int) -> bool:
-    """Return whether all tokens are active for all batch elements."""
+    """Return whether all tokens are active for all batch elements.
+
+    :param torch.Tensor | None attention_mask: Optional attention mask.
+    :param int seq_len: Expected sequence length.
+    :return bool: True when every token is active in every batch element.
+    """
 
     if attention_mask is None:
         return True
@@ -184,14 +229,12 @@ def _is_dense_batch(attention_mask: torch.Tensor | None, *, seq_len: int) -> boo
 
 
 @_compiler_disable
-
 def _build_unpad_metadata(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Build unpadding metadata for the varlen FlashDeBERTa kernel.
 
-    Returns:
-        indices: flattened non-pad token indices, shape ``(NNZ,)``
-        cu_seqlens: cumulative sequence lengths, shape ``(B+1,)`` int32
-        max_seqlen: maximum active tokens in any batch element, as a Python int
+    :param torch.Tensor mask_2d: Boolean keep mask with shape ``(B, S)``.
+    :return tuple[torch.Tensor, torch.Tensor, int]: Flattened token indices,
+        cumulative sequence lengths, and max sequence length in batch.
     """
 
     seqlens = mask_2d.sum(dim=-1, dtype=torch.int32)
@@ -202,14 +245,28 @@ def _build_unpad_metadata(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 
 def _flatten_valid_tokens(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Gather valid tokens from a padded ``(B,S,...)`` tensor into ``(NNZ,...)``."""
+    """Gather valid tokens from a padded tensor into an unpadded layout.
+
+    :param torch.Tensor tensor: Padded tensor with leading shape ``(B, S, ...)``.
+    :param torch.Tensor indices: Flattened valid-token indices.
+    :return torch.Tensor: Gathered tensor with leading shape ``(NNZ, ...)``.
+    """
 
     flat = tensor.reshape(tensor.shape[0] * tensor.shape[1], *tensor.shape[2:])
     return flat.index_select(0, indices)
 
 
-def _pad_valid_tokens(values: torch.Tensor, indices: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
-    """Scatter ``(NNZ,...)`` values back into a padded ``(B,S,...)`` layout."""
+def _pad_valid_tokens(
+    values: torch.Tensor, indices: torch.Tensor, batch_size: int, seq_len: int
+) -> torch.Tensor:
+    """Scatter unpadded values back into a padded batch layout.
+
+    :param torch.Tensor values: Unpadded values with leading shape ``(NNZ, ...)``.
+    :param torch.Tensor indices: Flattened valid-token indices.
+    :param int batch_size: Batch size.
+    :param int seq_len: Padded sequence length.
+    :return torch.Tensor: Padded tensor with leading shape ``(B, S, ...)``.
+    """
 
     flat_out = values.new_zeros((batch_size * seq_len, *values.shape[1:]))
     flat_out = flat_out.index_copy(0, indices, values)
@@ -221,7 +278,12 @@ def _should_use_varlen(
     attention_mask: torch.Tensor | None,
     seq_len: int,
 ) -> bool:
-    """Return whether the varlen kernel should be used for this call."""
+    """Return whether the varlen kernel should be used for this call.
+
+    :param torch.Tensor | None attention_mask: Optional attention mask.
+    :param int seq_len: Sequence length for the current call.
+    :return bool: True when the varlen kernel should run.
+    """
 
     if flash_attention_with_disentangled_varlen is None:
         return False
@@ -245,7 +307,11 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
     @classmethod
     def _warn_once(cls, *, reason: str, message: str) -> None:
-        """Emit one warning per process for a fallback reason."""
+        """Emit one warning per process for a fallback reason.
+
+        :param str reason: Stable fallback key.
+        :param str message: Warning text to emit.
+        """
 
         if reason in cls._warned_reasons:
             return
@@ -260,14 +326,25 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_states: torch.Tensor,
         rel_embeddings: torch.Tensor | None,
     ) -> tuple[str, str] | None:
-        """Return the first reason this call should use eager attention."""
+        """Return the first reason this call should use eager attention.
+
+        :param torch.Tensor hidden_states: Key/value hidden states.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor query_states: Query hidden states.
+        :param torch.Tensor | None rel_embeddings: Relative embedding table.
+        :return tuple[str, str] | None: Fallback reason key and message, or ``None``.
+        """
 
         query_len = int(query_states.shape[-2])
         key_len = int(hidden_states.shape[-2])
         dropout_p = float(getattr(self.dropout, "p", 0.0))
 
         dense_eager_limit = max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0))
-        if dense_eager_limit > 0 and key_len <= dense_eager_limit and _is_dense_batch(attention_mask, seq_len=key_len):
+        if (
+            dense_eager_limit > 0
+            and key_len <= dense_eager_limit
+            and _is_dense_batch(attention_mask, seq_len=key_len)
+        ):
             return (
                 "dense_short_policy",
                 "FlashDeBERTa dense short-sequence policy selected eager attention for this batch.",
@@ -333,7 +410,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
     ) -> tuple[str, str] | None:
-        """Return whether projected QKV tensors are unsupported by the flash kernels."""
+        """Return whether projected QKV tensors are unsupported by the flash kernels.
+
+        :param torch.Tensor query_layer: Projected query tensor.
+        :param torch.Tensor key_layer: Projected key tensor.
+        :param torch.Tensor value_layer: Projected value tensor.
+        :return tuple[str, str] | None: Fallback reason key and message, or ``None``.
+        """
 
         qkv_dtypes = {query_layer.dtype, key_layer.dtype, value_layer.dtype}
         if len(qkv_dtypes) != 1:
@@ -361,7 +444,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         pos_query: torch.Tensor | None,
         sm_scale: float,
     ) -> torch.Tensor:
-        """Run the fixed-length FlashDeBERTa kernel."""
+        """Run the fixed-length FlashDeBERTa kernel.
+
+        :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
+        :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
+        :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor | None attention_mask: Optional padding mask.
+        :param torch.Tensor | None pos_key: Optional c2p term.
+        :param torch.Tensor | None pos_query: Optional p2c term.
+        :param float sm_scale: Softmax scale.
+        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        """
 
         seq_lengths = None
         if attention_mask is not None:
@@ -391,7 +484,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         pos_query: torch.Tensor | None,
         sm_scale: float,
     ) -> torch.Tensor:
-        """Run the upstream-style unpadded varlen FlashDeBERTa kernel."""
+        """Run the upstream-style unpadded varlen FlashDeBERTa kernel.
+
+        :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
+        :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
+        :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor attention_mask: Padding-style keep mask.
+        :param torch.Tensor | None pos_key: Optional c2p term.
+        :param torch.Tensor | None pos_query: Optional p2c term.
+        :param float sm_scale: Softmax scale.
+        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        """
 
         if flash_attention_with_disentangled_varlen is None:  # pragma: no cover - guarded by caller
             raise RuntimeError("Varlen FlashDeBERTa operator unexpectedly unavailable.")
@@ -418,7 +521,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         k_unpad = _flatten_valid_tokens(k_padded, indices)
         v_unpad = _flatten_valid_tokens(v_padded, indices)
         pos_key_unpad = _flatten_valid_tokens(pos_key_padded, indices) if pos_key_padded is not None else None
-        pos_query_unpad = _flatten_valid_tokens(pos_query_padded, indices) if pos_query_padded is not None else None
+        pos_query_unpad = (
+            _flatten_valid_tokens(pos_query_padded, indices) if pos_query_padded is not None else None
+        )
 
         out_unpad = flash_attention_with_disentangled_varlen(
             q_unpad,
@@ -449,7 +554,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run flash-backed attention when the runtime contract is compatible."""
+        """Run flash-backed attention when the runtime contract is compatible.
+
+        :param torch.Tensor hidden_states: Input hidden states.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param bool output_attentions: Whether to return attention probabilities.
+        :param torch.Tensor | None query_states: Optional query states.
+        :param torch.Tensor | None relative_pos: Optional relative-position ids.
+        :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
+        :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
+        """
 
         del relative_pos  # The flash kernels compute relative positions on device.
 
@@ -469,6 +583,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             _record_stat("fallback_calls")
             _record_stat(f"fallback_{key}")
             self._warn_once(reason=key, message=message)
+            # The encoder-level get_rel_pos patch suppresses the shared (S,S)
+            # allocation globally. Unsupported correctness fallbacks rebuild
+            # relative-position bias inside eager attention instead.
             return super().forward(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -498,6 +615,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             _record_stat("fallback_calls")
             _record_stat(f"fallback_{key}")
             self._warn_once(reason=key, message=message)
+            # Keep the same eager fallback contract here for dtype/layout
+            # mismatches instead of reviving the encoder-wide relative_pos tensor.
             return super().forward(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
