@@ -14,35 +14,6 @@ _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 
 
-def _maybe_prefer_cublaslt(*, is_main: bool = False) -> None:
-    """Prefer cuBLASLt when PyTorch exposes the experimental backend switch.
-
-    :param bool is_main: Whether to emit a one-line informational log.
-    """
-
-    if not torch.cuda.is_available():
-        return
-
-    cuda_backend = getattr(torch.backends, "cuda", None)
-    preferred_blas_library = getattr(cuda_backend, "preferred_blas_library", None)
-    if not callable(preferred_blas_library):
-        return
-
-    try:
-        current = preferred_blas_library()
-    except Exception:
-        current = None
-
-    try:
-        preferred_blas_library("cublaslt")
-    except Exception:
-        logger.warning("Failed to prefer cuBLASLt for CUDA matmul.", exc_info=True)
-        return
-
-    if is_main:
-        logger.info("Preferred CUDA BLAS backend=%s (was %s).", "cublaslt", current)
-
-
 def _maybe_enable_tf32(enabled: bool) -> None:
     """Configure TF32 compute policy for CUDA matmul/cudnn.
 
@@ -106,8 +77,6 @@ def _bf16_runtime_sanity_check() -> bool:
 
     :return bool: True when a tiny bf16 autocast path succeeds.
     """
-    _maybe_prefer_cublaslt()
-
     if not torch.cuda.is_available():
         logger.error("bf16 mixed precision requested but CUDA is not available.")
         return False

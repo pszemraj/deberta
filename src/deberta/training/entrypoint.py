@@ -38,7 +38,6 @@ from deberta.training.compile import (
     _maybe_configure_sdpa_kernels,
     _maybe_cudagraph_mark_step_begin,
     _maybe_enable_tf32,
-    _maybe_prefer_cublaslt,
     _prefill_rotary_caches_for_compile,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
@@ -152,7 +151,6 @@ def run_pretraining_dry_run(
         config_path=config_path,
         run_name=train_cfg.run_name,
     )
-    _maybe_prefer_cublaslt(is_main=True)
     logging_output_dir = (
         Path(str(resolved_logging_cfg.output_dir))
         if resolved_logging_cfg.output_dir is not None and str(resolved_logging_cfg.output_dir).strip()
@@ -339,7 +337,6 @@ def run_pretraining(
         logging_cfg=resolved_logging_cfg,
     )
 
-    _maybe_prefer_cublaslt()
     log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
     mixed_precision = resolve_effective_mixed_precision(
         train_cfg.mixed_precision,
@@ -362,7 +359,6 @@ def run_pretraining(
     )
 
     setup_process_logging(accelerator.is_main_process)
-    _maybe_prefer_cublaslt(is_main=accelerator.is_main_process)
     _apply_profile_and_validate_training_configs(
         model_cfg=model_cfg,
         data_cfg=data_cfg,

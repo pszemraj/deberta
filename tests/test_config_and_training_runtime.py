@@ -1037,36 +1037,13 @@ def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
     import deberta.training.compile as compile_mod
 
     monkeypatch.setattr(compile_mod, "_bf16_runtime_sanity_check", lambda: False)
-    with pytest.raises(RuntimeError, match="mixed_precision=no explicitly"):
+    with pytest.raises(RuntimeError, match="TORCH_BLAS_PREFER_CUBLASLT=1"):
         resolve_effective_mixed_precision("bf16", bf16_sanity_check=compile_mod._bf16_runtime_sanity_check)
 
     assert (
         resolve_effective_mixed_precision("no", bf16_sanity_check=compile_mod._bf16_runtime_sanity_check)
         == "no"
     )
-
-
-def test_maybe_prefer_cublaslt_uses_cuda_backend_api(monkeypatch: pytest.MonkeyPatch):
-    import deberta.training.compile as compile_mod
-
-    calls: list[str] = []
-
-    def _preferred_blas_library(choice: str | None = None) -> object:
-        if choice is None:
-            return "_BlasBackend.Cublas"
-        calls.append(str(choice))
-        return "_BlasBackend.Cublaslt"
-
-    monkeypatch.setattr(compile_mod.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        compile_mod.torch.backends,
-        "cuda",
-        types.SimpleNamespace(preferred_blas_library=_preferred_blas_library),
-    )
-
-    compile_mod._maybe_prefer_cublaslt(is_main=True)
-
-    assert calls == ["cublaslt"]
 
 
 def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(
