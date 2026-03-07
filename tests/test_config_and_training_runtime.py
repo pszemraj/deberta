@@ -1037,7 +1037,7 @@ def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
     import deberta.training.compile as compile_mod
 
     monkeypatch.setattr(compile_mod, "_bf16_runtime_sanity_check", lambda: False)
-    with pytest.raises(RuntimeError, match="TORCH_BLAS_PREFER_CUBLASLT=1"):
+    with pytest.raises(RuntimeError, match="Set train.mixed_precision=no explicitly"):
         resolve_effective_mixed_precision("bf16", bf16_sanity_check=compile_mod._bf16_runtime_sanity_check)
 
     assert (

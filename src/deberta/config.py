@@ -1251,8 +1251,6 @@ def resolve_effective_mixed_precision(
     if mixed_precision == "bf16" and bf16_sanity_check is not None and not bf16_sanity_check():
         raise RuntimeError(
             "train.mixed_precision=bf16 requested but bf16 preflight failed. "
-            "If the logged preflight shows CUDA/CUBLAS invalid-value errors, retry with "
-            "TORCH_BLAS_PREFER_CUBLASLT=1. "
             "Set train.mixed_precision=no explicitly if you want to continue in full precision."
         )
     return mixed_precision
