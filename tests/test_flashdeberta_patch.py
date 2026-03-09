@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import warnings
 
 import pytest
 import torch
@@ -308,7 +309,9 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     cfg = _small_deberta_config()
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
 
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
     monkeypatch.setenv("FLASHDEBERTA_FORCE_VARLEN", "1")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
     monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
     monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
 
@@ -334,6 +337,32 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     assert stats["flash_varlen_calls"] == 1
     assert stats.get("flash_fixed_calls", 0) == 0
     assert stats.get("fallback_calls", 0) == 0
+
+
+def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+    attention_mod.reset_flashdeberta_stats()
+
+    attention_mod._record_stat("forward_calls")
+    assert attention_mod.flashdeberta_stats_snapshot()["forward_calls"] == 1
+
+    monkeypatch.setattr(attention_mod, "_is_torch_compiling", lambda: True)
+    attention_mod._record_stat("forward_calls")
+
+    assert attention_mod.flashdeberta_stats_snapshot()["forward_calls"] == 1
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        attention_mod.FlashDisentangledSelfAttention._warn_once(
+            reason="compile_skip",
+            message="should not warn while compiling",
+        )
+
+    assert len(captured) == 0
 
 
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

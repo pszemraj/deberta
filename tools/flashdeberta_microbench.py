@@ -21,6 +21,7 @@ Longer padded regime with varlen enabled:
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -48,10 +49,12 @@ from deberta.modeling.flashdeberta_patch import (  # noqa: E402
 try:  # noqa: E402
     from deberta.modeling.flashdeberta_attention import (  # type: ignore
         flashdeberta_stats_snapshot,
+        refresh_flashdeberta_runtime_config_from_env,
         reset_flashdeberta_stats,
     )
 except Exception:  # pragma: no cover
     flashdeberta_stats_snapshot = None
+    refresh_flashdeberta_runtime_config_from_env = None
     reset_flashdeberta_stats = None
 
 
@@ -146,6 +149,9 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats(device)
 
     if str(args.mode) == "flash":
+        os.environ.setdefault("FLASHDEBERTA_DEBUG_STATS", "1")
+        if callable(refresh_flashdeberta_runtime_config_from_env):
+            refresh_flashdeberta_runtime_config_from_env()
         enable_flashdeberta_attention(strict=True)
     else:
         disable_flashdeberta_attention()

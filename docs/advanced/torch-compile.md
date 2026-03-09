@@ -25,6 +25,17 @@ Default behavior (`auto`) compiles heavy backbone modules and keeps unstable wra
 
 The full RTD wrapper contains dynamic masking, token sampling, and corruption logic that causes graph breaks and instability in compiled graphs. The repo compiles backbone modules only and leaves wrapper orchestration eager.
 
+## FlashDeBERTa notes
+
+FlashDeBERTa path counters are debug-only and disabled by default. Normal compiled
+training should not mutate Python stats or emit per-call warnings from inside
+attention forward. Use benchmark/probe tooling for path visibility instead.
+
+The current varlen FlashDeBERTa unpadding metadata still lives outside compiled
+graphs. That is an intentional correctness-first boundary; if varlen+compile is
+still slower than expected after removing Python-side recompiles, treat that as
+a separate optimization problem.
+
 ## Special case: packed doc-block masks
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope downgrades toward FFN-focused compile to avoid shape-churn recompiles from dynamic pairwise masks.
