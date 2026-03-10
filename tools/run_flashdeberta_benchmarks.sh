@@ -129,7 +129,7 @@ summary_micro() {
     local name="$1"
     local log_path="${OUT_DIR}/${name}.log"
     local elapsed_s="NA"
-    local mean_ms active_tok_s slot_tok_s max_mem_gib flash_stats
+    local mean_ms active_tok_s slot_tok_s max_mem_gib flash_stats flash_stats_display
 
     if [[ -f "${OUT_DIR}/${name}.meta" ]]; then
         elapsed_s="$(awk -F= '/^elapsed_s=/{print $2}' "${OUT_DIR}/${name}.meta")"
@@ -146,9 +146,10 @@ summary_micro() {
     slot_tok_s="$(awk '/^slot_tok_per_s=/{sub(/^slot_tok_per_s=/, "", $0); print $0}' "${log_path}")"
     max_mem_gib="$(awk '/^max_memory_gib=/{sub(/^max_memory_gib=/, "", $0); print $0}' "${log_path}")"
     flash_stats="$(awk '/^flash_stats=/{sub(/^flash_stats=/, "", $0); print $0}' "${log_path}")"
+    flash_stats_display="${flash_stats:-\{\}}"
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${name}" "${elapsed_s}" "${mean_ms:-NA}" "${active_tok_s:-NA}" "${slot_tok_s:-NA}" "${max_mem_gib:-NA} ${flash_stats:-{}}"
+        "${name}" "${elapsed_s}" "${mean_ms:-NA}" "${active_tok_s:-NA}" "${slot_tok_s:-NA}" "${max_mem_gib:-NA} ${flash_stats_display}"
 }
 
 summary_train() {
