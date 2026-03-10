@@ -38,6 +38,7 @@ accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml \
 
 Use the flash wrapper only after installing the optional flash runtime, and keep `data.packing.block_cross_document_attention=false`.
 Use `tools/flashdeberta_microbench.py` to compare eager vs flash on dense and padded regimes before defaulting flash for a specific config or machine.
+Use `tools/run_flashdeberta_benchmarks.sh` when you want the full current-head matrix in one run, including dense/padded microbench cases plus packed and unpacked training logs under a single `/tmp` output directory.
 
 ## 3) Export discriminator for downstream use
 
