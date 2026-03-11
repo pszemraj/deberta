@@ -1247,6 +1247,62 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     assert reason is None
 
 
+def test_build_compile_kwargs_for_scope_omits_dynamic_for_flash_backbones() -> None:
+    class FlashDisentangledSelfAttention(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    FlashDisentangledSelfAttention.__module__ = "deberta.modeling.flashdeberta_attention"
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self, *, flash: bool) -> None:
+            super().__init__()
+            self.attention = FlashDisentangledSelfAttention() if flash else torch.nn.Linear(4, 4)
+
+    class _Backbone(torch.nn.Module):
+        def __init__(self, *, flash: bool) -> None:
+            super().__init__()
+            self.encoder = _Encoder(flash=flash)
+            self.proj = torch.nn.Linear(4, 4)
+
+    class _TinyRTD(torch.nn.Module):
+        def __init__(self, *, flash: bool) -> None:
+            super().__init__()
+            self.generator = _Backbone(flash=flash)
+            self.discriminator = _Backbone(flash=flash)
+
+    flash_model = _TinyRTD(flash=True)
+    flash_kwargs, flash_dynamic = _build_compile_kwargs_for_scope(
+        unwrapped_model=flash_model,
+        compile_scope="backbones",
+        compile_mode="default",
+        compile_backend="inductor",
+    )
+    assert flash_kwargs["mode"] == "default"
+    assert flash_kwargs["backend"] == "inductor"
+    assert "dynamic" not in flash_kwargs
+    assert flash_dynamic == "default"
+
+    ffn_kwargs, ffn_dynamic = _build_compile_kwargs_for_scope(
+        unwrapped_model=flash_model,
+        compile_scope="ffn",
+        compile_mode="default",
+        compile_backend="inductor",
+    )
+    assert ffn_kwargs["dynamic"] is False
+    assert ffn_dynamic == "false"
+
+    eager_model = _TinyRTD(flash=False)
+    eager_kwargs, eager_dynamic = _build_compile_kwargs_for_scope(
+        unwrapped_model=eager_model,
+        compile_scope="backbones",
+        compile_mode="default",
+        compile_backend="inductor",
+    )
+    assert eager_kwargs["dynamic"] is False
+    assert eager_dynamic == "false"
+
+
 def test_compile_controls_do_not_reference_environment_variables():
     import inspect
 
