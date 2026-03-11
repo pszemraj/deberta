@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from contextlib import nullcontext, suppress
@@ -31,7 +32,6 @@ from deberta.training.checkpointing import (
 )
 from deberta.training.compile import (
     _bf16_runtime_sanity_check,
-    _build_compile_kwargs_for_scope,
     _build_doc_block_mask,
     _compile_backbones_for_scope,
     _dtype_for_mixed_precision,
@@ -570,18 +570,24 @@ def run_pretraining(
     with suppress(Exception):
         _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
+    with suppress(Exception):
+        from deberta.modeling.flashdeberta_attention import set_flashdeberta_compile_active
+
+        set_flashdeberta_compile_active(bool(compile_enabled))
+
     if compile_enabled:
         try:
             if compile_scope_reason:
                 logger.warning(compile_scope_reason)
 
             unwrapped = unwrap_compiled_model(accelerator, model)
-            compile_kwargs, dynamic_policy = _build_compile_kwargs_for_scope(
-                unwrapped_model=unwrapped,
-                compile_scope=compile_scope,
-                compile_mode=compile_mode,
-                compile_backend=compile_backend,
-            )
+            compile_kwargs: dict[str, Any] = {"mode": compile_mode, "backend": compile_backend}
+            try:
+                compile_params = inspect.signature(torch.compile).parameters  # type: ignore[attr-defined]
+                if "dynamic" in compile_params:
+                    compile_kwargs["dynamic"] = False
+            except Exception:
+                pass
             compile_scope_key = str(compile_scope).strip().lower()
             if compile_scope_key in {"backbones", "encoder", "gen_encoder", "disc_encoder"}:
                 prefilled_rotary = _prefill_rotary_caches_for_compile(
@@ -607,16 +613,7 @@ def run_pretraining(
                 ",".join(compiled_targets),
                 compile_scope,
                 compile_scope_requested,
-                ", ".join(
-                    [
-                        *(f"{k}={v}" for k, v in compile_kwargs.items()),
-                        *(
-                            [f"dynamic={dynamic_policy}"]
-                            if dynamic_policy is not None and "dynamic" not in compile_kwargs
-                            else []
-                        ),
-                    ]
-                ),
+                ", ".join(f"{k}={v}" for k, v in compile_kwargs.items()),
             )
         except Exception as e:
             raise RuntimeError(

@@ -31,15 +31,11 @@ FlashDeBERTa path counters are debug-only and disabled by default. Normal compil
 training should not mutate Python stats or emit per-call warnings from inside
 attention forward. Use benchmark/probe tooling for path visibility instead.
 
-When a compiled target subtree contains FlashDeBERTa attention, the training
-entrypoint intentionally omits `dynamic=False` and lets `torch.compile` use its
-default dynamic policy. Non-flash targets and FFN-only compile scopes keep the
-repo's explicit `dynamic=False` setting.
-
 The current varlen FlashDeBERTa unpadding metadata still lives outside compiled
-graphs. That is an intentional correctness-first boundary; if varlen+compile is
-still slower than expected after removing Python-side recompiles, treat that as
-a separate optimization problem.
+graphs. Compiled runs therefore default back to the fixed flash path for padded
+batches unless `FLASHDEBERTA_ALLOW_COMPILED_VARLEN=1` is set explicitly for
+experimentation on a newer PyTorch/Triton stack. Treat true varlen+compile as a
+separate optimization problem until that path is proven stable.
 
 ## Special case: packed doc-block masks
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 from typing import Any
 
@@ -150,124 +149,6 @@ def _resolve_compile_scope(
             "auto scope selected FFN-only for rope + doc-blocking (mask shape churn under compile)",
         )
     return "backbones", None
-
-
-def _module_contains_flashdeberta_attention(module: torch.nn.Module) -> bool:
-    """Return whether a module subtree contains FlashDeBERTa attention.
-
-    This intentionally avoids importing the optional flash module here. Runtime
-    detection is based on the patched attention class identity already present in
-    the loaded model tree.
-
-    :param torch.nn.Module module: Module subtree to scan.
-    :return bool: True when the subtree contains flash-backed attention layers.
-    """
-
-    for submodule in module.modules():
-        cls = submodule.__class__
-        if cls.__name__ != "FlashDisentangledSelfAttention":
-            continue
-        if cls.__module__ == "deberta.modeling.flashdeberta_attention":
-            return True
-    return False
-
-
-def _compile_scope_uses_flashdeberta_attention(
-    *,
-    unwrapped_model: torch.nn.Module,
-    compile_scope: str,
-) -> bool:
-    """Return whether the selected compile scope targets flash-backed modules.
-
-    FlashDeBERTa varlen runs produce dynamic token counts after unpadding. When
-    compile scope includes the affected backbone/encoder modules, forcing
-    ``dynamic=False`` can over-specialize on one batch shape and drive repeated
-    recompiles for later batches. FFN-only scopes do not include attention, so
-    they keep the repo's explicit static-shape policy.
-
-    :param torch.nn.Module unwrapped_model: Unwrapped RTD pretrainer model.
-    :param str compile_scope: Effective compile scope.
-    :raises RuntimeError: If required RTD submodules are missing for the scope.
-    :raises ValueError: If the scope is unsupported.
-    :return bool: True when selected compile targets include flash attention.
-    """
-
-    scope = str(compile_scope).strip().lower()
-    if scope in {"ffn", "gen_ffn", "disc_ffn"}:
-        return False
-
-    generator = getattr(unwrapped_model, "generator", None)
-    discriminator = getattr(unwrapped_model, "discriminator", None)
-    if not isinstance(generator, torch.nn.Module) or not isinstance(discriminator, torch.nn.Module):
-        raise RuntimeError("RTD model must expose generator and discriminator modules for compilation.")
-
-    if scope == "backbones":
-        return _module_contains_flashdeberta_attention(generator) or _module_contains_flashdeberta_attention(
-            discriminator
-        )
-
-    uses_flash = False
-    if scope in {"encoder", "gen_encoder"}:
-        gen_encoder = getattr(generator, "encoder", None)
-        if not isinstance(gen_encoder, torch.nn.Module):
-            raise RuntimeError("generator.encoder is required for encoder-only compile scope.")
-        uses_flash = uses_flash or _module_contains_flashdeberta_attention(gen_encoder)
-
-    if scope in {"encoder", "disc_encoder"}:
-        disc_encoder = getattr(discriminator, "encoder", None)
-        if not isinstance(disc_encoder, torch.nn.Module):
-            raise RuntimeError("discriminator.encoder is required for encoder-only compile scope.")
-        uses_flash = uses_flash or _module_contains_flashdeberta_attention(disc_encoder)
-
-    if scope not in {"encoder", "gen_encoder", "disc_encoder"}:
-        raise ValueError(f"Unsupported compile scope: {compile_scope}")
-
-    return uses_flash
-
-
-def _build_compile_kwargs_for_scope(
-    *,
-    unwrapped_model: torch.nn.Module,
-    compile_scope: str,
-    compile_mode: str,
-    compile_backend: str,
-) -> tuple[dict[str, Any], str | None]:
-    """Build ``torch.compile`` kwargs for the selected compile scope.
-
-    Non-flash targets keep the repo's explicit ``dynamic=False`` policy. When
-    the selected target subtree contains FlashDeBERTa attention, the helper
-    omits the ``dynamic`` kwarg so PyTorch can use its default dynamic policy
-    for varlen shape generalization.
-
-    :param torch.nn.Module unwrapped_model: Unwrapped RTD pretrainer model.
-    :param str compile_scope: Effective compile scope.
-    :param str compile_mode: Requested compile mode.
-    :param str compile_backend: Requested compile backend.
-    :return tuple[dict[str, Any], str | None]: Compile kwargs and dynamic-policy
-        label for logging.
-    """
-
-    compile_kwargs: dict[str, Any] = {
-        "mode": str(compile_mode),
-        "backend": str(compile_backend),
-    }
-
-    try:
-        compile_params = inspect.signature(torch.compile).parameters  # type: ignore[attr-defined]
-    except Exception:
-        return compile_kwargs, None
-
-    if "dynamic" not in compile_params:
-        return compile_kwargs, None
-
-    if _compile_scope_uses_flashdeberta_attention(
-        unwrapped_model=unwrapped_model,
-        compile_scope=compile_scope,
-    ):
-        return compile_kwargs, "default"
-
-    compile_kwargs["dynamic"] = False
-    return compile_kwargs, "false"
 
 
 def _compile_backbones_for_scope(

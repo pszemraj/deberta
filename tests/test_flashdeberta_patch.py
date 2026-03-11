@@ -365,6 +365,25 @@ def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.Mon
     assert len(captured) == 0
 
 
+def test_varlen_is_disabled_by_default_while_compiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+
+    mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+
+    attention_mod.set_flashdeberta_compile_active(True)
+    monkeypatch.delenv("FLASHDEBERTA_ALLOW_COMPILED_VARLEN", raising=False)
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
+
+    monkeypatch.setenv("FLASHDEBERTA_ALLOW_COMPILED_VARLEN", "1")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is True
+    attention_mod.set_flashdeberta_compile_active(False)
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()

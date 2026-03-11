@@ -18,6 +18,9 @@ Important behavior
 ------------------
 - Fixed-length flash remains the default path for dense / maskless batches.
 - Varlen flash is used for padded batches when enabled by runtime policy.
+- Compiled runs default back to fixed flash for padded batches because the
+  current PyTorch/Triton stack is not yet reliable for symbolic-shape varlen
+  kernel tracing in end-to-end training.
 - Pairwise masks still fall back to eager attention for correctness.
 - The varlen unpadding helper intentionally remains outside compiled graphs.
   That means varlen runs may still see graph breaks around unpadding metadata.
@@ -33,6 +36,9 @@ Set these before importing this module:
     padding mask is present.
 - ``FLASHDEBERTA_FORCE_VARLEN`` (default: ``0``)
     Force the varlen kernel whenever a padding mask is present.
+- ``FLASHDEBERTA_ALLOW_COMPILED_VARLEN`` (default: ``0``)
+    Allow the varlen kernel while running under ``torch.compile``. Leave this
+    off unless you are explicitly testing a newer PyTorch/Triton stack.
 - ``FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN`` (default: ``0`` / disabled)
     Route dense maskless batches at or below this length back to eager attention.
 - ``FLASHDEBERTA_DEBUG_STATS`` (default: ``0``)
@@ -76,6 +82,7 @@ except Exception as exc:  # pragma: no cover - optional path
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
+_FLASHDEBERTA_COMPILE_ACTIVE = False
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
@@ -89,6 +96,7 @@ class FlashDebertaRuntimeConfig:
 
     force_varlen: bool = False
     varlen_min_seq_len: int = 1024
+    allow_compiled_varlen: bool = False
     eager_dense_max_seq_len: int = 0
     enable_debug_stats: bool = False
     warn_fallbacks: bool = True
@@ -159,6 +167,7 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
     return FlashDebertaRuntimeConfig(
         force_varlen=_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"),
         varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 1024)),
+        allow_compiled_varlen=_truthy_env("FLASHDEBERTA_ALLOW_COMPILED_VARLEN", default="0"),
         eager_dense_max_seq_len=max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0)),
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
         warn_fallbacks=_truthy_env("FLASHDEBERTA_WARN_FALLBACKS", default="1"),
@@ -177,6 +186,21 @@ def refresh_flashdeberta_runtime_config_from_env() -> None:
 
     global _RUNTIME_CONFIG
     _RUNTIME_CONFIG = _read_runtime_config_from_env()
+
+
+def set_flashdeberta_compile_active(active: bool) -> None:
+    """Record whether the repo training runtime enabled ``torch.compile``.
+
+    This is a stable runtime signal for policy decisions that should apply to
+    all compiled calls, even when `torch.compiler.is_compiling()` is False at
+    execution time after graph capture.
+
+    :param bool active: Whether compiled execution is enabled for flash-backed
+        training targets in the current process.
+    """
+
+    global _FLASHDEBERTA_COMPILE_ACTIVE
+    _FLASHDEBERTA_COMPILE_ACTIVE = bool(active)
 
 
 def flashdeberta_import_error() -> Exception | None:
@@ -344,7 +368,9 @@ def _should_use_varlen(
     This deliberately does not inspect tensor contents. In this repository's
     training path, the collator already drops all-ones masks, so
     ``attention_mask is None`` is the dense signal and ``attention_mask is not None``
-    is the padded signal.
+    is the padded signal. Compiled runs default to the fixed flash path for
+    padded batches because symbolic-shape varlen tracing is still unstable on
+    the current PyTorch/Triton stack.
 
     :param torch.Tensor | None attention_mask: Optional attention mask.
     :param int seq_len: Sequence length for the current call.
@@ -354,6 +380,9 @@ def _should_use_varlen(
     if flash_attention_with_disentangled_varlen is None:
         return False
     if attention_mask is None:
+        return False
+
+    if (_FLASHDEBERTA_COMPILE_ACTIVE or _is_torch_compiling()) and not _RUNTIME_CONFIG.allow_compiled_varlen:
         return False
 
     if _RUNTIME_CONFIG.force_varlen:
@@ -755,4 +784,5 @@ __all__ = [
     "flashdeberta_stats_snapshot",
     "refresh_flashdeberta_runtime_config_from_env",
     "reset_flashdeberta_stats",
+    "set_flashdeberta_compile_active",
 ]

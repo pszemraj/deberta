@@ -65,7 +65,6 @@ from deberta.training.checkpointing import (
     _resolve_data_resume_policy,
 )
 from deberta.training.compile import (
-    _build_compile_kwargs_for_scope,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _stabilize_compile_attention_mask,
