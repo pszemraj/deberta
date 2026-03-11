@@ -18,14 +18,9 @@ Important behavior
 ------------------
 - Fixed-length flash remains the default path for dense / maskless batches.
 - Varlen flash is used for padded batches when enabled by runtime policy.
-- Compiled runs default back to fixed flash for padded batches because the
-  current PyTorch/Triton stack is not yet reliable for symbolic-shape varlen
-  kernel tracing in end-to-end training.
+- The padded varlen path now runs through an opaque custom op on CUDA so
+  ``torch.compile`` does not trace into FlashDeBERTa's Python/Triton wrapper.
 - Pairwise masks still fall back to eager attention for correctness.
-- The varlen unpadding helper intentionally remains outside compiled graphs.
-  That means varlen runs may still see graph breaks around unpadding metadata.
-  This file fixes the constant recompile on the fixed flash path caused by
-  Python-side counters; it does not claim full compile purity for the varlen path.
 
 Optional runtime knobs
 ----------------------
@@ -36,9 +31,6 @@ Set these before importing this module:
     padding mask is present.
 - ``FLASHDEBERTA_FORCE_VARLEN`` (default: ``0``)
     Force the varlen kernel whenever a padding mask is present.
-- ``FLASHDEBERTA_ALLOW_COMPILED_VARLEN`` (default: ``0``)
-    Allow the varlen kernel while running under ``torch.compile``. Leave this
-    off unless you are explicitly testing a newer PyTorch/Triton stack.
 - ``FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN`` (default: ``0`` / disabled)
     Route dense maskless batches at or below this length back to eager attention.
 - ``FLASHDEBERTA_DEBUG_STATS`` (default: ``0``)
@@ -54,13 +46,15 @@ import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from deberta.modeling.deberta_v2_native import (
     DisentangledSelfAttention as _EagerDisentangledSelfAttention,
+)
+from deberta.modeling.flashdeberta_varlen_op import (
+    flashdeberta_compiled_varlen_available,
+    flashdeberta_varlen_padded,
 )
 from deberta.modeling.mask_utils import normalize_keep_mask
 
@@ -72,17 +66,8 @@ except Exception as exc:  # pragma: no cover - exercised indirectly in unit test
     flash_attention_with_disentangled = None
     _FLASH_FIXED_IMPORT_ERROR = exc
 
-try:
-    from flashdeberta.ops.flash_attention_varlen import flash_attention_with_disentangled_varlen
-
-    _FLASH_VARLEN_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - optional path
-    flash_attention_with_disentangled_varlen = None
-    _FLASH_VARLEN_IMPORT_ERROR = exc
-
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
-_FLASHDEBERTA_COMPILE_ACTIVE = False
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
@@ -96,24 +81,9 @@ class FlashDebertaRuntimeConfig:
 
     force_varlen: bool = False
     varlen_min_seq_len: int = 1024
-    allow_compiled_varlen: bool = False
     eager_dense_max_seq_len: int = 0
     enable_debug_stats: bool = False
     warn_fallbacks: bool = True
-
-
-try:  # pragma: no cover - version-compat fallback
-    _compiler_disable = torch.compiler.disable
-except Exception:  # pragma: no cover
-
-    def _compiler_disable(fn: Any) -> Any:  # type: ignore[no-redef]
-        """Return the function unchanged when ``torch.compiler.disable`` is unavailable.
-
-        :param Any fn: Callable to return unchanged.
-        :return Any: The original callable.
-        """
-
-        return fn
 
 
 def _is_torch_compiling() -> bool:
@@ -167,7 +137,6 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
     return FlashDebertaRuntimeConfig(
         force_varlen=_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"),
         varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 1024)),
-        allow_compiled_varlen=_truthy_env("FLASHDEBERTA_ALLOW_COMPILED_VARLEN", default="0"),
         eager_dense_max_seq_len=max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0)),
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
         warn_fallbacks=_truthy_env("FLASHDEBERTA_WARN_FALLBACKS", default="1"),
@@ -186,21 +155,6 @@ def refresh_flashdeberta_runtime_config_from_env() -> None:
 
     global _RUNTIME_CONFIG
     _RUNTIME_CONFIG = _read_runtime_config_from_env()
-
-
-def set_flashdeberta_compile_active(active: bool) -> None:
-    """Record whether the repo training runtime enabled ``torch.compile``.
-
-    This is a stable runtime signal for policy decisions that should apply to
-    all compiled calls, even when `torch.compiler.is_compiling()` is False at
-    execution time after graph capture.
-
-    :param bool active: Whether compiled execution is enabled for flash-backed
-        training targets in the current process.
-    """
-
-    global _FLASHDEBERTA_COMPILE_ACTIVE
-    _FLASHDEBERTA_COMPILE_ACTIVE = bool(active)
 
 
 def flashdeberta_import_error() -> Exception | None:
@@ -309,55 +263,6 @@ def _is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: 
     return False
 
 
-@_compiler_disable
-def _build_unpad_metadata(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Build unpadding metadata for the varlen FlashDeBERTa kernel.
-
-    This helper remains outside compiled graphs because it uses ``nonzero`` and
-    scalar extraction. It is correctness-safe and fast enough for now, but it is
-    not the final form if you later want a fully compile-friendly varlen path.
-
-    :param torch.Tensor mask_2d: Boolean keep mask with shape ``(B, S)``.
-    :return tuple[torch.Tensor, torch.Tensor, int]: Flattened token indices,
-        cumulative sequence lengths, and max sequence length in batch.
-    """
-
-    seqlens = mask_2d.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(mask_2d.reshape(-1), as_tuple=False).squeeze(-1)
-    max_seqlen = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
-    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
-    return indices, cu_seqlens, max_seqlen
-
-
-def _flatten_valid_tokens(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Gather valid tokens from a padded tensor into an unpadded layout.
-
-    :param torch.Tensor tensor: Padded tensor with leading shape ``(B, S, ...)``.
-    :param torch.Tensor indices: Flattened valid-token indices.
-    :return torch.Tensor: Gathered tensor with leading shape ``(NNZ, ...)``.
-    """
-
-    flat = tensor.reshape(tensor.shape[0] * tensor.shape[1], *tensor.shape[2:])
-    return flat.index_select(0, indices)
-
-
-def _pad_valid_tokens(
-    values: torch.Tensor, indices: torch.Tensor, batch_size: int, seq_len: int
-) -> torch.Tensor:
-    """Scatter unpadded values back into a padded batch layout.
-
-    :param torch.Tensor values: Unpadded values with leading shape ``(NNZ, ...)``.
-    :param torch.Tensor indices: Flattened valid-token indices.
-    :param int batch_size: Batch size.
-    :param int seq_len: Padded sequence length.
-    :return torch.Tensor: Padded tensor with leading shape ``(B, S, ...)``.
-    """
-
-    flat_out = values.new_zeros((batch_size * seq_len, *values.shape[1:]))
-    flat_out = flat_out.index_copy(0, indices, values)
-    return flat_out.view(batch_size, seq_len, *values.shape[1:])
-
-
 def _should_use_varlen(
     *,
     attention_mask: torch.Tensor | None,
@@ -368,21 +273,19 @@ def _should_use_varlen(
     This deliberately does not inspect tensor contents. In this repository's
     training path, the collator already drops all-ones masks, so
     ``attention_mask is None`` is the dense signal and ``attention_mask is not None``
-    is the padded signal. Compiled runs default to the fixed flash path for
-    padded batches because symbolic-shape varlen tracing is still unstable on
-    the current PyTorch/Triton stack.
+    is the padded signal. When ``torch.compile`` is active we require the opaque
+    custom-op varlen wrapper so Dynamo does not trace into FlashDeBERTa's
+    Python/Triton launcher.
 
     :param torch.Tensor | None attention_mask: Optional attention mask.
     :param int seq_len: Sequence length for the current call.
     :return bool: True when the varlen kernel should run.
     """
 
-    if flash_attention_with_disentangled_varlen is None:
-        return False
     if attention_mask is None:
         return False
 
-    if (_FLASHDEBERTA_COMPILE_ACTIVE or _is_torch_compiling()) and not _RUNTIME_CONFIG.allow_compiled_varlen:
+    if _is_torch_compiling() and not flashdeberta_compiled_varlen_available():
         return False
 
     if _RUNTIME_CONFIG.force_varlen:
@@ -578,7 +481,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         pos_query: torch.Tensor | None,
         sm_scale: float,
     ) -> torch.Tensor:
-        """Run the upstream-style unpadded varlen FlashDeBERTa kernel.
+        """Run padded varlen FlashDeBERTa attention.
 
         :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
         :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
@@ -590,56 +493,23 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
         """
 
-        if flash_attention_with_disentangled_varlen is None:  # pragma: no cover - guarded by caller
-            raise RuntimeError("Varlen FlashDeBERTa operator unexpectedly unavailable.")
-
-        bsz = int(query_layer.shape[0])
         seq_len = int(query_layer.shape[-2])
         mask_2d = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-        indices, cu_seqlens, max_seqlen = _build_unpad_metadata(mask_2d)
-
-        if int(indices.numel()) == 0:
-            # Degenerate all-pad batch. Training should not normally produce this, but
-            # returning zeros is safer than crashing inside the kernel.
-            if _RUNTIME_CONFIG.enable_debug_stats:
-                _record_stat("flash_varlen_all_pad_batches")
-            return torch.zeros_like(query_layer)
-
-        # Kernel expects token-major tensors: (NNZ, H, D/P).
-        q_padded = query_layer.permute(0, 2, 1, 3).contiguous()
-        k_padded = key_layer.permute(0, 2, 1, 3).contiguous()
-        v_padded = value_layer.permute(0, 2, 1, 3).contiguous()
-        pos_key_padded = pos_key.permute(0, 2, 1, 3).contiguous() if pos_key is not None else None
-        pos_query_padded = pos_query.permute(0, 2, 1, 3).contiguous() if pos_query is not None else None
-
-        q_unpad = _flatten_valid_tokens(q_padded, indices)
-        k_unpad = _flatten_valid_tokens(k_padded, indices)
-        v_unpad = _flatten_valid_tokens(v_padded, indices)
-        pos_key_unpad = _flatten_valid_tokens(pos_key_padded, indices) if pos_key_padded is not None else None
-        pos_query_unpad = (
-            _flatten_valid_tokens(pos_query_padded, indices) if pos_query_padded is not None else None
-        )
-
-        out_unpad = flash_attention_with_disentangled_varlen(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            pos_key_unpad,
-            pos_query_unpad,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            False,
-            sm_scale,
-            int(self.position_buckets),
-            int(self.max_relative_positions),
+        out = flashdeberta_varlen_padded(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            attention_mask_2d=mask_2d,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=sm_scale,
+            position_buckets=int(self.position_buckets),
+            max_relative_distance=int(self.max_relative_positions),
+            causal=False,
         )
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_varlen_calls")
-
-        out_padded = _pad_valid_tokens(out_unpad, indices, bsz, seq_len)
-        return out_padded.permute(0, 2, 1, 3).contiguous()
+        return out
 
     def forward(
         self,
@@ -784,5 +654,4 @@ __all__ = [
     "flashdeberta_stats_snapshot",
     "refresh_flashdeberta_runtime_config_from_env",
     "reset_flashdeberta_stats",
-    "set_flashdeberta_compile_active",
 ]

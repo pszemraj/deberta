@@ -31,11 +31,12 @@ FlashDeBERTa path counters are debug-only and disabled by default. Normal compil
 training should not mutate Python stats or emit per-call warnings from inside
 attention forward. Use benchmark/probe tooling for path visibility instead.
 
-The current varlen FlashDeBERTa unpadding metadata still lives outside compiled
-graphs. Compiled runs therefore default back to the fixed flash path for padded
-batches unless `FLASHDEBERTA_ALLOW_COMPILED_VARLEN=1` is set explicitly for
-experimentation on a newer PyTorch/Triton stack. Treat true varlen+compile as a
-separate optimization problem until that path is proven stable.
+Compiled FlashDeBERTa varlen now runs through an opaque custom op on CUDA. That
+keeps the padded-to-ragged unpadding logic and the upstream Triton launcher out
+of the Dynamo trace while still executing the real varlen kernels and backward
+pass. The compile contract remains the same: dense batches use fixed flash, and
+padded batches use varlen flash when the backend package exposes the low-level
+varlen primitives.
 
 ## Special case: packed doc-block masks
 

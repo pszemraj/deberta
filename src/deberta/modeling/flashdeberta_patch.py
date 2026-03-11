@@ -105,6 +105,8 @@ def enable_flashdeberta_attention(*, strict: bool = True) -> None:
     if os.environ.get("FLASHDEBERTA_SHOW_CONFIG_WARNINGS", "0").strip().lower() not in {"1", "true", "yes"}:
         warnings.filterwarnings("ignore", message=r"INFO: Fixed-length forward config is.*")
         warnings.filterwarnings("ignore", message=r"INFO: Fixed-length backward config is.*")
+        warnings.filterwarnings("ignore", message=r"INFO: Variable-length forward config is.*")
+        warnings.filterwarnings("ignore", message=r"INFO: Varlen backward config -> .*")
 
 
 def disable_flashdeberta_attention() -> None:

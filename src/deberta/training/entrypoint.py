@@ -570,11 +570,6 @@ def run_pretraining(
     with suppress(Exception):
         _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
-    with suppress(Exception):
-        from deberta.modeling.flashdeberta_attention import set_flashdeberta_compile_active
-
-        set_flashdeberta_compile_active(bool(compile_enabled))
-
     if compile_enabled:
         try:
             if compile_scope_reason:

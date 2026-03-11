@@ -304,7 +304,7 @@ def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatc
 
 
 def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _install_fake_flashdeberta(monkeypatch)
+    _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()
     cfg = _small_deberta_config()
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
@@ -314,6 +314,37 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
     monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
     monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    seen: dict[str, torch.Tensor] = {}
+
+    def _fake_varlen_wrapper(
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        attention_mask_2d: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Return zero output while recording padded-varlen wrapper inputs."""
+
+        del (
+            key_layer,
+            value_layer,
+            pos_key,
+            pos_query,
+            sm_scale,
+            position_buckets,
+            max_relative_distance,
+            causal,
+        )
+        seen["mask"] = attention_mask_2d
+        return torch.zeros_like(query_layer)
+
+    monkeypatch.setattr(attention_mod, "flashdeberta_varlen_padded", _fake_varlen_wrapper)
 
     hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
     attention_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
@@ -329,7 +360,9 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
 
     assert probs is None
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
-    assert calls == {"fixed": 0, "varlen": 1}
+    assert tuple(seen["mask"].shape) == (1, 4)
+    assert seen["mask"].dtype == torch.bool
+    assert torch.equal(seen["mask"], attention_mask)
 
     stats = attention_mod.flashdeberta_stats_snapshot()
     assert stats["forward_calls"] == 1
@@ -365,23 +398,25 @@ def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.Mon
     assert len(captured) == 0
 
 
-def test_varlen_is_disabled_by_default_while_compiling(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
-    attention_mod.set_flashdeberta_compile_active(True)
-    monkeypatch.delenv("FLASHDEBERTA_ALLOW_COMPILED_VARLEN", raising=False)
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
-
-    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
-
-    monkeypatch.setenv("FLASHDEBERTA_ALLOW_COMPILED_VARLEN", "1")
+    monkeypatch.setattr(attention_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: True)
+    monkeypatch.delenv("FLASHDEBERTA_FORCE_VARLEN", raising=False)
+    monkeypatch.delenv("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", raising=False)
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
     assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is True
-    attention_mod.set_flashdeberta_compile_active(False)
+
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: False)
+
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
 
 
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
