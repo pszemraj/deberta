@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${1:-configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2.yaml}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${FLASHDEBERTA_BENCH_OUT_DIR:-/tmp/flashdeberta_bench_${STAMP}}"
+DEFAULT_OUT_DIR="${ROOT_DIR}/local-scratch/benchmarks/flashdeberta/flashdeberta_bench_${STAMP}"
+OUT_DIR="${FLASHDEBERTA_BENCH_OUT_DIR:-${DEFAULT_OUT_DIR}}"
 
 MICRO_WARMUP="${FLASHDEBERTA_MICRO_WARMUP:-10}"
 MICRO_STEPS="${FLASHDEBERTA_MICRO_STEPS:-30}"
