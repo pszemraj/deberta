@@ -419,6 +419,34 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
     assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
 
 
+def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    varlen_mod._clear_unpad_metadata_cache()
+    calls = {"count": 0}
+    orig_build = varlen_mod._build_unpad_metadata
+
+    def _counting_build(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        calls["count"] += 1
+        return orig_build(mask_2d)
+
+    monkeypatch.setattr(varlen_mod, "_build_unpad_metadata", _counting_build)
+
+    mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+    first_indices, first_cu, first_max = varlen_mod._get_unpad_metadata_cached(mask)
+    second_indices, second_cu, second_max = varlen_mod._get_unpad_metadata_cached(mask)
+    clone_indices, clone_cu, clone_max = varlen_mod._get_unpad_metadata_cached(mask.clone())
+
+    assert calls["count"] == 2
+    assert first_max == second_max == clone_max == 2
+    assert first_indices.data_ptr() == second_indices.data_ptr()
+    assert first_cu.data_ptr() == second_cu.data_ptr()
+    assert clone_indices.data_ptr() != first_indices.data_ptr()
+    assert clone_cu.data_ptr() != first_cu.data_ptr()
+
+    varlen_mod._clear_unpad_metadata_cache()
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()

@@ -13,6 +13,8 @@ fall back to an eager Python implementation.
 
 from __future__ import annotations
 
+import weakref
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -53,6 +55,20 @@ except Exception as exc:  # pragma: no cover - optional import
 _VARLEN_OP_NAMESPACE = "deberta"
 _VARLEN_FWD_OP_NAME = "flashdeberta_varlen_padded"
 _VARLEN_BWD_OP_NAME = "flashdeberta_varlen_padded_backward"
+
+
+@dataclass
+class _MaskMetadataCacheEntry:
+    """Cached unpadding metadata for one padding-mask tensor."""
+
+    mask_ref: weakref.ReferenceType[torch.Tensor] | None
+    version: int
+    indices: torch.Tensor
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+
+
+_MASK_METADATA_CACHE: dict[int, _MaskMetadataCacheEntry] = {}
 
 
 def flashdeberta_varlen_import_error() -> Exception | None:
@@ -104,6 +120,69 @@ def _build_unpad_metadata(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     indices = torch.nonzero(mask_2d.reshape(-1), as_tuple=False).squeeze(-1)
     max_seqlen = int(seqlens.max().item()) if int(seqlens.numel()) > 0 else 0
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    return indices, cu_seqlens, max_seqlen
+
+
+def _mask_version(mask_2d: torch.Tensor) -> int:
+    """Return a best-effort mutation version for one mask tensor.
+
+    :param torch.Tensor mask_2d: Boolean padding mask.
+    :return int: Tensor version counter when available.
+    """
+
+    try:
+        return int(getattr(mask_2d, "_version", 0))
+    except Exception:
+        return 0
+
+
+def _clear_unpad_metadata_cache() -> None:
+    """Clear cached unpadding metadata.
+
+    This exists primarily for tests.
+    """
+
+    _MASK_METADATA_CACHE.clear()
+
+
+def _get_unpad_metadata_cached(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return cached unpadding metadata for one mask tensor when possible.
+
+    Real training reuses the same padding-mask tensor across many attention
+    layers in one generator/discriminator phase and then again in backward.
+    Recomputing ``nonzero`` and cumulative lengths for every call adds a large
+    amount of host overhead, especially for varlen-heavy compiled runs.
+
+    :param torch.Tensor mask_2d: Boolean keep mask with shape ``(B, S)``.
+    :return tuple[torch.Tensor, torch.Tensor, int]: Cached or newly built metadata.
+    """
+
+    cache_key = id(mask_2d)
+    current_version = _mask_version(mask_2d)
+    cached = _MASK_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        cached_mask = cached.mask_ref() if cached.mask_ref is not None else None
+        if cached_mask is mask_2d and cached.version == current_version:
+            return cached.indices, cached.cu_seqlens, cached.max_seqlen
+        _MASK_METADATA_CACHE.pop(cache_key, None)
+
+    indices, cu_seqlens, max_seqlen = _build_unpad_metadata(mask_2d)
+
+    mask_ref: weakref.ReferenceType[torch.Tensor] | None = None
+    try:
+        mask_ref = weakref.ref(mask_2d, lambda _ref, key=cache_key: _MASK_METADATA_CACHE.pop(key, None))
+    except TypeError:
+        mask_ref = None
+
+    if mask_ref is not None:
+        _MASK_METADATA_CACHE[cache_key] = _MaskMetadataCacheEntry(
+            mask_ref=mask_ref,
+            version=current_version,
+            indices=indices,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
     return indices, cu_seqlens, max_seqlen
 
 
@@ -186,7 +265,7 @@ def _varlen_eager_forward_impl(
     seq_len = int(query_layer.shape[-2])
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
-    indices, cu_seqlens, max_seqlen = _build_unpad_metadata(attention_mask_2d)
+    indices, cu_seqlens, max_seqlen = _get_unpad_metadata_cached(attention_mask_2d)
     if int(indices.numel()) == 0:
         output = torch.zeros_like(query_layer)
         if require_lse:
@@ -322,7 +401,7 @@ def _varlen_eager_backward_impl(
     seq_len = int(query_layer.shape[-2])
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
-    indices, cu_seqlens, max_seqlen = _build_unpad_metadata(attention_mask_2d)
+    indices, cu_seqlens, max_seqlen = _get_unpad_metadata_cached(attention_mask_2d)
     if int(indices.numel()) == 0:
         dq = torch.zeros_like(query_layer)
         dk = torch.zeros_like(key_layer)
