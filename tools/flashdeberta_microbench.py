@@ -25,6 +25,7 @@ import os
 import statistics
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--drop-all-ones-mask", action="store_true", default=True)
     parser.add_argument("--no-drop-all-ones-mask", dest="drop_all_ones_mask", action="store_false")
+    parser.add_argument("--profile-dir", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -138,6 +140,24 @@ def _format_stats(stats: dict[str, int] | None) -> str:
     return "{" + items + "}"
 
 
+def _write_profiler_outputs(profile_dir: Path, profiler: torch.profiler.profile) -> None:
+    """Persist profiler summaries and a Chrome trace.
+
+    :param Path profile_dir: Output directory for profiler artifacts.
+    :param torch.profiler.profile profiler: Completed profiler object.
+    """
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = profile_dir / "trace.json"
+    profiler.export_chrome_trace(str(trace_path))
+
+    cuda_table = profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=80)
+    cpu_table = profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=80)
+
+    (profile_dir / "key_averages_cuda.txt").write_text(cuda_table + "\n", encoding="utf-8")
+    (profile_dir / "key_averages_cpu.txt").write_text(cpu_table + "\n", encoding="utf-8")
+
+
 def main() -> None:
     args = _parse_args()
     if not torch.cuda.is_available():
@@ -170,26 +190,51 @@ def main() -> None:
         reset_flashdeberta_stats()
 
     times_ms: list[float] = []
-    total_steps = int(args.warmup) + int(args.steps)
+    total_warmup = int(args.warmup)
+    measured_steps = int(args.steps)
 
-    for step in range(total_steps):
+    for _ in range(total_warmup):
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize(device)
-        start = time.perf_counter()
-
         out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         loss = out.float().pow(2).mean()
         loss.backward()
-
         torch.cuda.synchronize(device)
-        end = time.perf_counter()
 
-        if step >= int(args.warmup):
+    profiler_ctx: Any
+    if args.profile_dir is not None:
+        profiler_ctx = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        )
+    else:
+        profiler_ctx = nullcontext()
+
+    with profiler_ctx as profiler:
+        for _ in range(measured_steps):
+            model.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+
+            out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            loss = out.float().pow(2).mean()
+            loss.backward()
+
+            torch.cuda.synchronize(device)
+            end = time.perf_counter()
             times_ms.append((end - start) * 1000.0)
 
+            if profiler is not None:
+                profiler.step()
+
+    if args.profile_dir is not None and profiler is not None:
+        _write_profiler_outputs(Path(args.profile_dir), profiler)
+
     elapsed_s = sum(times_ms) / 1000.0
-    active_tok_s = (active_tokens_per_batch * int(args.steps)) / elapsed_s
-    slot_tok_s = (slot_tokens_per_batch * int(args.steps)) / elapsed_s
+    active_tok_s = (active_tokens_per_batch * measured_steps) / elapsed_s
+    slot_tok_s = (slot_tokens_per_batch * measured_steps) / elapsed_s
     mean_ms = statistics.mean(times_ms)
     p50_ms = statistics.median(times_ms)
     p90_ms = statistics.quantiles(times_ms, n=10)[8] if len(times_ms) >= 10 else max(times_ms)
