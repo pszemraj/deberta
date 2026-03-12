@@ -426,7 +426,7 @@ def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.M
     calls = {"count": 0}
     orig_build = varlen_mod._build_unpad_metadata
 
-    def _counting_build(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def _counting_build(mask_2d: torch.Tensor):
         calls["count"] += 1
         return orig_build(mask_2d)
 
@@ -445,6 +445,59 @@ def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.M
     assert clone_cu.data_ptr() != first_cu.data_ptr()
 
     varlen_mod._clear_unpad_metadata_cache()
+
+
+def test_varlen_forward_aux_cache_round_trips() -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    varlen_mod._clear_forward_aux_cache()
+
+    output = torch.randn((1, 2, 4, 8), dtype=torch.float32)
+    indices = torch.tensor([0, 1, 4], dtype=torch.long)
+    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    batch_indices = torch.tensor([0, 0, 1], dtype=torch.long)
+    seq_indices = torch.tensor([0, 1, 0], dtype=torch.long)
+    q_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
+    k_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
+    v_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
+    out_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
+    lse_unpad = torch.randn((3, 2), dtype=torch.float32)
+    pos_key_unpad = torch.randn((3, 2, 4), dtype=torch.float32)
+    pos_query_unpad = torch.randn((3, 2, 4), dtype=torch.float32)
+
+    varlen_mod._store_forward_aux_cache(
+        output_padded=output,
+        indices=indices,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=2,
+        batch_indices=batch_indices,
+        seq_indices=seq_indices,
+        q_unpad=q_unpad,
+        k_unpad=k_unpad,
+        v_unpad=v_unpad,
+        out_unpad=out_unpad,
+        lse_unpad=lse_unpad,
+        pos_key_unpad=pos_key_unpad,
+        pos_query_unpad=pos_query_unpad,
+    )
+
+    cached = varlen_mod._pop_forward_aux_cache(output)
+    assert cached is not None
+    assert cached.max_seqlen == 2
+    assert cached.indices is indices
+    assert cached.cu_seqlens is cu_seqlens
+    assert cached.batch_indices is batch_indices
+    assert cached.seq_indices is seq_indices
+    assert cached.q_unpad is q_unpad
+    assert cached.k_unpad is k_unpad
+    assert cached.v_unpad is v_unpad
+    assert cached.out_unpad is out_unpad
+    assert cached.lse_unpad is lse_unpad
+    assert cached.pos_key_unpad is pos_key_unpad
+    assert cached.pos_query_unpad is pos_query_unpad
+    assert varlen_mod._pop_forward_aux_cache(output) is None
+
+    varlen_mod._clear_forward_aux_cache()
 
 
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
