@@ -1317,40 +1317,97 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
 
         return bool(getattr(self.config, "use_return_dict", True))
 
-    def forward(
+    def _resolve_forward_options(
         self,
+        *,
+        output_attentions: bool | None,
+        output_hidden_states: bool | None,
+        return_dict: bool | None,
+    ) -> tuple[bool, bool, bool]:
+        """Resolve optional public forward flags into stable booleans.
+
+        Keeping this logic in a dedicated helper lets compile-time dispatchers
+        normalize Python optionals before entering compiled code.
+
+        :param bool | None output_attentions: Optional attention-output flag.
+        :param bool | None output_hidden_states: Optional hidden-state-output flag.
+        :param bool | None return_dict: Optional return-format flag.
+        :return tuple[bool, bool, bool]: Resolved ``(output_attentions, output_hidden_states, return_dict)``.
+        """
+
+        resolved_attentions = (
+            self._default_output_attentions() if output_attentions is None else bool(output_attentions)
+        )
+        resolved_hidden_states = (
+            self._default_output_hidden_states()
+            if output_hidden_states is None
+            else bool(output_hidden_states)
+        )
+        resolved_return_dict = self._default_return_dict() if return_dict is None else bool(return_dict)
+        return resolved_attentions, resolved_hidden_states, resolved_return_dict
+
+    def _resolve_forward_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+    ) -> tuple[torch.Size, torch.device, torch.Tensor]:
+        """Validate mutually exclusive inputs and materialize token-type ids.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
+        :return tuple[torch.Size, torch.device, torch.Tensor]: Input shape, runtime device, and token-type ids.
+        """
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time.")
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You have to specify either input_ids or inputs_embeds.")
+
+        if input_ids is not None:
+            input_shape = input_ids.shape
+            device = input_ids.device
+        else:
+            input_shape = inputs_embeds.shape[:-1]
+            device = inputs_embeds.device
+
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        return input_shape, device, token_type_ids
+
+    def _forward_resolved(
+        self,
+        *,
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
-        """Run DeBERTa-v2 encoder forward pass.
+        """Run forward with already-resolved boolean output flags.
 
         :param torch.Tensor | None input_ids: Optional input token ids.
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param bool | None output_attentions: Optional attention-output flag.
-        :param bool | None output_hidden_states: Optional hidden-state-output flag.
-        :param bool | None return_dict: Optional return-format flag.
+        :param bool output_attentions: Resolved attention-output flag.
+        :param bool output_hidden_states: Resolved hidden-state-output flag.
+        :param bool return_dict: Resolved return-format flag.
         :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
-        output_attentions = (
-            self._default_output_attentions() if output_attentions is None else bool(output_attentions)
-        )
-        output_hidden_states = (
-            self._default_output_hidden_states()
-            if output_hidden_states is None
-            else bool(output_hidden_states)
-        )
-        return_dict = self._default_return_dict() if return_dict is None else bool(return_dict)
+        output_attentions = bool(output_attentions)
+        output_hidden_states = bool(output_hidden_states)
+        return_dict = bool(return_dict)
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time.")
@@ -1425,6 +1482,393 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             last_hidden_state=sequence_output,
             hidden_states=hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions if output_attentions else None,
+        )
+
+    def _forward_dense_resolved(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run forward on the dense no-mask path with resolved flags.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool output_attentions: Resolved attention-output flag.
+        :param bool output_hidden_states: Resolved hidden-state-output flag.
+        :param bool return_dict: Resolved return-format flag.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_resolved(
+            input_ids=input_ids,
+            attention_mask=None,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+    def _forward_masked_resolved(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run forward on the masked path with resolved flags.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Attention mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool output_attentions: Resolved attention-output flag.
+        :param bool output_hidden_states: Resolved hidden-state-output flag.
+        :param bool return_dict: Resolved return-format flag.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_resolved(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+    def _forward_dense_hs0(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the dense training fast path with hidden-state outputs disabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            token_type_ids=token_type_ids,
+        )
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            mask=None,
+            inputs_embeds=inputs_embeds,
+        )
+        need_hidden_states_for_z = int(self.z_steps) > 1
+        encoder_outputs = self.encoder(
+            embedding_output,
+            None,
+            output_hidden_states=need_hidden_states_for_z,
+            output_attentions=False,
+            return_dict=True,
+        )
+        sequence_output = encoder_outputs.last_hidden_state
+        hidden_states = encoder_outputs.hidden_states
+
+        if int(self.z_steps) > 1:
+            if hidden_states is None or len(hidden_states) < 2:
+                raise RuntimeError("z_steps>1 requires encoder hidden states.")
+            z_base_states = hidden_states[-2]
+            z_query_states = hidden_states[-1]
+            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            for layer in layers[1:]:
+                z_query_states, _ = layer(
+                    z_base_states,
+                    None,
+                    output_attentions=False,
+                    query_states=z_query_states,
+                    relative_pos=rel_pos,
+                    rel_embeddings=rel_embeddings,
+                )
+            sequence_output = z_query_states
+
+        return BaseModelOutput(
+            last_hidden_state=sequence_output,
+            hidden_states=None,
+            attentions=None,
+        )
+
+    def _forward_dense_hs1(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the dense training fast path with hidden-state outputs enabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            token_type_ids=token_type_ids,
+        )
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            mask=None,
+            inputs_embeds=inputs_embeds,
+        )
+        encoder_outputs = self.encoder(
+            embedding_output,
+            None,
+            output_hidden_states=True,
+            output_attentions=False,
+            return_dict=True,
+        )
+        sequence_output = encoder_outputs.last_hidden_state
+        hidden_states = encoder_outputs.hidden_states
+
+        if int(self.z_steps) > 1:
+            if hidden_states is None or len(hidden_states) < 2:
+                raise RuntimeError("z_steps>1 requires encoder hidden states.")
+            z_base_states = hidden_states[-2]
+            z_query_states = hidden_states[-1]
+            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            z_extras: list[torch.Tensor] = []
+            for layer in layers[1:]:
+                z_query_states, _ = layer(
+                    z_base_states,
+                    None,
+                    output_attentions=False,
+                    query_states=z_query_states,
+                    relative_pos=rel_pos,
+                    rel_embeddings=rel_embeddings,
+                )
+                z_extras.append(z_query_states)
+            sequence_output = z_query_states
+            if z_extras:
+                hidden_states = tuple(hidden_states) + tuple(z_extras)
+
+        return BaseModelOutput(
+            last_hidden_state=sequence_output,
+            hidden_states=hidden_states,
+            attentions=None,
+        )
+
+    def _forward_masked_hs0(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the masked training fast path with hidden-state outputs disabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Attention mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            token_type_ids=token_type_ids,
+        )
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        need_hidden_states_for_z = int(self.z_steps) > 1
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask,
+            output_hidden_states=need_hidden_states_for_z,
+            output_attentions=False,
+            return_dict=True,
+        )
+        sequence_output = encoder_outputs.last_hidden_state
+        hidden_states = encoder_outputs.hidden_states
+
+        if int(self.z_steps) > 1:
+            if hidden_states is None or len(hidden_states) < 2:
+                raise RuntimeError("z_steps>1 requires encoder hidden states.")
+            z_base_states = hidden_states[-2]
+            z_query_states = hidden_states[-1]
+            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            attn_mask = self.encoder.get_attention_mask(attention_mask)
+            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            for layer in layers[1:]:
+                z_query_states, _ = layer(
+                    z_base_states,
+                    attn_mask,
+                    output_attentions=False,
+                    query_states=z_query_states,
+                    relative_pos=rel_pos,
+                    rel_embeddings=rel_embeddings,
+                )
+            sequence_output = z_query_states
+
+        return BaseModelOutput(
+            last_hidden_state=sequence_output,
+            hidden_states=None,
+            attentions=None,
+        )
+
+    def _forward_masked_hs1(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the masked training fast path with hidden-state outputs enabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Attention mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            token_type_ids=token_type_ids,
+        )
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask,
+            output_hidden_states=True,
+            output_attentions=False,
+            return_dict=True,
+        )
+        sequence_output = encoder_outputs.last_hidden_state
+        hidden_states = encoder_outputs.hidden_states
+
+        if int(self.z_steps) > 1:
+            if hidden_states is None or len(hidden_states) < 2:
+                raise RuntimeError("z_steps>1 requires encoder hidden states.")
+            z_base_states = hidden_states[-2]
+            z_query_states = hidden_states[-1]
+            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            attn_mask = self.encoder.get_attention_mask(attention_mask)
+            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            z_extras: list[torch.Tensor] = []
+            for layer in layers[1:]:
+                z_query_states, _ = layer(
+                    z_base_states,
+                    attn_mask,
+                    output_attentions=False,
+                    query_states=z_query_states,
+                    relative_pos=rel_pos,
+                    rel_embeddings=rel_embeddings,
+                )
+                z_extras.append(z_query_states)
+            sequence_output = z_query_states
+            if z_extras:
+                hidden_states = tuple(hidden_states) + tuple(z_extras)
+
+        return BaseModelOutput(
+            last_hidden_state=sequence_output,
+            hidden_states=hidden_states,
+            attentions=None,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run DeBERTa-v2 encoder forward pass.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool | None output_attentions: Optional attention-output flag.
+        :param bool | None output_hidden_states: Optional hidden-state-output flag.
+        :param bool | None return_dict: Optional return-format flag.
+        :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        (
+            resolved_output_attentions,
+            resolved_output_hidden_states,
+            resolved_return_dict,
+        ) = self._resolve_forward_options(
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        return self._forward_resolved(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=resolved_output_attentions,
+            output_hidden_states=resolved_output_hidden_states,
+            return_dict=resolved_return_dict,
         )
 
 

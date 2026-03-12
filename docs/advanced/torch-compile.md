@@ -25,6 +25,13 @@ Default behavior (`auto`) compiles heavy backbone modules and keeps unstable wra
 
 The full RTD wrapper contains dynamic masking, token sampling, and corruption logic that causes graph breaks and instability in compiled graphs. The repo compiles backbone modules only and leaves wrapper orchestration eager.
 
+For native HF DeBERTa backbones, the compile path does not compile the public
+optional-heavy `forward` entrypoint directly. It installs a small eager
+dispatcher that normalizes public options, then routes into stable compiled
+dense/masked fast paths with fixed output contracts. This avoids repeated Dynamo
+specialization on `attention_mask is None` versus tensor and on
+`output_hidden_states=None|True|False`.
+
 ## FlashDeBERTa notes
 
 FlashDeBERTa path counters are debug-only and disabled by default. Normal compiled

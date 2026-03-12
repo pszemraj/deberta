@@ -1173,6 +1173,124 @@ def test_stabilize_compile_attention_mask_hf_deberta_v2():
     assert torch.equal(out3["attention_mask"], torch.tensor([[True, True, False]], dtype=torch.bool))
 
 
+def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_supported_backbones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compile_calls: list[tuple[Any, dict[str, Any]]] = []
+
+    def _fake_compile(
+        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
+    ) -> Any:
+        compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
+        return target
+
+    class _StableBackbone(torch.nn.Module):
+        def __init__(self, label: str) -> None:
+            super().__init__()
+            self.label = str(label)
+
+        def _resolve_forward_options(
+            self,
+            *,
+            output_attentions: bool | None,
+            output_hidden_states: bool | None,
+            return_dict: bool | None,
+        ) -> tuple[bool, bool, bool]:
+            return (
+                bool(False if output_attentions is None else output_attentions),
+                bool(False if output_hidden_states is None else output_hidden_states),
+                bool(True if return_dict is None else return_dict),
+            )
+
+        def _forward_dense_resolved(
+            self,
+            *,
+            input_ids: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            output_attentions: bool,
+            output_hidden_states: bool,
+            return_dict: bool,
+        ) -> tuple[str, bool, bool, bool]:
+            del input_ids, token_type_ids, position_ids, inputs_embeds
+            return (
+                f"{self.label}:dense",
+                bool(output_attentions),
+                bool(output_hidden_states),
+                bool(return_dict),
+            )
+
+        def _forward_masked_resolved(
+            self,
+            *,
+            input_ids: torch.Tensor | None = None,
+            attention_mask: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            output_attentions: bool,
+            output_hidden_states: bool,
+            return_dict: bool,
+        ) -> tuple[str, bool, bool, bool, torch.Tensor]:
+            del input_ids, token_type_ids, position_ids, inputs_embeds
+            return (
+                f"{self.label}:masked",
+                bool(output_attentions),
+                bool(output_hidden_states),
+                bool(return_dict),
+                attention_mask,
+            )
+
+        def forward(self, **_: Any) -> tuple[str]:
+            return (f"{self.label}:raw-forward",)
+
+    class _Wrapper(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = _StableBackbone("generator")
+            self.discriminator = _StableBackbone("discriminator")
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    wrapper = _Wrapper()
+    targets = _compile_backbones_for_scope(
+        unwrapped_model=wrapper,
+        compile_scope="backbones",
+        compile_kwargs={"mode": "default", "backend": "inductor", "dynamic": False},
+    )
+
+    assert targets == [
+        "generator[dense_hs0]",
+        "generator[dense_hs1]",
+        "generator[masked_hs0]",
+        "generator[masked_hs1]",
+        "discriminator[dense_hs0]",
+        "discriminator[dense_hs1]",
+        "discriminator[masked_hs0]",
+        "discriminator[masked_hs1]",
+    ]
+    assert len(compile_calls) == 8
+    for _, kwargs in compile_calls:
+        assert kwargs == {"mode": "default", "backend": "inductor", "dynamic": False}
+
+    dense_out = wrapper.generator(
+        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        output_hidden_states=None,
+        return_dict=None,
+    )
+    masked_out = wrapper.generator(
+        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=torch.tensor([[True, True, False]], dtype=torch.bool),
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    assert dense_out == ("generator:dense", False, False, True)
+    assert masked_out[:4] == ("generator:masked", False, True, True)
+    assert torch.equal(masked_out[4], torch.tensor([[True, True, False]], dtype=torch.bool))
+
+
 def test_stabilize_compile_attention_mask_rope_doc_blocking():
     # Stabilizer is now a no-op for RoPE — mask shape churn is handled by
     # _resolve_compile_scope auto-downgrading to FFN instead.

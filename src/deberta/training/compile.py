@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import types
 from typing import Any
 
 import torch
@@ -180,6 +181,13 @@ def _compile_backbones_for_scope(
         :param torch.nn.Module module: Module whose forward should be compiled.
         :param str target: Human-readable target name for logs.
         """
+        if _install_stable_backbone_compile_dispatch(
+            module=module,
+            compile_kwargs=compile_kwargs,
+            target=target,
+            compiled_targets=compiled_targets,
+        ):
+            return
         forward = getattr(module, "forward", None)
         if not callable(forward):
             raise RuntimeError(f"{target}.forward is required for compile scope.")
@@ -240,7 +248,7 @@ def _compile_backbones_for_scope(
     if compile_scope == "backbones":
         _compile_module_forward(module=generator, target="generator")
         _compile_module_forward(module=discriminator, target="discriminator")
-        return ["generator", "discriminator"]
+        return compiled_targets
 
     if compile_scope in {"encoder", "gen_encoder"}:
         gen_encoder = getattr(generator, "encoder", None)
@@ -263,6 +271,248 @@ def _compile_backbones_for_scope(
     if not compiled_targets:
         raise ValueError(f"Unsupported compile scope: {compile_scope}")
     return compiled_targets
+
+
+def _install_stable_backbone_compile_dispatch(
+    *,
+    module: torch.nn.Module,
+    compile_kwargs: dict[str, Any],
+    target: str,
+    compiled_targets: list[str],
+) -> bool:
+    """Install a stable compiled dense/masked dispatcher when supported.
+
+    Native HF DeBERTa backbones accept Python optionals in ``forward`` for
+    ``attention_mask`` and output flags. Compiling that public ``forward``
+    directly encourages Dynamo to guard on ``None``/bool optionals. When the
+    backbone exposes resolved dense/masked helpers, compile those stable
+    entrypoints instead and leave ``forward`` as a tiny Python dispatcher.
+
+    :param torch.nn.Module module: Candidate backbone module.
+    :param dict[str, Any] compile_kwargs: Keyword arguments passed to ``torch.compile``.
+    :param str target: Human-readable target name for logs.
+    :param list[str] compiled_targets: Accumulator for compiled target labels.
+    :return bool: True when a stable dispatcher was installed.
+    """
+
+    resolve_options = getattr(module, "_resolve_forward_options", None)
+    dense_hs0 = getattr(module, "_forward_dense_hs0", None)
+    dense_hs1 = getattr(module, "_forward_dense_hs1", None)
+    masked_hs0 = getattr(module, "_forward_masked_hs0", None)
+    masked_hs1 = getattr(module, "_forward_masked_hs1", None)
+    dense_forward = getattr(module, "_forward_dense_resolved", None)
+    masked_forward = getattr(module, "_forward_masked_resolved", None)
+    if not callable(resolve_options):
+        return False
+
+    if callable(dense_hs0) and callable(dense_hs1) and callable(masked_hs0) and callable(masked_hs1):
+        dense_hs0_fn = dense_hs0
+        dense_hs1_fn = dense_hs1
+        masked_hs0_fn = masked_hs0
+        masked_hs1_fn = masked_hs1
+    else:
+        if not callable(dense_forward) or not callable(masked_forward):
+            return False
+
+        def _dense_hs0_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+        ) -> Any:
+            """Call the generic dense helper with fixed ``hidden_states=False``.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :return Any: Dense-path backbone outputs.
+            """
+
+            return dense_forward(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+
+        def _dense_hs1_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+        ) -> Any:
+            """Call the generic dense helper with fixed ``hidden_states=True``.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :return Any: Dense-path backbone outputs.
+            """
+
+            return dense_forward(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        def _masked_hs0_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            attention_mask: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+        ) -> Any:
+            """Call the generic masked helper with fixed ``hidden_states=False``.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor attention_mask: Attention mask tensor.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :return Any: Masked-path backbone outputs.
+            """
+
+            return masked_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+
+        def _masked_hs1_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            attention_mask: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+        ) -> Any:
+            """Call the generic masked helper with fixed ``hidden_states=True``.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor attention_mask: Attention mask tensor.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :return Any: Masked-path backbone outputs.
+            """
+
+            return masked_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        dense_hs0_fn = _dense_hs0_fn
+        dense_hs1_fn = _dense_hs1_fn
+        masked_hs0_fn = _masked_hs0_fn
+        masked_hs1_fn = _masked_hs1_fn
+    compiled_dense = {
+        False: torch.compile(dense_hs0_fn, **compile_kwargs),
+        True: torch.compile(dense_hs1_fn, **compile_kwargs),
+    }
+    compiled_masked = {
+        False: torch.compile(masked_hs0_fn, **compile_kwargs),
+        True: torch.compile(masked_hs1_fn, **compile_kwargs),
+    }
+
+    def _dispatch_forward(
+        self: torch.nn.Module,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+    ) -> Any:
+        """Normalize public options, then dispatch into stable compiled entrypoints.
+
+        :param torch.nn.Module self: Backbone module instance.
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool | None output_attentions: Optional attention-output flag.
+        :param bool | None output_hidden_states: Optional hidden-state-output flag.
+        :param bool | None return_dict: Optional return-format flag.
+        :return Any: Module outputs from either a compiled fast path or the generic resolved path.
+        """
+
+        (
+            resolved_output_attentions,
+            resolved_output_hidden_states,
+            resolved_return_dict,
+        ) = self._resolve_forward_options(  # type: ignore[attr-defined]
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        # The fast compiled path specializes on the fixed training contract:
+        # return_dict=True, output_attentions=False, output_hidden_states in {False, True}.
+        # Other combinations are correct but uncommon in training, so keep them
+        # on the uncompiled resolved path instead of exploding compile variants.
+        if resolved_output_attentions or not resolved_return_dict:
+            return self._forward_resolved(  # type: ignore[attr-defined]
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=resolved_output_attentions,
+                output_hidden_states=resolved_output_hidden_states,
+                return_dict=resolved_return_dict,
+            )
+        if attention_mask is None:
+            return compiled_dense[resolved_output_hidden_states](
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+        return compiled_masked[resolved_output_hidden_states](
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+        )
+
+    module._compiled_forward_dense = compiled_dense
+    module._compiled_forward_masked = compiled_masked
+    module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]
+    compiled_targets.extend(
+        [
+            f"{target}[dense_hs0]",
+            f"{target}[dense_hs1]",
+            f"{target}[masked_hs0]",
+            f"{target}[masked_hs1]",
+        ]
+    )
+    return True
 
 
 def _dtype_for_mixed_precision(mode: str) -> torch.dtype:
