@@ -500,6 +500,27 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
     varlen_mod._clear_forward_aux_cache()
 
 
+def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    for name in (
+        "FLASHDEBERTA_VARLEN_BWD_BLOCK_M",
+        "FLASHDEBERTA_VARLEN_BWD_BLOCK_N",
+        "FLASHDEBERTA_VARLEN_BWD_NUM_STAGES",
+        "FLASHDEBERTA_VARLEN_BWD_NUM_WARPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") is None
+
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_M", "64")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_STAGES", "3")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_WARPS", "8")
+
+    assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()

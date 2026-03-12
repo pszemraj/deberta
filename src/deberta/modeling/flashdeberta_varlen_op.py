@@ -13,6 +13,7 @@ fall back to an eager Python implementation.
 
 from __future__ import annotations
 
+import os
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -128,6 +129,53 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
         return None
     op = getattr(ns, name)
     return getattr(op, "default", op)
+
+
+def _varlen_kernel_override_from_env(
+    *,
+    kind: str,
+) -> tuple[int, int, int, int] | None:
+    """Return repo-side varlen-only kernel overrides when fully specified.
+
+    These overrides intentionally apply only to the custom padded-varlen path.
+    They exist because upstream ``FLASHDEBERTA_{FWD,BWD}_*`` knobs affect both
+    fixed and varlen kernels, which makes tuning padded workloads awkward in
+    mixed dense+masked runs.
+
+    Supported env vars:
+    - ``FLASHDEBERTA_VARLEN_FWD_BLOCK_M``
+    - ``FLASHDEBERTA_VARLEN_FWD_BLOCK_N``
+    - ``FLASHDEBERTA_VARLEN_FWD_NUM_STAGES``
+    - ``FLASHDEBERTA_VARLEN_FWD_NUM_WARPS``
+    - ``FLASHDEBERTA_VARLEN_BWD_BLOCK_M``
+    - ``FLASHDEBERTA_VARLEN_BWD_BLOCK_N``
+    - ``FLASHDEBERTA_VARLEN_BWD_NUM_STAGES``
+    - ``FLASHDEBERTA_VARLEN_BWD_NUM_WARPS``
+
+    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when unset / invalid / incomplete.
+    """
+
+    normalized = str(kind).strip().lower()
+    if normalized not in {"fwd", "bwd"}:
+        raise ValueError(f"Unsupported varlen kernel override kind: {kind!r}")
+
+    prefix = f"FLASHDEBERTA_VARLEN_{normalized.upper()}"
+    names = (
+        f"{prefix}_BLOCK_M",
+        f"{prefix}_BLOCK_N",
+        f"{prefix}_NUM_STAGES",
+        f"{prefix}_NUM_WARPS",
+    )
+    raw = [os.environ.get(name) for name in names]
+    if any(value is None or not str(value).strip() for value in raw):
+        return None
+    try:
+        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
+    except Exception:
+        return None
+    return int(block_m), int(block_n), int(num_stages), int(num_warps)
 
 
 def _build_unpad_metadata(
@@ -463,15 +511,19 @@ def _varlen_eager_forward_impl(
     )
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
-        block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-            total_tokens=int(q_unpad.shape[0]),
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            D=int(query_layer.shape[-1]),
-            causal=bool(causal),
-            disentangled=True,
-            att_span=att_span,
-        )
+        override = _varlen_kernel_override_from_env(kind="fwd")
+        if override is not None:
+            block_m, block_n, num_stages, num_warps = override
+        else:
+            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
+                total_tokens=int(q_unpad.shape[0]),
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                D=int(query_layer.shape[-1]),
+                causal=bool(causal),
+                disentangled=True,
+                att_span=att_span,
+            )
         out_unpad, lse_unpad = _flash_attn_v2_fwd_dise_lowlevel(
             q_unpad,
             k_unpad,
@@ -730,17 +782,21 @@ def _varlen_eager_backward_cached_impl(
             seq_indices=seq_indices,
         )
 
-    block_m, block_n, num_stages, num_warps = _get_bwd_config_varlen_lowlevel(
-        total_tokens_q=int(q_unpad.shape[0]),
-        total_tokens_k=int(k_unpad.shape[0]),
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        D=int(query_layer.shape[-1]),
-        causal=bool(causal),
-        disentangled=True,
-        att_span=att_span,
-        dtype=query_layer.dtype,
-    )
+    override = _varlen_kernel_override_from_env(kind="bwd")
+    if override is not None:
+        block_m, block_n, num_stages, num_warps = override
+    else:
+        block_m, block_n, num_stages, num_warps = _get_bwd_config_varlen_lowlevel(
+            total_tokens_q=int(q_unpad.shape[0]),
+            total_tokens_k=int(k_unpad.shape[0]),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            D=int(query_layer.shape[-1]),
+            causal=bool(causal),
+            disentangled=True,
+            att_span=att_span,
+            dtype=query_layer.dtype,
+        )
     dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad = _flash_attn_v2_bwd_dise_varlen_lowlevel(
         out_unpad,
         grad_unpad,
