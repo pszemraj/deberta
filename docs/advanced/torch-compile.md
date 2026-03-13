@@ -38,12 +38,12 @@ FlashDeBERTa path counters are debug-only and disabled by default. Normal compil
 training should not mutate Python stats or emit per-call warnings from inside
 attention forward. Use benchmark/probe tooling for path visibility instead.
 
-Compiled FlashDeBERTa varlen now runs through an opaque custom op on CUDA. That
-keeps the padded-to-ragged unpadding logic and the upstream Triton launcher out
-of the Dynamo trace while still executing the real varlen kernels and backward
-pass. The compile contract remains the same: dense batches use fixed flash, and
-padded batches use varlen flash when the backend package exposes the low-level
-varlen primitives.
+Compiled FlashDeBERTa fixed and varlen paths now both run through opaque custom
+ops on CUDA. That keeps the upstream Python autograd wrappers, config caches,
+and Triton launch setup out of the Dynamo trace while still executing the real
+kernels and backward passes. The compile contract remains the same: dense
+batches use fixed flash, and padded batches use varlen flash when the backend
+package exposes the required low-level primitives.
 
 ## Special case: packed doc-block masks
 

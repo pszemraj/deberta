@@ -372,6 +372,73 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     assert stats.get("fallback_calls", 0) == 0
 
 
+def test_flash_attention_fixed_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    monkeypatch.delenv("FLASHDEBERTA_FORCE_VARLEN", raising=False)
+    monkeypatch.delenv("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", raising=False)
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    seen: dict[str, object] = {}
+
+    def _fake_fixed_wrapper(
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        seq_lengths: torch.Tensor | None,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Return zero output while recording fixed wrapper inputs."""
+
+        del (
+            key_layer,
+            value_layer,
+            pos_key,
+            pos_query,
+            sm_scale,
+            position_buckets,
+            max_relative_distance,
+            causal,
+        )
+        seen["seq_lengths"] = seq_lengths
+        return torch.zeros_like(query_layer)
+
+    monkeypatch.setattr(attention_mod, "flashdeberta_fixed", _fake_fixed_wrapper)
+
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+    )
+
+    assert probs is None
+    assert tuple(output.shape) == (1, 4, cfg.hidden_size)
+    assert seen["seq_lengths"] is None
+
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["forward_calls"] == 1
+    assert stats["flash_eligible_calls"] == 1
+    assert stats["flash_fixed_calls"] == 1
+    assert stats.get("flash_varlen_calls", 0) == 0
+    assert stats.get("fallback_calls", 0) == 0
+
+
 def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()

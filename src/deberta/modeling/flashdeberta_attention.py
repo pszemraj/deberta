@@ -52,19 +52,15 @@ import torch
 from deberta.modeling.deberta_v2_native import (
     DisentangledSelfAttention as _EagerDisentangledSelfAttention,
 )
+from deberta.modeling.flashdeberta_fixed_op import (
+    flashdeberta_fixed,
+    flashdeberta_fixed_import_error,
+)
 from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_padded,
 )
 from deberta.modeling.mask_utils import normalize_keep_mask
-
-try:
-    from flashdeberta.ops.flash_attention import flash_attention_with_disentangled
-
-    _FLASH_FIXED_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - exercised indirectly in unit tests
-    flash_attention_with_disentangled = None
-    _FLASH_FIXED_IMPORT_ERROR = exc
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
@@ -166,7 +162,7 @@ def flashdeberta_import_error() -> Exception | None:
     :return Exception | None: Stored fixed-kernel import failure, if one occurred.
     """
 
-    return _FLASH_FIXED_IMPORT_ERROR
+    return flashdeberta_fixed_import_error()
 
 
 def flashdeberta_stats_snapshot() -> dict[str, int]:
@@ -377,12 +373,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "missing_position_buckets",
                 "FlashDeBERTa attention requires config.position_buckets > 0; using eager attention.",
             )
-        if flash_attention_with_disentangled is None:
-            detail = (
-                str(_FLASH_FIXED_IMPORT_ERROR)
-                if _FLASH_FIXED_IMPORT_ERROR is not None
-                else "unknown import error"
-            )
+        fixed_import_error = flashdeberta_fixed_import_error()
+        if fixed_import_error is not None:
+            detail = str(fixed_import_error)
             return (
                 "missing_flashdeberta",
                 f"FlashDeBERTa fixed-length attention is unavailable ({detail}); using eager attention.",
@@ -457,17 +450,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             seq_lengths = _mask4d_to_seqlens(attention_mask, seq_len=int(key_layer.shape[-2]))
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_fixed_calls")
-        return flash_attention_with_disentangled(
-            query_layer,
-            key_layer,
-            value_layer,
-            seq_lengths,
-            pos_key,
-            pos_query,
-            False,
-            sm_scale,
-            int(self.position_buckets),
-            int(self.max_relative_positions),
+        return flashdeberta_fixed(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            seq_lengths=seq_lengths,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            causal=False,
+            sm_scale=sm_scale,
+            position_buckets=int(self.position_buckets),
+            max_relative_distance=int(self.max_relative_positions),
         )
 
     def _flash_varlen(
@@ -563,7 +556,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 rel_embeddings=rel_embeddings,
             )
 
-        if flash_attention_with_disentangled is None:  # pragma: no cover - guarded above
+        if flashdeberta_fixed_import_error() is not None:  # pragma: no cover - guarded above
             raise RuntimeError("FlashDeBERTa operator import unexpectedly unavailable during flash forward.")
 
         model_dtype = hidden_states.dtype
