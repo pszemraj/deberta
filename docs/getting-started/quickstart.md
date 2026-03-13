@@ -40,6 +40,7 @@ Use the flash wrapper only after installing the optional flash runtime, and keep
 Use `tools/flashdeberta_microbench.py` to compare eager vs flash on dense and padded regimes before defaulting flash for a specific config or machine.
 Use `tools/run_flashdeberta_benchmarks.sh` when you want the full current-head matrix in one run, including dense/padded microbench cases plus packed and unpacked training logs under a single persistent `local-scratch/benchmarks/flashdeberta/...` output directory. Override that location with `FLASHDEBERTA_BENCH_OUT_DIR=/your/path` when needed.
 When tuning the padded varlen path, prefer `FLASHDEBERTA_VARLEN_FWD_*` and `FLASHDEBERTA_VARLEN_BWD_*` so experiments do not also perturb the fixed-length flash kernels.
+When tuning dense fixed-length flash, prefer `FLASHDEBERTA_FIXED_FWD_*` and `FLASHDEBERTA_FIXED_BWD_*` so experiments do not also perturb the padded-varlen path.
 
 For kernel-level profiling, `tools/flashdeberta_microbench.py --profile-dir local-scratch/profiles/...` writes a Chrome trace plus CPU/CUDA key-average tables for the selected eager or flash attention regime.
 

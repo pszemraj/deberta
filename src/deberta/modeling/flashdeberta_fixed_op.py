@@ -13,6 +13,7 @@ wrapper so semantics stay unchanged when the low-level pieces are unavailable.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -104,6 +105,52 @@ def _fixed_attention_span(position_buckets: int, max_relative_distance: int) -> 
     return int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
 
+def _fixed_kernel_override_from_env(
+    *,
+    kind: str,
+) -> tuple[int, int, int, int] | None:
+    """Return repo-side fixed-kernel overrides when fully specified.
+
+    These overrides intentionally apply only to the repo's fixed-length wrapper.
+    They exist so dense fixed-kernel tuning can be done without also perturbing
+    the padded-varlen path.
+
+    Supported env vars:
+    - ``FLASHDEBERTA_FIXED_FWD_BLOCK_M``
+    - ``FLASHDEBERTA_FIXED_FWD_BLOCK_N``
+    - ``FLASHDEBERTA_FIXED_FWD_NUM_STAGES``
+    - ``FLASHDEBERTA_FIXED_FWD_NUM_WARPS``
+    - ``FLASHDEBERTA_FIXED_BWD_BLOCK_M``
+    - ``FLASHDEBERTA_FIXED_BWD_BLOCK_N``
+    - ``FLASHDEBERTA_FIXED_BWD_NUM_STAGES``
+    - ``FLASHDEBERTA_FIXED_BWD_NUM_WARPS``
+
+    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when unset / invalid / incomplete.
+    """
+
+    normalized = str(kind).strip().lower()
+    if normalized not in {"fwd", "bwd"}:
+        raise ValueError(f"Unsupported fixed kernel override kind: {kind!r}")
+
+    prefix = f"FLASHDEBERTA_FIXED_{normalized.upper()}"
+    names = (
+        f"{prefix}_BLOCK_M",
+        f"{prefix}_BLOCK_N",
+        f"{prefix}_NUM_STAGES",
+        f"{prefix}_NUM_WARPS",
+    )
+    raw = [os.environ.get(name) for name in names]
+    if any(value is None or not str(value).strip() for value in raw):
+        return None
+    try:
+        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
+    except Exception:
+        return None
+    return int(block_m), int(block_n), int(num_stages), int(num_warps)
+
+
 def _fixed_eager_forward_impl(
     *,
     query_layer: torch.Tensor,
@@ -148,16 +195,20 @@ def _fixed_eager_forward_impl(
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
-        block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-            batch_size,
-            num_heads,
-            query_len,
-            key_len,
-            head_dim,
-            bool(causal),
-            disentangled=True,
-            att_span=att_span,
-        )
+        override = _fixed_kernel_override_from_env(kind="fwd")
+        if override is not None:
+            block_m, block_n, num_stages, num_warps = override
+        else:
+            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
+                batch_size,
+                num_heads,
+                query_len,
+                key_len,
+                head_dim,
+                bool(causal),
+                disentangled=True,
+                att_span=att_span,
+            )
         output, lse = _flash_attn_v2_fwd_dise_lowlevel(
             query_layer,
             key_layer,
@@ -245,17 +296,21 @@ def _fixed_eager_backward_impl(
     key_len = int(key_layer.shape[-2])
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
 
-    block_m, block_n, num_stages, num_warps = _get_bwd_config_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
-        disentangled=(pos_key is not None or pos_query is not None),
-        att_span=att_span,
-        dtype=query_layer.dtype,
-    )
+    override = _fixed_kernel_override_from_env(kind="bwd")
+    if override is not None:
+        block_m, block_n, num_stages, num_warps = override
+    else:
+        block_m, block_n, num_stages, num_warps = _get_bwd_config_lowlevel(
+            batch_size,
+            num_heads,
+            query_len,
+            key_len,
+            head_dim,
+            bool(causal),
+            disentangled=(pos_key is not None or pos_query is not None),
+            att_span=att_span,
+            dtype=query_layer.dtype,
+        )
     return _flash_attn_v2_bwd_dise_lowlevel(
         output,
         grad_output,
@@ -650,4 +705,5 @@ __all__ = [
     "flashdeberta_compiled_fixed_available",
     "flashdeberta_fixed",
     "flashdeberta_fixed_import_error",
+    "_fixed_kernel_override_from_env",
 ]

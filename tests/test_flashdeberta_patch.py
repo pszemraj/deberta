@@ -588,6 +588,27 @@ def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
 
 
+def test_fixed_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_fixed_op as fixed_mod
+
+    for name in (
+        "FLASHDEBERTA_FIXED_BWD_BLOCK_M",
+        "FLASHDEBERTA_FIXED_BWD_BLOCK_N",
+        "FLASHDEBERTA_FIXED_BWD_NUM_STAGES",
+        "FLASHDEBERTA_FIXED_BWD_NUM_WARPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert fixed_mod._fixed_kernel_override_from_env(kind="bwd") is None
+
+    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_BLOCK_M", "64")
+    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_NUM_STAGES", "3")
+    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_NUM_WARPS", "8")
+
+    assert fixed_mod._fixed_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()
