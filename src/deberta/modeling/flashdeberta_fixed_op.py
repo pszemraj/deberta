@@ -51,6 +51,7 @@ except Exception as exc:  # pragma: no cover - optional import
 
 _FIXED_OP_NAMESPACE = "deberta"
 _FIXED_FWD_OP_NAME = "flashdeberta_fixed"
+_FIXED_BWD_OP_NAME = "flashdeberta_fixed_backward"
 
 
 def flashdeberta_fixed_import_error() -> Exception | None:
@@ -74,7 +75,7 @@ def flashdeberta_compiled_fixed_available() -> bool:
     :return bool: True when the custom-op based CUDA path is registered.
     """
 
-    return _FLASHDEBERTA_FIXED_CUSTOM_OP is not None
+    return _FLASHDEBERTA_FIXED_CUSTOM_OP is not None and _FLASHDEBERTA_FIXED_BWD_CUSTOM_OP is not None
 
 
 def _lookup_registered_op(namespace: str, name: str) -> Any | None:
@@ -277,15 +278,16 @@ def _fixed_eager_backward_impl(
     )
 
 
-def _build_fixed_custom_op() -> Any | None:
-    """Register or retrieve the opaque fixed-length custom op.
+def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
+    """Register or retrieve the opaque fixed-length custom ops.
 
-    :return Any | None: Forward custom-op handle, or ``None`` when unavailable.
+    :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing = _lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME)
-    if existing is not None:
-        return existing
+    existing_forward = _lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME)
+    existing_backward = _lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_BWD_OP_NAME)
+    if existing_forward is not None and existing_backward is not None:
+        return existing_forward, existing_backward
 
     if (
         _flash_attn_v2_fwd_dise_lowlevel is None
@@ -293,7 +295,7 @@ def _build_fixed_custom_op() -> Any | None:
         or not hasattr(torch, "library")
         or not hasattr(torch.library, "custom_op")
     ):
-        return None
+        return None, None
 
     @torch.library.custom_op(
         f"{_FIXED_OP_NAMESPACE}::{_FIXED_FWD_OP_NAME}",
@@ -390,6 +392,106 @@ def _build_fixed_custom_op() -> Any | None:
         lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         return torch.empty_like(q), lse
 
+    @torch.library.custom_op(
+        f"{_FIXED_OP_NAMESPACE}::{_FIXED_BWD_OP_NAME}",
+        mutates_args=(),
+        device_types="cuda",
+        schema=(
+            "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor? seq_lengths, Tensor out, Tensor lse, "
+            "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, "
+            "int max_relative_distance, bool causal) -> (Tensor, Tensor, Tensor, Tensor?, Tensor?)"
+        ),
+    )
+    def _backward_op(
+        grad_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_lengths: torch.Tensor | None,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Run fixed-length backward as one opaque CUDA op.
+
+        :param torch.Tensor grad_out: Gradient of the fixed output tensor.
+        :param torch.Tensor q: Forward queries.
+        :param torch.Tensor k: Forward keys.
+        :param torch.Tensor v: Forward values.
+        :param torch.Tensor | None seq_lengths: Optional per-example active lengths.
+        :param torch.Tensor out: Forward output tensor.
+        :param torch.Tensor lse: Forward LSE tensor.
+        :param torch.Tensor | None pos_key: Optional c2p tensor.
+        :param torch.Tensor | None pos_query: Optional p2c tensor.
+        :param float sm_scale: Softmax scale.
+        :param int position_buckets: Relative-position bucket count.
+        :param int max_relative_distance: Maximum relative distance.
+        :param bool causal: Whether causal masking is enabled.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+            Gradients for q/k/v and optional positional tensors.
+        """
+
+        return _fixed_eager_backward_impl(
+            grad_output=grad_out,
+            query_layer=q,
+            key_layer=k,
+            value_layer=v,
+            seq_lengths=seq_lengths,
+            output=out,
+            lse=lse,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+        )
+
+    @torch.library.register_fake(_backward_op)
+    def _backward_op_fake(
+        grad_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_lengths: torch.Tensor | None,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Return fake fixed-length backward outputs with static shapes.
+
+        :param torch.Tensor grad_out: Fake gradient tensor.
+        :param torch.Tensor q: Fake query tensor.
+        :param torch.Tensor k: Fake key tensor.
+        :param torch.Tensor v: Fake value tensor.
+        :param torch.Tensor | None seq_lengths: Fake optional sequence lengths.
+        :param torch.Tensor out: Fake output tensor.
+        :param torch.Tensor lse: Fake LSE tensor.
+        :param torch.Tensor | None pos_key: Fake optional c2p tensor.
+        :param torch.Tensor | None pos_query: Fake optional p2c tensor.
+        :param float sm_scale: Fake softmax scale.
+        :param int position_buckets: Fake relative-position bucket count.
+        :param int max_relative_distance: Fake maximum relative distance.
+        :param bool causal: Fake causal flag.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+            Fake gradients for q/k/v and optional positional tensors.
+        """
+
+        del grad_out, seq_lengths, out, lse, sm_scale, position_buckets, max_relative_distance, causal
+        dpos_key = torch.empty_like(pos_key) if pos_key is not None else None
+        dpos_query = torch.empty_like(pos_query) if pos_query is not None else None
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), dpos_key, dpos_query
+
     def _setup_context(
         ctx: Any,
         inputs: tuple[Any, ...],
@@ -456,28 +558,28 @@ def _build_fixed_custom_op() -> Any | None:
             next_idx += 1
         pos_query = saved[next_idx] if bool(ctx.has_pos_query) else None
         grad = grad_out if grad_out is not None else torch.zeros_like(out)
-        dq, dk, dv, dpos_key, dpos_query = _fixed_eager_backward_impl(
-            grad_output=grad,
-            query_layer=q,
-            key_layer=k,
-            value_layer=v,
-            seq_lengths=seq_lengths,
-            output=out,
-            lse=lse,
-            pos_key=pos_key,
-            pos_query=pos_query,
-            sm_scale=ctx.sm_scale,
-            position_buckets=ctx.position_buckets,
-            max_relative_distance=ctx.max_relative_distance,
-            causal=ctx.causal,
+        dq, dk, dv, dpos_key, dpos_query = _backward_op(
+            grad,
+            q,
+            k,
+            v,
+            seq_lengths,
+            out,
+            lse,
+            pos_key,
+            pos_query,
+            ctx.sm_scale,
+            ctx.position_buckets,
+            ctx.max_relative_distance,
+            ctx.causal,
         )
         return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None
 
     torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
-    return _forward_op
+    return _forward_op, _backward_op
 
 
-_FLASHDEBERTA_FIXED_CUSTOM_OP = _build_fixed_custom_op()
+_FLASHDEBERTA_FIXED_CUSTOM_OP, _FLASHDEBERTA_FIXED_BWD_CUSTOM_OP = _build_fixed_custom_ops()
 
 
 def flashdeberta_fixed(
