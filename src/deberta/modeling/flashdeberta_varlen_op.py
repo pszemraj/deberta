@@ -67,8 +67,6 @@ class _MaskMetadataCacheEntry:
     indices: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
-    batch_indices: torch.Tensor
-    seq_indices: torch.Tensor
 
 
 @dataclass
@@ -79,8 +77,6 @@ class _ForwardAuxCacheEntry:
     indices: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
-    batch_indices: torch.Tensor
-    seq_indices: torch.Tensor
     q_unpad: torch.Tensor
     k_unpad: torch.Tensor
     v_unpad: torch.Tensor
@@ -180,23 +176,19 @@ def _varlen_kernel_override_from_env(
 
 def _build_unpad_metadata(
     mask_2d: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Build flattened-token indices and cumulative lengths for a 2D keep mask.
 
     :param torch.Tensor mask_2d: Boolean mask with shape ``(B, S)``.
-    :return tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
-        Valid-token indices, cumulative lengths, max sequence length, and cached
-        ``(batch_idx, seq_idx)`` selectors for ``(B, H, S, D)`` tensors.
+    :return tuple[torch.Tensor, torch.Tensor, int]:
+        Valid-token indices, cumulative lengths, and max sequence length.
     """
 
     seqlens = mask_2d.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(mask_2d.reshape(-1), as_tuple=False).squeeze(-1)
     max_seqlen = int(seqlens.max().item()) if int(seqlens.numel()) > 0 else 0
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
-    seq_len = int(mask_2d.shape[-1])
-    batch_indices = torch.div(indices, seq_len, rounding_mode="floor")
-    seq_indices = torch.remainder(indices, seq_len)
-    return indices, cu_seqlens, max_seqlen, batch_indices, seq_indices
+    return indices, cu_seqlens, max_seqlen
 
 
 def _mask_version(mask_2d: torch.Tensor) -> int:
@@ -246,7 +238,7 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
             return cached
         _MASK_METADATA_CACHE.pop(cache_key, None)
 
-    indices, cu_seqlens, max_seqlen, batch_indices, seq_indices = _build_unpad_metadata(mask_2d)
+    indices, cu_seqlens, max_seqlen = _build_unpad_metadata(mask_2d)
 
     mask_ref: weakref.ReferenceType[torch.Tensor] | None = None
     try:
@@ -260,8 +252,6 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
         indices=indices,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
-        batch_indices=batch_indices,
-        seq_indices=seq_indices,
     )
     if mask_ref is not None:
         _MASK_METADATA_CACHE[cache_key] = entry
@@ -287,35 +277,17 @@ def _get_unpad_metadata_cached(mask_2d: torch.Tensor) -> tuple[torch.Tensor, tor
 def _flatten_valid_tokens(
     tensor: torch.Tensor,
     *,
-    batch_indices: torch.Tensor,
-    seq_indices: torch.Tensor,
+    indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Gather valid tokens from ``(B, H, S, D)`` padded layout without a full transpose copy.
+    """Gather valid entries from padded ``(B, S, ...)`` layout.
 
-    :param torch.Tensor tensor: Padded tensor with leading shape ``(B, H, S, D)``.
-    :param torch.Tensor batch_indices: Batch selector for each valid token.
-    :param torch.Tensor seq_indices: Sequence-position selector for each valid token.
+    :param torch.Tensor tensor: Padded tensor with leading shape ``(B, S, ...)``.
+    :param torch.Tensor indices: Flattened valid-token indices into ``(B*S)`` layout.
     :return torch.Tensor: Gathered tensor with leading shape ``(NNZ, ...)``.
     """
 
-    return tensor.transpose(1, 2)[batch_indices, seq_indices]
-
-
-def _flatten_valid_lse(
-    tensor: torch.Tensor,
-    *,
-    batch_indices: torch.Tensor,
-    seq_indices: torch.Tensor,
-) -> torch.Tensor:
-    """Gather valid padded LSE values from ``(B, S, H)`` layout.
-
-    :param torch.Tensor tensor: Padded LSE tensor with leading shape ``(B, S, H)``.
-    :param torch.Tensor batch_indices: Batch selector for each valid token.
-    :param torch.Tensor seq_indices: Sequence-position selector for each valid token.
-    :return torch.Tensor: Gathered tensor with leading shape ``(NNZ, H)``.
-    """
-
-    return tensor[batch_indices, seq_indices]
+    flat = tensor.reshape(int(tensor.shape[0]) * int(tensor.shape[1]), *tensor.shape[2:])
+    return flat.index_select(0, indices)
 
 
 def _pad_valid_tokens(
@@ -344,8 +316,6 @@ def _store_forward_aux_cache(
     indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
-    batch_indices: torch.Tensor,
-    seq_indices: torch.Tensor,
     q_unpad: torch.Tensor,
     k_unpad: torch.Tensor,
     v_unpad: torch.Tensor,
@@ -360,8 +330,6 @@ def _store_forward_aux_cache(
     :param torch.Tensor indices: Flattened valid-token indices.
     :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
     :param int max_seqlen: Maximum active length in batch.
-    :param torch.Tensor batch_indices: Batch selector for each valid token.
-    :param torch.Tensor seq_indices: Sequence-position selector for each valid token.
     :param torch.Tensor q_unpad: Unpadded query tensor.
     :param torch.Tensor k_unpad: Unpadded key tensor.
     :param torch.Tensor v_unpad: Unpadded value tensor.
@@ -383,8 +351,6 @@ def _store_forward_aux_cache(
         indices=indices,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
-        batch_indices=batch_indices,
-        seq_indices=seq_indices,
         q_unpad=q_unpad,
         k_unpad=k_unpad,
         v_unpad=v_unpad,
@@ -429,12 +395,12 @@ def _varlen_eager_forward_impl(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run padded varlen attention eagerly, returning padded outputs.
 
-    :param torch.Tensor query_layer: Queries in ``(B, H, S, D)`` layout.
-    :param torch.Tensor key_layer: Keys in ``(B, H, S, D)`` layout.
-    :param torch.Tensor value_layer: Values in ``(B, H, S, D)`` layout.
+    :param torch.Tensor query_layer: Queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Values in ``(B, S, H, D)`` layout.
     :param torch.Tensor attention_mask_2d: Boolean keep mask in ``(B, S)`` layout.
-    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, H, S, P)`` layout.
-    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, H, S, P)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
     :param float sm_scale: Softmax scale.
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
@@ -442,7 +408,7 @@ def _varlen_eager_forward_impl(
     :param bool require_lse: Whether the caller also needs padded log-sum-exp values.
     :param bool stash_backward_cache: Whether to cache unpadded forward tensors for reuse in backward.
     :raises RuntimeError: If no eager varlen implementation is importable.
-    :return tuple[torch.Tensor, torch.Tensor | None]: Padded output in ``(B, H, S, D)``
+    :return tuple[torch.Tensor, torch.Tensor | None]: Padded output in ``(B, S, H, D)``
         layout and optional padded LSE in ``(B, S, H)`` layout.
     """
 
@@ -458,7 +424,7 @@ def _varlen_eager_forward_impl(
         )
 
     batch_size = int(query_layer.shape[0])
-    seq_len = int(query_layer.shape[-2])
+    seq_len = int(query_layer.shape[1])
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
     metadata = _get_unpad_metadata_entry(attention_mask_2d)
@@ -469,7 +435,7 @@ def _varlen_eager_forward_impl(
         output = torch.zeros_like(query_layer)
         if require_lse:
             lse = torch.zeros(
-                (batch_size, seq_len, int(query_layer.shape[1])),
+                (batch_size, seq_len, int(query_layer.shape[2])),
                 device=query_layer.device,
                 dtype=torch.float32,
             )
@@ -478,24 +444,20 @@ def _varlen_eager_forward_impl(
 
     q_unpad = _flatten_valid_tokens(
         query_layer,
-        batch_indices=metadata.batch_indices,
-        seq_indices=metadata.seq_indices,
+        indices=indices,
     )
     k_unpad = _flatten_valid_tokens(
         key_layer,
-        batch_indices=metadata.batch_indices,
-        seq_indices=metadata.seq_indices,
+        indices=indices,
     )
     v_unpad = _flatten_valid_tokens(
         value_layer,
-        batch_indices=metadata.batch_indices,
-        seq_indices=metadata.seq_indices,
+        indices=indices,
     )
     pos_key_unpad = (
         _flatten_valid_tokens(
             pos_key,
-            batch_indices=metadata.batch_indices,
-            seq_indices=metadata.seq_indices,
+            indices=indices,
         )
         if pos_key is not None
         else None
@@ -503,8 +465,7 @@ def _varlen_eager_forward_impl(
     pos_query_unpad = (
         _flatten_valid_tokens(
             pos_query,
-            batch_indices=metadata.batch_indices,
-            seq_indices=metadata.seq_indices,
+            indices=indices,
         )
         if pos_query is not None
         else None
@@ -563,7 +524,6 @@ def _varlen_eager_forward_impl(
         lse_unpad = None
 
     out_padded = _pad_valid_tokens(out_unpad, indices, batch_size, seq_len)
-    out_padded = out_padded.permute(0, 2, 1, 3).contiguous()
 
     if not require_lse:
         return out_padded, None
@@ -579,8 +539,6 @@ def _varlen_eager_forward_impl(
             indices=indices,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            batch_indices=metadata.batch_indices,
-            seq_indices=metadata.seq_indices,
             q_unpad=q_unpad,
             k_unpad=k_unpad,
             v_unpad=v_unpad,
@@ -610,15 +568,15 @@ def _varlen_eager_backward_impl(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run padded varlen backward eagerly and repad gradients.
 
-    :param torch.Tensor grad_output: Gradient of padded output in ``(B, H, S, D)`` layout.
-    :param torch.Tensor query_layer: Forward queries in ``(B, H, S, D)`` layout.
-    :param torch.Tensor key_layer: Forward keys in ``(B, H, S, D)`` layout.
-    :param torch.Tensor value_layer: Forward values in ``(B, H, S, D)`` layout.
+    :param torch.Tensor grad_output: Gradient of padded output in ``(B, S, H, D)`` layout.
+    :param torch.Tensor query_layer: Forward queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Forward keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Forward values in ``(B, S, H, D)`` layout.
     :param torch.Tensor attention_mask_2d: Boolean keep mask in ``(B, S)`` layout.
-    :param torch.Tensor output_padded: Forward output in ``(B, H, S, D)`` layout.
+    :param torch.Tensor output_padded: Forward output in ``(B, S, H, D)`` layout.
     :param torch.Tensor lse_padded: Forward padded LSE in ``(B, S, H)`` layout.
-    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, H, S, P)`` layout.
-    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, H, S, P)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
     :param float sm_scale: Softmax scale.
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
@@ -653,8 +611,6 @@ def _varlen_eager_backward_impl(
         indices=metadata.indices,
         cu_seqlens=metadata.cu_seqlens,
         max_seqlen=metadata.max_seqlen,
-        batch_indices=metadata.batch_indices,
-        seq_indices=metadata.seq_indices,
         q_unpad=None,
         k_unpad=None,
         v_unpad=None,
@@ -682,8 +638,6 @@ def _varlen_eager_backward_cached_impl(
     indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
-    batch_indices: torch.Tensor,
-    seq_indices: torch.Tensor,
     q_unpad: torch.Tensor | None,
     k_unpad: torch.Tensor | None,
     v_unpad: torch.Tensor | None,
@@ -694,14 +648,14 @@ def _varlen_eager_backward_cached_impl(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run padded varlen backward, optionally reusing forward-side unpadded tensors.
 
-    :param torch.Tensor grad_output: Gradient of padded output in ``(B, H, S, D)`` layout.
-    :param torch.Tensor query_layer: Forward queries in ``(B, H, S, D)`` layout.
-    :param torch.Tensor key_layer: Forward keys in ``(B, H, S, D)`` layout.
-    :param torch.Tensor value_layer: Forward values in ``(B, H, S, D)`` layout.
-    :param torch.Tensor output_padded: Forward output in ``(B, H, S, D)`` layout.
+    :param torch.Tensor grad_output: Gradient of padded output in ``(B, S, H, D)`` layout.
+    :param torch.Tensor query_layer: Forward queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Forward keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Forward values in ``(B, S, H, D)`` layout.
+    :param torch.Tensor output_padded: Forward output in ``(B, S, H, D)`` layout.
     :param torch.Tensor lse_padded: Forward padded LSE in ``(B, S, H)`` layout.
-    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, H, S, P)`` layout.
-    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, H, S, P)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
     :param float sm_scale: Softmax scale.
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
@@ -709,8 +663,6 @@ def _varlen_eager_backward_cached_impl(
     :param torch.Tensor indices: Flattened valid-token indices.
     :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
     :param int max_seqlen: Maximum active length in batch.
-    :param torch.Tensor batch_indices: Batch selector for each valid token.
-    :param torch.Tensor seq_indices: Sequence-position selector for each valid token.
     :param torch.Tensor | None q_unpad: Optional cached unpadded query tensor.
     :param torch.Tensor | None k_unpad: Optional cached unpadded key tensor.
     :param torch.Tensor | None v_unpad: Optional cached unpadded value tensor.
@@ -723,7 +675,7 @@ def _varlen_eager_backward_cached_impl(
     """
 
     batch_size = int(query_layer.shape[0])
-    seq_len = int(query_layer.shape[-2])
+    seq_len = int(query_layer.shape[1])
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
     if int(indices.numel()) == 0:
@@ -737,49 +689,41 @@ def _varlen_eager_backward_cached_impl(
     if q_unpad is None:
         q_unpad = _flatten_valid_tokens(
             query_layer,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
     if k_unpad is None:
         k_unpad = _flatten_valid_tokens(
             key_layer,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
     if v_unpad is None:
         v_unpad = _flatten_valid_tokens(
             value_layer,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
     if out_unpad is None:
         out_unpad = _flatten_valid_tokens(
             output_padded,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
     grad_unpad = _flatten_valid_tokens(
         grad_output,
-        batch_indices=batch_indices,
-        seq_indices=seq_indices,
+        indices=indices,
     )
     if lse_unpad is None:
-        lse_unpad = _flatten_valid_lse(
+        lse_unpad = _flatten_valid_tokens(
             lse_padded,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
     if pos_key is not None and pos_key_unpad is None:
         pos_key_unpad = _flatten_valid_tokens(
             pos_key,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
     if pos_query is not None and pos_query_unpad is None:
         pos_query_unpad = _flatten_valid_tokens(
             pos_query,
-            batch_indices=batch_indices,
-            seq_indices=seq_indices,
+            indices=indices,
         )
 
     override = _varlen_kernel_override_from_env(kind="bwd")
@@ -819,16 +763,16 @@ def _varlen_eager_backward_cached_impl(
         att_span,
     )
 
-    dq = _pad_valid_tokens(dq_unpad, indices, batch_size, seq_len).permute(0, 2, 1, 3).contiguous()
-    dk = _pad_valid_tokens(dk_unpad, indices, batch_size, seq_len).permute(0, 2, 1, 3).contiguous()
-    dv = _pad_valid_tokens(dv_unpad, indices, batch_size, seq_len).permute(0, 2, 1, 3).contiguous()
+    dq = _pad_valid_tokens(dq_unpad, indices, batch_size, seq_len)
+    dk = _pad_valid_tokens(dk_unpad, indices, batch_size, seq_len)
+    dv = _pad_valid_tokens(dv_unpad, indices, batch_size, seq_len)
     dpos_key = (
-        _pad_valid_tokens(dpos_key_unpad, indices, batch_size, seq_len).permute(0, 2, 1, 3).contiguous()
+        _pad_valid_tokens(dpos_key_unpad, indices, batch_size, seq_len)
         if dpos_key_unpad is not None
         else None
     )
     dpos_query = (
-        _pad_valid_tokens(dpos_query_unpad, indices, batch_size, seq_len).permute(0, 2, 1, 3).contiguous()
+        _pad_valid_tokens(dpos_query_unpad, indices, batch_size, seq_len)
         if dpos_query_unpad is not None
         else None
     )
@@ -877,9 +821,9 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run padded varlen forward as one opaque CUDA op.
 
-        :param torch.Tensor q: Padded queries in ``(B, H, S, D)`` layout.
-        :param torch.Tensor k: Padded keys in ``(B, H, S, D)`` layout.
-        :param torch.Tensor v: Padded values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor q: Padded queries in ``(B, S, H, D)`` layout.
+        :param torch.Tensor k: Padded keys in ``(B, S, H, D)`` layout.
+        :param torch.Tensor v: Padded values in ``(B, S, H, D)`` layout.
         :param torch.Tensor mask: Boolean keep mask in ``(B, S)`` layout.
         :param torch.Tensor | None pos_key: Optional c2p tensor.
         :param torch.Tensor | None pos_query: Optional p2c tensor.
@@ -935,11 +879,11 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
 
         del k, v, mask, pos_key, pos_query, sm_scale, position_buckets, max_relative_distance, causal
         lse = torch.empty(
-            (q.shape[0], q.shape[2], q.shape[1]),
+            (q.shape[0], q.shape[1], q.shape[2]),
             device=q.device,
             dtype=torch.float32,
         )
-        return torch.empty_like(q), lse
+        return torch.empty(q.shape, device=q.device, dtype=q.dtype), lse
 
     @torch.library.custom_op(
         f"{_VARLEN_OP_NAMESPACE}::{_VARLEN_BWD_OP_NAME}",
@@ -1037,9 +981,23 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
         """
 
         del grad_out, mask, out, lse, sm_scale, position_buckets, max_relative_distance, causal
-        dpos_key = torch.empty_like(pos_key) if pos_key is not None else None
-        dpos_query = torch.empty_like(pos_query) if pos_query is not None else None
-        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), dpos_key, dpos_query
+        dpos_key = (
+            torch.empty(pos_key.shape, device=pos_key.device, dtype=pos_key.dtype)
+            if pos_key is not None
+            else None
+        )
+        dpos_query = (
+            torch.empty(pos_query.shape, device=pos_query.device, dtype=pos_query.dtype)
+            if pos_query is not None
+            else None
+        )
+        return (
+            torch.empty(q.shape, device=q.device, dtype=q.dtype),
+            torch.empty(k.shape, device=k.device, dtype=k.dtype),
+            torch.empty(v.shape, device=v.device, dtype=v.dtype),
+            dpos_key,
+            dpos_query,
+        )
 
     def _setup_context(
         ctx: Any,
@@ -1108,8 +1066,6 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
                 indices=cached.indices,
                 cu_seqlens=cached.cu_seqlens,
                 max_seqlen=cached.max_seqlen,
-                batch_indices=cached.batch_indices,
-                seq_indices=cached.seq_indices,
                 q_unpad=cached.q_unpad,
                 k_unpad=cached.k_unpad,
                 v_unpad=cached.v_unpad,
@@ -1163,17 +1119,17 @@ def flashdeberta_varlen_padded(
     upstream Python/Triton launcher. Otherwise it falls back to the eager Python
     implementation.
 
-    :param torch.Tensor query_layer: Queries in ``(B, H, S, D)`` layout.
-    :param torch.Tensor key_layer: Keys in ``(B, H, S, D)`` layout.
-    :param torch.Tensor value_layer: Values in ``(B, H, S, D)`` layout.
+    :param torch.Tensor query_layer: Queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Values in ``(B, S, H, D)`` layout.
     :param torch.Tensor attention_mask_2d: Boolean keep mask in ``(B, S)`` layout.
-    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, H, S, P)`` layout.
-    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, H, S, P)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
     :param float sm_scale: Softmax scale.
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
-    :return torch.Tensor: Attention output in ``(B, H, S, D)`` layout.
+    :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
     """
 
     if _FLASHDEBERTA_VARLEN_CUSTOM_OP is not None and query_layer.device.type == "cuda":

@@ -519,11 +519,9 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
 
     varlen_mod._clear_forward_aux_cache()
 
-    output = torch.randn((1, 2, 4, 8), dtype=torch.float32)
+    output = torch.randn((1, 4, 2, 8), dtype=torch.float32)
     indices = torch.tensor([0, 1, 4], dtype=torch.long)
     cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
-    batch_indices = torch.tensor([0, 0, 1], dtype=torch.long)
-    seq_indices = torch.tensor([0, 1, 0], dtype=torch.long)
     q_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
     k_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
     v_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
@@ -537,8 +535,6 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
         indices=indices,
         cu_seqlens=cu_seqlens,
         max_seqlen=2,
-        batch_indices=batch_indices,
-        seq_indices=seq_indices,
         q_unpad=q_unpad,
         k_unpad=k_unpad,
         v_unpad=v_unpad,
@@ -553,8 +549,6 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
     assert cached.max_seqlen == 2
     assert cached.indices is indices
     assert cached.cu_seqlens is cu_seqlens
-    assert cached.batch_indices is batch_indices
-    assert cached.seq_indices is seq_indices
     assert cached.q_unpad is q_unpad
     assert cached.k_unpad is k_unpad
     assert cached.v_unpad is v_unpad
@@ -586,6 +580,49 @@ def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_WARPS", "8")
 
     assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
+
+
+def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
+    fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
+
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    if varlen_mod._FLASHDEBERTA_VARLEN_BWD_CUSTOM_OP is None:
+        pytest.skip("Compiled varlen custom op is unavailable in this environment.")
+
+    with fake_tensor_mod.FakeTensorMode():
+        q = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        k = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        v = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        grad_out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        lse = torch.empty((2, 4, 3), device="cuda", dtype=torch.float32)
+        mask = torch.ones((2, 4), device="cuda", dtype=torch.bool)
+        pos_key = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
+        pos_query = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
+
+        _, _, _, dpos_key, dpos_query = varlen_mod._FLASHDEBERTA_VARLEN_BWD_CUSTOM_OP(
+            grad_out,
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            pos_key,
+            pos_query,
+            1.0,
+            32,
+            128,
+            False,
+        )
+
+    assert dpos_key is not None
+    assert dpos_query is not None
+    assert dpos_key.shape == pos_key.shape
+    assert dpos_query.shape == pos_query.shape
+    assert dpos_key.stride() == (84, 21, 7, 1)
+    assert dpos_query.stride() == (84, 21, 7, 1)
 
 
 def test_fixed_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -45,6 +45,12 @@ kernels and backward passes. The compile contract remains the same: dense
 batches use fixed flash, and padded batches use varlen flash when the backend
 package exposes the required low-level primitives.
 
+The padded-varlen custom op now uses a `B,S,H,D` internal layout so valid tokens
+can be flattened with one `B*S` gather/scatter instead of advanced indexing over
+`B,H,S,D` transposes. When profiling unpacked runs, expect the remaining costs
+to show up as `aten::gather` / `aten::index_copy` and the varlen Triton backward
+kernel, not the older `aten::index` hotspot.
+
 ## Special case: packed doc-block masks
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope downgrades toward FFN-focused compile to avoid shape-churn recompiles from dynamic pairwise masks.

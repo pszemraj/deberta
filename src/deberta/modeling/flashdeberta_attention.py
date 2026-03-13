@@ -422,6 +422,21 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             )
         return None
 
+    def _shape_varlen(self, x: torch.Tensor) -> torch.Tensor:
+        """Reshape projection output into varlen-friendly multi-head layout.
+
+        The padded-varlen path operates more naturally in ``(B, S, H, D)``
+        layout, which lets the custom op flatten ``(B*S)`` directly and use one
+        flat gather/scatter instead of per-token advanced indexing over a
+        ``(B, H, S, D)`` transpose.
+
+        :param torch.Tensor x: Projected tensor with trailing dim ``all_head_size``.
+        :return torch.Tensor: Tensor with shape ``(B, S, H, D)``.
+        """
+
+        bsz, seq_len, _ = x.shape
+        return x.view(bsz, seq_len, self.num_attention_heads, self.attention_head_size)
+
     def _flash_fixed(
         self,
         *,
@@ -476,17 +491,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     ) -> torch.Tensor:
         """Run padded varlen FlashDeBERTa attention.
 
-        :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
-        :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
-        :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor query_layer: Projected queries in ``(B, S, H, D)`` layout.
+        :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
+        :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param torch.Tensor attention_mask: Padding-style keep mask.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
-        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        :return torch.Tensor: Flash output in ``(B, S, H, D)`` layout.
         """
 
-        seq_len = int(query_layer.shape[-2])
+        seq_len = int(query_layer.shape[1])
         mask_2d = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
         out = flashdeberta_varlen_padded(
             query_layer=query_layer,
@@ -561,10 +576,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
+        use_varlen = _should_use_varlen(attention_mask=attention_mask, seq_len=int(hidden_states.shape[-2]))
 
-        query_layer = self._shape(self.query_proj(query_states)).contiguous()
-        key_layer = self._shape(self.key_proj(hidden_states)).contiguous()
-        value_layer = self._shape(self.value_proj(hidden_states)).contiguous()
+        if use_varlen:
+            query_layer = self._shape_varlen(self.query_proj(query_states))
+            key_layer = self._shape_varlen(self.key_proj(hidden_states))
+            value_layer = self._shape_varlen(self.value_proj(hidden_states))
+        else:
+            query_layer = self._shape(self.query_proj(query_states)).contiguous()
+            key_layer = self._shape(self.key_proj(hidden_states)).contiguous()
+            value_layer = self._shape(self.value_proj(hidden_states)).contiguous()
 
         projected_reason = self._projected_qkv_fallback_reason(
             query_layer=query_layer,
@@ -594,11 +615,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if "c2p" in self.pos_att_type:
             pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
-            pos_key = torch.matmul(query_layer, pos_key_layer.unsqueeze(0).transpose(-1, -2))
+            if use_varlen:
+                pos_key = torch.einsum("bshd,hpd->bshp", query_layer, pos_key_layer)
+            else:
+                pos_key = torch.matmul(query_layer, pos_key_layer.unsqueeze(0).transpose(-1, -2))
 
         if "p2c" in self.pos_att_type:
             pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=key_layer.dtype)
-            pos_query = torch.matmul(key_layer, pos_query_layer.unsqueeze(0).transpose(-1, -2))
+            if use_varlen:
+                pos_query = torch.einsum("bshd,hpd->bshp", key_layer, pos_query_layer)
+            else:
+                pos_query = torch.matmul(key_layer, pos_query_layer.unsqueeze(0).transpose(-1, -2))
 
         scale_factor = 1
         if pos_key is not None:
@@ -609,7 +636,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_eligible_calls")
-        if _should_use_varlen(attention_mask=attention_mask, seq_len=int(key_layer.shape[-2])):
+        if use_varlen:
             output = self._flash_varlen(
                 query_layer=query_layer,
                 key_layer=key_layer,
@@ -619,6 +646,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 pos_query=pos_query,
                 sm_scale=sm_scale,
             )
+            output = output.contiguous().view(bsz, query_len, self.all_head_size)
         else:
             output = self._flash_fixed(
                 query_layer=query_layer,
@@ -629,8 +657,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 pos_query=pos_query,
                 sm_scale=sm_scale,
             )
-
-        output = output.transpose(1, 2).contiguous().view(bsz, query_len, self.all_head_size)
+            output = output.transpose(1, 2).contiguous().view(bsz, query_len, self.all_head_size)
         output = output.to(dtype=model_dtype)
 
         if output_attentions:
