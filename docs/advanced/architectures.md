@@ -44,6 +44,8 @@ Use explicit config values when you want different behavior.
 
 ## FlashDeBERTa follow-ups
 
+- TODO (flash kernel follow-up): redesign or retile the fixed-length backward Triton kernels for dense packed `1024` on newer GPUs; current packed flash losses are dominated by fixed backward kernel time, not compile integration.
+- TODO (flash kernel follow-up): if padded-varlen training is still bottlenecked after layout cleanups, replace the remaining gather/scatter repad path with dedicated pack/unpack kernels instead of relying on `aten::gather` and `aten::index_copy`.
 - TODO (flash optimization follow-up): benchmark and, only if warranted, add the upstream small-batch local-bias path for `512 < seq_len < 1024` with very small training batches.
 - TODO (flash feature follow-up): add packed doc-block-aware flash attention for `hf_deberta_v2` only after the simpler padding-style flash path is proven worthwhile in longer-context runs.
 
