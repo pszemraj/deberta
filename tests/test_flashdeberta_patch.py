@@ -486,6 +486,57 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
     assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
 
 
+def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    calls = {"triton": 0, "custom": 0}
+
+    def _fake_triton_op(*args):
+        calls["triton"] += 1
+        return torch.ones_like(args[0]), torch.zeros(
+            (args[0].shape[0], args[0].shape[1], args[0].shape[2]),
+            dtype=torch.float32,
+            device=args[0].device,
+        )
+
+    def _fake_custom_op(*args):
+        calls["custom"] += 1
+        return torch.zeros_like(args[0]), torch.zeros(
+            (args[0].shape[0], args[0].shape[1], args[0].shape[2]),
+            dtype=torch.float32,
+            device=args[0].device,
+        )
+
+    monkeypatch.setattr(varlen_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(varlen_mod, "_FLASHDEBERTA_VARLEN_TRITON_OP", _fake_triton_op)
+    monkeypatch.setattr(varlen_mod, "_FLASHDEBERTA_VARLEN_CUSTOM_OP", _fake_custom_op)
+
+    with fake_tensor_mod.FakeTensorMode():
+        q = torch.empty((1, 4, 2, 8), device="cuda", dtype=torch.bfloat16)
+        k = torch.empty((1, 4, 2, 8), device="cuda", dtype=torch.bfloat16)
+        v = torch.empty((1, 4, 2, 8), device="cuda", dtype=torch.bfloat16)
+        mask = torch.ones((1, 4), device="cuda", dtype=torch.bool)
+
+        output = varlen_mod.flashdeberta_varlen_padded(
+            query_layer=q,
+            key_layer=k,
+            value_layer=v,
+            attention_mask_2d=mask,
+            pos_key=None,
+            pos_query=None,
+            sm_scale=1.0,
+            position_buckets=32,
+            max_relative_distance=128,
+            causal=False,
+        )
+
+    assert output.shape == q.shape
+    assert output.dtype == q.dtype
+    assert output.device.type == q.device.type
+    assert calls == {"triton": 1, "custom": 0}
+
+
 def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 

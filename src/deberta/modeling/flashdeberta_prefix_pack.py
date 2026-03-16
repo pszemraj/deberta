@@ -51,6 +51,21 @@ def flashdeberta_prefix_pack_available() -> bool:
     return triton is not None and tl is not None
 
 
+def _traceable_triton_kernel(kernel: object) -> object:
+    """Return a traceable Triton kernel wrapper when PyTorch exposes one.
+
+    :param object kernel: Raw Triton kernel or autotuned wrapper.
+    :return object: Traceable wrapper when available, otherwise ``kernel`` unchanged.
+    """
+
+    if not hasattr(torch, "library") or not hasattr(torch.library, "wrap_triton"):
+        return kernel
+    try:
+        return torch.library.wrap_triton(kernel)
+    except Exception:
+        return kernel
+
+
 def _flatten_rows(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int, int]:
     """Flatten a ``(B, S, ...)`` tensor into contiguous row-major ``(B*S, F)`` form.
 
@@ -463,25 +478,24 @@ def prefix_pack_padded_rows(
             triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS),
             num_heads * col_tiles,
         )
-        with torch.cuda.device(tensor.device):
-            _pack_prefix_rows_rank4_strided_kernel[grid](
-                tensor,
-                flat_output,
-                seqlens,
-                cu_seqlens,
-                tensor.stride(0),
-                tensor.stride(1),
-                tensor.stride(2),
-                tensor.stride(3),
-                int(tensor.shape[1]),
-                num_heads,
-                feature_size,
-                col_tiles,
-                BLOCK_ROWS=_PACK_BLOCK_ROWS,
-                BLOCK_COLS=_PACK_BLOCK_COLS,
-                num_warps=_PACK_NUM_WARPS,
-                num_stages=_PACK_NUM_STAGES,
-            )
+        _traceable_triton_kernel(_pack_prefix_rows_rank4_strided_kernel)[grid](
+            tensor,
+            flat_output,
+            seqlens,
+            cu_seqlens,
+            tensor.stride(0),
+            tensor.stride(1),
+            tensor.stride(2),
+            tensor.stride(3),
+            int(tensor.shape[1]),
+            num_heads,
+            feature_size,
+            col_tiles,
+            BLOCK_ROWS=_PACK_BLOCK_ROWS,
+            BLOCK_COLS=_PACK_BLOCK_COLS,
+            num_warps=_PACK_NUM_WARPS,
+            num_stages=_PACK_NUM_STAGES,
+        )
         return flat_output.view(total_tokens, num_heads, feature_size)
     if flashdeberta_prefix_pack_available() and tensor.device.type == "cuda" and not tensor.is_contiguous():
         tensor = tensor.contiguous()
@@ -496,19 +510,18 @@ def prefix_pack_padded_rows(
         triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS),
         triton.cdiv(row_size, _PACK_BLOCK_COLS),
     )
-    with torch.cuda.device(tensor.device):
-        _pack_prefix_rows_kernel[grid](
-            flat_input,
-            flat_output,
-            seqlens,
-            cu_seqlens,
-            seq_len,
-            row_size,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
-            num_warps=_PACK_NUM_WARPS,
-            num_stages=_PACK_NUM_STAGES,
-        )
+    _traceable_triton_kernel(_pack_prefix_rows_kernel)[grid](
+        flat_input,
+        flat_output,
+        seqlens,
+        cu_seqlens,
+        seq_len,
+        row_size,
+        BLOCK_ROWS=_PACK_BLOCK_ROWS,
+        BLOCK_COLS=_PACK_BLOCK_COLS,
+        num_warps=_PACK_NUM_WARPS,
+        num_stages=_PACK_NUM_STAGES,
+    )
     return flat_output.view(total_tokens, *trailing_shape)
 
 
@@ -555,19 +568,18 @@ def prefix_unpack_padded_rows(
         triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
         triton.cdiv(row_size, _PACK_BLOCK_COLS),
     )
-    with torch.cuda.device(values.device):
-        _unpack_prefix_rows_kernel[grid](
-            flat_values,
-            flat_output,
-            seqlens,
-            cu_seqlens,
-            seq_len,
-            row_size,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
-            num_warps=_PACK_NUM_WARPS,
-            num_stages=_PACK_NUM_STAGES,
-        )
+    _traceable_triton_kernel(_unpack_prefix_rows_kernel)[grid](
+        flat_values,
+        flat_output,
+        seqlens,
+        cu_seqlens,
+        seq_len,
+        row_size,
+        BLOCK_ROWS=_PACK_BLOCK_ROWS,
+        BLOCK_COLS=_PACK_BLOCK_COLS,
+        num_warps=_PACK_NUM_WARPS,
+        num_stages=_PACK_NUM_STAGES,
+    )
     return flat_output.view(batch_size, seq_len, *trailing_shape)
 
 
@@ -665,21 +677,20 @@ def prefix_unpack_padded_rows_pair(
         triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
         triton.cdiv(row_size, _PACK_BLOCK_COLS),
     )
-    with torch.cuda.device(values_a.device):
-        _unpack_prefix_rows_pair_kernel[grid](
-            flat_values_a,
-            flat_values_b,
-            flat_output_a,
-            flat_output_b,
-            seqlens,
-            cu_seqlens,
-            seq_len,
-            row_size,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
-            num_warps=_PACK_NUM_WARPS,
-            num_stages=_PACK_NUM_STAGES,
-        )
+    _traceable_triton_kernel(_unpack_prefix_rows_pair_kernel)[grid](
+        flat_values_a,
+        flat_values_b,
+        flat_output_a,
+        flat_output_b,
+        seqlens,
+        cu_seqlens,
+        seq_len,
+        row_size,
+        BLOCK_ROWS=_PACK_BLOCK_ROWS,
+        BLOCK_COLS=_PACK_BLOCK_COLS,
+        num_warps=_PACK_NUM_WARPS,
+        num_stages=_PACK_NUM_STAGES,
+    )
     return (
         flat_output_a.view(batch_size, seq_len, *trailing_shape),
         flat_output_b.view(batch_size, seq_len, *trailing_shape),
@@ -779,23 +790,22 @@ def prefix_unpack_padded_rows_triple(
         triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
         triton.cdiv(row_size, _PACK_BLOCK_COLS),
     )
-    with torch.cuda.device(values_a.device):
-        _unpack_prefix_rows_triple_kernel[grid](
-            flat_values_a,
-            flat_values_b,
-            flat_values_c,
-            flat_output_a,
-            flat_output_b,
-            flat_output_c,
-            seqlens,
-            cu_seqlens,
-            seq_len,
-            row_size,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
-            num_warps=_PACK_NUM_WARPS,
-            num_stages=_PACK_NUM_STAGES,
-        )
+    _traceable_triton_kernel(_unpack_prefix_rows_triple_kernel)[grid](
+        flat_values_a,
+        flat_values_b,
+        flat_values_c,
+        flat_output_a,
+        flat_output_b,
+        flat_output_c,
+        seqlens,
+        cu_seqlens,
+        seq_len,
+        row_size,
+        BLOCK_ROWS=_PACK_BLOCK_ROWS,
+        BLOCK_COLS=_PACK_BLOCK_COLS,
+        num_warps=_PACK_NUM_WARPS,
+        num_stages=_PACK_NUM_STAGES,
+    )
     return (
         flat_output_a.view(batch_size, seq_len, *trailing_shape),
         flat_output_b.view(batch_size, seq_len, *trailing_shape),
