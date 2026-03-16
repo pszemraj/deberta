@@ -59,7 +59,10 @@ instead of generic `nonzero`/`gather`/`index_copy` flows, and q/k/v or paired
 positional tensors can share those pack/unpack launches. When profiling
 unpacked runs, expect the remaining costs to be the varlen Triton backward
 kernel plus the smaller repo-local prefix pack/unpack kernels, not the older
-`aten::index` or generic `gather`/`index_copy` hotspots.
+`aten::index` or generic `gather`/`index_copy` hotspots. The backward path also
+fuses padded `grad_out` packing with `delta` construction, so the old
+`prefix-pack grad -> _bwd_preprocess_varlen` boundary is no longer a separate
+hot path in repo code.
 
 ## Special case: packed doc-block masks
 

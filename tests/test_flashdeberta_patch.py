@@ -950,6 +950,58 @@ def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
     assert torch.equal(unpacked_triple_c, expected_c)
 
 
+def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
+    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    output = torch.arange(2 * 4 * 2 * 3, dtype=torch.float32).view(2, 4, 2, 3).contiguous()
+    grad = (output + 10.0).contiguous()
+    seqlens = torch.tensor([2, 3], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    expected_out = prefix_mod.prefix_pack_padded_rows(
+        output,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+    expected_grad = prefix_mod.prefix_pack_padded_rows(
+        grad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+    expected_delta = (expected_out.to(dtype=torch.float32) * expected_grad.to(dtype=torch.float32)).sum(
+        dim=-1
+    )
+
+    out_unpad, grad_unpad, delta = varlen_mod._pack_grad_and_delta_from_padded(
+        grad_output=grad,
+        output_padded=output,
+        out_unpad=None,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        total_tokens=5,
+    )
+    assert torch.equal(out_unpad, expected_out)
+    assert torch.equal(grad_unpad, expected_grad)
+    assert torch.equal(delta, expected_delta)
+
+    cached_out, cached_grad, cached_delta = varlen_mod._pack_grad_and_delta_from_padded(
+        grad_output=grad,
+        output_padded=output,
+        out_unpad=expected_out,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        total_tokens=5,
+    )
+    assert torch.equal(cached_out, expected_out)
+    assert torch.equal(cached_grad, expected_grad)
+    assert torch.equal(cached_delta, expected_delta)
+
+
 def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
