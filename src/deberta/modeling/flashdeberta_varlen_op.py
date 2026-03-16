@@ -21,6 +21,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from deberta.modeling.flashdeberta_prefix_pack import (
+    prefix_pack_padded_rows,
+    prefix_unpack_padded_rows,
+)
+
 try:
     from flashdeberta.ops.flash_attention_varlen import (
         flash_attention_with_disentangled_varlen as _flash_attention_with_disentangled_varlen_highlevel,
@@ -64,7 +69,7 @@ class _MaskMetadataCacheEntry:
 
     mask_ref: weakref.ReferenceType[torch.Tensor] | None
     version: int
-    indices: torch.Tensor
+    seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
 
@@ -74,7 +79,7 @@ class _ForwardAuxCacheEntry:
     """Forward-side varlen tensors reused by the padded backward helper."""
 
     output_ref: weakref.ReferenceType[torch.Tensor] | None
-    indices: torch.Tensor
+    seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
     q_unpad: torch.Tensor
@@ -177,18 +182,17 @@ def _varlen_kernel_override_from_env(
 def _build_unpad_metadata(
     mask_2d: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Build flattened-token indices and cumulative lengths for a 2D keep mask.
+    """Build prefix-padding metadata for a 2D keep mask.
 
     :param torch.Tensor mask_2d: Boolean mask with shape ``(B, S)``.
     :return tuple[torch.Tensor, torch.Tensor, int]:
-        Valid-token indices, cumulative lengths, and max sequence length.
+        Per-example sequence lengths, cumulative lengths, and max sequence length.
     """
 
     seqlens = mask_2d.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(mask_2d.reshape(-1), as_tuple=False).squeeze(-1)
     max_seqlen = int(seqlens.max().item()) if int(seqlens.numel()) > 0 else 0
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
-    return indices, cu_seqlens, max_seqlen
+    return seqlens, cu_seqlens, max_seqlen
 
 
 def _mask_version(mask_2d: torch.Tensor) -> int:
@@ -238,7 +242,7 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
             return cached
         _MASK_METADATA_CACHE.pop(cache_key, None)
 
-    indices, cu_seqlens, max_seqlen = _build_unpad_metadata(mask_2d)
+    seqlens, cu_seqlens, max_seqlen = _build_unpad_metadata(mask_2d)
 
     mask_ref: weakref.ReferenceType[torch.Tensor] | None = None
     try:
@@ -249,7 +253,7 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     entry = _MaskMetadataCacheEntry(
         mask_ref=mask_ref,
         version=current_version,
-        indices=indices,
+        seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
     )
@@ -271,49 +275,13 @@ def _get_unpad_metadata_cached(mask_2d: torch.Tensor) -> tuple[torch.Tensor, tor
     """
 
     entry = _get_unpad_metadata_entry(mask_2d)
-    return entry.indices, entry.cu_seqlens, entry.max_seqlen
-
-
-def _flatten_valid_tokens(
-    tensor: torch.Tensor,
-    *,
-    indices: torch.Tensor,
-) -> torch.Tensor:
-    """Gather valid entries from padded ``(B, S, ...)`` layout.
-
-    :param torch.Tensor tensor: Padded tensor with leading shape ``(B, S, ...)``.
-    :param torch.Tensor indices: Flattened valid-token indices into ``(B*S)`` layout.
-    :return torch.Tensor: Gathered tensor with leading shape ``(NNZ, ...)``.
-    """
-
-    flat = tensor.reshape(int(tensor.shape[0]) * int(tensor.shape[1]), *tensor.shape[2:])
-    return flat.index_select(0, indices)
-
-
-def _pad_valid_tokens(
-    values: torch.Tensor,
-    indices: torch.Tensor,
-    batch_size: int,
-    seq_len: int,
-) -> torch.Tensor:
-    """Scatter unpadded values back into a padded batch layout.
-
-    :param torch.Tensor values: Unpadded values with leading shape ``(NNZ, ...)``.
-    :param torch.Tensor indices: Flattened valid-token indices.
-    :param int batch_size: Batch size.
-    :param int seq_len: Padded sequence length.
-    :return torch.Tensor: Padded tensor with leading shape ``(B, S, ...)``.
-    """
-
-    flat_out = values.new_zeros((batch_size * seq_len, *values.shape[1:]))
-    flat_out = flat_out.index_copy(0, indices, values)
-    return flat_out.view(batch_size, seq_len, *values.shape[1:])
+    return entry.seqlens, entry.cu_seqlens, entry.max_seqlen
 
 
 def _store_forward_aux_cache(
     *,
     output_padded: torch.Tensor,
-    indices: torch.Tensor,
+    seqlens: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
     q_unpad: torch.Tensor,
@@ -327,7 +295,7 @@ def _store_forward_aux_cache(
     """Stash forward unpadded tensors so backward does not rebuild them.
 
     :param torch.Tensor output_padded: Returned padded attention output tensor.
-    :param torch.Tensor indices: Flattened valid-token indices.
+    :param torch.Tensor seqlens: Per-example active lengths.
     :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
     :param int max_seqlen: Maximum active length in batch.
     :param torch.Tensor q_unpad: Unpadded query tensor.
@@ -348,7 +316,7 @@ def _store_forward_aux_cache(
 
     _FORWARD_AUX_CACHE[cache_key] = _ForwardAuxCacheEntry(
         output_ref=output_ref,
-        indices=indices,
+        seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
         q_unpad=q_unpad,
@@ -428,10 +396,11 @@ def _varlen_eager_forward_impl(
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
     metadata = _get_unpad_metadata_entry(attention_mask_2d)
-    indices = metadata.indices
+    seqlens = metadata.seqlens
     cu_seqlens = metadata.cu_seqlens
     max_seqlen = metadata.max_seqlen
-    if int(indices.numel()) == 0:
+    total_tokens = int(cu_seqlens[-1].item()) if int(cu_seqlens.numel()) > 0 else 0
+    if total_tokens == 0:
         output = torch.zeros_like(query_layer)
         if require_lse:
             lse = torch.zeros(
@@ -442,30 +411,40 @@ def _varlen_eager_forward_impl(
             return output, lse
         return output, None
 
-    q_unpad = _flatten_valid_tokens(
+    q_unpad = prefix_pack_padded_rows(
         query_layer,
-        indices=indices,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
-    k_unpad = _flatten_valid_tokens(
+    k_unpad = prefix_pack_padded_rows(
         key_layer,
-        indices=indices,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
-    v_unpad = _flatten_valid_tokens(
+    v_unpad = prefix_pack_padded_rows(
         value_layer,
-        indices=indices,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
     pos_key_unpad = (
-        _flatten_valid_tokens(
+        prefix_pack_padded_rows(
             pos_key,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
         if pos_key is not None
         else None
     )
     pos_query_unpad = (
-        _flatten_valid_tokens(
+        prefix_pack_padded_rows(
             pos_query,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
         if pos_query is not None
         else None
@@ -523,7 +502,13 @@ def _varlen_eager_forward_impl(
         )
         lse_unpad = None
 
-    out_padded = _pad_valid_tokens(out_unpad, indices, batch_size, seq_len)
+    out_padded = prefix_unpack_padded_rows(
+        out_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
 
     if not require_lse:
         return out_padded, None
@@ -532,11 +517,17 @@ def _varlen_eager_forward_impl(
             "Compiled FlashDeBERTa varlen requires low-level forward primitives with padded LSE support."
         )
 
-    lse_padded = _pad_valid_tokens(lse_unpad, indices, batch_size, seq_len).contiguous()
+    lse_padded = prefix_unpack_padded_rows(
+        lse_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    ).contiguous()
     if stash_backward_cache:
         _store_forward_aux_cache(
             output_padded=out_padded,
-            indices=indices,
+            seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             q_unpad=q_unpad,
@@ -608,7 +599,7 @@ def _varlen_eager_backward_impl(
         position_buckets=position_buckets,
         max_relative_distance=max_relative_distance,
         causal=causal,
-        indices=metadata.indices,
+        seqlens=metadata.seqlens,
         cu_seqlens=metadata.cu_seqlens,
         max_seqlen=metadata.max_seqlen,
         q_unpad=None,
@@ -635,7 +626,7 @@ def _varlen_eager_backward_cached_impl(
     position_buckets: int,
     max_relative_distance: int,
     causal: bool,
-    indices: torch.Tensor,
+    seqlens: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
     q_unpad: torch.Tensor | None,
@@ -660,7 +651,7 @@ def _varlen_eager_backward_cached_impl(
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
-    :param torch.Tensor indices: Flattened valid-token indices.
+    :param torch.Tensor seqlens: Per-example active lengths.
     :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
     :param int max_seqlen: Maximum active length in batch.
     :param torch.Tensor | None q_unpad: Optional cached unpadded query tensor.
@@ -678,7 +669,8 @@ def _varlen_eager_backward_cached_impl(
     seq_len = int(query_layer.shape[1])
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
-    if int(indices.numel()) == 0:
+    total_tokens = int(cu_seqlens[-1].item()) if int(cu_seqlens.numel()) > 0 else 0
+    if total_tokens == 0:
         dq = torch.zeros_like(query_layer)
         dk = torch.zeros_like(key_layer)
         dv = torch.zeros_like(value_layer)
@@ -687,43 +679,59 @@ def _varlen_eager_backward_cached_impl(
         return dq, dk, dv, dpos_key, dpos_query
 
     if q_unpad is None:
-        q_unpad = _flatten_valid_tokens(
+        q_unpad = prefix_pack_padded_rows(
             query_layer,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
     if k_unpad is None:
-        k_unpad = _flatten_valid_tokens(
+        k_unpad = prefix_pack_padded_rows(
             key_layer,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
     if v_unpad is None:
-        v_unpad = _flatten_valid_tokens(
+        v_unpad = prefix_pack_padded_rows(
             value_layer,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
     if out_unpad is None:
-        out_unpad = _flatten_valid_tokens(
+        out_unpad = prefix_pack_padded_rows(
             output_padded,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
-    grad_unpad = _flatten_valid_tokens(
+    grad_unpad = prefix_pack_padded_rows(
         grad_output,
-        indices=indices,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
     if lse_unpad is None:
-        lse_unpad = _flatten_valid_tokens(
+        lse_unpad = prefix_pack_padded_rows(
             lse_padded,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
     if pos_key is not None and pos_key_unpad is None:
-        pos_key_unpad = _flatten_valid_tokens(
+        pos_key_unpad = prefix_pack_padded_rows(
             pos_key,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
     if pos_query is not None and pos_query_unpad is None:
-        pos_query_unpad = _flatten_valid_tokens(
+        pos_query_unpad = prefix_pack_padded_rows(
             pos_query,
-            indices=indices,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
     override = _varlen_kernel_override_from_env(kind="bwd")
@@ -763,16 +771,46 @@ def _varlen_eager_backward_cached_impl(
         att_span,
     )
 
-    dq = _pad_valid_tokens(dq_unpad, indices, batch_size, seq_len)
-    dk = _pad_valid_tokens(dk_unpad, indices, batch_size, seq_len)
-    dv = _pad_valid_tokens(dv_unpad, indices, batch_size, seq_len)
+    dq = prefix_unpack_padded_rows(
+        dq_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
+    dk = prefix_unpack_padded_rows(
+        dk_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
+    dv = prefix_unpack_padded_rows(
+        dv_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
     dpos_key = (
-        _pad_valid_tokens(dpos_key_unpad, indices, batch_size, seq_len)
+        prefix_unpack_padded_rows(
+            dpos_key_unpad,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
         if dpos_key_unpad is not None
         else None
     )
     dpos_query = (
-        _pad_valid_tokens(dpos_query_unpad, indices, batch_size, seq_len)
+        prefix_unpack_padded_rows(
+            dpos_query_unpad,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
         if dpos_query_unpad is not None
         else None
     )
@@ -1063,7 +1101,7 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
                 position_buckets=ctx.position_buckets,
                 max_relative_distance=ctx.max_relative_distance,
                 causal=ctx.causal,
-                indices=cached.indices,
+                seqlens=cached.seqlens,
                 cu_seqlens=cached.cu_seqlens,
                 max_seqlen=cached.max_seqlen,
                 q_unpad=cached.q_unpad,

@@ -45,11 +45,14 @@ kernels and backward passes. The compile contract remains the same: dense
 batches use fixed flash, and padded batches use varlen flash when the backend
 package exposes the required low-level primitives.
 
-The padded-varlen custom op now uses a `B,S,H,D` internal layout so valid tokens
-can be flattened with one `B*S` gather/scatter instead of advanced indexing over
-`B,H,S,D` transposes. When profiling unpacked runs, expect the remaining costs
-to show up as `aten::gather` / `aten::index_copy` and the varlen Triton backward
-kernel, not the older `aten::index` hotspot.
+The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
+prefix-pack Triton kernels. Because repo masks use standard prefix padding,
+active tokens can be packed and repadded directly from `seqlens/cu_seqlens`
+instead of generic `nonzero`/`gather`/`index_copy` flows. When profiling
+unpacked runs, expect the remaining costs to be the varlen Triton backward
+kernel plus repo-local `_pack_prefix_rows_rank4_strided_kernel` /
+`_unpack_prefix_rows_kernel`, not the older `aten::index` or generic
+`gather`/`index_copy` hotspots.
 
 ## Special case: packed doc-block masks
 

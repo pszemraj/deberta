@@ -500,15 +500,15 @@ def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.M
     monkeypatch.setattr(varlen_mod, "_build_unpad_metadata", _counting_build)
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
-    first_indices, first_cu, first_max = varlen_mod._get_unpad_metadata_cached(mask)
-    second_indices, second_cu, second_max = varlen_mod._get_unpad_metadata_cached(mask)
-    clone_indices, clone_cu, clone_max = varlen_mod._get_unpad_metadata_cached(mask.clone())
+    first_seqlens, first_cu, first_max = varlen_mod._get_unpad_metadata_cached(mask)
+    second_seqlens, second_cu, second_max = varlen_mod._get_unpad_metadata_cached(mask)
+    clone_seqlens, clone_cu, clone_max = varlen_mod._get_unpad_metadata_cached(mask.clone())
 
     assert calls["count"] == 2
     assert first_max == second_max == clone_max == 2
-    assert first_indices.data_ptr() == second_indices.data_ptr()
+    assert first_seqlens.data_ptr() == second_seqlens.data_ptr()
     assert first_cu.data_ptr() == second_cu.data_ptr()
-    assert clone_indices.data_ptr() != first_indices.data_ptr()
+    assert clone_seqlens.data_ptr() != first_seqlens.data_ptr()
     assert clone_cu.data_ptr() != first_cu.data_ptr()
 
     varlen_mod._clear_unpad_metadata_cache()
@@ -520,7 +520,7 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
     varlen_mod._clear_forward_aux_cache()
 
     output = torch.randn((1, 4, 2, 8), dtype=torch.float32)
-    indices = torch.tensor([0, 1, 4], dtype=torch.long)
+    seqlens = torch.tensor([2, 1], dtype=torch.int32)
     cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
     q_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
     k_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
@@ -532,7 +532,7 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
 
     varlen_mod._store_forward_aux_cache(
         output_padded=output,
-        indices=indices,
+        seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=2,
         q_unpad=q_unpad,
@@ -547,7 +547,7 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
     cached = varlen_mod._pop_forward_aux_cache(output)
     assert cached is not None
     assert cached.max_seqlen == 2
-    assert cached.indices is indices
+    assert cached.seqlens is seqlens
     assert cached.cu_seqlens is cu_seqlens
     assert cached.q_unpad is q_unpad
     assert cached.k_unpad is k_unpad
@@ -559,6 +559,36 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
     assert varlen_mod._pop_forward_aux_cache(output) is None
 
     varlen_mod._clear_forward_aux_cache()
+
+
+def test_prefix_pack_round_trips_with_prefix_padding_contract() -> None:
+    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
+
+    tensor = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3).contiguous()
+    seqlens = torch.tensor([2, 3], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    packed = prefix_mod.prefix_pack_padded_rows(
+        tensor,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+    unpacked = prefix_mod.prefix_unpack_padded_rows(
+        packed,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+
+    expected_packed = torch.cat((tensor[0, :2], tensor[1, :3]), dim=0)
+    expected_unpacked = torch.zeros_like(tensor)
+    expected_unpacked[0, :2] = tensor[0, :2]
+    expected_unpacked[1, :3] = tensor[1, :3]
+
+    assert torch.equal(packed, expected_packed)
+    assert torch.equal(unpacked, expected_unpacked)
 
 
 def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
