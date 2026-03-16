@@ -39,7 +39,7 @@ accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml \
 Use the flash wrapper only after installing the optional flash runtime, and keep `data.packing.block_cross_document_attention=false`.
 Use `tools/flashdeberta_microbench.py` to compare eager vs flash on dense and padded regimes before defaulting flash for a specific config or machine.
 Use `tools/run_flashdeberta_benchmarks.sh` when you want the full current-head matrix in one run, including dense/padded microbench cases plus packed and unpacked training logs under a single persistent `local-scratch/benchmarks/flashdeberta/...` output directory. Override that location with `FLASHDEBERTA_BENCH_OUT_DIR=/your/path` when needed.
-On current `hf_deberta_v2` runs, dense packed `1024` batches may route through the repo-local local-bias flash path automatically; padded batches still use the varlen path.
+On current `hf_deberta_v2` runs, dense packed `1024` batches may route through the repo-local local-bias flash path automatically. Padded `1024` batches now default to the fixed flash path with per-example `seq_lengths`, while longer padded batches (`2048+` by default) use the varlen path.
 When tuning the padded varlen path, prefer `FLASHDEBERTA_VARLEN_FWD_*` and `FLASHDEBERTA_VARLEN_BWD_*` so experiments do not also perturb the fixed-length flash kernels.
 When tuning dense fixed-length flash, prefer `FLASHDEBERTA_FIXED_FWD_*` and `FLASHDEBERTA_FIXED_BWD_*` so experiments do not also perturb the padded-varlen path.
 

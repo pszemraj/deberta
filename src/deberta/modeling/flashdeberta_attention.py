@@ -26,9 +26,12 @@ Optional runtime knobs
 ----------------------
 Set these before importing this module:
 
-- ``FLASHDEBERTA_VARLEN_MIN_SEQ_LEN`` (default: ``1024``)
+- ``FLASHDEBERTA_VARLEN_MIN_SEQ_LEN`` (default: ``2048``)
     Minimum sequence length required before the varlen kernel is used when a
-    padding mask is present.
+    padding mask is present. On the repo's measured ``1024`` unpacked RTD
+    regime, the compile-clean fixed path with per-example ``seq_lengths`` is
+    faster than the varlen backward kernels, so masked ``1024`` batches stay on
+    the fixed path by default.
 - ``FLASHDEBERTA_FORCE_VARLEN`` (default: ``0``)
     Force the varlen kernel whenever a padding mask is present.
 - ``FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN`` (default: ``0`` / disabled)
@@ -84,7 +87,7 @@ class FlashDebertaRuntimeConfig:
     """
 
     force_varlen: bool = False
-    varlen_min_seq_len: int = 1024
+    varlen_min_seq_len: int = 2048
     eager_dense_max_seq_len: int = 0
     enable_debug_stats: bool = False
     warn_fallbacks: bool = True
@@ -140,7 +143,7 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
 
     return FlashDebertaRuntimeConfig(
         force_varlen=_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"),
-        varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 1024)),
+        varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 2048)),
         eager_dense_max_seq_len=max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0)),
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
         warn_fallbacks=_truthy_env("FLASHDEBERTA_WARN_FALLBACKS", default="1"),
@@ -277,9 +280,11 @@ def _should_use_varlen(
     This deliberately does not inspect tensor contents. In this repository's
     training path, the collator already drops all-ones masks, so
     ``attention_mask is None`` is the dense signal and ``attention_mask is not None``
-    is the padded signal. When ``torch.compile`` is active we require the opaque
-    custom-op varlen wrapper so Dynamo does not trace into FlashDeBERTa's
-    Python/Triton launcher.
+    is the padded signal. The repo defaults masked ``1024`` batches to the
+    fixed flash path because that measured faster than varlen on the current
+    RTD stack, while longer padded batches still route to varlen. When
+    ``torch.compile`` is active we require the opaque custom-op varlen wrapper
+    so Dynamo does not trace into FlashDeBERTa's Python/Triton launcher.
 
     :param torch.Tensor | None attention_mask: Optional attention mask.
     :param int seq_len: Sequence length for the current call.

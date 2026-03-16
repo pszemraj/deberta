@@ -41,9 +41,19 @@ attention forward. Use benchmark/probe tooling for path visibility instead.
 Compiled FlashDeBERTa fixed and varlen paths now both run through opaque custom
 ops on CUDA. That keeps the upstream Python autograd wrappers, config caches,
 and Triton launch setup out of the Dynamo trace while still executing the real
-kernels and backward passes. The compile contract remains the same: dense
-batches use fixed flash, and padded batches use varlen flash when the backend
-package exposes the required low-level primitives.
+kernels and backward passes. The current routing contract is:
+
+- dense batches use fixed flash
+- padded `1024` batches use fixed flash with per-example `seq_lengths`
+- longer padded batches (`2048+` by default) use varlen flash when the backend
+  package exposes the required low-level primitives
+
+That split is deliberate. On the repo's measured unpacked `1024` RTD regime,
+the compile-clean fixed path outperformed the varlen backward kernels, while
+the varlen path pulled back ahead again for longer padded contexts.
+Set `FLASHDEBERTA_VARLEN_MIN_SEQ_LEN=1024` if you need to force the older
+"all padded batches go varlen" policy for debugging or machine-specific
+comparisons.
 
 Dense packed `1024` has one additional fast path: for small-batch non-causal
 training where DeBERTa relative terms are present, the adapter can materialize

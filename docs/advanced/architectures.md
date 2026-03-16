@@ -46,7 +46,8 @@ Use explicit config values when you want different behavior.
 
 - Dense packed `1024` now uses a repo-local local-bias flash path for the common small-batch training regime. Instead of retuning the original fixed disentangled backward kernel directly, the adapter materializes dense DeBERTa relative bias and dispatches through FlashDeBERTa's flash-with-bias kernels when that route is faster on current GPUs.
 - Padded varlen now uses dedicated repo-local prefix-pack Triton kernels, including shared pair/triple pack and unpack paths, and the padded backward path now builds packed `grad_out` plus `delta` in one fused step instead of a standalone prefix-pack followed by a separate preprocess kernel.
-- Current profiling result: for unpacked `1024` RTD runs, the remaining loss is dominated by FlashDeBERTa's varlen backward kernels themselves, not by generic gather/scatter or Python-side pack/preprocess plumbing.
+- Unpacked `1024` now defaults masked batches to the fixed flash path with per-example `seq_lengths`. Sequential microbench and RTD benchmarking showed that route beats the varlen backward kernels at `1024`, while the varlen path regains the advantage at `2048+`.
+- Current profiling result for longer padded runs: once the router hands work to varlen, the remaining loss is dominated by FlashDeBERTa's varlen backward kernels themselves, not by generic gather/scatter or Python-side pack/preprocess plumbing.
 - TODO (flash optimization follow-up): benchmark and, only if warranted, add the upstream small-batch local-bias path for `512 < seq_len < 1024` with very small training batches.
 - TODO (flash feature follow-up): add packed doc-block-aware flash attention for `hf_deberta_v2` only after the simpler padding-style flash path is proven worthwhile in longer-context runs.
 

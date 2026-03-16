@@ -647,11 +647,28 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
     monkeypatch.delenv("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", raising=False)
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
-    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is True
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=2048) is True
 
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: False)
 
-    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=2048) is False
+
+
+def test_varlen_min_seq_len_env_override_restores_1024_varlen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+
+    mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+
+    monkeypatch.setattr(attention_mod, "_is_torch_compiling", lambda: False)
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", "1024")
+    monkeypatch.delenv("FLASHDEBERTA_FORCE_VARLEN", raising=False)
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+
+    assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is True
 
 
 def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.MonkeyPatch) -> None:

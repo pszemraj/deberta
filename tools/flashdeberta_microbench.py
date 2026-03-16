@@ -10,11 +10,11 @@ Dense packed-like 1024 (mask dropped):
     python tools/flashdeberta_microbench.py --mode eager --seq-len 1024 --batch-size 8 --pad-ratio 0.0
     python tools/flashdeberta_microbench.py --mode flash --seq-len 1024 --batch-size 8 --pad-ratio 0.0
 
-Padding-heavy 1024:
+Padding-heavy 1024 (defaults to the fixed flash path with per-example seq_lengths):
     python tools/flashdeberta_microbench.py --mode flash --seq-len 1024 --batch-size 8 --pad-ratio 0.35
 
 Longer padded regime with varlen enabled:
-    FLASHDEBERTA_VARLEN_MIN_SEQ_LEN=1024 python tools/flashdeberta_microbench.py \
+    python tools/flashdeberta_microbench.py \
         --mode flash --seq-len 2048 --batch-size 4 --pad-ratio 0.35
 """
 
