@@ -14,7 +14,6 @@ and missing-Triton environments working without affecting correctness.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
 
 import torch
 
@@ -100,12 +99,12 @@ def _can_use_triton_prefix_pack(
 
 @triton.jit
 def _pack_prefix_rows_kernel(
-    input_ptr: Any,
-    output_ptr: Any,
-    seqlens_ptr: Any,
-    cu_seqlens_ptr: Any,
-    seq_len: Any,
-    row_size: Any,
+    input_ptr: None,
+    output_ptr: None,
+    seqlens_ptr: None,
+    cu_seqlens_ptr: None,
+    seq_len: int,
+    row_size: int,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ) -> None:
@@ -143,18 +142,18 @@ def _pack_prefix_rows_kernel(
 
 @triton.jit
 def _pack_prefix_rows_rank4_strided_kernel(
-    input_ptr: Any,
-    output_ptr: Any,
-    seqlens_ptr: Any,
-    cu_seqlens_ptr: Any,
-    stride_b: Any,
-    stride_s: Any,
-    stride_h: Any,
-    stride_f: Any,
-    seq_len: Any,
-    num_heads: Any,
-    feature_size: Any,
-    col_tiles: Any,
+    input_ptr: None,
+    output_ptr: None,
+    seqlens_ptr: None,
+    cu_seqlens_ptr: None,
+    stride_b: int,
+    stride_s: int,
+    stride_h: int,
+    stride_f: int,
+    seq_len: int,
+    num_heads: int,
+    feature_size: int,
+    col_tiles: int,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ) -> None:
@@ -210,12 +209,12 @@ def _pack_prefix_rows_rank4_strided_kernel(
 
 @triton.jit
 def _unpack_prefix_rows_kernel(
-    input_ptr: Any,
-    output_ptr: Any,
-    seqlens_ptr: Any,
-    cu_seqlens_ptr: Any,
-    seq_len: Any,
-    row_size: Any,
+    input_ptr: None,
+    output_ptr: None,
+    seqlens_ptr: None,
+    cu_seqlens_ptr: None,
+    seq_len: int,
+    row_size: int,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ) -> None:
@@ -250,6 +249,118 @@ def _unpack_prefix_rows_kernel(
     dst_ptrs = output_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
     values = tl.load(src_ptrs, mask=input_mask, other=0)
     tl.store(dst_ptrs, values, mask=output_mask)
+
+
+@triton.jit
+def _unpack_prefix_rows_pair_kernel(
+    input_a_ptr: None,
+    input_b_ptr: None,
+    output_a_ptr: None,
+    output_b_ptr: None,
+    seqlens_ptr: None,
+    cu_seqlens_ptr: None,
+    seq_len: int,
+    row_size: int,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+) -> None:
+    """Copy two packed tensors back into padded layout with shared prefix metadata.
+
+    :param Any input_a_ptr: Triton pointer to the first packed row-major input tensor.
+    :param Any input_b_ptr: Triton pointer to the second packed row-major input tensor.
+    :param Any output_a_ptr: Triton pointer to the first padded row-major output tensor.
+    :param Any output_b_ptr: Triton pointer to the second padded row-major output tensor.
+    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
+    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
+    :param Any seq_len: Padded sequence length.
+    :param Any row_size: Flattened trailing feature width.
+    :param Any BLOCK_ROWS: Triton row tile size.
+    :param Any BLOCK_COLS: Triton feature tile size.
+    :return None: This Triton kernel writes directly to the output pointers.
+    """
+
+    batch_idx = tl.program_id(0)
+    tile_row = tl.program_id(1)
+    tile_col = tl.program_id(2)
+
+    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+
+    seqlen = tl.load(seqlens_ptr + batch_idx)
+    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
+    dst_rows = batch_idx * seq_len + row_offsets
+    src_rows = packed_base + row_offsets
+
+    output_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
+    input_mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
+    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+    values_a = tl.load(src_a_ptrs, mask=input_mask, other=0)
+    values_b = tl.load(src_b_ptrs, mask=input_mask, other=0)
+    tl.store(dst_a_ptrs, values_a, mask=output_mask)
+    tl.store(dst_b_ptrs, values_b, mask=output_mask)
+
+
+@triton.jit
+def _unpack_prefix_rows_triple_kernel(
+    input_a_ptr: None,
+    input_b_ptr: None,
+    input_c_ptr: None,
+    output_a_ptr: None,
+    output_b_ptr: None,
+    output_c_ptr: None,
+    seqlens_ptr: None,
+    cu_seqlens_ptr: None,
+    seq_len: int,
+    row_size: int,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+) -> None:
+    """Copy three packed tensors back into padded layout with shared prefix metadata.
+
+    :param Any input_a_ptr: Triton pointer to the first packed row-major input tensor.
+    :param Any input_b_ptr: Triton pointer to the second packed row-major input tensor.
+    :param Any input_c_ptr: Triton pointer to the third packed row-major input tensor.
+    :param Any output_a_ptr: Triton pointer to the first padded row-major output tensor.
+    :param Any output_b_ptr: Triton pointer to the second padded row-major output tensor.
+    :param Any output_c_ptr: Triton pointer to the third padded row-major output tensor.
+    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
+    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
+    :param Any seq_len: Padded sequence length.
+    :param Any row_size: Flattened trailing feature width.
+    :param Any BLOCK_ROWS: Triton row tile size.
+    :param Any BLOCK_COLS: Triton feature tile size.
+    :return None: This Triton kernel writes directly to the output pointers.
+    """
+
+    batch_idx = tl.program_id(0)
+    tile_row = tl.program_id(1)
+    tile_col = tl.program_id(2)
+
+    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+
+    seqlen = tl.load(seqlens_ptr + batch_idx)
+    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
+    dst_rows = batch_idx * seq_len + row_offsets
+    src_rows = packed_base + row_offsets
+
+    output_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
+    input_mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
+    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+    src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+    dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+    values_a = tl.load(src_a_ptrs, mask=input_mask, other=0)
+    values_b = tl.load(src_b_ptrs, mask=input_mask, other=0)
+    values_c = tl.load(src_c_ptrs, mask=input_mask, other=0)
+    tl.store(dst_a_ptrs, values_a, mask=output_mask)
+    tl.store(dst_b_ptrs, values_b, mask=output_mask)
+    tl.store(dst_c_ptrs, values_c, mask=output_mask)
 
 
 def _prefix_pack_fallback(
@@ -312,6 +423,7 @@ def prefix_pack_padded_rows(
     seqlens: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    total_tokens: int | None = None,
 ) -> torch.Tensor:
     """Pack active prefix rows from a padded tensor.
 
@@ -319,12 +431,16 @@ def prefix_pack_padded_rows(
     :param torch.Tensor seqlens: Per-example active lengths.
     :param torch.Tensor cu_seqlens: Cumulative active lengths.
     :param int max_seqlen: Maximum active length in the batch.
+    :param int | None total_tokens: Optional precomputed number of active tokens.
     :return torch.Tensor: Packed tensor with leading shape ``(NNZ, ...)``.
     """
 
     if int(cu_seqlens.numel()) == 0:
         return tensor.new_empty((0, *tensor.shape[2:]))
-    total_tokens = int(cu_seqlens[-1].item())
+    if total_tokens is None:
+        total_tokens = int(sum(int(length) for length in seqlens.detach().cpu().tolist()))
+    else:
+        total_tokens = int(total_tokens)
     if total_tokens == 0:
         return tensor.new_empty((0, *tensor.shape[2:]))
     if (
@@ -455,9 +571,243 @@ def prefix_unpack_padded_rows(
     return flat_output.view(batch_size, seq_len, *trailing_shape)
 
 
+def _require_matching_packed_shapes(
+    values_a: torch.Tensor,
+    values_b: torch.Tensor,
+    values_c: torch.Tensor | None = None,
+) -> tuple[int, tuple[int, ...]]:
+    """Validate that packed tensors share the same leading and trailing shape.
+
+    :param torch.Tensor values_a: First packed tensor.
+    :param torch.Tensor values_b: Second packed tensor.
+    :param torch.Tensor | None values_c: Optional third packed tensor.
+    :raises ValueError: If packed tensor shapes do not match.
+    :return tuple[int, tuple[int, ...]]: Shared packed-token count and trailing shape.
+    """
+
+    trailing_shape = tuple(int(dim) for dim in values_a.shape[1:])
+    total_tokens = int(values_a.shape[0]) if int(values_a.ndim) > 0 else 0
+    expected = (total_tokens, *trailing_shape)
+    if tuple(int(dim) for dim in values_b.shape) != expected:
+        raise ValueError(f"Packed tensor shape mismatch: expected {expected}, got {tuple(values_b.shape)}")
+    if values_c is not None and tuple(int(dim) for dim in values_c.shape) != expected:
+        raise ValueError(f"Packed tensor shape mismatch: expected {expected}, got {tuple(values_c.shape)}")
+    return total_tokens, trailing_shape
+
+
+def prefix_unpack_padded_rows_pair(
+    values_a: torch.Tensor,
+    values_b: torch.Tensor,
+    *,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack two packed tensors back into padded layout with shared metadata.
+
+    :param torch.Tensor values_a: First packed tensor with leading shape ``(NNZ, ...)``.
+    :param torch.Tensor values_b: Second packed tensor with leading shape ``(NNZ, ...)``.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative active lengths.
+    :param int batch_size: Batch size.
+    :param int seq_len: Padded sequence length.
+    :return tuple[torch.Tensor, torch.Tensor]: Two padded tensors with leading shape ``(B, S, ...)``.
+    """
+
+    _, trailing_shape = _require_matching_packed_shapes(values_a, values_b)
+    if batch_size == 0 or seq_len == 0 or values_a.numel() == 0:
+        empty = values_a.new_zeros((batch_size, seq_len, *trailing_shape))
+        return empty, values_b.new_zeros((batch_size, seq_len, *trailing_shape))
+    if (
+        flashdeberta_prefix_pack_available()
+        and values_a.device.type == "cuda"
+        and not values_a.is_contiguous()
+    ):
+        values_a = values_a.contiguous()
+    if (
+        flashdeberta_prefix_pack_available()
+        and values_b.device.type == "cuda"
+        and not values_b.is_contiguous()
+    ):
+        values_b = values_b.contiguous()
+    if not _can_use_triton_prefix_pack(tensor=values_a, seqlens=seqlens, cu_seqlens=cu_seqlens):
+        return (
+            _prefix_unpack_fallback(
+                values_a,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                trailing_shape=trailing_shape,
+            ),
+            _prefix_unpack_fallback(
+                values_b,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                trailing_shape=trailing_shape,
+            ),
+        )
+
+    flat_values_a = values_a.view(int(values_a.shape[0]), -1)
+    flat_values_b = values_b.view(int(values_b.shape[0]), -1)
+    row_size = int(flat_values_a.shape[1])
+    flat_output_a = torch.empty(
+        (batch_size * seq_len, row_size), device=values_a.device, dtype=values_a.dtype
+    )
+    flat_output_b = torch.empty(
+        (batch_size * seq_len, row_size), device=values_b.device, dtype=values_b.dtype
+    )
+    grid = (
+        batch_size,
+        triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
+        triton.cdiv(row_size, _PACK_BLOCK_COLS),
+    )
+    with torch.cuda.device(values_a.device):
+        _unpack_prefix_rows_pair_kernel[grid](
+            flat_values_a,
+            flat_values_b,
+            flat_output_a,
+            flat_output_b,
+            seqlens,
+            cu_seqlens,
+            seq_len,
+            row_size,
+            BLOCK_ROWS=_PACK_BLOCK_ROWS,
+            BLOCK_COLS=_PACK_BLOCK_COLS,
+            num_warps=_PACK_NUM_WARPS,
+            num_stages=_PACK_NUM_STAGES,
+        )
+    return (
+        flat_output_a.view(batch_size, seq_len, *trailing_shape),
+        flat_output_b.view(batch_size, seq_len, *trailing_shape),
+    )
+
+
+def prefix_unpack_padded_rows_triple(
+    values_a: torch.Tensor,
+    values_b: torch.Tensor,
+    values_c: torch.Tensor,
+    *,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack three packed tensors back into padded layout with shared metadata.
+
+    :param torch.Tensor values_a: First packed tensor with leading shape ``(NNZ, ...)``.
+    :param torch.Tensor values_b: Second packed tensor with leading shape ``(NNZ, ...)``.
+    :param torch.Tensor values_c: Third packed tensor with leading shape ``(NNZ, ...)``.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative active lengths.
+    :param int batch_size: Batch size.
+    :param int seq_len: Padded sequence length.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        Three padded tensors with leading shape ``(B, S, ...)``.
+    """
+
+    _, trailing_shape = _require_matching_packed_shapes(values_a, values_b, values_c)
+    if batch_size == 0 or seq_len == 0 or values_a.numel() == 0:
+        empty_a = values_a.new_zeros((batch_size, seq_len, *trailing_shape))
+        empty_b = values_b.new_zeros((batch_size, seq_len, *trailing_shape))
+        empty_c = values_c.new_zeros((batch_size, seq_len, *trailing_shape))
+        return empty_a, empty_b, empty_c
+    if (
+        flashdeberta_prefix_pack_available()
+        and values_a.device.type == "cuda"
+        and not values_a.is_contiguous()
+    ):
+        values_a = values_a.contiguous()
+    if (
+        flashdeberta_prefix_pack_available()
+        and values_b.device.type == "cuda"
+        and not values_b.is_contiguous()
+    ):
+        values_b = values_b.contiguous()
+    if (
+        flashdeberta_prefix_pack_available()
+        and values_c.device.type == "cuda"
+        and not values_c.is_contiguous()
+    ):
+        values_c = values_c.contiguous()
+    if not _can_use_triton_prefix_pack(tensor=values_a, seqlens=seqlens, cu_seqlens=cu_seqlens):
+        return (
+            _prefix_unpack_fallback(
+                values_a,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                trailing_shape=trailing_shape,
+            ),
+            _prefix_unpack_fallback(
+                values_b,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                trailing_shape=trailing_shape,
+            ),
+            _prefix_unpack_fallback(
+                values_c,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                trailing_shape=trailing_shape,
+            ),
+        )
+
+    flat_values_a = values_a.view(int(values_a.shape[0]), -1)
+    flat_values_b = values_b.view(int(values_b.shape[0]), -1)
+    flat_values_c = values_c.view(int(values_c.shape[0]), -1)
+    row_size = int(flat_values_a.shape[1])
+    flat_output_a = torch.empty(
+        (batch_size * seq_len, row_size), device=values_a.device, dtype=values_a.dtype
+    )
+    flat_output_b = torch.empty(
+        (batch_size * seq_len, row_size), device=values_b.device, dtype=values_b.dtype
+    )
+    flat_output_c = torch.empty(
+        (batch_size * seq_len, row_size), device=values_c.device, dtype=values_c.dtype
+    )
+    grid = (
+        batch_size,
+        triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
+        triton.cdiv(row_size, _PACK_BLOCK_COLS),
+    )
+    with torch.cuda.device(values_a.device):
+        _unpack_prefix_rows_triple_kernel[grid](
+            flat_values_a,
+            flat_values_b,
+            flat_values_c,
+            flat_output_a,
+            flat_output_b,
+            flat_output_c,
+            seqlens,
+            cu_seqlens,
+            seq_len,
+            row_size,
+            BLOCK_ROWS=_PACK_BLOCK_ROWS,
+            BLOCK_COLS=_PACK_BLOCK_COLS,
+            num_warps=_PACK_NUM_WARPS,
+            num_stages=_PACK_NUM_STAGES,
+        )
+    return (
+        flat_output_a.view(batch_size, seq_len, *trailing_shape),
+        flat_output_b.view(batch_size, seq_len, *trailing_shape),
+        flat_output_c.view(batch_size, seq_len, *trailing_shape),
+    )
+
+
 __all__ = [
     "flashdeberta_prefix_pack_available",
     "flashdeberta_prefix_pack_import_error",
     "prefix_pack_padded_rows",
     "prefix_unpack_padded_rows",
+    "prefix_unpack_padded_rows_pair",
+    "prefix_unpack_padded_rows_triple",
 ]

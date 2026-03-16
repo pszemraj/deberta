@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_padded_rows,
     prefix_unpack_padded_rows,
+    prefix_unpack_padded_rows_pair,
+    prefix_unpack_padded_rows_triple,
 )
 
 try:
@@ -37,6 +39,7 @@ except Exception as exc:  # pragma: no cover - optional import
     _FLASH_VARLEN_HIGHLEVEL_IMPORT_ERROR = exc
 
 try:
+    import flashdeberta.ops.flash_attention_varlen as _flash_attention_varlen_module
     from flashdeberta.ops.flash_attention_varlen import (
         flash_attn_v2_bwd_dise_varlen as _flash_attn_v2_bwd_dise_varlen_lowlevel,
     )
@@ -52,6 +55,7 @@ try:
 
     _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
+    _flash_attention_varlen_module = None
     _flash_attn_v2_bwd_dise_varlen_lowlevel = None
     _flash_attn_v2_fwd_dise_lowlevel = None
     _get_bwd_config_varlen_lowlevel = None
@@ -72,6 +76,29 @@ class _MaskMetadataCacheEntry:
     seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
+    total_tokens: int
+    cu_seqlens_host: tuple[int, ...]
+
+
+@dataclass
+class _CuSeqlensHostCacheEntry:
+    """Cached host tuple for one cumulative-seqlens tensor."""
+
+    cu_ref: weakref.ReferenceType[torch.Tensor] | None
+    cu_seqlens_host: tuple[int, ...]
+
+
+@dataclass
+class _MidTensorCacheEntry:
+    """Cached varlen tile-metadata tensors for one cumulative-seqlens tensor."""
+
+    cu_ref: weakref.ReferenceType[torch.Tensor] | None
+    block_m: int
+    device_type: str
+    device_index: int | None
+    mid_batch: torch.Tensor
+    mid_start: torch.Tensor
+    mn: int
 
 
 @dataclass
@@ -82,6 +109,7 @@ class _ForwardAuxCacheEntry:
     seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
+    total_tokens: int
     q_unpad: torch.Tensor
     k_unpad: torch.Tensor
     v_unpad: torch.Tensor
@@ -91,7 +119,11 @@ class _ForwardAuxCacheEntry:
     pos_query_unpad: torch.Tensor | None
 
 
-_MASK_METADATA_CACHE: dict[int, _MaskMetadataCacheEntry] = {}
+_MASK_METADATA_CACHE: dict[
+    tuple[int, int, tuple[int, ...], tuple[int, ...], str, int], _MaskMetadataCacheEntry
+] = {}
+_CU_SEQLENS_HOST_CACHE: dict[int, _CuSeqlensHostCacheEntry] = {}
+_MID_TENSOR_CACHE: dict[tuple[int, int, str, int | None], _MidTensorCacheEntry] = {}
 _FORWARD_AUX_CACHE: dict[int, _ForwardAuxCacheEntry] = {}
 
 
@@ -181,18 +213,25 @@ def _varlen_kernel_override_from_env(
 
 def _build_unpad_metadata(
     mask_2d: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, int, int, tuple[int, ...]]:
     """Build prefix-padding metadata for a 2D keep mask.
 
     :param torch.Tensor mask_2d: Boolean mask with shape ``(B, S)``.
-    :return tuple[torch.Tensor, torch.Tensor, int]:
-        Per-example sequence lengths, cumulative lengths, and max sequence length.
+    :return tuple[torch.Tensor, torch.Tensor, int, int, tuple[int, ...]]:
+        Per-example sequence lengths, cumulative lengths, max sequence length,
+        total active tokens, and host cumulative lengths.
     """
 
     seqlens = mask_2d.sum(dim=-1, dtype=torch.int32)
-    max_seqlen = int(seqlens.max().item()) if int(seqlens.numel()) > 0 else 0
+    seqlens_host = tuple(int(value) for value in seqlens.detach().cpu().tolist())
+    max_seqlen = max(seqlens_host, default=0)
+    total_tokens = sum(seqlens_host)
+    cu_seqlens_host_list = [0]
+    for seqlen in seqlens_host:
+        cu_seqlens_host_list.append(int(cu_seqlens_host_list[-1]) + int(seqlen))
+    cu_seqlens_host = tuple(int(value) for value in cu_seqlens_host_list)
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
-    return seqlens, cu_seqlens, max_seqlen
+    return seqlens, cu_seqlens, max_seqlen, total_tokens, cu_seqlens_host
 
 
 def _mask_version(mask_2d: torch.Tensor) -> int:
@@ -208,6 +247,32 @@ def _mask_version(mask_2d: torch.Tensor) -> int:
         return 0
 
 
+def _mask_metadata_cache_key(
+    mask_2d: torch.Tensor,
+) -> tuple[int, int, tuple[int, ...], tuple[int, ...], str, int]:
+    """Return a storage-stable cache key for one padding-mask tensor.
+
+    The encoder often passes fresh view objects of the same broadcast padding
+    mask to many attention layers. Keying only by ``id(mask)`` misses those
+    cases; keying by storage pointer + offset + layout + version preserves cache
+    reuse across equivalent views without synchronizing on tensor contents.
+
+    :param torch.Tensor mask_2d: Boolean keep mask with shape ``(B, S)``.
+    :return tuple[int, int, tuple[int, ...], tuple[int, ...], str, int]:
+        Storage pointer, storage offset, shape, stride, device text, and version.
+    """
+
+    storage = mask_2d.untyped_storage()
+    return (
+        int(storage.data_ptr()),
+        int(mask_2d.storage_offset()),
+        tuple(int(dim) for dim in mask_2d.shape),
+        tuple(int(dim) for dim in mask_2d.stride()),
+        str(mask_2d.device),
+        _mask_version(mask_2d),
+    )
+
+
 def _clear_unpad_metadata_cache() -> None:
     """Clear cached unpadding metadata.
 
@@ -215,6 +280,8 @@ def _clear_unpad_metadata_cache() -> None:
     """
 
     _MASK_METADATA_CACHE.clear()
+    _CU_SEQLENS_HOST_CACHE.clear()
+    _MID_TENSOR_CACHE.clear()
 
 
 def _clear_forward_aux_cache() -> None:
@@ -226,6 +293,183 @@ def _clear_forward_aux_cache() -> None:
     _FORWARD_AUX_CACHE.clear()
 
 
+def _clear_mid_tensor_cache() -> None:
+    """Clear cached varlen mid tensors.
+
+    This exists primarily for tests.
+    """
+
+    _MID_TENSOR_CACHE.clear()
+
+
+def _register_cu_seqlens_host_tuple(
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...],
+) -> None:
+    """Register a host tuple for one cumulative-seqlens tensor.
+
+    :param torch.Tensor cu_seqlens: Device cumulative-seqlens tensor.
+    :param tuple[int, ...] cu_seqlens_host: Host cumulative lengths.
+    """
+
+    cache_key = id(cu_seqlens)
+    cu_ref: weakref.ReferenceType[torch.Tensor] | None = None
+    try:
+
+        def _cleanup(_ref: object, key: int = cache_key) -> None:
+            """Remove cached host and mid tensors when ``cu_seqlens`` is released.
+
+            :param object _ref: Weakref callback payload from the released tensor.
+            :param int key: Cache key associated with the released tensor.
+            :return None: This callback mutates the module-local caches in place.
+            """
+
+            _CU_SEQLENS_HOST_CACHE.pop(key, None)
+            stale_keys = [mid_key for mid_key in _MID_TENSOR_CACHE if mid_key[0] == key]
+            for stale_key in stale_keys:
+                _MID_TENSOR_CACHE.pop(stale_key, None)
+
+        cu_ref = weakref.ref(cu_seqlens, _cleanup)
+    except TypeError:
+        cu_ref = None
+
+    _CU_SEQLENS_HOST_CACHE[cache_key] = _CuSeqlensHostCacheEntry(
+        cu_ref=cu_ref,
+        cu_seqlens_host=tuple(int(value) for value in cu_seqlens_host),
+    )
+
+
+def _cu_seqlens_host_tuple(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
+    """Return a cached host copy of one cumulative-seqlens tensor.
+
+    :param torch.Tensor cu_seqlens: Device cumulative-seqlens tensor.
+    :return tuple[int, ...]: Host cumulative lengths.
+    """
+
+    cache_key = id(cu_seqlens)
+    cached = _CU_SEQLENS_HOST_CACHE.get(cache_key)
+    if cached is not None:
+        cached_tensor = cached.cu_ref() if cached.cu_ref is not None else None
+        if cached_tensor is cu_seqlens:
+            return cached.cu_seqlens_host
+        _CU_SEQLENS_HOST_CACHE.pop(cache_key, None)
+        stale_keys = [mid_key for mid_key in _MID_TENSOR_CACHE if mid_key[0] == cache_key]
+        for stale_key in stale_keys:
+            _MID_TENSOR_CACHE.pop(stale_key, None)
+
+    cu_seqlens_host = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    _register_cu_seqlens_host_tuple(cu_seqlens=cu_seqlens, cu_seqlens_host=cu_seqlens_host)
+    return cu_seqlens_host
+
+
+def _build_mid_host_tuples(
+    *,
+    cu_seqlens_host: tuple[int, ...],
+    block_m: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+    """Build host-side varlen tile metadata for one cumulative-seqlens tuple.
+
+    :param tuple[int, ...] cu_seqlens_host: Host cumulative lengths with shape ``(B+1,)``.
+    :param int block_m: Query tile height.
+    :return tuple[tuple[int, ...], tuple[int, ...], int]:
+        Batch ids, start offsets, and total tile count.
+    """
+
+    mid_batch: list[int] = []
+    mid_start: list[int] = []
+    mn = 0
+    for batch_idx in range(max(0, len(cu_seqlens_host) - 1)):
+        q_start = int(cu_seqlens_host[batch_idx])
+        q_end = int(cu_seqlens_host[batch_idx + 1])
+        n_batch_blocks = max(0, (q_end - q_start + int(block_m) - 1) // int(block_m))
+        mn += int(n_batch_blocks)
+        for block_idx in range(int(n_batch_blocks)):
+            mid_batch.append(int(batch_idx))
+            mid_start.append(int(q_start + block_idx * int(block_m)))
+    return tuple(mid_batch), tuple(mid_start), int(mn)
+
+
+def _get_mid_tensors_cached(
+    *,
+    cu_seqlens: torch.Tensor,
+    block_m: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return cached varlen mid tensors for one cumulative-seqlens tensor.
+
+    :param torch.Tensor cu_seqlens: Device cumulative-seqlens tensor.
+    :param int block_m: Query tile height.
+    :param torch.device device: Device where the returned tensors should live.
+    :return tuple[torch.Tensor, torch.Tensor, int]: ``(mid_batch, mid_start, mn)``.
+    """
+
+    cache_key = (id(cu_seqlens), int(block_m), str(device.type), device.index)
+    cached = _MID_TENSOR_CACHE.get(cache_key)
+    if cached is not None:
+        cached_tensor = cached.cu_ref() if cached.cu_ref is not None else None
+        if cached_tensor is cu_seqlens:
+            return cached.mid_batch, cached.mid_start, cached.mn
+        _MID_TENSOR_CACHE.pop(cache_key, None)
+
+    cu_seqlens_host = _cu_seqlens_host_tuple(cu_seqlens)
+    mid_batch_host, mid_start_host, mn = _build_mid_host_tuples(
+        cu_seqlens_host=cu_seqlens_host,
+        block_m=int(block_m),
+    )
+    mid_batch = torch.tensor(mid_batch_host, dtype=torch.long, device=device)
+    mid_start = torch.tensor(mid_start_host, dtype=torch.long, device=device)
+
+    cu_ref: weakref.ReferenceType[torch.Tensor] | None = None
+    try:
+        cu_ref = weakref.ref(cu_seqlens)
+    except TypeError:
+        cu_ref = None
+
+    _MID_TENSOR_CACHE[cache_key] = _MidTensorCacheEntry(
+        cu_ref=cu_ref,
+        block_m=int(block_m),
+        device_type=str(device.type),
+        device_index=device.index,
+        mid_batch=mid_batch,
+        mid_start=mid_start,
+        mn=int(mn),
+    )
+    return mid_batch, mid_start, int(mn)
+
+
+def _patch_upstream_varlen_mid_cache() -> None:
+    """Replace upstream varlen mid-cache helpers with repo-local caching."""
+
+    if _flash_attention_varlen_module is None:
+        return
+
+    def _repo_get_mid_cached(
+        cu_seqlens: torch.Tensor,
+        B: int,
+        BLOCK_M: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return repo-cached mid tensors with the upstream helper signature.
+
+        :param torch.Tensor cu_seqlens: Cumulative seqlens tensor for one batch.
+        :param int B: Upstream batch-size argument, unused by the repo-local cache.
+        :param int BLOCK_M: Query tile height.
+        :param torch.device device: Device where the returned tensors should live.
+        :return tuple[torch.Tensor, torch.Tensor, int]:
+            Cached ``(mid_batch, mid_start, mn)`` tensors and tile count.
+        """
+
+        del B
+        return _get_mid_tensors_cached(
+            cu_seqlens=cu_seqlens,
+            block_m=int(BLOCK_M),
+            device=device,
+        )
+
+    _flash_attention_varlen_module.get_mid_cached = _repo_get_mid_cached
+
+
 def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     """Return cached unpadding metadata entry for one mask tensor.
 
@@ -233,32 +477,28 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     :return _MaskMetadataCacheEntry: Cached or newly built metadata entry.
     """
 
-    cache_key = id(mask_2d)
-    current_version = _mask_version(mask_2d)
+    cache_key = _mask_metadata_cache_key(mask_2d)
     cached = _MASK_METADATA_CACHE.get(cache_key)
     if cached is not None:
-        cached_mask = cached.mask_ref() if cached.mask_ref is not None else None
-        if cached_mask is mask_2d and cached.version == current_version:
-            return cached
-        _MASK_METADATA_CACHE.pop(cache_key, None)
+        return cached
 
-    seqlens, cu_seqlens, max_seqlen = _build_unpad_metadata(mask_2d)
-
-    mask_ref: weakref.ReferenceType[torch.Tensor] | None = None
-    try:
-        mask_ref = weakref.ref(mask_2d, lambda _ref, key=cache_key: _MASK_METADATA_CACHE.pop(key, None))
-    except TypeError:
-        mask_ref = None
+    seqlens, cu_seqlens, max_seqlen, total_tokens, cu_seqlens_host = _build_unpad_metadata(mask_2d)
 
     entry = _MaskMetadataCacheEntry(
-        mask_ref=mask_ref,
-        version=current_version,
+        mask_ref=None,
+        version=cache_key[-1],
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
+        cu_seqlens_host=cu_seqlens_host,
     )
-    if mask_ref is not None:
-        _MASK_METADATA_CACHE[cache_key] = entry
+    _register_cu_seqlens_host_tuple(cu_seqlens=cu_seqlens, cu_seqlens_host=cu_seqlens_host)
+    _MASK_METADATA_CACHE[cache_key] = entry
+    if len(_MASK_METADATA_CACHE) > 512:
+        stale_keys = list(_MASK_METADATA_CACHE.keys())[:256]
+        for stale_key in stale_keys:
+            _MASK_METADATA_CACHE.pop(stale_key, None)
     return entry
 
 
@@ -284,6 +524,7 @@ def _store_forward_aux_cache(
     seqlens: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    total_tokens: int,
     q_unpad: torch.Tensor,
     k_unpad: torch.Tensor,
     v_unpad: torch.Tensor,
@@ -298,6 +539,7 @@ def _store_forward_aux_cache(
     :param torch.Tensor seqlens: Per-example active lengths.
     :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
     :param int max_seqlen: Maximum active length in batch.
+    :param int total_tokens: Total active tokens in batch.
     :param torch.Tensor q_unpad: Unpadded query tensor.
     :param torch.Tensor k_unpad: Unpadded key tensor.
     :param torch.Tensor v_unpad: Unpadded value tensor.
@@ -319,6 +561,7 @@ def _store_forward_aux_cache(
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        total_tokens=int(total_tokens),
         q_unpad=q_unpad,
         k_unpad=k_unpad,
         v_unpad=v_unpad,
@@ -399,7 +642,7 @@ def _varlen_eager_forward_impl(
     seqlens = metadata.seqlens
     cu_seqlens = metadata.cu_seqlens
     max_seqlen = metadata.max_seqlen
-    total_tokens = int(cu_seqlens[-1].item()) if int(cu_seqlens.numel()) > 0 else 0
+    total_tokens = metadata.total_tokens
     if total_tokens == 0:
         output = torch.zeros_like(query_layer)
         if require_lse:
@@ -416,18 +659,21 @@ def _varlen_eager_forward_impl(
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
     )
     k_unpad = prefix_pack_padded_rows(
         key_layer,
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
     )
     v_unpad = prefix_pack_padded_rows(
         value_layer,
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
     )
     pos_key_unpad = (
         prefix_pack_padded_rows(
@@ -435,6 +681,7 @@ def _varlen_eager_forward_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
         if pos_key is not None
         else None
@@ -445,6 +692,7 @@ def _varlen_eager_forward_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
         if pos_query is not None
         else None
@@ -530,6 +778,7 @@ def _varlen_eager_forward_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
             q_unpad=q_unpad,
             k_unpad=k_unpad,
             v_unpad=v_unpad,
@@ -602,6 +851,7 @@ def _varlen_eager_backward_impl(
         seqlens=metadata.seqlens,
         cu_seqlens=metadata.cu_seqlens,
         max_seqlen=metadata.max_seqlen,
+        total_tokens=metadata.total_tokens,
         q_unpad=None,
         k_unpad=None,
         v_unpad=None,
@@ -629,6 +879,7 @@ def _varlen_eager_backward_cached_impl(
     seqlens: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    total_tokens: int,
     q_unpad: torch.Tensor | None,
     k_unpad: torch.Tensor | None,
     v_unpad: torch.Tensor | None,
@@ -654,6 +905,7 @@ def _varlen_eager_backward_cached_impl(
     :param torch.Tensor seqlens: Per-example active lengths.
     :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
     :param int max_seqlen: Maximum active length in batch.
+    :param int total_tokens: Total active tokens in batch.
     :param torch.Tensor | None q_unpad: Optional cached unpadded query tensor.
     :param torch.Tensor | None k_unpad: Optional cached unpadded key tensor.
     :param torch.Tensor | None v_unpad: Optional cached unpadded value tensor.
@@ -669,7 +921,6 @@ def _varlen_eager_backward_cached_impl(
     seq_len = int(query_layer.shape[1])
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
-    total_tokens = int(cu_seqlens[-1].item()) if int(cu_seqlens.numel()) > 0 else 0
     if total_tokens == 0:
         dq = torch.zeros_like(query_layer)
         dk = torch.zeros_like(key_layer)
@@ -684,6 +935,7 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
     if k_unpad is None:
         k_unpad = prefix_pack_padded_rows(
@@ -691,6 +943,7 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
     if v_unpad is None:
         v_unpad = prefix_pack_padded_rows(
@@ -698,6 +951,7 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
     if out_unpad is None:
         out_unpad = prefix_pack_padded_rows(
@@ -705,12 +959,14 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
     grad_unpad = prefix_pack_padded_rows(
         grad_output,
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
     )
     if lse_unpad is None:
         lse_unpad = prefix_pack_padded_rows(
@@ -718,6 +974,7 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
     if pos_key is not None and pos_key_unpad is None:
         pos_key_unpad = prefix_pack_padded_rows(
@@ -725,6 +982,7 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
     if pos_query is not None and pos_query_unpad is None:
         pos_query_unpad = prefix_pack_padded_rows(
@@ -732,6 +990,7 @@ def _varlen_eager_backward_cached_impl(
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
         )
 
     override = _varlen_kernel_override_from_env(kind="bwd")
@@ -771,49 +1030,47 @@ def _varlen_eager_backward_cached_impl(
         att_span,
     )
 
-    dq = prefix_unpack_padded_rows(
+    dq, dk, dv = prefix_unpack_padded_rows_triple(
         dq_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-    dk = prefix_unpack_padded_rows(
         dk_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-    dv = prefix_unpack_padded_rows(
         dv_unpad,
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         batch_size=batch_size,
         seq_len=seq_len,
     )
-    dpos_key = (
-        prefix_unpack_padded_rows(
+    if dpos_key_unpad is not None and dpos_query_unpad is not None:
+        dpos_key, dpos_query = prefix_unpack_padded_rows_pair(
             dpos_key_unpad,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            batch_size=batch_size,
-            seq_len=seq_len,
-        )
-        if dpos_key_unpad is not None
-        else None
-    )
-    dpos_query = (
-        prefix_unpack_padded_rows(
             dpos_query_unpad,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             batch_size=batch_size,
             seq_len=seq_len,
         )
-        if dpos_query_unpad is not None
-        else None
-    )
+    else:
+        dpos_key = (
+            prefix_unpack_padded_rows(
+                dpos_key_unpad,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+            )
+            if dpos_key_unpad is not None
+            else None
+        )
+        dpos_query = (
+            prefix_unpack_padded_rows(
+                dpos_query_unpad,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                batch_size=batch_size,
+                seq_len=seq_len,
+            )
+            if dpos_query_unpad is not None
+            else None
+        )
     return dq, dk, dv, dpos_key, dpos_query
 
 
@@ -1104,6 +1361,7 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
                 seqlens=cached.seqlens,
                 cu_seqlens=cached.cu_seqlens,
                 max_seqlen=cached.max_seqlen,
+                total_tokens=cached.total_tokens,
                 q_unpad=cached.q_unpad,
                 k_unpad=cached.k_unpad,
                 v_unpad=cached.v_unpad,
@@ -1135,6 +1393,7 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
 
 
 _FLASHDEBERTA_VARLEN_CUSTOM_OP, _FLASHDEBERTA_VARLEN_BWD_CUSTOM_OP = _build_varlen_custom_ops()
+_patch_upstream_varlen_mid_cache()
 
 
 def flashdeberta_varlen_padded(

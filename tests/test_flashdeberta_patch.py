@@ -514,6 +514,42 @@ def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.M
     varlen_mod._clear_unpad_metadata_cache()
 
 
+def test_varlen_mid_tensor_cache_reuses_registered_cu_seqlens() -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    varlen_mod._clear_unpad_metadata_cache()
+    varlen_mod._clear_mid_tensor_cache()
+
+    mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    entry = varlen_mod._get_unpad_metadata_entry(mask)
+
+    first_batch, first_start, first_mn = varlen_mod._get_mid_tensors_cached(
+        cu_seqlens=entry.cu_seqlens,
+        block_m=2,
+        device=entry.cu_seqlens.device,
+    )
+    second_batch, second_start, second_mn = varlen_mod._get_mid_tensors_cached(
+        cu_seqlens=entry.cu_seqlens,
+        block_m=2,
+        device=entry.cu_seqlens.device,
+    )
+
+    assert first_mn == second_mn == 2
+    assert torch.equal(first_batch.cpu(), torch.tensor([0, 1], dtype=torch.long))
+    assert torch.equal(first_start.cpu(), torch.tensor([0, 2], dtype=torch.long))
+    assert first_batch.data_ptr() == second_batch.data_ptr()
+    assert first_start.data_ptr() == second_start.data_ptr()
+
+    varlen_mod._clear_mid_tensor_cache()
+    varlen_mod._clear_unpad_metadata_cache()
+
+
 def test_varlen_forward_aux_cache_round_trips() -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
@@ -535,6 +571,7 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=2,
+        total_tokens=3,
         q_unpad=q_unpad,
         k_unpad=k_unpad,
         v_unpad=v_unpad,
@@ -547,6 +584,7 @@ def test_varlen_forward_aux_cache_round_trips() -> None:
     cached = varlen_mod._pop_forward_aux_cache(output)
     assert cached is not None
     assert cached.max_seqlen == 2
+    assert cached.total_tokens == 3
     assert cached.seqlens is seqlens
     assert cached.cu_seqlens is cu_seqlens
     assert cached.q_unpad is q_unpad
@@ -589,6 +627,108 @@ def test_prefix_pack_round_trips_with_prefix_padding_contract() -> None:
 
     assert torch.equal(packed, expected_packed)
     assert torch.equal(unpacked, expected_unpacked)
+
+
+def test_prefix_pack_explicit_total_tokens_avoids_tensor_item(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
+
+    tensor = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3).contiguous()
+    seqlens = torch.tensor([2, 3], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+    original_item = torch.Tensor.item
+
+    def _forbid_item(self, *args, **kwargs):
+        raise AssertionError("Tensor.item should not be used when total_tokens is provided")
+
+    monkeypatch.setattr(torch.Tensor, "item", _forbid_item)
+    try:
+        packed = prefix_mod.prefix_pack_padded_rows(
+            tensor,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=3,
+            total_tokens=5,
+        )
+    finally:
+        monkeypatch.setattr(torch.Tensor, "item", original_item)
+
+    expected = torch.cat((tensor[0, :2], tensor[1, :3]), dim=0)
+    assert torch.equal(packed, expected)
+
+
+def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
+    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
+
+    tensor_a = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3).contiguous()
+    tensor_b = (tensor_a + 100.0).contiguous()
+    tensor_c = (tensor_a + 200.0).contiguous()
+    seqlens = torch.tensor([2, 3], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    packed_a = prefix_mod.prefix_pack_padded_rows(
+        tensor_a,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+    packed_b = prefix_mod.prefix_pack_padded_rows(
+        tensor_b,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+    packed_c = prefix_mod.prefix_pack_padded_rows(
+        tensor_c,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+
+    unpacked_pair_a, unpacked_pair_b = prefix_mod.prefix_unpack_padded_rows_pair(
+        packed_a,
+        packed_b,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+    unpacked_triple_a, unpacked_triple_b, unpacked_triple_c = prefix_mod.prefix_unpack_padded_rows_triple(
+        packed_a,
+        packed_b,
+        packed_c,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+
+    expected_a = prefix_mod.prefix_unpack_padded_rows(
+        packed_a,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+    expected_b = prefix_mod.prefix_unpack_padded_rows(
+        packed_b,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+    expected_c = prefix_mod.prefix_unpack_padded_rows(
+        packed_c,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+
+    assert torch.equal(unpacked_pair_a, expected_a)
+    assert torch.equal(unpacked_pair_b, expected_b)
+    assert torch.equal(unpacked_triple_a, expected_a)
+    assert torch.equal(unpacked_triple_b, expected_b)
+    assert torch.equal(unpacked_triple_c, expected_c)
 
 
 def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -674,6 +814,51 @@ def test_fixed_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_NUM_WARPS", "8")
 
     assert fixed_mod._fixed_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
+
+
+def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_fixed_op as fixed_mod
+
+    monkeypatch.setattr(fixed_mod.torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (12, 0))
+
+    assert fixed_mod._fixed_repo_tuned_config(
+        kind="fwd",
+        query_len=1024,
+        key_len=1024,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    ) == (64, 64, 2, 4)
+
+    assert fixed_mod._fixed_repo_tuned_config(
+        kind="bwd",
+        query_len=1024,
+        key_len=1024,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    ) == (16, 16, 1, 2)
+
+    assert (
+        fixed_mod._fixed_repo_tuned_config(
+            kind="bwd",
+            query_len=2048,
+            key_len=2048,
+            head_dim=64,
+            causal=False,
+            disentangled=True,
+            att_span=256,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+        )
+        is None
+    )
 
 
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

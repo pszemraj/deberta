@@ -105,6 +105,74 @@ def _fixed_attention_span(position_buckets: int, max_relative_distance: int) -> 
     return int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
 
+def _fixed_device_capability(device: torch.device) -> tuple[int, int]:
+    """Return CUDA device capability for the given tensor device.
+
+    :param torch.device device: CUDA device to query.
+    :return tuple[int, int]: ``(major, minor)`` compute capability.
+    """
+
+    if device.type != "cuda":
+        return (0, 0)
+    index = device.index
+    if index is None:
+        return torch.cuda.get_device_capability()
+    return torch.cuda.get_device_capability(index)
+
+
+def _fixed_repo_tuned_config(
+    *,
+    kind: str,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    disentangled: bool,
+    att_span: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int] | None:
+    """Return repo-local tuned kernel configs for measured hot paths.
+
+    Upstream FlashDeBERTa does not currently special-case ``sm_120``. On the
+    repo's dense DeBERTa ``1024 x 1024`` backward regime, the stock
+    ``64 x 64`` backward tile materially underperforms a smaller ``16 x 16``
+    tile on measured ``sm_120`` hardware. Keep this override narrow and fall
+    back to upstream selection everywhere else.
+
+    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Attention head dimension.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool disentangled: Whether c2p/p2c position terms are active.
+    :param int att_span: Effective relative-position span.
+    :param torch.dtype dtype: Kernel dtype.
+    :param torch.device device: CUDA device for the kernel launch.
+    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when no repo-local override applies.
+    """
+
+    del dtype
+    normalized_kind = str(kind).strip().lower()
+    if normalized_kind not in {"fwd", "bwd"}:
+        return None
+    if bool(causal) or not bool(disentangled):
+        return None
+    if int(head_dim) > 64:
+        return None
+    if int(query_len) != 1024 or int(key_len) != 1024:
+        return None
+    if int(att_span) < 128:
+        return None
+    capability = _fixed_device_capability(device)
+    if int(capability[0]) < 12:
+        return None
+    if normalized_kind == "fwd":
+        return (64, 64, 2, 4)
+    return (16, 16, 1, 2)
+
+
 def _fixed_kernel_override_from_env(
     *,
     kind: str,
@@ -196,8 +264,21 @@ def _fixed_eager_forward_impl(
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
         override = _fixed_kernel_override_from_env(kind="fwd")
+        tuned = _fixed_repo_tuned_config(
+            kind="fwd",
+            query_len=query_len,
+            key_len=key_len,
+            head_dim=head_dim,
+            causal=bool(causal),
+            disentangled=(pos_key is not None or pos_query is not None),
+            att_span=att_span,
+            dtype=query_layer.dtype,
+            device=query_layer.device,
+        )
         if override is not None:
             block_m, block_n, num_stages, num_warps = override
+        elif tuned is not None:
+            block_m, block_n, num_stages, num_warps = tuned
         else:
             block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
                 batch_size,
@@ -297,8 +378,21 @@ def _fixed_eager_backward_impl(
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
 
     override = _fixed_kernel_override_from_env(kind="bwd")
+    tuned = _fixed_repo_tuned_config(
+        kind="bwd",
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        disentangled=(pos_key is not None or pos_query is not None),
+        att_span=att_span,
+        dtype=query_layer.dtype,
+        device=query_layer.device,
+    )
     if override is not None:
         block_m, block_n, num_stages, num_warps = override
+    elif tuned is not None:
+        block_m, block_n, num_stages, num_warps = tuned
     else:
         block_m, block_n, num_stages, num_warps = _get_bwd_config_lowlevel(
             batch_size,
@@ -706,4 +800,5 @@ __all__ = [
     "flashdeberta_fixed",
     "flashdeberta_fixed_import_error",
     "_fixed_kernel_override_from_env",
+    "_fixed_repo_tuned_config",
 ]
