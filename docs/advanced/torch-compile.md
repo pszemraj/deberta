@@ -45,14 +45,21 @@ kernels and backward passes. The compile contract remains the same: dense
 batches use fixed flash, and padded batches use varlen flash when the backend
 package exposes the required low-level primitives.
 
+Dense packed `1024` has one additional fast path: for small-batch non-causal
+training where DeBERTa relative terms are present, the adapter can materialize
+the dense relative bias matrix and route through FlashDeBERTa's flash-with-bias
+kernels. That path is opaque to Dynamo in the same way as the fixed and varlen
+custom ops, so it behaves like a normal compiled attention primitive instead of
+tracing through Python-side launcher code.
+
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,
 active tokens can be packed and repadded directly from `seqlens/cu_seqlens`
-instead of generic `nonzero`/`gather`/`index_copy` flows. When profiling
+instead of generic `nonzero`/`gather`/`index_copy` flows, and q/k/v or paired
+positional tensors can share those pack/unpack launches. When profiling
 unpacked runs, expect the remaining costs to be the varlen Triton backward
-kernel plus repo-local `_pack_prefix_rows_rank4_strided_kernel` /
-`_unpack_prefix_rows_kernel`, not the older `aten::index` or generic
-`gather`/`index_copy` hotspots.
+kernel plus the smaller repo-local prefix pack/unpack kernels, not the older
+`aten::index` or generic `gather`/`index_copy` hotspots.
 
 ## Special case: packed doc-block masks
 

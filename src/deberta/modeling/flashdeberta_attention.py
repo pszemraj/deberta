@@ -52,6 +52,11 @@ import torch
 from deberta.modeling.deberta_v2_native import (
     DisentangledSelfAttention as _EagerDisentangledSelfAttention,
 )
+from deberta.modeling.flashdeberta_bias_op import (
+    flashdeberta_bias,
+    flashdeberta_bias_import_error,
+    flashdeberta_compiled_bias_available,
+)
 from deberta.modeling.flashdeberta_fixed_op import (
     flashdeberta_fixed,
     flashdeberta_fixed_import_error,
@@ -65,6 +70,9 @@ from deberta.modeling.mask_utils import normalize_keep_mask
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
 _TRUTHY = {"1", "true", "yes", "y", "on"}
+_LOCAL_BIAS_SEQ_LEN = 1024
+_LOCAL_BIAS_MAX_BATCH_SIZE = 4
+_DENSE_BUCKET_INDEX_CACHE: dict[tuple[int, int, int, str, int | None], torch.Tensor] = {}
 
 
 @dataclass(frozen=True)
@@ -290,6 +298,89 @@ def _should_use_varlen(
     return int(seq_len) >= int(_RUNTIME_CONFIG.varlen_min_seq_len)
 
 
+def _dense_bucket_index_cache_key(
+    *,
+    seq_len: int,
+    position_buckets: int,
+    max_relative_distance: int,
+    device: torch.device,
+) -> tuple[int, int, int, str, int | None]:
+    """Return the cache key for one dense bucket-index tensor.
+
+    :param int seq_len: Sequence length.
+    :param int position_buckets: Relative bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param torch.device device: Device for the cached tensor.
+    :return tuple[int, int, int, str, int | None]: Cache key.
+    """
+
+    return (int(seq_len), int(position_buckets), int(max_relative_distance), str(device.type), device.index)
+
+
+def _dense_bucket_index_tensor(
+    *,
+    seq_len: int,
+    position_buckets: int,
+    max_relative_distance: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a cached dense DeBERTa bucket-index matrix ``(S, S)``.
+
+    :param int seq_len: Sequence length.
+    :param int position_buckets: Relative bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param torch.device device: Target device.
+    :return torch.Tensor: Dense int64 bucket-index tensor.
+    """
+
+    max_rel = int(max_relative_distance)
+    if max_rel <= 0:
+        max_rel = int(seq_len)
+    key = _dense_bucket_index_cache_key(
+        seq_len=seq_len,
+        position_buckets=position_buckets,
+        max_relative_distance=max_rel,
+        device=device,
+    )
+    cached = _DENSE_BUCKET_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    positions = torch.arange(int(seq_len), device=device, dtype=torch.int32)
+    relative_positions = positions[:, None] - positions[None, :]
+    mid_val = max(1, int(position_buckets) // 2)
+    sign = torch.sign(relative_positions.to(dtype=torch.float32))
+    abs_relative = relative_positions.abs()
+    condition = (relative_positions < mid_val) & (relative_positions > -mid_val)
+    abs_pos = torch.where(condition, torch.full_like(abs_relative, mid_val - 1), abs_relative)
+
+    if max_rel <= mid_val:
+        bucket_pos = relative_positions.to(dtype=torch.float32)
+    else:
+        log_denom = math.log((int(max_rel) - 1) / int(mid_val))
+        log_scaled = (
+            torch.log(abs_pos.to(dtype=torch.float32).clamp_min(float(mid_val)) / float(mid_val))
+            / float(log_denom)
+            * float(mid_val - 1)
+        )
+        log_pos = torch.ceil(log_scaled) + float(mid_val)
+        bucket_pos = torch.where(
+            abs_pos <= mid_val, relative_positions.to(dtype=torch.float32), log_pos * sign
+        )
+
+    bucket_index = (
+        (bucket_pos + float(position_buckets))
+        .clamp_(0.0, float(2 * int(position_buckets) - 1))
+        .to(dtype=torch.int64)
+    )
+    _DENSE_BUCKET_INDEX_CACHE[key] = bucket_index
+    if len(_DENSE_BUCKET_INDEX_CACHE) > 8:
+        stale_keys = list(_DENSE_BUCKET_INDEX_CACHE.keys())[:4]
+        for stale_key in stale_keys:
+            _DENSE_BUCKET_INDEX_CACHE.pop(stale_key, None)
+    return bucket_index
+
+
 class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     """FlashDeBERTa-backed variant of native disentangled self-attention."""
 
@@ -478,6 +569,100 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
         )
 
+    def _should_use_local_bias(
+        self,
+        *,
+        attention_mask: torch.Tensor | None,
+        batch_size: int,
+        seq_len: int,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+    ) -> bool:
+        """Return whether the dense local-bias flash path should run.
+
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param int batch_size: Runtime batch size.
+        :param int seq_len: Sequence length.
+        :param torch.Tensor | None pos_key: Optional c2p term.
+        :param torch.Tensor | None pos_query: Optional p2c term.
+        :return bool: True when dense local-bias flash should run.
+        """
+
+        if attention_mask is not None:
+            return False
+        if not self.training:
+            return False
+        if int(batch_size) > _LOCAL_BIAS_MAX_BATCH_SIZE:
+            return False
+        if int(seq_len) != _LOCAL_BIAS_SEQ_LEN:
+            return False
+        if pos_key is None and pos_query is None:
+            return False
+        if flashdeberta_bias_import_error() is not None:
+            return False
+        if _is_torch_compiling() and not flashdeberta_compiled_bias_available():
+            return False
+        return True
+
+    def _flash_local_bias(
+        self,
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Run dense local-bias flash attention.
+
+        :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
+        :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
+        :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor | None pos_key: Optional c2p term.
+        :param torch.Tensor | None pos_query: Optional p2c term.
+        :param float sm_scale: Softmax scale.
+        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        """
+
+        batch_size, num_heads, seq_len, _ = query_layer.shape
+        bucket_index = _dense_bucket_index_tensor(
+            seq_len=seq_len,
+            position_buckets=int(self.position_buckets),
+            max_relative_distance=int(self.max_relative_positions),
+            device=query_layer.device,
+        )
+        bucket_index_b = bucket_index.view(1, 1, seq_len, seq_len).expand(
+            batch_size, num_heads, seq_len, seq_len
+        )
+        bias: torch.Tensor | None = None
+
+        if pos_key is not None:
+            bias = torch.gather(pos_key, dim=-1, index=bucket_index_b)
+        if pos_query is not None:
+            bucket_index_t = (
+                bucket_index.t()
+                .contiguous()
+                .view(1, 1, seq_len, seq_len)
+                .expand(batch_size, num_heads, seq_len, seq_len)
+            )
+            p2c_bias = torch.gather(pos_query, dim=-1, index=bucket_index_t).transpose(-1, -2)
+            bias = p2c_bias if bias is None else bias + p2c_bias
+
+        if bias is None:  # pragma: no cover - guarded by caller
+            raise RuntimeError("Local-bias flash path requires at least one positional term.")
+
+        if _RUNTIME_CONFIG.enable_debug_stats:
+            _record_stat("flash_bias_calls")
+        return flashdeberta_bias(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            bias=bias * float(sm_scale),
+            sm_scale=sm_scale,
+            causal=False,
+        )
+
     def _flash_varlen(
         self,
         *,
@@ -648,15 +833,31 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             )
             output = output.contiguous().view(bsz, query_len, self.all_head_size)
         else:
-            output = self._flash_fixed(
-                query_layer=query_layer,
-                key_layer=key_layer,
-                value_layer=value_layer,
+            if self._should_use_local_bias(
                 attention_mask=attention_mask,
+                batch_size=bsz,
+                seq_len=query_len,
                 pos_key=pos_key,
                 pos_query=pos_query,
-                sm_scale=sm_scale,
-            )
+            ):
+                output = self._flash_local_bias(
+                    query_layer=query_layer,
+                    key_layer=key_layer,
+                    value_layer=value_layer,
+                    pos_key=pos_key,
+                    pos_query=pos_query,
+                    sm_scale=sm_scale,
+                )
+            else:
+                output = self._flash_fixed(
+                    query_layer=query_layer,
+                    key_layer=key_layer,
+                    value_layer=value_layer,
+                    attention_mask=attention_mask,
+                    pos_key=pos_key,
+                    pos_query=pos_query,
+                    sm_scale=sm_scale,
+                )
             output = output.transpose(1, 2).contiguous().view(bsz, query_len, self.all_head_size)
         output = output.to(dtype=model_dtype)
 

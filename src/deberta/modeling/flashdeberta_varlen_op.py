@@ -23,6 +23,8 @@ import torch.nn.functional as F
 
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_padded_rows,
+    prefix_pack_padded_rows_pair,
+    prefix_pack_padded_rows_triple,
     prefix_unpack_padded_rows,
     prefix_unpack_padded_rows_pair,
     prefix_unpack_padded_rows_triple,
@@ -732,49 +734,47 @@ def _varlen_eager_forward_impl(
             return output, lse
         return output, None
 
-    q_unpad = prefix_pack_padded_rows(
+    q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
         query_layer,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        total_tokens=total_tokens,
-    )
-    k_unpad = prefix_pack_padded_rows(
         key_layer,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        total_tokens=total_tokens,
-    )
-    v_unpad = prefix_pack_padded_rows(
         value_layer,
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
         total_tokens=total_tokens,
     )
-    pos_key_unpad = (
-        prefix_pack_padded_rows(
+    if pos_key is not None and pos_query is not None:
+        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
             pos_key,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-        if pos_key is not None
-        else None
-    )
-    pos_query_unpad = (
-        prefix_pack_padded_rows(
             pos_query,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             total_tokens=total_tokens,
         )
-        if pos_query is not None
-        else None
-    )
+    else:
+        pos_key_unpad = (
+            prefix_pack_padded_rows(
+                pos_key,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                total_tokens=total_tokens,
+            )
+            if pos_key is not None
+            else None
+        )
+        pos_query_unpad = (
+            prefix_pack_padded_rows(
+                pos_query,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                total_tokens=total_tokens,
+            )
+            if pos_query is not None
+            else None
+        )
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
         override = _varlen_kernel_override_from_env(kind="fwd")
@@ -1007,24 +1007,10 @@ def _varlen_eager_backward_cached_impl(
         dpos_query = torch.zeros_like(pos_query) if pos_query is not None else None
         return dq, dk, dv, dpos_key, dpos_query
 
-    if q_unpad is None:
-        q_unpad = prefix_pack_padded_rows(
+    if q_unpad is None or k_unpad is None or v_unpad is None:
+        q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
             query_layer,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-    if k_unpad is None:
-        k_unpad = prefix_pack_padded_rows(
             key_layer,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-    if v_unpad is None:
-        v_unpad = prefix_pack_padded_rows(
             value_layer,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
@@ -1054,22 +1040,32 @@ def _varlen_eager_backward_cached_impl(
             max_seqlen=max_seqlen,
             total_tokens=total_tokens,
         )
-    if pos_key is not None and pos_key_unpad is None:
-        pos_key_unpad = prefix_pack_padded_rows(
+    if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
+        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
             pos_key,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-    if pos_query is not None and pos_query_unpad is None:
-        pos_query_unpad = prefix_pack_padded_rows(
             pos_query,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             total_tokens=total_tokens,
         )
+    else:
+        if pos_key is not None and pos_key_unpad is None:
+            pos_key_unpad = prefix_pack_padded_rows(
+                pos_key,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                total_tokens=total_tokens,
+            )
+        if pos_query is not None and pos_query_unpad is None:
+            pos_query_unpad = prefix_pack_padded_rows(
+                pos_query,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                total_tokens=total_tokens,
+            )
 
     override = _varlen_kernel_override_from_env(kind="bwd")
     if override is not None:
@@ -1528,49 +1524,47 @@ def _varlen_triton_forward_impl(
     seqlens = mask.sum(dim=-1, dtype=torch.int32)
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
 
-    q_unpad = prefix_pack_padded_rows(
+    q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
         q,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=seq_len,
-        total_tokens=capacity_tokens,
-    )
-    k_unpad = prefix_pack_padded_rows(
         k,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=seq_len,
-        total_tokens=capacity_tokens,
-    )
-    v_unpad = prefix_pack_padded_rows(
         v,
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=seq_len,
         total_tokens=capacity_tokens,
     )
-    pos_key_unpad = (
-        prefix_pack_padded_rows(
+    if pos_key is not None and pos_query is not None:
+        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
             pos_key,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-        if pos_key is not None
-        else None
-    )
-    pos_query_unpad = (
-        prefix_pack_padded_rows(
             pos_query,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=seq_len,
             total_tokens=capacity_tokens,
         )
-        if pos_query is not None
-        else None
-    )
+    else:
+        pos_key_unpad = (
+            prefix_pack_padded_rows(
+                pos_key,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=seq_len,
+                total_tokens=capacity_tokens,
+            )
+            if pos_key is not None
+            else None
+        )
+        pos_query_unpad = (
+            prefix_pack_padded_rows(
+                pos_query,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=seq_len,
+                total_tokens=capacity_tokens,
+            )
+            if pos_query is not None
+            else None
+        )
 
     override = _varlen_kernel_override_from_env(kind="fwd")
     if override is not None:
@@ -1751,24 +1745,10 @@ def _varlen_triton_backward_impl(
     else:
         seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
 
-    if q_unpad is None:
-        q_unpad = prefix_pack_padded_rows(
+    if q_unpad is None or k_unpad is None or v_unpad is None:
+        q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
             q,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    if k_unpad is None:
-        k_unpad = prefix_pack_padded_rows(
             k,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    if v_unpad is None:
-        v_unpad = prefix_pack_padded_rows(
             v,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
@@ -1798,22 +1778,32 @@ def _varlen_triton_backward_impl(
             max_seqlen=seq_len,
             total_tokens=capacity_tokens,
         )
-    if pos_key is not None and pos_key_unpad is None:
-        pos_key_unpad = prefix_pack_padded_rows(
+    if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
+        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
             pos_key,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    if pos_query is not None and pos_query_unpad is None:
-        pos_query_unpad = prefix_pack_padded_rows(
             pos_query,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=seq_len,
             total_tokens=capacity_tokens,
         )
+    else:
+        if pos_key is not None and pos_key_unpad is None:
+            pos_key_unpad = prefix_pack_padded_rows(
+                pos_key,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=seq_len,
+                total_tokens=capacity_tokens,
+            )
+        if pos_query is not None and pos_query_unpad is None:
+            pos_query_unpad = prefix_pack_padded_rows(
+                pos_query,
+                seqlens=seqlens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=seq_len,
+                total_tokens=capacity_tokens,
+            )
 
     override = _varlen_kernel_override_from_env(kind="bwd")
     if override is not None:

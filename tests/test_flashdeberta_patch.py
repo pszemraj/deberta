@@ -24,7 +24,8 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
     ops_pkg.__path__ = []  # type: ignore[attr-defined]
     flash_attention_mod = types.ModuleType("flashdeberta.ops.flash_attention")
     flash_attention_varlen_mod = types.ModuleType("flashdeberta.ops.flash_attention_varlen")
-    calls = {"fixed": 0, "varlen": 0}
+    flash_attention_bias_mod = types.ModuleType("flashdeberta.ops.flash_attention_bias")
+    calls = {"fixed": 0, "varlen": 0, "bias": 0}
 
     def _fake_flash_attention_with_disentangled(
         q: torch.Tensor,
@@ -107,18 +108,44 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
         )
         return torch.zeros_like(q)
 
+    def _fake_flash_attention_with_bias(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bias: torch.Tensor,
+        causal: bool = False,
+        sm_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Return value-shaped zeros for dense local-bias adapter tests.
+
+        :param torch.Tensor q: Query tensor.
+        :param torch.Tensor k: Key tensor.
+        :param torch.Tensor v: Value tensor.
+        :param torch.Tensor bias: Additive attention bias tensor.
+        :param bool causal: Unused causal flag.
+        :param float | None sm_scale: Optional softmax scale.
+        :return torch.Tensor: Zero tensor shaped like ``q``.
+        """
+
+        calls["bias"] += 1
+        del k, v, bias, causal, sm_scale
+        return torch.zeros_like(q)
+
     flash_attention_mod.flash_attention_with_disentangled = _fake_flash_attention_with_disentangled
     flash_attention_varlen_mod.flash_attention_with_disentangled_varlen = (
         _fake_flash_attention_with_disentangled_varlen
     )
+    flash_attention_bias_mod.flash_attention_with_bias = _fake_flash_attention_with_bias
     flash_pkg.ops = ops_pkg  # type: ignore[attr-defined]
     ops_pkg.flash_attention = flash_attention_mod  # type: ignore[attr-defined]
     ops_pkg.flash_attention_varlen = flash_attention_varlen_mod  # type: ignore[attr-defined]
+    ops_pkg.flash_attention_bias = flash_attention_bias_mod  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "flashdeberta", flash_pkg)
     monkeypatch.setitem(sys.modules, "flashdeberta.ops", ops_pkg)
     monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention", flash_attention_mod)
     monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention_varlen", flash_attention_varlen_mod)
+    monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention_bias", flash_attention_bias_mod)
     return calls
 
 
@@ -437,6 +464,147 @@ def test_flash_attention_fixed_path_records_stats(monkeypatch: pytest.MonkeyPatc
     assert stats["flash_fixed_calls"] == 1
     assert stats.get("flash_varlen_calls", 0) == 0
     assert stats.get("fallback_calls", 0) == 0
+
+
+def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    cfg.max_position_embeddings = 1024
+    cfg.max_relative_positions = 1024
+    cfg.position_buckets = 256
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+    attention.train()
+
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    monkeypatch.delenv("FLASHDEBERTA_FORCE_VARLEN", raising=False)
+    monkeypatch.delenv("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", raising=False)
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    seen: dict[str, object] = {}
+
+    def _fake_bias_wrapper(
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        bias: torch.Tensor,
+        sm_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Return zero output while recording dense local-bias inputs."""
+
+        del key_layer, value_layer, sm_scale, causal
+        seen["bias_shape"] = tuple(bias.shape)
+        seen["query_shape"] = tuple(query_layer.shape)
+        return torch.zeros_like(query_layer)
+
+    monkeypatch.setattr(attention_mod, "flashdeberta_bias", _fake_bias_wrapper)
+
+    hidden_states = torch.randn((1, 1024, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+    )
+
+    assert probs is None
+    assert tuple(output.shape) == (1, 1024, cfg.hidden_size)
+    assert seen["query_shape"] == (
+        1,
+        cfg.num_attention_heads,
+        1024,
+        cfg.hidden_size // cfg.num_attention_heads,
+    )
+    assert seen["bias_shape"] == (1, cfg.num_attention_heads, 1024, 1024)
+
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["forward_calls"] == 1
+    assert stats["flash_eligible_calls"] == 1
+    assert stats["flash_bias_calls"] == 1
+    assert stats.get("flash_fixed_calls", 0) == 0
+    assert stats.get("flash_varlen_calls", 0) == 0
+    assert stats.get("fallback_calls", 0) == 0
+
+
+def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
+    from deberta.modeling.flashdeberta_prefix_pack import (
+        prefix_pack_padded_rows_pair,
+        prefix_pack_padded_rows_triple,
+        prefix_unpack_padded_rows_pair,
+        prefix_unpack_padded_rows_triple,
+    )
+
+    seqlens = torch.tensor([3, 1], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 3, 4], dtype=torch.int32)
+    a = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3)
+    b = a + 100.0
+    c = a + 200.0
+
+    packed_a, packed_b = prefix_pack_padded_rows_pair(
+        a,
+        b,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        total_tokens=4,
+    )
+    packed_c1, packed_c2, packed_c3 = prefix_pack_padded_rows_triple(
+        a,
+        b,
+        c,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        total_tokens=4,
+    )
+
+    expected_a = torch.cat([a[0, :3], a[1, :1]], dim=0)
+    expected_b = torch.cat([b[0, :3], b[1, :1]], dim=0)
+    expected_c = torch.cat([c[0, :3], c[1, :1]], dim=0)
+    assert torch.equal(packed_a, expected_a)
+    assert torch.equal(packed_b, expected_b)
+    assert torch.equal(packed_c1, expected_a)
+    assert torch.equal(packed_c2, expected_b)
+    assert torch.equal(packed_c3, expected_c)
+
+    unpacked_a, unpacked_b = prefix_unpack_padded_rows_pair(
+        packed_a,
+        packed_b,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+    unpacked_c1, unpacked_c2, unpacked_c3 = prefix_unpack_padded_rows_triple(
+        packed_c1,
+        packed_c2,
+        packed_c3,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=2,
+        seq_len=4,
+    )
+
+    expected_unpacked_a = torch.zeros_like(a)
+    expected_unpacked_b = torch.zeros_like(b)
+    expected_unpacked_c = torch.zeros_like(c)
+    expected_unpacked_a[0, :3] = a[0, :3]
+    expected_unpacked_a[1, :1] = a[1, :1]
+    expected_unpacked_b[0, :3] = b[0, :3]
+    expected_unpacked_b[1, :1] = b[1, :1]
+    expected_unpacked_c[0, :3] = c[0, :3]
+    expected_unpacked_c[1, :1] = c[1, :1]
+    assert torch.equal(unpacked_a, expected_unpacked_a)
+    assert torch.equal(unpacked_b, expected_unpacked_b)
+    assert torch.equal(unpacked_c1, expected_unpacked_a)
+    assert torch.equal(unpacked_c2, expected_unpacked_b)
+    assert torch.equal(unpacked_c3, expected_unpacked_c)
 
 
 def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.MonkeyPatch) -> None:

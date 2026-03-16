@@ -44,8 +44,8 @@ Use explicit config values when you want different behavior.
 
 ## FlashDeBERTa follow-ups
 
-- TODO (flash kernel follow-up): redesign or retile the fixed-length backward Triton kernels for dense packed `1024` on newer GPUs; current packed flash losses are dominated by fixed backward kernel time, not compile integration.
-- TODO (flash kernel follow-up): padded-varlen now uses dedicated prefix-pack Triton kernels. If unpacked training is still bottlenecked, the next target is reducing the remaining prefix-pack/unpack overhead or fusing it more tightly with varlen backward instead of relying on separate copy kernels.
+- Dense packed `1024` now uses a repo-local local-bias flash path for the common small-batch training regime. Instead of retuning the original fixed disentangled backward kernel directly, the adapter materializes dense DeBERTa relative bias and dispatches through FlashDeBERTa's flash-with-bias kernels when that route is faster on current GPUs.
+- Padded varlen now uses dedicated repo-local prefix-pack Triton kernels, including shared pair/triple pack and unpack paths, so q/k/v and positional tensors are no longer copied through independent generic gather/scatter launches.
 - TODO (flash optimization follow-up): benchmark and, only if warranted, add the upstream small-batch local-bias path for `512 < seq_len < 1024` with very small training batches.
 - TODO (flash feature follow-up): add packed doc-block-aware flash attention for `hf_deberta_v2` only after the simpler padding-style flash path is proven worthwhile in longer-context runs.
 
