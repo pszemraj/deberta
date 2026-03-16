@@ -30,6 +30,18 @@ except Exception as exc:  # pragma: no cover - optional import
 
 try:
     from flashdeberta.ops.flash_attention import (
+        _bwd_kv_dise_kernel as _bwd_kv_dise_kernel_raw,
+    )
+    from flashdeberta.ops.flash_attention import (
+        _bwd_preprocess as _bwd_preprocess_raw,
+    )
+    from flashdeberta.ops.flash_attention import (
+        _bwd_q_dise_kernel as _bwd_q_dise_kernel_raw,
+    )
+    from flashdeberta.ops.flash_attention import (
+        _fwd_kernel_deberta_disentangled_attention as _fwd_kernel_dise_raw,
+    )
+    from flashdeberta.ops.flash_attention import (
         flash_attn_v2_bwd_dise as _flash_attn_v2_bwd_dise_lowlevel,
     )
     from flashdeberta.ops.flash_attention import (
@@ -44,6 +56,10 @@ try:
 
     _FLASH_FIXED_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
+    _bwd_kv_dise_kernel_raw = None
+    _bwd_preprocess_raw = None
+    _bwd_q_dise_kernel_raw = None
+    _fwd_kernel_dise_raw = None
     _flash_attn_v2_bwd_dise_lowlevel = None
     _flash_attn_v2_fwd_dise_lowlevel = None
     _get_bwd_config_lowlevel = None
@@ -92,6 +108,17 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
         return None
     op = getattr(ns, name)
     return getattr(op, "default", op)
+
+
+def _cdiv(a: int, b: int) -> int:
+    """Return ceil-division for positive integers.
+
+    :param int a: Dividend.
+    :param int b: Divisor.
+    :return int: ``ceil(a / b)``.
+    """
+
+    return (int(a) + int(b) - 1) // int(b)
 
 
 def _fixed_attention_span(position_buckets: int, max_relative_distance: int) -> int:
@@ -219,6 +246,167 @@ def _fixed_kernel_override_from_env(
     return int(block_m), int(block_n), int(num_stages), int(num_warps)
 
 
+def _fixed_use_triton_op() -> bool:
+    """Return whether the compile-visible Triton fixed op can be registered.
+
+    :return bool: True when raw fixed kernels and ``torch.library.triton_op`` are available.
+    """
+
+    return (
+        _fwd_kernel_dise_raw is not None
+        and _bwd_preprocess_raw is not None
+        and _bwd_kv_dise_kernel_raw is not None
+        and _bwd_q_dise_kernel_raw is not None
+        and hasattr(torch, "library")
+        and hasattr(torch.library, "triton_op")
+        and hasattr(torch.library, "wrap_triton")
+    )
+
+
+def _materialize_fixed_seq_lengths(
+    *,
+    seq_lengths: torch.Tensor | None,
+    batch_size: int,
+    query_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a concrete sequence-length tensor for Triton kernel launches.
+
+    :param torch.Tensor | None seq_lengths: Optional caller-provided sequence lengths.
+    :param int batch_size: Batch size.
+    :param int query_len: Query sequence length.
+    :param torch.device device: Runtime CUDA device.
+    :return torch.Tensor: Sequence lengths with dtype ``int32`` on ``device``.
+    """
+
+    if seq_lengths is not None:
+        return seq_lengths
+    return torch.full((batch_size,), int(query_len), dtype=torch.int32, device=device)
+
+
+def _fixed_forward_config(
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    position_buckets: int,
+    max_relative_distance: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    has_pos: bool,
+) -> tuple[int, int, int, int]:
+    """Resolve the fixed forward Triton tile config.
+
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :param bool has_pos: Whether any disentangled positional term is active.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    override = _fixed_kernel_override_from_env(kind="fwd")
+    tuned = _fixed_repo_tuned_config(
+        kind="fwd",
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        disentangled=bool(has_pos),
+        att_span=att_span,
+        dtype=dtype,
+        device=device,
+    )
+    if override is not None:
+        return override
+    if tuned is not None:
+        return tuned
+    if _get_fwd_config_lowlevel is None:
+        raise RuntimeError("FlashDeBERTa fixed forward config helper is unavailable.")
+    return _get_fwd_config_lowlevel(
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        head_dim,
+        bool(causal),
+        disentangled=bool(has_pos),
+        att_span=att_span,
+    )
+
+
+def _fixed_backward_config(
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    position_buckets: int,
+    max_relative_distance: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    has_pos: bool,
+) -> tuple[int, int, int, int]:
+    """Resolve the fixed backward Triton tile config.
+
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :param bool has_pos: Whether any disentangled positional term is active.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    override = _fixed_kernel_override_from_env(kind="bwd")
+    tuned = _fixed_repo_tuned_config(
+        kind="bwd",
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        disentangled=bool(has_pos),
+        att_span=att_span,
+        dtype=dtype,
+        device=device,
+    )
+    if override is not None:
+        return override
+    if tuned is not None:
+        return tuned
+    if _get_bwd_config_lowlevel is None:
+        raise RuntimeError("FlashDeBERTa fixed backward config helper is unavailable.")
+    return _get_bwd_config_lowlevel(
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        head_dim,
+        bool(causal),
+        disentangled=bool(has_pos),
+        att_span=att_span,
+        dtype=dtype,
+    )
+
+
 def _fixed_eager_forward_impl(
     *,
     query_layer: torch.Tensor,
@@ -260,36 +448,21 @@ def _fixed_eager_forward_impl(
 
     batch_size, num_heads, query_len, head_dim = query_layer.shape
     key_len = int(key_layer.shape[-2])
-    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
-
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
-        override = _fixed_kernel_override_from_env(kind="fwd")
-        tuned = _fixed_repo_tuned_config(
-            kind="fwd",
+        att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+        block_m, block_n, num_stages, num_warps = _fixed_forward_config(
+            batch_size=batch_size,
+            num_heads=num_heads,
             query_len=query_len,
             key_len=key_len,
             head_dim=head_dim,
             causal=bool(causal),
-            disentangled=(pos_key is not None or pos_query is not None),
-            att_span=att_span,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
             dtype=query_layer.dtype,
             device=query_layer.device,
+            has_pos=(pos_key is not None or pos_query is not None),
         )
-        if override is not None:
-            block_m, block_n, num_stages, num_warps = override
-        elif tuned is not None:
-            block_m, block_n, num_stages, num_warps = tuned
-        else:
-            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-                batch_size,
-                num_heads,
-                query_len,
-                key_len,
-                head_dim,
-                bool(causal),
-                disentangled=True,
-                att_span=att_span,
-            )
         output, lse = _flash_attn_v2_fwd_dise_lowlevel(
             query_layer,
             key_layer,
@@ -376,35 +549,19 @@ def _fixed_eager_backward_impl(
     batch_size, num_heads, query_len, head_dim = query_layer.shape
     key_len = int(key_layer.shape[-2])
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
-
-    override = _fixed_kernel_override_from_env(kind="bwd")
-    tuned = _fixed_repo_tuned_config(
-        kind="bwd",
+    block_m, block_n, num_stages, num_warps = _fixed_backward_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
         causal=bool(causal),
-        disentangled=(pos_key is not None or pos_query is not None),
-        att_span=att_span,
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
         dtype=query_layer.dtype,
         device=query_layer.device,
+        has_pos=(pos_key is not None or pos_query is not None),
     )
-    if override is not None:
-        block_m, block_n, num_stages, num_warps = override
-    elif tuned is not None:
-        block_m, block_n, num_stages, num_warps = tuned
-    else:
-        block_m, block_n, num_stages, num_warps = _get_bwd_config_lowlevel(
-            batch_size,
-            num_heads,
-            query_len,
-            key_len,
-            head_dim,
-            bool(causal),
-            disentangled=(pos_key is not None or pos_query is not None),
-            att_span=att_span,
-            dtype=query_layer.dtype,
-        )
     return _flash_attn_v2_bwd_dise_lowlevel(
         output,
         grad_output,
@@ -427,8 +584,380 @@ def _fixed_eager_backward_impl(
     )
 
 
-def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
-    """Register or retrieve the opaque fixed-length custom ops.
+def _fixed_triton_forward_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_lengths: torch.Tensor | None,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the raw fixed forward Triton kernel through ``wrap_triton``.
+
+    :param torch.Tensor q: Queries in ``(B, H, S, D)`` layout.
+    :param torch.Tensor k: Keys in ``(B, H, S, D)`` layout.
+    :param torch.Tensor v: Values in ``(B, H, S, D)`` layout.
+    :param torch.Tensor | None seq_lengths: Optional per-example active lengths.
+    :param torch.Tensor | None pos_key: Optional c2p tensor.
+    :param torch.Tensor | None pos_query: Optional p2c tensor.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :return tuple[torch.Tensor, torch.Tensor]: Output tensor and padded LSE tensor.
+    """
+
+    if not _fixed_use_triton_op():
+        raise RuntimeError("Fixed FlashDeBERTa Triton op support is unavailable.")
+
+    batch_size = int(q.shape[0])
+    num_heads = int(q.shape[1])
+    query_len = int(q.shape[2])
+    key_len = int(k.shape[2])
+    head_dim = int(q.shape[3])
+    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    block_m, block_n, num_stages, num_warps = _fixed_forward_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        dtype=q.dtype,
+        device=q.device,
+        has_pos=(pos_key is not None or pos_query is not None),
+    )
+
+    seq_lengths_full = _materialize_fixed_seq_lengths(
+        seq_lengths=seq_lengths,
+        batch_size=batch_size,
+        query_len=query_len,
+        device=q.device,
+    )
+    full_length = seq_lengths is None
+    if full_length:
+        output = torch.empty_like(q)
+        lse = torch.empty((batch_size, num_heads, query_len), device=q.device, dtype=torch.float32)
+    else:
+        output = torch.zeros_like(q)
+        lse = torch.zeros((batch_size, num_heads, query_len), device=q.device, dtype=torch.float32)
+
+    if pos_key is not None:
+        stride_pk0, stride_pk1, stride_pk2, stride_pk3 = pos_key.stride()
+    else:
+        stride_pk0 = stride_pk1 = stride_pk2 = stride_pk3 = 0
+    if pos_query is not None:
+        stride_pq0, stride_pq1, stride_pq2, stride_pq3 = pos_query.stride()
+    else:
+        stride_pq0 = stride_pq1 = stride_pq2 = stride_pq3 = 0
+
+    grid = (_cdiv(query_len, block_m), num_heads, batch_size)
+    torch.library.wrap_triton(_fwd_kernel_dise_raw)[grid](
+        q,
+        k,
+        v,
+        pos_key,
+        pos_query,
+        lse,
+        output,
+        seq_lengths_full,
+        float(sm_scale),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        stride_pk0,
+        stride_pk1,
+        stride_pk2,
+        stride_pk3,
+        stride_pq0,
+        stride_pq1,
+        stride_pq2,
+        stride_pq3,
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        key_len - query_len,
+        BLOCK_M=block_m,
+        BLOCK_DMODEL=head_dim,
+        BLOCK_N=block_n,
+        IS_CAUSAL=bool(causal),
+        LARGER_M=bool(query_len > key_len),
+        DIVISIBLE_M=bool(query_len % block_m == 0),
+        DIVISIBLE_N=bool(key_len % block_n == 0),
+        HAS_C2P=bool(pos_key is not None),
+        HAS_P2C=bool(pos_query is not None),
+        ATT_SPAN=att_span,
+        NUM_BUCKETS=int(position_buckets),
+        MAX_DISTANCE=int(max_relative_distance),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return output, lse
+
+
+def _fixed_triton_backward_impl(
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_lengths: torch.Tensor | None,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Launch the raw fixed backward Triton kernels through ``wrap_triton``.
+
+    :param torch.Tensor grad_out: Gradient of the attention output.
+    :param torch.Tensor q: Forward queries.
+    :param torch.Tensor k: Forward keys.
+    :param torch.Tensor v: Forward values.
+    :param torch.Tensor | None seq_lengths: Optional per-example active lengths.
+    :param torch.Tensor out: Forward output tensor.
+    :param torch.Tensor lse: Forward LSE tensor.
+    :param torch.Tensor | None pos_key: Optional c2p tensor.
+    :param torch.Tensor | None pos_query: Optional p2c tensor.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Gradients for q/k/v and optional positional tensors.
+    """
+
+    if not _fixed_use_triton_op():
+        raise RuntimeError("Fixed FlashDeBERTa Triton op support is unavailable.")
+
+    batch_size = int(q.shape[0])
+    num_heads = int(q.shape[1])
+    query_len = int(q.shape[2])
+    key_len = int(k.shape[2])
+    head_dim = int(q.shape[3])
+    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    block_m, block_n, num_stages, num_warps = _fixed_backward_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        dtype=q.dtype,
+        device=q.device,
+        has_pos=(pos_key is not None or pos_query is not None),
+    )
+
+    seq_lengths_full = _materialize_fixed_seq_lengths(
+        seq_lengths=seq_lengths,
+        batch_size=batch_size,
+        query_len=query_len,
+        device=q.device,
+    )
+    full_length = seq_lengths is None
+    if full_length:
+        delta = torch.empty_like(lse)
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+    else:
+        delta = torch.zeros_like(lse)
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+    dk_pos = torch.zeros_like(pos_key) if pos_key is not None else None
+    dq_pos = torch.zeros_like(pos_query) if pos_query is not None else None
+
+    if pos_key is not None:
+        stride_pk0, stride_pk1, stride_pk2, stride_pk3 = pos_key.stride()
+    else:
+        stride_pk0 = stride_pk1 = stride_pk2 = stride_pk3 = 0
+    if pos_query is not None:
+        stride_pq0, stride_pq1, stride_pq2, stride_pq3 = pos_query.stride()
+    else:
+        stride_pq0 = stride_pq1 = stride_pq2 = stride_pq3 = 0
+
+    grid_delta = (_cdiv(query_len, block_m), num_heads, batch_size)
+    torch.library.wrap_triton(_bwd_preprocess_raw)[grid_delta](
+        out,
+        grad_out,
+        delta,
+        seq_lengths_full,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        grad_out.stride(0),
+        grad_out.stride(1),
+        grad_out.stride(2),
+        grad_out.stride(3),
+        delta.stride(0),
+        delta.stride(1),
+        delta.stride(2),
+        query_len,
+        BLOCK_M=block_m,
+        D_HEAD=head_dim,
+        DIVISIBLE_M=bool(query_len % block_m == 0),
+    )
+
+    grid_kv = (_cdiv(key_len, block_n), num_heads, batch_size)
+    torch.library.wrap_triton(_bwd_kv_dise_kernel_raw)[grid_kv](
+        q,
+        k,
+        v,
+        seq_lengths_full,
+        pos_key,
+        pos_query,
+        float(sm_scale),
+        grad_out,
+        dk,
+        dv,
+        dq_pos,
+        lse,
+        delta,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        grad_out.stride(0),
+        grad_out.stride(1),
+        grad_out.stride(2),
+        grad_out.stride(3),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dk.stride(3),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
+        dv.stride(3),
+        stride_pk0,
+        stride_pk1,
+        stride_pk2,
+        stride_pk3,
+        stride_pq0,
+        stride_pq1,
+        stride_pq2,
+        stride_pq3,
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        key_len - query_len,
+        BLOCK_M=block_m,
+        BLOCK_DMODEL=head_dim,
+        BLOCK_N=block_n,
+        CAUSAL=bool(causal),
+        HAS_C2P=bool(pos_key is not None),
+        HAS_P2C=bool(pos_query is not None),
+        DIVISIBLE_M=bool(query_len % block_m == 0),
+        DIVISIBLE_N=bool(key_len % block_n == 0),
+        ATT_SPAN=att_span,
+        NUM_BUCKETS=int(position_buckets),
+        MAX_DISTANCE=int(max_relative_distance),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    grid_q = (_cdiv(query_len, block_m), num_heads, batch_size)
+    torch.library.wrap_triton(_bwd_q_dise_kernel_raw)[grid_q](
+        q,
+        k,
+        v,
+        seq_lengths_full,
+        pos_key,
+        pos_query,
+        float(sm_scale),
+        grad_out,
+        dq,
+        dk_pos,
+        lse,
+        delta,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        grad_out.stride(0),
+        grad_out.stride(1),
+        grad_out.stride(2),
+        grad_out.stride(3),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        dq.stride(3),
+        stride_pk0,
+        stride_pk1,
+        stride_pk2,
+        stride_pk3,
+        stride_pq0,
+        stride_pq1,
+        stride_pq2,
+        stride_pq3,
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        key_len - query_len,
+        BLOCK_M=block_m,
+        BLOCK_DMODEL=head_dim,
+        BLOCK_N=block_n,
+        CAUSAL=bool(causal),
+        HAS_C2P=bool(pos_key is not None),
+        HAS_P2C=bool(pos_query is not None),
+        LARGER_M=bool(query_len > key_len),
+        DIVISIBLE_M=bool(query_len % block_m == 0),
+        DIVISIBLE_N=bool(key_len % block_n == 0),
+        ATT_SPAN=att_span,
+        NUM_BUCKETS=int(position_buckets),
+        MAX_DISTANCE=int(max_relative_distance),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return dq, dk, dv, dk_pos, dq_pos
+
+
+def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
+    """Register or retrieve the compile-visible fixed-length Triton ops.
 
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
@@ -438,18 +967,12 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 
-    if (
-        _flash_attn_v2_fwd_dise_lowlevel is None
-        or _flash_attn_v2_bwd_dise_lowlevel is None
-        or not hasattr(torch, "library")
-        or not hasattr(torch.library, "custom_op")
-    ):
+    if not _fixed_use_triton_op():
         return None, None
 
-    @torch.library.custom_op(
+    @torch.library.triton_op(
         f"{_FIXED_OP_NAMESPACE}::{_FIXED_FWD_OP_NAME}",
         mutates_args=(),
-        device_types="cuda",
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor? seq_lengths, Tensor? pos_key, Tensor? pos_query, "
             "float sm_scale, int position_buckets, int max_relative_distance, bool causal) -> (Tensor, Tensor)"
@@ -482,10 +1005,10 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
         :return tuple[torch.Tensor, torch.Tensor]: Fixed-length output and LSE tensors.
         """
 
-        output, lse = _fixed_eager_forward_impl(
-            query_layer=q,
-            key_layer=k,
-            value_layer=v,
+        return _fixed_triton_forward_impl(
+            q=q,
+            k=k,
+            v=v,
             seq_lengths=seq_lengths,
             pos_key=pos_key,
             pos_query=pos_query,
@@ -493,58 +1016,11 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
             causal=causal,
-            require_lse=True,
         )
-        if lse is None:  # pragma: no cover - guarded by require_lse
-            raise RuntimeError("Fixed FlashDeBERTa custom op requires forward LSE output.")
-        return output, lse
 
-    @torch.library.register_fake(_forward_op)
-    def _forward_op_fake(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        seq_lengths: torch.Tensor | None,
-        pos_key: torch.Tensor | None,
-        pos_query: torch.Tensor | None,
-        sm_scale: float,
-        position_buckets: int,
-        max_relative_distance: int,
-        causal: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return fake fixed-length outputs with static shapes.
-
-        :param torch.Tensor q: Fake query tensor.
-        :param torch.Tensor k: Fake key tensor.
-        :param torch.Tensor v: Fake value tensor.
-        :param torch.Tensor | None seq_lengths: Fake optional sequence lengths.
-        :param torch.Tensor | None pos_key: Fake optional c2p tensor.
-        :param torch.Tensor | None pos_query: Fake optional p2c tensor.
-        :param float sm_scale: Fake softmax scale.
-        :param int position_buckets: Fake relative-position bucket count.
-        :param int max_relative_distance: Fake maximum relative distance.
-        :param bool causal: Fake causal flag.
-        :return tuple[torch.Tensor, torch.Tensor]: Fake output and LSE tensors.
-        """
-
-        del (
-            k,
-            v,
-            seq_lengths,
-            pos_key,
-            pos_query,
-            sm_scale,
-            position_buckets,
-            max_relative_distance,
-            causal,
-        )
-        lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        return torch.empty_like(q), lse
-
-    @torch.library.custom_op(
+    @torch.library.triton_op(
         f"{_FIXED_OP_NAMESPACE}::{_FIXED_BWD_OP_NAME}",
         mutates_args=(),
-        device_types="cuda",
         schema=(
             "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor? seq_lengths, Tensor out, Tensor lse, "
             "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, "
@@ -565,8 +1041,8 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Run fixed-length backward as one opaque CUDA op.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run fixed-length backward as one compile-visible Triton op.
 
         :param torch.Tensor grad_out: Gradient of the fixed output tensor.
         :param torch.Tensor q: Forward queries.
@@ -581,17 +1057,18 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
         :param bool causal: Whether causal masking is enabled.
-        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-            Gradients for q/k/v and optional positional tensors.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            Gradients for q/k/v and positional tensors, with empty tensor sentinels
+            when the corresponding positional input is absent.
         """
 
-        return _fixed_eager_backward_impl(
-            grad_output=grad_out,
-            query_layer=q,
-            key_layer=k,
-            value_layer=v,
+        dq, dk, dv, dpos_key, dpos_query = _fixed_triton_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
             seq_lengths=seq_lengths,
-            output=out,
+            out=out,
             lse=lse,
             pos_key=pos_key,
             pos_query=pos_query,
@@ -600,46 +1077,11 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
             max_relative_distance=max_relative_distance,
             causal=causal,
         )
-
-    @torch.library.register_fake(_backward_op)
-    def _backward_op_fake(
-        grad_out: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        seq_lengths: torch.Tensor | None,
-        out: torch.Tensor,
-        lse: torch.Tensor,
-        pos_key: torch.Tensor | None,
-        pos_query: torch.Tensor | None,
-        sm_scale: float,
-        position_buckets: int,
-        max_relative_distance: int,
-        causal: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Return fake fixed-length backward outputs with static shapes.
-
-        :param torch.Tensor grad_out: Fake gradient tensor.
-        :param torch.Tensor q: Fake query tensor.
-        :param torch.Tensor k: Fake key tensor.
-        :param torch.Tensor v: Fake value tensor.
-        :param torch.Tensor | None seq_lengths: Fake optional sequence lengths.
-        :param torch.Tensor out: Fake output tensor.
-        :param torch.Tensor lse: Fake LSE tensor.
-        :param torch.Tensor | None pos_key: Fake optional c2p tensor.
-        :param torch.Tensor | None pos_query: Fake optional p2c tensor.
-        :param float sm_scale: Fake softmax scale.
-        :param int position_buckets: Fake relative-position bucket count.
-        :param int max_relative_distance: Fake maximum relative distance.
-        :param bool causal: Fake causal flag.
-        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-            Fake gradients for q/k/v and optional positional tensors.
-        """
-
-        del grad_out, seq_lengths, out, lse, sm_scale, position_buckets, max_relative_distance, causal
-        dpos_key = torch.empty_like(pos_key) if pos_key is not None else None
-        dpos_query = torch.empty_like(pos_query) if pos_query is not None else None
-        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), dpos_key, dpos_query
+        if dpos_key is None:
+            dpos_key = q.new_empty((0,))
+        if dpos_query is None:
+            dpos_query = q.new_empty((0,))
+        return dq, dk, dv, dpos_key, dpos_query
 
     def _setup_context(
         ctx: Any,
@@ -722,13 +1164,17 @@ def _build_fixed_custom_ops() -> tuple[Any | None, Any | None]:
             ctx.max_relative_distance,
             ctx.causal,
         )
+        if not bool(ctx.has_pos_key):
+            dpos_key = None
+        if not bool(ctx.has_pos_query):
+            dpos_query = None
         return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None
 
     torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
     return _forward_op, _backward_op
 
 
-_FLASHDEBERTA_FIXED_CUSTOM_OP, _FLASHDEBERTA_FIXED_BWD_CUSTOM_OP = _build_fixed_custom_ops()
+_FLASHDEBERTA_FIXED_CUSTOM_OP, _FLASHDEBERTA_FIXED_BWD_CUSTOM_OP = _build_fixed_triton_ops()
 
 
 def flashdeberta_fixed(
