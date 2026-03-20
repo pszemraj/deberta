@@ -9,6 +9,7 @@ the upstream Python autograd wrapper.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -89,6 +90,216 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
     return getattr(op, "default", op)
 
 
+def _bias_device_capability(device: torch.device) -> tuple[int, int]:
+    """Return CUDA device capability for the given tensor device.
+
+    :param torch.device device: CUDA device to query.
+    :return tuple[int, int]: ``(major, minor)`` compute capability.
+    """
+
+    if device.type != "cuda":
+        return (0, 0)
+    index = device.index
+    if index is None:
+        return torch.cuda.get_device_capability()
+    return torch.cuda.get_device_capability(index)
+
+
+def _bias_kernel_override_from_env(*, kind: str) -> tuple[int, int, int, int] | None:
+    """Return repo-side dense-bias kernel overrides when fully specified.
+
+    These overrides intentionally apply only to the repo's dense flash-with-bias
+    wrapper so doc-block tuning does not perturb the fixed or varlen paths.
+
+    Supported env vars:
+    - ``FLASHDEBERTA_BIAS_FWD_BLOCK_M``
+    - ``FLASHDEBERTA_BIAS_FWD_BLOCK_N``
+    - ``FLASHDEBERTA_BIAS_FWD_NUM_STAGES``
+    - ``FLASHDEBERTA_BIAS_FWD_NUM_WARPS``
+    - ``FLASHDEBERTA_BIAS_BWD_BLOCK_M``
+    - ``FLASHDEBERTA_BIAS_BWD_BLOCK_N``
+    - ``FLASHDEBERTA_BIAS_BWD_NUM_STAGES``
+    - ``FLASHDEBERTA_BIAS_BWD_NUM_WARPS``
+
+    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when unset / invalid / incomplete.
+    """
+
+    normalized = str(kind).strip().lower()
+    if normalized not in {"fwd", "bwd"}:
+        raise ValueError(f"Unsupported bias kernel override kind: {kind!r}")
+
+    prefix = f"FLASHDEBERTA_BIAS_{normalized.upper()}"
+    names = (
+        f"{prefix}_BLOCK_M",
+        f"{prefix}_BLOCK_N",
+        f"{prefix}_NUM_STAGES",
+        f"{prefix}_NUM_WARPS",
+    )
+    raw = [os.environ.get(name) for name in names]
+    if any(value is None or not str(value).strip() for value in raw):
+        return None
+    try:
+        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
+    except Exception:
+        return None
+    return int(block_m), int(block_n), int(num_stages), int(num_warps)
+
+
+def _bias_repo_tuned_config(
+    *,
+    kind: str,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int] | None:
+    """Return repo-local tuned dense-bias configs for measured hot paths.
+
+    This helper stays intentionally narrow. Only promote configs that have been
+    measured on real packed doc-block RTD batches for the repo's current
+    DeBERTa ``1024 x 1024`` non-causal bf16 regime on ``sm_120`` hardware.
+
+    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when no repo-local override applies.
+    """
+
+    del batch_size, num_heads
+    normalized_kind = str(kind).strip().lower()
+    if normalized_kind not in {"fwd", "bwd"}:
+        return None
+    if bool(causal):
+        return None
+    if dtype not in {torch.float16, torch.bfloat16}:
+        return None
+    if int(head_dim) > 64:
+        return None
+    if int(query_len) != 1024 or int(key_len) != 1024:
+        return None
+    capability = _bias_device_capability(device)
+    if int(capability[0]) < 12:
+        return None
+    return None
+
+
+def _bias_forward_config(
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int]:
+    """Resolve the dense-bias forward Triton tile config.
+
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    override = _bias_kernel_override_from_env(kind="fwd")
+    tuned = _bias_repo_tuned_config(
+        kind="fwd",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=dtype,
+        device=device,
+    )
+    if override is not None:
+        return override
+    if tuned is not None:
+        return tuned
+    if _get_fwd_config_bias_lowlevel is None:
+        raise RuntimeError("FlashDeBERTa local-bias config helper is unavailable.")
+    return _get_fwd_config_bias_lowlevel(
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        head_dim,
+        bool(causal),
+    )
+
+
+def _bias_backward_config(
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int]:
+    """Resolve the dense-bias backward Triton tile config.
+
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    override = _bias_kernel_override_from_env(kind="bwd")
+    tuned = _bias_repo_tuned_config(
+        kind="bwd",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=dtype,
+        device=device,
+    )
+    if override is not None:
+        return override
+    if tuned is not None:
+        return tuned
+    if _get_bwd_config_bias_lowlevel is None:
+        raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
+    return _get_bwd_config_bias_lowlevel(
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        head_dim,
+        bool(causal),
+    )
+
+
 def _bias_eager_forward_impl(
     *,
     q: torch.Tensor,
@@ -121,15 +332,15 @@ def _bias_eager_forward_impl(
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
-    if _get_fwd_config_bias_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa local-bias config helper is unavailable.")
-    block_m, block_n, num_stages, num_warps = _get_fwd_config_bias_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
+    block_m, block_n, num_stages, num_warps = _bias_forward_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=q.dtype,
+        device=q.device,
     )
     out, lse = _flash_attn_v2_fwd_bias_lowlevel(
         q,
@@ -175,18 +386,20 @@ def _bias_eager_backward_impl(
         Gradients for q/k/v and the additive bias tensor.
     """
 
-    if _flash_attn_v2_bwd_bias_lowlevel is None or _get_bwd_config_bias_lowlevel is None:
+    if _flash_attn_v2_bwd_bias_lowlevel is None:
         raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
-    block_m, block_n, num_stages, num_warps = _get_bwd_config_bias_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
+    block_m, block_n, num_stages, num_warps = _bias_backward_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=q.dtype,
+        device=q.device,
     )
     dq, dk, dv, d_bias = _flash_attn_v2_bwd_bias_lowlevel(
         out,

@@ -1736,6 +1736,27 @@ def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.Mo
     )
 
 
+def test_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+
+    for name in (
+        "FLASHDEBERTA_BIAS_BWD_BLOCK_M",
+        "FLASHDEBERTA_BIAS_BWD_BLOCK_N",
+        "FLASHDEBERTA_BIAS_BWD_NUM_STAGES",
+        "FLASHDEBERTA_BIAS_BWD_NUM_WARPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert bias_mod._bias_kernel_override_from_env(kind="bwd") is None
+
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_M", "32")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_STAGES", "2")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_WARPS", "4")
+
+    assert bias_mod._bias_kernel_override_from_env(kind="bwd") == (32, 64, 2, 4)
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()

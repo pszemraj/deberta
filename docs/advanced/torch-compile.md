@@ -78,6 +78,11 @@ The dense-bias branch also builds its `(B,H,S,S)` additive bias with
 `take_along_dim` plus broadcast masks instead of expanding the shared bucket
 index and keep mask across heads first, which cuts the pairwise-bias assembly
 overhead before the flash bias kernels run.
+That dense flash-with-bias route now has its own repo-local tuning seam too:
+`FLASHDEBERTA_BIAS_FWD_*` and `FLASHDEBERTA_BIAS_BWD_*` are resolved inside the
+opaque bias wrapper before it falls back to upstream FlashDeBERTa config
+selection, so packed-docblock kernel tuning stays isolated from the fixed and
+varlen routes.
 
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,
