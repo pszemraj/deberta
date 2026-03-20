@@ -74,6 +74,10 @@ batch, runs the existing disentangled varlen flash kernels, and scatters the
 results back into the original packed layout. The fixed-shape metadata contract
 is important: it keeps the compiled `masked_docblock_*` entrypoints from
 recompiling when the number of documents per packed batch changes.
+The dense-bias branch also builds its `(B,H,S,S)` additive bias with
+`take_along_dim` plus broadcast masks instead of expanding the shared bucket
+index and keep mask across heads first, which cuts the pairwise-bias assembly
+overhead before the flash bias kernels run.
 
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,

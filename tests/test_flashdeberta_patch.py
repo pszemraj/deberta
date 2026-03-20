@@ -1484,6 +1484,68 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     assert stats.get("fallback_calls", 0) == 0
 
 
+def test_build_dense_flash_bias_matches_reference() -> None:
+    import deberta.modeling.flashdeberta_attention as attention_mod
+
+    batch_size = 2
+    num_heads = 3
+    seq_len = 4
+    buckets = 7
+
+    pos_key = torch.randn((batch_size, num_heads, seq_len, buckets), dtype=torch.float32)
+    pos_query = torch.randn((batch_size, num_heads, seq_len, buckets), dtype=torch.float32)
+    bucket_index = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [1, 0, 3, 4],
+            [2, 3, 0, 5],
+            [3, 4, 5, 0],
+        ],
+        dtype=torch.int64,
+    )
+    keep_mask = torch.tensor(
+        [
+            [
+                [
+                    [True, True, False, False],
+                    [True, True, False, False],
+                    [False, False, True, True],
+                    [False, False, True, True],
+                ]
+            ],
+            [
+                [
+                    [True, False, False, False],
+                    [False, True, False, False],
+                    [False, False, True, False],
+                    [False, False, False, True],
+                ]
+            ],
+        ],
+        dtype=torch.bool,
+    )
+
+    index = bucket_index.view(1, 1, seq_len, seq_len).expand(batch_size, num_heads, seq_len, seq_len)
+    reference = torch.gather(pos_key, dim=-1, index=index)
+    reverse = (
+        bucket_index.t()
+        .contiguous()
+        .view(1, 1, seq_len, seq_len)
+        .expand(batch_size, num_heads, seq_len, seq_len)
+    )
+    reference = reference + torch.gather(pos_query, dim=-1, index=reverse).transpose(-1, -2)
+    reference = reference.masked_fill(~keep_mask, -1.0e4)
+
+    actual = attention_mod._build_dense_flash_bias(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+    )
+
+    assert torch.equal(actual, reference)
+
+
 def test_varlen_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 

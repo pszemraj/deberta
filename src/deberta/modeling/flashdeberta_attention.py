@@ -447,6 +447,52 @@ def _dense_bucket_index_tensor(
     return bucket_index
 
 
+def _build_dense_flash_bias(
+    *,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    bucket_index: torch.Tensor,
+    keep_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build a dense FlashDeBERTa bias tensor from disentangled position terms.
+
+    ``torch.take_along_dim`` broadcasts the shared ``(S,S)`` bucket map across
+    batch and head dimensions, which avoids materializing expanded index tensors
+    before the gather. The doc-block route also keeps the pairwise mask in
+    ``(B,1,S,S)`` form so masked fill broadcasts across heads instead of
+    expanding the mask eagerly.
+
+    :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :raises RuntimeError: If both positional terms are missing.
+    :return torch.Tensor: Dense additive bias in ``(B,H,S,S)`` layout.
+    """
+
+    seq_len = int(bucket_index.shape[0])
+    gather_index = bucket_index.view(1, 1, seq_len, seq_len)
+    bias: torch.Tensor | None = None
+
+    if pos_key is not None:
+        bias = torch.take_along_dim(pos_key, gather_index, dim=-1)
+
+    if pos_query is not None:
+        reverse_index = bucket_index.transpose(0, 1).view(1, 1, seq_len, seq_len)
+        p2c_bias = torch.take_along_dim(pos_query, reverse_index, dim=-1).transpose(-1, -2)
+        if bias is None:
+            bias = p2c_bias
+        else:
+            bias.add_(p2c_bias)
+
+    if bias is None:  # pragma: no cover - guarded by callers
+        raise RuntimeError("FlashDeBERTa dense bias construction requires at least one positional term.")
+
+    if keep_mask is not None:
+        bias.masked_fill_(~keep_mask, -1.0e4)
+    return bias
+
+
 class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     """FlashDeBERTa-backed variant of native disentangled self-attention."""
 
@@ -705,25 +751,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        bucket_index_b = bucket_index.view(1, 1, seq_len, seq_len).expand(
-            batch_size, num_heads, seq_len, seq_len
+        del batch_size, num_heads
+        bias = _build_dense_flash_bias(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
         )
-        bias: torch.Tensor | None = None
-
-        if pos_key is not None:
-            bias = torch.gather(pos_key, dim=-1, index=bucket_index_b)
-        if pos_query is not None:
-            bucket_index_t = (
-                bucket_index.t()
-                .contiguous()
-                .view(1, 1, seq_len, seq_len)
-                .expand(batch_size, num_heads, seq_len, seq_len)
-            )
-            p2c_bias = torch.gather(pos_query, dim=-1, index=bucket_index_t).transpose(-1, -2)
-            bias = p2c_bias if bias is None else bias + p2c_bias
-
-        if bias is None:  # pragma: no cover - guarded by caller
-            raise RuntimeError("Local-bias flash path requires at least one positional term.")
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_bias_calls")
@@ -731,7 +764,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            bias=bias * float(sm_scale),
+            bias=bias.mul_(float(sm_scale)),
             sm_scale=sm_scale,
             causal=False,
         )
@@ -855,39 +888,27 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             attention_mask,
             query_len=seq_len,
             key_len=int(key_layer.shape[-2]),
-        ).expand(batch_size, num_heads, seq_len, int(key_layer.shape[-2]))
+        )
         bucket_index = _dense_bucket_index_tensor(
             seq_len=seq_len,
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        bucket_index_b = bucket_index.view(1, 1, seq_len, seq_len).expand(
-            batch_size, num_heads, seq_len, seq_len
+        del batch_size, num_heads
+        bias = _build_dense_flash_bias(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
         )
-        bias = torch.zeros(
-            (batch_size, num_heads, seq_len, seq_len),
-            device=query_layer.device,
-            dtype=query_layer.dtype,
-        )
-        if pos_key is not None:
-            bias = bias + torch.gather(pos_key, dim=-1, index=bucket_index_b)
-        if pos_query is not None:
-            bucket_index_t = (
-                bucket_index.t()
-                .contiguous()
-                .view(1, 1, seq_len, seq_len)
-                .expand(batch_size, num_heads, seq_len, seq_len)
-            )
-            bias = bias + torch.gather(pos_query, dim=-1, index=bucket_index_t).transpose(-1, -2)
-        bias = bias.masked_fill(~keep_mask, -1.0e4)
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_docblock_bias_calls")
         return flashdeberta_bias(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            bias=bias * float(sm_scale),
+            bias=bias.mul_(float(sm_scale)),
             sm_scale=sm_scale,
             causal=False,
         )
