@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 
+import deberta.modeling.flashdeberta_fixed_op as _fixed_mod
 import deberta.modeling.flashdeberta_varlen_op as _varlen_mod
 from deberta.modeling.flashdeberta_segment_pack import (
     segment_pack_padded_rows,
@@ -38,21 +39,38 @@ class _DocBlockForwardAuxCacheEntry:
     """Forward-side packed tensors reused by doc-block backward."""
 
     output_ref: weakref.ReferenceType[torch.Tensor] | None
+    single_rows: torch.Tensor
+    single_seq_lengths: torch.Tensor
+    multi_rows: torch.Tensor
     segment_offsets: torch.Tensor
     segment_lengths: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
     total_tokens: int
-    q_unpad: torch.Tensor
-    k_unpad: torch.Tensor
-    v_unpad: torch.Tensor
-    out_unpad: torch.Tensor
-    lse_unpad: torch.Tensor
+    q_unpad: torch.Tensor | None
+    k_unpad: torch.Tensor | None
+    v_unpad: torch.Tensor | None
+    out_unpad: torch.Tensor | None
+    lse_unpad: torch.Tensor | None
     pos_key_unpad: torch.Tensor | None
     pos_query_unpad: torch.Tensor | None
 
 
 _DOCBLOCK_FORWARD_AUX_CACHE: dict[int, _DocBlockForwardAuxCacheEntry] = {}
+
+
+@dataclass(frozen=True)
+class _DocBlockRowPartition:
+    """Per-row split between dense single-segment rows and ragged multi rows."""
+
+    single_rows: torch.Tensor
+    single_seq_lengths: torch.Tensor
+    multi_rows: torch.Tensor
+    multi_segment_offsets: torch.Tensor
+    multi_segment_lengths: torch.Tensor
+    multi_cu_seqlens: torch.Tensor
+    multi_max_seqlen: int
+    multi_total_tokens: int
 
 
 def flashdeberta_docblock_import_error() -> Exception | None:
@@ -116,25 +134,247 @@ def _active_docblock_metadata(
     return active_offsets, active_lengths, active_cu_seqlens, num_segments, max_seqlen, total_tokens
 
 
+def _partition_docblock_rows(
+    *,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    seq_len: int,
+) -> _DocBlockRowPartition:
+    """Split one doc-block batch into dense single rows and ragged multi rows.
+
+    Rows with exactly one active document segment can use the cheaper fixed
+    FlashDeBERTa path directly. Only rows with more than one segment need the
+    segment-aware ragged route.
+
+    :param torch.Tensor segment_offsets: Active flat padded row offsets per segment.
+    :param torch.Tensor segment_lengths: Active per-segment lengths.
+    :param int seq_len: Padded row length.
+    :return _DocBlockRowPartition: Row partition plus rebased ragged metadata.
+    """
+
+    empty_rows = torch.empty((0,), device=segment_offsets.device, dtype=torch.long)
+    empty_i32 = torch.empty((0,), device=segment_offsets.device, dtype=torch.int32)
+    empty_cu = torch.zeros((1,), device=segment_offsets.device, dtype=torch.int32)
+    if int(segment_lengths.numel()) == 0:
+        return _DocBlockRowPartition(
+            single_rows=empty_rows,
+            single_seq_lengths=empty_i32,
+            multi_rows=empty_rows,
+            multi_segment_offsets=empty_i32,
+            multi_segment_lengths=empty_i32,
+            multi_cu_seqlens=empty_cu,
+            multi_max_seqlen=0,
+            multi_total_tokens=0,
+        )
+
+    batch_rows = torch.div(segment_offsets, int(seq_len), rounding_mode="floor")
+    row_starts = segment_offsets - batch_rows * int(seq_len)
+    unique_rows, counts = torch.unique_consecutive(batch_rows, return_counts=True)
+    start_indices = torch.cumsum(counts, dim=0, dtype=torch.int64) - counts.to(torch.int64)
+
+    single_mask = counts.eq(1)
+    single_rows = unique_rows[single_mask].to(dtype=torch.long)
+    single_seq_lengths = segment_lengths.index_select(
+        0, start_indices[single_mask].to(dtype=torch.long)
+    ).contiguous()
+
+    multi_row_ids = unique_rows[~single_mask].to(dtype=torch.int32)
+    if int(multi_row_ids.numel()) == 0:
+        return _DocBlockRowPartition(
+            single_rows=single_rows,
+            single_seq_lengths=single_seq_lengths,
+            multi_rows=empty_rows,
+            multi_segment_offsets=empty_i32,
+            multi_segment_lengths=empty_i32,
+            multi_cu_seqlens=empty_cu,
+            multi_max_seqlen=0,
+            multi_total_tokens=0,
+        )
+
+    group_ids = torch.repeat_interleave(
+        torch.arange(int(unique_rows.numel()), device=segment_offsets.device, dtype=torch.long),
+        counts.to(dtype=torch.long),
+    )
+    multi_segment_mask = (~single_mask).index_select(0, group_ids)
+    multi_lengths = segment_lengths[multi_segment_mask].contiguous()
+    multi_batch_rows = batch_rows[multi_segment_mask].to(dtype=torch.int32)
+    multi_row_starts = row_starts[multi_segment_mask].to(dtype=torch.int32)
+    compact_rows = torch.searchsorted(multi_row_ids, multi_batch_rows)
+    multi_offsets = compact_rows.to(dtype=torch.int32) * int(seq_len) + multi_row_starts
+    multi_cu_seqlens = torch.nn.functional.pad(
+        torch.cumsum(multi_lengths, dim=0, dtype=torch.int32),
+        (1, 0),
+    )
+    return _DocBlockRowPartition(
+        single_rows=single_rows,
+        single_seq_lengths=single_seq_lengths,
+        multi_rows=multi_row_ids.to(dtype=torch.long),
+        multi_segment_offsets=multi_offsets.contiguous(),
+        multi_segment_lengths=multi_lengths,
+        multi_cu_seqlens=multi_cu_seqlens,
+        multi_max_seqlen=int(multi_lengths.max().item()),
+        multi_total_tokens=int(multi_cu_seqlens[-1].item()),
+    )
+
+
+def _select_rows_or_none(tensor: torch.Tensor | None, rows: torch.Tensor) -> torch.Tensor | None:
+    """Gather batch rows when the optional tensor is present.
+
+    :param torch.Tensor | None tensor: Optional tensor whose first dim is batch.
+    :param torch.Tensor rows: Row indices to gather.
+    :return torch.Tensor | None: Gathered tensor or ``None``.
+    """
+
+    if tensor is None:
+        return None
+    if int(rows.numel()) == 0:
+        return tensor[:0]
+    return tensor.index_select(0, rows)
+
+
+def _docblock_fixed_forward_impl(
+    *,
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed FlashDeBERTa path on a subset of batch rows.
+
+    :param torch.Tensor query_layer: Queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Values in ``(B, S, H, D)`` layout.
+    :param torch.Tensor seq_lengths: Per-row active lengths.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :return tuple[torch.Tensor, torch.Tensor]: Output and LSE in ``(B, S, H, *)`` layouts.
+    """
+
+    q = query_layer.transpose(1, 2).contiguous()
+    k = key_layer.transpose(1, 2).contiguous()
+    v = value_layer.transpose(1, 2).contiguous()
+    pk = pos_key.transpose(1, 2).contiguous() if pos_key is not None else None
+    pq = pos_query.transpose(1, 2).contiguous() if pos_query is not None else None
+    out, lse = _fixed_mod._fixed_eager_forward_impl(
+        query_layer=q,
+        key_layer=k,
+        value_layer=v,
+        seq_lengths=seq_lengths,
+        pos_key=pk,
+        pos_query=pq,
+        sm_scale=sm_scale,
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        causal=causal,
+        require_lse=True,
+    )
+    if lse is None:  # pragma: no cover - guarded by low-level availability
+        raise RuntimeError("Doc-block fixed forward requires fixed-length LSE support.")
+    return out.transpose(1, 2).contiguous(), lse.transpose(1, 2).contiguous()
+
+
+def _docblock_fixed_backward_impl(
+    *,
+    grad_output: torch.Tensor,
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    output_padded: torch.Tensor,
+    lse_padded: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run fixed-length backward on a subset of batch rows.
+
+    :param torch.Tensor grad_output: Gradient in ``(B, S, H, D)`` layout.
+    :param torch.Tensor query_layer: Queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Values in ``(B, S, H, D)`` layout.
+    :param torch.Tensor seq_lengths: Per-row active lengths.
+    :param torch.Tensor output_padded: Forward output in ``(B, S, H, D)`` layout.
+    :param torch.Tensor lse_padded: Forward LSE in ``(B, S, H)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Gradients in the same layouts as the forward inputs.
+    """
+
+    q = query_layer.transpose(1, 2).contiguous()
+    k = key_layer.transpose(1, 2).contiguous()
+    v = value_layer.transpose(1, 2).contiguous()
+    grad = grad_output.transpose(1, 2).contiguous()
+    out = output_padded.transpose(1, 2).contiguous()
+    lse = lse_padded.transpose(1, 2).contiguous()
+    pk = pos_key.transpose(1, 2).contiguous() if pos_key is not None else None
+    pq = pos_query.transpose(1, 2).contiguous() if pos_query is not None else None
+    dq, dk, dv, dpk, dpq = _fixed_mod._fixed_eager_backward_impl(
+        grad_output=grad,
+        query_layer=q,
+        key_layer=k,
+        value_layer=v,
+        seq_lengths=seq_lengths,
+        output=out,
+        lse=lse,
+        pos_key=pk,
+        pos_query=pq,
+        sm_scale=sm_scale,
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        causal=causal,
+    )
+    return (
+        dq.transpose(1, 2).contiguous(),
+        dk.transpose(1, 2).contiguous(),
+        dv.transpose(1, 2).contiguous(),
+        dpk.transpose(1, 2).contiguous() if dpk is not None else None,
+        dpq.transpose(1, 2).contiguous() if dpq is not None else None,
+    )
+
+
 def _store_forward_aux_cache(
     *,
     output_padded: torch.Tensor,
+    single_rows: torch.Tensor,
+    single_seq_lengths: torch.Tensor,
+    multi_rows: torch.Tensor,
     segment_offsets: torch.Tensor,
     segment_lengths: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
     total_tokens: int,
-    q_unpad: torch.Tensor,
-    k_unpad: torch.Tensor,
-    v_unpad: torch.Tensor,
-    out_unpad: torch.Tensor,
-    lse_unpad: torch.Tensor,
+    q_unpad: torch.Tensor | None,
+    k_unpad: torch.Tensor | None,
+    v_unpad: torch.Tensor | None,
+    out_unpad: torch.Tensor | None,
+    lse_unpad: torch.Tensor | None,
     pos_key_unpad: torch.Tensor | None,
     pos_query_unpad: torch.Tensor | None,
 ) -> None:
     """Stash forward packed tensors so backward does not rebuild them.
 
     :param torch.Tensor output_padded: Returned padded attention output tensor.
+    :param torch.Tensor single_rows: Batch rows handled by the fixed single-segment path.
+    :param torch.Tensor single_seq_lengths: Active lengths for ``single_rows``.
+    :param torch.Tensor multi_rows: Batch rows handled by the ragged multi-segment path.
     :param torch.Tensor segment_offsets: Flat padded row offsets per segment.
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets.
@@ -160,6 +400,9 @@ def _store_forward_aux_cache(
 
     _DOCBLOCK_FORWARD_AUX_CACHE[cache_key] = _DocBlockForwardAuxCacheEntry(
         output_ref=output_ref,
+        single_rows=single_rows,
+        single_seq_lengths=single_seq_lengths,
+        multi_rows=multi_rows,
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
@@ -266,6 +509,132 @@ def _docblock_forward_impl(
             )
             return output, lse
         return output, None
+
+    partition = _partition_docblock_rows(
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        seq_len=seq_len,
+    )
+    has_single_rows = int(partition.single_rows.numel()) > 0
+    has_multi_rows = int(partition.multi_rows.numel()) > 0
+
+    if has_single_rows and not has_multi_rows:
+        fixed_out, fixed_lse = _docblock_fixed_forward_impl(
+            query_layer=query_layer.index_select(0, partition.single_rows),
+            key_layer=key_layer.index_select(0, partition.single_rows),
+            value_layer=value_layer.index_select(0, partition.single_rows),
+            seq_lengths=partition.single_seq_lengths,
+            pos_key=_select_rows_or_none(pos_key, partition.single_rows),
+            pos_query=_select_rows_or_none(pos_query, partition.single_rows),
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+        )
+        output = torch.zeros_like(query_layer)
+        output.index_copy_(0, partition.single_rows, fixed_out)
+        if not require_lse:
+            return output, None
+        lse = torch.zeros(
+            (batch_size, seq_len, int(query_layer.shape[2])),
+            device=query_layer.device,
+            dtype=torch.float32,
+        )
+        lse.index_copy_(0, partition.single_rows, fixed_lse)
+        if stash_backward_cache:
+            _store_forward_aux_cache(
+                output_padded=output,
+                single_rows=partition.single_rows,
+                single_seq_lengths=partition.single_seq_lengths,
+                multi_rows=partition.multi_rows,
+                segment_offsets=active_segment_offsets[:0],
+                segment_lengths=active_segment_lengths[:0],
+                cu_seqlens=active_cu_seqlens[:1],
+                max_seqlen=0,
+                total_tokens=0,
+                q_unpad=None,
+                k_unpad=None,
+                v_unpad=None,
+                out_unpad=None,
+                lse_unpad=None,
+                pos_key_unpad=None,
+                pos_query_unpad=None,
+            )
+        return output, lse
+
+    if has_single_rows and has_multi_rows:
+        output = torch.zeros_like(query_layer)
+        lse = (
+            torch.zeros(
+                (batch_size, seq_len, int(query_layer.shape[2])),
+                device=query_layer.device,
+                dtype=torch.float32,
+            )
+            if require_lse
+            else None
+        )
+        fixed_out, fixed_lse = _docblock_fixed_forward_impl(
+            query_layer=query_layer.index_select(0, partition.single_rows),
+            key_layer=key_layer.index_select(0, partition.single_rows),
+            value_layer=value_layer.index_select(0, partition.single_rows),
+            seq_lengths=partition.single_seq_lengths,
+            pos_key=_select_rows_or_none(pos_key, partition.single_rows),
+            pos_query=_select_rows_or_none(pos_query, partition.single_rows),
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+        )
+        output.index_copy_(0, partition.single_rows, fixed_out)
+        if lse is not None:
+            lse.index_copy_(0, partition.single_rows, fixed_lse)
+
+        multi_output, multi_lse = _docblock_forward_impl(
+            query_layer=query_layer.index_select(0, partition.multi_rows),
+            key_layer=key_layer.index_select(0, partition.multi_rows),
+            value_layer=value_layer.index_select(0, partition.multi_rows),
+            segment_offsets=partition.multi_segment_offsets,
+            segment_lengths=partition.multi_segment_lengths,
+            cu_seqlens=partition.multi_cu_seqlens,
+            pos_key=_select_rows_or_none(pos_key, partition.multi_rows),
+            pos_query=_select_rows_or_none(pos_query, partition.multi_rows),
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            require_lse=require_lse,
+            stash_backward_cache=stash_backward_cache,
+        )
+        multi_cached = _pop_forward_aux_cache(multi_output) if stash_backward_cache else None
+        output.index_copy_(0, partition.multi_rows, multi_output)
+        if lse is not None and multi_lse is not None:
+            lse.index_copy_(0, partition.multi_rows, multi_lse)
+        if stash_backward_cache:
+            _store_forward_aux_cache(
+                output_padded=output,
+                single_rows=partition.single_rows,
+                single_seq_lengths=partition.single_seq_lengths,
+                multi_rows=partition.multi_rows,
+                segment_offsets=(
+                    partition.multi_segment_offsets if multi_cached is None else multi_cached.segment_offsets
+                ),
+                segment_lengths=(
+                    partition.multi_segment_lengths if multi_cached is None else multi_cached.segment_lengths
+                ),
+                cu_seqlens=partition.multi_cu_seqlens if multi_cached is None else multi_cached.cu_seqlens,
+                max_seqlen=partition.multi_max_seqlen if multi_cached is None else multi_cached.max_seqlen,
+                total_tokens=partition.multi_total_tokens
+                if multi_cached is None
+                else multi_cached.total_tokens,
+                q_unpad=None if multi_cached is None else multi_cached.q_unpad,
+                k_unpad=None if multi_cached is None else multi_cached.k_unpad,
+                v_unpad=None if multi_cached is None else multi_cached.v_unpad,
+                out_unpad=None if multi_cached is None else multi_cached.out_unpad,
+                lse_unpad=None if multi_cached is None else multi_cached.lse_unpad,
+                pos_key_unpad=None if multi_cached is None else multi_cached.pos_key_unpad,
+                pos_query_unpad=None if multi_cached is None else multi_cached.pos_query_unpad,
+            )
+        return output, lse
 
     q_unpad, k_unpad, v_unpad = segment_pack_padded_rows_triple(
         query_layer,
@@ -389,6 +758,9 @@ def _docblock_forward_impl(
     if stash_backward_cache:
         _store_forward_aux_cache(
             output_padded=out_padded,
+            single_rows=partition.single_rows,
+            single_seq_lengths=partition.single_seq_lengths,
+            multi_rows=partition.multi_rows,
             segment_offsets=active_segment_offsets,
             segment_lengths=active_segment_lengths,
             cu_seqlens=active_cu_seqlens,
@@ -477,8 +849,109 @@ def _docblock_backward_impl(
         dq = torch.zeros_like(query_layer)
         dk = torch.zeros_like(key_layer)
         dv = torch.zeros_like(value_layer)
-        dpos_key = torch.zeros_like(pos_key) if pos_key is not None else None
-        dpos_query = torch.zeros_like(pos_query) if pos_query is not None else None
+        dpos_key = torch.zeros_like(pos_key).contiguous() if pos_key is not None else None
+        dpos_query = torch.zeros_like(pos_query).contiguous() if pos_query is not None else None
+        return dq, dk, dv, dpos_key, dpos_query
+
+    partition = _partition_docblock_rows(
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        seq_len=seq_len,
+    )
+    has_single_rows = int(partition.single_rows.numel()) > 0
+    has_multi_rows = int(partition.multi_rows.numel()) > 0
+
+    if has_single_rows and not has_multi_rows:
+        dq_single, dk_single, dv_single, dpk_single, dpq_single = _docblock_fixed_backward_impl(
+            grad_output=grad_output.index_select(0, partition.single_rows),
+            query_layer=query_layer.index_select(0, partition.single_rows),
+            key_layer=key_layer.index_select(0, partition.single_rows),
+            value_layer=value_layer.index_select(0, partition.single_rows),
+            seq_lengths=partition.single_seq_lengths,
+            output_padded=output_padded.index_select(0, partition.single_rows),
+            lse_padded=lse_padded.index_select(0, partition.single_rows),
+            pos_key=_select_rows_or_none(pos_key, partition.single_rows),
+            pos_query=_select_rows_or_none(pos_query, partition.single_rows),
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+        )
+        dq = torch.zeros_like(query_layer)
+        dk = torch.zeros_like(key_layer)
+        dv = torch.zeros_like(value_layer)
+        dq.index_copy_(0, partition.single_rows, dq_single)
+        dk.index_copy_(0, partition.single_rows, dk_single)
+        dv.index_copy_(0, partition.single_rows, dv_single)
+        dpos_key = torch.zeros_like(pos_key).contiguous() if pos_key is not None else None
+        dpos_query = torch.zeros_like(pos_query).contiguous() if pos_query is not None else None
+        if dpos_key is not None and dpk_single is not None:
+            dpos_key.index_copy_(0, partition.single_rows, dpk_single)
+        if dpos_query is not None and dpq_single is not None:
+            dpos_query.index_copy_(0, partition.single_rows, dpq_single)
+        return dq, dk, dv, dpos_key, dpos_query
+
+    if has_single_rows and has_multi_rows:
+        dq = torch.zeros_like(query_layer)
+        dk = torch.zeros_like(key_layer)
+        dv = torch.zeros_like(value_layer)
+        dpos_key = torch.zeros_like(pos_key).contiguous() if pos_key is not None else None
+        dpos_query = torch.zeros_like(pos_query).contiguous() if pos_query is not None else None
+
+        dq_single, dk_single, dv_single, dpk_single, dpq_single = _docblock_fixed_backward_impl(
+            grad_output=grad_output.index_select(0, partition.single_rows),
+            query_layer=query_layer.index_select(0, partition.single_rows),
+            key_layer=key_layer.index_select(0, partition.single_rows),
+            value_layer=value_layer.index_select(0, partition.single_rows),
+            seq_lengths=partition.single_seq_lengths,
+            output_padded=output_padded.index_select(0, partition.single_rows),
+            lse_padded=lse_padded.index_select(0, partition.single_rows),
+            pos_key=_select_rows_or_none(pos_key, partition.single_rows),
+            pos_query=_select_rows_or_none(pos_query, partition.single_rows),
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+        )
+        dq.index_copy_(0, partition.single_rows, dq_single)
+        dk.index_copy_(0, partition.single_rows, dk_single)
+        dv.index_copy_(0, partition.single_rows, dv_single)
+        if dpos_key is not None and dpk_single is not None:
+            dpos_key.index_copy_(0, partition.single_rows, dpk_single)
+        if dpos_query is not None and dpq_single is not None:
+            dpos_query.index_copy_(0, partition.single_rows, dpq_single)
+
+        dq_multi, dk_multi, dv_multi, dpk_multi, dpq_multi = _docblock_backward_impl(
+            grad_output=grad_output.index_select(0, partition.multi_rows),
+            query_layer=query_layer.index_select(0, partition.multi_rows),
+            key_layer=key_layer.index_select(0, partition.multi_rows),
+            value_layer=value_layer.index_select(0, partition.multi_rows),
+            output_padded=output_padded.index_select(0, partition.multi_rows),
+            lse_padded=lse_padded.index_select(0, partition.multi_rows),
+            segment_offsets=partition.multi_segment_offsets,
+            segment_lengths=partition.multi_segment_lengths,
+            cu_seqlens=partition.multi_cu_seqlens,
+            pos_key=_select_rows_or_none(pos_key, partition.multi_rows),
+            pos_query=_select_rows_or_none(pos_query, partition.multi_rows),
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            q_unpad=q_unpad,
+            k_unpad=k_unpad,
+            v_unpad=v_unpad,
+            out_unpad=out_unpad,
+            lse_unpad=lse_unpad,
+            pos_key_unpad=pos_key_unpad,
+            pos_query_unpad=pos_query_unpad,
+        )
+        dq.index_copy_(0, partition.multi_rows, dq_multi)
+        dk.index_copy_(0, partition.multi_rows, dk_multi)
+        dv.index_copy_(0, partition.multi_rows, dv_multi)
+        if dpos_key is not None and dpk_multi is not None:
+            dpos_key.index_copy_(0, partition.multi_rows, dpk_multi)
+        if dpos_query is not None and dpq_multi is not None:
+            dpos_query.index_copy_(0, partition.multi_rows, dpq_multi)
         return dq, dk, dv, dpos_key, dpos_query
 
     if q_unpad is None or k_unpad is None or v_unpad is None:
@@ -608,7 +1081,13 @@ def _docblock_backward_impl(
             if dpos_query_unpad is not None
             else None
         )
-    return dq, dk, dv, dpos_key, dpos_query
+    return (
+        dq.contiguous(),
+        dk.contiguous(),
+        dv.contiguous(),
+        dpos_key.contiguous() if dpos_key is not None else None,
+        dpos_query.contiguous() if dpos_query is not None else None,
+    )
 
 
 def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:

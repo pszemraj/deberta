@@ -258,6 +258,36 @@ def _mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torc
     return key_mask.to(dtype=torch.bool)
 
 
+def _pairwise_mask_to_4d_keep_mask(
+    attention_mask: torch.Tensor,
+    *,
+    query_len: int,
+    key_len: int,
+) -> torch.Tensor:
+    """Extract a canonical pairwise keep mask ``(B,1,Q,K)``.
+
+    :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
+    :param int query_len: Expected query length.
+    :param int key_len: Expected key length.
+    :raises ValueError: If the mask is not pairwise.
+    :return torch.Tensor: Boolean keep mask with shape ``(B, 1, Q, K)``.
+    """
+
+    mask = normalize_keep_mask(attention_mask)
+    if mask.ndim == 3:
+        pairwise = mask.unsqueeze(1)
+    elif mask.ndim == 4:
+        pairwise = mask
+    else:
+        raise ValueError("FlashDeBERTa pairwise masks must be shaped (B,Q,K) or (B,1,Q,K).")
+    if tuple(pairwise.shape[-2:]) != (int(query_len), int(key_len)):
+        raise ValueError(
+            "FlashDeBERTa pairwise masks must match the attention shape; "
+            f"got mask={tuple(pairwise.shape)} expected=(*,{int(query_len)},{int(key_len)})."
+        )
+    return pairwise.to(dtype=torch.bool)
+
+
 def _is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
     """Return whether a mask encodes per-query pairwise constraints.
 
@@ -448,6 +478,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         attention_mask: torch.Tensor | None,
         query_states: torch.Tensor,
         rel_embeddings: torch.Tensor | None,
+        flash_route_hint: str | None = None,
     ) -> tuple[str, str] | None:
         """Return the first reason this call should use eager attention.
 
@@ -455,12 +486,14 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor query_states: Query hidden states.
         :param torch.Tensor | None rel_embeddings: Relative embedding table.
+        :param str | None flash_route_hint: Optional out-of-graph routing hint.
         :return tuple[str, str] | None: Fallback reason key and message, or ``None``.
         """
 
         query_len = int(query_states.shape[-2])
         key_len = int(hidden_states.shape[-2])
         dropout_p = float(getattr(self.dropout, "p", 0.0))
+        normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
 
         dense_eager_limit = int(_RUNTIME_CONFIG.eager_dense_max_seq_len)
         if dense_eager_limit > 0 and attention_mask is None and key_len <= dense_eager_limit:
@@ -468,8 +501,10 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "dense_short_policy",
                 "FlashDeBERTa dense short-sequence policy selected eager attention for this batch.",
             )
-        if attention_mask is not None and _is_pairwise_mask(
-            attention_mask, query_len=query_len, key_len=key_len
+        if (
+            attention_mask is not None
+            and _is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
+            and normalized_flash_route != "docblock_bias"
         ):
             return (
                 "pairwise_mask",
@@ -792,6 +827,71 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             _record_stat("flash_docblock_calls")
         return out
 
+    def _flash_docblock_bias(
+        self,
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Run dense flash-with-bias for short packed doc-block batches.
+
+        :param torch.Tensor query_layer: Queries in ``(B, H, S, D)`` layout.
+        :param torch.Tensor key_layer: Keys in ``(B, H, S, D)`` layout.
+        :param torch.Tensor value_layer: Values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
+        :param torch.Tensor | None pos_key: Optional c2p term in ``(B, H, S, P)`` layout.
+        :param torch.Tensor | None pos_query: Optional p2c term in ``(B, H, S, P)`` layout.
+        :param float sm_scale: Softmax scale.
+        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        """
+
+        batch_size, num_heads, seq_len, _ = query_layer.shape
+        keep_mask = _pairwise_mask_to_4d_keep_mask(
+            attention_mask,
+            query_len=seq_len,
+            key_len=int(key_layer.shape[-2]),
+        ).expand(batch_size, num_heads, seq_len, int(key_layer.shape[-2]))
+        bucket_index = _dense_bucket_index_tensor(
+            seq_len=seq_len,
+            position_buckets=int(self.position_buckets),
+            max_relative_distance=int(self.max_relative_positions),
+            device=query_layer.device,
+        )
+        bucket_index_b = bucket_index.view(1, 1, seq_len, seq_len).expand(
+            batch_size, num_heads, seq_len, seq_len
+        )
+        bias = torch.zeros(
+            (batch_size, num_heads, seq_len, seq_len),
+            device=query_layer.device,
+            dtype=query_layer.dtype,
+        )
+        if pos_key is not None:
+            bias = bias + torch.gather(pos_key, dim=-1, index=bucket_index_b)
+        if pos_query is not None:
+            bucket_index_t = (
+                bucket_index.t()
+                .contiguous()
+                .view(1, 1, seq_len, seq_len)
+                .expand(batch_size, num_heads, seq_len, seq_len)
+            )
+            bias = bias + torch.gather(pos_query, dim=-1, index=bucket_index_t).transpose(-1, -2)
+        bias = bias.masked_fill(~keep_mask, -1.0e4)
+        if _RUNTIME_CONFIG.enable_debug_stats:
+            _record_stat("flash_docblock_bias_calls")
+        return flashdeberta_bias(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            bias=bias * float(sm_scale),
+            sm_scale=sm_scale,
+            causal=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -835,6 +935,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             attention_mask=attention_mask,
             query_states=query_states,
             rel_embeddings=rel_embeddings,
+            flash_route_hint=flash_route_hint,
         )
         if reason is not None:
             key, message = reason
@@ -860,9 +961,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
         normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
+        use_docblock_bias = normalized_flash_route == "docblock_bias"
         use_docblock = normalized_flash_route == "docblock"
         if use_docblock:
             use_varlen = True
+        elif use_docblock_bias:
+            use_varlen = False
         elif normalized_flash_route == "varlen":
             use_varlen = True
         elif normalized_flash_route in {"fixed", "dense", "pairwise"}:
@@ -872,6 +976,67 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 attention_mask=attention_mask,
                 seq_len=int(hidden_states.shape[-2]),
             )
+
+        if use_docblock_bias:
+            if attention_mask is None or not _is_pairwise_mask(
+                attention_mask,
+                query_len=query_len,
+                key_len=int(hidden_states.shape[-2]),
+            ):
+                if _RUNTIME_CONFIG.enable_debug_stats:
+                    _record_stat("fallback_calls")
+                    _record_stat("fallback_docblock_bias_mask")
+                self._warn_once(
+                    reason="docblock_bias_mask",
+                    message=(
+                        "FlashDeBERTa dense doc-block bias routing requires a pairwise keep mask; "
+                        "using eager attention."
+                    ),
+                )
+                return super().forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    query_states=query_states,
+                    relative_pos=None,
+                    rel_embeddings=rel_embeddings,
+                )
+            bias_import_error = flashdeberta_bias_import_error()
+            if bias_import_error is not None:
+                if _RUNTIME_CONFIG.enable_debug_stats:
+                    _record_stat("fallback_calls")
+                    _record_stat("fallback_docblock_bias_missing")
+                self._warn_once(
+                    reason="docblock_bias_missing",
+                    message=("FlashDeBERTa dense doc-block bias path is unavailable; using eager attention."),
+                )
+                return super().forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    query_states=query_states,
+                    relative_pos=None,
+                    rel_embeddings=rel_embeddings,
+                )
+            if _is_torch_compiling() and not flashdeberta_compiled_bias_available():
+                if _RUNTIME_CONFIG.enable_debug_stats:
+                    _record_stat("fallback_calls")
+                    _record_stat("fallback_docblock_bias_compile")
+                self._warn_once(
+                    reason="docblock_bias_compile",
+                    message=(
+                        "FlashDeBERTa dense doc-block bias path is not compile-visible on this build; "
+                        "using eager attention."
+                    ),
+                )
+                return super().forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    query_states=query_states,
+                    relative_pos=None,
+                    rel_embeddings=rel_embeddings,
+                )
 
         if use_docblock:
             if (
@@ -992,7 +1157,18 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_eligible_calls")
-        if use_docblock:
+        if use_docblock_bias:
+            output = self._flash_docblock_bias(
+                query_layer=query_layer,
+                key_layer=key_layer,
+                value_layer=value_layer,
+                attention_mask=attention_mask,
+                pos_key=pos_key,
+                pos_query=pos_query,
+                sm_scale=sm_scale,
+            )
+            output = output.contiguous().view(bsz, query_len, self.all_head_size)
+        elif use_docblock:
             output = self._flash_docblock(
                 query_layer=query_layer,
                 key_layer=key_layer,

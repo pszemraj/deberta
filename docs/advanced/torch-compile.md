@@ -62,15 +62,18 @@ kernels. That path is opaque to Dynamo in the same way as the fixed and varlen
 custom ops, so it behaves like a normal compiled attention primitive instead of
 tracing through Python-side launcher code.
 
-Packed doc-block batches on `hf_deberta_v2` use a fourth route. Instead of
-expanding `doc_ids` into a dense `(B,S,S)` mask, the compile metadata step
-keeps the 2D keep mask plus fixed-shape segment descriptors sized to `B*S`.
-The opaque doc-block custom op slices the active segment prefix, repacks those
-document spans into a ragged batch, runs the existing disentangled varlen flash
-kernels, and scatters the results back into the original packed layout. The
-fixed-shape metadata contract is important: it keeps the compiled
-`masked_docblock_*` entrypoints from recompiling when the number of documents
-per packed batch changes.
+Packed doc-block batches on `hf_deberta_v2` use a fourth route family with a
+measured split by sequence regime. Exact packed `1024` batches route through a
+dense flash-with-bias path by default, because that short packed-docblock case
+is better served by the quadratic bias kernel than by the ragged varlen
+backward path on current GPUs. Longer packed doc-block batches keep the
+segment-aware route. In that path, compile metadata keeps the 2D keep mask plus
+fixed-shape segment descriptors sized to `B*S`, and the opaque doc-block custom
+op slices the active segment prefix, repacks those document spans into a ragged
+batch, runs the existing disentangled varlen flash kernels, and scatters the
+results back into the original packed layout. The fixed-shape metadata contract
+is important: it keeps the compiled `masked_docblock_*` entrypoints from
+recompiling when the number of documents per packed batch changes.
 
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,
@@ -100,8 +103,15 @@ first and prefer the split overrides:
 
 ## Special case: packed doc-block masks
 
-For `hf_deberta_v2`, packed doc-blocking now stays on the segment-aware flash
-route described above when the FlashDeBERTa runtime patch is enabled.
+For `hf_deberta_v2`, packed doc-blocking now uses the measured route policy
+described above when the FlashDeBERTa runtime patch is enabled:
+
+- exact packed `1024` uses dense flash-with-bias by default
+- longer packed doc-block runs stay on the segment-aware flash custom op
+
+Set `FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN=0` to disable the dense-bias shortcut,
+or point it at a different exact sequence length if another machine bucket
+proves a different crossover.
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope
 downgrades toward FFN-focused compile to avoid shape-churn recompiles from

@@ -1266,6 +1266,58 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
     assert torch.count_nonzero(prepared["flash_doc_segment_lengths"][4:]).item() == 0
 
 
+def test_prepare_flash_attention_batch_metadata_routes_docblock_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.training.compile as compile_mod
+
+    monkeypatch.setenv("FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN", "5")
+    batch = {
+        "input_ids": torch.zeros((2, 5), dtype=torch.long),
+        "doc_ids": torch.tensor(
+            [
+                [1, 1, 2, 2, 0],
+                [1, 2, 2, 0, 0],
+            ],
+            dtype=torch.long,
+        ),
+    }
+
+    prepared, route = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+    )
+
+    assert route == "docblock_bias"
+    assert "doc_ids" not in prepared
+    assert "flash_doc_segment_offsets" not in prepared
+    assert "flash_doc_segment_lengths" not in prepared
+    assert "flash_doc_cu_seqlens" not in prepared
+    assert tuple(prepared["attention_mask"].shape) == (2, 5, 5)
+    assert prepared["attention_mask"].dtype == torch.bool
+    assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([4, 3], dtype=torch.int32))
+    assert int(prepared["flash_active_tokens"].item()) == 7
+
+
+def test_partition_docblock_rows_splits_single_and_multi_rows() -> None:
+    import deberta.modeling.flashdeberta_docblock_op as docblock_mod
+
+    partition = docblock_mod._partition_docblock_rows(
+        segment_offsets=torch.tensor([0, 5, 7], dtype=torch.int32),
+        segment_lengths=torch.tensor([5, 2, 3], dtype=torch.int32),
+        seq_len=5,
+    )
+
+    assert torch.equal(partition.single_rows, torch.tensor([0], dtype=torch.long))
+    assert torch.equal(partition.single_seq_lengths, torch.tensor([5], dtype=torch.int32))
+    assert torch.equal(partition.multi_rows, torch.tensor([1], dtype=torch.long))
+    assert torch.equal(partition.multi_segment_offsets, torch.tensor([0, 2], dtype=torch.int32))
+    assert torch.equal(partition.multi_segment_lengths, torch.tensor([2, 3], dtype=torch.int32))
+    assert torch.equal(partition.multi_cu_seqlens, torch.tensor([0, 2, 5], dtype=torch.int32))
+    assert partition.multi_total_tokens == 5
+    assert partition.multi_max_seqlen == 3
+
+
 def test_prepare_flash_attention_batch_metadata_respects_force_varlen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1366,6 +1418,69 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
     assert stats["flash_docblock_calls"] == 1
     assert stats.get("flash_varlen_calls", 0) == 0
     assert stats.get("flash_fixed_calls", 0) == 0
+    assert stats.get("fallback_calls", 0) == 0
+
+
+def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(attention_mod, "flashdeberta_bias_import_error", lambda: None)
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_bias_available", lambda: True)
+    seen: dict[str, torch.Tensor] = {}
+
+    def _fake_bias_wrapper(
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        bias: torch.Tensor,
+        sm_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        del key_layer, value_layer, sm_scale, causal
+        seen["bias"] = bias
+        return torch.zeros_like(query_layer)
+
+    monkeypatch.setattr(attention_mod, "flashdeberta_bias", _fake_bias_wrapper)
+
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.tensor(
+        [
+            [
+                [True, True, False, False],
+                [True, True, False, False],
+                [False, False, True, False],
+                [False, False, False, False],
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+        flash_route_hint="docblock_bias",
+    )
+
+    assert probs is None
+    assert tuple(output.shape) == (1, 4, cfg.hidden_size)
+    assert tuple(seen["bias"].shape) == (1, cfg.num_attention_heads, 4, 4)
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["forward_calls"] == 1
+    assert stats["flash_eligible_calls"] == 1
+    assert stats["flash_docblock_bias_calls"] == 1
+    assert stats.get("flash_docblock_calls", 0) == 0
     assert stats.get("fallback_calls", 0) == 0
 
 

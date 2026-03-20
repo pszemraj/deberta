@@ -1298,6 +1298,101 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
     assert tuple(masked.shape) == (1, 4)
 
 
+def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.rtd import EnhancedMaskDecoder
+
+    class _Cfg:
+        position_biased_input = False
+
+    class _PositionEmbeddings(torch.nn.Module):
+        def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+            bsz, seq_len = position_ids.shape
+            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
+
+    class _Embeddings(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.position_embeddings = _PositionEmbeddings()
+            self.LayerNorm = torch.nn.Identity()
+
+    class _LastLayer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: dict[str, torch.Tensor | str | None] = {}
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            *,
+            output_attentions: bool = False,
+            query_states: torch.Tensor | None = None,
+            relative_pos: torch.Tensor | None = None,
+            rel_embeddings: torch.Tensor | None = None,
+            flash_seq_lengths: torch.Tensor | None = None,
+            flash_doc_segment_offsets: torch.Tensor | None = None,
+            flash_doc_segment_lengths: torch.Tensor | None = None,
+            flash_doc_cu_seqlens: torch.Tensor | None = None,
+            flash_route_hint: str | None = None,
+        ) -> tuple[torch.Tensor, None]:
+            del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
+            assert query_states is not None
+            self.seen = {
+                "flash_seq_lengths": flash_seq_lengths,
+                "flash_doc_segment_offsets": flash_doc_segment_offsets,
+                "flash_doc_segment_lengths": flash_doc_segment_lengths,
+                "flash_doc_cu_seqlens": flash_doc_cu_seqlens,
+                "flash_route_hint": flash_route_hint,
+            }
+            return query_states, None
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self, layer: torch.nn.Module) -> None:
+            super().__init__()
+            self.layer = torch.nn.ModuleList([layer])
+
+    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
+    last_layer = _LastLayer()
+    encoder = _Encoder(last_layer)
+    embeddings = _Embeddings()
+
+    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
+    encoder_hidden_states = [kv_states, kv_states + 1.0]
+    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    attention_mask = torch.tensor(
+        [[[True, True, False], [True, True, False], [False, False, True]]],
+        dtype=torch.bool,
+    )
+    flash_seq_lengths = torch.tensor([2], dtype=torch.int32)
+    flash_doc_segment_offsets = torch.tensor([0, 2], dtype=torch.int32)
+    flash_doc_segment_lengths = torch.tensor([2, 1], dtype=torch.int32)
+    flash_doc_cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+
+    masked = decoder(
+        encoder_hidden_states=encoder_hidden_states,
+        masked_positions=masked_positions,
+        attention_mask=attention_mask,
+        embeddings=embeddings,
+        encoder=encoder,
+        flash_seq_lengths=flash_seq_lengths,
+        flash_doc_segment_offsets=flash_doc_segment_offsets,
+        flash_doc_segment_lengths=flash_doc_segment_lengths,
+        flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+        flash_route_hint="docblock_bias",
+    )
+
+    assert tuple(masked.shape) == (1, 4)
+    assert last_layer.seen["flash_route_hint"] == "docblock_bias"
+    assert torch.equal(last_layer.seen["flash_seq_lengths"], flash_seq_lengths)
+    assert torch.equal(last_layer.seen["flash_doc_segment_offsets"], flash_doc_segment_offsets)
+    assert torch.equal(last_layer.seen["flash_doc_segment_lengths"], flash_doc_segment_lengths)
+    assert torch.equal(last_layer.seen["flash_doc_cu_seqlens"], flash_doc_cu_seqlens)
+
+
 def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
     import pytest
 

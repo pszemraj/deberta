@@ -227,6 +227,24 @@ def _flash_route_hint_for_padding_batch(
     return route_by_bucket.get(density_bucket, default_route)
 
 
+def _flash_route_hint_for_docblock_batch(*, seq_len: int) -> str:
+    """Select the doc-block flash backend for one packed batch.
+
+    The repo's measured packed-docblock ``1024`` regime is not a good fit for
+    the ragged segment-aware varlen path. Route that exact short-sequence case
+    through dense flash-with-bias instead, and keep the ragged doc-block custom
+    op for longer contexts where the quadratic bias route is less practical.
+
+    :param int seq_len: Packed sequence length.
+    :return str: Either ``docblock_bias`` or ``docblock``.
+    """
+
+    bias_seq_len = max(0, _flash_int_env("FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN", 1024))
+    if int(bias_seq_len) > 0 and int(seq_len) == int(bias_seq_len):
+        return "docblock_bias"
+    return "docblock"
+
+
 def _build_doc_segment_metadata(
     doc_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -315,18 +333,27 @@ def prepare_flash_attention_batch_metadata(
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
+        route_hint = _flash_route_hint_for_docblock_batch(seq_len=int(input_ids.shape[-1]))
         keep_mask = doc_ids.ne(0)
         seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
-        segment_offsets, segment_lengths, cu_seqlens, active_tokens = _build_doc_segment_metadata(doc_ids)
-        batch["attention_mask"] = keep_mask
+        active_tokens = int(seq_lengths.sum(dtype=torch.int32).item())
+        batch["attention_mask"] = (
+            _build_doc_block_mask(doc_ids) if route_hint == "docblock_bias" else keep_mask
+        )
         batch["flash_seq_lengths"] = seq_lengths
         batch["flash_active_tokens"] = torch.tensor(
             int(active_tokens), device=seq_lengths.device, dtype=torch.int32
         )
+        if route_hint == "docblock_bias":
+            batch.pop("flash_doc_segment_offsets", None)
+            batch.pop("flash_doc_segment_lengths", None)
+            batch.pop("flash_doc_cu_seqlens", None)
+            return batch, route_hint
+        segment_offsets, segment_lengths, cu_seqlens, _ = _build_doc_segment_metadata(doc_ids)
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
-        return batch, "docblock"
+        return batch, route_hint
 
     attention_mask = batch.get("attention_mask")
     seq_len = int(input_ids.shape[-1])
@@ -941,6 +968,80 @@ def _install_stable_backbone_compile_dispatch(
             flash_route_hint="docblock",
         )
 
+    def _masked_docblock_bias_hs0_fn(
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
+    ) -> Any:
+        """Call the masked helper with dense doc-block bias flash routing.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
+        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block segment metadata.
+        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block segment metadata.
+        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block segment metadata.
+        :return Any: Masked-path backbone outputs.
+        """
+        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
+
+        return masked_hs0_fn(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            flash_seq_lengths=flash_seq_lengths,
+            flash_route_hint="docblock_bias",
+        )
+
+    def _masked_docblock_bias_hs1_fn(
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
+    ) -> Any:
+        """Call the masked helper with dense doc-block bias flash routing and hidden states.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
+        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block segment metadata.
+        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block segment metadata.
+        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block segment metadata.
+        :return Any: Masked-path backbone outputs.
+        """
+        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
+
+        return masked_hs1_fn(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            flash_seq_lengths=flash_seq_lengths,
+            flash_route_hint="docblock_bias",
+        )
+
     compiled_dense = {
         False: torch.compile(dense_hs0_fn, **compile_kwargs),
         True: torch.compile(dense_hs1_fn, **compile_kwargs),
@@ -960,6 +1061,10 @@ def _install_stable_backbone_compile_dispatch(
     compiled_masked_docblock = {
         False: torch.compile(_masked_docblock_hs0_fn, **compile_kwargs),
         True: torch.compile(_masked_docblock_hs1_fn, **compile_kwargs),
+    }
+    compiled_masked_docblock_bias = {
+        False: torch.compile(_masked_docblock_bias_hs0_fn, **compile_kwargs),
+        True: torch.compile(_masked_docblock_bias_hs1_fn, **compile_kwargs),
     }
 
     def _dispatch_forward(
@@ -1075,6 +1180,18 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
             )
+        if normalized_flash_route == "docblock_bias":
+            return compiled_masked_docblock_bias[resolved_output_hidden_states](
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                flash_seq_lengths=flash_seq_lengths,
+                flash_doc_segment_offsets=flash_doc_segment_offsets,
+                flash_doc_segment_lengths=flash_doc_segment_lengths,
+                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+            )
         return compiled_masked[resolved_output_hidden_states](
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1093,6 +1210,7 @@ def _install_stable_backbone_compile_dispatch(
     module._compiled_forward_masked_fixed = compiled_masked_fixed
     module._compiled_forward_masked_varlen = compiled_masked_varlen
     module._compiled_forward_masked_docblock = compiled_masked_docblock
+    module._compiled_forward_masked_docblock_bias = compiled_masked_docblock_bias
     module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]
     compiled_targets.extend(
         [
@@ -1106,6 +1224,8 @@ def _install_stable_backbone_compile_dispatch(
             f"{target}[masked_varlen_hs1]",
             f"{target}[masked_docblock_hs0]",
             f"{target}[masked_docblock_hs1]",
+            f"{target}[masked_docblock_bias_hs0]",
+            f"{target}[masked_docblock_bias_hs1]",
         ]
     )
     return True

@@ -423,6 +423,11 @@ class EnhancedMaskDecoder(nn.Module):
         encoder: nn.Module,
         position_ids: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
+        flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_route_hint: str | None = None,
     ) -> torch.Tensor:
         """Return hidden states for masked positions, using EMD when applicable.
 
@@ -442,6 +447,16 @@ class EnhancedMaskDecoder(nn.Module):
                 Optional position ids (B,S). If None, we create a 0..S-1 range.
             relative_pos:
                 Optional precomputed relative-position ids (for disentangled attention).
+            flash_seq_lengths:
+                Optional precomputed active lengths for flash backends.
+            flash_doc_segment_offsets:
+                Optional flat padded row offsets per doc segment.
+            flash_doc_segment_lengths:
+                Optional per-segment doc lengths.
+            flash_doc_cu_seqlens:
+                Optional cumulative packed doc offsets.
+            flash_route_hint:
+                Optional flash backend routing hint for the reused last layer.
 
         Returns:
             Tensor (N,H) of contextual states for masked positions.
@@ -527,13 +542,26 @@ class EnhancedMaskDecoder(nn.Module):
         outputs: list[torch.Tensor] = []
         for _ in range(self.num_passes):
             # DebertaV2Layer signature: (hidden_states, attention_mask, ..., query_states=...)
+            last_layer_kwargs: dict[str, Any] = {
+                "output_attentions": False,
+                "query_states": query_states,
+                "relative_pos": rel_pos,
+                "rel_embeddings": rel_embeddings,
+            }
+            if flash_seq_lengths is not None:
+                last_layer_kwargs["flash_seq_lengths"] = flash_seq_lengths
+            if flash_doc_segment_offsets is not None:
+                last_layer_kwargs["flash_doc_segment_offsets"] = flash_doc_segment_offsets
+            if flash_doc_segment_lengths is not None:
+                last_layer_kwargs["flash_doc_segment_lengths"] = flash_doc_segment_lengths
+            if flash_doc_cu_seqlens is not None:
+                last_layer_kwargs["flash_doc_cu_seqlens"] = flash_doc_cu_seqlens
+            if flash_route_hint is not None:
+                last_layer_kwargs["flash_route_hint"] = flash_route_hint
             out, _att = last_layer(
                 kv_states,
                 attn,
-                output_attentions=False,
-                query_states=query_states,
-                relative_pos=rel_pos,
-                rel_embeddings=rel_embeddings,
+                **last_layer_kwargs,
             )
             query_states = out
             outputs.append(out)
@@ -1070,6 +1098,11 @@ class DebertaV3RTDPretrainer(nn.Module):
                 attention_mask=attention_mask,
                 embeddings=self.generator.embeddings,
                 encoder=self.generator.encoder,
+                flash_seq_lengths=flash_seq_lengths,
+                flash_doc_segment_offsets=flash_doc_segment_offsets,
+                flash_doc_segment_lengths=flash_doc_segment_lengths,
+                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_route_hint=flash_route_hint,
             )
         else:
             hidden = gen_out.last_hidden_state
