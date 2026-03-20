@@ -241,14 +241,22 @@ def _varlen_kernel_override_from_env(
     - ``FLASHDEBERTA_VARLEN_BWD_BLOCK_N``
     - ``FLASHDEBERTA_VARLEN_BWD_NUM_STAGES``
     - ``FLASHDEBERTA_VARLEN_BWD_NUM_WARPS``
+    - ``FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_M``
+    - ``FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_N``
+    - ``FLASHDEBERTA_VARLEN_BWD_KV_NUM_STAGES``
+    - ``FLASHDEBERTA_VARLEN_BWD_KV_NUM_WARPS``
+    - ``FLASHDEBERTA_VARLEN_BWD_Q_BLOCK_M``
+    - ``FLASHDEBERTA_VARLEN_BWD_Q_BLOCK_N``
+    - ``FLASHDEBERTA_VARLEN_BWD_Q_NUM_STAGES``
+    - ``FLASHDEBERTA_VARLEN_BWD_Q_NUM_WARPS``
 
-    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param str kind: One of ``"fwd"``, ``"bwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
     :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
         or ``None`` when unset / invalid / incomplete.
     """
 
     normalized = str(kind).strip().lower()
-    if normalized not in {"fwd", "bwd"}:
+    if normalized not in {"fwd", "bwd", "bwd_kv", "bwd_q"}:
         raise ValueError(f"Unsupported varlen kernel override kind: {kind!r}")
 
     prefix = f"FLASHDEBERTA_VARLEN_{normalized.upper()}"
@@ -266,6 +274,165 @@ def _varlen_kernel_override_from_env(
     except Exception:
         return None
     return int(block_m), int(block_n), int(num_stages), int(num_warps)
+
+
+def _varlen_device_capability(device: torch.device) -> tuple[int, int]:
+    """Return CUDA device capability for one device.
+
+    :param torch.device device: CUDA device to query.
+    :return tuple[int, int]: ``(major, minor)`` compute capability.
+    """
+
+    if device.type != "cuda":
+        return (0, 0)
+    index = device.index
+    if index is None:
+        return torch.cuda.get_device_capability()
+    return torch.cuda.get_device_capability(index)
+
+
+def _varlen_density_bucket(*, seq_len: int, total_tokens: int, batch_size: int) -> str:
+    """Return the repo-local density bucket for one padded-varlen batch.
+
+    :param int seq_len: Padded sequence length.
+    :param int total_tokens: Total active tokens across the batch.
+    :param int batch_size: Batch size.
+    :return str: Density bucket label used by repo-local heuristics.
+    """
+
+    capacity = max(1, int(seq_len) * max(1, int(batch_size)))
+    density = float(total_tokens) / float(capacity)
+    if int(seq_len) >= 4096:
+        return "4096_plus"
+    if int(seq_len) >= 2048:
+        return "2048_medium" if density >= 0.60 else "2048_sparse"
+    return "1024_dense_or_medium"
+
+
+def _varlen_repo_tuned_bwd_config(
+    *,
+    kind: str,
+    seq_len: int,
+    total_tokens: int,
+    batch_size: int,
+    head_dim: int,
+    causal: bool,
+    disentangled: bool,
+    att_span: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int] | None:
+    """Return repo-local backward-kernel heuristics for measured hot paths.
+
+    :param str kind: Either ``"kv"`` or ``"q"``.
+    :param int seq_len: Padded sequence length.
+    :param int total_tokens: Total active tokens in the packed batch.
+    :param int batch_size: Batch size.
+    :param int head_dim: Attention head dimension.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool disentangled: Whether c2p/p2c position terms are active.
+    :param int att_span: Effective relative-position span.
+    :param torch.dtype dtype: Kernel dtype.
+    :param torch.device device: Launch device.
+    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when no repo-local override applies.
+    """
+
+    del dtype
+    normalized_kind = str(kind).strip().lower()
+    if normalized_kind not in {"kv", "q"}:
+        return None
+    if bool(causal) or not bool(disentangled):
+        return None
+    if int(head_dim) != 64:
+        return None
+    if int(att_span) < 128:
+        return None
+    capability = _varlen_device_capability(device)
+    if int(capability[0]) < 12:
+        return None
+    bucket = _varlen_density_bucket(
+        seq_len=int(seq_len), total_tokens=int(total_tokens), batch_size=int(batch_size)
+    )
+    tuned: dict[tuple[str, str], tuple[int, int, int, int]] = {
+        ("kv", "2048_medium"): (64, 64, 3, 8),
+        ("kv", "2048_sparse"): (64, 64, 3, 8),
+        ("kv", "4096_plus"): (64, 64, 3, 8),
+        ("q", "2048_medium"): (64, 64, 3, 8),
+        ("q", "2048_sparse"): (64, 64, 3, 8),
+        ("q", "4096_plus"): (64, 64, 3, 8),
+    }
+    return tuned.get((normalized_kind, bucket))
+
+
+def _resolve_varlen_bwd_kernel_config(
+    *,
+    kind: str,
+    total_tokens_q: int,
+    total_tokens_k: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    batch_size: int,
+    head_dim: int,
+    causal: bool,
+    disentangled: bool,
+    att_span: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int]:
+    """Resolve one repo-local varlen backward kernel config.
+
+    :param str kind: Either ``"kv"`` or ``"q"``.
+    :param int total_tokens_q: Total query tokens.
+    :param int total_tokens_k: Total key tokens.
+    :param int max_seqlen_q: Maximum query sequence length.
+    :param int max_seqlen_k: Maximum key sequence length.
+    :param int batch_size: Batch size.
+    :param int head_dim: Attention head dimension.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool disentangled: Whether c2p/p2c position terms are active.
+    :param int att_span: Effective relative-position span.
+    :param torch.dtype dtype: Kernel dtype.
+    :param torch.device device: Launch device.
+    :return tuple[int, int, int, int]: Resolved ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    specific_override = _varlen_kernel_override_from_env(kind=f"bwd_{kind}")
+    if specific_override is not None:
+        return specific_override
+
+    generic_override = _varlen_kernel_override_from_env(kind="bwd")
+    if generic_override is not None:
+        return generic_override
+
+    repo_tuned = _varlen_repo_tuned_bwd_config(
+        kind=kind,
+        seq_len=max(max_seqlen_q, max_seqlen_k),
+        total_tokens=max(total_tokens_q, total_tokens_k),
+        batch_size=batch_size,
+        head_dim=head_dim,
+        causal=causal,
+        disentangled=disentangled,
+        att_span=att_span,
+        dtype=dtype,
+        device=device,
+    )
+    if repo_tuned is not None:
+        return repo_tuned
+
+    if _get_bwd_config_varlen_lowlevel is None:
+        raise RuntimeError("FlashDeBERTa varlen backward config helper is unavailable.")
+    return _get_bwd_config_varlen_lowlevel(
+        total_tokens_q=int(total_tokens_q),
+        total_tokens_k=int(total_tokens_k),
+        max_seqlen_q=int(max_seqlen_q),
+        max_seqlen_k=int(max_seqlen_k),
+        D=int(head_dim),
+        causal=bool(causal),
+        disentangled=bool(disentangled),
+        att_span=int(att_span),
+        dtype=dtype,
+    )
 
 
 def _build_unpad_metadata(
@@ -807,48 +974,58 @@ def _varlen_backward_raw_impl(
         Packed gradients for q/k/v and optional positional tensors.
     """
 
-    if _get_bwd_config_varlen_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa varlen backward config helper is unavailable.")
-
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
-    override = _varlen_kernel_override_from_env(kind="bwd")
-    if override is not None:
-        block_m, block_n, num_stages, num_warps = override
-    else:
-        block_m, block_n, num_stages, num_warps = _get_bwd_config_varlen_lowlevel(
-            total_tokens_q=int(token_capacity),
-            total_tokens_k=int(token_capacity),
-            max_seqlen_q=int(seq_bound),
-            max_seqlen_k=int(seq_bound),
-            D=int(q_unpad.shape[-1]),
-            causal=bool(causal),
-            disentangled=True,
-            att_span=att_span,
-            dtype=q_unpad.dtype,
-        )
+    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_varlen_bwd_kernel_config(
+        kind="kv",
+        total_tokens_q=int(token_capacity),
+        total_tokens_k=int(token_capacity),
+        max_seqlen_q=int(seq_bound),
+        max_seqlen_k=int(seq_bound),
+        batch_size=int(batch_size),
+        head_dim=int(q_unpad.shape[-1]),
+        causal=bool(causal),
+        disentangled=True,
+        att_span=att_span,
+        dtype=q_unpad.dtype,
+        device=q_unpad.device,
+    )
+    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_varlen_bwd_kernel_config(
+        kind="q",
+        total_tokens_q=int(token_capacity),
+        total_tokens_k=int(token_capacity),
+        max_seqlen_q=int(seq_bound),
+        max_seqlen_k=int(seq_bound),
+        batch_size=int(batch_size),
+        head_dim=int(q_unpad.shape[-1]),
+        causal=bool(causal),
+        disentangled=True,
+        att_span=att_span,
+        dtype=q_unpad.dtype,
+        device=q_unpad.device,
+    )
 
     if dense_mid_tensors:
         mid_m_batch, mid_m_start, m_tile_count = _build_dense_mid_tensors(
             cu_seqlens=cu_seqlens,
             batch_size=batch_size,
             seq_len=int(seq_bound),
-            block_size=block_m,
+            block_size=q_block_m,
         )
         mid_n_batch, mid_n_start, n_tile_count = _build_dense_mid_tensors(
             cu_seqlens=cu_seqlens,
             batch_size=batch_size,
             seq_len=int(seq_bound),
-            block_size=block_n,
+            block_size=kv_block_n,
         )
     else:
         mid_m_batch, mid_m_start, m_tile_count = _get_mid_tensors_cached(
             cu_seqlens=cu_seqlens,
-            block_m=block_m,
+            block_m=q_block_m,
             device=q_unpad.device,
         )
         mid_n_batch, mid_n_start, n_tile_count = _get_mid_tensors_cached(
             cu_seqlens=cu_seqlens,
-            block_m=block_n,
+            block_m=kv_block_n,
             device=q_unpad.device,
         )
 
@@ -912,17 +1089,17 @@ def _varlen_backward_raw_impl(
         stride_pq2,
         batch_size,
         int(q_unpad.shape[1]),
-        BLOCK_M=block_m,
+        BLOCK_M=kv_block_m,
         BLOCK_DMODEL=int(q_unpad.shape[-1]),
-        BLOCK_N=block_n,
+        BLOCK_N=kv_block_n,
         CAUSAL=bool(causal),
         HAS_C2P=bool(pos_key_unpad is not None),
         HAS_P2C=bool(pos_query_unpad is not None),
         ATT_SPAN=att_span,
         NUM_BUCKETS=int(position_buckets),
         MAX_DISTANCE=int(max_relative_distance),
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=kv_num_warps,
+        num_stages=kv_num_stages,
     )
 
     grid_q = (m_tile_count, int(q_unpad.shape[1]))
@@ -964,17 +1141,17 @@ def _varlen_backward_raw_impl(
         stride_pq2,
         batch_size,
         int(q_unpad.shape[1]),
-        BLOCK_M=block_m,
+        BLOCK_M=q_block_m,
         BLOCK_DMODEL=int(q_unpad.shape[-1]),
-        BLOCK_N=block_n,
+        BLOCK_N=q_block_n,
         CAUSAL=bool(causal),
         HAS_C2P=bool(pos_key_unpad is not None),
         HAS_P2C=bool(pos_query_unpad is not None),
         ATT_SPAN=att_span,
         NUM_BUCKETS=int(position_buckets),
         MAX_DISTANCE=int(max_relative_distance),
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=q_num_warps,
+        num_stages=q_num_stages,
     )
     return dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad
 

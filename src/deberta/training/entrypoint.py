@@ -42,6 +42,7 @@ from deberta.training.compile import (
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _stabilize_compile_attention_mask,
+    prepare_flash_attention_batch_metadata,
 )
 from deberta.training.export_helpers import _export_discriminator_hf_subprocess
 from deberta.training.loop_utils import (
@@ -1124,6 +1125,10 @@ def run_pretraining(
                         compile_scope=compile_scope,
                         backbone_type=str(model_cfg.backbone_type),
                     )
+                    batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                        batch=batch,
+                        backbone_type=str(model_cfg.backbone_type),
+                    )
                     if compile_enabled:
                         _maybe_cudagraph_mark_step_begin()
 
@@ -1137,6 +1142,8 @@ def run_pretraining(
                             token_type_ids=batch.get("token_type_ids"),
                             sampling_temperature=train_cfg.sampling_temperature,
                             phase="generator",
+                            flash_seq_lengths=batch.get("flash_seq_lengths"),
+                            flash_route_hint=flash_route_hint,
                         )
                         gen_loss = gen_phase_out.gen_loss_raw
                         if token_weighted_ga:
@@ -1229,6 +1236,8 @@ def run_pretraining(
                                 "input_ids": batch["input_ids"],
                                 "attention_mask": batch.get("attention_mask"),
                                 "token_type_ids": batch.get("token_type_ids"),
+                                "flash_seq_lengths": batch.get("flash_seq_lengths"),
+                                "flash_route_hint": flash_route_hint,
                                 "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                                 "disc_labels": gen_phase_out.disc_labels,
                                 "disc_count": float(disc_count),
@@ -1305,6 +1314,8 @@ def run_pretraining(
                                 attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
                                 token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                                 phase="discriminator",
+                                flash_seq_lengths=payload["flash_seq_lengths"],  # type: ignore[arg-type]
+                                flash_route_hint=payload["flash_route_hint"],  # type: ignore[arg-type]
                             )
                             disc_loss = disc_phase_out.disc_loss_raw
                             disc_objective_weight = float(payload.get("disc_objective_weight", 1.0))
@@ -1578,6 +1589,10 @@ def run_pretraining(
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
                 )
+                batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                    batch=batch,
+                    backbone_type=str(model_cfg.backbone_type),
+                )
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()
 
@@ -1593,6 +1608,8 @@ def run_pretraining(
                         sampling_temperature=train_cfg.sampling_temperature,
                         gen_loss_weight=train_cfg.gen_loss_weight,
                         disc_loss_weight=train_cfg.disc_loss_weight,
+                        flash_seq_lengths=batch.get("flash_seq_lengths"),
+                        flash_route_hint=flash_route_hint,
                     )
 
                     if token_weighted_ga:

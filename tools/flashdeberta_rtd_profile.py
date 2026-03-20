@@ -61,6 +61,7 @@ from deberta.training.compile import (  # noqa: E402
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _stabilize_compile_attention_mask,
+    prepare_flash_attention_batch_metadata,
 )
 from deberta.training.loop_utils import _resolve_window_token_denominators  # noqa: E402
 from deberta.training.runtime import (  # noqa: E402
@@ -301,6 +302,10 @@ def _run_decoupled_window(
                     compile_scope=compile_scope,
                     backbone_type=backbone_type,
                 )
+                batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                    batch=batch,
+                    backbone_type=backbone_type,
+                )
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()
 
@@ -313,6 +318,8 @@ def _run_decoupled_window(
                         token_type_ids=batch.get("token_type_ids"),
                         sampling_temperature=float(sampling_temperature),
                         phase="generator",
+                        flash_seq_lengths=batch.get("flash_seq_lengths"),
+                        flash_route_hint=flash_route_hint,
                     )
 
             gen_loss = gen_phase_out.gen_loss_raw
@@ -338,6 +345,8 @@ def _run_decoupled_window(
                     "input_ids": batch["input_ids"],
                     "attention_mask": batch.get("attention_mask"),
                     "token_type_ids": batch.get("token_type_ids"),
+                    "flash_seq_lengths": batch.get("flash_seq_lengths"),
+                    "flash_route_hint": flash_route_hint,
                     "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                     "disc_labels": gen_phase_out.disc_labels,
                     "disc_count": float(disc_count),
@@ -368,6 +377,8 @@ def _run_decoupled_window(
                         attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
                         token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                         phase="discriminator",
+                        flash_seq_lengths=payload["flash_seq_lengths"],  # type: ignore[arg-type]
+                        flash_route_hint=payload["flash_route_hint"],  # type: ignore[arg-type]
                     )
 
             disc_loss = disc_phase_out.disc_loss_raw
@@ -483,6 +494,10 @@ def _run_coupled_window(
                     compile_scope=compile_scope,
                     backbone_type=backbone_type,
                 )
+                batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                    batch=batch,
+                    backbone_type=backbone_type,
+                )
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()
 
@@ -496,6 +511,8 @@ def _run_coupled_window(
                         sampling_temperature=float(sampling_temperature),
                         gen_loss_weight=gen_loss_weight,
                         disc_loss_weight=disc_loss_weight,
+                        flash_seq_lengths=batch.get("flash_seq_lengths"),
+                        flash_route_hint=flash_route_hint,
                     )
 
             if token_weighted_ga:

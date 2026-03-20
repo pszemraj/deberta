@@ -1,0 +1,98 @@
+# HF DeBERTa-v3 positional RTD pretraining - 2048 seq len, base-sized.
+
+model:
+  profile: deberta_v3_parity
+  backbone_type: hf_deberta_v2
+  from_scratch: true
+  embedding_sharing: gdes
+  gradient_checkpointing: false
+  tokenizer:
+    name_or_path: BEE-spoke-data/wordpiece-tokenizer-32k-en_code-msp
+    allow_vocab_resize: true
+    vocab_target: null
+    vocab_multiple: 128
+  hf:
+    model_size: base
+    attention_kernel: dynamic
+    max_position_embeddings: 2048
+  pretrained:
+    discriminator_path: ""
+    generator_path: null
+
+data:
+  source:
+    dataset_name: EleutherAI/SmolLM2-1.7B-stage-4-100B
+    dataset_config_name: default
+    data_files: null
+    load_from_disk: null
+    train_split: train
+    text_column_name: text
+    streaming: true
+    shuffle_buffer_size: 10000
+  packing:
+    enabled: true
+    max_seq_length: 2048
+    block_cross_document_attention: false
+
+train:
+  max_steps: 50000
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  token_weighted_gradient_accumulation: true
+  mixed_precision: bf16
+  tf32: true
+  sdpa_kernel: auto
+  decoupled_training: true
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+  compile:
+    enabled: true
+    mode: default
+    scope: backbones
+    backend: inductor
+  objective:
+    mlm_probability: 0.15
+    mlm_max_ngram: 1
+    mask_token_prob: 1.0
+    random_token_prob: 0.0
+    sampling_temperature: 1.0
+    gen_loss_weight: 1.0
+    disc_loss_weight: 10.0
+  checkpoint:
+    output_dir: null
+    overwrite_output_dir: true
+    save_steps: 5000
+    save_total_limit: 3
+    resume_from_checkpoint: null
+    resume_data_strategy: auto
+    resume_replay_max_micro_batches: 10000
+    export_hf_final: true
+
+optim:
+  lr:
+    base: 5e-4
+    generator: -1.0
+    discriminator: -1.0
+  adam:
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-6
+  scheduler:
+    type: linear
+    warmup_steps: 1000
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+logging:
+  project_name: deberta-0.1.1.post1-debug
+  run_name: hfv2-base-2048-gdes-50k-v2
+  output_dir: null
+  logging_steps: 50
+  backend: none
+  wandb:
+    enabled: true
+    watch: gradients
+    watch_log_freq: 100
+  debug:
+    metrics: false

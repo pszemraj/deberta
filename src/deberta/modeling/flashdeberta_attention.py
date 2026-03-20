@@ -303,6 +303,32 @@ def _should_use_varlen(
     return int(seq_len) >= int(_RUNTIME_CONFIG.varlen_min_seq_len)
 
 
+def _normalize_flash_route_hint(flash_route_hint: str | None) -> str | None:
+    """Normalize an optional flash routing hint.
+
+    :param str | None flash_route_hint: Optional routing hint.
+    :return str | None: Normalized hint or ``None`` when unset.
+    """
+
+    if flash_route_hint is None:
+        return None
+    text = str(flash_route_hint).strip().lower()
+    return text if text else None
+
+
+def _seqlens_to_mask_2d(seq_lengths: torch.Tensor, *, seq_len: int) -> torch.Tensor:
+    """Build a canonical prefix-padding keep mask from per-example lengths.
+
+    :param torch.Tensor seq_lengths: Per-example active lengths with shape ``(B,)``.
+    :param int seq_len: Padded sequence length.
+    :return torch.Tensor: Boolean keep mask in ``(B,S)`` layout.
+    """
+
+    clipped = seq_lengths.to(dtype=torch.int32).clamp(min=0, max=int(seq_len))
+    positions = torch.arange(int(seq_len), device=clipped.device, dtype=torch.int32)
+    return positions.unsqueeze(0) < clipped.unsqueeze(-1)
+
+
 def _dense_bucket_index_cache_key(
     *,
     seq_len: int,
@@ -540,6 +566,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        flash_seq_lengths: torch.Tensor | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -550,14 +577,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
         :param torch.Tensor | None attention_mask: Optional padding mask.
+        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
         :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
         """
 
-        seq_lengths = None
-        if attention_mask is not None:
+        seq_lengths = flash_seq_lengths
+        if seq_lengths is None and attention_mask is not None:
             seq_lengths = _mask4d_to_seqlens(attention_mask, seq_len=int(key_layer.shape[-2]))
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_fixed_calls")
@@ -675,6 +703,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask: torch.Tensor,
+        flash_seq_lengths: torch.Tensor | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -685,6 +714,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param torch.Tensor attention_mask: Padding-style keep mask.
+        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
@@ -692,7 +722,10 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_len = int(query_layer.shape[1])
-        mask_2d = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+        if flash_seq_lengths is not None:
+            mask_2d = _seqlens_to_mask_2d(flash_seq_lengths, seq_len=seq_len)
+        else:
+            mask_2d = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
         out = flashdeberta_varlen_padded(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -717,6 +750,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
+        flash_seq_lengths: torch.Tensor | None = None,
+        flash_route_hint: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run flash-backed attention when the runtime contract is compatible.
 
@@ -726,6 +761,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
+        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
+        :param str | None flash_route_hint: Optional flash backend routing hint.
         :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
         """
 
@@ -766,7 +803,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
-        use_varlen = _should_use_varlen(attention_mask=attention_mask, seq_len=int(hidden_states.shape[-2]))
+        normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
+        if normalized_flash_route == "varlen":
+            use_varlen = True
+        elif normalized_flash_route in {"fixed", "dense", "pairwise"}:
+            use_varlen = False
+        else:
+            use_varlen = _should_use_varlen(
+                attention_mask=attention_mask,
+                seq_len=int(hidden_states.shape[-2]),
+            )
 
         if use_varlen:
             query_layer = self._shape_varlen(self.query_proj(query_states))
@@ -832,6 +878,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 key_layer=key_layer,
                 value_layer=value_layer,
                 attention_mask=attention_mask,
+                flash_seq_lengths=flash_seq_lengths,
                 pos_key=pos_key,
                 pos_query=pos_query,
                 sm_scale=sm_scale,
@@ -859,6 +906,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     key_layer=key_layer,
                     value_layer=value_layer,
                     attention_mask=attention_mask,
+                    flash_seq_lengths=flash_seq_lengths,
                     pos_key=pos_key,
                     pos_query=pos_query,
                     sm_scale=sm_scale,

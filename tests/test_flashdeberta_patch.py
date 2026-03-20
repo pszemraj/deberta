@@ -1040,6 +1040,199 @@ def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
 
 
+def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.training.compile as compile_mod
+
+    monkeypatch.delenv("FLASHDEBERTA_FORCE_VARLEN", raising=False)
+    monkeypatch.delenv("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", raising=False)
+
+    dense_batch = {"input_ids": torch.zeros((2, 1024), dtype=torch.long)}
+    prepared_dense, dense_route = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=dense_batch,
+        backbone_type="hf_deberta_v2",
+    )
+    assert prepared_dense is dense_batch
+    assert dense_route == "dense"
+    assert "flash_seq_lengths" not in prepared_dense
+    assert "flash_active_tokens" not in prepared_dense
+
+    pairwise_batch = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "attention_mask": torch.ones((1, 4, 4), dtype=torch.bool),
+    }
+    prepared_pairwise, pairwise_route = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=pairwise_batch,
+        backbone_type="hf_deberta_v2",
+    )
+    assert prepared_pairwise is pairwise_batch
+    assert pairwise_route == "pairwise"
+    assert "flash_seq_lengths" not in prepared_pairwise
+    assert "flash_active_tokens" not in prepared_pairwise
+
+    padded_1024 = {
+        "input_ids": torch.zeros((2, 1024), dtype=torch.long),
+        "attention_mask": torch.cat(
+            (
+                torch.ones((1, 1024), dtype=torch.bool),
+                torch.cat(
+                    (
+                        torch.ones((1, 768), dtype=torch.bool),
+                        torch.zeros((1, 256), dtype=torch.bool),
+                    ),
+                    dim=1,
+                ),
+            ),
+            dim=0,
+        ),
+    }
+    prepared_fixed, fixed_route = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=padded_1024,
+        backbone_type="hf_deberta_v2",
+    )
+    assert fixed_route == "fixed"
+    assert torch.equal(prepared_fixed["flash_seq_lengths"], torch.tensor([1024, 768], dtype=torch.int32))
+    assert int(prepared_fixed["flash_active_tokens"].item()) == 1792
+
+    padded_2048 = {
+        "input_ids": torch.zeros((2, 2048), dtype=torch.long),
+        "attention_mask": torch.cat(
+            (
+                torch.cat(
+                    (
+                        torch.ones((1, 1800), dtype=torch.bool),
+                        torch.zeros((1, 248), dtype=torch.bool),
+                    ),
+                    dim=1,
+                ),
+                torch.cat(
+                    (
+                        torch.ones((1, 1700), dtype=torch.bool),
+                        torch.zeros((1, 348), dtype=torch.bool),
+                    ),
+                    dim=1,
+                ),
+            ),
+            dim=0,
+        ),
+    }
+    prepared_varlen, varlen_route = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=padded_2048,
+        backbone_type="hf_deberta_v2",
+    )
+    assert varlen_route == "varlen"
+    assert torch.equal(prepared_varlen["flash_seq_lengths"], torch.tensor([1800, 1700], dtype=torch.int32))
+    assert int(prepared_varlen["flash_active_tokens"].item()) == 3500
+
+
+def test_prepare_flash_attention_batch_metadata_respects_force_varlen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.training.compile as compile_mod
+
+    monkeypatch.setenv("FLASHDEBERTA_FORCE_VARLEN", "1")
+
+    batch = {
+        "input_ids": torch.zeros((2, 1024), dtype=torch.long),
+        "attention_mask": torch.tensor(
+            [
+                [True, True, False, False],
+                [True, True, True, False],
+            ],
+            dtype=torch.bool,
+        ),
+    }
+    prepared, route = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+    )
+    assert route == "varlen"
+    assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([2, 3], dtype=torch.int32))
+    assert int(prepared["flash_active_tokens"].item()) == 5
+
+
+def test_varlen_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_M", "32")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_STAGES", "2")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_WARPS", "4")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_M", "64")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_NUM_STAGES", "3")
+    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_NUM_WARPS", "8")
+    monkeypatch.setattr(varlen_mod, "_varlen_repo_tuned_bwd_config", lambda **kwargs: None)
+    monkeypatch.setattr(varlen_mod, "_get_bwd_config_varlen_lowlevel", lambda **kwargs: (16, 16, 1, 2))
+
+    kv_config = varlen_mod._resolve_varlen_bwd_kernel_config(
+        kind="kv",
+        total_tokens_q=3500,
+        total_tokens_k=3500,
+        max_seqlen_q=2048,
+        max_seqlen_k=2048,
+        batch_size=2,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    q_config = varlen_mod._resolve_varlen_bwd_kernel_config(
+        kind="q",
+        total_tokens_q=3500,
+        total_tokens_k=3500,
+        max_seqlen_q=2048,
+        max_seqlen_k=2048,
+        batch_size=2,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert kv_config == (64, 64, 3, 8)
+    assert q_config == (32, 64, 2, 4)
+
+
+def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    monkeypatch.setattr(varlen_mod, "_varlen_device_capability", lambda device: (12, 0))
+
+    sparse_cfg = varlen_mod._varlen_repo_tuned_bwd_config(
+        kind="kv",
+        seq_len=2048,
+        total_tokens=1800,
+        batch_size=2,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    long_cfg = varlen_mod._varlen_repo_tuned_bwd_config(
+        kind="q",
+        seq_len=4096,
+        total_tokens=3500,
+        batch_size=1,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+
+    assert sparse_cfg == (64, 64, 3, 8)
+    assert long_cfg == (64, 64, 3, 8)
+
+
 def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
     fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
 
