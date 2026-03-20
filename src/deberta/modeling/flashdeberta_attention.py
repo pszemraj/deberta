@@ -60,6 +60,11 @@ from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_import_error,
     flashdeberta_compiled_bias_available,
 )
+from deberta.modeling.flashdeberta_docblock_op import (
+    flashdeberta_compiled_docblock_available,
+    flashdeberta_docblock,
+    flashdeberta_docblock_import_error,
+)
 from deberta.modeling.flashdeberta_fixed_op import (
     flashdeberta_fixed,
     flashdeberta_fixed_import_error,
@@ -742,6 +747,51 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             _record_stat("flash_varlen_calls")
         return out
 
+    def _flash_docblock(
+        self,
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        flash_doc_segment_offsets: torch.Tensor,
+        flash_doc_segment_lengths: torch.Tensor,
+        flash_doc_cu_seqlens: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Run doc-block-aware FlashDeBERTa attention over packed document segments.
+
+        :param torch.Tensor query_layer: Projected queries in ``(B, S, H, D)`` layout.
+        :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
+        :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
+        :param torch.Tensor flash_doc_segment_offsets: Flat padded row offsets per segment.
+        :param torch.Tensor flash_doc_segment_lengths: Per-segment lengths.
+        :param torch.Tensor flash_doc_cu_seqlens: Cumulative packed offsets per segment.
+        :param torch.Tensor | None pos_key: Optional c2p term.
+        :param torch.Tensor | None pos_query: Optional p2c term.
+        :param float sm_scale: Softmax scale.
+        :return torch.Tensor: Flash output in ``(B, S, H, D)`` layout.
+        """
+
+        out = flashdeberta_docblock(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            segment_offsets=flash_doc_segment_offsets,
+            segment_lengths=flash_doc_segment_lengths,
+            cu_seqlens=flash_doc_cu_seqlens,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=sm_scale,
+            position_buckets=int(self.position_buckets),
+            max_relative_distance=int(self.max_relative_positions),
+            causal=False,
+        )
+        if _RUNTIME_CONFIG.enable_debug_stats:
+            _record_stat("flash_docblock_calls")
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -751,6 +801,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
         flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
         flash_route_hint: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run flash-backed attention when the runtime contract is compatible.
@@ -762,6 +815,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
         :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
+        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
+        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
+        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
         :param str | None flash_route_hint: Optional flash backend routing hint.
         :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
         """
@@ -804,7 +860,10 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
         normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
-        if normalized_flash_route == "varlen":
+        use_docblock = normalized_flash_route == "docblock"
+        if use_docblock:
+            use_varlen = True
+        elif normalized_flash_route == "varlen":
             use_varlen = True
         elif normalized_flash_route in {"fixed", "dense", "pairwise"}:
             use_varlen = False
@@ -813,6 +872,67 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 attention_mask=attention_mask,
                 seq_len=int(hidden_states.shape[-2]),
             )
+
+        if use_docblock:
+            if (
+                flash_doc_segment_offsets is None
+                or flash_doc_segment_lengths is None
+                or flash_doc_cu_seqlens is None
+            ):
+                if _RUNTIME_CONFIG.enable_debug_stats:
+                    _record_stat("fallback_calls")
+                    _record_stat("fallback_docblock_metadata_missing")
+                self._warn_once(
+                    reason="docblock_metadata_missing",
+                    message=(
+                        "FlashDeBERTa doc-block routing requires precomputed segment metadata; "
+                        "using eager attention."
+                    ),
+                )
+                return super().forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    query_states=query_states,
+                    relative_pos=None,
+                    rel_embeddings=rel_embeddings,
+                )
+            docblock_import_error = flashdeberta_docblock_import_error()
+            if docblock_import_error is not None:
+                if _RUNTIME_CONFIG.enable_debug_stats:
+                    _record_stat("fallback_calls")
+                    _record_stat("fallback_docblock_missing")
+                self._warn_once(
+                    reason="docblock_missing",
+                    message=("FlashDeBERTa doc-block flash path is unavailable; using eager attention."),
+                )
+                return super().forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    query_states=query_states,
+                    relative_pos=None,
+                    rel_embeddings=rel_embeddings,
+                )
+            if _is_torch_compiling() and not flashdeberta_compiled_docblock_available():
+                if _RUNTIME_CONFIG.enable_debug_stats:
+                    _record_stat("fallback_calls")
+                    _record_stat("fallback_docblock_compile")
+                self._warn_once(
+                    reason="docblock_compile",
+                    message=(
+                        "FlashDeBERTa doc-block flash path is not compile-visible on this build; "
+                        "using eager attention."
+                    ),
+                )
+                return super().forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    query_states=query_states,
+                    relative_pos=None,
+                    rel_embeddings=rel_embeddings,
+                )
 
         if use_varlen:
             query_layer = self._shape_varlen(self.query_proj(query_states))
@@ -872,7 +992,20 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_eligible_calls")
-        if use_varlen:
+        if use_docblock:
+            output = self._flash_docblock(
+                query_layer=query_layer,
+                key_layer=key_layer,
+                value_layer=value_layer,
+                flash_doc_segment_offsets=flash_doc_segment_offsets,
+                flash_doc_segment_lengths=flash_doc_segment_lengths,
+                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                pos_key=pos_key,
+                pos_query=pos_query,
+                sm_scale=sm_scale,
+            )
+            output = output.contiguous().view(bsz, query_len, self.all_head_size)
+        elif use_varlen:
             output = self._flash_varlen(
                 query_layer=query_layer,
                 key_layer=key_layer,

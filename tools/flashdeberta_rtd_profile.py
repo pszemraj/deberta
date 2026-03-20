@@ -53,6 +53,7 @@ from deberta.modeling.flashdeberta_patch import (  # noqa: E402
 )
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
+    _build_doc_block_mask,
     _compile_backbones_for_scope,
     _dtype_for_mixed_precision,
     _maybe_cudagraph_mark_step_begin,
@@ -294,8 +295,10 @@ def _run_decoupled_window(
             with _TimedPhase("batch_to_device", phase_times_ms):
                 batch = _move_batch_to_device(batch, device)
                 doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None:
-                    raise RuntimeError("Doc-block profiling is not supported in this tool.")
+                if doc_ids is not None and str(backbone_type).strip().lower() != "hf_deberta_v2":
+                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+                elif doc_ids is not None:
+                    batch["doc_ids"] = doc_ids
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
@@ -319,6 +322,9 @@ def _run_decoupled_window(
                         sampling_temperature=float(sampling_temperature),
                         phase="generator",
                         flash_seq_lengths=batch.get("flash_seq_lengths"),
+                        flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
+                        flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
+                        flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
                         flash_route_hint=flash_route_hint,
                     )
 
@@ -346,6 +352,9 @@ def _run_decoupled_window(
                     "attention_mask": batch.get("attention_mask"),
                     "token_type_ids": batch.get("token_type_ids"),
                     "flash_seq_lengths": batch.get("flash_seq_lengths"),
+                    "flash_doc_segment_offsets": batch.get("flash_doc_segment_offsets"),
+                    "flash_doc_segment_lengths": batch.get("flash_doc_segment_lengths"),
+                    "flash_doc_cu_seqlens": batch.get("flash_doc_cu_seqlens"),
                     "flash_route_hint": flash_route_hint,
                     "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                     "disc_labels": gen_phase_out.disc_labels,
@@ -378,6 +387,9 @@ def _run_decoupled_window(
                         token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                         phase="discriminator",
                         flash_seq_lengths=payload["flash_seq_lengths"],  # type: ignore[arg-type]
+                        flash_doc_segment_offsets=payload["flash_doc_segment_offsets"],  # type: ignore[arg-type]
+                        flash_doc_segment_lengths=payload["flash_doc_segment_lengths"],  # type: ignore[arg-type]
+                        flash_doc_cu_seqlens=payload["flash_doc_cu_seqlens"],  # type: ignore[arg-type]
                         flash_route_hint=payload["flash_route_hint"],  # type: ignore[arg-type]
                     )
 
@@ -486,8 +498,10 @@ def _run_coupled_window(
             with _TimedPhase("batch_to_device", phase_times_ms):
                 batch = _move_batch_to_device(batch, device)
                 doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None:
-                    raise RuntimeError("Doc-block profiling is not supported in this tool.")
+                if doc_ids is not None and str(backbone_type).strip().lower() != "hf_deberta_v2":
+                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+                elif doc_ids is not None:
+                    batch["doc_ids"] = doc_ids
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
@@ -512,6 +526,9 @@ def _run_coupled_window(
                         gen_loss_weight=gen_loss_weight,
                         disc_loss_weight=disc_loss_weight,
                         flash_seq_lengths=batch.get("flash_seq_lengths"),
+                        flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
+                        flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
+                        flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
                         flash_route_hint=flash_route_hint,
                     )
 

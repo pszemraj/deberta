@@ -1562,10 +1562,11 @@ def validate_data_config(cfg: DataConfig) -> None:
         and int(pack.max_seq_length) > int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)
     ):
         warnings.warn(
-            "data.packing.block_cross_document_attention builds dense O(S^2) pairwise masks. "
+            "data.packing.block_cross_document_attention may build dense O(S^2) pairwise masks on "
+            "non-segment-aware attention backends. "
             f"Configured data.packing.max_seq_length={int(pack.max_seq_length)} may be expensive; "
             "consider reducing sequence length or disabling data.packing.block_cross_document_attention "
-            f"until sparse/segment-aware attention support lands (warning threshold: {int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)}).",
+            f"until a segment-aware backend is enabled (warning threshold: {int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)}).",
             UserWarning,
             stacklevel=2,
         )
@@ -1728,11 +1729,13 @@ def validate_training_workflow_options(
     :param LoggingConfig | None logging_cfg: Optional logging configuration.
     """
     sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
-    if (
+    reject_flash_sdpa_for_doc_block = (
         bool(data_cfg.packing.enabled)
         and bool(data_cfg.packing.block_cross_document_attention)
         and sdpa_policy == "flash"
-    ):
+        and (model_cfg is None or str(model_cfg.backbone_type).strip().lower() == "rope")
+    )
+    if reject_flash_sdpa_for_doc_block:
         raise ValueError(
             "train.sdpa_kernel=flash is not supported with data.packing.enabled=true. "
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
@@ -1754,15 +1757,6 @@ def validate_training_workflow_options(
             raise ValueError(
                 "train.sdpa_kernel only affects rope attention when model.rope.attention_implementation='sdpa'. "
                 "Set train.sdpa_kernel=auto or switch model.rope.attention_implementation=sdpa."
-            )
-        if (
-            backbone_type != "rope"
-            and bool(data_cfg.packing.enabled)
-            and bool(data_cfg.packing.block_cross_document_attention)
-        ):
-            raise ValueError(
-                "data.packing.block_cross_document_attention=true is only supported with model.backbone_type='rope'. "
-                "Use data.packing.block_cross_document_attention=false or switch to model.backbone_type='rope'."
             )
         embed_sharing = str(model_cfg.embedding_sharing).strip().lower()
         local_optim = optim_cfg or OptimConfig()

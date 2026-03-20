@@ -834,7 +834,7 @@ def test_validate_data_config_rejects_doc_blocking_when_not_packed():
 
 
 def test_validate_data_config_warns_on_long_context_dense_doc_blocking():
-    with pytest.warns(UserWarning, match="dense O\\(S\\^2\\) pairwise masks"):
+    with pytest.warns(UserWarning, match="segment-aware attention backends"):
         validate_data_config(
             DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
@@ -879,15 +879,27 @@ def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_ro
         )
 
 
-def test_validate_training_workflow_options_rejects_hf_backbone_doc_blocking_in_packed_mode():
-    with pytest.raises(ValueError, match="only supported with model.backbone_type='rope'"):
+def test_validate_training_workflow_options_allows_hf_backbone_doc_blocking_in_packed_mode():
+    validate_training_workflow_options(
+        data_cfg=DataConfig(
+            dataset_name="HuggingFaceFW/fineweb-edu",
+            pack_sequences=True,
+            block_cross_document_attention=True,
+        ),
+        train_cfg=TrainConfig(),
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+    )
+
+
+def test_validate_training_workflow_options_allows_hf_backbone_doc_blocking_when_sdpa_kernel_is_flash():
+    with pytest.warns(UserWarning, match="train.sdpa_kernel has no effect"):
         validate_training_workflow_options(
             data_cfg=DataConfig(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=True,
                 block_cross_document_attention=True,
             ),
-            train_cfg=TrainConfig(),
+            train_cfg=TrainConfig(sdpa_kernel="flash"),
             model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
         )
 

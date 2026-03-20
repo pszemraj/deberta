@@ -994,6 +994,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         token_type_ids: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
         flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
         flash_route_hint: str | None = None,
     ) -> RTDGeneratorPhaseOutput:
         """Run generator forward/corruption only, returning discriminator targets.
@@ -1004,6 +1007,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param float sampling_temperature: Generator sampling temperature.
         :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
+        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
+        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
+        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
         :param str | None flash_route_hint: Optional flash backend routing hint.
         :return RTDGeneratorPhaseOutput: Generator loss and corruption artifacts.
         """
@@ -1033,6 +1039,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             "token_type_ids": token_type_ids,
             "return_dict": True,
             "flash_seq_lengths": flash_seq_lengths,
+            "flash_doc_segment_offsets": flash_doc_segment_offsets,
+            "flash_doc_segment_lengths": flash_doc_segment_lengths,
+            "flash_doc_cu_seqlens": flash_doc_cu_seqlens,
             "flash_route_hint": flash_route_hint,
         }
         if use_emd:
@@ -1107,6 +1116,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
         flash_route_hint: str | None = None,
     ) -> RTDDiscriminatorPhaseOutput:
         """Run discriminator scoring only, given prebuilt corrupted ids/labels.
@@ -1117,6 +1129,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
+        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
+        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
+        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
         :param str | None flash_route_hint: Optional flash backend routing hint.
         :return RTDDiscriminatorPhaseOutput: Discriminator loss and metrics.
         """
@@ -1127,6 +1142,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             token_type_ids=token_type_ids,
             return_dict=True,
             flash_seq_lengths=flash_seq_lengths,
+            flash_doc_segment_offsets=flash_doc_segment_offsets,
+            flash_doc_segment_lengths=flash_doc_segment_lengths,
+            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
             flash_route_hint=flash_route_hint,
         )
         disc_hidden = disc_out.last_hidden_state
@@ -1177,6 +1195,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         corrupted_input_ids: torch.Tensor | None = None,
         disc_labels: torch.Tensor | None = None,
         flash_seq_lengths: torch.Tensor | None = None,
+        flash_doc_segment_offsets: torch.Tensor | None = None,
+        flash_doc_segment_lengths: torch.Tensor | None = None,
+        flash_doc_cu_seqlens: torch.Tensor | None = None,
         flash_route_hint: str | None = None,
     ) -> RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
         """Run RTD forward in combined or phase-specific mode.
@@ -1192,6 +1213,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None corrupted_input_ids: Precomputed corrupted ids for ``phase='discriminator'``.
         :param torch.Tensor | None disc_labels: Precomputed RTD labels for ``phase='discriminator'``.
         :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
+        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
+        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
+        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
         :param str | None flash_route_hint: Optional flash backend routing hint.
         :return RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
             Combined output for ``phase='both'``; phase-local outputs otherwise.
@@ -1207,6 +1231,9 @@ class DebertaV3RTDPretrainer(nn.Module):
                 token_type_ids=token_type_ids,
                 sampling_temperature=sampling_temperature,
                 flash_seq_lengths=flash_seq_lengths,
+                flash_doc_segment_offsets=flash_doc_segment_offsets,
+                flash_doc_segment_lengths=flash_doc_segment_lengths,
+                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
                 flash_route_hint=flash_route_hint,
             )
         if phase_norm == "discriminator":
@@ -1221,6 +1248,9 @@ class DebertaV3RTDPretrainer(nn.Module):
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 flash_seq_lengths=flash_seq_lengths,
+                flash_doc_segment_offsets=flash_doc_segment_offsets,
+                flash_doc_segment_lengths=flash_doc_segment_lengths,
+                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
                 flash_route_hint=flash_route_hint,
             )
         if phase_norm != "both":
@@ -1235,6 +1265,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             token_type_ids=token_type_ids,
             sampling_temperature=sampling_temperature,
             flash_seq_lengths=flash_seq_lengths,
+            flash_doc_segment_offsets=flash_doc_segment_offsets,
+            flash_doc_segment_lengths=flash_doc_segment_lengths,
+            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
             flash_route_hint=flash_route_hint,
         )
         if not bool(gen_phase.has_masked_targets):
@@ -1259,6 +1292,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             corrupted_input_ids=gen_phase.corrupted_input_ids,
             disc_labels=gen_phase.disc_labels,
             flash_seq_lengths=flash_seq_lengths,
+            flash_doc_segment_offsets=flash_doc_segment_offsets,
+            flash_doc_segment_lengths=flash_doc_segment_lengths,
+            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
             flash_route_hint=flash_route_hint,
         )
 

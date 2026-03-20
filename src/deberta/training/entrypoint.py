@@ -1117,8 +1117,13 @@ def run_pretraining(
                 for step_idx, (batch, gen_count, disc_count, has_gen_targets) in enumerate(window):
                     batch = _move_batch_to_device(batch, accelerator.device)
                     doc_ids = batch.pop("doc_ids", None)
-                    if doc_ids is not None:
+                    if (
+                        doc_ids is not None
+                        and str(model_cfg.backbone_type).strip().lower() != "hf_deberta_v2"
+                    ):
                         batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+                    elif doc_ids is not None:
+                        batch["doc_ids"] = doc_ids
                     batch = _stabilize_compile_attention_mask(
                         batch=batch,
                         compile_enabled=compile_enabled,
@@ -1143,6 +1148,9 @@ def run_pretraining(
                             sampling_temperature=train_cfg.sampling_temperature,
                             phase="generator",
                             flash_seq_lengths=batch.get("flash_seq_lengths"),
+                            flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
+                            flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
+                            flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
                             flash_route_hint=flash_route_hint,
                         )
                         gen_loss = gen_phase_out.gen_loss_raw
@@ -1237,6 +1245,9 @@ def run_pretraining(
                                 "attention_mask": batch.get("attention_mask"),
                                 "token_type_ids": batch.get("token_type_ids"),
                                 "flash_seq_lengths": batch.get("flash_seq_lengths"),
+                                "flash_doc_segment_offsets": batch.get("flash_doc_segment_offsets"),
+                                "flash_doc_segment_lengths": batch.get("flash_doc_segment_lengths"),
+                                "flash_doc_cu_seqlens": batch.get("flash_doc_cu_seqlens"),
                                 "flash_route_hint": flash_route_hint,
                                 "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                                 "disc_labels": gen_phase_out.disc_labels,
@@ -1315,6 +1326,9 @@ def run_pretraining(
                                 token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                                 phase="discriminator",
                                 flash_seq_lengths=payload["flash_seq_lengths"],  # type: ignore[arg-type]
+                                flash_doc_segment_offsets=payload["flash_doc_segment_offsets"],  # type: ignore[arg-type]
+                                flash_doc_segment_lengths=payload["flash_doc_segment_lengths"],  # type: ignore[arg-type]
+                                flash_doc_cu_seqlens=payload["flash_doc_cu_seqlens"],  # type: ignore[arg-type]
                                 flash_route_hint=payload["flash_route_hint"],  # type: ignore[arg-type]
                             )
                             disc_loss = disc_phase_out.disc_loss_raw
@@ -1581,8 +1595,10 @@ def run_pretraining(
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
                 doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None:
+                if doc_ids is not None and str(model_cfg.backbone_type).strip().lower() != "hf_deberta_v2":
                     batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+                elif doc_ids is not None:
+                    batch["doc_ids"] = doc_ids
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
@@ -1609,6 +1625,9 @@ def run_pretraining(
                         gen_loss_weight=train_cfg.gen_loss_weight,
                         disc_loss_weight=train_cfg.disc_loss_weight,
                         flash_seq_lengths=batch.get("flash_seq_lengths"),
+                        flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
+                        flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
+                        flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
                         flash_route_hint=flash_route_hint,
                     )
 
