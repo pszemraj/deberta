@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${1:-configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2.yaml}"
+DOCBLOCK_CONFIG_PATH="${FLASHDEBERTA_DOCBLOCK_CONFIG_PATH:-configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 DEFAULT_OUT_DIR="${ROOT_DIR}/local-scratch/benchmarks/flashdeberta/flashdeberta_bench_${STAMP}"
 OUT_DIR="${FLASHDEBERTA_BENCH_OUT_DIR:-${DEFAULT_OUT_DIR}}"
@@ -11,8 +12,10 @@ MICRO_WARMUP="${FLASHDEBERTA_MICRO_WARMUP:-10}"
 MICRO_STEPS="${FLASHDEBERTA_MICRO_STEPS:-30}"
 PACKED_MAX_STEPS="${FLASHDEBERTA_PACKED_MAX_STEPS:-100}"
 UNPACKED_MAX_STEPS="${FLASHDEBERTA_UNPACKED_MAX_STEPS:-100}"
+DOCBLOCK_MAX_STEPS="${FLASHDEBERTA_DOCBLOCK_MAX_STEPS:-100}"
 LOGGING_STEPS="${FLASHDEBERTA_LOGGING_STEPS:-10}"
 AVG_FROM_STEP="${FLASHDEBERTA_AVG_FROM_STEP:-20}"
+INCLUDE_DOCBLOCK="${FLASHDEBERTA_INCLUDE_DOCBLOCK:-0}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -57,7 +60,8 @@ micro_case() {
 train_eager_case() {
     local name="$1"
     local steps="$2"
-    shift 2
+    local config_path="$3"
+    shift 3
 
     local output_dir="${OUT_DIR}/${name}"
     mkdir -p "${output_dir}"
@@ -65,7 +69,7 @@ train_eager_case() {
     run_case \
         "${name}" \
         env HF_HUB_DOWNLOAD_TIMEOUT=120 HF_HUB_ETAG_TIMEOUT=120 TOKENIZERS_PARALLELISM=false \
-        conda run --name neobert --no-capture-output deberta train "${CONFIG_PATH}" \
+        conda run --name neobert --no-capture-output deberta train "${config_path}" \
         --train.max_steps "${steps}" \
         --logging.logging_steps "${LOGGING_STEPS}" \
         --train.checkpoint.output_dir "${output_dir}" \
@@ -81,7 +85,8 @@ train_flash_case() {
     local name="$1"
     local steps="$2"
     local dense_policy="${3:-}"
-    shift 3
+    local config_path="$4"
+    shift 4
 
     local output_dir="${OUT_DIR}/${name}"
     local -a env_prefix=(
@@ -99,7 +104,7 @@ train_flash_case() {
     run_case \
         "${name}" \
         "${env_prefix[@]}" \
-        conda run --name neobert --no-capture-output python tools/train_flashdeberta.py train "${CONFIG_PATH}" \
+        conda run --name neobert --no-capture-output python tools/train_flashdeberta.py train "${config_path}" \
         --train.max_steps "${steps}" \
         --logging.logging_steps "${LOGGING_STEPS}" \
         --train.checkpoint.output_dir "${output_dir}" \
@@ -120,11 +125,16 @@ micro_case micro_flash_padded2048 --mode flash --seq-len 2048 --batch-size 4 --p
 micro_case micro_eager_padded4096 --mode eager --seq-len 4096 --batch-size 2 --pad-ratio 0.35
 micro_case micro_flash_padded4096 --mode flash --seq-len 4096 --batch-size 2 --pad-ratio 0.35
 
-train_eager_case train_packed_eager "${PACKED_MAX_STEPS}"
-train_flash_case train_packed_flash "${PACKED_MAX_STEPS}" ""
-train_flash_case train_packed_flash_densepolicy "${PACKED_MAX_STEPS}" "1024"
-train_eager_case train_unpacked_eager "${UNPACKED_MAX_STEPS}" --data.packing.enabled false
-train_flash_case train_unpacked_flash "${UNPACKED_MAX_STEPS}" "" --data.packing.enabled false
+train_eager_case train_packed_eager "${PACKED_MAX_STEPS}" "${CONFIG_PATH}"
+train_flash_case train_packed_flash "${PACKED_MAX_STEPS}" "" "${CONFIG_PATH}"
+train_flash_case train_packed_flash_densepolicy "${PACKED_MAX_STEPS}" "1024" "${CONFIG_PATH}"
+train_eager_case train_unpacked_eager "${UNPACKED_MAX_STEPS}" "${CONFIG_PATH}" --data.packing.enabled false
+train_flash_case train_unpacked_flash "${UNPACKED_MAX_STEPS}" "" "${CONFIG_PATH}" --data.packing.enabled false
+
+if [[ "${INCLUDE_DOCBLOCK}" == "1" ]]; then
+    train_eager_case train_packed_docblock_eager "${DOCBLOCK_MAX_STEPS}" "${DOCBLOCK_CONFIG_PATH}"
+    train_flash_case train_packed_docblock_flash "${DOCBLOCK_MAX_STEPS}" "" "${DOCBLOCK_CONFIG_PATH}"
+fi
 
 summary_micro() {
     local name="$1"
@@ -227,6 +237,10 @@ summary_train() {
     summary_train train_packed_flash_densepolicy
     summary_train train_unpacked_eager
     summary_train train_unpacked_flash
+    if [[ "${INCLUDE_DOCBLOCK}" == "1" ]]; then
+        summary_train train_packed_docblock_eager
+        summary_train train_packed_docblock_flash
+    fi
 } | tee "${OUT_DIR}/summary.tsv"
 
 echo

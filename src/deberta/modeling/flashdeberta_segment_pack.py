@@ -498,6 +498,8 @@ def segment_pack_padded_rows(
     :return torch.Tensor: Packed tensor with shape ``(NNZ, ...)``.
     """
 
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
     flat, trailing_shape, _batch_size, _seq_len = _flatten_rows(tensor)
     total = max(0, int(total_tokens))
     output = tensor.new_empty((total,) + trailing_shape)
@@ -564,6 +566,10 @@ def segment_pack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
+    if not tensor_a.is_contiguous():
+        tensor_a = tensor_a.contiguous()
+    if not tensor_b.is_contiguous():
+        tensor_b = tensor_b.contiguous()
     flat_a, trailing_shape, _batch_size, _seq_len = _flatten_rows(tensor_a)
     flat_b, trailing_shape_b, _, _ = _flatten_rows(tensor_b)
     if trailing_shape_b != trailing_shape:
@@ -584,7 +590,6 @@ def segment_pack_padded_rows_pair(
             segment_lengths=segment_lengths,
             cu_seqlens=cu_seqlens,
         )
-        and tensor_b.is_contiguous()
         and tensor_b.device == tensor_a.device
     ):
         max_len = max(1, int(segment_lengths.max().item()))
@@ -646,6 +651,12 @@ def segment_pack_padded_rows_triple(
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
+    if not tensor_a.is_contiguous():
+        tensor_a = tensor_a.contiguous()
+    if not tensor_b.is_contiguous():
+        tensor_b = tensor_b.contiguous()
+    if not tensor_c.is_contiguous():
+        tensor_c = tensor_c.contiguous()
     flat_a, trailing_shape, _batch_size, _seq_len = _flatten_rows(tensor_a)
     flat_b, trailing_shape_b, _, _ = _flatten_rows(tensor_b)
     flat_c, trailing_shape_c, _, _ = _flatten_rows(tensor_c)
@@ -662,15 +673,11 @@ def segment_pack_padded_rows_triple(
     out_flat_c = out_c.view(total, -1)
     row_size = int(out_flat_a.shape[1])
 
-    if (
-        _can_use_triton_segment_pack(
-            tensor=tensor_a,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-        )
-        and tensor_b.is_contiguous()
-        and tensor_c.is_contiguous()
+    if _can_use_triton_segment_pack(
+        tensor=tensor_a,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(segment_lengths.max().item()))
         grid = (

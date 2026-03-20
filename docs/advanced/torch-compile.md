@@ -62,6 +62,16 @@ kernels. That path is opaque to Dynamo in the same way as the fixed and varlen
 custom ops, so it behaves like a normal compiled attention primitive instead of
 tracing through Python-side launcher code.
 
+Packed doc-block batches on `hf_deberta_v2` use a fourth route. Instead of
+expanding `doc_ids` into a dense `(B,S,S)` mask, the compile metadata step
+keeps the 2D keep mask plus fixed-shape segment descriptors sized to `B*S`.
+The opaque doc-block custom op slices the active segment prefix, repacks those
+document spans into a ragged batch, runs the existing disentangled varlen flash
+kernels, and scatters the results back into the original packed layout. The
+fixed-shape metadata contract is important: it keeps the compiled
+`masked_docblock_*` entrypoints from recompiling when the number of documents
+per packed batch changes.
+
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,
 active tokens can be packed and repadded directly from `seqlens/cu_seqlens`
@@ -90,7 +100,12 @@ first and prefer the split overrides:
 
 ## Special case: packed doc-block masks
 
-For `rope` with `data.packing.block_cross_document_attention=true`, auto scope downgrades toward FFN-focused compile to avoid shape-churn recompiles from dynamic pairwise masks.
+For `hf_deberta_v2`, packed doc-blocking now stays on the segment-aware flash
+route described above when the FlashDeBERTa runtime patch is enabled.
+
+For `rope` with `data.packing.block_cross_document_attention=true`, auto scope
+downgrades toward FFN-focused compile to avoid shape-churn recompiles from
+dynamic pairwise masks.
 
 ## Compile debugging helpers
 

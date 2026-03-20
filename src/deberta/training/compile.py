@@ -239,17 +239,22 @@ def _build_doc_segment_metadata(
 
     :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with ``0`` for padding.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        Flat padded row offsets per segment, per-segment lengths, cumulative
-        packed offsets, and total active tokens.
+        Fixed-shape flat padded row offsets per segment, fixed-shape per-segment
+        lengths, fixed-shape cumulative packed offsets, and total active tokens.
     """
 
     if doc_ids.ndim != 2:
         raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
 
+    batch_size, seq_len = int(doc_ids.shape[0]), int(doc_ids.shape[1])
+    max_segments = max(1, batch_size * seq_len)
+    segment_offsets_padded = torch.zeros((max_segments,), device=doc_ids.device, dtype=torch.int32)
+    segment_lengths_padded = torch.zeros((max_segments,), device=doc_ids.device, dtype=torch.int32)
+    cu_seqlens_padded = torch.zeros((max_segments + 1,), device=doc_ids.device, dtype=torch.int32)
+
     active = doc_ids.ne(0)
     if not bool(active.any().item()):
-        empty = torch.empty((0,), device=doc_ids.device, dtype=torch.int32)
-        return empty, empty, torch.zeros((1,), device=doc_ids.device, dtype=torch.int32), 0
+        return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, 0
 
     prev = torch.zeros_like(doc_ids)
     prev[:, 1:] = doc_ids[:, :-1]
@@ -264,7 +269,6 @@ def _build_doc_segment_metadata(
     if int(start_idx.shape[0]) != int(end_idx.shape[0]):
         raise RuntimeError("doc-block segment boundary count mismatch.")
 
-    seq_len = int(doc_ids.shape[1])
     segment_starts = start_idx[:, 1].to(dtype=torch.int32)
     segment_ends = end_idx[:, 1].to(dtype=torch.int32)
     segment_lengths = (segment_ends - segment_starts + 1).to(dtype=torch.int32)
@@ -274,8 +278,12 @@ def _build_doc_segment_metadata(
         torch.cumsum(segment_lengths, dim=0, dtype=torch.int32),
         (1, 0),
     )
+    num_segments = int(segment_lengths.shape[0])
+    segment_offsets_padded[:num_segments] = segment_offsets
+    segment_lengths_padded[:num_segments] = segment_lengths
+    cu_seqlens_padded[: num_segments + 1] = cu_seqlens
     total_tokens = int(cu_seqlens[-1].item())
-    return segment_offsets, segment_lengths, cu_seqlens, total_tokens
+    return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, total_tokens
 
 
 def prepare_flash_attention_batch_metadata(

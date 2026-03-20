@@ -88,24 +88,32 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
     return getattr(op, "default", op)
 
 
-def _docblock_metadata(
+def _active_docblock_metadata(
     *,
+    segment_offsets: torch.Tensor,
     segment_lengths: torch.Tensor,
     cu_seqlens: torch.Tensor,
-) -> tuple[int, int, int]:
-    """Return host metadata for one doc-segment batch.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+    """Return the active prefix of one fixed-shape doc-segment metadata batch.
 
-    :param torch.Tensor segment_lengths: Per-segment lengths.
-    :param torch.Tensor cu_seqlens: Cumulative packed offsets.
-    :return tuple[int, int, int]: Number of segments, max segment length, total active tokens.
+    :param torch.Tensor segment_offsets: Fixed-shape flat padded row offsets per segment.
+    :param torch.Tensor segment_lengths: Fixed-shape per-segment lengths.
+    :param torch.Tensor cu_seqlens: Fixed-shape cumulative packed offsets.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+        Active segment offsets, active segment lengths, active cumulative
+        offsets, number of segments, maximum segment length, and total tokens.
     """
 
-    num_segments = int(segment_lengths.shape[0])
+    num_segments = int(segment_lengths.count_nonzero().item())
     if num_segments <= 0:
-        return 0, 0, 0
-    max_seqlen = int(segment_lengths.max().item())
-    total_tokens = int(cu_seqlens[-1].item())
-    return num_segments, max_seqlen, total_tokens
+        empty = segment_lengths[:0]
+        return segment_offsets[:0], empty, cu_seqlens[:1], 0, 0, 0
+    active_offsets = segment_offsets[:num_segments]
+    active_lengths = segment_lengths[:num_segments]
+    active_cu_seqlens = cu_seqlens[: num_segments + 1]
+    max_seqlen = int(active_lengths.max().item())
+    total_tokens = int(active_cu_seqlens[-1].item())
+    return active_offsets, active_lengths, active_cu_seqlens, num_segments, max_seqlen, total_tokens
 
 
 def _store_forward_aux_cache(
@@ -234,7 +242,15 @@ def _docblock_forward_impl(
 
     batch_size = int(query_layer.shape[0])
     seq_len = int(query_layer.shape[1])
-    num_segments, max_seqlen, total_tokens = _docblock_metadata(
+    (
+        active_segment_offsets,
+        active_segment_lengths,
+        active_cu_seqlens,
+        num_segments,
+        max_seqlen,
+        total_tokens,
+    ) = _active_docblock_metadata(
+        segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     )
@@ -255,27 +271,27 @@ def _docblock_forward_impl(
         query_layer,
         key_layer,
         value_layer,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
         total_tokens=total_tokens,
     )
     if pos_key is not None and pos_query is not None:
         pos_key_unpad, pos_query_unpad = segment_pack_padded_rows_pair(
             pos_key,
             pos_query,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             total_tokens=total_tokens,
         )
     else:
         pos_key_unpad = (
             segment_pack_padded_rows(
                 pos_key,
-                segment_offsets=segment_offsets,
-                segment_lengths=segment_lengths,
-                cu_seqlens=cu_seqlens,
+                segment_offsets=active_segment_offsets,
+                segment_lengths=active_segment_lengths,
+                cu_seqlens=active_cu_seqlens,
                 total_tokens=total_tokens,
             )
             if pos_key is not None
@@ -284,9 +300,9 @@ def _docblock_forward_impl(
         pos_query_unpad = (
             segment_pack_padded_rows(
                 pos_query,
-                segment_offsets=segment_offsets,
-                segment_lengths=segment_lengths,
-                cu_seqlens=cu_seqlens,
+                segment_offsets=active_segment_offsets,
+                segment_lengths=active_segment_lengths,
+                cu_seqlens=active_cu_seqlens,
                 total_tokens=total_tokens,
             )
             if pos_query is not None
@@ -316,8 +332,8 @@ def _docblock_forward_impl(
             v_unpad,
             pos_key_unpad,
             pos_query_unpad,
-            cu_seqlens,
-            cu_seqlens,
+            active_cu_seqlens,
+            active_cu_seqlens,
             max_seqlen,
             max_seqlen,
             bool(causal),
@@ -337,8 +353,8 @@ def _docblock_forward_impl(
             v_unpad,
             pos_key_unpad,
             pos_query_unpad,
-            cu_seqlens,
-            cu_seqlens,
+            active_cu_seqlens,
+            active_cu_seqlens,
             max_seqlen,
             max_seqlen,
             bool(causal),
@@ -350,9 +366,9 @@ def _docblock_forward_impl(
 
     out_padded = segment_unpack_padded_rows(
         out_unpad,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
         batch_size=batch_size,
         seq_len=seq_len,
     )
@@ -364,18 +380,18 @@ def _docblock_forward_impl(
         )
     lse_padded = segment_unpack_padded_rows(
         lse_unpad,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
         batch_size=batch_size,
         seq_len=seq_len,
     ).contiguous()
     if stash_backward_cache:
         _store_forward_aux_cache(
             output_padded=out_padded,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             max_seqlen=max_seqlen,
             total_tokens=total_tokens,
             q_unpad=q_unpad,
@@ -444,7 +460,15 @@ def _docblock_backward_impl(
 
     batch_size = int(query_layer.shape[0])
     seq_len = int(query_layer.shape[1])
-    num_segments, max_seqlen, total_tokens = _docblock_metadata(
+    (
+        active_segment_offsets,
+        active_segment_lengths,
+        active_cu_seqlens,
+        num_segments,
+        max_seqlen,
+        total_tokens,
+    ) = _active_docblock_metadata(
+        segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     )
@@ -462,59 +486,59 @@ def _docblock_backward_impl(
             query_layer,
             key_layer,
             value_layer,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             total_tokens=total_tokens,
         )
     if out_unpad is None:
         out_unpad = segment_pack_padded_rows(
             output_padded,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             total_tokens=total_tokens,
         )
     grad_unpad = segment_pack_padded_rows(
         grad_output,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
         total_tokens=total_tokens,
     )
     delta = (out_unpad * grad_unpad).sum(dim=-1)
     if lse_unpad is None:
         lse_unpad = segment_pack_padded_rows(
             lse_padded,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             total_tokens=total_tokens,
         )
     if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
         pos_key_unpad, pos_query_unpad = segment_pack_padded_rows_pair(
             pos_key,
             pos_query,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             total_tokens=total_tokens,
         )
     else:
         if pos_key is not None and pos_key_unpad is None:
             pos_key_unpad = segment_pack_padded_rows(
                 pos_key,
-                segment_offsets=segment_offsets,
-                segment_lengths=segment_lengths,
-                cu_seqlens=cu_seqlens,
+                segment_offsets=active_segment_offsets,
+                segment_lengths=active_segment_lengths,
+                cu_seqlens=active_cu_seqlens,
                 total_tokens=total_tokens,
             )
         if pos_query is not None and pos_query_unpad is None:
             pos_query_unpad = segment_pack_padded_rows(
                 pos_query,
-                segment_offsets=segment_offsets,
-                segment_lengths=segment_lengths,
-                cu_seqlens=cu_seqlens,
+                segment_offsets=active_segment_offsets,
+                segment_lengths=active_segment_lengths,
+                cu_seqlens=active_cu_seqlens,
                 total_tokens=total_tokens,
             )
 
@@ -528,7 +552,7 @@ def _docblock_backward_impl(
         delta=delta,
         pos_key_unpad=pos_key_unpad,
         pos_query_unpad=pos_query_unpad,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=active_cu_seqlens,
         batch_size=num_segments,
         seq_bound=max_seqlen,
         token_capacity=total_tokens,
@@ -543,9 +567,9 @@ def _docblock_backward_impl(
         dq_unpad,
         dk_unpad,
         dv_unpad,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
         batch_size=batch_size,
         seq_len=seq_len,
     )
@@ -553,9 +577,9 @@ def _docblock_backward_impl(
         dpos_key, dpos_query = segment_unpack_padded_rows_pair(
             dpos_key_unpad,
             dpos_query_unpad,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
+            segment_offsets=active_segment_offsets,
+            segment_lengths=active_segment_lengths,
+            cu_seqlens=active_cu_seqlens,
             batch_size=batch_size,
             seq_len=seq_len,
         )
@@ -563,9 +587,9 @@ def _docblock_backward_impl(
         dpos_key = (
             segment_unpack_padded_rows(
                 dpos_key_unpad,
-                segment_offsets=segment_offsets,
-                segment_lengths=segment_lengths,
-                cu_seqlens=cu_seqlens,
+                segment_offsets=active_segment_offsets,
+                segment_lengths=active_segment_lengths,
+                cu_seqlens=active_cu_seqlens,
                 batch_size=batch_size,
                 seq_len=seq_len,
             )
@@ -575,9 +599,9 @@ def _docblock_backward_impl(
         dpos_query = (
             segment_unpack_padded_rows(
                 dpos_query_unpad,
-                segment_offsets=segment_offsets,
-                segment_lengths=segment_lengths,
-                cu_seqlens=cu_seqlens,
+                segment_offsets=active_segment_offsets,
+                segment_lengths=active_segment_lengths,
+                cu_seqlens=active_cu_seqlens,
                 batch_size=batch_size,
                 seq_len=seq_len,
             )

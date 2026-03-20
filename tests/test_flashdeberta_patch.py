@@ -618,9 +618,14 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
     segment_offsets = torch.tensor([0, 2, 5, 6], dtype=torch.int32)
     segment_lengths = torch.tensor([2, 2, 1, 2], dtype=torch.int32)
     cu_seqlens = torch.tensor([0, 2, 4, 5, 7], dtype=torch.int32)
-    a = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3).contiguous()
-    b = (a + 100.0).contiguous()
-    c = (a + 200.0).contiguous()
+    base = torch.arange(2 * 5 * 3 * 3, dtype=torch.float32).view(2, 5, 3, 3)
+    a = base[..., 0]
+    b = base[..., 1]
+    c = base[..., 2]
+
+    assert not a.is_contiguous()
+    assert not b.is_contiguous()
+    assert not c.is_contiguous()
 
     packed_a, packed_b = segment_pack_padded_rows_pair(
         a,
@@ -1243,9 +1248,22 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
     )
     assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([4, 3], dtype=torch.int32))
     assert int(prepared["flash_active_tokens"].item()) == 7
-    assert torch.equal(prepared["flash_doc_segment_offsets"], torch.tensor([0, 2, 5, 6], dtype=torch.int32))
-    assert torch.equal(prepared["flash_doc_segment_lengths"], torch.tensor([2, 2, 1, 2], dtype=torch.int32))
-    assert torch.equal(prepared["flash_doc_cu_seqlens"], torch.tensor([0, 2, 4, 5, 7], dtype=torch.int32))
+    assert tuple(prepared["flash_doc_segment_offsets"].shape) == (10,)
+    assert tuple(prepared["flash_doc_segment_lengths"].shape) == (10,)
+    assert tuple(prepared["flash_doc_cu_seqlens"].shape) == (11,)
+    assert torch.equal(
+        prepared["flash_doc_segment_offsets"][:4],
+        torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+    )
+    assert torch.equal(
+        prepared["flash_doc_segment_lengths"][:4],
+        torch.tensor([2, 2, 1, 2], dtype=torch.int32),
+    )
+    assert torch.equal(
+        prepared["flash_doc_cu_seqlens"][:5],
+        torch.tensor([0, 2, 4, 5, 7], dtype=torch.int32),
+    )
+    assert torch.count_nonzero(prepared["flash_doc_segment_lengths"][4:]).item() == 0
 
 
 def test_prepare_flash_attention_batch_metadata_respects_force_varlen(

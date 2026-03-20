@@ -98,6 +98,12 @@ def _parse_args() -> argparse.Namespace:
         help="Optional override for data.packing.enabled.",
     )
     parser.add_argument(
+        "--block-cross-document-attention",
+        choices=("true", "false"),
+        default=None,
+        help="Optional override for data.packing.block_cross_document_attention.",
+    )
+    parser.add_argument(
         "--ga-steps",
         type=int,
         default=None,
@@ -165,6 +171,11 @@ def _maybe_override_config(args: argparse.Namespace) -> list[str]:
     ]
     if args.packing_enabled is not None:
         overrides.append(f"data.packing.enabled={str(_bool_text(args.packing_enabled)).lower()}")
+    if args.block_cross_document_attention is not None:
+        overrides.append(
+            "data.packing.block_cross_document_attention="
+            f"{str(_bool_text(args.block_cross_document_attention)).lower()}"
+        )
     if args.ga_steps is not None:
         overrides.append(f"train.gradient_accumulation_steps={int(args.ga_steps)}")
     return overrides
