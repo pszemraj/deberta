@@ -60,6 +60,7 @@ from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_import_error,
     flashdeberta_compiled_bias_available,
 )
+from deberta.modeling.flashdeberta_dense_bias_op import flashdeberta_dense_bias
 from deberta.modeling.flashdeberta_docblock_op import (
     flashdeberta_compiled_docblock_available,
     flashdeberta_docblock,
@@ -752,19 +753,19 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             device=query_layer.device,
         )
         del batch_size, num_heads
-        bias = _build_dense_flash_bias(
-            pos_key=pos_key,
-            pos_query=pos_query,
-            bucket_index=bucket_index,
-        )
-
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_bias_calls")
         return flashdeberta_bias(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            bias=bias.mul_(float(sm_scale)),
+            bias=flashdeberta_dense_bias(
+                pos_key=pos_key,
+                pos_query=pos_query,
+                bucket_index=bucket_index,
+                keep_mask=None,
+                scale=float(sm_scale),
+            ),
             sm_scale=sm_scale,
             causal=False,
         )
@@ -896,19 +897,19 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             device=query_layer.device,
         )
         del batch_size, num_heads
-        bias = _build_dense_flash_bias(
-            pos_key=pos_key,
-            pos_query=pos_query,
-            bucket_index=bucket_index,
-            keep_mask=keep_mask,
-        )
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_docblock_bias_calls")
         return flashdeberta_bias(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            bias=bias.mul_(float(sm_scale)),
+            bias=flashdeberta_dense_bias(
+                pos_key=pos_key,
+                pos_query=pos_query,
+                bucket_index=bucket_index,
+                keep_mask=keep_mask,
+                scale=float(sm_scale),
+            ),
             sm_scale=sm_scale,
             causal=False,
         )

@@ -74,10 +74,11 @@ batch, runs the existing disentangled varlen flash kernels, and scatters the
 results back into the original packed layout. The fixed-shape metadata contract
 is important: it keeps the compiled `masked_docblock_*` entrypoints from
 recompiling when the number of documents per packed batch changes.
-The dense-bias branch also builds its `(B,H,S,S)` additive bias with
-`take_along_dim` plus broadcast masks instead of expanding the shared bucket
-index and keep mask across heads first, which cuts the pairwise-bias assembly
-overhead before the flash bias kernels run.
+The dense-bias branch now builds its `(B,H,S,S)` additive bias through a
+repo-local opaque custom op instead of tracing the earlier
+`take_along_dim`/mask-scaling chain in eager Python. That keeps dense-bias
+assembly compile-stable and materially reduces the packed-docblock `1024`
+builder overhead before the flash bias kernels run.
 That dense flash-with-bias route now has its own repo-local tuning seam too:
 `FLASHDEBERTA_BIAS_FWD_*` and `FLASHDEBERTA_BIAS_BWD_*` are resolved inside the
 opaque bias wrapper before it falls back to upstream FlashDeBERTa config

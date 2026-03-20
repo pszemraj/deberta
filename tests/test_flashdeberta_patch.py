@@ -1546,6 +1546,66 @@ def test_build_dense_flash_bias_matches_reference() -> None:
     assert torch.equal(actual, reference)
 
 
+def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    batch_size = 2
+    num_heads = 3
+    seq_len = 4
+    buckets = 7
+    scale = 0.125
+
+    pos_key = torch.randn((batch_size, num_heads, seq_len, buckets), dtype=torch.float32)
+    pos_query = torch.randn((batch_size, num_heads, seq_len, buckets), dtype=torch.float32)
+    bucket_index = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [1, 0, 3, 4],
+            [2, 3, 0, 5],
+            [3, 4, 5, 0],
+        ],
+        dtype=torch.int64,
+    )
+    keep_mask = torch.tensor(
+        [
+            [
+                [
+                    [True, True, False, False],
+                    [True, True, False, False],
+                    [False, False, True, True],
+                    [False, False, True, True],
+                ]
+            ],
+            [
+                [
+                    [True, False, False, False],
+                    [False, True, False, False],
+                    [False, False, True, False],
+                    [False, False, False, True],
+                ]
+            ],
+        ],
+        dtype=torch.bool,
+    )
+
+    expected = dense_bias_mod._dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
+    actual = dense_bias_mod.flashdeberta_dense_bias(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
+
+    assert torch.equal(actual, expected)
+
+
 def test_varlen_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
