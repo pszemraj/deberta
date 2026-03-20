@@ -1,3 +1,4 @@
+# ruff: noqa: F821,UP037
 """Compile-safe dense DeBERTa bias assembly for FlashDeBERTa local-bias routes.
 
 The short-sequence local-bias flash path still needs a dense additive bias
@@ -13,6 +14,7 @@ existing semantics via explicit scatter-add rules.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -62,6 +64,114 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
         return None
     op = getattr(ns, name)
     return getattr(op, "default", op)
+
+
+def _dense_bias_kernel_override_from_env() -> tuple[int, int, int, int] | None:
+    """Return dense-bias builder launch overrides when fully specified.
+
+    Supported env vars:
+    - ``FLASHDEBERTA_DENSE_BIAS_BLOCK_M``
+    - ``FLASHDEBERTA_DENSE_BIAS_BLOCK_N``
+    - ``FLASHDEBERTA_DENSE_BIAS_NUM_STAGES``
+    - ``FLASHDEBERTA_DENSE_BIAS_NUM_WARPS``
+
+    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when unset / invalid / incomplete.
+    """
+
+    names = (
+        "FLASHDEBERTA_DENSE_BIAS_BLOCK_M",
+        "FLASHDEBERTA_DENSE_BIAS_BLOCK_N",
+        "FLASHDEBERTA_DENSE_BIAS_NUM_STAGES",
+        "FLASHDEBERTA_DENSE_BIAS_NUM_WARPS",
+    )
+    raw = [os.environ.get(name) for name in names]
+    if any(value is None or not str(value).strip() for value in raw):
+        return None
+    try:
+        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
+    except Exception:
+        return None
+    return int(block_m), int(block_n), int(num_stages), int(num_warps)
+
+
+def _dense_bias_repo_tuned_config(
+    *,
+    batch_size: int,
+    num_heads: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    has_mask: bool,
+) -> tuple[int, int, int, int] | None:
+    """Return repo-local dense-bias builder configs for measured hot paths.
+
+    This helper stays conservative. Promote a tuned config only after it wins
+    in the real packed-docblock RTD loop, not just in isolated sweeps.
+
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int seq_len: Query/key sequence length.
+    :param torch.dtype dtype: Input/output dtype.
+    :param torch.device device: CUDA device hosting the builder tensors.
+    :param bool has_mask: Whether the keep mask is active.
+    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when no measured config is promoted.
+    """
+
+    if device.type != "cuda":
+        return None
+    if dtype not in {torch.float16, torch.bfloat16}:
+        return None
+    if int(seq_len) != 1024:
+        return None
+    if int(batch_size) != 4 or int(num_heads) != 12:
+        return None
+    capability = (
+        torch.cuda.get_device_capability(device.index)
+        if device.index is not None
+        else torch.cuda.get_device_capability()
+    )
+    if int(capability[0]) < 12:
+        return None
+    del has_mask
+    return (64, 128, 2, 4)
+
+
+def _dense_bias_kernel_config(
+    *,
+    batch_size: int,
+    num_heads: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    has_mask: bool,
+) -> tuple[int, int, int, int]:
+    """Resolve the fused dense-bias builder launch config.
+
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int seq_len: Query/key sequence length.
+    :param torch.dtype dtype: Input/output dtype.
+    :param torch.device device: CUDA device hosting the builder tensors.
+    :param bool has_mask: Whether the keep mask is active.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    override = _dense_bias_kernel_override_from_env()
+    if override is not None:
+        return override
+    tuned = _dense_bias_repo_tuned_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        seq_len=seq_len,
+        dtype=dtype,
+        device=device,
+        has_mask=has_mask,
+    )
+    if tuned is not None:
+        return tuned
+    return (64, 64, 2, 4)
 
 
 def _dense_bias_forward_fallback(
@@ -287,8 +397,16 @@ def _dense_bias_forward_cuda(
     keep_mask_tensor = (
         keep_mask if keep_mask is not None else torch.empty((0,), device=reference.device, dtype=torch.bool)
     )
+    block_m, block_n, num_stages, num_warps = _dense_bias_kernel_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        seq_len=seq_len,
+        dtype=reference.dtype,
+        device=reference.device,
+        has_mask=keep_mask is not None,
+    )
 
-    grid = (triton.cdiv(seq_len, 64), triton.cdiv(seq_len, 64), batch_size * num_heads)
+    grid = (triton.cdiv(seq_len, block_m), triton.cdiv(seq_len, block_n), batch_size * num_heads)
     with torch.cuda.device(reference.device.index):
         _dense_bias_fwd_kernel[grid](
             pos_key_tensor,
@@ -321,10 +439,10 @@ def _dense_bias_forward_cuda(
             HAS_POS_KEY=pos_key is not None,
             HAS_POS_QUERY=pos_query is not None,
             HAS_MASK=keep_mask is not None,
-            BLOCK_M=64,
-            BLOCK_N=64,
-            num_warps=4,
-            num_stages=2,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     return output
 

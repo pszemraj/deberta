@@ -79,6 +79,16 @@ repo-local opaque custom op instead of tracing the earlier
 `take_along_dim`/mask-scaling chain in eager Python. That keeps dense-bias
 assembly compile-stable and materially reduces the packed-docblock `1024`
 builder overhead before the flash bias kernels run.
+The builder has its own tuning seam as well:
+- `FLASHDEBERTA_DENSE_BIAS_BLOCK_M`
+- `FLASHDEBERTA_DENSE_BIAS_BLOCK_N`
+- `FLASHDEBERTA_DENSE_BIAS_NUM_STAGES`
+- `FLASHDEBERTA_DENSE_BIAS_NUM_WARPS`
+
+Those overrides affect only the repo-local dense-bias assembly op, not the
+downstream flash-with-bias attention kernels.
+The current measured `sm_120` packed-docblock `1024` default for that builder
+is `64 x 128, stages=2, warps=4`.
 That dense flash-with-bias route now has its own repo-local tuning seam too:
 `FLASHDEBERTA_BIAS_FWD_*` and `FLASHDEBERTA_BIAS_BWD_*` are resolved inside the
 opaque bias wrapper before it falls back to upstream FlashDeBERTa config

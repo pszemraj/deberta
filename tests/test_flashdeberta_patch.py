@@ -1817,6 +1817,54 @@ def test_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert bias_mod._bias_kernel_override_from_env(kind="bwd") == (32, 64, 2, 4)
 
 
+def test_dense_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    for name in (
+        "FLASHDEBERTA_DENSE_BIAS_BLOCK_M",
+        "FLASHDEBERTA_DENSE_BIAS_BLOCK_N",
+        "FLASHDEBERTA_DENSE_BIAS_NUM_STAGES",
+        "FLASHDEBERTA_DENSE_BIAS_NUM_WARPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert dense_bias_mod._dense_bias_kernel_override_from_env() is None
+
+    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_BLOCK_M", "128")
+    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_NUM_STAGES", "3")
+    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_NUM_WARPS", "4")
+
+    assert dense_bias_mod._dense_bias_kernel_override_from_env() == (128, 64, 3, 4)
+
+
+def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    monkeypatch.setattr(dense_bias_mod.torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (12, 0))
+
+    assert dense_bias_mod._dense_bias_repo_tuned_config(
+        batch_size=4,
+        num_heads=12,
+        seq_len=1024,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        has_mask=False,
+    ) == (64, 128, 2, 4)
+
+    assert (
+        dense_bias_mod._dense_bias_repo_tuned_config(
+            batch_size=2,
+            num_heads=12,
+            seq_len=1024,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            has_mask=True,
+        )
+        is None
+    )
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()
