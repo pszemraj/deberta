@@ -355,11 +355,12 @@ def _varlen_repo_tuned_bwd_config(
         seq_len=int(seq_len), total_tokens=int(total_tokens), batch_size=int(batch_size)
     )
     tuned: dict[tuple[str, str], tuple[int, int, int, int]] = {
-        ("kv", "2048_medium"): (64, 64, 3, 8),
-        ("kv", "2048_sparse"): (64, 64, 3, 8),
-        ("kv", "4096_plus"): (64, 64, 3, 8),
-        ("q", "2048_medium"): (64, 64, 3, 8),
-        ("q", "2048_sparse"): (64, 64, 3, 8),
+        # Measured on sampled unpacked HF DeBERTa RTD batches on sm_120.
+        ("kv", "2048_medium"): (64, 32, 2, 4),
+        ("kv", "2048_sparse"): (64, 32, 2, 4),
+        ("kv", "4096_plus"): (32, 64, 2, 4),
+        ("q", "2048_medium"): (32, 64, 2, 4),
+        ("q", "2048_sparse"): (32, 64, 2, 4),
         ("q", "4096_plus"): (64, 64, 3, 8),
     }
     return tuned.get((normalized_kind, bucket))
@@ -2554,7 +2555,9 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor mask, Tensor out, Tensor lse, "
             "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, "
-            "int max_relative_distance, bool causal) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+            "int max_relative_distance, bool causal, Tensor cu_seqlens, Tensor q_unpad, Tensor k_unpad, "
+            "Tensor v_unpad, Tensor out_unpad, Tensor lse_unpad, Tensor? pos_key_unpad, "
+            "Tensor? pos_query_unpad) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
     )
     def _backward_op(
@@ -2571,6 +2574,14 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        cu_seqlens: torch.Tensor,
+        q_unpad: torch.Tensor,
+        k_unpad: torch.Tensor,
+        v_unpad: torch.Tensor,
+        out_unpad: torch.Tensor,
+        lse_unpad: torch.Tensor,
+        pos_key_unpad: torch.Tensor | None,
+        pos_query_unpad: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run compile-visible padded varlen backward.
 
@@ -2587,6 +2598,14 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
         :param bool causal: Whether causal masking is enabled.
+        :param torch.Tensor cu_seqlens: Cached cumulative sequence lengths.
+        :param torch.Tensor q_unpad: Cached packed queries.
+        :param torch.Tensor k_unpad: Cached packed keys.
+        :param torch.Tensor v_unpad: Cached packed values.
+        :param torch.Tensor out_unpad: Cached packed forward output.
+        :param torch.Tensor lse_unpad: Cached packed forward LSE.
+        :param torch.Tensor | None pos_key_unpad: Cached packed c2p tensor.
+        :param torch.Tensor | None pos_query_unpad: Cached packed p2c tensor.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             Padded q/k/v gradients plus positional gradients with empty sentinels
             for absent positional inputs.
@@ -2606,6 +2625,14 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
             causal=causal,
+            cu_seqlens=cu_seqlens,
+            q_unpad=q_unpad,
+            k_unpad=k_unpad,
+            v_unpad=v_unpad,
+            out_unpad=out_unpad,
+            lse_unpad=lse_unpad,
+            pos_key_unpad=pos_key_unpad,
+            pos_query_unpad=pos_query_unpad,
         )
         if dpos_key is None:
             dpos_key = q.new_empty((0,))

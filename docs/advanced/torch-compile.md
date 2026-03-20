@@ -74,6 +74,20 @@ fuses padded `grad_out` packing with `delta` construction, so the old
 `prefix-pack grad -> _bwd_preprocess_varlen` boundary is no longer a separate
 hot path in repo code.
 
+Current repo-local varlen backward heuristics are measured on real unpacked HF
+DeBERTa RTD batches on `sm_120`, not synthetic pad ratios:
+
+- `2048_medium` / `2048_sparse`: `KV=(64,32,2,4)`, `Q=(32,64,2,4)`
+- `4096_plus`: `KV=(32,64,2,4)`, `Q=(64,64,3,8)`
+
+Those tuned buckets are enough for the current branch to beat eager end to end
+on the provided unpacked `2048` and `4096` configs while staying compile-stable.
+If you need to retune for another GPU, use `tools/flashdeberta_varlen_tune.py`
+first and prefer the split overrides:
+
+- `FLASHDEBERTA_VARLEN_BWD_KV_*`
+- `FLASHDEBERTA_VARLEN_BWD_Q_*`
+
 ## Special case: packed doc-block masks
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope downgrades toward FFN-focused compile to avoid shape-churn recompiles from dynamic pairwise masks.

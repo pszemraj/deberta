@@ -379,7 +379,7 @@ def main() -> None:
     )
 
     summary_lines = [
-        "candidate\troute\tmean_ms\tactive_tok_per_s\tslot_tok_per_s\tmax_memory_gib\tseq_len\ttotal_tokens\thead_dim\tatt_span\tdevice_capability\tdensity_bucket"
+        "candidate\troute\tstatus\tmean_ms\tactive_tok_per_s\tslot_tok_per_s\tmax_memory_gib\tseq_len\ttotal_tokens\thead_dim\tatt_span\tdevice_capability\tdensity_bucket\terror"
     ]
     best_by_key: dict[str, dict[str, Any]] = {}
 
@@ -387,13 +387,44 @@ def main() -> None:
         saved_env = _apply_candidate_env(env_map)
         try:
             for route in routes:
-                mean_ms, active_tok_s, slot_tok_s, max_mem_gib, per_sample_mean = _run_candidate(
-                    model=model,
-                    samples=samples,
-                    route=route,
-                    warmup=int(args.warmup),
-                    steps=int(args.steps),
-                )
+                sample0 = samples[0]
+                density_buckets = {sample.density_bucket for sample in samples}
+                density_bucket = next(iter(density_buckets)) if len(density_buckets) == 1 else "mixed"
+                try:
+                    mean_ms, active_tok_s, slot_tok_s, max_mem_gib, per_sample_mean = _run_candidate(
+                        model=model,
+                        samples=samples,
+                        route=route,
+                        warmup=int(args.warmup),
+                        steps=int(args.steps),
+                    )
+                except Exception as exc:
+                    error_text = " ".join(str(exc).split())
+                    summary_lines.append(
+                        "\t".join(
+                            [
+                                candidate_name,
+                                route,
+                                "failed",
+                                "",
+                                "",
+                                "",
+                                "",
+                                str(sample0.seq_len),
+                                str(sum(sample.active_tokens for sample in samples)),
+                                str(sample0.head_dim),
+                                str(sample0.att_span),
+                                sample0.device_capability,
+                                density_bucket,
+                                error_text,
+                            ]
+                        )
+                    )
+                    print(f"candidate_failed name={candidate_name} route={route} error={error_text}")
+                    model.zero_grad(set_to_none=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
                 for sample in samples:
                     key = json.dumps(
                         {
@@ -416,13 +447,12 @@ def main() -> None:
                             "env": env_map,
                             "density_bucket": sample.density_bucket,
                         }
-                sample0 = samples[0]
-                density_buckets = {sample.density_bucket for sample in samples}
                 summary_lines.append(
                     "\t".join(
                         [
                             candidate_name,
                             route,
+                            "ok",
                             f"{mean_ms:.4f}",
                             f"{active_tok_s:.2f}",
                             f"{slot_tok_s:.2f}",
@@ -432,7 +462,8 @@ def main() -> None:
                             str(sample0.head_dim),
                             str(sample0.att_span),
                             sample0.device_capability,
-                            next(iter(density_buckets)) if len(density_buckets) == 1 else "mixed",
+                            density_bucket,
+                            "",
                         ]
                     )
                 )

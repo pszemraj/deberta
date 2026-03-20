@@ -1229,7 +1229,7 @@ def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.Mo
         device=torch.device("cuda"),
     )
 
-    assert sparse_cfg == (64, 64, 3, 8)
+    assert sparse_cfg == (64, 32, 2, 4)
     assert long_cfg == (64, 64, 3, 8)
 
 
