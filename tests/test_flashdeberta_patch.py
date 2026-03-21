@@ -1932,6 +1932,30 @@ def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: p
     )
 
 
+def test_encoder_compile_hidden_state_snapshots_clone_outputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deberta.modeling import deberta_v2_native as dv2
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = _small_deberta_config()
+    model = DebertaV2Model(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    monkeypatch.setattr(dv2, "_is_torch_compiling", lambda: True)
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    assert outputs.hidden_states is not None
+    assert len(outputs.hidden_states) == int(cfg.num_hidden_layers) + 1
+    assert outputs.hidden_states[0].data_ptr() != outputs.hidden_states[1].data_ptr()
+    assert outputs.hidden_states[-1].data_ptr() != outputs.last_hidden_state.data_ptr()
+    torch.testing.assert_close(outputs.hidden_states[-1], outputs.last_hidden_state)
+
+
 def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _, patch_mod = _reload_flash_modules()

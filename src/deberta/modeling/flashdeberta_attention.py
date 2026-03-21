@@ -890,15 +890,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             query_len=seq_len,
             key_len=int(key_layer.shape[-2]),
         )
+        del batch_size, num_heads
+        if _RUNTIME_CONFIG.enable_debug_stats:
+            _record_stat("flash_docblock_bias_calls")
         bucket_index = _dense_bucket_index_tensor(
             seq_len=seq_len,
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        del batch_size, num_heads
-        if _RUNTIME_CONFIG.enable_debug_stats:
-            _record_stat("flash_docblock_bias_calls")
         return flashdeberta_bias(
             query_layer=query_layer,
             key_layer=key_layer,

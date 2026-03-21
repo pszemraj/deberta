@@ -25,6 +25,20 @@ except Exception as e:  # pragma: no cover
     raise RuntimeError("transformers is required for the hf_deberta_v2 backbone.") from e
 
 
+def _is_torch_compiling() -> bool:
+    """Return whether execution is happening inside a ``torch.compile`` graph.
+
+    :return bool: True when currently tracing/executing under ``torch.compile``.
+    """
+
+    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
+        return False
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
+
+
 def _normalize_pos_att_type(raw: Any) -> list[str]:
     """Normalize positional-attention type config into a canonical string list.
 
@@ -1205,8 +1219,11 @@ class DebertaV2Encoder(nn.Module):
         rel_pos = self.get_rel_pos(hidden_states, query_states=query_states, relative_pos=relative_pos)
         rel_embeddings = self.get_rel_embedding()
 
+        capture_hidden_states = bool(output_hidden_states)
+        compile_snapshot_hidden_states = bool(capture_hidden_states and _is_torch_compiling())
+        initial_hidden_state = hidden_states.clone() if compile_snapshot_hidden_states else hidden_states
         all_hidden_states: tuple[torch.Tensor, ...] | None = (
-            (hidden_states,) if output_hidden_states else None
+            (initial_hidden_state,) if capture_hidden_states else None
         )
         all_attentions: tuple[torch.Tensor, ...] | None = () if output_attentions else None
 
@@ -1277,8 +1294,11 @@ class DebertaV2Encoder(nn.Module):
             if idx == 0 and self.conv is not None:
                 output_states = self.conv(hidden_states, output_states, input_mask)
 
-            if output_hidden_states and all_hidden_states is not None:
-                all_hidden_states = all_hidden_states + (output_states,)
+            if capture_hidden_states and all_hidden_states is not None:
+                hidden_state_snapshot = (
+                    output_states.clone() if compile_snapshot_hidden_states else output_states
+                )
+                all_hidden_states = all_hidden_states + (hidden_state_snapshot,)
 
             if query_states is not None:
                 query_states = output_states
@@ -1287,8 +1307,9 @@ class DebertaV2Encoder(nn.Module):
         if not return_dict:
             return tuple(v for v in (output_states, all_hidden_states, all_attentions) if v is not None)
 
+        last_hidden_state = output_states.clone() if compile_snapshot_hidden_states else output_states
         return BaseModelOutput(
-            last_hidden_state=output_states,
+            last_hidden_state=last_hidden_state,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
