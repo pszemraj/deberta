@@ -9,7 +9,7 @@ visible steady-state hotspot for packed doc-block training.
 This module exposes a repo-local fused forward builder as an opaque custom op.
 It gathers c2p/p2c positional terms and applies the optional keep mask plus
 softmax scale inside one Triton launch, while the backward path keeps the
-existing semantics via explicit scatter-add rules.
+existing semantics via cached row-range reductions derived from the bucket map.
 """
 
 from __future__ import annotations
@@ -31,6 +31,24 @@ except Exception as exc:  # pragma: no cover - optional import
 
 _DENSE_BIAS_NAMESPACE = "deberta"
 _DENSE_BIAS_OP_NAME = "flashdeberta_dense_bias"
+_DENSE_BUCKET_RANGE_CACHE: dict[
+    tuple[int, int, tuple[int, ...], tuple[int, ...], str, int],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+
+
+def _is_torch_compiling() -> bool:
+    """Return whether execution is happening under ``torch.compile``.
+
+    :return bool: True when inside compiled/traced execution.
+    """
+
+    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
+        return False
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
 
 
 def flashdeberta_compiled_dense_bias_available() -> bool:
@@ -215,6 +233,164 @@ def _dense_bias_forward_fallback(
     if keep_mask is not None:
         bias.masked_fill_(~keep_mask, -1.0e4 * float(scale))
     return bias
+
+
+def _dense_bucket_range_cache_key(
+    bucket_index: torch.Tensor,
+    *,
+    num_buckets: int,
+) -> tuple[int, int, tuple[int, ...], tuple[int, ...], str, int]:
+    """Return a storage-stable cache key for one dense bucket map.
+
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param int num_buckets: Positional-bias width.
+    :return tuple[int, int, tuple[int, ...], tuple[int, ...], str, int]:
+        Storage pointer, storage offset, shape, stride, device text, and bucket count.
+    """
+
+    storage = bucket_index.untyped_storage()
+    return (
+        int(storage.data_ptr()),
+        int(bucket_index.storage_offset()),
+        tuple(int(dim) for dim in bucket_index.shape),
+        tuple(int(dim) for dim in bucket_index.stride()),
+        str(bucket_index.device),
+        int(num_buckets),
+    )
+
+
+def _dense_bucket_ranges(
+    bucket_index: torch.Tensor,
+    *,
+    num_buckets: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached contiguous bucket ranges for one dense bucket map.
+
+    Each DeBERTa row maps columns into bucket ids without re-entering the same
+    bucket later in the row. That lets backward replace random scatter-add
+    traffic with contiguous segment reductions.
+
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param int num_buckets: Positional-bias width.
+    :return tuple[torch.Tensor, torch.Tensor]: Inclusive start/end indices in ``(S,P)`` layout.
+    """
+
+    cache_key: tuple[int, int, tuple[int, ...], tuple[int, ...], str, int] | None = None
+    if not _is_torch_compiling():
+        try:
+            cache_key = _dense_bucket_range_cache_key(bucket_index, num_buckets=num_buckets)
+        except Exception:
+            cache_key = None
+        if cache_key is not None:
+            cached = _DENSE_BUCKET_RANGE_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
+    seq_len = int(bucket_index.shape[0])
+    column_ids = torch.arange(seq_len, device=bucket_index.device, dtype=torch.int64)
+    column_ids = column_ids.view(1, seq_len).expand(seq_len, seq_len)
+    bucket_ids = bucket_index.to(dtype=torch.int64)
+
+    missing = torch.full(
+        (seq_len, int(num_buckets)),
+        int(seq_len),
+        device=bucket_index.device,
+        dtype=torch.int64,
+    )
+    start = missing.scatter_reduce(
+        -1,
+        bucket_ids,
+        column_ids,
+        reduce="amin",
+        include_self=True,
+    )
+    start = torch.where(start == int(seq_len), torch.full_like(start, -1), start)
+
+    end = torch.full(
+        (seq_len, int(num_buckets)),
+        -1,
+        device=bucket_index.device,
+        dtype=torch.int64,
+    )
+    end = end.scatter_reduce(
+        -1,
+        bucket_ids,
+        column_ids,
+        reduce="amax",
+        include_self=True,
+    )
+
+    if cache_key is not None:
+        _DENSE_BUCKET_RANGE_CACHE[cache_key] = (start, end)
+        if len(_DENSE_BUCKET_RANGE_CACHE) > 32:
+            stale_keys = list(_DENSE_BUCKET_RANGE_CACHE.keys())[:16]
+            for stale_key in stale_keys:
+                _DENSE_BUCKET_RANGE_CACHE.pop(stale_key, None)
+    return start, end
+
+
+def _dense_bucket_reduce_from_ranges(
+    *,
+    grad: torch.Tensor,
+    start: torch.Tensor,
+    end: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce dense bias gradients back into bucket space from cached ranges.
+
+    :param torch.Tensor grad: Dense bias gradient in ``(B,H,S,S)`` layout.
+    :param torch.Tensor start: Inclusive bucket start indices in ``(S,P)`` layout.
+    :param torch.Tensor end: Inclusive bucket end indices in ``(S,P)`` layout.
+    :param torch.dtype output_dtype: Output dtype for the reduced bucket tensor.
+    :return torch.Tensor: Reduced gradient in ``(B,H,S,P)`` layout.
+    """
+
+    seq_len = int(start.shape[0])
+    num_buckets = int(start.shape[1])
+    if int(num_buckets) <= 0:
+        return grad.new_zeros((*grad.shape[:3], 0), dtype=output_dtype)
+    prefix = grad.to(dtype=torch.float32).cumsum(dim=-1)
+
+    start_view = start.view(1, 1, seq_len, int(num_buckets))
+    end_view = end.view(1, 1, seq_len, int(num_buckets))
+    valid = end_view >= 0
+
+    end_idx = end_view.clamp_min(0).expand(int(grad.shape[0]), int(grad.shape[1]), -1, -1)
+    end_vals = torch.take_along_dim(prefix, end_idx, dim=-1)
+
+    start_prev = start_view - 1
+    start_prev_idx = start_prev.clamp_min(0).expand(int(grad.shape[0]), int(grad.shape[1]), -1, -1)
+    start_vals = torch.take_along_dim(prefix, start_prev_idx, dim=-1)
+    start_mask = start_prev >= 0
+
+    reduced = end_vals - torch.where(start_mask.expand_as(end_vals), start_vals, torch.zeros_like(start_vals))
+    reduced = torch.where(valid.expand_as(reduced), reduced, torch.zeros_like(reduced))
+    return reduced.to(dtype=output_dtype)
+
+
+def _dense_bucket_reduce(
+    *,
+    grad: torch.Tensor,
+    bucket_index: torch.Tensor,
+    num_buckets: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce dense bias gradients back into bucket space.
+
+    :param torch.Tensor grad: Dense bias gradient in ``(B,H,S,S)`` layout.
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param int num_buckets: Positional-bias width.
+    :param torch.dtype output_dtype: Output dtype for the reduced bucket tensor.
+    :return torch.Tensor: Reduced gradient in ``(B,H,S,P)`` layout.
+    """
+
+    start, end = _dense_bucket_ranges(bucket_index, num_buckets=int(num_buckets))
+    return _dense_bucket_reduce_from_ranges(
+        grad=grad,
+        start=start,
+        end=end,
+        output_dtype=output_dtype,
+    )
 
 
 if triton is not None:
@@ -545,7 +721,17 @@ def _build_dense_bias_custom_op() -> Any | None:
 
         del output
         pos_key, pos_query, bucket_index, keep_mask, scale, has_pos_key, has_pos_query, has_keep_mask = inputs
-        ctx.save_for_backward(pos_key, pos_query, bucket_index, keep_mask)
+        num_key_buckets = int(pos_key.shape[-1]) if bool(has_pos_key) else 0
+        num_query_buckets = int(pos_query.shape[-1]) if bool(has_pos_query) else 0
+        start_key = end_key = start_query = end_query = torch.empty(
+            (0,), device=bucket_index.device, dtype=torch.int64
+        )
+        if bool(has_pos_key):
+            start_key, end_key = _dense_bucket_ranges(bucket_index, num_buckets=num_key_buckets)
+        if bool(has_pos_query):
+            transposed = bucket_index.transpose(0, 1).contiguous()
+            start_query, end_query = _dense_bucket_ranges(transposed, num_buckets=num_query_buckets)
+        ctx.save_for_backward(pos_key, pos_query, keep_mask, start_key, end_key, start_query, end_query)
         ctx.scale = float(scale)
         ctx.has_pos_key = bool(has_pos_key)
         ctx.has_pos_query = bool(has_pos_query)
@@ -559,30 +745,32 @@ def _build_dense_bias_custom_op() -> Any | None:
         :return tuple[torch.Tensor | None, ...]: Gradients for the forward inputs.
         """
 
-        pos_key, pos_query, bucket_index, keep_mask = ctx.saved_tensors
+        pos_key, pos_query, keep_mask, start_key, end_key, start_query, end_query = ctx.saved_tensors
         if grad_out is None:
             return None, None, None, None, None, None, None, None
 
-        grad = grad_out
+        grad = grad_out.to(dtype=torch.float32)
         if ctx.has_keep_mask:
-            grad = grad.masked_fill(~keep_mask, 0)
+            grad = grad.masked_fill(~keep_mask, 0.0)
         grad = grad * float(ctx.scale)
 
         dpos_key: torch.Tensor | None = None
         if ctx.has_pos_key:
-            gather_index = bucket_index.view(1, 1, bucket_index.shape[0], bucket_index.shape[1]).expand(
-                grad.shape[0], grad.shape[1], -1, -1
+            dpos_key = _dense_bucket_reduce_from_ranges(
+                grad=grad,
+                start=start_key,
+                end=end_key,
+                output_dtype=pos_key.dtype,
             )
-            dpos_key = torch.zeros_like(pos_key).scatter_add_(-1, gather_index, grad)
 
         dpos_query: torch.Tensor | None = None
         if ctx.has_pos_query:
-            reverse_index = (
-                bucket_index.transpose(0, 1)
-                .view(1, 1, bucket_index.shape[0], bucket_index.shape[1])
-                .expand(grad.shape[0], grad.shape[1], -1, -1)
+            dpos_query = _dense_bucket_reduce_from_ranges(
+                grad=grad.transpose(-1, -2).contiguous(),
+                start=start_query,
+                end=end_query,
+                output_dtype=pos_query.dtype,
             )
-            dpos_query = torch.zeros_like(pos_query).scatter_add_(-1, reverse_index, grad.transpose(-1, -2))
 
         return dpos_key, dpos_query, None, None, None, None, None, None
 

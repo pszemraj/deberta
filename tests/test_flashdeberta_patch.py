@@ -1606,6 +1606,32 @@ def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    bucket_index = torch.tensor(
+        [
+            [1, 1, 2, 3],
+            [0, 1, 1, 2],
+            [0, 0, 1, 1],
+            [0, 0, 0, 1],
+        ],
+        dtype=torch.int64,
+    )
+    grad = torch.randn((2, 3, 4, 4), dtype=torch.float32)
+
+    actual = dense_bias_mod._dense_bucket_reduce(
+        grad=grad,
+        bucket_index=bucket_index,
+        num_buckets=4,
+        output_dtype=torch.float32,
+    )
+    gather_index = bucket_index.view(1, 1, 4, 4).expand(grad.shape[0], grad.shape[1], -1, -1)
+    expected = torch.zeros((2, 3, 4, 4), dtype=torch.float32).scatter_add_(-1, gather_index, grad)
+
+    assert torch.allclose(actual, expected)
+
+
 def test_varlen_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
@@ -1815,6 +1841,47 @@ def test_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_WARPS", "4")
 
     assert bias_mod._bias_kernel_override_from_env(kind="bwd") == (32, 64, 2, 4)
+
+
+def test_bias_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_M", "32")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_N", "64")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_STAGES", "2")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_WARPS", "4")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_BLOCK_M", "64")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_BLOCK_N", "128")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_NUM_STAGES", "3")
+    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_NUM_WARPS", "8")
+    monkeypatch.setattr(bias_mod, "_bias_repo_tuned_config", lambda **kwargs: None)
+    monkeypatch.setattr(bias_mod, "_get_bwd_config_bias_lowlevel", lambda *args, **kwargs: (16, 16, 1, 2))
+
+    kv_config = bias_mod._resolve_bias_bwd_kernel_config(
+        kind="kv",
+        batch_size=4,
+        num_heads=12,
+        query_len=1024,
+        key_len=1024,
+        head_dim=64,
+        causal=False,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    q_config = bias_mod._resolve_bias_bwd_kernel_config(
+        kind="q",
+        batch_size=4,
+        num_heads=12,
+        query_len=1024,
+        key_len=1024,
+        head_dim=64,
+        causal=False,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert kv_config == (64, 128, 3, 8)
+    assert q_config == (32, 64, 2, 4)
 
 
 def test_dense_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

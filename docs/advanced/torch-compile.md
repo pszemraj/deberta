@@ -79,6 +79,9 @@ repo-local opaque custom op instead of tracing the earlier
 `take_along_dim`/mask-scaling chain in eager Python. That keeps dense-bias
 assembly compile-stable and materially reduces the packed-docblock `1024`
 builder overhead before the flash bias kernels run.
+Its backward path now also saves bucket-range metadata through the custom-op
+context and reduces dense bias gradients with contiguous segment reductions
+instead of the earlier `scatter_add_` / `scatter_reduce_` heavy fallback.
 The builder has its own tuning seam as well:
 - `FLASHDEBERTA_DENSE_BIAS_BLOCK_M`
 - `FLASHDEBERTA_DENSE_BIAS_BLOCK_N`
@@ -90,10 +93,13 @@ downstream flash-with-bias attention kernels.
 The current measured `sm_120` packed-docblock `1024` default for that builder
 is `64 x 128, stages=2, warps=4`.
 That dense flash-with-bias route now has its own repo-local tuning seam too:
-`FLASHDEBERTA_BIAS_FWD_*` and `FLASHDEBERTA_BIAS_BWD_*` are resolved inside the
-opaque bias wrapper before it falls back to upstream FlashDeBERTa config
-selection, so packed-docblock kernel tuning stays isolated from the fixed and
-varlen routes.
+`FLASHDEBERTA_BIAS_FWD_*`, the generic `FLASHDEBERTA_BIAS_BWD_*` fallback, and
+the more specific `FLASHDEBERTA_BIAS_BWD_KV_*` / `FLASHDEBERTA_BIAS_BWD_Q_*`
+overrides are resolved inside the opaque bias wrapper before it falls back to
+upstream FlashDeBERTa config selection, so packed-docblock kernel tuning stays
+isolated from the fixed and varlen routes. The repo now launches the raw bias
+backward `KV` and `Q` Triton kernels directly, which makes those two backward
+surfaces independently tunable without forking the whole attention wrapper.
 
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,

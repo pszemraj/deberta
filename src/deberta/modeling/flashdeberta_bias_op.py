@@ -26,6 +26,15 @@ except Exception as exc:  # pragma: no cover - optional import
 
 try:
     from flashdeberta.ops.flash_attention_bias import (
+        _bwd_kv_kernel as _bwd_kv_kernel_bias_raw,
+    )
+    from flashdeberta.ops.flash_attention_bias import (
+        _bwd_preprocess as _bwd_preprocess_bias_raw,
+    )
+    from flashdeberta.ops.flash_attention_bias import (
+        _bwd_q_kernel as _bwd_q_kernel_bias_raw,
+    )
+    from flashdeberta.ops.flash_attention_bias import (
         flash_attn_v2_bwd as _flash_attn_v2_bwd_bias_lowlevel,
     )
     from flashdeberta.ops.flash_attention_bias import (
@@ -40,6 +49,9 @@ try:
 
     _FLASH_BIAS_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
+    _bwd_kv_kernel_bias_raw = None
+    _bwd_preprocess_bias_raw = None
+    _bwd_q_kernel_bias_raw = None
     _flash_attn_v2_bwd_bias_lowlevel = None
     _flash_attn_v2_fwd_bias_lowlevel = None
     _get_bwd_config_bias_lowlevel = None
@@ -120,14 +132,22 @@ def _bias_kernel_override_from_env(*, kind: str) -> tuple[int, int, int, int] | 
     - ``FLASHDEBERTA_BIAS_BWD_BLOCK_N``
     - ``FLASHDEBERTA_BIAS_BWD_NUM_STAGES``
     - ``FLASHDEBERTA_BIAS_BWD_NUM_WARPS``
+    - ``FLASHDEBERTA_BIAS_BWD_KV_BLOCK_M``
+    - ``FLASHDEBERTA_BIAS_BWD_KV_BLOCK_N``
+    - ``FLASHDEBERTA_BIAS_BWD_KV_NUM_STAGES``
+    - ``FLASHDEBERTA_BIAS_BWD_KV_NUM_WARPS``
+    - ``FLASHDEBERTA_BIAS_BWD_Q_BLOCK_M``
+    - ``FLASHDEBERTA_BIAS_BWD_Q_BLOCK_N``
+    - ``FLASHDEBERTA_BIAS_BWD_Q_NUM_STAGES``
+    - ``FLASHDEBERTA_BIAS_BWD_Q_NUM_WARPS``
 
-    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param str kind: One of ``"fwd"``, ``"bwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
     :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
         or ``None`` when unset / invalid / incomplete.
     """
 
     normalized = str(kind).strip().lower()
-    if normalized not in {"fwd", "bwd"}:
+    if normalized not in {"fwd", "bwd", "bwd_kv", "bwd_q"}:
         raise ValueError(f"Unsupported bias kernel override kind: {kind!r}")
 
     prefix = f"FLASHDEBERTA_BIAS_{normalized.upper()}"
@@ -165,7 +185,7 @@ def _bias_repo_tuned_config(
     measured on real packed doc-block RTD batches for the repo's current
     DeBERTa ``1024 x 1024`` non-causal bf16 regime on ``sm_120`` hardware.
 
-    :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param str kind: One of ``"fwd"``, ``"bwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
     :param int batch_size: Batch size.
     :param int num_heads: Number of attention heads.
     :param int query_len: Query sequence length.
@@ -180,7 +200,7 @@ def _bias_repo_tuned_config(
 
     del batch_size, num_heads
     normalized_kind = str(kind).strip().lower()
-    if normalized_kind not in {"fwd", "bwd"}:
+    if normalized_kind not in {"fwd", "bwd", "bwd_kv", "bwd_q"}:
         return None
     if bool(causal):
         return None
@@ -300,6 +320,75 @@ def _bias_backward_config(
     )
 
 
+def _resolve_bias_bwd_kernel_config(
+    *,
+    kind: str,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int]:
+    """Resolve one dense-bias backward kernel config.
+
+    Specific ``KV`` / ``Q`` overrides take precedence over the generic
+    backward override so the repo can specialize the two backward kernels
+    independently for measured hot paths.
+
+    :param str kind: Either ``"kv"`` or ``"q"``.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :raises ValueError: If ``kind`` is unsupported.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    normalized_kind = str(kind).strip().lower()
+    if normalized_kind not in {"kv", "q"}:
+        raise ValueError(f"Unsupported dense-bias backward kernel kind: {kind!r}")
+
+    specific_override = _bias_kernel_override_from_env(kind=f"bwd_{normalized_kind}")
+    if specific_override is not None:
+        return specific_override
+
+    generic_override = _bias_kernel_override_from_env(kind="bwd")
+    if generic_override is not None:
+        return generic_override
+
+    repo_tuned = _bias_repo_tuned_config(
+        kind=f"bwd_{normalized_kind}",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=dtype,
+        device=device,
+    )
+    if repo_tuned is not None:
+        return repo_tuned
+
+    return _bias_backward_config(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=dtype,
+        device=device,
+    )
+
+
 def _bias_eager_forward_impl(
     *,
     q: torch.Tensor,
@@ -391,7 +480,36 @@ def _bias_eager_backward_impl(
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
-    block_m, block_n, num_stages, num_warps = _bias_backward_config(
+    if _bwd_preprocess_bias_raw is None or _bwd_kv_kernel_bias_raw is None or _bwd_q_kernel_bias_raw is None:
+        block_m, block_n, num_stages, num_warps = _bias_backward_config(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            query_len=query_len,
+            key_len=key_len,
+            head_dim=head_dim,
+            causal=bool(causal),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        dq, dk, dv, d_bias = _flash_attn_v2_bwd_bias_lowlevel(
+            out,
+            grad_out,
+            q,
+            k,
+            v,
+            bias,
+            lse,
+            bool(causal),
+            float(sm_scale),
+            int(block_m),
+            int(block_n),
+            int(num_warps),
+            int(num_stages),
+        )
+        return dq, dk, dv, d_bias
+
+    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_bias_bwd_kernel_config(
+        kind="kv",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,
@@ -401,21 +519,197 @@ def _bias_eager_backward_impl(
         dtype=q.dtype,
         device=q.device,
     )
-    dq, dk, dv, d_bias = _flash_attn_v2_bwd_bias_lowlevel(
-        out,
-        grad_out,
-        q,
-        k,
-        v,
-        bias,
-        lse,
-        bool(causal),
-        float(sm_scale),
-        int(block_m),
-        int(block_n),
-        int(num_warps),
-        int(num_stages),
+    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_bias_bwd_kernel_config(
+        kind="q",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=q.dtype,
+        device=q.device,
     )
+
+    bias_batch_stride = bias.stride(0)
+    bias_heads_stride = bias.stride(1)
+    if int(bias.shape[0]) != int(q.shape[0]) and int(bias.shape[0]) == 1:
+        bias_batch_stride = 0
+    if int(bias.shape[1]) != int(q.shape[1]) and int(bias.shape[1]) == 1:
+        bias_heads_stride = 0
+
+    preprocess_block_m = max(int(kv_block_m), int(q_block_m))
+    preprocess_grid = (
+        -(-int(query_len) // int(preprocess_block_m)),
+        int(num_heads),
+        int(batch_size),
+    )
+    delta = torch.empty_like(lse)
+    with torch.cuda.device(q.device.index):
+        _bwd_preprocess_bias_raw[preprocess_grid](
+            out,
+            grad_out,
+            delta,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            delta.stride(0),
+            delta.stride(1),
+            delta.stride(2),
+            int(query_len),
+            BLOCK_M=int(preprocess_block_m),
+            D_HEAD=int(head_dim),
+            DIVISIBLE_M=bool(int(query_len) % int(preprocess_block_m) == 0),
+        )
+
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    is_batch_reduced = int(bias_batch_stride) == 0
+    group_size_bias = int(batch_size)
+    if is_batch_reduced:
+        if bool(causal):
+            d_bias = torch.zeros((group_size_bias, *bias.shape[1:]), dtype=bias.dtype, device=bias.device)
+        else:
+            d_bias = torch.empty((group_size_bias, *bias.shape[1:]), dtype=bias.dtype, device=bias.device)
+        locks = torch.zeros(2 * group_size_bias, dtype=torch.int32, device=q.device)
+    else:
+        if bool(causal):
+            d_bias = torch.zeros_like(bias)
+        else:
+            d_bias = torch.empty_like(bias)
+        locks = None
+
+    kv_grid = (
+        -(-int(key_len) // int(kv_block_n)),
+        int(num_heads),
+        int(batch_size),
+    )
+    with torch.cuda.device(q.device.index):
+        _bwd_kv_kernel_bias_raw[kv_grid](
+            q,
+            k,
+            v,
+            bias,
+            float(sm_scale),
+            grad_out,
+            dk,
+            dv,
+            d_bias,
+            lse,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            bias.stride(0),
+            bias_heads_stride,
+            bias.stride(2),
+            bias.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            dk.stride(3),
+            dv.stride(0),
+            dv.stride(1),
+            dv.stride(2),
+            dv.stride(3),
+            int(batch_size),
+            int(num_heads),
+            int(query_len),
+            int(key_len),
+            int(key_len - query_len),
+            locks,
+            BLOCK_M=int(kv_block_m),
+            BLOCK_DMODEL=int(head_dim),
+            BLOCK_N=int(kv_block_n),
+            CAUSAL=bool(causal),
+            DIVISIBLE_M=bool(int(query_len) % int(kv_block_m) == 0),
+            DIVISIBLE_N=bool(int(key_len) % int(kv_block_n) == 0),
+            HAS_BIAS=True,
+            RETURN_DS=True,
+            IS_BATCH_REDUCED=bool(is_batch_reduced),
+            GROUP_SIZE_BIAS=int(group_size_bias),
+            num_stages=int(kv_num_stages),
+            num_warps=int(kv_num_warps),
+        )
+
+    if is_batch_reduced and group_size_bias > 1:
+        d_bias = d_bias.sum(0, keepdim=True)
+
+    dq = torch.empty_like(q)
+    q_grid = (
+        -(-int(query_len) // int(q_block_m)),
+        int(num_heads),
+        int(batch_size),
+    )
+    with torch.cuda.device(q.device.index):
+        _bwd_q_kernel_bias_raw[q_grid](
+            q,
+            k,
+            v,
+            bias,
+            float(sm_scale),
+            grad_out,
+            dq,
+            lse,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            bias_batch_stride,
+            bias_heads_stride,
+            bias.stride(2),
+            bias.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            dq.stride(3),
+            int(batch_size),
+            int(num_heads),
+            int(query_len),
+            int(key_len),
+            int(key_len - query_len),
+            BLOCK_M=int(q_block_m),
+            BLOCK_DMODEL=int(head_dim),
+            BLOCK_N=int(q_block_n),
+            CAUSAL=bool(causal),
+            LARGER_M=bool(int(query_len) > int(key_len)),
+            DIVISIBLE_M=bool(int(query_len) % int(q_block_m) == 0),
+            DIVISIBLE_N=bool(int(key_len) % int(q_block_n) == 0),
+            HAS_BIAS=True,
+            num_stages=int(q_num_stages),
+            num_warps=int(q_num_warps),
+        )
     return dq, dk, dv, d_bias
 
 
