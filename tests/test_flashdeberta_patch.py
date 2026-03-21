@@ -1884,6 +1884,59 @@ def test_bias_bwd_config_resolution_prefers_specific_override(monkeypatch: pytes
     assert q_config == (32, 64, 2, 4)
 
 
+def test_bias_backward_dispatches_to_specialized_docblock_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+
+    monkeypatch.setattr(bias_mod, "_flash_attn_v2_bwd_bias_lowlevel", object())
+    monkeypatch.setattr(
+        bias_mod,
+        "_should_use_specialized_docblock_bias_backward",
+        lambda **_kwargs: True,
+    )
+    seen: dict[str, torch.Tensor] = {}
+
+    def _fake_specialized(**kwargs: torch.Tensor | float) -> tuple[torch.Tensor, ...]:
+        seen["q"] = kwargs["q"]  # type: ignore[index]
+        q = kwargs["q"]  # type: ignore[index]
+        k = kwargs["k"]  # type: ignore[index]
+        v = kwargs["v"]  # type: ignore[index]
+        bias = kwargs["bias"]  # type: ignore[index]
+        return (
+            torch.ones_like(q),
+            torch.ones_like(k),
+            torch.ones_like(v),
+            torch.ones_like(bias),
+        )
+
+    monkeypatch.setattr(bias_mod, "_bias_specialized_docblock_backward_impl", _fake_specialized)
+
+    q = torch.randn((1, 1, 4, 2), dtype=torch.float32)
+    k = torch.randn((1, 1, 4, 2), dtype=torch.float32)
+    v = torch.randn((1, 1, 4, 2), dtype=torch.float32)
+    bias = torch.randn((1, 1, 4, 4), dtype=torch.float32)
+    out = torch.randn_like(q)
+    lse = torch.randn((1, 1, 4), dtype=torch.float32)
+    grad = torch.randn_like(q)
+
+    dq, dk, dv, d_bias = bias_mod._bias_eager_backward_impl(
+        grad_out=grad,
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        out=out,
+        lse=lse,
+        sm_scale=0.5,
+        causal=False,
+    )
+
+    assert seen["q"] is q
+    assert torch.equal(dq, torch.ones_like(q))
+    assert torch.equal(dk, torch.ones_like(k))
+    assert torch.equal(dv, torch.ones_like(v))
+    assert torch.equal(d_bias, torch.ones_like(bias))
+
+
 def test_dense_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 

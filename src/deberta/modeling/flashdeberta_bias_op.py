@@ -15,6 +15,13 @@ from typing import Any
 import torch
 
 try:
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover - optional import
+    triton = None
+    tl = None
+
+try:
     from flashdeberta.ops.flash_attention_bias import (
         flash_attention_with_bias as _flash_attention_with_bias_highlevel,
     )
@@ -389,6 +396,562 @@ def _resolve_bias_bwd_kernel_config(
     )
 
 
+def _should_use_specialized_docblock_bias_backward(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    causal: bool,
+) -> bool:
+    """Return whether the repo-local short doc-block bias backward should run.
+
+    This path is intentionally narrow: it targets the measured packed doc-block
+    RTD hot path where FlashDeBERTa already wins overall but still spends most
+    of its remaining attention time in the generic local-bias backward kernels.
+
+    :param torch.Tensor q: Forward query tensor in ``(B,H,S,D)`` layout.
+    :param torch.Tensor k: Forward key tensor in ``(B,H,S,D)`` layout.
+    :param torch.Tensor v: Forward value tensor in ``(B,H,S,D)`` layout.
+    :param torch.Tensor bias: Dense additive bias tensor in ``(B,H,S,S)`` layout.
+    :param bool causal: Whether causal masking is enabled.
+    :return bool: True when the exact-match specialized backward should run.
+    """
+
+    if triton is None:
+        return False
+    if bool(causal):
+        return False
+    if q.device.type != "cuda" or bias.device.type != "cuda":
+        return False
+    if q.dtype not in {torch.float16, torch.bfloat16}:
+        return False
+    if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype != bias.dtype:
+        return False
+    if int(q.shape[-1]) != 64:
+        return False
+    if int(q.shape[-2]) != 1024 or int(k.shape[-2]) != 1024 or int(v.shape[-2]) != 1024:
+        return False
+    if tuple(q.shape[:2]) != tuple(k.shape[:2]) or tuple(q.shape[:2]) != tuple(v.shape[:2]):
+        return False
+    if tuple(bias.shape) != (int(q.shape[0]), int(q.shape[1]), 1024, 1024):
+        return False
+    if int(bias.stride(0)) == 0 or int(bias.stride(1)) == 0:
+        return False
+    return True
+
+
+if triton is not None:
+
+    @triton.jit
+    def _bwd_kv_kernel_docblock1024(
+        Q: None,
+        K: None,
+        V: None,
+        B: None,
+        sm_scale: float,
+        DO: None,
+        DK: None,
+        DV: None,
+        DS: None,
+        L: None,
+        D: None,
+        stride_qz: int,
+        stride_qh: int,
+        stride_qm: int,
+        stride_qk: int,
+        stride_kz: int,
+        stride_kh: int,
+        stride_kn: int,
+        stride_kk: int,
+        stride_vz: int,
+        stride_vh: int,
+        stride_vn: int,
+        stride_vk: int,
+        stride_bz: int,
+        stride_bh: int,
+        stride_bm: int,
+        stride_bn: int,
+        stride_doz: int,
+        stride_doh: int,
+        stride_dom: int,
+        stride_dok: int,
+        stride_dkz: int,
+        stride_dkh: int,
+        stride_dkn: int,
+        stride_dkk: int,
+        stride_dvz: int,
+        stride_dvh: int,
+        stride_dvn: int,
+        stride_dvk: int,
+        H: int,
+        M: int,
+        N: int,
+        BLOCK_M: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ) -> None:
+        """Specialized dense-bias KV backward for non-causal full-bias ``1024 x 1024``.
+
+        :param Any Q: Triton pointer to the query tensor.
+        :param Any K: Triton pointer to the key tensor.
+        :param Any V: Triton pointer to the value tensor.
+        :param Any B: Triton pointer to the dense additive bias tensor.
+        :param float sm_scale: Softmax scale factor.
+        :param Any DO: Triton pointer to the output gradient tensor.
+        :param Any DK: Triton pointer to the key gradient tensor.
+        :param Any DV: Triton pointer to the value gradient tensor.
+        :param Any DS: Triton pointer to the dense bias gradient tensor.
+        :param Any L: Triton pointer to the per-row log-sum-exp tensor.
+        :param Any D: Triton pointer to the per-row delta tensor.
+        :param int stride_qz: Query batch stride.
+        :param int stride_qh: Query head stride.
+        :param int stride_qm: Query row stride.
+        :param int stride_qk: Query column stride.
+        :param int stride_kz: Key batch stride.
+        :param int stride_kh: Key head stride.
+        :param int stride_kn: Key row stride.
+        :param int stride_kk: Key column stride.
+        :param int stride_vz: Value batch stride.
+        :param int stride_vh: Value head stride.
+        :param int stride_vn: Value row stride.
+        :param int stride_vk: Value column stride.
+        :param int stride_bz: Bias batch stride.
+        :param int stride_bh: Bias head stride.
+        :param int stride_bm: Bias row stride.
+        :param int stride_bn: Bias column stride.
+        :param int stride_doz: Output-gradient batch stride.
+        :param int stride_doh: Output-gradient head stride.
+        :param int stride_dom: Output-gradient row stride.
+        :param int stride_dok: Output-gradient column stride.
+        :param int stride_dkz: Key-gradient batch stride.
+        :param int stride_dkh: Key-gradient head stride.
+        :param int stride_dkn: Key-gradient row stride.
+        :param int stride_dkk: Key-gradient column stride.
+        :param int stride_dvz: Value-gradient batch stride.
+        :param int stride_dvh: Value-gradient head stride.
+        :param int stride_dvn: Value-gradient row stride.
+        :param int stride_dvk: Value-gradient column stride.
+        :param int H: Number of heads.
+        :param int M: Query sequence length.
+        :param int N: Key sequence length.
+        :param Any BLOCK_M: Query tile height.
+        :param Any BLOCK_DMODEL: Head dimension tile width.
+        :param Any BLOCK_N: Key tile width.
+        :return None: This Triton kernel writes gradients directly to its outputs.
+        """
+
+        input_dtype = Q.dtype.element_ty
+        start_n = tl.program_id(0)
+        off_h = tl.program_id(1)
+        off_z = tl.program_id(2)
+        log2e: tl.constexpr = 1.4426950408889634
+
+        Q += off_z * stride_qz + off_h * stride_qh
+        K += off_z * stride_kz + off_h * stride_kh
+        V += off_z * stride_vz + off_h * stride_vh
+        B += off_z * stride_bz + off_h * stride_bh
+        DO += off_z * stride_doz + off_h * stride_doh
+        DK += off_z * stride_dkz + off_h * stride_dkh
+        DV += off_z * stride_dvz + off_h * stride_dvh
+        DS += off_z * stride_bz + off_h * stride_bh
+        D += (off_z * H + off_h) * M
+        L += (off_z * H + off_h) * M
+
+        offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m_base = tl.arange(0, BLOCK_M)
+        offs_k = tl.arange(0, BLOCK_DMODEL)
+
+        k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        v_ptrs = V + (offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk)
+        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_k[None, :] * stride_dvk)
+
+        k = tl.load(k_ptrs)
+        v = tl.load(v_ptrs)
+        dk = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+
+        for start_m in range(0, M, BLOCK_M):
+            start_m = tl.multiple_of(start_m, BLOCK_M)
+            offs_m = start_m + offs_m_base
+            q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+            do_ptrs = DO + (offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok)
+            bias_ptrs = B + (offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn)
+            ds_ptrs = DS + (offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn)
+
+            q = tl.load(q_ptrs)
+            do = tl.load(do_ptrs)
+            lse_row = tl.load(L + offs_m)
+            delta = tl.load(D + offs_m)
+            b = tl.load(bias_ptrs)
+
+            s = tl.dot(q, tl.trans(k)) * sm_scale
+            s += b
+            p = tl.math.exp2((s - lse_row[:, None]) * log2e)
+            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
+            dp = tl.dot(do, tl.trans(v))
+            ds = (p * (dp - delta[:, None])).to(input_dtype)
+            dk += tl.dot(tl.trans(ds), q)
+            tl.store(ds_ptrs, ds)
+
+        dk *= sm_scale
+        tl.store(dk_ptrs, dk.to(input_dtype))
+        tl.store(dv_ptrs, dv.to(input_dtype))
+
+    @triton.jit
+    def _bwd_q_kernel_docblock1024(
+        Q: None,
+        K: None,
+        V: None,
+        B: None,
+        sm_scale: float,
+        DO: None,
+        DQ: None,
+        L: None,
+        D: None,
+        stride_qz: int,
+        stride_qh: int,
+        stride_qm: int,
+        stride_qk: int,
+        stride_kz: int,
+        stride_kh: int,
+        stride_kn: int,
+        stride_kk: int,
+        stride_vz: int,
+        stride_vh: int,
+        stride_vn: int,
+        stride_vk: int,
+        stride_bz: int,
+        stride_bh: int,
+        stride_bm: int,
+        stride_bn: int,
+        stride_doz: int,
+        stride_doh: int,
+        stride_dom: int,
+        stride_dok: int,
+        stride_dqz: int,
+        stride_dqh: int,
+        stride_dqm: int,
+        stride_dqk: int,
+        H: int,
+        M: int,
+        N: int,
+        BLOCK_M: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ) -> None:
+        """Specialized dense-bias Q backward for non-causal full-bias ``1024 x 1024``.
+
+        :param Any Q: Triton pointer to the query tensor.
+        :param Any K: Triton pointer to the key tensor.
+        :param Any V: Triton pointer to the value tensor.
+        :param Any B: Triton pointer to the dense additive bias tensor.
+        :param float sm_scale: Softmax scale factor.
+        :param Any DO: Triton pointer to the output gradient tensor.
+        :param Any DQ: Triton pointer to the query gradient tensor.
+        :param Any L: Triton pointer to the per-row log-sum-exp tensor.
+        :param Any D: Triton pointer to the per-row delta tensor.
+        :param int stride_qz: Query batch stride.
+        :param int stride_qh: Query head stride.
+        :param int stride_qm: Query row stride.
+        :param int stride_qk: Query column stride.
+        :param int stride_kz: Key batch stride.
+        :param int stride_kh: Key head stride.
+        :param int stride_kn: Key row stride.
+        :param int stride_kk: Key column stride.
+        :param int stride_vz: Value batch stride.
+        :param int stride_vh: Value head stride.
+        :param int stride_vn: Value row stride.
+        :param int stride_vk: Value column stride.
+        :param int stride_bz: Bias batch stride.
+        :param int stride_bh: Bias head stride.
+        :param int stride_bm: Bias row stride.
+        :param int stride_bn: Bias column stride.
+        :param int stride_doz: Output-gradient batch stride.
+        :param int stride_doh: Output-gradient head stride.
+        :param int stride_dom: Output-gradient row stride.
+        :param int stride_dok: Output-gradient column stride.
+        :param int stride_dqz: Query-gradient batch stride.
+        :param int stride_dqh: Query-gradient head stride.
+        :param int stride_dqm: Query-gradient row stride.
+        :param int stride_dqk: Query-gradient column stride.
+        :param int H: Number of heads.
+        :param int M: Query sequence length.
+        :param int N: Key sequence length.
+        :param Any BLOCK_M: Query tile height.
+        :param Any BLOCK_DMODEL: Head dimension tile width.
+        :param Any BLOCK_N: Key tile width.
+        :return None: This Triton kernel writes gradients directly to ``DQ``.
+        """
+
+        input_dtype = Q.dtype.element_ty
+        start_m = tl.program_id(0)
+        off_h = tl.program_id(1)
+        off_z = tl.program_id(2)
+        log2e: tl.constexpr = 1.4426950408889634
+
+        Q += off_z * stride_qz + off_h * stride_qh
+        K += off_z * stride_kz + off_h * stride_kh
+        V += off_z * stride_vz + off_h * stride_vh
+        B += off_z * stride_bz + off_h * stride_bh
+        DO += off_z * stride_doz + off_h * stride_doh
+        DQ += off_z * stride_dqz + off_h * stride_dqh
+        D += (off_z * H + off_h) * M
+        L += (off_z * H + off_h) * M
+
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n_base = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_DMODEL)
+
+        q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dq_ptrs = DQ + (offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk)
+        do_ptrs = DO + (offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok)
+
+        q = tl.load(q_ptrs)
+        do = tl.load(do_ptrs)
+        delta = tl.load(D + offs_m)
+        lse_row = tl.load(L + offs_m)
+        dq = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+        for start_n in range(0, N, BLOCK_N):
+            offs_n = start_n + offs_n_base
+            k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+            v_ptrs = V + (offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+            bias_ptrs = B + (offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn)
+
+            k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
+            b = tl.load(bias_ptrs)
+
+            s = tl.dot(q, tl.trans(k)) * sm_scale
+            s += b
+            p = tl.math.exp2((s - lse_row[:, None]) * log2e)
+            dp = tl.dot(do.to(input_dtype), tl.trans(v))
+            ds = (p * (dp - delta[:, None])).to(input_dtype)
+            dq += tl.dot(ds, k)
+
+        dq *= sm_scale
+        tl.store(dq_ptrs, dq.to(input_dtype))
+
+else:  # pragma: no cover - optional dependency fallback
+    _bwd_kv_kernel_docblock1024 = None
+    _bwd_q_kernel_docblock1024 = None
+
+
+def _bias_specialized_docblock_backward_impl(
+    *,
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the repo-local specialized dense-bias backward for short doc-block batches.
+
+    :param torch.Tensor grad_out: Gradient of the output tensor.
+    :param torch.Tensor q: Forward queries.
+    :param torch.Tensor k: Forward keys.
+    :param torch.Tensor v: Forward values.
+    :param torch.Tensor bias: Dense additive bias tensor.
+    :param torch.Tensor out: Forward output tensor.
+    :param torch.Tensor lse: Forward LSE tensor.
+    :param float sm_scale: Softmax scale.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        Gradients for q/k/v and bias.
+    """
+
+    batch_size, num_heads, query_len, head_dim = q.shape
+    key_len = int(k.shape[2])
+    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_bias_bwd_kernel_config(
+        kind="kv",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=False,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_bias_bwd_kernel_config(
+        kind="q",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=False,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    if (
+        _bwd_kv_kernel_docblock1024 is None
+        or _bwd_q_kernel_docblock1024 is None
+        or int(query_len) != 1024
+        or int(key_len) != 1024
+        or int(head_dim) != 64
+        or int(query_len) % int(kv_block_m) != 0
+        or int(key_len) % int(kv_block_n) != 0
+        or int(query_len) % int(q_block_m) != 0
+        or int(key_len) % int(q_block_n) != 0
+    ):
+        return _bias_generic_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
+            bias=bias,
+            out=out,
+            lse=lse,
+            sm_scale=sm_scale,
+            causal=False,
+        )
+
+    preprocess_block_m = max(int(kv_block_m), int(q_block_m))
+    preprocess_grid = (
+        -(-int(query_len) // int(preprocess_block_m)),
+        int(num_heads),
+        int(batch_size),
+    )
+    delta = torch.empty_like(lse)
+    with torch.cuda.device(q.device.index):
+        _bwd_preprocess_bias_raw[preprocess_grid](
+            out,
+            grad_out,
+            delta,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            delta.stride(0),
+            delta.stride(1),
+            delta.stride(2),
+            int(query_len),
+            BLOCK_M=int(preprocess_block_m),
+            D_HEAD=int(head_dim),
+            DIVISIBLE_M=bool(int(query_len) % int(preprocess_block_m) == 0),
+        )
+
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    d_bias = torch.empty_like(bias)
+    kv_grid = (
+        -(-int(key_len) // int(kv_block_n)),
+        int(num_heads),
+        int(batch_size),
+    )
+    with torch.cuda.device(q.device.index):
+        _bwd_kv_kernel_docblock1024[kv_grid](
+            q,
+            k,
+            v,
+            bias,
+            float(sm_scale),
+            grad_out,
+            dk,
+            dv,
+            d_bias,
+            lse,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            bias.stride(0),
+            bias.stride(1),
+            bias.stride(2),
+            bias.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            dk.stride(3),
+            dv.stride(0),
+            dv.stride(1),
+            dv.stride(2),
+            dv.stride(3),
+            int(num_heads),
+            int(query_len),
+            int(key_len),
+            BLOCK_M=int(kv_block_m),
+            BLOCK_DMODEL=int(head_dim),
+            BLOCK_N=int(kv_block_n),
+            num_stages=int(kv_num_stages),
+            num_warps=int(kv_num_warps),
+        )
+
+    dq = torch.empty_like(q)
+    q_grid = (
+        -(-int(query_len) // int(q_block_m)),
+        int(num_heads),
+        int(batch_size),
+    )
+    with torch.cuda.device(q.device.index):
+        _bwd_q_kernel_docblock1024[q_grid](
+            q,
+            k,
+            v,
+            bias,
+            float(sm_scale),
+            grad_out,
+            dq,
+            lse,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            bias.stride(0),
+            bias.stride(1),
+            bias.stride(2),
+            bias.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            dq.stride(3),
+            int(num_heads),
+            int(query_len),
+            int(key_len),
+            BLOCK_M=int(q_block_m),
+            BLOCK_DMODEL=int(head_dim),
+            BLOCK_N=int(q_block_n),
+            num_stages=int(q_num_stages),
+            num_warps=int(q_num_warps),
+        )
+    return dq, dk, dv, d_bias
+
+
 def _bias_eager_forward_impl(
     *,
     q: torch.Tensor,
@@ -448,7 +1011,7 @@ def _bias_eager_forward_impl(
     return out, lse
 
 
-def _bias_eager_backward_impl(
+def _bias_generic_backward_impl(
     *,
     grad_out: torch.Tensor,
     q: torch.Tensor,
@@ -460,7 +1023,7 @@ def _bias_eager_backward_impl(
     sm_scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run dense bias backward through the low-level CUDA launcher.
+    """Run dense bias backward through the generic low-level CUDA launcher.
 
     :param torch.Tensor grad_out: Gradient of the output tensor.
     :param torch.Tensor q: Forward queries.
@@ -474,9 +1037,6 @@ def _bias_eager_backward_impl(
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Gradients for q/k/v and the additive bias tensor.
     """
-
-    if _flash_attn_v2_bwd_bias_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
@@ -711,6 +1271,61 @@ def _bias_eager_backward_impl(
             num_warps=int(q_num_warps),
         )
     return dq, dk, dv, d_bias
+
+
+def _bias_eager_backward_impl(
+    *,
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run dense bias backward, dispatching to repo-local special cases when applicable.
+
+    :param torch.Tensor grad_out: Gradient of the output tensor.
+    :param torch.Tensor q: Forward queries.
+    :param torch.Tensor k: Forward keys.
+    :param torch.Tensor v: Forward values.
+    :param torch.Tensor bias: Forward additive bias tensor.
+    :param torch.Tensor out: Forward output tensor.
+    :param torch.Tensor lse: Forward LSE tensor.
+    :param float sm_scale: Softmax scale.
+    :param bool causal: Whether causal masking is enabled.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        Gradients for q/k/v and the additive bias tensor.
+    """
+
+    if _flash_attn_v2_bwd_bias_lowlevel is None:
+        raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
+
+    if _should_use_specialized_docblock_bias_backward(q=q, k=k, v=v, bias=bias, causal=causal):
+        return _bias_specialized_docblock_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
+            bias=bias,
+            out=out,
+            lse=lse,
+            sm_scale=sm_scale,
+        )
+
+    return _bias_generic_backward_impl(
+        grad_out=grad_out,
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        out=out,
+        lse=lse,
+        sm_scale=sm_scale,
+        causal=causal,
+    )
 
 
 def _build_bias_custom_ops() -> tuple[Any | None, Any | None]:

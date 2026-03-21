@@ -100,6 +100,15 @@ upstream FlashDeBERTa config selection, so packed-docblock kernel tuning stays
 isolated from the fixed and varlen routes. The repo now launches the raw bias
 backward `KV` and `Q` Triton kernels directly, which makes those two backward
 surfaces independently tunable without forking the whole attention wrapper.
+For the measured packed-docblock `1024` hot path, the wrapper now goes one step
+further: when the run is non-causal, bf16/fp16, `D=64`, and the additive bias
+is a full dense `(B,H,1024,1024)` tensor, the backward path dispatches exact-
+match repo-local `_bwd_kv_kernel_docblock1024` / `_bwd_q_kernel_docblock1024`
+Triton kernels instead of the more generic FlashDeBERTa bias backward launcher.
+That specialization is intentionally narrow and stays behind the same opaque
+custom op boundary, so Dynamo still sees one stable flash-with-bias primitive.
+Outside that exact regime, the wrapper falls back to the generic raw bias
+backward kernels and the normal override/tuning path.
 
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,
