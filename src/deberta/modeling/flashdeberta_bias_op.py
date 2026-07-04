@@ -172,9 +172,9 @@ def _bias_repo_tuned_config(
 ) -> tuple[int, int, int, int] | None:
     """Return repo-local tuned dense-bias configs for measured hot paths.
 
-    This helper stays intentionally narrow. Only promote configs that have been
-    measured on real packed doc-block RTD batches for the repo's current
-    DeBERTa ``1024 x 1024`` non-causal bf16 regime on ``sm_120`` hardware.
+    Shape ownership lives in the shared JSON tuning table. This helper only
+    applies cheap safety gates before resolving a table row for the current
+    dense flash-with-bias kernel launch.
 
     :param str kind: One of ``"fwd"``, ``"bwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
     :param int batch_size: Batch size.
@@ -197,8 +197,6 @@ def _bias_repo_tuned_config(
     if dtype not in {torch.float16, torch.bfloat16}:
         return None
     if int(head_dim) > 64:
-        return None
-    if int(query_len) != 1024 or int(key_len) != 1024:
         return None
     capability = _bias_device_capability(device)
     return resolve_flash_kernel_config(

@@ -2409,6 +2409,40 @@ def test_bias_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.M
     assert q_config == (16, 16, 1, 2)
 
 
+def test_bias_repo_tuned_config_is_table_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+
+    monkeypatch.setattr(bias_mod.torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (12, 0))
+
+    base = dict(
+        batch_size=2,
+        num_heads=12,
+        query_len=1024,
+        key_len=1024,
+        head_dim=64,
+        causal=False,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+
+    assert bias_mod._bias_repo_tuned_config(kind="fwd", **base) == (128, 64, 3, 4)
+    assert bias_mod._bias_repo_tuned_config(kind="bwd", **base) == (64, 64, 2, 4)
+    assert bias_mod._bias_repo_tuned_config(kind="bwd_kv", **base) == (64, 64, 2, 4)
+    assert bias_mod._bias_repo_tuned_config(kind="bwd_q", **base) == (64, 64, 2, 4)
+
+    assert (
+        bias_mod._bias_repo_tuned_config(
+            kind="fwd",
+            **{
+                **base,
+                "query_len": 2048,
+                "key_len": 2048,
+            },
+        )
+        is None
+    )
+
+
 def test_bias_backward_dispatches_to_specialized_docblock_path(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_bias_op as bias_mod
 
