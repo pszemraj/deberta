@@ -47,10 +47,6 @@ from deberta.modeling import (  # noqa: E402
     build_backbone_configs,
     build_backbones,
 )
-from deberta.modeling.flashdeberta_patch import (  # noqa: E402
-    disable_flashdeberta_attention,
-    enable_flashdeberta_attention,
-)
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
     _build_doc_block_mask,
@@ -168,7 +164,10 @@ def _maybe_override_config(args: argparse.Namespace) -> list[str]:
         "logging.wandb.enabled=false",
         "logging.backend=none",
         "train.checkpoint.export_hf_final=false",
+        f"model.hf.attention_impl={str(args.mode)}",
     ]
+    if args.dense_policy is not None:
+        overrides.append(f"model.hf.flash.eager_dense_max_seq_len={int(args.dense_policy)}")
     if args.packing_enabled is not None:
         overrides.append(f"data.packing.enabled={str(_bool_text(args.packing_enabled)).lower()}")
     if args.block_cross_document_attention is not None:
@@ -261,6 +260,7 @@ def _run_decoupled_window(
     compile_enabled: bool,
     compile_scope: str,
     backbone_type: str,
+    flash_enabled: bool,
     flash_cfg: Any | None,
     gen_optimizer: torch.optim.Optimizer,
     disc_optimizer: torch.optim.Optimizer,
@@ -320,7 +320,7 @@ def _run_decoupled_window(
                 batch, flash_meta = prepare_flash_attention_batch_metadata(
                     batch=batch,
                     backbone_type=backbone_type,
-                    flash_enabled=True,
+                    flash_enabled=flash_enabled,
                     flash_cfg=flash_cfg,
                 )
             if compile_enabled:
@@ -458,6 +458,7 @@ def _run_coupled_window(
     compile_enabled: bool,
     compile_scope: str,
     backbone_type: str,
+    flash_enabled: bool,
     flash_cfg: Any | None,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: Any,
@@ -514,7 +515,7 @@ def _run_coupled_window(
                 batch, flash_meta = prepare_flash_attention_batch_metadata(
                     batch=batch,
                     backbone_type=backbone_type,
-                    flash_enabled=True,
+                    flash_enabled=flash_enabled,
                     flash_cfg=flash_cfg,
                 )
             if compile_enabled:
@@ -598,13 +599,6 @@ def main() -> None:
     cfg = load_config(args.config, overrides=overrides)
     model_cfg, data_cfg, train_cfg = cfg.model, cfg.data, cfg.train
 
-    if str(args.mode) == "flash":
-        if args.dense_policy is not None:
-            os.environ["FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN"] = str(int(args.dense_policy))
-        enable_flashdeberta_attention(strict=True)
-    else:
-        disable_flashdeberta_attention()
-
     mixed_precision = resolve_effective_mixed_precision(
         train_cfg.mixed_precision,
         bf16_sanity_check=_bf16_runtime_sanity_check,
@@ -683,6 +677,7 @@ def main() -> None:
     ga_steps = int(args.ga_steps) if args.ga_steps is not None else int(train_cfg.gradient_accumulation_steps)
     token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
     disc_pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    flash_enabled = str(model_cfg.hf.attention_impl).strip().lower() == "flash"
     phase_times_ms: dict[str, list[float]] = defaultdict(list)
 
     for _ in range(int(args.warmup_steps)):
@@ -697,6 +692,7 @@ def main() -> None:
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
                 backbone_type=str(model_cfg.backbone_type),
+                flash_enabled=flash_enabled,
                 flash_cfg=getattr(model_cfg.hf, "flash", None),
                 gen_optimizer=gen_optimizer,
                 disc_optimizer=disc_optimizer,
@@ -718,6 +714,7 @@ def main() -> None:
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
                 backbone_type=str(model_cfg.backbone_type),
+                flash_enabled=flash_enabled,
                 flash_cfg=getattr(model_cfg.hf, "flash", None),
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
@@ -748,6 +745,7 @@ def main() -> None:
                     compile_enabled=compile_enabled,
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
+                    flash_enabled=flash_enabled,
                     flash_cfg=getattr(model_cfg.hf, "flash", None),
                     gen_optimizer=gen_optimizer,
                     disc_optimizer=disc_optimizer,
@@ -769,6 +767,7 @@ def main() -> None:
                     compile_enabled=compile_enabled,
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
+                    flash_enabled=flash_enabled,
                     flash_cfg=getattr(model_cfg.hf, "flash", None),
                     optimizer=optimizer,
                     lr_scheduler=lr_scheduler,

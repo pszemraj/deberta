@@ -162,7 +162,6 @@ def _flash_route_hint_for_padding_batch(
     if _flash_cfg_bool(
         flash_cfg,
         name="force_varlen",
-        env_name="FLASHDEBERTA_FORCE_VARLEN",
         default="0",
     ):
         return "varlen"
@@ -179,7 +178,6 @@ def _flash_route_hint_for_padding_batch(
         _flash_cfg_int(
             flash_cfg,
             name="varlen_min_seq_len",
-            env_name="FLASHDEBERTA_VARLEN_MIN_SEQ_LEN",
             default=2048,
         ),
     )
@@ -209,7 +207,6 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None 
         _flash_cfg_int(
             flash_cfg,
             name="docblock_bias_seq_len",
-            env_name="FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN",
             default=1024,
         ),
     )

@@ -95,10 +95,11 @@ train_flash_case() {
         HF_HUB_ETAG_TIMEOUT=120
         TOKENIZERS_PARALLELISM=false
     )
+    local -a flash_args=()
     mkdir -p "${output_dir}"
 
     if [[ -n "${dense_policy}" ]]; then
-        env_prefix+=("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN=${dense_policy}")
+        flash_args+=(--model.hf.flash.eager_dense_max_seq_len "${dense_policy}")
     fi
 
     run_case \
@@ -106,6 +107,7 @@ train_flash_case() {
         "${env_prefix[@]}" \
         conda run --name neobert --no-capture-output deberta train "${config_path}" \
         --model.hf.attention_impl flash \
+        "${flash_args[@]}" \
         --train.max_steps "${steps}" \
         --logging.logging_steps "${LOGGING_STEPS}" \
         --train.checkpoint.output_dir "${output_dir}" \

@@ -142,9 +142,9 @@ Set `model.hf.flash.docblock_bias_seq_len=0` to disable the dense-bias shortcut,
 or point it at a different exact sequence length if another machine bucket
 proves a different crossover. Set `model.hf.flash.local_bias_max_batch_size=0`
 to disable the small-batch dense local-bias route without changing the doc-block
-sequence split. The older `FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN` environment
-variable remains a diagnostic fallback for tooling that does not load a repo
-config.
+sequence split. Route policy is config-only; the older FlashDeBERTa route
+environment fallbacks are not consulted by the training path or profiling
+tools.
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope
 downgrades toward FFN-focused compile to avoid shape-churn recompiles from

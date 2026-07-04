@@ -104,20 +104,14 @@ logger = logging.getLogger(__name__)
 
 
 def _flash_attention_enabled_for_runtime(model_cfg: ModelConfig) -> bool:
-    """Return whether current training can consume FlashDeBERTa metadata.
+    """Return whether current training can consume FlashDeBERTa metadata by config.
 
     :param ModelConfig model_cfg: Resolved model config.
-    :return bool: True when flash attention is enabled by config or legacy patch.
+    :return bool: True when flash attention is enabled by config.
     """
 
     hf_cfg = getattr(model_cfg, "hf", None)
-    if str(getattr(hf_cfg, "attention_impl", "eager")).strip().lower() == "flash":
-        return True
-    try:
-        from deberta.modeling import deberta_v2_native as dv2
-    except Exception:
-        return False
-    return bool(getattr(dv2, "_FLASHDEBERTA_ENABLED", False))
+    return str(getattr(hf_cfg, "attention_impl", "eager")).strip().lower() == "flash"
 
 
 def run_pretraining_dry_run(

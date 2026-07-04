@@ -7,8 +7,8 @@ What changed versus the earlier adapter
 1. Stats are now debug-only and disabled by default. The prior adapter mutated
    a Python ``Counter`` inside the attention forward path, which is exactly the
    kind of Python/global state that TorchDynamo may guard on and recompile.
-2. Runtime knobs are parsed once at import time, then exposed via a refresh helper
-   for tests or benchmark scripts that deliberately mutate environment variables.
+2. Runtime policy is read from the resolved DeBERTa config at construction time;
+   environment variables are limited to debug instrumentation.
 3. Dense-vs-varlen routing no longer inspects attention-mask contents inside the
    compiled forward path. In this repository's training loop, dense batches already
    arrive as ``attention_mask=None`` because the collator drops all-ones masks.
@@ -22,20 +22,12 @@ Important behavior
   ``torch.compile`` does not trace into FlashDeBERTa's Python/Triton wrapper.
 - Pairwise masks still fall back to eager attention for correctness.
 
-Optional runtime knobs
-----------------------
-Set these before importing this module:
+Runtime controls
+----------------
+Use ``model.hf.attention_impl=flash`` and ``model.hf.flash.*`` for routing and
+kernel policy. Set these optional instrumentation environment variables before
+importing this module:
 
-- ``FLASHDEBERTA_VARLEN_MIN_SEQ_LEN`` (default: ``2048``)
-    Minimum sequence length required before the varlen kernel is used when a
-    padding mask is present. On the repo's measured ``1024`` unpacked RTD
-    regime, the compile-clean fixed path with per-example ``seq_lengths`` is
-    faster than the varlen backward kernels, so masked ``1024`` batches stay on
-    the fixed path by default.
-- ``FLASHDEBERTA_FORCE_VARLEN`` (default: ``0``)
-    Force the varlen kernel whenever a padding mask is present.
-- ``FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN`` (default: ``0`` / disabled)
-    Route dense maskless batches at or below this length back to eager attention.
 - ``FLASHDEBERTA_DEBUG_STATS`` (default: ``0``)
     Enable eager/debug-only path counters for benchmark scripts.
 - ``FLASHDEBERTA_WARN_FALLBACKS`` (default: ``1``)
@@ -133,36 +125,19 @@ def _truthy_env(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in _TRUTHY
 
 
-def _int_env(name: str, default: int) -> int:
-    """Parse an integer environment variable with safe fallback.
-
-    :param str name: Environment variable name.
-    :param int default: Default integer value.
-    :return int: Parsed integer or the default on parse failure.
-    """
-
-    raw = os.environ.get(name)
-    if raw is None:
-        return int(default)
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        return int(default)
-
-
 def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
-    """Load runtime policy once from environment variables.
+    """Load debug instrumentation toggles from environment variables.
 
-    :return FlashDebertaRuntimeConfig: Parsed runtime policy.
+    :return FlashDebertaRuntimeConfig: Default runtime policy plus debug toggles.
     """
 
     return FlashDebertaRuntimeConfig(
-        force_varlen=_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"),
-        varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 2048)),
-        docblock_bias_seq_len=max(0, _int_env("FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN", 1024)),
+        force_varlen=False,
+        varlen_min_seq_len=2048,
+        docblock_bias_seq_len=1024,
         local_bias_max_batch_size=4,
-        eager_dense_max_seq_len=max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0)),
-        kernel_overrides_path=os.environ.get("FLASHDEBERTA_KERNEL_OVERRIDES_PATH"),
+        eager_dense_max_seq_len=0,
+        kernel_overrides_path=None,
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
         warn_fallbacks=_truthy_env("FLASHDEBERTA_WARN_FALLBACKS", default="1"),
     )
@@ -172,7 +147,7 @@ _RUNTIME_CONFIG = _read_runtime_config_from_env()
 
 
 def refresh_flashdeberta_runtime_config_from_env() -> None:
-    """Reload runtime policy from environment variables.
+    """Reload debug instrumentation toggles from environment variables.
 
     This exists primarily for tests or benchmark scripts that intentionally
     mutate ``os.environ`` after the module was imported.
@@ -229,7 +204,7 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
         ),
         kernel_overrides_path=getter(
             "kernel_overrides_path",
-            getattr(config, "flash_kernel_overrides_path", _RUNTIME_CONFIG.kernel_overrides_path),
+            getattr(config, "flash_kernel_overrides_path", None),
         ),
         enable_debug_stats=bool(_RUNTIME_CONFIG.enable_debug_stats),
         warn_fallbacks=bool(_RUNTIME_CONFIG.warn_fallbacks),
@@ -239,8 +214,8 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
 def flashdeberta_import_error() -> Exception | None:
     """Return the fixed-kernel import error, if any.
 
-    The runtime patch requires the fixed kernel. The varlen kernel is optional and
-    only affects padding-heavy workloads.
+    Flash attention construction requires the fixed kernel. The varlen kernel is
+    optional and only affects padding-heavy workloads.
 
     :return Exception | None: Stored fixed-kernel import failure, if one occurred.
     """

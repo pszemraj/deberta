@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,34 +72,6 @@ def normalize_keep_mask(mask: torch.Tensor, *, name: str = "attention_mask") -> 
     return mask.ne(0)
 
 
-def _flash_truthy_env(name: str, default: str = "0") -> bool:
-    """Return whether an environment variable is set to a truthy value.
-
-    :param str name: Environment variable name.
-    :param str default: Default text when unset.
-    :return bool: Parsed truthy value.
-    """
-
-    return os.environ.get(name, default).strip().lower() in _FLASH_TRUTHY
-
-
-def _flash_int_env(name: str, default: int) -> int:
-    """Parse an integer environment variable with fallback.
-
-    :param str name: Environment variable name.
-    :param int default: Default integer.
-    :return int: Parsed value or default.
-    """
-
-    raw = os.environ.get(name)
-    if raw is None:
-        return int(default)
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        return int(default)
-
-
 def _flash_cfg_get(flash_cfg: Any | None, name: str, default: Any) -> Any:
     """Return one flash config value from a mapping/dataclass/object.
 
@@ -121,20 +92,18 @@ def _flash_cfg_bool(
     flash_cfg: Any | None,
     *,
     name: str,
-    env_name: str,
     default: str,
 ) -> bool:
-    """Resolve one boolean flash option from config or environment.
+    """Resolve one boolean flash option from config or a declared default.
 
     :param Any | None flash_cfg: Optional config source.
     :param str name: Config field name.
-    :param str env_name: Environment fallback name.
-    :param str default: Environment fallback default.
+    :param str default: Default text when config is absent.
     :return bool: Resolved boolean value.
     """
 
     if flash_cfg is None:
-        return _flash_truthy_env(env_name, default=default)
+        return str(default).strip().lower() in _FLASH_TRUTHY
     return bool(_flash_cfg_get(flash_cfg, name, False))
 
 
@@ -142,20 +111,18 @@ def _flash_cfg_int(
     flash_cfg: Any | None,
     *,
     name: str,
-    env_name: str,
     default: int,
 ) -> int:
-    """Resolve one integer flash option from config or environment.
+    """Resolve one integer flash option from config or a declared default.
 
     :param Any | None flash_cfg: Optional config source.
     :param str name: Config field name.
-    :param str env_name: Environment fallback name.
-    :param int default: Environment fallback default.
+    :param int default: Default integer when config is absent.
     :return int: Resolved integer value.
     """
 
     if flash_cfg is None:
-        return _flash_int_env(env_name, int(default))
+        return int(default)
     try:
         return int(_flash_cfg_get(flash_cfg, name, default))
     except Exception:
@@ -351,10 +318,8 @@ __all__ = [
     "_flash_cfg_bool",
     "_flash_cfg_get",
     "_flash_cfg_int",
-    "_flash_int_env",
     "_flash_is_pairwise_mask",
     "_flash_mask_to_2d_keep_mask",
-    "_flash_truthy_env",
     "build_doc_block_mask",
     "build_doc_segment_metadata",
     "doc_segment_metadata_host_stats",

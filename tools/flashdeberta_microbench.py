@@ -42,20 +42,14 @@ def _ensure_src_on_path() -> None:
 _ensure_src_on_path()
 
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
-from deberta.modeling.flashdeberta_patch import (  # noqa: E402
-    disable_flashdeberta_attention,
-    enable_flashdeberta_attention,
-)
 
 try:  # noqa: E402
     from deberta.modeling.flashdeberta_attention import (  # type: ignore
         flashdeberta_stats_snapshot,
-        refresh_flashdeberta_runtime_config_from_env,
         reset_flashdeberta_stats,
     )
 except Exception:  # pragma: no cover
     flashdeberta_stats_snapshot = None
-    refresh_flashdeberta_runtime_config_from_env = None
     reset_flashdeberta_stats = None
 
 
@@ -80,7 +74,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_config(args: argparse.Namespace) -> DebertaV2Config:
-    return DebertaV2Config(
+    cfg = DebertaV2Config(
         vocab_size=int(args.vocab_size),
         hidden_size=int(args.hidden_size),
         num_hidden_layers=int(args.num_layers),
@@ -99,6 +93,16 @@ def _build_config(args: argparse.Namespace) -> DebertaV2Config:
         pad_token_id=0,
         position_biased_input=False,
     )
+    cfg.hf_attention_impl = str(args.mode)
+    cfg.hf_flash = {
+        "force_varlen": False,
+        "varlen_min_seq_len": 2048,
+        "docblock_bias_seq_len": 1024,
+        "local_bias_max_batch_size": 4,
+        "eager_dense_max_seq_len": 0,
+        "kernel_overrides_path": None,
+    }
+    return cfg
 
 
 def _dtype_from_arg(name: str) -> torch.dtype:
@@ -170,11 +174,6 @@ def main() -> None:
 
     if str(args.mode) == "flash":
         os.environ.setdefault("FLASHDEBERTA_DEBUG_STATS", "1")
-        if callable(refresh_flashdeberta_runtime_config_from_env):
-            refresh_flashdeberta_runtime_config_from_env()
-        enable_flashdeberta_attention(strict=True)
-    else:
-        disable_flashdeberta_attention()
 
     cfg = _build_config(args)
     model = DebertaV2Model(cfg).to(device=device, dtype=dtype)

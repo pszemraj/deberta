@@ -36,7 +36,6 @@ from deberta.config import load_config, resolve_effective_mixed_precision  # noq
 from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling.builder import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
-from deberta.modeling.flashdeberta_patch import enable_flashdeberta_attention  # noqa: E402
 from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
@@ -141,6 +140,7 @@ def _sample_batches(
         "logging.wandb.enabled=false",
         "logging.backend=none",
         "train.checkpoint.export_hf_final=false",
+        "model.hf.attention_impl=flash",
         "data.packing.enabled=true",
         "data.packing.block_cross_document_attention=true",
     ]
@@ -321,7 +321,6 @@ def main() -> None:
     out_dir = _resolve_out_dir(args.out_dir)
     device = torch.device("cuda")
     torch.manual_seed(0)
-    enable_flashdeberta_attention(strict=True)
 
     samples, backbone_config = _sample_batches(
         config_path=str(args.config),
