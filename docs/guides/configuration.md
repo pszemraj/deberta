@@ -2,6 +2,9 @@
 
 ## Config shape
 
+For the complete generated key inventory, including type, default, valid values, interactions, and
+inline warnings for every leaf key, use [Guides / Config Reference](config-reference.md).
+
 The loader accepts nested YAML/JSON with these top-level sections:
 
 - `model`
