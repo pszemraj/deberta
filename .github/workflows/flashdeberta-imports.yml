@@ -1,0 +1,40 @@
+name: FlashDeBERTa Imports
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/flash
+
+jobs:
+  no-triton:
+    name: no-triton import contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev dependencies without flash extra
+        run: python -m pip install -e '.[dev]'
+      - name: Run no-Triton import regression
+        run: python -m pytest tests/test_flashdeberta_patch.py::test_flashdeberta_pack_and_varlen_modules_import_without_triton -q
+
+  with-triton:
+    name: with-triton import contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install flash dependencies
+        run: python -m pip install -e '.[dev,flash]'
+      - name: Run FlashDeBERTa import and metadata regressions
+        run: >
+          python -m pytest
+          tests/test_flashdeberta_patch.py::test_flashdeberta_version_guard_accepts_pinned_version
+          tests/test_flashdeberta_patch.py::test_prepare_flash_attention_batch_metadata_routes_docblock
+          tests/test_flashdeberta_patch.py::test_prepare_flash_attention_batch_metadata_docblock_host_stats
+          -q

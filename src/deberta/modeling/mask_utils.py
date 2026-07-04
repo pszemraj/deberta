@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+
+_FLASH_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
 @dataclass(frozen=True)
@@ -16,6 +20,8 @@ class FlashBatchMeta:
     :param torch.Tensor | None doc_segment_lengths: Optional per-segment doc lengths.
     :param torch.Tensor | None doc_cu_seqlens: Optional cumulative packed doc offsets.
     :param int | None active_tokens_host: Optional host-side active token count.
+    :param int | None doc_num_segments_host: Optional host-side active doc segment count.
+    :param int | None doc_max_segment_length_host: Optional host-side max doc segment length.
     :param str | None route_hint: Optional normalized flash route hint.
     """
 
@@ -24,6 +30,8 @@ class FlashBatchMeta:
     doc_segment_lengths: torch.Tensor | None = None
     doc_cu_seqlens: torch.Tensor | None = None
     active_tokens_host: int | None = None
+    doc_num_segments_host: int | None = None
+    doc_max_segment_length_host: int | None = None
     route_hint: str | None = None
 
     def normalized_route_hint(self) -> str | None:
@@ -48,6 +56,9 @@ class FlashBatchMeta:
             "flash_doc_segment_offsets": self.doc_segment_offsets,
             "flash_doc_segment_lengths": self.doc_segment_lengths,
             "flash_doc_cu_seqlens": self.doc_cu_seqlens,
+            "flash_active_tokens": self.active_tokens_host,
+            "flash_doc_num_segments": self.doc_num_segments_host,
+            "flash_doc_max_seqlen": self.doc_max_segment_length_host,
             "flash_route_hint": self.normalized_route_hint(),
         }
 
@@ -77,6 +88,128 @@ def normalize_keep_mask(mask: torch.Tensor, *, name: str = "attention_mask") -> 
             "Floating-point masks are ambiguous (0/1 keep vs 0/-inf additive)."
         )
     return mask.ne(0)
+
+
+def _flash_truthy_env(name: str, default: str = "0") -> bool:
+    """Return whether an environment variable is set to a truthy value.
+
+    :param str name: Environment variable name.
+    :param str default: Default text when unset.
+    :return bool: Parsed truthy value.
+    """
+
+    return os.environ.get(name, default).strip().lower() in _FLASH_TRUTHY
+
+
+def _flash_int_env(name: str, default: int) -> int:
+    """Parse an integer environment variable with fallback.
+
+    :param str name: Environment variable name.
+    :param int default: Default integer.
+    :return int: Parsed value or default.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+
+def _flash_cfg_get(flash_cfg: Any | None, name: str, default: Any) -> Any:
+    """Return one flash config value from a mapping/dataclass/object.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Field name.
+    :param Any default: Default value.
+    :return Any: Resolved value.
+    """
+
+    if flash_cfg is None:
+        return default
+    if isinstance(flash_cfg, dict):
+        return flash_cfg.get(name, default)
+    return getattr(flash_cfg, name, default)
+
+
+def _flash_cfg_bool(
+    flash_cfg: Any | None,
+    *,
+    name: str,
+    env_name: str,
+    default: str,
+) -> bool:
+    """Resolve one boolean flash option from config or environment.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Config field name.
+    :param str env_name: Environment fallback name.
+    :param str default: Environment fallback default.
+    :return bool: Resolved boolean value.
+    """
+
+    if flash_cfg is None:
+        return _flash_truthy_env(env_name, default=default)
+    return bool(_flash_cfg_get(flash_cfg, name, False))
+
+
+def _flash_cfg_int(
+    flash_cfg: Any | None,
+    *,
+    name: str,
+    env_name: str,
+    default: int,
+) -> int:
+    """Resolve one integer flash option from config or environment.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Config field name.
+    :param str env_name: Environment fallback name.
+    :param int default: Environment fallback default.
+    :return int: Resolved integer value.
+    """
+
+    if flash_cfg is None:
+        return _flash_int_env(env_name, int(default))
+    try:
+        return int(_flash_cfg_get(flash_cfg, name, default))
+    except Exception:
+        return int(default)
+
+
+def _flash_mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
+    """Extract a canonical ``(B,S)`` keep mask from rank-2/4 padding masks.
+
+    :param torch.Tensor attention_mask: Padding-style keep mask.
+    :param int seq_len: Expected sequence length.
+    :raises ValueError: If the mask is not 2D or broadcast 4D.
+    :return torch.Tensor: Boolean keep mask in ``(B,S)`` layout.
+    """
+
+    mask = normalize_keep_mask(attention_mask)
+    if mask.ndim == 2:
+        return mask[:, :seq_len]
+    if mask.ndim == 4 and int(mask.shape[-2]) == 1:
+        return mask[:, 0, 0, :seq_len]
+    raise ValueError(f"Unsupported padding-mask shape for flash metadata: {tuple(mask.shape)}")
+
+
+def _flash_is_pairwise_mask(attention_mask: torch.Tensor, *, seq_len: int) -> bool:
+    """Return whether a mask carries per-query pairwise structure.
+
+    :param torch.Tensor attention_mask: Candidate mask tensor.
+    :param int seq_len: Expected query/key length.
+    :return bool: True for ``(B,S,S)`` or ``(B,1,S,S)`` style masks.
+    """
+
+    mask = normalize_keep_mask(attention_mask)
+    if mask.ndim == 3:
+        return tuple(mask.shape[-2:]) == (int(seq_len), int(seq_len))
+    if mask.ndim == 4:
+        return tuple(mask.shape[-2:]) == (int(seq_len), int(seq_len))
+    return False
 
 
 _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
@@ -174,6 +307,26 @@ def build_doc_segment_metadata(
     return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, total_tokens
 
 
+def doc_segment_metadata_host_stats(
+    segment_lengths: torch.Tensor,
+    *,
+    active_tokens: int | None = None,
+) -> tuple[int | None, int | None, int | None]:
+    """Return host-side doc-segment stats for already-built metadata.
+
+    :param torch.Tensor segment_lengths: Padded per-segment lengths.
+    :param int | None active_tokens: Optional total active token count.
+    :return tuple[int | None, int | None, int | None]: Active segment count, max segment length, and active tokens.
+    """
+
+    if segment_lengths.device.type != "cpu":
+        return None, None, active_tokens
+    active = segment_lengths[segment_lengths.ne(0)]
+    if int(active.numel()) == 0:
+        return 0, 0, active_tokens
+    return int(active.numel()), int(active.max().item()), active_tokens
+
+
 def doc_ids_from_segments(
     *,
     offsets: torch.Tensor,
@@ -212,8 +365,16 @@ def doc_ids_from_segments(
 
 __all__ = [
     "FlashBatchMeta",
+    "_flash_cfg_bool",
+    "_flash_cfg_get",
+    "_flash_cfg_int",
+    "_flash_int_env",
+    "_flash_is_pairwise_mask",
+    "_flash_mask_to_2d_keep_mask",
+    "_flash_truthy_env",
     "build_doc_block_mask",
     "build_doc_segment_metadata",
+    "doc_segment_metadata_host_stats",
     "doc_ids_from_segments",
     "normalize_keep_mask",
 ]

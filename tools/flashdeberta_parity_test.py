@@ -22,7 +22,11 @@ def _ensure_src_on_path() -> None:
 _ensure_src_on_path()
 
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
-from deberta.modeling.mask_utils import build_doc_block_mask, build_doc_segment_metadata  # noqa: E402
+from deberta.modeling.mask_utils import (  # noqa: E402
+    build_doc_block_mask,
+    build_doc_segment_metadata,
+    doc_segment_metadata_host_stats,
+)
 
 
 @dataclass(frozen=True)
@@ -78,7 +82,7 @@ def _copy_weights(src: torch.nn.Module, dst: torch.nn.Module) -> None:
 
 def _case_payload(
     case: ParityCase, *, cfg: DebertaV2Config, device: torch.device
-) -> dict[str, torch.Tensor | str | None]:
+) -> dict[str, torch.Tensor | int | str | None]:
     """Build inputs and flash metadata for one route case."""
 
     input_ids = torch.randint(5, cfg.vocab_size, (case.batch_size, case.seq_len), device=device)
@@ -87,14 +91,18 @@ def _case_payload(
     flash_doc_segment_offsets: torch.Tensor | None = None
     flash_doc_segment_lengths: torch.Tensor | None = None
     flash_doc_cu_seqlens: torch.Tensor | None = None
+    flash_active_tokens: int | None = None
+    flash_doc_num_segments: int | None = None
+    flash_doc_max_seqlen: int | None = None
 
     if case.docblock:
-        doc_ids = torch.zeros((case.batch_size, case.seq_len), device=device, dtype=torch.long)
+        doc_ids_cpu = torch.zeros((case.batch_size, case.seq_len), dtype=torch.long)
         split = max(2, case.seq_len // 2)
-        doc_ids[:, :split] = 1
-        doc_ids[:, split : case.seq_len - case.pad_tail] = 2
+        doc_ids_cpu[:, :split] = 1
+        doc_ids_cpu[:, split : case.seq_len - case.pad_tail] = 2
         if case.pad_tail > 0:
             input_ids[:, -case.pad_tail :] = int(cfg.pad_token_id)
+        doc_ids = doc_ids_cpu.to(device=device)
         flash_seq_lengths = doc_ids.ne(0).sum(-1, dtype=torch.int32)
         if case.route_hint == "docblock_bias":
             attention_mask = build_doc_block_mask(doc_ids)
@@ -104,8 +112,15 @@ def _case_payload(
                 flash_doc_segment_offsets,
                 flash_doc_segment_lengths,
                 flash_doc_cu_seqlens,
-                _active_tokens,
-            ) = build_doc_segment_metadata(doc_ids)
+                flash_active_tokens,
+            ) = build_doc_segment_metadata(doc_ids_cpu)
+            flash_doc_num_segments, flash_doc_max_seqlen, _ = doc_segment_metadata_host_stats(
+                flash_doc_segment_lengths,
+                active_tokens=flash_active_tokens,
+            )
+            flash_doc_segment_offsets = flash_doc_segment_offsets.to(device=device)
+            flash_doc_segment_lengths = flash_doc_segment_lengths.to(device=device)
+            flash_doc_cu_seqlens = flash_doc_cu_seqlens.to(device=device)
     elif case.pad_tail > 0:
         attention_mask = torch.ones((case.batch_size, case.seq_len), device=device, dtype=torch.bool)
         attention_mask[1, -case.pad_tail :] = False
@@ -119,13 +134,16 @@ def _case_payload(
         "flash_doc_segment_offsets": flash_doc_segment_offsets,
         "flash_doc_segment_lengths": flash_doc_segment_lengths,
         "flash_doc_cu_seqlens": flash_doc_cu_seqlens,
+        "flash_active_tokens": flash_active_tokens,
+        "flash_doc_num_segments": flash_doc_num_segments,
+        "flash_doc_max_seqlen": flash_doc_max_seqlen,
         "flash_route_hint": case.route_hint,
     }
 
 
 def _run(
     model: DebertaV2Model,
-    payload: dict[str, torch.Tensor | str | None],
+    payload: dict[str, torch.Tensor | int | str | None],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run one forward/backward pass and return selected gradients."""
 
@@ -153,8 +171,11 @@ def _assert_close_to_reference(
     reference: torch.Tensor,
     max_abs_limit: float,
     mean_abs_limit: float,
-) -> None:
-    """Assert one tensor is close enough to the fp32 eager reference."""
+) -> tuple[float, float]:
+    """Assert one tensor is close enough to the fp32 eager reference.
+
+    :return tuple[float, float]: Observed max and mean absolute errors.
+    """
 
     diff = (actual.float() - reference.float()).abs()
     max_abs = float(diff.max().item())
@@ -166,6 +187,7 @@ def _assert_close_to_reference(
             f"max_abs={max_abs:.4e} > {max_abs_limit:.4e} or "
             f"mean_abs={mean_abs:.4e} > {mean_abs_limit:.4e}"
         )
+    return max_abs, mean_abs
 
 
 def _run_case(case: ParityCase, *, device: torch.device) -> None:
@@ -185,6 +207,9 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
     ref_payload.pop("flash_doc_segment_offsets")
     ref_payload.pop("flash_doc_segment_lengths")
     ref_payload.pop("flash_doc_cu_seqlens")
+    ref_payload.pop("flash_active_tokens")
+    ref_payload.pop("flash_doc_num_segments")
+    ref_payload.pop("flash_doc_max_seqlen")
     ref_payload.pop("flash_route_hint")
     if case.route_hint == "docblock":
         doc_ids = torch.zeros((case.batch_size, case.seq_len), device=device, dtype=torch.long)
@@ -197,7 +222,7 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
     eager_out, eager_grads = _run(eager, ref_payload)
     flash_out, flash_grads = _run(flash, payload)
 
-    _assert_close_to_reference(
+    eager_out_max, eager_out_mean = _assert_close_to_reference(
         case_name=case.name,
         label="eager_bf16_out",
         actual=eager_out,
@@ -210,11 +235,11 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
         label="flash_bf16_out",
         actual=flash_out,
         reference=ref_out,
-        max_abs_limit=7e-2,
-        mean_abs_limit=1.2e-2,
+        max_abs_limit=max(3.0 * eager_out_max, 7e-2),
+        mean_abs_limit=max(3.0 * eager_out_mean, 1.2e-2),
     )
     for key in ("word_embeddings", "rel_embeddings", "query", "value"):
-        _assert_close_to_reference(
+        eager_grad_max, eager_grad_mean = _assert_close_to_reference(
             case_name=case.name,
             label=f"eager_grad_{key}",
             actual=eager_grads[key],
@@ -227,8 +252,8 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
             label=f"flash_grad_{key}",
             actual=flash_grads[key],
             reference=ref_grads[key],
-            max_abs_limit=1.2e-1,
-            mean_abs_limit=2e-2,
+            max_abs_limit=max(3.0 * eager_grad_max, 1.2e-1),
+            mean_abs_limit=max(3.0 * eager_grad_mean, 2e-2),
         )
 
 

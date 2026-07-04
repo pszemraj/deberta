@@ -131,10 +131,10 @@ DeBERTa RTD batches on `sm_120`, not synthetic pad ratios:
 Those tuned buckets are enough for the current branch to beat eager end to end
 on the provided unpacked `2048` and `4096` configs while staying compile-stable.
 If you need to retune for another GPU, use `tools/flashdeberta_varlen_tune.py`
-first and prefer the split overrides:
-
-- `FLASHDEBERTA_VARLEN_BWD_KV_*`
-- `FLASHDEBERTA_VARLEN_BWD_Q_*`
+first and put durable results in a JSON table selected with
+`model.hf.flash.kernel_overrides_path`. Legacy `FLASHDEBERTA_VARLEN_*`
+environment overrides remain diagnostic-only fallbacks for one-off local
+experiments.
 
 ## Special case: packed doc-block masks
 

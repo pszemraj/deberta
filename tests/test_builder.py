@@ -488,6 +488,51 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         assert built_cfg.flash_eager_dense_max_seq_len == 512
 
 
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"relative_attention": False}, "relative_attention=true"),
+        ({"position_buckets": 0}, "position_buckets > 0"),
+        ({"pos_att_type": "p2c|p2p"}, "does not support pos_att_type"),
+    ],
+)
+def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
+    monkeypatch: pytest.MonkeyPatch,
+    updates: dict[str, Any],
+    message: str,
+):
+    pytest.importorskip("transformers")
+    invalid_cfg = builder_mod._build_repo_hf_deberta_v2_config(
+        model_cfg=ModelConfig(backbone_type="hf_deberta_v2")
+    )
+    for key, value in updates.items():
+        setattr(invalid_cfg, key, value)
+
+    def _fake_from_pretrained(cls, src: str):
+        del cls
+        del src
+        return invalid_cfg
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained_discriminator_path="custom-deberta",
+        hf={"attention_impl": "flash"},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=128100),
+            max_position_embeddings=64,
+        )
+
+
 def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritative(
     monkeypatch: pytest.MonkeyPatch,
 ):

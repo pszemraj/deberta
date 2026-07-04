@@ -1236,6 +1236,9 @@ def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_s
             flash_doc_segment_offsets: torch.Tensor | None = None,
             flash_doc_segment_lengths: torch.Tensor | None = None,
             flash_doc_cu_seqlens: torch.Tensor | None = None,
+            flash_active_tokens: int | None = None,
+            flash_doc_num_segments: int | None = None,
+            flash_doc_max_seqlen: int | None = None,
             flash_route_hint: str | None = None,
         ) -> tuple[str, bool, bool, bool, torch.Tensor]:
             del (
@@ -1247,6 +1250,9 @@ def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_s
                 flash_doc_segment_offsets,
                 flash_doc_segment_lengths,
                 flash_doc_cu_seqlens,
+                flash_active_tokens,
+                flash_doc_num_segments,
+                flash_doc_max_seqlen,
                 flash_route_hint,
             )
             return (

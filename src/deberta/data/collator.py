@@ -10,6 +10,8 @@ from typing import Any
 
 import torch
 
+from deberta.modeling.mask_utils import build_doc_segment_metadata, doc_segment_metadata_host_stats
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,6 +153,7 @@ class DebertaV3ElectraCollator:
         )
         if doc_ids is not None:
             batch["doc_ids"] = doc_ids
+            self._attach_flash_doc_metadata(batch=batch, doc_ids=doc_ids)
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
@@ -165,12 +168,51 @@ class DebertaV3ElectraCollator:
                         batch.pop("attention_mask", None)
                 except Exception:
                     pass
+            self._attach_flash_padding_metadata(batch)
 
         input_ids, labels = self._mask_tokens(batch["input_ids"], special_tokens_mask=special_tokens_mask)
 
         batch["input_ids"] = input_ids
         batch["labels"] = labels
         return batch
+
+    @staticmethod
+    def _attach_flash_doc_metadata(*, batch: dict[str, Any], doc_ids: torch.Tensor) -> None:
+        """Attach CPU-built flash metadata for compact doc-block batches.
+
+        :param dict[str, Any] batch: Collated batch mapping.
+        :param torch.Tensor doc_ids: Compact document ids in ``(B,S)`` layout.
+        """
+
+        keep_mask = doc_ids.ne(0)
+        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(doc_ids)
+        num_segments, max_segment_length, _ = doc_segment_metadata_host_stats(
+            segment_lengths,
+            active_tokens=int(active_tokens),
+        )
+        batch["flash_seq_lengths"] = seq_lengths
+        batch["flash_active_tokens"] = int(active_tokens)
+        batch["flash_doc_num_segments"] = int(num_segments)
+        batch["flash_doc_max_seqlen"] = int(max_segment_length)
+        batch["flash_doc_segment_offsets"] = segment_offsets
+        batch["flash_doc_segment_lengths"] = segment_lengths
+        batch["flash_doc_cu_seqlens"] = cu_seqlens
+
+    @staticmethod
+    def _attach_flash_padding_metadata(batch: dict[str, Any]) -> None:
+        """Attach cheap flash metadata for standard padded batches.
+
+        :param dict[str, Any] batch: Collated batch mapping.
+        """
+
+        attention_mask = batch.get("attention_mask")
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            return
+        keep_mask = attention_mask.to(dtype=torch.bool)
+        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        batch["flash_seq_lengths"] = seq_lengths
+        batch["flash_active_tokens"] = int(seq_lengths.sum(dtype=torch.int32))
 
     def _harmonize_optional_attention_masks(self, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Ensure optional ``attention_mask`` keys are consistent before tokenizer padding.

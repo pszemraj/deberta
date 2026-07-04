@@ -12,9 +12,6 @@ scattering packed outputs/gradients back to the original padded layout.
 
 from __future__ import annotations
 
-import weakref
-from dataclasses import dataclass
-
 import torch
 
 try:  # pragma: no cover - optional Triton dependency
@@ -24,27 +21,8 @@ try:  # pragma: no cover - optional Triton dependency
     _TRITON_IMPORT_ERROR: Exception | None = None
     _TRITON_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - optional Triton dependency
-
-    class _MissingTriton:
-        """Minimal stand-in that lets this module define fallback kernels."""
-
-        @staticmethod
-        def jit(fn: object) -> object:
-            """Return ``fn`` unchanged when Triton is unavailable.
-
-            :param object fn: Function object.
-            :return object: The unchanged function object.
-            """
-
-            return fn
-
-    class _MissingTritonLanguage:
-        """Minimal annotation stand-in for ``tl.constexpr``."""
-
-        constexpr = object
-
-    triton = _MissingTriton()
-    tl = _MissingTritonLanguage()
+    triton = None
+    tl = None
     _TRITON_IMPORT_ERROR = exc
     _TRITON_AVAILABLE = False
 
@@ -52,17 +30,6 @@ _SEGMENT_BLOCK_ROWS = 32
 _SEGMENT_BLOCK_COLS = 128
 _SEGMENT_NUM_WARPS = 4
 _SEGMENT_NUM_STAGES = 2
-
-
-@dataclass
-class _SegmentHostCacheEntry:
-    """Cached host tuple for one device metadata tensor."""
-
-    tensor_ref: weakref.ReferenceType[torch.Tensor] | None
-    host_values: tuple[int, ...]
-
-
-_SEGMENT_HOST_CACHE: dict[int, _SegmentHostCacheEntry] = {}
 
 
 def flashdeberta_segment_pack_import_error() -> Exception | None:
@@ -98,38 +65,40 @@ def _traceable_triton_kernel(kernel: object) -> object:
         return kernel
 
 
-def _tensor_host_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
-    """Return a cached host tuple for one 1D metadata tensor.
+def _optional_triton_jit(fn: object) -> object:
+    """Apply ``triton.jit`` only when Triton imported successfully.
 
-    :param torch.Tensor tensor: Device metadata tensor.
-    :return tuple[int, ...]: Cached host integer values.
+    :param object fn: Kernel function.
+    :return object: JIT kernel or unchanged function in no-Triton environments.
     """
 
-    cache_key = id(tensor)
-    cached = _SEGMENT_HOST_CACHE.get(cache_key)
-    if cached is not None:
-        cached_tensor = cached.tensor_ref() if cached.tensor_ref is not None else None
-        if cached_tensor is tensor:
-            return cached.host_values
-        _SEGMENT_HOST_CACHE.pop(cache_key, None)
+    if triton is None or tl is None:
+        return fn
+    return triton.jit(fn)
 
-    host_values = tuple(int(value) for value in tensor.detach().cpu().tolist())
-    tensor_ref: weakref.ReferenceType[torch.Tensor] | None = None
-    try:
-        tensor_ref = weakref.ref(tensor, lambda _ref, key=cache_key: _SEGMENT_HOST_CACHE.pop(key, None))
-    except TypeError:
-        tensor_ref = None
-    _SEGMENT_HOST_CACHE[cache_key] = _SegmentHostCacheEntry(tensor_ref=tensor_ref, host_values=host_values)
-    return host_values
+
+def _tensor_host_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
+    """Return a host tuple for one CPU metadata tensor.
+
+    :param torch.Tensor tensor: CPU metadata tensor.
+    :raises RuntimeError: If a device tensor reaches the eager fallback path.
+    :return tuple[int, ...]: Host integer values.
+    """
+
+    if tensor.device.type != "cpu":
+        raise RuntimeError(
+            "Segment-pack eager fallback requires CPU metadata; device metadata must use Triton."
+        )
+    return tuple(int(value) for value in tensor.tolist())
 
 
 def clear_segment_pack_host_cache() -> None:
-    """Clear cached host metadata tuples.
+    """Compatibility no-op for the removed segment host cache.
 
     :return None: This exists primarily for tests.
     """
 
-    _SEGMENT_HOST_CACHE.clear()
+    return None
 
 
 def _flatten_rows(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int, int]:
@@ -183,7 +152,7 @@ def _can_use_triton_segment_pack(
     return True
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_segment_rows_kernel(
     input_ptr: None,
     output_ptr: None,
@@ -228,7 +197,7 @@ def _pack_segment_rows_kernel(
     tl.store(dst_ptrs, values, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_segment_rows_pair_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -281,7 +250,7 @@ def _pack_segment_rows_pair_kernel(
     tl.store(dst_b_ptrs, values_b, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_segment_rows_triple_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -342,7 +311,7 @@ def _pack_segment_rows_triple_kernel(
     tl.store(dst_c_ptrs, values_c, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _unpack_segment_rows_kernel(
     input_ptr: None,
     output_ptr: None,
@@ -387,7 +356,7 @@ def _unpack_segment_rows_kernel(
     tl.store(dst_ptrs, values, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _unpack_segment_rows_pair_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -440,7 +409,7 @@ def _unpack_segment_rows_pair_kernel(
     tl.store(dst_b_ptrs, values_b, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _unpack_segment_rows_triple_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -508,6 +477,7 @@ def segment_pack_padded_rows(
     segment_lengths: torch.Tensor,
     cu_seqlens: torch.Tensor,
     total_tokens: int,
+    max_segment_length: int | None = None,
 ) -> torch.Tensor:
     """Pack contiguous padded token segments into one packed tensor.
 
@@ -516,6 +486,7 @@ def segment_pack_padded_rows(
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
     :param int total_tokens: Total packed token count.
+    :param int | None max_segment_length: Host-side maximum segment length.
     :return torch.Tensor: Packed tensor with shape ``(NNZ, ...)``.
     """
 
@@ -535,7 +506,7 @@ def segment_pack_padded_rows(
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     ):
-        max_len = max(1, int(segment_lengths.max().item()))
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
         grid = (
             int(segment_lengths.shape[0]),
             triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
@@ -575,6 +546,7 @@ def segment_pack_padded_rows_pair(
     segment_lengths: torch.Tensor,
     cu_seqlens: torch.Tensor,
     total_tokens: int,
+    max_segment_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack two contiguous padded tensors with shared segment metadata.
 
@@ -584,6 +556,7 @@ def segment_pack_padded_rows_pair(
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
     :param int total_tokens: Total packed token count.
+    :param int | None max_segment_length: Host-side maximum segment length.
     :return tuple[torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
@@ -613,7 +586,7 @@ def segment_pack_padded_rows_pair(
         )
         and tensor_b.device == tensor_a.device
     ):
-        max_len = max(1, int(segment_lengths.max().item()))
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
         grid = (
             int(segment_lengths.shape[0]),
             triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
@@ -659,6 +632,7 @@ def segment_pack_padded_rows_triple(
     segment_lengths: torch.Tensor,
     cu_seqlens: torch.Tensor,
     total_tokens: int,
+    max_segment_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack three contiguous padded tensors with shared segment metadata.
 
@@ -669,6 +643,7 @@ def segment_pack_padded_rows_triple(
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
     :param int total_tokens: Total packed token count.
+    :param int | None max_segment_length: Host-side maximum segment length.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
@@ -700,7 +675,7 @@ def segment_pack_padded_rows_triple(
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     ):
-        max_len = max(1, int(segment_lengths.max().item()))
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
         grid = (
             int(segment_lengths.shape[0]),
             triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
@@ -748,6 +723,7 @@ def segment_unpack_padded_rows(
     cu_seqlens: torch.Tensor,
     batch_size: int,
     seq_len: int,
+    max_segment_length: int | None = None,
 ) -> torch.Tensor:
     """Scatter one packed tensor back into padded ``(B, S, ...)`` layout.
 
@@ -757,6 +733,7 @@ def segment_unpack_padded_rows(
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
     :param int batch_size: Output batch size.
     :param int seq_len: Output padded sequence length.
+    :param int | None max_segment_length: Host-side maximum segment length.
     :return torch.Tensor: Padded tensor with shape ``(B, S, ...)``.
     """
 
@@ -775,7 +752,7 @@ def segment_unpack_padded_rows(
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     ):
-        max_len = max(1, int(segment_lengths.max().item()))
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
         grid = (
             int(segment_lengths.shape[0]),
             triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
@@ -818,6 +795,7 @@ def segment_unpack_padded_rows_pair(
     cu_seqlens: torch.Tensor,
     batch_size: int,
     seq_len: int,
+    max_segment_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Scatter two packed tensors back into padded ``(B, S, ...)`` layout.
 
@@ -828,6 +806,7 @@ def segment_unpack_padded_rows_pair(
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
     :param int batch_size: Output batch size.
     :param int seq_len: Output padded sequence length.
+    :param int | None max_segment_length: Host-side maximum segment length.
     :return tuple[torch.Tensor, torch.Tensor]: Padded tensors ``(B, S, ...)``.
     """
 
@@ -852,7 +831,7 @@ def segment_unpack_padded_rows_pair(
         )
         and packed_b.device == packed_a.device
     ):
-        max_len = max(1, int(segment_lengths.max().item()))
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
         grid = (
             int(segment_lengths.shape[0]),
             triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
@@ -899,6 +878,7 @@ def segment_unpack_padded_rows_triple(
     cu_seqlens: torch.Tensor,
     batch_size: int,
     seq_len: int,
+    max_segment_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Scatter three packed tensors back into padded ``(B, S, ...)`` layout.
 
@@ -910,6 +890,7 @@ def segment_unpack_padded_rows_triple(
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
     :param int batch_size: Output batch size.
     :param int seq_len: Output padded sequence length.
+    :param int | None max_segment_length: Host-side maximum segment length.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Padded tensors ``(B, S, ...)``.
     """
 
@@ -938,7 +919,7 @@ def segment_unpack_padded_rows_triple(
         and packed_b.device == packed_a.device
         and packed_c.device == packed_a.device
     ):
-        max_len = max(1, int(segment_lengths.max().item()))
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
         grid = (
             int(segment_lengths.shape[0]),
             triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),

@@ -14,6 +14,11 @@ from typing import Any
 
 import torch
 
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    FlashKernelContext,
+    resolve_flash_kernel_config,
+)
+
 try:
     import triton
     import triton.language as tl
@@ -124,6 +129,16 @@ def _bias_device_capability(device: torch.device) -> tuple[int, int]:
     return torch.cuda.get_device_capability(index)
 
 
+def _kernel_dtype_name(dtype: torch.dtype) -> str:
+    """Return a compact dtype name for tuning-table matching.
+
+    :param torch.dtype dtype: Torch dtype.
+    :return str: Dtype name without the ``torch.`` prefix.
+    """
+
+    return str(dtype).removeprefix("torch.")
+
+
 def _bias_kernel_override_from_env(*, kind: str) -> tuple[int, int, int, int] | None:
     """Return repo-side dense-bias kernel overrides when fully specified.
 
@@ -205,7 +220,6 @@ def _bias_repo_tuned_config(
         or ``None`` when no repo-local override applies.
     """
 
-    del batch_size, num_heads
     normalized_kind = str(kind).strip().lower()
     if normalized_kind not in {"fwd", "bwd", "bwd_kv", "bwd_q"}:
         return None
@@ -218,9 +232,21 @@ def _bias_repo_tuned_config(
     if int(query_len) != 1024 or int(key_len) != 1024:
         return None
     capability = _bias_device_capability(device)
-    if int(capability[0]) < 12:
-        return None
-    return None
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=capability,
+            route="bias",
+            kind=normalized_kind,
+            seq_len=max(int(query_len), int(key_len)),
+            batch_size=int(batch_size),
+            query_len=int(query_len),
+            key_len=int(key_len),
+            num_heads=int(num_heads),
+            head_dim=int(head_dim),
+            dtype=_kernel_dtype_name(dtype),
+            causal=bool(causal),
+        )
+    )
 
 
 def _bias_forward_config(
@@ -247,7 +273,6 @@ def _bias_forward_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    override = _bias_kernel_override_from_env(kind="fwd")
     tuned = _bias_repo_tuned_config(
         kind="fwd",
         batch_size=batch_size,
@@ -259,10 +284,11 @@ def _bias_forward_config(
         dtype=dtype,
         device=device,
     )
-    if override is not None:
-        return override
     if tuned is not None:
         return tuned
+    override = _bias_kernel_override_from_env(kind="fwd")
+    if override is not None:
+        return override
     if _get_fwd_config_bias_lowlevel is None:
         raise RuntimeError("FlashDeBERTa local-bias config helper is unavailable.")
     return _get_fwd_config_bias_lowlevel(
@@ -299,7 +325,6 @@ def _bias_backward_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    override = _bias_kernel_override_from_env(kind="bwd")
     tuned = _bias_repo_tuned_config(
         kind="bwd",
         batch_size=batch_size,
@@ -311,10 +336,11 @@ def _bias_backward_config(
         dtype=dtype,
         device=device,
     )
-    if override is not None:
-        return override
     if tuned is not None:
         return tuned
+    override = _bias_kernel_override_from_env(kind="bwd")
+    if override is not None:
+        return override
     if _get_bwd_config_bias_lowlevel is None:
         raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
     return _get_bwd_config_bias_lowlevel(
@@ -362,14 +388,6 @@ def _resolve_bias_bwd_kernel_config(
     if normalized_kind not in {"kv", "q"}:
         raise ValueError(f"Unsupported dense-bias backward kernel kind: {kind!r}")
 
-    specific_override = _bias_kernel_override_from_env(kind=f"bwd_{normalized_kind}")
-    if specific_override is not None:
-        return specific_override
-
-    generic_override = _bias_kernel_override_from_env(kind="bwd")
-    if generic_override is not None:
-        return generic_override
-
     repo_tuned = _bias_repo_tuned_config(
         kind=f"bwd_{normalized_kind}",
         batch_size=batch_size,
@@ -383,6 +401,14 @@ def _resolve_bias_bwd_kernel_config(
     )
     if repo_tuned is not None:
         return repo_tuned
+
+    specific_override = _bias_kernel_override_from_env(kind=f"bwd_{normalized_kind}")
+    if specific_override is not None:
+        return specific_override
+
+    generic_override = _bias_kernel_override_from_env(kind="bwd")
+    if generic_override is not None:
+        return generic_override
 
     return _bias_backward_config(
         batch_size=batch_size,

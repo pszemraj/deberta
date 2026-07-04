@@ -27,29 +27,15 @@ try:  # pragma: no cover - optional Triton dependency
 
     _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover - optional Triton dependency
-
-    class _MissingTriton:
-        """Minimal stand-in that lets this module define fallback kernels."""
-
-        @staticmethod
-        def jit(fn: object) -> object:
-            """Return ``fn`` unchanged when Triton is unavailable.
-
-            :param object fn: Function object.
-            :return object: The unchanged function object.
-            """
-
-            return fn
-
-    class _MissingTritonLanguage:
-        """Minimal annotation stand-in for ``tl.constexpr``."""
-
-        constexpr = object
-
-    triton = _MissingTriton()
-    tl = _MissingTritonLanguage()
+    triton = None
+    tl = None
     _TRITON_AVAILABLE = False
 
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    FlashKernelContext,
+    flash_seq_bucket,
+    resolve_flash_kernel_config,
+)
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_padded_rows,
     prefix_pack_padded_rows_pair,
@@ -58,6 +44,19 @@ from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_unpack_padded_rows_pair,
     prefix_unpack_padded_rows_triple,
 )
+
+
+def _optional_triton_jit(fn: object) -> object:
+    """Apply ``triton.jit`` only when Triton imported successfully.
+
+    :param object fn: Kernel function.
+    :return object: JIT kernel or unchanged function in no-Triton environments.
+    """
+
+    if triton is None or tl is None:
+        return fn
+    return triton.jit(fn)
+
 
 try:
     from flashdeberta.ops.flash_attention_varlen import (
@@ -149,24 +148,6 @@ class _MidTensorCacheEntry:
     mn: int
 
 
-@dataclass
-class _ForwardAuxCacheEntry:
-    """Forward-side varlen tensors reused by the padded backward helper."""
-
-    output_ref: weakref.ReferenceType[torch.Tensor] | None
-    seqlens: torch.Tensor
-    cu_seqlens: torch.Tensor
-    max_seqlen: int
-    total_tokens: int
-    q_unpad: torch.Tensor
-    k_unpad: torch.Tensor
-    v_unpad: torch.Tensor
-    out_unpad: torch.Tensor
-    lse_unpad: torch.Tensor
-    pos_key_unpad: torch.Tensor | None
-    pos_query_unpad: torch.Tensor | None
-
-
 _MASK_METADATA_CACHE: dict[
     tuple[int, int, tuple[int, ...], tuple[int, ...], str, int], _MaskMetadataCacheEntry
 ] = {}
@@ -217,7 +198,10 @@ def _varlen_use_triton_op() -> bool:
     """
 
     return (
-        _fwd_kernel_varlen_raw is not None
+        _TRITON_AVAILABLE
+        and triton is not None
+        and tl is not None
+        and _fwd_kernel_varlen_raw is not None
         and _bwd_preprocess_varlen_raw is not None
         and _bwd_kv_dise_kernel_varlen_raw is not None
         and _bwd_q_dise_kernel_varlen_raw is not None
@@ -321,13 +305,21 @@ def _varlen_density_bucket(*, seq_len: int, total_tokens: int, batch_size: int) 
     :return str: Density bucket label used by repo-local heuristics.
     """
 
-    capacity = max(1, int(seq_len) * max(1, int(batch_size)))
-    density = float(total_tokens) / float(capacity)
-    if int(seq_len) >= 4096:
-        return "4096_plus"
-    if int(seq_len) >= 2048:
-        return "2048_medium" if density >= 0.60 else "2048_sparse"
-    return "1024_dense_or_medium"
+    return flash_seq_bucket(
+        seq_len=int(seq_len),
+        total_tokens=int(total_tokens),
+        batch_size=int(batch_size),
+    )
+
+
+def _kernel_dtype_name(dtype: torch.dtype) -> str:
+    """Return a compact dtype name for tuning-table matching.
+
+    :param torch.dtype dtype: Torch dtype.
+    :return str: Dtype name without the ``torch.`` prefix.
+    """
+
+    return str(dtype).removeprefix("torch.")
 
 
 def _varlen_repo_tuned_bwd_config(
@@ -359,32 +351,68 @@ def _varlen_repo_tuned_bwd_config(
         or ``None`` when no repo-local override applies.
     """
 
-    del dtype
     normalized_kind = str(kind).strip().lower()
     if normalized_kind not in {"kv", "q"}:
         return None
-    if bool(causal) or not bool(disentangled):
-        return None
-    if int(head_dim) != 64:
-        return None
-    if int(att_span) < 128:
-        return None
     capability = _varlen_device_capability(device)
-    if int(capability[0]) < 12:
-        return None
-    bucket = _varlen_density_bucket(
-        seq_len=int(seq_len), total_tokens=int(total_tokens), batch_size=int(batch_size)
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=capability,
+            route="varlen",
+            kind=f"bwd_{normalized_kind}",
+            seq_len=int(seq_len),
+            total_tokens=int(total_tokens),
+            batch_size=int(batch_size),
+            head_dim=int(head_dim),
+            dtype=_kernel_dtype_name(dtype),
+            causal=bool(causal),
+            disentangled=bool(disentangled),
+            att_span=int(att_span),
+        )
     )
-    tuned: dict[tuple[str, str], tuple[int, int, int, int]] = {
-        # Measured on sampled unpacked HF DeBERTa RTD batches on sm_120.
-        ("kv", "2048_medium"): (64, 32, 2, 4),
-        ("kv", "2048_sparse"): (64, 32, 2, 4),
-        ("kv", "4096_plus"): (32, 64, 2, 4),
-        ("q", "2048_medium"): (32, 64, 2, 4),
-        ("q", "2048_sparse"): (32, 64, 2, 4),
-        ("q", "4096_plus"): (64, 64, 3, 8),
-    }
-    return tuned.get((normalized_kind, bucket))
+
+
+def _varlen_repo_tuned_fwd_config(
+    *,
+    seq_len: int,
+    total_tokens: int,
+    batch_size: int,
+    head_dim: int,
+    causal: bool,
+    disentangled: bool,
+    att_span: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int] | None:
+    """Return a table-driven varlen forward-kernel config, if one matches.
+
+    :param int seq_len: Padded sequence length.
+    :param int total_tokens: Active token count.
+    :param int batch_size: Batch size.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool disentangled: Whether c2p/p2c position terms are active.
+    :param int att_span: Effective relative-position span.
+    :param torch.dtype dtype: Kernel dtype.
+    :param torch.device device: Launch device.
+    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=_varlen_device_capability(device),
+            route="varlen",
+            kind="fwd",
+            seq_len=int(seq_len),
+            total_tokens=int(total_tokens),
+            batch_size=int(batch_size),
+            head_dim=int(head_dim),
+            dtype=_kernel_dtype_name(dtype),
+            causal=bool(causal),
+            disentangled=bool(disentangled),
+            att_span=int(att_span),
+        )
+    )
 
 
 def _resolve_varlen_bwd_kernel_config(
@@ -419,14 +447,6 @@ def _resolve_varlen_bwd_kernel_config(
     :return tuple[int, int, int, int]: Resolved ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    specific_override = _varlen_kernel_override_from_env(kind=f"bwd_{kind}")
-    if specific_override is not None:
-        return specific_override
-
-    generic_override = _varlen_kernel_override_from_env(kind="bwd")
-    if generic_override is not None:
-        return generic_override
-
     repo_tuned = _varlen_repo_tuned_bwd_config(
         kind=kind,
         seq_len=max(max_seqlen_q, max_seqlen_k),
@@ -441,6 +461,14 @@ def _resolve_varlen_bwd_kernel_config(
     )
     if repo_tuned is not None:
         return repo_tuned
+
+    specific_override = _varlen_kernel_override_from_env(kind=f"bwd_{kind}")
+    if specific_override is not None:
+        return specific_override
+
+    generic_override = _varlen_kernel_override_from_env(kind="bwd")
+    if generic_override is not None:
+        return generic_override
 
     if _get_bwd_config_varlen_lowlevel is None:
         raise RuntimeError("FlashDeBERTa varlen backward config helper is unavailable.")
@@ -528,15 +556,6 @@ def _clear_unpad_metadata_cache() -> None:
     _MASK_METADATA_CACHE.clear()
     _CU_SEQLENS_HOST_CACHE.clear()
     _MID_TENSOR_CACHE.clear()
-
-
-def _clear_forward_aux_cache() -> None:
-    """Compatibility no-op for the removed forward aux side channel.
-
-    This exists primarily for tests.
-    """
-
-    return None
 
 
 def _clear_mid_tensor_cache() -> None:
@@ -715,7 +734,7 @@ def _build_dense_mid_tensors(
     return mid_batch, mid_start, int(batch_size * tiles_per_batch)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_grad_and_delta_prefix_kernel(
     grad_padded_ptr: None,
     out_unpad_ptr: None,
@@ -1257,65 +1276,6 @@ def _get_unpad_metadata_cached(mask_2d: torch.Tensor) -> tuple[torch.Tensor, tor
     return entry.seqlens, entry.cu_seqlens, entry.max_seqlen
 
 
-def _store_forward_aux_cache(
-    *,
-    output_padded: torch.Tensor,
-    seqlens: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    total_tokens: int,
-    q_unpad: torch.Tensor,
-    k_unpad: torch.Tensor,
-    v_unpad: torch.Tensor,
-    out_unpad: torch.Tensor,
-    lse_unpad: torch.Tensor,
-    pos_key_unpad: torch.Tensor | None,
-    pos_query_unpad: torch.Tensor | None,
-) -> None:
-    """Compatibility no-op for the removed forward aux side channel.
-
-    :param torch.Tensor output_padded: Returned padded attention output tensor.
-    :param torch.Tensor seqlens: Per-example active lengths.
-    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
-    :param int max_seqlen: Maximum active length in batch.
-    :param int total_tokens: Total active tokens in batch.
-    :param torch.Tensor q_unpad: Unpadded query tensor.
-    :param torch.Tensor k_unpad: Unpadded key tensor.
-    :param torch.Tensor v_unpad: Unpadded value tensor.
-    :param torch.Tensor out_unpad: Unpadded forward output tensor.
-    :param torch.Tensor lse_unpad: Unpadded forward LSE tensor.
-    :param torch.Tensor | None pos_key_unpad: Optional unpadded c2p tensor.
-    :param torch.Tensor | None pos_query_unpad: Optional unpadded p2c tensor.
-    """
-
-    del (
-        output_padded,
-        seqlens,
-        cu_seqlens,
-        max_seqlen,
-        total_tokens,
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        out_unpad,
-        lse_unpad,
-        pos_key_unpad,
-        pos_query_unpad,
-    )
-    return None
-
-
-def _pop_forward_aux_cache(output_padded: torch.Tensor) -> _ForwardAuxCacheEntry | None:
-    """Compatibility no-op for the removed forward aux side channel.
-
-    :param torch.Tensor output_padded: Padded output tensor returned by the custom op.
-    :return _ForwardAuxCacheEntry | None: Always ``None``.
-    """
-
-    del output_padded
-    return None
-
-
 def _varlen_eager_forward_impl(
     *,
     query_layer: torch.Tensor,
@@ -1329,7 +1289,6 @@ def _varlen_eager_forward_impl(
     max_relative_distance: int,
     causal: bool,
     require_lse: bool,
-    stash_backward_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run padded varlen attention eagerly, returning padded outputs.
 
@@ -1344,7 +1303,6 @@ def _varlen_eager_forward_impl(
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
     :param bool require_lse: Whether the caller also needs padded log-sum-exp values.
-    :param bool stash_backward_cache: Whether to cache unpadded forward tensors for reuse in backward.
     :raises RuntimeError: If no eager varlen implementation is importable.
     :return tuple[torch.Tensor, torch.Tensor | None]: Padded output in ``(B, S, H, D)``
         layout and optional padded LSE in ``(B, S, H)`` layout.
@@ -1424,19 +1382,33 @@ def _varlen_eager_forward_impl(
         )
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
-        override = _varlen_kernel_override_from_env(kind="fwd")
-        if override is not None:
-            block_m, block_n, num_stages, num_warps = override
+        table_config = _varlen_repo_tuned_fwd_config(
+            seq_len=max_seqlen,
+            total_tokens=int(q_unpad.shape[0]),
+            batch_size=int(query_layer.shape[0]),
+            head_dim=int(query_layer.shape[-1]),
+            causal=bool(causal),
+            disentangled=True,
+            att_span=att_span,
+            dtype=query_layer.dtype,
+            device=query_layer.device,
+        )
+        if table_config is not None:
+            block_m, block_n, num_stages, num_warps = table_config
         else:
-            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-                total_tokens=int(q_unpad.shape[0]),
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                D=int(query_layer.shape[-1]),
-                causal=bool(causal),
-                disentangled=True,
-                att_span=att_span,
-            )
+            override = _varlen_kernel_override_from_env(kind="fwd")
+            if override is not None:
+                block_m, block_n, num_stages, num_warps = override
+            else:
+                block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
+                    total_tokens=int(q_unpad.shape[0]),
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    D=int(query_layer.shape[-1]),
+                    causal=bool(causal),
+                    disentangled=True,
+                    att_span=att_span,
+                )
         out_unpad, lse_unpad = _flash_attn_v2_fwd_dise_lowlevel(
             q_unpad,
             k_unpad,
@@ -1497,21 +1469,6 @@ def _varlen_eager_forward_impl(
         batch_size=batch_size,
         seq_len=seq_len,
     ).contiguous()
-    if stash_backward_cache:
-        _store_forward_aux_cache(
-            output_padded=out_padded,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-            q_unpad=q_unpad,
-            k_unpad=k_unpad,
-            v_unpad=v_unpad,
-            out_unpad=out_unpad,
-            lse_unpad=lse_unpad,
-            pos_key_unpad=pos_key_unpad,
-            pos_query_unpad=pos_query_unpad,
-        )
     return out_padded, lse_padded
 
 
@@ -1847,7 +1804,6 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
             max_relative_distance=max_relative_distance,
             causal=causal,
             require_lse=True,
-            stash_backward_cache=False,
         )
 
     @torch.library.register_fake(_forward_op)
@@ -2049,49 +2005,21 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
             next_idx += 1
         pos_query = saved[next_idx] if bool(ctx.has_pos_query) else None
         grad = grad_out if grad_out is not None else torch.zeros_like(out)
-        cached = _pop_forward_aux_cache(out)
-        if cached is not None:
-            dq, dk, dv, dpos_key, dpos_query = _varlen_eager_backward_cached_impl(
-                grad_output=grad,
-                query_layer=q,
-                key_layer=k,
-                value_layer=v,
-                output_padded=out,
-                lse_padded=lse,
-                pos_key=pos_key,
-                pos_query=pos_query,
-                sm_scale=ctx.sm_scale,
-                position_buckets=ctx.position_buckets,
-                max_relative_distance=ctx.max_relative_distance,
-                causal=ctx.causal,
-                seqlens=cached.seqlens,
-                cu_seqlens=cached.cu_seqlens,
-                max_seqlen=cached.max_seqlen,
-                total_tokens=cached.total_tokens,
-                q_unpad=cached.q_unpad,
-                k_unpad=cached.k_unpad,
-                v_unpad=cached.v_unpad,
-                out_unpad=cached.out_unpad,
-                lse_unpad=cached.lse_unpad,
-                pos_key_unpad=cached.pos_key_unpad,
-                pos_query_unpad=cached.pos_query_unpad,
-            )
-        else:
-            dq, dk, dv, dpos_key, dpos_query = _backward_op(
-                grad,
-                q,
-                k,
-                v,
-                mask,
-                out,
-                lse,
-                pos_key,
-                pos_query,
-                ctx.sm_scale,
-                ctx.position_buckets,
-                ctx.max_relative_distance,
-                ctx.causal,
-            )
+        dq, dk, dv, dpos_key, dpos_query = _backward_op(
+            grad,
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            pos_key,
+            pos_query,
+            ctx.sm_scale,
+            ctx.position_buckets,
+            ctx.max_relative_distance,
+            ctx.causal,
+        )
         return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None
 
     torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
@@ -2198,21 +2126,35 @@ def _varlen_triton_forward_impl(
             else None
         )
 
-    override = _varlen_kernel_override_from_env(kind="fwd")
-    if override is not None:
-        block_m, block_n, num_stages, num_warps = override
+    table_config = _varlen_repo_tuned_fwd_config(
+        seq_len=seq_len,
+        total_tokens=capacity_tokens,
+        batch_size=batch_size,
+        head_dim=head_dim,
+        causal=bool(causal),
+        disentangled=True,
+        att_span=att_span,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    if table_config is not None:
+        block_m, block_n, num_stages, num_warps = table_config
     else:
-        if _get_fwd_config_lowlevel is None:
-            raise RuntimeError("FlashDeBERTa varlen forward config helper is unavailable.")
-        block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-            total_tokens=capacity_tokens,
-            max_seqlen_q=seq_len,
-            max_seqlen_k=seq_len,
-            D=head_dim,
-            causal=bool(causal),
-            disentangled=True,
-            att_span=att_span,
-        )
+        override = _varlen_kernel_override_from_env(kind="fwd")
+        if override is not None:
+            block_m, block_n, num_stages, num_warps = override
+        else:
+            if _get_fwd_config_lowlevel is None:
+                raise RuntimeError("FlashDeBERTa varlen forward config helper is unavailable.")
+            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
+                total_tokens=capacity_tokens,
+                max_seqlen_q=seq_len,
+                max_seqlen_k=seq_len,
+                D=head_dim,
+                causal=bool(causal),
+                disentangled=True,
+                att_span=att_span,
+            )
 
     mid_batch, mid_start, tile_count = _build_dense_mid_tensors(
         cu_seqlens=cu_seqlens,

@@ -623,6 +623,36 @@ def _apply_hf_config_normalization(
     cfg.use_rmsnorm_heads = False
 
 
+def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND) -> None:
+    """Reject materialized HF DeBERTa configs that cannot use flash attention.
+
+    :param Any cfg: Materialized DeBERTa-v2/v3 config.
+    :param str component: Component name for diagnostics.
+    :raises ValueError: If flash attention is enabled for an unsupported config.
+    """
+
+    if str(getattr(cfg, "hf_attention_impl", "eager")).strip().lower() != "flash":
+        return
+    hidden_dropout = float(getattr(cfg, "hidden_dropout_prob", 0.0))
+    attention_dropout = float(getattr(cfg, "attention_probs_dropout_prob", 0.0))
+    if hidden_dropout > 0.0 or attention_dropout > 0.0:
+        raise ValueError(
+            f"{component} flash attention requires dropout disabled; got "
+            f"hidden_dropout_prob={hidden_dropout}, attention_probs_dropout_prob={attention_dropout}."
+        )
+    if not bool(getattr(cfg, "relative_attention", False)):
+        raise ValueError(f"{component} flash attention requires relative_attention=true.")
+    if int(getattr(cfg, "position_buckets", 0)) <= 0:
+        raise ValueError(f"{component} flash attention requires position_buckets > 0.")
+    pos_att_type = getattr(cfg, "pos_att_type", "")
+    if isinstance(pos_att_type, str):
+        pos_parts = {part.strip().lower() for part in pos_att_type.split("|") if part.strip()}
+    else:
+        pos_parts = {str(part).strip().lower() for part in pos_att_type if str(part).strip()}
+    if "p2p" in pos_parts:
+        raise ValueError(f"{component} flash attention does not support pos_att_type containing 'p2p'.")
+
+
 def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Config:
     """Build a repo-owned HF-compatible DeBERTa-v2/v3 architecture config.
 
@@ -827,6 +857,8 @@ def build_backbone_configs(
             required_max_position_embeddings=int(max_position_embeddings),
             component="generator",
         )
+        _validate_hf_flash_attention_config(disc_cfg, component="discriminator")
+        _validate_hf_flash_attention_config(gen_cfg, component="generator")
 
         return disc_cfg, gen_cfg
 

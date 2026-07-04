@@ -1411,6 +1411,21 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError(
             "model.hf.attention_impl='flash' is only supported with model.backbone_type='hf_deberta_v2'."
         )
+    if cfg.hf.attention_impl == "flash":
+        dropout_values = {
+            "model.dropout.hidden_prob": cfg.dropout.hidden_prob,
+            "model.dropout.attention_probs_prob": cfg.dropout.attention_probs_prob,
+        }
+        enabled_dropout = [
+            f"{name}={float(value)}"
+            for name, value in dropout_values.items()
+            if value is not None and float(value) > 0.0
+        ]
+        if enabled_dropout:
+            raise ValueError(
+                "model.hf.attention_impl='flash' requires dropout disabled; invalid values: "
+                + ", ".join(enabled_dropout)
+            )
     if int(cfg.tokenizer.vocab_multiple) <= 0:
         raise ValueError("model.tokenizer.vocab_multiple must be >= 1.")
     if cfg.tokenizer.vocab_target is not None and int(cfg.tokenizer.vocab_target) <= 0:

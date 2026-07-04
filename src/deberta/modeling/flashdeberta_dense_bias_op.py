@@ -19,6 +19,11 @@ from typing import Any
 
 import torch
 
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    FlashKernelContext,
+    resolve_flash_kernel_config,
+)
+
 try:
     import triton
     import triton.language as tl
@@ -137,23 +142,26 @@ def _dense_bias_repo_tuned_config(
         or ``None`` when no measured config is promoted.
     """
 
-    if device.type != "cuda":
-        return None
-    if dtype not in {torch.float16, torch.bfloat16}:
-        return None
-    if int(seq_len) != 1024:
-        return None
-    if int(batch_size) != 4 or int(num_heads) != 12:
+    if device.type != "cuda" or dtype not in {torch.float16, torch.bfloat16}:
         return None
     capability = (
         torch.cuda.get_device_capability(device.index)
         if device.index is not None
         else torch.cuda.get_device_capability()
     )
-    if int(capability[0]) < 12:
-        return None
-    del has_mask
-    return (64, 128, 2, 4)
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=capability,
+            route="dense_bias",
+            kind="fwd",
+            seq_len=int(seq_len),
+            batch_size=int(batch_size),
+            num_heads=int(num_heads),
+            head_dim=0,
+            dtype=str(dtype).removeprefix("torch."),
+            has_mask=bool(has_mask),
+        )
+    )
 
 
 def _dense_bias_kernel_config(
@@ -176,9 +184,6 @@ def _dense_bias_kernel_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    override = _dense_bias_kernel_override_from_env()
-    if override is not None:
-        return override
     tuned = _dense_bias_repo_tuned_config(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -189,6 +194,9 @@ def _dense_bias_kernel_config(
     )
     if tuned is not None:
         return tuned
+    override = _dense_bias_kernel_override_from_env()
+    if override is not None:
+        return override
     return (64, 64, 2, 4)
 
 

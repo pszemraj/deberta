@@ -24,27 +24,8 @@ try:  # pragma: no cover - optional Triton dependency
     _TRITON_IMPORT_ERROR: Exception | None = None
     _TRITON_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - optional Triton dependency
-
-    class _MissingTriton:
-        """Minimal stand-in that lets this module define fallback kernels."""
-
-        @staticmethod
-        def jit(fn: object) -> object:
-            """Return ``fn`` unchanged when Triton is unavailable.
-
-            :param object fn: Function object.
-            :return object: The unchanged function object.
-            """
-
-            return fn
-
-    class _MissingTritonLanguage:
-        """Minimal annotation stand-in for ``tl.constexpr``."""
-
-        constexpr = object
-
-    triton = _MissingTriton()
-    tl = _MissingTritonLanguage()
+    triton = None
+    tl = None
     _TRITON_IMPORT_ERROR = exc
     _TRITON_AVAILABLE = False
 
@@ -85,6 +66,18 @@ def _traceable_triton_kernel(kernel: object) -> object:
         return torch.library.wrap_triton(kernel)
     except Exception:
         return kernel
+
+
+def _optional_triton_jit(fn: object) -> object:
+    """Apply ``triton.jit`` only when Triton imported successfully.
+
+    :param object fn: Kernel function.
+    :return object: JIT kernel or unchanged function in no-Triton environments.
+    """
+
+    if triton is None or tl is None:
+        return fn
+    return triton.jit(fn)
 
 
 def _flatten_rows(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int, int]:
@@ -133,7 +126,7 @@ def _can_use_triton_prefix_pack(
     return True
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_prefix_rows_kernel(
     input_ptr: None,
     output_ptr: None,
@@ -176,7 +169,7 @@ def _pack_prefix_rows_kernel(
     tl.store(dst_ptrs, values, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_prefix_rows_pair_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -227,7 +220,7 @@ def _pack_prefix_rows_pair_kernel(
     tl.store(dst_b_ptrs, values_b, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_prefix_rows_triple_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -286,7 +279,7 @@ def _pack_prefix_rows_triple_kernel(
     tl.store(dst_c_ptrs, values_c, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_prefix_rows_rank4_strided_kernel(
     input_ptr: None,
     output_ptr: None,
@@ -353,7 +346,7 @@ def _pack_prefix_rows_rank4_strided_kernel(
     tl.store(dst_ptrs, values, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_prefix_rows_rank4_strided_pair_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -447,7 +440,7 @@ def _pack_prefix_rows_rank4_strided_pair_kernel(
     tl.store(dst_b_ptrs, values_b, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _pack_prefix_rows_rank4_strided_triple_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -568,7 +561,7 @@ def _pack_prefix_rows_rank4_strided_triple_kernel(
     tl.store(dst_c_ptrs, values_c, mask=mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _unpack_prefix_rows_kernel(
     input_ptr: None,
     output_ptr: None,
@@ -612,7 +605,7 @@ def _unpack_prefix_rows_kernel(
     tl.store(dst_ptrs, values, mask=output_mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _unpack_prefix_rows_pair_kernel(
     input_a_ptr: None,
     input_b_ptr: None,
@@ -664,7 +657,7 @@ def _unpack_prefix_rows_pair_kernel(
     tl.store(dst_b_ptrs, values_b, mask=output_mask)
 
 
-@triton.jit
+@_optional_triton_jit
 def _unpack_prefix_rows_triple_kernel(
     input_a_ptr: None,
     input_b_ptr: None,

@@ -57,6 +57,9 @@ dev = ["ruff>=0.6.0", "black>=24.8.0", "mypy>=1.11.0", "pytest>=8.0.0"]
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+[tool.setuptools.package-data]
+deberta = ["modeling/*.json"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

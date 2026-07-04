@@ -481,6 +481,10 @@ def check_flash_batch_metadata_contract(repo_root: Path) -> CheckResult:
         return _fail(
             name, "Doc-block flash route must include segment offsets, lengths, and cumulative lengths."
         )
+    if prepared.get("flash_doc_num_segments") != 4 or prepared.get("flash_doc_max_seqlen") != 2:
+        return _fail(name, "Doc-block flash route must carry host segment count and max segment length.")
+    if meta.doc_num_segments_host != 4 or meta.doc_max_segment_length_host != 2:
+        return _fail(name, "FlashBatchMeta must retain host segment count and max segment length.")
     if tuple(meta.doc_segment_offsets.shape) != (10,) or tuple(meta.doc_cu_seqlens.shape) != (11,):
         return _fail(name, "Doc-block segment descriptors must use fixed B*S and B*S+1 shapes.")
     reconstructed = doc_ids_from_segments(

@@ -21,6 +21,7 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
 
     flash_pkg = types.ModuleType("flashdeberta")
     flash_pkg.__path__ = []  # type: ignore[attr-defined]
+    flash_pkg.__version__ = "0.0.7"  # type: ignore[attr-defined]
     ops_pkg = types.ModuleType("flashdeberta.ops")
     ops_pkg.__path__ = []  # type: ignore[attr-defined]
     flash_attention_mod = types.ModuleType("flashdeberta.ops.flash_attention")
@@ -172,6 +173,95 @@ def _reload_flash_modules() -> tuple[types.ModuleType, types.ModuleType]:
     return importlib.reload(attention_mod), importlib.reload(patch_mod)
 
 
+def test_flashdeberta_version_guard_accepts_pinned_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+
+    import deberta.modeling.flashdeberta_version as version_mod
+
+    version_mod = importlib.reload(version_mod)
+
+    assert version_mod.flashdeberta_version_error() is None
+    assert version_mod.flashdeberta_runtime_version() == "0.0.7"
+
+
+def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        FlashKernelContext,
+        configure_flashdeberta_kernel_overrides,
+        flash_route_choice,
+        flash_seq_bucket,
+        resolve_flash_kernel_config,
+    )
+
+    configure_flashdeberta_kernel_overrides(None)
+
+    bucket = flash_seq_bucket(seq_len=2048, total_tokens=3000, batch_size=2)
+    assert bucket == "2048_medium"
+    assert flash_route_choice(policy="padding", seq_bucket=bucket) == "varlen"
+    assert flash_route_choice(policy="docblock", seq_bucket=flash_seq_bucket(seq_len=1024)) == "docblock_bias"
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="varlen",
+            kind="bwd_kv",
+            seq_len=2048,
+            total_tokens=3000,
+            batch_size=2,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+            disentangled=True,
+            att_span=256,
+        )
+    ) == (64, 32, 2, 4)
+
+
+def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        FlashKernelContext,
+        configure_flashdeberta_kernel_overrides,
+        resolve_flash_kernel_config,
+    )
+
+    override_path = tmp_path / "flash_tuning.json"
+    override_path.write_text(
+        """
+{
+  "kernels": [
+    {
+      "compute_capability": "sm_120",
+      "route": "varlen",
+      "kind": "bwd_kv",
+      "seq_bucket": "2048_medium",
+      "head_dim": 64,
+      "block_m": 16,
+      "block_n": 32,
+      "num_stages": 1,
+      "num_warps": 2
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        assert resolve_flash_kernel_config(
+            FlashKernelContext(
+                compute_capability=(12, 0),
+                route="varlen",
+                kind="bwd_kv",
+                seq_len=2048,
+                total_tokens=3000,
+                batch_size=2,
+                head_dim=64,
+            )
+        ) == (16, 32, 1, 2)
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def _small_deberta_config():
     """Build a small config for native DeBERTa patch tests."""
 
@@ -189,6 +279,31 @@ def _small_deberta_config():
         relative_attention=True,
         position_buckets=8,
         max_relative_positions=16,
+        pos_att_type=["c2p", "p2c"],
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        position_biased_input=False,
+    )
+
+
+def _docblock_attention_config(*, seq_len: int):
+    """Build a tiny native DeBERTa config for doc-block attention tests."""
+
+    pytest.importorskip("transformers")
+    from deberta.modeling.deberta_v2_native import DebertaV2Config
+
+    return DebertaV2Config(
+        vocab_size=64,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=16,
+        max_position_embeddings=int(seq_len),
+        type_vocab_size=0,
+        relative_attention=True,
+        position_buckets=4,
+        max_relative_positions=8,
         pos_att_type=["c2p", "p2c"],
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
@@ -899,52 +1014,6 @@ def test_varlen_mid_tensor_cache_reuses_registered_cu_seqlens() -> None:
     varlen_mod._clear_unpad_metadata_cache()
 
 
-def test_varlen_forward_aux_cache_side_channel_removed() -> None:
-    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
-
-    varlen_mod._clear_forward_aux_cache()
-
-    output = torch.randn((1, 4, 2, 8), dtype=torch.float32)
-    seqlens = torch.tensor([2, 1], dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
-    q_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
-    k_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
-    v_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
-    out_unpad = torch.randn((3, 2, 8), dtype=torch.float32)
-    lse_unpad = torch.randn((3, 2), dtype=torch.float32)
-    pos_key_unpad = torch.randn((3, 2, 4), dtype=torch.float32)
-    pos_query_unpad = torch.randn((3, 2, 4), dtype=torch.float32)
-
-    varlen_mod._store_forward_aux_cache(
-        output_padded=output,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=2,
-        total_tokens=3,
-        q_unpad=q_unpad,
-        k_unpad=k_unpad,
-        v_unpad=v_unpad,
-        out_unpad=out_unpad,
-        lse_unpad=lse_unpad,
-        pos_key_unpad=pos_key_unpad,
-        pos_query_unpad=pos_query_unpad,
-    )
-
-    assert not hasattr(varlen_mod, "_FORWARD_AUX_CACHE")
-    assert varlen_mod._pop_forward_aux_cache(output) is None
-
-    varlen_mod._clear_forward_aux_cache()
-
-
-def test_docblock_forward_aux_cache_side_channel_removed() -> None:
-    import deberta.modeling.flashdeberta_docblock_op as docblock_mod
-
-    output = torch.randn((1, 4, 2, 8), dtype=torch.float32)
-
-    assert not hasattr(docblock_mod, "_DOCBLOCK_FORWARD_AUX_CACHE")
-    assert docblock_mod._pop_forward_aux_cache(output) is None
-
-
 def test_prefix_pack_round_trips_with_prefix_padding_contract() -> None:
     import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
 
@@ -1232,7 +1301,8 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert fixed_meta is not None
     assert fixed_meta.normalized_route_hint() == "fixed"
     assert torch.equal(prepared_fixed["flash_seq_lengths"], torch.tensor([1024, 768], dtype=torch.int32))
-    assert int(prepared_fixed["flash_active_tokens"].item()) == 1792
+    assert prepared_fixed["flash_active_tokens"] == 1792
+    assert fixed_meta.active_tokens_host == 1792
 
     padded_2048 = {
         "input_ids": torch.zeros((2, 2048), dtype=torch.long),
@@ -1264,7 +1334,8 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert varlen_meta is not None
     assert varlen_meta.normalized_route_hint() == "varlen"
     assert torch.equal(prepared_varlen["flash_seq_lengths"], torch.tensor([1800, 1700], dtype=torch.int32))
-    assert int(prepared_varlen["flash_active_tokens"].item()) == 3500
+    assert prepared_varlen["flash_active_tokens"] == 3500
+    assert varlen_meta.active_tokens_host == 3500
 
 
 def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
@@ -1301,7 +1372,8 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
         ),
     )
     assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([4, 3], dtype=torch.int32))
-    assert int(prepared["flash_active_tokens"].item()) == 7
+    assert prepared["flash_active_tokens"] == 7
+    assert meta.active_tokens_host == 7
     assert tuple(prepared["flash_doc_segment_offsets"].shape) == (10,)
     assert tuple(prepared["flash_doc_segment_lengths"].shape) == (10,)
     assert tuple(prepared["flash_doc_cu_seqlens"].shape) == (11,)
@@ -1339,6 +1411,103 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_pairwise_mas
     assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
 
 
+@pytest.mark.parametrize("seq_len", [2048, 4096])
+def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_large_pairwise_mask(seq_len: int) -> None:
+    import deberta.training.compile as compile_mod
+
+    doc_ids = torch.cat(
+        (
+            torch.ones((1, seq_len // 2), dtype=torch.long),
+            torch.full((1, seq_len - (seq_len // 2)), 2, dtype=torch.long),
+        ),
+        dim=1,
+    )
+    batch = {"input_ids": torch.zeros((1, seq_len), dtype=torch.long), "doc_ids": doc_ids}
+
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=False,
+    )
+
+    assert meta is None
+    assert "flash_seq_lengths" not in prepared
+    assert tuple(prepared["attention_mask"].shape) == (1, seq_len, seq_len)
+    assert prepared["attention_mask"].ndim == 3
+    assert not bool(prepared["attention_mask"][0, 0, seq_len // 2])
+    assert not bool(prepared["attention_mask"][0, seq_len // 2, 0])
+
+
+def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+    from deberta.modeling.mask_utils import build_doc_block_mask
+
+    seq_len = 2048
+    cfg = _docblock_attention_config(seq_len=seq_len)
+    attention = DisentangledSelfAttention(cfg).eval()
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    doc_ids = torch.cat(
+        (
+            torch.ones((1, seq_len // 2), dtype=torch.long),
+            torch.full((1, seq_len // 2), 2, dtype=torch.long),
+        ),
+        dim=1,
+    )
+    pairwise_mask = build_doc_block_mask(doc_ids).unsqueeze(1)
+
+    _, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=pairwise_mask,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+    )
+
+    assert probs is not None
+    assert float(probs[0, 0, 0, seq_len // 2 :].detach().abs().max()) == pytest.approx(0.0)
+    assert float(probs[0, 0, seq_len // 2, : seq_len // 2].detach().abs().max()) == pytest.approx(0.0)
+
+
+def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    from deberta.modeling.mask_utils import build_doc_segment_metadata
+
+    seq_len = 2048
+    cfg = _docblock_attention_config(seq_len=seq_len)
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    doc_ids = torch.cat(
+        (
+            torch.ones((1, seq_len // 2), dtype=torch.long),
+            torch.full((1, seq_len // 2), 2, dtype=torch.long),
+        ),
+        dim=1,
+    )
+    segment_offsets, segment_lengths, cu_seqlens, _ = build_doc_segment_metadata(doc_ids)
+
+    _, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=doc_ids.ne(0),
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+        flash_route_hint="docblock",
+        flash_doc_segment_offsets=segment_offsets,
+        flash_doc_segment_lengths=segment_lengths,
+        flash_doc_cu_seqlens=cu_seqlens,
+        flash_active_tokens=seq_len,
+        flash_doc_num_segments=2,
+        flash_doc_max_seqlen=seq_len // 2,
+    )
+
+    assert probs is not None
+    assert float(probs[0, 0, 0, seq_len // 2 :].detach().abs().max()) == pytest.approx(0.0)
+    assert float(probs[0, 0, seq_len // 2, : seq_len // 2].detach().abs().max()) == pytest.approx(0.0)
+
+
 def test_prepare_flash_attention_batch_metadata_routes_docblock_bias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1371,26 +1540,35 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock_bias(
     assert tuple(prepared["attention_mask"].shape) == (2, 5, 5)
     assert prepared["attention_mask"].dtype == torch.bool
     assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([4, 3], dtype=torch.int32))
-    assert int(prepared["flash_active_tokens"].item()) == 7
+    assert prepared["flash_active_tokens"] == 7
+    assert meta.active_tokens_host == 7
 
 
-def test_partition_docblock_rows_splits_single_and_multi_rows() -> None:
-    import deberta.modeling.flashdeberta_docblock_op as docblock_mod
+def test_prepare_flash_attention_batch_metadata_docblock_host_stats() -> None:
+    import deberta.training.compile as compile_mod
 
-    partition = docblock_mod._partition_docblock_rows(
-        segment_offsets=torch.tensor([0, 5, 7], dtype=torch.int32),
-        segment_lengths=torch.tensor([5, 2, 3], dtype=torch.int32),
-        seq_len=5,
+    batch = {
+        "input_ids": torch.zeros((2, 5), dtype=torch.long),
+        "doc_ids": torch.tensor(
+            [
+                [1, 1, 2, 2, 0],
+                [1, 2, 2, 0, 0],
+            ],
+            dtype=torch.long,
+        ),
+    }
+
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
     )
 
-    assert torch.equal(partition.single_rows, torch.tensor([0], dtype=torch.long))
-    assert torch.equal(partition.single_seq_lengths, torch.tensor([5], dtype=torch.int32))
-    assert torch.equal(partition.multi_rows, torch.tensor([1], dtype=torch.long))
-    assert torch.equal(partition.multi_segment_offsets, torch.tensor([0, 2], dtype=torch.int32))
-    assert torch.equal(partition.multi_segment_lengths, torch.tensor([2, 3], dtype=torch.int32))
-    assert torch.equal(partition.multi_cu_seqlens, torch.tensor([0, 2, 5], dtype=torch.int32))
-    assert partition.multi_total_tokens == 5
-    assert partition.multi_max_seqlen == 3
+    assert prepared["flash_doc_num_segments"] == 4
+    assert prepared["flash_doc_max_seqlen"] == 2
+    assert meta is not None
+    assert meta.doc_num_segments_host == 4
+    assert meta.doc_max_segment_length_host == 2
 
 
 def test_prepare_flash_attention_batch_metadata_respects_force_varlen(
@@ -1418,7 +1596,8 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen(
     assert meta is not None
     assert meta.normalized_route_hint() == "varlen"
     assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([2, 3], dtype=torch.int32))
-    assert int(prepared["flash_active_tokens"].item()) == 5
+    assert prepared["flash_active_tokens"] == 5
+    assert meta.active_tokens_host == 5
 
 
 def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1448,6 +1627,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
+        num_segments: int,
+        max_seqlen: int,
+        total_tokens: int,
         causal: bool,
     ) -> torch.Tensor:
         del (
@@ -1463,6 +1645,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
         seen["segment_offsets"] = segment_offsets
         seen["segment_lengths"] = segment_lengths
         seen["cu_seqlens"] = cu_seqlens
+        seen["num_segments"] = torch.tensor(num_segments)
+        seen["max_seqlen"] = torch.tensor(max_seqlen)
+        seen["total_tokens"] = torch.tensor(total_tokens)
         return torch.zeros_like(query_layer)
 
     monkeypatch.setattr(attention_mod, "flashdeberta_docblock", _fake_docblock_wrapper)
@@ -1481,6 +1666,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
         flash_doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32),
         flash_doc_segment_lengths=torch.tensor([2, 1], dtype=torch.int32),
         flash_doc_cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+        flash_active_tokens=3,
+        flash_doc_num_segments=2,
+        flash_doc_max_seqlen=2,
     )
 
     assert probs is None
@@ -1488,6 +1676,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
     assert torch.equal(seen["segment_offsets"], torch.tensor([0, 2], dtype=torch.int32))
     assert torch.equal(seen["segment_lengths"], torch.tensor([2, 1], dtype=torch.int32))
     assert torch.equal(seen["cu_seqlens"], torch.tensor([0, 2, 3], dtype=torch.int32))
+    assert seen["num_segments"].item() == 2
+    assert seen["max_seqlen"].item() == 2
+    assert seen["total_tokens"].item() == 3
 
     stats = attention_mod.flashdeberta_stats_snapshot()
     assert stats["forward_calls"] == 1

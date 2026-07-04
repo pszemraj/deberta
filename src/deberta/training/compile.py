@@ -3,22 +3,30 @@
 from __future__ import annotations
 
 import logging
-import os
 import types
 from typing import Any
 
 import torch
 
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    configure_flashdeberta_kernel_overrides,
+    flash_route_choice,
+    flash_seq_bucket,
+)
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
+    _flash_cfg_bool,
+    _flash_cfg_get,
+    _flash_cfg_int,
+    _flash_is_pairwise_mask,
+    _flash_mask_to_2d_keep_mask,
     build_doc_block_mask,
     build_doc_segment_metadata,
-    normalize_keep_mask,
+    doc_segment_metadata_host_stats,
 )
 
 logger = logging.getLogger(__name__)
-_FLASH_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
 def _maybe_enable_tf32(enabled: bool) -> None:
@@ -119,128 +127,6 @@ def _resolve_compile_enabled_or_raise(requested: bool) -> bool:
     return True
 
 
-def _flash_truthy_env(name: str, default: str = "0") -> bool:
-    """Return whether an env var is set to a truthy value.
-
-    :param str name: Environment variable name.
-    :param str default: Default text when unset.
-    :return bool: Parsed truthy value.
-    """
-
-    return os.environ.get(name, default).strip().lower() in _FLASH_TRUTHY
-
-
-def _flash_int_env(name: str, default: int) -> int:
-    """Parse an integer env var with fallback.
-
-    :param str name: Environment variable name.
-    :param int default: Default integer.
-    :return int: Parsed value or default.
-    """
-
-    raw = os.environ.get(name)
-    if raw is None:
-        return int(default)
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        return int(default)
-
-
-def _flash_cfg_get(flash_cfg: Any | None, name: str, default: Any) -> Any:
-    """Return one flash config value from a mapping/dataclass/object.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Field name.
-    :param Any default: Default value.
-    :return Any: Resolved value.
-    """
-
-    if flash_cfg is None:
-        return default
-    if isinstance(flash_cfg, dict):
-        return flash_cfg.get(name, default)
-    return getattr(flash_cfg, name, default)
-
-
-def _flash_cfg_bool(
-    flash_cfg: Any | None,
-    *,
-    name: str,
-    env_name: str,
-    default: str,
-) -> bool:
-    """Resolve one boolean flash option from config or environment.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Config field name.
-    :param str env_name: Environment fallback name.
-    :param str default: Environment fallback default.
-    :return bool: Resolved boolean value.
-    """
-
-    if flash_cfg is None:
-        return _flash_truthy_env(env_name, default=default)
-    return bool(_flash_cfg_get(flash_cfg, name, False))
-
-
-def _flash_cfg_int(
-    flash_cfg: Any | None,
-    *,
-    name: str,
-    env_name: str,
-    default: int,
-) -> int:
-    """Resolve one integer flash option from config or environment.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Config field name.
-    :param str env_name: Environment fallback name.
-    :param int default: Environment fallback default.
-    :return int: Resolved integer value.
-    """
-
-    if flash_cfg is None:
-        return _flash_int_env(env_name, int(default))
-    try:
-        return int(_flash_cfg_get(flash_cfg, name, default))
-    except Exception:
-        return int(default)
-
-
-def _flash_mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
-    """Extract a canonical ``(B,S)`` keep mask from rank-2/4 padding masks.
-
-    :param torch.Tensor attention_mask: Padding-style keep mask.
-    :param int seq_len: Expected sequence length.
-    :raises ValueError: If the mask is not 2D or broadcast 4D.
-    :return torch.Tensor: Boolean keep mask in ``(B,S)`` layout.
-    """
-
-    mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 2:
-        return mask[:, :seq_len]
-    if mask.ndim == 4 and int(mask.shape[-2]) == 1:
-        return mask[:, 0, 0, :seq_len]
-    raise ValueError(f"Unsupported padding-mask shape for flash metadata: {tuple(mask.shape)}")
-
-
-def _flash_is_pairwise_mask(attention_mask: torch.Tensor, *, seq_len: int) -> bool:
-    """Return whether a mask carries per-query pairwise structure.
-
-    :param torch.Tensor attention_mask: Candidate mask tensor.
-    :param int seq_len: Expected query/key length.
-    :return bool: True for ``(B,S,S)`` or ``(B,1,S,S)`` style masks.
-    """
-
-    mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 3:
-        return tuple(mask.shape[-2:]) == (int(seq_len), int(seq_len))
-    if mask.ndim == 4:
-        return tuple(mask.shape[-2:]) == (int(seq_len), int(seq_len))
-    return False
-
-
 def _flash_density_bucket(*, seq_len: int, active_tokens: int, batch_size: int) -> str:
     """Return the repo-local density bucket for one padded batch.
 
@@ -250,13 +136,11 @@ def _flash_density_bucket(*, seq_len: int, active_tokens: int, batch_size: int) 
     :return str: Density bucket label.
     """
 
-    capacity = max(1, int(seq_len) * max(1, int(batch_size)))
-    density = float(active_tokens) / float(capacity)
-    if int(seq_len) >= 4096:
-        return "4096_plus"
-    if int(seq_len) >= 2048:
-        return "2048_medium" if density >= 0.60 else "2048_sparse"
-    return "1024_dense_or_medium"
+    return flash_seq_bucket(
+        seq_len=int(seq_len),
+        total_tokens=int(active_tokens),
+        batch_size=int(batch_size),
+    )
 
 
 def _flash_route_hint_for_padding_batch(
@@ -287,12 +171,9 @@ def _flash_route_hint_for_padding_batch(
         active_tokens=int(active_tokens),
         batch_size=int(batch_size),
     )
-    route_by_bucket = {
-        "1024_dense_or_medium": "fixed",
-        "2048_medium": "varlen",
-        "2048_sparse": "varlen",
-        "4096_plus": "varlen",
-    }
+    table_route = flash_route_choice(policy="padding", seq_bucket=density_bucket)
+    if table_route in {"fixed", "varlen"}:
+        return table_route
     default_varlen_min_seq_len = max(
         1,
         _flash_cfg_int(
@@ -302,8 +183,7 @@ def _flash_route_hint_for_padding_batch(
             default=2048,
         ),
     )
-    default_route = "varlen" if int(seq_len) >= int(default_varlen_min_seq_len) else "fixed"
-    return route_by_bucket.get(density_bucket, default_route)
+    return "varlen" if int(seq_len) >= int(default_varlen_min_seq_len) else "fixed"
 
 
 def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
@@ -319,6 +199,11 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None 
     :return str: Either ``docblock_bias`` or ``docblock``.
     """
 
+    seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
+    table_route = flash_route_choice(policy="docblock", seq_bucket=seq_bucket)
+    if table_route in {"docblock", "docblock_bias"}:
+        return table_route
+
     bias_seq_len = max(
         0,
         _flash_cfg_int(
@@ -333,6 +218,18 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None 
     return "docblock"
 
 
+def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
+    """Apply config-driven FlashDeBERTa kernel override tables for route helpers.
+
+    :param Any | None flash_cfg: Optional flash config object or mapping.
+    """
+
+    if flash_cfg is None:
+        return
+    value = _flash_cfg_get(flash_cfg, "kernel_overrides_path", None)
+    configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
+
+
 def _build_doc_segment_metadata(
     doc_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -343,6 +240,71 @@ def _build_doc_segment_metadata(
     """
 
     return build_doc_segment_metadata(doc_ids)
+
+
+def _flash_active_tokens_host(value: Any) -> int | None:
+    """Return a host active-token count when one is already available.
+
+    :param Any value: Candidate scalar from the batch.
+    :return int | None: Host integer or ``None``.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool | int):
+        return int(value)
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, torch.Tensor) and value.ndim == 0 and value.device.type == "cpu":
+        return int(value)
+    return None
+
+
+def _flash_active_tokens_from_seq_lengths(seq_lengths: torch.Tensor) -> int | None:
+    """Return active tokens from CPU sequence lengths without touching GPU state.
+
+    :param torch.Tensor seq_lengths: Per-example active lengths.
+    :return int | None: Host integer for CPU tensors, otherwise ``None``.
+    """
+
+    if seq_lengths.device.type != "cpu":
+        return None
+    return int(seq_lengths.sum(dtype=torch.int32))
+
+
+def _flash_existing_seq_lengths(batch: dict[str, Any]) -> torch.Tensor | None:
+    """Return precomputed flash sequence lengths when present.
+
+    :param dict[str, Any] batch: Batch mapping.
+    :return torch.Tensor | None: Precomputed ``(B,)`` int32 sequence lengths.
+    """
+
+    value = batch.get("flash_seq_lengths")
+    return value if isinstance(value, torch.Tensor) and value.ndim == 1 else None
+
+
+def _flash_doc_segment_host_stats(batch: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Return precomputed host doc-segment stats from the batch.
+
+    :param dict[str, Any] batch: Batch mapping.
+    :return tuple[int | None, int | None]: Segment count and max segment length.
+    """
+
+    num_segments = batch.get("flash_doc_num_segments")
+    max_seqlen = batch.get("flash_doc_max_seqlen")
+    if isinstance(num_segments, bool | int) and isinstance(max_seqlen, bool | int):
+        return int(num_segments), int(max_seqlen)
+    return None, None
+
+
+def _pop_flash_doc_segment_host_stats(batch: dict[str, Any]) -> None:
+    """Remove doc-segment host stats from a batch.
+
+    :param dict[str, Any] batch: Batch mapping.
+    """
+
+    batch.pop("flash_doc_num_segments", None)
+    batch.pop("flash_doc_max_seqlen", None)
 
 
 def prepare_flash_attention_batch_metadata(
@@ -361,10 +323,13 @@ def prepare_flash_attention_batch_metadata(
     :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
     """
 
+    _configure_flash_kernel_overrides_from_cfg(flash_cfg)
+
     btype = str(backbone_type).strip().lower()
     if btype != "hf_deberta_v2":
         batch.pop("flash_seq_lengths", None)
         batch.pop("flash_active_tokens", None)
+        _pop_flash_doc_segment_host_stats(batch)
         return batch, None
 
     input_ids = batch.get("input_ids")
@@ -374,6 +339,7 @@ def prepare_flash_attention_batch_metadata(
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
+        _pop_flash_doc_segment_host_stats(batch)
         return batch, None
 
     doc_ids = batch.pop("doc_ids", None)
@@ -383,12 +349,15 @@ def prepare_flash_attention_batch_metadata(
             flash_cfg=flash_cfg,
         )
         keep_mask = doc_ids.ne(0)
-        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
-        active_tokens = int(seq_lengths.sum(dtype=torch.int32).item())
+        seq_lengths = _flash_existing_seq_lengths(batch)
+        if seq_lengths is None:
+            seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
+        if active_tokens is None:
+            active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
         batch["flash_seq_lengths"] = seq_lengths
-        batch["flash_active_tokens"] = torch.tensor(
-            int(active_tokens), device=seq_lengths.device, dtype=torch.int32
-        )
+        if active_tokens is not None:
+            batch["flash_active_tokens"] = int(active_tokens)
         if (not bool(flash_enabled)) or route_hint == "docblock_bias":
             batch["attention_mask"] = _build_doc_block_mask(doc_ids)
             if not bool(flash_enabled):
@@ -397,6 +366,7 @@ def prepare_flash_attention_batch_metadata(
             batch.pop("flash_doc_segment_offsets", None)
             batch.pop("flash_doc_segment_lengths", None)
             batch.pop("flash_doc_cu_seqlens", None)
+            _pop_flash_doc_segment_host_stats(batch)
             meta = FlashBatchMeta(
                 seq_lengths=seq_lengths if bool(flash_enabled) else None,
                 active_tokens_host=active_tokens,
@@ -404,16 +374,44 @@ def prepare_flash_attention_batch_metadata(
             )
             return batch, meta if bool(flash_enabled) else None
         batch["attention_mask"] = keep_mask
-        segment_offsets, segment_lengths, cu_seqlens, _ = _build_doc_segment_metadata(doc_ids)
+        segment_offsets = batch.get("flash_doc_segment_offsets")
+        segment_lengths = batch.get("flash_doc_segment_lengths")
+        cu_seqlens = batch.get("flash_doc_cu_seqlens")
+        if not (
+            isinstance(segment_offsets, torch.Tensor)
+            and isinstance(segment_lengths, torch.Tensor)
+            and isinstance(cu_seqlens, torch.Tensor)
+        ):
+            if doc_ids.device.type != "cpu":
+                raise RuntimeError(
+                    "Flash doc-block metadata is missing for a device batch. "
+                    "Build flash_doc_segment_* metadata in the collator before device transfer."
+                )
+            segment_offsets, segment_lengths, cu_seqlens, _ = _build_doc_segment_metadata(doc_ids)
+        doc_num_segments, doc_max_seqlen = _flash_doc_segment_host_stats(batch)
+        if doc_num_segments is None or doc_max_seqlen is None:
+            doc_num_segments, doc_max_seqlen, _ = doc_segment_metadata_host_stats(
+                segment_lengths,
+                active_tokens=active_tokens,
+            )
+        if doc_num_segments is None or doc_max_seqlen is None:
+            raise RuntimeError(
+                "Flash doc-block host stats are missing for a device batch. "
+                "Build flash_doc_num_segments and flash_doc_max_seqlen in the collator before device transfer."
+            )
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
+        batch["flash_doc_num_segments"] = int(doc_num_segments)
+        batch["flash_doc_max_seqlen"] = int(doc_max_seqlen)
         return batch, FlashBatchMeta(
             seq_lengths=seq_lengths,
             doc_segment_offsets=segment_offsets,
             doc_segment_lengths=segment_lengths,
             doc_cu_seqlens=cu_seqlens,
             active_tokens_host=active_tokens,
+            doc_num_segments_host=doc_num_segments,
+            doc_max_segment_length_host=doc_max_seqlen,
             route_hint=route_hint,
         )
 
@@ -425,6 +423,7 @@ def prepare_flash_attention_batch_metadata(
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
+        _pop_flash_doc_segment_host_stats(batch)
         return batch, FlashBatchMeta(route_hint="dense") if bool(flash_enabled) else None
     if _flash_is_pairwise_mask(attention_mask, seq_len=int(seq_len)):
         batch.pop("flash_seq_lengths", None)
@@ -432,6 +431,7 @@ def prepare_flash_attention_batch_metadata(
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
+        _pop_flash_doc_segment_host_stats(batch)
         return batch, None
 
     if not isinstance(attention_mask, torch.Tensor):
@@ -440,6 +440,7 @@ def prepare_flash_attention_batch_metadata(
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
+        _pop_flash_doc_segment_host_stats(batch)
         return batch, None
 
     if not bool(flash_enabled):
@@ -448,22 +449,34 @@ def prepare_flash_attention_batch_metadata(
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
+        _pop_flash_doc_segment_host_stats(batch)
         return batch, None
 
     keep_mask = _flash_mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-    seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
-    active_tokens = int(seq_lengths.sum(dtype=torch.int32).item())
+    seq_lengths = _flash_existing_seq_lengths(batch)
+    if seq_lengths is None:
+        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+    active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
+    if active_tokens is None:
+        active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
+    route_active_tokens = (
+        int(active_tokens) if active_tokens is not None else int(seq_len) * int(input_ids.shape[0])
+    )
     route_hint = _flash_route_hint_for_padding_batch(
         seq_len=seq_len,
-        active_tokens=active_tokens,
+        active_tokens=route_active_tokens,
         batch_size=int(input_ids.shape[0]),
         flash_cfg=flash_cfg,
     )
     batch["flash_seq_lengths"] = seq_lengths
-    batch["flash_active_tokens"] = torch.tensor(active_tokens, device=seq_lengths.device, dtype=torch.int32)
+    if active_tokens is not None:
+        batch["flash_active_tokens"] = int(active_tokens)
+    else:
+        batch.pop("flash_active_tokens", None)
     batch.pop("flash_doc_segment_offsets", None)
     batch.pop("flash_doc_segment_lengths", None)
     batch.pop("flash_doc_cu_seqlens", None)
+    _pop_flash_doc_segment_host_stats(batch)
     return batch, FlashBatchMeta(
         seq_lengths=seq_lengths,
         active_tokens_host=active_tokens,
@@ -735,21 +748,27 @@ def _install_stable_backbone_compile_dispatch(
             flash_doc_segment_offsets: torch.Tensor | None = None,
             flash_doc_segment_lengths: torch.Tensor | None = None,
             flash_doc_cu_seqlens: torch.Tensor | None = None,
+            flash_active_tokens: int | None = None,
+            flash_doc_num_segments: int | None = None,
+            flash_doc_max_seqlen: int | None = None,
             flash_route_hint: str | None = None,
         ) -> Any:
             """Call the generic masked helper with fixed ``hidden_states=False``.
 
-            :param torch.Tensor | None input_ids: Optional input token ids.
-            :param torch.Tensor attention_mask: Attention mask tensor.
-            :param torch.Tensor | None token_type_ids: Optional token type ids.
-            :param torch.Tensor | None position_ids: Optional position ids.
-            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-            :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-            :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-            :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-            :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-            :param str | None flash_route_hint: Optional flash routing hint.
-            :return Any: Masked-path backbone outputs.
+                :param torch.Tensor | None input_ids: Optional input token ids.
+                :param torch.Tensor attention_mask: Attention mask tensor.
+                :param torch.Tensor | None token_type_ids: Optional token type ids.
+                :param torch.Tensor | None position_ids: Optional position ids.
+                :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+                :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
+                :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
+                :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
+                :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
+            :param int | None flash_active_tokens: Optional host-side active token count.
+            :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+            :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+                :param str | None flash_route_hint: Optional flash routing hint.
+                :return Any: Masked-path backbone outputs.
             """
 
             return masked_forward(
@@ -765,6 +784,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
                 flash_route_hint=flash_route_hint,
             )
 
@@ -779,21 +801,27 @@ def _install_stable_backbone_compile_dispatch(
             flash_doc_segment_offsets: torch.Tensor | None = None,
             flash_doc_segment_lengths: torch.Tensor | None = None,
             flash_doc_cu_seqlens: torch.Tensor | None = None,
+            flash_active_tokens: int | None = None,
+            flash_doc_num_segments: int | None = None,
+            flash_doc_max_seqlen: int | None = None,
             flash_route_hint: str | None = None,
         ) -> Any:
             """Call the generic masked helper with fixed ``hidden_states=True``.
 
-            :param torch.Tensor | None input_ids: Optional input token ids.
-            :param torch.Tensor attention_mask: Attention mask tensor.
-            :param torch.Tensor | None token_type_ids: Optional token type ids.
-            :param torch.Tensor | None position_ids: Optional position ids.
-            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-            :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-            :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-            :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-            :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-            :param str | None flash_route_hint: Optional flash routing hint.
-            :return Any: Masked-path backbone outputs.
+                :param torch.Tensor | None input_ids: Optional input token ids.
+                :param torch.Tensor attention_mask: Attention mask tensor.
+                :param torch.Tensor | None token_type_ids: Optional token type ids.
+                :param torch.Tensor | None position_ids: Optional position ids.
+                :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+                :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
+                :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
+                :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
+                :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
+            :param int | None flash_active_tokens: Optional host-side active token count.
+            :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+            :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+                :param str | None flash_route_hint: Optional flash routing hint.
+                :return Any: Masked-path backbone outputs.
             """
 
             return masked_forward(
@@ -809,6 +837,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
                 flash_route_hint=flash_route_hint,
             )
 
@@ -828,6 +859,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with fixed-flash routing.
 
@@ -840,6 +874,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the fixed route.
         :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the fixed route.
         :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the fixed route.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
         del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
@@ -865,6 +902,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with fixed-flash routing and hidden states.
 
@@ -877,6 +917,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the fixed route.
         :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the fixed route.
         :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the fixed route.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
         del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
@@ -902,6 +945,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with varlen-flash routing.
 
@@ -914,6 +960,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the varlen route.
         :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the varlen route.
         :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the varlen route.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
         del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
@@ -939,6 +988,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with varlen-flash routing and hidden states.
 
@@ -951,6 +1003,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the varlen route.
         :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the varlen route.
         :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the varlen route.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
         del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
@@ -976,6 +1031,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with doc-block flash routing.
 
@@ -988,6 +1046,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
         :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
         :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
 
@@ -1001,6 +1062,9 @@ def _install_stable_backbone_compile_dispatch(
             flash_doc_segment_offsets=flash_doc_segment_offsets,
             flash_doc_segment_lengths=flash_doc_segment_lengths,
             flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+            flash_active_tokens=flash_active_tokens,
+            flash_doc_num_segments=flash_doc_num_segments,
+            flash_doc_max_seqlen=flash_doc_max_seqlen,
             flash_route_hint="docblock",
         )
 
@@ -1015,6 +1079,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with doc-block flash routing and hidden states.
 
@@ -1027,6 +1094,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
         :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
         :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
 
@@ -1040,6 +1110,9 @@ def _install_stable_backbone_compile_dispatch(
             flash_doc_segment_offsets=flash_doc_segment_offsets,
             flash_doc_segment_lengths=flash_doc_segment_lengths,
             flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+            flash_active_tokens=flash_active_tokens,
+            flash_doc_num_segments=flash_doc_num_segments,
+            flash_doc_max_seqlen=flash_doc_max_seqlen,
             flash_route_hint="docblock",
         )
 
@@ -1054,6 +1127,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with dense doc-block bias flash routing.
 
@@ -1066,6 +1142,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block segment metadata.
         :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block segment metadata.
         :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block segment metadata.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
         del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
@@ -1091,6 +1170,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
     ) -> Any:
         """Call the masked helper with dense doc-block bias flash routing and hidden states.
 
@@ -1103,6 +1185,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block segment metadata.
         :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block segment metadata.
         :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block segment metadata.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :return Any: Masked-path backbone outputs.
         """
         del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
@@ -1156,6 +1241,9 @@ def _install_stable_backbone_compile_dispatch(
         flash_doc_segment_offsets: torch.Tensor | None = None,
         flash_doc_segment_lengths: torch.Tensor | None = None,
         flash_doc_cu_seqlens: torch.Tensor | None = None,
+        flash_active_tokens: int | None = None,
+        flash_doc_num_segments: int | None = None,
+        flash_doc_max_seqlen: int | None = None,
         flash_route_hint: str | None = None,
     ) -> Any:
         """Normalize public options, then dispatch into stable compiled entrypoints.
@@ -1173,6 +1261,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
         :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
         :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
+        :param int | None flash_active_tokens: Optional host-side active token count.
+        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
+        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
         :param str | None flash_route_hint: Optional flash routing hint selected outside compiled code.
         :return Any: Module outputs from either a compiled fast path or the generic resolved path.
         """
@@ -1204,6 +1295,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
                 flash_route_hint=flash_route_hint,
             )
         if attention_mask is None:
@@ -1230,6 +1324,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
             )
         if normalized_flash_route == "varlen":
             return compiled_masked_varlen[resolved_output_hidden_states](
@@ -1242,6 +1339,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
             )
         if normalized_flash_route == "docblock":
             return compiled_masked_docblock[resolved_output_hidden_states](
@@ -1254,6 +1354,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
             )
         if normalized_flash_route == "docblock_bias":
             return compiled_masked_docblock_bias[resolved_output_hidden_states](
@@ -1266,6 +1369,9 @@ def _install_stable_backbone_compile_dispatch(
                 flash_doc_segment_offsets=flash_doc_segment_offsets,
                 flash_doc_segment_lengths=flash_doc_segment_lengths,
                 flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+                flash_active_tokens=flash_active_tokens,
+                flash_doc_num_segments=flash_doc_num_segments,
+                flash_doc_max_seqlen=flash_doc_max_seqlen,
             )
         return compiled_masked[resolved_output_hidden_states](
             input_ids=input_ids,
@@ -1277,6 +1383,9 @@ def _install_stable_backbone_compile_dispatch(
             flash_doc_segment_offsets=flash_doc_segment_offsets,
             flash_doc_segment_lengths=flash_doc_segment_lengths,
             flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+            flash_active_tokens=flash_active_tokens,
+            flash_doc_num_segments=flash_doc_num_segments,
+            flash_doc_max_seqlen=flash_doc_max_seqlen,
             flash_route_hint=normalized_flash_route,
         )
 

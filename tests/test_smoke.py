@@ -271,6 +271,11 @@ def test_collator_emits_document_ids_when_packed():
     assert doc_ids[0, 3].item() == doc_ids[0, 5].item()
     # Cross-document ids differ.
     assert doc_ids[0, 1].item() != doc_ids[0, 3].item()
+    assert torch.equal(batch["flash_seq_lengths"], torch.tensor([6], dtype=torch.int32))
+    assert batch["flash_active_tokens"] == 6
+    assert torch.equal(batch["flash_doc_segment_offsets"][:2], torch.tensor([0, 3], dtype=torch.int32))
+    assert torch.equal(batch["flash_doc_segment_lengths"][:2], torch.tensor([3, 3], dtype=torch.int32))
+    assert torch.equal(batch["flash_doc_cu_seqlens"][:3], torch.tensor([0, 3, 6], dtype=torch.int32))
 
 
 def test_collator_treats_consecutive_internal_separators_as_single_boundary():
@@ -643,6 +648,8 @@ def test_collator_handles_mixed_attention_mask_keys():
         assert "attention_mask" in batch
         assert batch["attention_mask"].shape == batch["input_ids"].shape
         assert (batch["attention_mask"] == 0).any()
+        assert torch.equal(batch["flash_seq_lengths"].sort().values, torch.tensor([3, 4], dtype=torch.int32))
+        assert batch["flash_active_tokens"] == 7
 
 
 def test_collator_infers_special_tokens_mask_when_missing():
@@ -1091,6 +1098,77 @@ def test_rope_pretrainer_ignores_flash_metadata_boundary():
     assert torch.isfinite(out.loss)
 
 
+def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_backbone():
+    """RTD should not pass flash metadata to backbones that do not declare it."""
+
+    from types import SimpleNamespace
+
+    from deberta.modeling.mask_utils import FlashBatchMeta
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    class _Embeddings(torch.nn.Module):
+        def __init__(self, vocab_size: int, hidden_size: int) -> None:
+            super().__init__()
+            self.word_embeddings = torch.nn.Embedding(vocab_size, hidden_size)
+
+    class _BaseSignatureBackbone(torch.nn.Module):
+        def __init__(self, cfg: SimpleNamespace) -> None:
+            super().__init__()
+            self.embeddings = _Embeddings(cfg.vocab_size, cfg.hidden_size)
+            self.proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size)
+
+        def forward(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            return_dict: bool = True,
+            output_hidden_states: bool = False,
+        ) -> SimpleNamespace:
+            del attention_mask, token_type_ids, return_dict
+            hidden = self.proj(self.embeddings.word_embeddings(input_ids))
+            hidden_states = (hidden,) if output_hidden_states else None
+            return SimpleNamespace(last_hidden_state=hidden, hidden_states=hidden_states)
+
+    cfg = SimpleNamespace(
+        vocab_size=32,
+        hidden_size=16,
+        embedding_size=16,
+        hidden_act="gelu",
+        layer_norm_eps=1e-6,
+        use_rmsnorm_heads=False,
+        position_biased_input=True,
+        pad_token_id=0,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=_BaseSignatureBackbone(cfg),
+        generator_backbone=_BaseSignatureBackbone(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+        use_enhanced_mask_decoder=False,
+    )
+    assert model._generator_accepts_flash_kwargs is False
+
+    input_ids = torch.randint(low=1, high=32, size=(2, 6), dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[:, 2] = input_ids[:, 2]
+    out = model.forward_generator_phase(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=torch.ones_like(input_ids),
+        flash_meta=FlashBatchMeta(
+            seq_lengths=torch.tensor([6, 6], dtype=torch.int32),
+            active_tokens_host=12,
+            route_hint="fixed",
+        ),
+    )
+
+    assert out.has_masked_targets is True
+    assert torch.isfinite(out.gen_loss_raw)
+
+
 def test_pretrainer_sampler_avoids_configured_special_ids():
     import pytest
 
@@ -1369,7 +1447,7 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.seen: dict[str, torch.Tensor | str | None] = {}
+            self.seen: dict[str, torch.Tensor | int | str | None] = {}
 
         def forward(
             self,
@@ -1384,6 +1462,9 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
             flash_doc_segment_offsets: torch.Tensor | None = None,
             flash_doc_segment_lengths: torch.Tensor | None = None,
             flash_doc_cu_seqlens: torch.Tensor | None = None,
+            flash_active_tokens: int | None = None,
+            flash_doc_num_segments: int | None = None,
+            flash_doc_max_seqlen: int | None = None,
             flash_route_hint: str | None = None,
         ) -> tuple[torch.Tensor, None]:
             del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
@@ -1393,6 +1474,9 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
                 "flash_doc_segment_offsets": flash_doc_segment_offsets,
                 "flash_doc_segment_lengths": flash_doc_segment_lengths,
                 "flash_doc_cu_seqlens": flash_doc_cu_seqlens,
+                "flash_active_tokens": flash_active_tokens,
+                "flash_doc_num_segments": flash_doc_num_segments,
+                "flash_doc_max_seqlen": flash_doc_max_seqlen,
                 "flash_route_hint": flash_route_hint,
             }
             return query_states, None
@@ -1429,6 +1513,9 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
         flash_doc_segment_offsets=flash_doc_segment_offsets,
         flash_doc_segment_lengths=flash_doc_segment_lengths,
         flash_doc_cu_seqlens=flash_doc_cu_seqlens,
+        flash_active_tokens=3,
+        flash_doc_num_segments=2,
+        flash_doc_max_seqlen=2,
         flash_route_hint="docblock_bias",
     )
 
@@ -1438,6 +1525,9 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
     assert torch.equal(last_layer.seen["flash_doc_segment_offsets"], flash_doc_segment_offsets)
     assert torch.equal(last_layer.seen["flash_doc_segment_lengths"], flash_doc_segment_lengths)
     assert torch.equal(last_layer.seen["flash_doc_cu_seqlens"], flash_doc_cu_seqlens)
+    assert last_layer.seen["flash_active_tokens"] == 3
+    assert last_layer.seen["flash_doc_num_segments"] == 2
+    assert last_layer.seen["flash_doc_max_seqlen"] == 2
 
 
 def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():

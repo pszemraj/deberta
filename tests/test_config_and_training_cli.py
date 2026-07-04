@@ -987,6 +987,19 @@ def test_validate_model_config_rejects_flash_attention_for_rope():
         validate_model_config(cfg)
 
 
+@pytest.mark.parametrize(
+    "dropout",
+    [
+        {"hidden_prob": 0.1, "attention_probs_prob": 0.0},
+        {"hidden_prob": 0.0, "attention_probs_prob": 0.1},
+    ],
+)
+def test_validate_model_config_rejects_flash_attention_with_dropout(dropout: dict[str, float]):
+    cfg = ModelConfig(backbone_type="hf_deberta_v2", hf={"attention_impl": "flash"}, dropout=dropout)
+    with pytest.raises(ValueError, match="requires dropout disabled"):
+        validate_model_config(cfg)
+
+
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_multiple():
     cfg = ModelConfig(tokenizer_vocab_multiple=0)
     with pytest.raises(ValueError, match="model.tokenizer.vocab_multiple"):
@@ -1425,6 +1438,16 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
     assert meta["flash_attention"]["attention_impl"] == "flash"
     assert meta["flash_attention"]["flash"]["force_varlen"] is True
     assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
+    assert meta["flash_attention"]["flashdeberta_distribution_version"] == "0.0.7"
+
+
+def test_build_run_metadata_omits_flash_attention_for_eager_config():
+    model_cfg = ModelConfig(backbone_type="hf_deberta_v2")
+    validate_model_config(model_cfg)
+
+    meta = _build_run_metadata(model_cfg=model_cfg)
+
+    assert "flash_attention" not in meta
 
 
 def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_path: Path):

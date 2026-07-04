@@ -63,13 +63,17 @@ def _build_run_metadata(
         meta["effective_compile_scope"] = str(effective_compile_scope)
     if compile_scope_reason is not None:
         meta["compile_scope_reason"] = str(compile_scope_reason)
-    if model_cfg is not None:
-        from deberta.modeling.flashdeberta_version import flashdeberta_distribution_version
+    if model_cfg is not None and str(model_cfg.hf.attention_impl).strip().lower() == "flash":
+        from deberta.modeling.flashdeberta_version import (
+            flashdeberta_distribution_version,
+            flashdeberta_runtime_version,
+        )
 
         meta["flash_attention"] = {
             "attention_impl": str(model_cfg.hf.attention_impl),
             "flash": asdict_without_private(model_cfg.hf.flash),
-            "flashdeberta_version": flashdeberta_distribution_version(),
+            "flashdeberta_version": flashdeberta_runtime_version(),
+            "flashdeberta_distribution_version": flashdeberta_distribution_version(),
         }
     return meta
 
