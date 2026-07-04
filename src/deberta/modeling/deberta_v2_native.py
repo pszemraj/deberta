@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 
 from deberta.config import _normalize_hf_attention_kernel
-from deberta.modeling.mask_utils import normalize_keep_mask
+from deberta.modeling.mask_utils import FlashBatchMeta, normalize_keep_mask
 
 try:
     from transformers import DebertaV2Config, PreTrainedModel
@@ -583,14 +583,7 @@ class DisentangledSelfAttention(nn.Module):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run disentangled self-attention.
 
@@ -600,26 +593,10 @@ class DisentangledSelfAttention(nn.Module):
         :param torch.Tensor | None query_states: Optional query states (for iterative decoding).
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative-position embedding table.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle, ignored by eager attention.
         :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
         """
-        del (
-            flash_seq_lengths,
-            flash_doc_segment_offsets,
-            flash_doc_segment_lengths,
-            flash_doc_cu_seqlens,
-            flash_active_tokens,
-            flash_doc_num_segments,
-            flash_doc_max_seqlen,
-            flash_route_hint,
-        )
+        del flash_meta
 
         if query_states is None:
             query_states = hidden_states
@@ -718,14 +695,7 @@ class DebertaV2Attention(nn.Module):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run attention and post-attention projection.
 
@@ -735,14 +705,7 @@ class DebertaV2Attention(nn.Module):
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Layer outputs.
         """
 
@@ -753,14 +716,7 @@ class DebertaV2Attention(nn.Module):
             query_states=query_states,
             relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
         if query_states is None:
             query_states = hidden_states
@@ -849,14 +805,7 @@ class DebertaV2Layer(nn.Module):
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
         output_attentions: bool = False,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run one transformer layer.
 
@@ -866,14 +815,7 @@ class DebertaV2Layer(nn.Module):
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
         :param bool output_attentions: Whether to emit attention probs.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Layer output and optional attentions.
         """
 
@@ -884,14 +826,7 @@ class DebertaV2Layer(nn.Module):
             query_states=query_states,
             relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
@@ -1222,14 +1157,7 @@ class DebertaV2Encoder(nn.Module):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         return_dict: bool = True,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> (
         BaseModelOutput
         | tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, tuple[torch.Tensor, ...] | None]
@@ -1243,14 +1171,7 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param bool return_dict: Whether to return HF output dataclass.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return BaseModelOutput | tuple: Encoder outputs.
         """
 
@@ -1300,14 +1221,7 @@ class DebertaV2Encoder(nn.Module):
                         relative_pos=rp,
                         rel_embeddings=re,
                         output_attentions=output_attentions,
-                        flash_seq_lengths=flash_seq_lengths,
-                        flash_doc_segment_offsets=flash_doc_segment_offsets,
-                        flash_doc_segment_lengths=flash_doc_segment_lengths,
-                        flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                        flash_active_tokens=flash_active_tokens,
-                        flash_doc_num_segments=flash_doc_num_segments,
-                        flash_doc_max_seqlen=flash_doc_max_seqlen,
-                        flash_route_hint=flash_route_hint,
+                        flash_meta=flash_meta,
                     )
 
                 output_states, attn_weights = torch.utils.checkpoint.checkpoint(
@@ -1326,14 +1240,7 @@ class DebertaV2Encoder(nn.Module):
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
                     output_attentions=output_attentions,
-                    flash_seq_lengths=flash_seq_lengths,
-                    flash_doc_segment_offsets=flash_doc_segment_offsets,
-                    flash_doc_segment_lengths=flash_doc_segment_lengths,
-                    flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                    flash_active_tokens=flash_active_tokens,
-                    flash_doc_num_segments=flash_doc_num_segments,
-                    flash_doc_max_seqlen=flash_doc_max_seqlen,
-                    flash_route_hint=flash_route_hint,
+                    flash_meta=flash_meta,
                 )
 
             if output_attentions and all_attentions is not None:
@@ -1517,19 +1424,6 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
 
         return input_shape, device, token_type_ids
 
-    @staticmethod
-    def _normalize_flash_route_hint(flash_route_hint: str | None) -> str | None:
-        """Normalize an optional flash routing hint.
-
-        :param str | None flash_route_hint: Optional raw routing hint.
-        :return str | None: Normalized routing hint or ``None`` when unset.
-        """
-
-        if flash_route_hint is None:
-            return None
-        text = str(flash_route_hint).strip().lower()
-        return text if text else None
-
     def _forward_resolved(
         self,
         *,
@@ -1541,14 +1435,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         output_attentions: bool,
         output_hidden_states: bool,
         return_dict: bool,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run forward with already-resolved boolean output flags.
 
@@ -1560,14 +1447,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param bool output_attentions: Resolved attention-output flag.
         :param bool output_hidden_states: Resolved hidden-state-output flag.
         :param bool return_dict: Resolved return-format flag.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
@@ -1606,14 +1486,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_hidden_states=(output_hidden_states or need_hidden_states_for_z),
             output_attentions=output_attentions,
             return_dict=True,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
 
         sequence_output = encoder_outputs.last_hidden_state
@@ -1639,14 +1512,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
                     query_states=z_query_states,
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
-                    flash_seq_lengths=flash_seq_lengths,
-                    flash_doc_segment_offsets=flash_doc_segment_offsets,
-                    flash_doc_segment_lengths=flash_doc_segment_lengths,
-                    flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                    flash_active_tokens=flash_active_tokens,
-                    flash_doc_num_segments=flash_doc_num_segments,
-                    flash_doc_max_seqlen=flash_doc_max_seqlen,
-                    flash_route_hint=flash_route_hint,
+                    flash_meta=flash_meta,
                 )
                 z_extras.append(z_query_states)
             sequence_output = z_query_states
@@ -1712,14 +1578,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         output_attentions: bool,
         output_hidden_states: bool,
         return_dict: bool,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run forward on the masked path with resolved flags.
 
@@ -1731,14 +1590,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param bool output_attentions: Resolved attention-output flag.
         :param bool output_hidden_states: Resolved hidden-state-output flag.
         :param bool return_dict: Resolved return-format flag.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
@@ -1751,14 +1603,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
 
     def _forward_dense_hs0(
@@ -1902,14 +1747,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run the masked training fast path with hidden-state outputs disabled.
 
@@ -1918,14 +1756,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
@@ -1948,14 +1779,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_hidden_states=need_hidden_states_for_z,
             output_attentions=False,
             return_dict=True,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
         sequence_output = encoder_outputs.last_hidden_state
         hidden_states = encoder_outputs.hidden_states
@@ -1977,14 +1801,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
                     query_states=z_query_states,
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
-                    flash_seq_lengths=flash_seq_lengths,
-                    flash_doc_segment_offsets=flash_doc_segment_offsets,
-                    flash_doc_segment_lengths=flash_doc_segment_lengths,
-                    flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                    flash_active_tokens=flash_active_tokens,
-                    flash_doc_num_segments=flash_doc_num_segments,
-                    flash_doc_max_seqlen=flash_doc_max_seqlen,
-                    flash_route_hint=flash_route_hint,
+                    flash_meta=flash_meta,
                 )
             sequence_output = z_query_states
 
@@ -2002,14 +1819,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run the masked training fast path with hidden-state outputs enabled.
 
@@ -2018,14 +1828,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
@@ -2047,14 +1850,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_hidden_states=True,
             output_attentions=False,
             return_dict=True,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
         sequence_output = encoder_outputs.last_hidden_state
         hidden_states = encoder_outputs.hidden_states
@@ -2077,14 +1873,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
                     query_states=z_query_states,
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
-                    flash_seq_lengths=flash_seq_lengths,
-                    flash_doc_segment_offsets=flash_doc_segment_offsets,
-                    flash_doc_segment_lengths=flash_doc_segment_lengths,
-                    flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                    flash_active_tokens=flash_active_tokens,
-                    flash_doc_num_segments=flash_doc_num_segments,
-                    flash_doc_max_seqlen=flash_doc_max_seqlen,
-                    flash_route_hint=flash_route_hint,
+                    flash_meta=flash_meta,
                 )
                 z_extras.append(z_query_states)
             sequence_output = z_query_states
@@ -2107,14 +1896,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run DeBERTa-v2 encoder forward pass.
 
@@ -2126,14 +1908,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param bool | None output_attentions: Optional attention-output flag.
         :param bool | None output_hidden_states: Optional hidden-state-output flag.
         :param bool | None return_dict: Optional return-format flag.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
@@ -2156,14 +1931,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_attentions=resolved_output_attentions,
             output_hidden_states=resolved_output_hidden_states,
             return_dict=resolved_return_dict,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=self._normalize_flash_route_hint(flash_route_hint),
+            flash_meta=flash_meta,
         )
 
 

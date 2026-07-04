@@ -23,6 +23,7 @@ _ensure_src_on_path()
 
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.modeling.mask_utils import (  # noqa: E402
+    FlashBatchMeta,
     build_doc_block_mask,
     build_doc_segment_metadata,
     doc_segment_metadata_host_stats,
@@ -82,18 +83,18 @@ def _copy_weights(src: torch.nn.Module, dst: torch.nn.Module) -> None:
 
 def _case_payload(
     case: ParityCase, *, cfg: DebertaV2Config, device: torch.device
-) -> dict[str, torch.Tensor | int | str | None]:
+) -> dict[str, torch.Tensor | FlashBatchMeta | None]:
     """Build inputs and flash metadata for one route case."""
 
     input_ids = torch.randint(5, cfg.vocab_size, (case.batch_size, case.seq_len), device=device)
     attention_mask: torch.Tensor | None = None
-    flash_seq_lengths: torch.Tensor | None = None
-    flash_doc_segment_offsets: torch.Tensor | None = None
-    flash_doc_segment_lengths: torch.Tensor | None = None
-    flash_doc_cu_seqlens: torch.Tensor | None = None
-    flash_active_tokens: int | None = None
-    flash_doc_num_segments: int | None = None
-    flash_doc_max_seqlen: int | None = None
+    seq_lengths: torch.Tensor | None = None
+    doc_segment_offsets: torch.Tensor | None = None
+    doc_segment_lengths: torch.Tensor | None = None
+    doc_cu_seqlens: torch.Tensor | None = None
+    active_tokens: int | None = None
+    doc_num_segments: int | None = None
+    doc_max_seqlen: int | None = None
 
     if case.docblock:
         doc_ids_cpu = torch.zeros((case.batch_size, case.seq_len), dtype=torch.long)
@@ -103,47 +104,51 @@ def _case_payload(
         if case.pad_tail > 0:
             input_ids[:, -case.pad_tail :] = int(cfg.pad_token_id)
         doc_ids = doc_ids_cpu.to(device=device)
-        flash_seq_lengths = doc_ids.ne(0).sum(-1, dtype=torch.int32)
+        seq_lengths = doc_ids.ne(0).sum(-1, dtype=torch.int32)
         if case.route_hint == "docblock_bias":
             attention_mask = build_doc_block_mask(doc_ids)
         else:
             attention_mask = doc_ids.ne(0)
             (
-                flash_doc_segment_offsets,
-                flash_doc_segment_lengths,
-                flash_doc_cu_seqlens,
-                flash_active_tokens,
+                doc_segment_offsets,
+                doc_segment_lengths,
+                doc_cu_seqlens,
+                active_tokens,
             ) = build_doc_segment_metadata(doc_ids_cpu)
-            flash_doc_num_segments, flash_doc_max_seqlen, _ = doc_segment_metadata_host_stats(
-                flash_doc_segment_lengths,
-                active_tokens=flash_active_tokens,
+            doc_num_segments, doc_max_seqlen, _ = doc_segment_metadata_host_stats(
+                doc_segment_lengths,
+                active_tokens=active_tokens,
             )
-            flash_doc_segment_offsets = flash_doc_segment_offsets.to(device=device)
-            flash_doc_segment_lengths = flash_doc_segment_lengths.to(device=device)
-            flash_doc_cu_seqlens = flash_doc_cu_seqlens.to(device=device)
+            doc_segment_offsets = doc_segment_offsets.to(device=device)
+            doc_segment_lengths = doc_segment_lengths.to(device=device)
+            doc_cu_seqlens = doc_cu_seqlens.to(device=device)
     elif case.pad_tail > 0:
         attention_mask = torch.ones((case.batch_size, case.seq_len), device=device, dtype=torch.bool)
         attention_mask[1, -case.pad_tail :] = False
         input_ids[1, -case.pad_tail :] = int(cfg.pad_token_id)
-        flash_seq_lengths = attention_mask.sum(-1, dtype=torch.int32)
+        seq_lengths = attention_mask.sum(-1, dtype=torch.int32)
+
+    flash_meta = FlashBatchMeta(
+        seq_lengths=seq_lengths,
+        doc_segment_offsets=doc_segment_offsets,
+        doc_segment_lengths=doc_segment_lengths,
+        doc_cu_seqlens=doc_cu_seqlens,
+        active_tokens_host=active_tokens,
+        doc_num_segments_host=doc_num_segments,
+        doc_max_segment_length_host=doc_max_seqlen,
+        route_hint=case.route_hint,
+    )
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "flash_seq_lengths": flash_seq_lengths,
-        "flash_doc_segment_offsets": flash_doc_segment_offsets,
-        "flash_doc_segment_lengths": flash_doc_segment_lengths,
-        "flash_doc_cu_seqlens": flash_doc_cu_seqlens,
-        "flash_active_tokens": flash_active_tokens,
-        "flash_doc_num_segments": flash_doc_num_segments,
-        "flash_doc_max_seqlen": flash_doc_max_seqlen,
-        "flash_route_hint": case.route_hint,
+        "flash_meta": flash_meta,
     }
 
 
 def _run(
     model: DebertaV2Model,
-    payload: dict[str, torch.Tensor | int | str | None],
+    payload: dict[str, torch.Tensor | FlashBatchMeta | None],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run one forward/backward pass and return selected gradients."""
 
@@ -203,14 +208,7 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
 
     payload = _case_payload(case, cfg=cfg_ref, device=device)
     ref_payload = dict(payload)
-    ref_payload.pop("flash_seq_lengths")
-    ref_payload.pop("flash_doc_segment_offsets")
-    ref_payload.pop("flash_doc_segment_lengths")
-    ref_payload.pop("flash_doc_cu_seqlens")
-    ref_payload.pop("flash_active_tokens")
-    ref_payload.pop("flash_doc_num_segments")
-    ref_payload.pop("flash_doc_max_seqlen")
-    ref_payload.pop("flash_route_hint")
+    ref_payload.pop("flash_meta")
     if case.route_hint == "docblock":
         doc_ids = torch.zeros((case.batch_size, case.seq_len), device=device, dtype=torch.long)
         split = max(2, case.seq_len // 2)

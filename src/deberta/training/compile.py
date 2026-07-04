@@ -260,6 +260,35 @@ def _flash_active_tokens_host(value: Any) -> int | None:
     return None
 
 
+def _flash_meta_with_route(
+    flash_meta: FlashBatchMeta | None, route_hint: str | None
+) -> FlashBatchMeta | None:
+    """Return metadata with a normalized route hint override.
+
+    :param FlashBatchMeta | None flash_meta: Existing metadata bundle.
+    :param str | None route_hint: Route hint to install.
+    :return FlashBatchMeta | None: Metadata bundle with the requested route.
+    """
+
+    route = str(route_hint).strip().lower() if route_hint is not None else None
+    if route == "":
+        route = None
+    if flash_meta is None:
+        return FlashBatchMeta(route_hint=route) if route is not None else None
+    if flash_meta.normalized_route_hint() == route:
+        return flash_meta
+    return FlashBatchMeta(
+        seq_lengths=flash_meta.seq_lengths,
+        doc_segment_offsets=flash_meta.doc_segment_offsets,
+        doc_segment_lengths=flash_meta.doc_segment_lengths,
+        doc_cu_seqlens=flash_meta.doc_cu_seqlens,
+        active_tokens_host=flash_meta.active_tokens_host,
+        doc_num_segments_host=flash_meta.doc_num_segments_host,
+        doc_max_segment_length_host=flash_meta.doc_max_segment_length_host,
+        route_hint=route,
+    )
+
+
 def _flash_active_tokens_from_seq_lengths(seq_lengths: torch.Tensor) -> int | None:
     """Return active tokens from CPU sequence lengths without touching GPU state.
 
@@ -744,31 +773,17 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids: torch.Tensor | None = None,
             position_ids: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
-            flash_seq_lengths: torch.Tensor | None = None,
-            flash_doc_segment_offsets: torch.Tensor | None = None,
-            flash_doc_segment_lengths: torch.Tensor | None = None,
-            flash_doc_cu_seqlens: torch.Tensor | None = None,
-            flash_active_tokens: int | None = None,
-            flash_doc_num_segments: int | None = None,
-            flash_doc_max_seqlen: int | None = None,
-            flash_route_hint: str | None = None,
+            flash_meta: FlashBatchMeta | None = None,
         ) -> Any:
             """Call the generic masked helper with fixed ``hidden_states=False``.
 
-                :param torch.Tensor | None input_ids: Optional input token ids.
-                :param torch.Tensor attention_mask: Attention mask tensor.
-                :param torch.Tensor | None token_type_ids: Optional token type ids.
-                :param torch.Tensor | None position_ids: Optional position ids.
-                :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-                :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-                :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-                :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-                :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-            :param int | None flash_active_tokens: Optional host-side active token count.
-            :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-            :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-                :param str | None flash_route_hint: Optional flash routing hint.
-                :return Any: Masked-path backbone outputs.
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor attention_mask: Attention mask tensor.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+            :return Any: Masked-path backbone outputs.
             """
 
             return masked_forward(
@@ -780,14 +795,7 @@ def _install_stable_backbone_compile_dispatch(
                 output_attentions=False,
                 output_hidden_states=False,
                 return_dict=True,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
-                flash_route_hint=flash_route_hint,
+                flash_meta=flash_meta,
             )
 
         def _masked_hs1_fn(
@@ -797,31 +805,17 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids: torch.Tensor | None = None,
             position_ids: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
-            flash_seq_lengths: torch.Tensor | None = None,
-            flash_doc_segment_offsets: torch.Tensor | None = None,
-            flash_doc_segment_lengths: torch.Tensor | None = None,
-            flash_doc_cu_seqlens: torch.Tensor | None = None,
-            flash_active_tokens: int | None = None,
-            flash_doc_num_segments: int | None = None,
-            flash_doc_max_seqlen: int | None = None,
-            flash_route_hint: str | None = None,
+            flash_meta: FlashBatchMeta | None = None,
         ) -> Any:
             """Call the generic masked helper with fixed ``hidden_states=True``.
 
-                :param torch.Tensor | None input_ids: Optional input token ids.
-                :param torch.Tensor attention_mask: Attention mask tensor.
-                :param torch.Tensor | None token_type_ids: Optional token type ids.
-                :param torch.Tensor | None position_ids: Optional position ids.
-                :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-                :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-                :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-                :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-                :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-            :param int | None flash_active_tokens: Optional host-side active token count.
-            :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-            :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-                :param str | None flash_route_hint: Optional flash routing hint.
-                :return Any: Masked-path backbone outputs.
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor attention_mask: Attention mask tensor.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+            :return Any: Masked-path backbone outputs.
             """
 
             return masked_forward(
@@ -833,14 +827,7 @@ def _install_stable_backbone_compile_dispatch(
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
-                flash_route_hint=flash_route_hint,
+                flash_meta=flash_meta,
             )
 
         dense_hs0_fn = _dense_hs0_fn
@@ -855,13 +842,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with fixed-flash routing.
 
@@ -870,16 +851,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the fixed route.
-        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the fixed route.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the fixed route.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
-        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
 
         return masked_hs0_fn(
             input_ids=input_ids,
@@ -887,8 +861,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_route_hint="fixed",
+            flash_meta=_flash_meta_with_route(flash_meta, "fixed"),
         )
 
     def _masked_fixed_hs1_fn(
@@ -898,13 +871,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with fixed-flash routing and hidden states.
 
@@ -913,16 +880,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the fixed route.
-        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the fixed route.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the fixed route.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
-        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
 
         return masked_hs1_fn(
             input_ids=input_ids,
@@ -930,8 +890,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_route_hint="fixed",
+            flash_meta=_flash_meta_with_route(flash_meta, "fixed"),
         )
 
     def _masked_varlen_hs0_fn(
@@ -941,13 +900,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with varlen-flash routing.
 
@@ -956,16 +909,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the varlen route.
-        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the varlen route.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the varlen route.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
-        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
 
         return masked_hs0_fn(
             input_ids=input_ids,
@@ -973,8 +919,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_route_hint="varlen",
+            flash_meta=_flash_meta_with_route(flash_meta, "varlen"),
         )
 
     def _masked_varlen_hs1_fn(
@@ -984,13 +929,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with varlen-flash routing and hidden states.
 
@@ -999,16 +938,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block metadata for the varlen route.
-        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block metadata for the varlen route.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block metadata for the varlen route.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
-        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
 
         return masked_hs1_fn(
             input_ids=input_ids,
@@ -1016,8 +948,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_route_hint="varlen",
+            flash_meta=_flash_meta_with_route(flash_meta, "varlen"),
         )
 
     def _masked_docblock_hs0_fn(
@@ -1027,13 +958,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with doc-block flash routing.
 
@@ -1042,13 +967,7 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
 
@@ -1058,14 +977,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint="docblock",
+            flash_meta=_flash_meta_with_route(flash_meta, "docblock"),
         )
 
     def _masked_docblock_hs1_fn(
@@ -1075,13 +987,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with doc-block flash routing and hidden states.
 
@@ -1090,13 +996,7 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
 
@@ -1106,14 +1006,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint="docblock",
+            flash_meta=_flash_meta_with_route(flash_meta, "docblock"),
         )
 
     def _masked_docblock_bias_hs0_fn(
@@ -1123,13 +1016,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with dense doc-block bias flash routing.
 
@@ -1138,16 +1025,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block segment metadata.
-        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block segment metadata.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block segment metadata.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
-        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
 
         return masked_hs0_fn(
             input_ids=input_ids,
@@ -1155,8 +1035,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_route_hint="docblock_bias",
+            flash_meta=_flash_meta_with_route(flash_meta, "docblock_bias"),
         )
 
     def _masked_docblock_bias_hs1_fn(
@@ -1166,13 +1045,7 @@ def _install_stable_backbone_compile_dispatch(
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Call the masked helper with dense doc-block bias flash routing and hidden states.
 
@@ -1181,16 +1054,9 @@ def _install_stable_backbone_compile_dispatch(
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths.
-        :param torch.Tensor | None flash_doc_segment_offsets: Ignored doc-block segment metadata.
-        :param torch.Tensor | None flash_doc_segment_lengths: Ignored doc-block segment metadata.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Ignored doc-block segment metadata.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Masked-path backbone outputs.
         """
-        del flash_doc_segment_offsets, flash_doc_segment_lengths, flash_doc_cu_seqlens
 
         return masked_hs1_fn(
             input_ids=input_ids,
@@ -1198,8 +1064,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_route_hint="docblock_bias",
+            flash_meta=_flash_meta_with_route(flash_meta, "docblock_bias"),
         )
 
     compiled_dense = {
@@ -1237,14 +1102,7 @@ def _install_stable_backbone_compile_dispatch(
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> Any:
         """Normalize public options, then dispatch into stable compiled entrypoints.
 
@@ -1257,14 +1115,7 @@ def _install_stable_backbone_compile_dispatch(
         :param bool | None output_attentions: Optional attention-output flag.
         :param bool | None output_hidden_states: Optional hidden-state-output flag.
         :param bool | None return_dict: Optional return-format flag.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash routing hint selected outside compiled code.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return Any: Module outputs from either a compiled fast path or the generic resolved path.
         """
 
@@ -1291,14 +1142,7 @@ def _install_stable_backbone_compile_dispatch(
                 output_attentions=resolved_output_attentions,
                 output_hidden_states=resolved_output_hidden_states,
                 return_dict=resolved_return_dict,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
-                flash_route_hint=flash_route_hint,
+                flash_meta=flash_meta,
             )
         if attention_mask is None:
             return compiled_dense[resolved_output_hidden_states](
@@ -1307,71 +1151,42 @@ def _install_stable_backbone_compile_dispatch(
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
             )
-        normalized_flash_route = None
-        normalize_route_hint = getattr(self, "_normalize_flash_route_hint", None)
-        if callable(normalize_route_hint):
-            normalized_flash_route = normalize_route_hint(flash_route_hint)
-        elif flash_route_hint is not None:
-            normalized_flash_route = str(flash_route_hint).strip().lower() or None
-        if normalized_flash_route == "fixed":
+        normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
+        if normalized_route == "fixed":
             return compiled_masked_fixed[resolved_output_hidden_states](
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
+                flash_meta=flash_meta,
             )
-        if normalized_flash_route == "varlen":
+        if normalized_route == "varlen":
             return compiled_masked_varlen[resolved_output_hidden_states](
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
+                flash_meta=flash_meta,
             )
-        if normalized_flash_route == "docblock":
+        if normalized_route == "docblock":
             return compiled_masked_docblock[resolved_output_hidden_states](
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
+                flash_meta=flash_meta,
             )
-        if normalized_flash_route == "docblock_bias":
+        if normalized_route == "docblock_bias":
             return compiled_masked_docblock_bias[resolved_output_hidden_states](
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_seq_lengths=flash_seq_lengths,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=flash_active_tokens,
-                flash_doc_num_segments=flash_doc_num_segments,
-                flash_doc_max_seqlen=flash_doc_max_seqlen,
+                flash_meta=flash_meta,
             )
         return compiled_masked[resolved_output_hidden_states](
             input_ids=input_ids,
@@ -1379,14 +1194,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=normalized_flash_route,
+            flash_meta=_flash_meta_with_route(flash_meta, normalized_route),
         )
 
     module._compiled_forward_dense = compiled_dense

@@ -151,6 +151,7 @@ class ModelHFFlashConfig:
     force_varlen: bool = field(default=False)
     varlen_min_seq_len: int = field(default=2048)
     docblock_bias_seq_len: int = field(default=1024)
+    local_bias_max_batch_size: int = field(default=4)
     eager_dense_max_seq_len: int = field(default=0)
     kernel_overrides_path: str | None = field(default=None)
 
@@ -1364,6 +1365,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
     _cfg_set(cfg.hf.flash, "force_varlen", bool(cfg.hf.flash.force_varlen))
     _cfg_set(cfg.hf.flash, "varlen_min_seq_len", int(cfg.hf.flash.varlen_min_seq_len))
     _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
+    _cfg_set(cfg.hf.flash, "local_bias_max_batch_size", int(cfg.hf.flash.local_bias_max_batch_size))
     _cfg_set(cfg.hf.flash, "eager_dense_max_seq_len", int(cfg.hf.flash.eager_dense_max_seq_len))
     if cfg.hf.flash.kernel_overrides_path is not None:
         _cfg_set(
@@ -1405,6 +1407,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError("model.hf.flash.varlen_min_seq_len must be > 0.")
     if int(cfg.hf.flash.docblock_bias_seq_len) < 0:
         raise ValueError("model.hf.flash.docblock_bias_seq_len must be >= 0.")
+    if int(cfg.hf.flash.local_bias_max_batch_size) < 0:
+        raise ValueError("model.hf.flash.local_bias_max_batch_size must be >= 0.")
     if int(cfg.hf.flash.eager_dense_max_seq_len) < 0:
         raise ValueError("model.hf.flash.eager_dense_max_seq_len must be >= 0.")
     if cfg.backbone_type != "hf_deberta_v2" and cfg.hf.attention_impl == "flash":

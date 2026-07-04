@@ -13,7 +13,6 @@ fall back to an eager Python implementation.
 
 from __future__ import annotations
 
-import os
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -226,61 +225,6 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
     return getattr(op, "default", op)
 
 
-def _varlen_kernel_override_from_env(
-    *,
-    kind: str,
-) -> tuple[int, int, int, int] | None:
-    """Return repo-side varlen-only kernel overrides when fully specified.
-
-    These overrides intentionally apply only to the custom padded-varlen path.
-    They exist because upstream ``FLASHDEBERTA_{FWD,BWD}_*`` knobs affect both
-    fixed and varlen kernels, which makes tuning padded workloads awkward in
-    mixed dense+masked runs.
-
-    Supported env vars:
-    - ``FLASHDEBERTA_VARLEN_FWD_BLOCK_M``
-    - ``FLASHDEBERTA_VARLEN_FWD_BLOCK_N``
-    - ``FLASHDEBERTA_VARLEN_FWD_NUM_STAGES``
-    - ``FLASHDEBERTA_VARLEN_FWD_NUM_WARPS``
-    - ``FLASHDEBERTA_VARLEN_BWD_BLOCK_M``
-    - ``FLASHDEBERTA_VARLEN_BWD_BLOCK_N``
-    - ``FLASHDEBERTA_VARLEN_BWD_NUM_STAGES``
-    - ``FLASHDEBERTA_VARLEN_BWD_NUM_WARPS``
-    - ``FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_M``
-    - ``FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_N``
-    - ``FLASHDEBERTA_VARLEN_BWD_KV_NUM_STAGES``
-    - ``FLASHDEBERTA_VARLEN_BWD_KV_NUM_WARPS``
-    - ``FLASHDEBERTA_VARLEN_BWD_Q_BLOCK_M``
-    - ``FLASHDEBERTA_VARLEN_BWD_Q_BLOCK_N``
-    - ``FLASHDEBERTA_VARLEN_BWD_Q_NUM_STAGES``
-    - ``FLASHDEBERTA_VARLEN_BWD_Q_NUM_WARPS``
-
-    :param str kind: One of ``"fwd"``, ``"bwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
-    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
-        or ``None`` when unset / invalid / incomplete.
-    """
-
-    normalized = str(kind).strip().lower()
-    if normalized not in {"fwd", "bwd", "bwd_kv", "bwd_q"}:
-        raise ValueError(f"Unsupported varlen kernel override kind: {kind!r}")
-
-    prefix = f"FLASHDEBERTA_VARLEN_{normalized.upper()}"
-    names = (
-        f"{prefix}_BLOCK_M",
-        f"{prefix}_BLOCK_N",
-        f"{prefix}_NUM_STAGES",
-        f"{prefix}_NUM_WARPS",
-    )
-    raw = [os.environ.get(name) for name in names]
-    if any(value is None or not str(value).strip() for value in raw):
-        return None
-    try:
-        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
-    except Exception:
-        return None
-    return int(block_m), int(block_n), int(num_stages), int(num_warps)
-
-
 def _varlen_device_capability(device: torch.device) -> tuple[int, int]:
     """Return CUDA device capability for one device.
 
@@ -461,14 +405,6 @@ def _resolve_varlen_bwd_kernel_config(
     )
     if repo_tuned is not None:
         return repo_tuned
-
-    specific_override = _varlen_kernel_override_from_env(kind=f"bwd_{kind}")
-    if specific_override is not None:
-        return specific_override
-
-    generic_override = _varlen_kernel_override_from_env(kind="bwd")
-    if generic_override is not None:
-        return generic_override
 
     if _get_bwd_config_varlen_lowlevel is None:
         raise RuntimeError("FlashDeBERTa varlen backward config helper is unavailable.")
@@ -1396,19 +1332,15 @@ def _varlen_eager_forward_impl(
         if table_config is not None:
             block_m, block_n, num_stages, num_warps = table_config
         else:
-            override = _varlen_kernel_override_from_env(kind="fwd")
-            if override is not None:
-                block_m, block_n, num_stages, num_warps = override
-            else:
-                block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-                    total_tokens=int(q_unpad.shape[0]),
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    D=int(query_layer.shape[-1]),
-                    causal=bool(causal),
-                    disentangled=True,
-                    att_span=att_span,
-                )
+            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
+                total_tokens=int(q_unpad.shape[0]),
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                D=int(query_layer.shape[-1]),
+                causal=bool(causal),
+                disentangled=True,
+                att_span=att_span,
+            )
         out_unpad, lse_unpad = _flash_attn_v2_fwd_dise_lowlevel(
             q_unpad,
             k_unpad,
@@ -2140,21 +2072,17 @@ def _varlen_triton_forward_impl(
     if table_config is not None:
         block_m, block_n, num_stages, num_warps = table_config
     else:
-        override = _varlen_kernel_override_from_env(kind="fwd")
-        if override is not None:
-            block_m, block_n, num_stages, num_warps = override
-        else:
-            if _get_fwd_config_lowlevel is None:
-                raise RuntimeError("FlashDeBERTa varlen forward config helper is unavailable.")
-            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-                total_tokens=capacity_tokens,
-                max_seqlen_q=seq_len,
-                max_seqlen_k=seq_len,
-                D=head_dim,
-                causal=bool(causal),
-                disentangled=True,
-                att_span=att_span,
-            )
+        if _get_fwd_config_lowlevel is None:
+            raise RuntimeError("FlashDeBERTa varlen forward config helper is unavailable.")
+        block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
+            total_tokens=capacity_tokens,
+            max_seqlen_q=seq_len,
+            max_seqlen_k=seq_len,
+            D=head_dim,
+            causal=bool(causal),
+            disentangled=True,
+            att_span=att_span,
+        )
 
     mid_batch, mid_start, tile_count = _build_dense_mid_tensors(
         cu_seqlens=cu_seqlens,

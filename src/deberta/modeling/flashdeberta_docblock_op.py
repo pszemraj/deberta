@@ -18,6 +18,10 @@ import torch
 
 import deberta.modeling.flashdeberta_fixed_op as _fixed_mod
 import deberta.modeling.flashdeberta_varlen_op as _varlen_mod
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    FlashKernelContext,
+    resolve_flash_kernel_config,
+)
 from deberta.modeling.flashdeberta_segment_pack import (
     segment_pack_padded_rows,
     segment_pack_padded_rows_pair,
@@ -369,9 +373,23 @@ def _docblock_forward_impl(
         _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is not None
         and _varlen_mod._get_fwd_config_lowlevel is not None
     ):
-        override = _varlen_mod._varlen_kernel_override_from_env(kind="fwd")
-        if override is not None:
-            block_m, block_n, num_stages, num_warps = override
+        table_config = resolve_flash_kernel_config(
+            FlashKernelContext(
+                compute_capability=_varlen_mod._varlen_device_capability(query_layer.device),
+                route="docblock",
+                kind="fwd",
+                seq_len=int(max_seqlen),
+                total_tokens=int(q_unpad.shape[0]),
+                batch_size=int(num_segments),
+                head_dim=int(query_layer.shape[-1]),
+                dtype=str(query_layer.dtype).removeprefix("torch."),
+                causal=bool(causal),
+                disentangled=True,
+                att_span=int(att_span),
+            )
+        )
+        if table_config is not None:
+            block_m, block_n, num_stages, num_warps = table_config
         else:
             block_m, block_n, num_stages, num_warps = _varlen_mod._get_fwd_config_lowlevel(
                 total_tokens=int(q_unpad.shape[0]),

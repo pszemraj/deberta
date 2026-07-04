@@ -77,12 +77,16 @@ from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_varlen_padded,
 )
 from deberta.modeling.flashdeberta_version import flashdeberta_version_error, require_flashdeberta_version
-from deberta.modeling.mask_utils import build_doc_block_mask, doc_ids_from_segments, normalize_keep_mask
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    build_doc_block_mask,
+    doc_ids_from_segments,
+    normalize_keep_mask,
+)
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
 _TRUTHY = {"1", "true", "yes", "y", "on"}
-_LOCAL_BIAS_MAX_BATCH_SIZE = 4
 _DENSE_BUCKET_INDEX_CACHE: dict[tuple[int, int, int, str, int | None], torch.Tensor] = {}
 
 
@@ -97,6 +101,7 @@ class FlashDebertaRuntimeConfig:
     force_varlen: bool = False
     varlen_min_seq_len: int = 2048
     docblock_bias_seq_len: int = 1024
+    local_bias_max_batch_size: int = 4
     eager_dense_max_seq_len: int = 0
     kernel_overrides_path: str | None = None
     enable_debug_stats: bool = False
@@ -155,6 +160,7 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
         force_varlen=_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"),
         varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 2048)),
         docblock_bias_seq_len=max(0, _int_env("FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN", 1024)),
+        local_bias_max_batch_size=4,
         eager_dense_max_seq_len=max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0)),
         kernel_overrides_path=os.environ.get("FLASHDEBERTA_KERNEL_OVERRIDES_PATH"),
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
@@ -207,6 +213,15 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
         docblock_bias_seq_len=max(
             0,
             int(getter("docblock_bias_seq_len", getattr(config, "flash_docblock_bias_seq_len", 1024))),
+        ),
+        local_bias_max_batch_size=max(
+            0,
+            int(
+                getter(
+                    "local_bias_max_batch_size",
+                    getattr(config, "flash_local_bias_max_batch_size", 4),
+                )
+            ),
         ),
         eager_dense_max_seq_len=max(
             0,
@@ -396,16 +411,16 @@ def _should_use_varlen(
     return int(seq_len) >= int(cfg.varlen_min_seq_len)
 
 
-def _normalize_flash_route_hint(flash_route_hint: str | None) -> str | None:
+def _normalize_route_hint(route_hint: str | None) -> str | None:
     """Normalize an optional flash routing hint.
 
-    :param str | None flash_route_hint: Optional routing hint.
+    :param str | None route_hint: Optional routing hint.
     :return str | None: Normalized hint or ``None`` when unset.
     """
 
-    if flash_route_hint is None:
+    if route_hint is None:
         return None
-    text = str(flash_route_hint).strip().lower()
+    text = str(route_hint).strip().lower()
     return text if text else None
 
 
@@ -595,7 +610,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         attention_mask: torch.Tensor | None,
         query_states: torch.Tensor,
         rel_embeddings: torch.Tensor | None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[str, str] | None:
         """Return the first reason this call should use eager attention.
 
@@ -603,14 +618,14 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor query_states: Query hidden states.
         :param torch.Tensor | None rel_embeddings: Relative embedding table.
-        :param str | None flash_route_hint: Optional out-of-graph routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional out-of-graph routing metadata.
         :return tuple[str, str] | None: Fallback reason key and message, or ``None``.
         """
 
         query_len = int(query_states.shape[-2])
         key_len = int(hidden_states.shape[-2])
         dropout_p = float(getattr(self.dropout, "p", 0.0))
-        normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
+        normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
 
         dense_eager_limit = int(self._runtime_config.eager_dense_max_seq_len)
         if dense_eager_limit > 0 and attention_mask is None and key_len <= dense_eager_limit:
@@ -621,7 +636,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         if (
             attention_mask is not None
             and _is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
-            and normalized_flash_route != "docblock_bias"
+            and normalized_route != "docblock_bias"
         ):
             return (
                 "pairwise_mask",
@@ -723,7 +738,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        flash_seq_lengths: torch.Tensor | None,
+        flash_meta: FlashBatchMeta | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -734,14 +749,14 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
         :param torch.Tensor | None attention_mask: Optional padding mask.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
         :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
         """
 
-        seq_lengths = flash_seq_lengths
+        seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
         if seq_lengths is None and attention_mask is not None:
             seq_lengths = _mask4d_to_seqlens(attention_mask, seq_len=int(key_layer.shape[-2]))
         if _RUNTIME_CONFIG.enable_debug_stats:
@@ -782,7 +797,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if not self.training:
             return False
-        if int(batch_size) > _LOCAL_BIAS_MAX_BATCH_SIZE:
+        local_bias_max_batch_size = int(self._runtime_config.local_bias_max_batch_size)
+        if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
             return False
         if int(seq_len) != int(self._runtime_config.docblock_bias_seq_len):
             return False
@@ -847,7 +863,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask: torch.Tensor,
-        flash_seq_lengths: torch.Tensor | None,
+        flash_meta: FlashBatchMeta | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -858,7 +874,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param torch.Tensor attention_mask: Padding-style keep mask.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
@@ -866,8 +882,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_len = int(query_layer.shape[1])
-        if flash_seq_lengths is not None:
-            mask_2d = _seqlens_to_mask_2d(flash_seq_lengths, seq_len=seq_len)
+        seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
+        if seq_lengths is not None:
+            mask_2d = _seqlens_to_mask_2d(seq_lengths, seq_len=seq_len)
         else:
             mask_2d = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
         out = flashdeberta_varlen_padded(
@@ -892,12 +909,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
-        flash_doc_segment_offsets: torch.Tensor,
-        flash_doc_segment_lengths: torch.Tensor,
-        flash_doc_cu_seqlens: torch.Tensor,
-        flash_active_tokens: int,
-        flash_doc_num_segments: int,
-        flash_doc_max_seqlen: int,
+        flash_meta: FlashBatchMeta,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -907,33 +919,37 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor query_layer: Projected queries in ``(B, S, H, D)`` layout.
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
-        :param torch.Tensor flash_doc_segment_offsets: Flat padded row offsets per segment.
-        :param torch.Tensor flash_doc_segment_lengths: Per-segment lengths.
-        :param torch.Tensor flash_doc_cu_seqlens: Cumulative packed offsets per segment.
-        :param int flash_active_tokens: Host-side total active tokens.
-        :param int flash_doc_num_segments: Host-side active doc-segment count.
-        :param int flash_doc_max_seqlen: Host-side maximum doc-segment length.
+        :param FlashBatchMeta flash_meta: FlashDeBERTa doc-block metadata bundle.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
         :return torch.Tensor: Flash output in ``(B, S, H, D)`` layout.
         """
 
+        if (
+            flash_meta.doc_segment_offsets is None
+            or flash_meta.doc_segment_lengths is None
+            or flash_meta.doc_cu_seqlens is None
+            or flash_meta.active_tokens_host is None
+            or flash_meta.doc_num_segments_host is None
+            or flash_meta.doc_max_segment_length_host is None
+        ):
+            raise RuntimeError("Doc-block flash route requires complete FlashBatchMeta.")
         out = flashdeberta_docblock(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            segment_offsets=flash_doc_segment_offsets,
-            segment_lengths=flash_doc_segment_lengths,
-            cu_seqlens=flash_doc_cu_seqlens,
+            segment_offsets=flash_meta.doc_segment_offsets,
+            segment_lengths=flash_meta.doc_segment_lengths,
+            cu_seqlens=flash_meta.doc_cu_seqlens,
             pos_key=pos_key,
             pos_query=pos_query,
             sm_scale=sm_scale,
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
-            num_segments=int(flash_doc_num_segments),
-            max_seqlen=int(flash_doc_max_seqlen),
-            total_tokens=int(flash_active_tokens),
+            num_segments=int(flash_meta.doc_num_segments_host),
+            max_seqlen=int(flash_meta.doc_max_segment_length_host),
+            total_tokens=int(flash_meta.active_tokens_host),
             causal=False,
         )
         if _RUNTIME_CONFIG.enable_debug_stats:
@@ -999,32 +1015,28 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         attention_mask: torch.Tensor | None,
         hidden_states: torch.Tensor,
         query_states: torch.Tensor,
-        flash_doc_segment_offsets: torch.Tensor | None,
-        flash_doc_segment_lengths: torch.Tensor | None,
-        flash_route_hint: str | None,
+        flash_meta: FlashBatchMeta | None,
     ) -> torch.Tensor | None:
         """Rebuild pairwise doc-block masks for eager fallback when needed.
 
         :param torch.Tensor | None attention_mask: Original attention mask.
         :param torch.Tensor hidden_states: Key/value hidden states.
         :param torch.Tensor query_states: Query hidden states.
-        :param torch.Tensor | None flash_doc_segment_offsets: Flat padded row offsets per segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Per-segment lengths.
-        :param str | None flash_route_hint: Flash route hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return torch.Tensor | None: Eager-compatible attention mask.
         """
 
-        if _normalize_flash_route_hint(flash_route_hint) != "docblock":
+        if flash_meta is None or flash_meta.normalized_route_hint() != "docblock":
             return attention_mask
-        if flash_doc_segment_offsets is None or flash_doc_segment_lengths is None:
+        if flash_meta.doc_segment_offsets is None or flash_meta.doc_segment_lengths is None:
             return attention_mask
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2])
         if query_len != key_len:
             return attention_mask
         doc_ids = doc_ids_from_segments(
-            offsets=flash_doc_segment_offsets,
-            lengths=flash_doc_segment_lengths,
+            offsets=flash_meta.doc_segment_offsets,
+            lengths=flash_meta.doc_segment_lengths,
             batch_size=int(hidden_states.shape[0]),
             seq_len=key_len,
         )
@@ -1038,14 +1050,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run flash-backed attention when the runtime contract is compatible.
 
@@ -1055,14 +1060,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side total active tokens.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
         """
 
@@ -1074,9 +1072,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             attention_mask=attention_mask,
             hidden_states=hidden_states,
             query_states=query_states,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
 
         if _RUNTIME_CONFIG.enable_debug_stats:
@@ -1087,7 +1083,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             attention_mask=attention_mask,
             query_states=query_states,
             rel_embeddings=rel_embeddings,
-            flash_route_hint=flash_route_hint,
+            flash_meta=flash_meta,
         )
         if reason is not None:
             key, message = reason
@@ -1112,16 +1108,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
-        normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
-        use_docblock_bias = normalized_flash_route == "docblock_bias"
-        use_docblock = normalized_flash_route == "docblock"
+        normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
+        use_docblock_bias = normalized_route == "docblock_bias"
+        use_docblock = normalized_route == "docblock"
         if use_docblock:
             use_varlen = True
         elif use_docblock_bias:
             use_varlen = False
-        elif normalized_flash_route == "varlen":
+        elif normalized_route == "varlen":
             use_varlen = True
-        elif normalized_flash_route in {"fixed", "dense", "pairwise"}:
+        elif normalized_route in {"fixed", "dense", "pairwise"}:
             use_varlen = False
         else:
             use_varlen = _should_use_varlen(
@@ -1193,12 +1189,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if use_docblock:
             if (
-                flash_doc_segment_offsets is None
-                or flash_doc_segment_lengths is None
-                or flash_doc_cu_seqlens is None
-                or flash_active_tokens is None
-                or flash_doc_num_segments is None
-                or flash_doc_max_seqlen is None
+                flash_meta is None
+                or flash_meta.doc_segment_offsets is None
+                or flash_meta.doc_segment_lengths is None
+                or flash_meta.doc_cu_seqlens is None
+                or flash_meta.active_tokens_host is None
+                or flash_meta.doc_num_segments_host is None
+                or flash_meta.doc_max_segment_length_host is None
             ):
                 if _RUNTIME_CONFIG.enable_debug_stats:
                     _record_stat("fallback_calls")
@@ -1329,12 +1326,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 query_layer=query_layer,
                 key_layer=key_layer,
                 value_layer=value_layer,
-                flash_doc_segment_offsets=flash_doc_segment_offsets,
-                flash_doc_segment_lengths=flash_doc_segment_lengths,
-                flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-                flash_active_tokens=int(flash_active_tokens),
-                flash_doc_num_segments=int(flash_doc_num_segments),
-                flash_doc_max_seqlen=int(flash_doc_max_seqlen),
+                flash_meta=flash_meta,
                 pos_key=pos_key,
                 pos_query=pos_query,
                 sm_scale=sm_scale,
@@ -1346,7 +1338,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 key_layer=key_layer,
                 value_layer=value_layer,
                 attention_mask=attention_mask,
-                flash_seq_lengths=flash_seq_lengths,
+                flash_meta=flash_meta,
                 pos_key=pos_key,
                 pos_query=pos_query,
                 sm_scale=sm_scale,
@@ -1374,7 +1366,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     key_layer=key_layer,
                     value_layer=value_layer,
                     attention_mask=attention_mask,
-                    flash_seq_lengths=flash_seq_lengths,
+                    flash_meta=flash_meta,
                     pos_key=pos_key,
                     pos_query=pos_query,
                     sm_scale=sm_scale,

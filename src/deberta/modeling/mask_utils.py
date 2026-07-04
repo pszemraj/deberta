@@ -45,23 +45,6 @@ class FlashBatchMeta:
         text = str(self.route_hint).strip().lower()
         return text if text else None
 
-    def to_legacy_kwargs(self) -> dict[str, torch.Tensor | str | None]:
-        """Return keyword arguments for existing flash-aware model call sites.
-
-        :return dict[str, torch.Tensor | str | None]: Legacy flash keyword payload.
-        """
-
-        return {
-            "flash_seq_lengths": self.seq_lengths,
-            "flash_doc_segment_offsets": self.doc_segment_offsets,
-            "flash_doc_segment_lengths": self.doc_segment_lengths,
-            "flash_doc_cu_seqlens": self.doc_cu_seqlens,
-            "flash_active_tokens": self.active_tokens_host,
-            "flash_doc_num_segments": self.doc_num_segments_host,
-            "flash_doc_max_seqlen": self.doc_max_segment_length_host,
-            "flash_route_hint": self.normalized_route_hint(),
-        }
-
 
 def normalize_keep_mask(mask: torch.Tensor, *, name: str = "attention_mask") -> torch.Tensor:
     """Normalize a keep-mask tensor to boolean without lossy float coercion.

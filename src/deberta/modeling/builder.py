@@ -612,12 +612,14 @@ def _apply_hf_config_normalization(
         "force_varlen": bool(model_cfg.hf.flash.force_varlen),
         "varlen_min_seq_len": int(model_cfg.hf.flash.varlen_min_seq_len),
         "docblock_bias_seq_len": int(model_cfg.hf.flash.docblock_bias_seq_len),
+        "local_bias_max_batch_size": int(model_cfg.hf.flash.local_bias_max_batch_size),
         "eager_dense_max_seq_len": int(model_cfg.hf.flash.eager_dense_max_seq_len),
         "kernel_overrides_path": model_cfg.hf.flash.kernel_overrides_path,
     }
     cfg.flash_force_varlen = bool(model_cfg.hf.flash.force_varlen)
     cfg.flash_varlen_min_seq_len = int(model_cfg.hf.flash.varlen_min_seq_len)
     cfg.flash_docblock_bias_seq_len = int(model_cfg.hf.flash.docblock_bias_seq_len)
+    cfg.flash_local_bias_max_batch_size = int(model_cfg.hf.flash.local_bias_max_batch_size)
     cfg.flash_eager_dense_max_seq_len = int(model_cfg.hf.flash.eager_dense_max_seq_len)
     cfg.flash_kernel_overrides_path = model_cfg.hf.flash.kernel_overrides_path
     cfg.use_rmsnorm_heads = False

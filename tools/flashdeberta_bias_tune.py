@@ -37,6 +37,7 @@ from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling.builder import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
 from deberta.modeling.flashdeberta_patch import enable_flashdeberta_attention  # noqa: E402
+from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
     _maybe_enable_tf32,
@@ -285,7 +286,7 @@ def _run_candidate(
         out = model(
             input_ids=sample.input_ids,
             attention_mask=sample.attention_mask,
-            flash_route_hint="docblock_bias",
+            flash_meta=FlashBatchMeta(route_hint="docblock_bias"),
         ).last_hidden_state
         loss = out.float().pow(2).mean()
         loss.backward()

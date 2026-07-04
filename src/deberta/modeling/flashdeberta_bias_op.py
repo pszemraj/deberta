@@ -9,7 +9,6 @@ the upstream Python autograd wrapper.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -139,56 +138,6 @@ def _kernel_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _bias_kernel_override_from_env(*, kind: str) -> tuple[int, int, int, int] | None:
-    """Return repo-side dense-bias kernel overrides when fully specified.
-
-    These overrides intentionally apply only to the repo's dense flash-with-bias
-    wrapper so doc-block tuning does not perturb the fixed or varlen paths.
-
-    Supported env vars:
-    - ``FLASHDEBERTA_BIAS_FWD_BLOCK_M``
-    - ``FLASHDEBERTA_BIAS_FWD_BLOCK_N``
-    - ``FLASHDEBERTA_BIAS_FWD_NUM_STAGES``
-    - ``FLASHDEBERTA_BIAS_FWD_NUM_WARPS``
-    - ``FLASHDEBERTA_BIAS_BWD_BLOCK_M``
-    - ``FLASHDEBERTA_BIAS_BWD_BLOCK_N``
-    - ``FLASHDEBERTA_BIAS_BWD_NUM_STAGES``
-    - ``FLASHDEBERTA_BIAS_BWD_NUM_WARPS``
-    - ``FLASHDEBERTA_BIAS_BWD_KV_BLOCK_M``
-    - ``FLASHDEBERTA_BIAS_BWD_KV_BLOCK_N``
-    - ``FLASHDEBERTA_BIAS_BWD_KV_NUM_STAGES``
-    - ``FLASHDEBERTA_BIAS_BWD_KV_NUM_WARPS``
-    - ``FLASHDEBERTA_BIAS_BWD_Q_BLOCK_M``
-    - ``FLASHDEBERTA_BIAS_BWD_Q_BLOCK_N``
-    - ``FLASHDEBERTA_BIAS_BWD_Q_NUM_STAGES``
-    - ``FLASHDEBERTA_BIAS_BWD_Q_NUM_WARPS``
-
-    :param str kind: One of ``"fwd"``, ``"bwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
-    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
-        or ``None`` when unset / invalid / incomplete.
-    """
-
-    normalized = str(kind).strip().lower()
-    if normalized not in {"fwd", "bwd", "bwd_kv", "bwd_q"}:
-        raise ValueError(f"Unsupported bias kernel override kind: {kind!r}")
-
-    prefix = f"FLASHDEBERTA_BIAS_{normalized.upper()}"
-    names = (
-        f"{prefix}_BLOCK_M",
-        f"{prefix}_BLOCK_N",
-        f"{prefix}_NUM_STAGES",
-        f"{prefix}_NUM_WARPS",
-    )
-    raw = [os.environ.get(name) for name in names]
-    if any(value is None or not str(value).strip() for value in raw):
-        return None
-    try:
-        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
-    except Exception:
-        return None
-    return int(block_m), int(block_n), int(num_stages), int(num_warps)
-
-
 def _bias_repo_tuned_config(
     *,
     kind: str,
@@ -286,9 +235,6 @@ def _bias_forward_config(
     )
     if tuned is not None:
         return tuned
-    override = _bias_kernel_override_from_env(kind="fwd")
-    if override is not None:
-        return override
     if _get_fwd_config_bias_lowlevel is None:
         raise RuntimeError("FlashDeBERTa local-bias config helper is unavailable.")
     return _get_fwd_config_bias_lowlevel(
@@ -338,9 +284,6 @@ def _bias_backward_config(
     )
     if tuned is not None:
         return tuned
-    override = _bias_kernel_override_from_env(kind="bwd")
-    if override is not None:
-        return override
     if _get_bwd_config_bias_lowlevel is None:
         raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
     return _get_bwd_config_bias_lowlevel(
@@ -402,14 +345,6 @@ def _resolve_bias_bwd_kernel_config(
     if repo_tuned is not None:
         return repo_tuned
 
-    specific_override = _bias_kernel_override_from_env(kind=f"bwd_{normalized_kind}")
-    if specific_override is not None:
-        return specific_override
-
-    generic_override = _bias_kernel_override_from_env(kind="bwd")
-    if generic_override is not None:
-        return generic_override
-
     return _bias_backward_config(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -455,6 +390,24 @@ def _should_use_specialized_docblock_bias_backward(
     if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype != bias.dtype:
         return False
     if int(q.shape[-1]) != 64:
+        return False
+    policy = resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=_bias_device_capability(q.device),
+            route="bias_docblock_specialized",
+            kind="bwd",
+            seq_len=max(int(q.shape[-2]), int(k.shape[-2])),
+            batch_size=int(q.shape[0]),
+            query_len=int(q.shape[-2]),
+            key_len=int(k.shape[-2]),
+            num_heads=int(q.shape[1]),
+            head_dim=int(q.shape[-1]),
+            dtype=_kernel_dtype_name(q.dtype),
+            causal=bool(causal),
+            has_mask=True,
+        )
+    )
+    if policy is None:
         return False
     if int(q.shape[-2]) != 1024 or int(k.shape[-2]) != 1024 or int(v.shape[-2]) != 1024:
         return False

@@ -48,23 +48,14 @@ except Exception:  # pragma: no cover - optional distributed dependency
     _TorchDTensor = None
 
 
-_FLASH_FORWARD_KEYS = (
-    "flash_seq_lengths",
-    "flash_doc_segment_offsets",
-    "flash_doc_segment_lengths",
-    "flash_doc_cu_seqlens",
-    "flash_active_tokens",
-    "flash_doc_num_segments",
-    "flash_doc_max_seqlen",
-    "flash_route_hint",
-)
+_FLASH_FORWARD_KEYS = ("flash_meta",)
 
 
 def _backbone_accepts_flash_kwargs(backbone: nn.Module) -> bool:
-    """Return whether a backbone forward can consume FlashDeBERTa metadata kwargs.
+    """Return whether a backbone forward can consume FlashDeBERTa metadata.
 
     :param nn.Module backbone: Backbone module to inspect.
-    :return bool: True when all flash kwargs or a ``**kwargs`` catch-all are declared.
+    :return bool: True when ``flash_meta`` or a ``**kwargs`` catch-all is declared.
     """
 
     try:
@@ -73,60 +64,7 @@ def _backbone_accepts_flash_kwargs(backbone: nn.Module) -> bool:
         return False
     if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
         return True
-    if "flash_meta" in params:
-        return True
     return all(key in params for key in _FLASH_FORWARD_KEYS)
-
-
-def _flash_meta_from_legacy_kwargs(
-    *,
-    flash_meta: FlashBatchMeta | None = None,
-    flash_seq_lengths: torch.Tensor | None = None,
-    flash_doc_segment_offsets: torch.Tensor | None = None,
-    flash_doc_segment_lengths: torch.Tensor | None = None,
-    flash_doc_cu_seqlens: torch.Tensor | None = None,
-    flash_active_tokens: int | None = None,
-    flash_doc_num_segments: int | None = None,
-    flash_doc_max_seqlen: int | None = None,
-    flash_route_hint: str | None = None,
-) -> FlashBatchMeta | None:
-    """Resolve a metadata bundle from new or legacy flash arguments.
-
-    :param FlashBatchMeta | None flash_meta: Preferred metadata bundle.
-    :param torch.Tensor | None flash_seq_lengths: Legacy per-example active lengths.
-    :param torch.Tensor | None flash_doc_segment_offsets: Legacy segment offsets.
-    :param torch.Tensor | None flash_doc_segment_lengths: Legacy segment lengths.
-    :param torch.Tensor | None flash_doc_cu_seqlens: Legacy cumulative document offsets.
-    :param int | None flash_active_tokens: Legacy host active-token count.
-    :param int | None flash_doc_num_segments: Legacy host active doc-segment count.
-    :param int | None flash_doc_max_seqlen: Legacy host maximum doc-segment length.
-    :param str | None flash_route_hint: Legacy route hint.
-    :return FlashBatchMeta | None: Resolved metadata or ``None``.
-    """
-
-    if flash_meta is not None:
-        return flash_meta
-    if (
-        flash_seq_lengths is None
-        and flash_doc_segment_offsets is None
-        and flash_doc_segment_lengths is None
-        and flash_doc_cu_seqlens is None
-        and flash_active_tokens is None
-        and flash_doc_num_segments is None
-        and flash_doc_max_seqlen is None
-        and flash_route_hint is None
-    ):
-        return None
-    return FlashBatchMeta(
-        seq_lengths=flash_seq_lengths,
-        doc_segment_offsets=flash_doc_segment_offsets,
-        doc_segment_lengths=flash_doc_segment_lengths,
-        doc_cu_seqlens=flash_doc_cu_seqlens,
-        active_tokens_host=flash_active_tokens,
-        doc_num_segments_host=flash_doc_num_segments,
-        doc_max_segment_length_host=flash_doc_max_seqlen,
-        route_hint=flash_route_hint,
-    )
 
 
 # -----------------------------------------------------------------------------
@@ -525,14 +463,6 @@ class EnhancedMaskDecoder(nn.Module):
         position_ids: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         flash_meta: FlashBatchMeta | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
     ) -> torch.Tensor:
         """Return hidden states for masked positions, using EMD when applicable.
 
@@ -554,37 +484,10 @@ class EnhancedMaskDecoder(nn.Module):
                 Optional precomputed relative-position ids (for disentangled attention).
             flash_meta:
                 Optional FlashDeBERTa metadata bundle for the reused last layer.
-            flash_seq_lengths:
-                Optional precomputed active lengths for flash backends.
-            flash_doc_segment_offsets:
-                Optional flat padded row offsets per doc segment.
-            flash_doc_segment_lengths:
-                Optional per-segment doc lengths.
-            flash_doc_cu_seqlens:
-                Optional cumulative packed doc offsets.
-            flash_active_tokens:
-                Optional host-side active token count for flash route planning.
-            flash_doc_num_segments:
-                Optional host-side document segment count for docblock routes.
-            flash_doc_max_seqlen:
-                Optional host-side maximum document segment length for docblock routes.
-            flash_route_hint:
-                Optional flash backend routing hint for the reused last layer.
 
         Returns:
             Tensor (N,H) of contextual states for masked positions.
         """
-        flash_meta = _flash_meta_from_legacy_kwargs(
-            flash_meta=flash_meta,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
-        )
 
         if isinstance(encoder_hidden_states, tuple):
             hs = list(encoder_hidden_states)
@@ -675,7 +578,7 @@ class EnhancedMaskDecoder(nn.Module):
                 "rel_embeddings": rel_embeddings,
             }
             if flash_meta is not None:
-                last_layer_kwargs.update(flash_meta.to_legacy_kwargs())
+                last_layer_kwargs["flash_meta"] = flash_meta
             out, _att = last_layer(
                 kv_states,
                 attn,
@@ -1142,14 +1045,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         token_type_ids: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
         flash_meta: FlashBatchMeta | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
     ) -> RTDGeneratorPhaseOutput:
         """Run generator forward/corruption only, returning discriminator targets.
 
@@ -1159,30 +1054,11 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param float sampling_temperature: Generator sampling temperature.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
         :return RTDGeneratorPhaseOutput: Generator loss and corruption artifacts.
         """
 
         if labels is None:
             raise ValueError("labels must be provided (MLM labels with -100 for unmasked positions)")
-        flash_meta = _flash_meta_from_legacy_kwargs(
-            flash_meta=flash_meta,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
-        )
 
         ignore_index = -100
         masked_positions = labels.ne(ignore_index)  # (B,S)
@@ -1207,7 +1083,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             "return_dict": True,
         }
         if flash_meta is not None and self._generator_accepts_flash_kwargs:
-            gen_forward_kwargs.update(flash_meta.to_legacy_kwargs())
+            gen_forward_kwargs["flash_meta"] = flash_meta
         if use_emd:
             gen_forward_kwargs["output_hidden_states"] = True
 
@@ -1281,14 +1157,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         flash_meta: FlashBatchMeta | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
     ) -> RTDDiscriminatorPhaseOutput:
         """Run discriminator scoring only, given prebuilt corrupted ids/labels.
 
@@ -1298,28 +1166,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
         :return RTDDiscriminatorPhaseOutput: Discriminator loss and metrics.
         """
 
-        flash_meta = _flash_meta_from_legacy_kwargs(
-            flash_meta=flash_meta,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
-        )
         disc_forward_kwargs: dict[str, Any] = {
             "input_ids": corrupted_input_ids,
             "attention_mask": attention_mask,
@@ -1327,7 +1176,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             "return_dict": True,
         }
         if flash_meta is not None and self._discriminator_accepts_flash_kwargs:
-            disc_forward_kwargs.update(flash_meta.to_legacy_kwargs())
+            disc_forward_kwargs["flash_meta"] = flash_meta
         disc_out = self.discriminator(**disc_forward_kwargs)
         disc_hidden = disc_out.last_hidden_state
         disc_logits = self.discriminator_head(disc_hidden, attention_mask=attention_mask)
@@ -1377,14 +1226,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         corrupted_input_ids: torch.Tensor | None = None,
         disc_labels: torch.Tensor | None = None,
         flash_meta: FlashBatchMeta | None = None,
-        flash_seq_lengths: torch.Tensor | None = None,
-        flash_doc_segment_offsets: torch.Tensor | None = None,
-        flash_doc_segment_lengths: torch.Tensor | None = None,
-        flash_doc_cu_seqlens: torch.Tensor | None = None,
-        flash_active_tokens: int | None = None,
-        flash_doc_num_segments: int | None = None,
-        flash_doc_max_seqlen: int | None = None,
-        flash_route_hint: str | None = None,
     ) -> RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
         """Run RTD forward in combined or phase-specific mode.
 
@@ -1399,28 +1240,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None corrupted_input_ids: Precomputed corrupted ids for ``phase='discriminator'``.
         :param torch.Tensor | None disc_labels: Precomputed RTD labels for ``phase='discriminator'``.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :param torch.Tensor | None flash_seq_lengths: Optional precomputed per-example active lengths for flash backends.
-        :param torch.Tensor | None flash_doc_segment_offsets: Optional flat padded row offsets per doc segment.
-        :param torch.Tensor | None flash_doc_segment_lengths: Optional per-segment doc lengths.
-        :param torch.Tensor | None flash_doc_cu_seqlens: Optional cumulative packed doc offsets.
-        :param int | None flash_active_tokens: Optional host-side active token count.
-        :param int | None flash_doc_num_segments: Optional host-side active doc-segment count.
-        :param int | None flash_doc_max_seqlen: Optional host-side maximum doc-segment length.
-        :param str | None flash_route_hint: Optional flash backend routing hint.
         :return RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
             Combined output for ``phase='both'``; phase-local outputs otherwise.
         """
-        flash_meta = _flash_meta_from_legacy_kwargs(
-            flash_meta=flash_meta,
-            flash_seq_lengths=flash_seq_lengths,
-            flash_doc_segment_offsets=flash_doc_segment_offsets,
-            flash_doc_segment_lengths=flash_doc_segment_lengths,
-            flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-            flash_active_tokens=flash_active_tokens,
-            flash_doc_num_segments=flash_doc_num_segments,
-            flash_doc_max_seqlen=flash_doc_max_seqlen,
-            flash_route_hint=flash_route_hint,
-        )
         phase_norm = str(phase or "both").strip().lower()
         if phase_norm == "generator":
             if labels is None:

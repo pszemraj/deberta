@@ -468,6 +468,7 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
                 "force_varlen": True,
                 "varlen_min_seq_len": 4096,
                 "docblock_bias_seq_len": 0,
+                "local_bias_max_batch_size": 2,
                 "eager_dense_max_seq_len": 512,
             },
         },
@@ -485,6 +486,7 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         assert built_cfg.hf_flash["force_varlen"] is True
         assert built_cfg.hf_flash["varlen_min_seq_len"] == 4096
         assert built_cfg.flash_docblock_bias_seq_len == 0
+        assert built_cfg.flash_local_bias_max_batch_size == 2
         assert built_cfg.flash_eager_dense_max_seq_len == 512
 
 

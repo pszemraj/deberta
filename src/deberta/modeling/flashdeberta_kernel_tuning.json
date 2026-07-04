@@ -60,6 +60,38 @@
   "kernels": [
     {
       "compute_capability": "sm_120",
+      "route": "fixed",
+      "kind": "fwd",
+      "seq_bucket": "1024_exact",
+      "head_dim": 64,
+      "query_len": 1024,
+      "key_len": 1024,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 64,
+      "block_n": 64,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "fixed",
+      "kind": "bwd",
+      "seq_bucket": "1024_exact",
+      "head_dim": 64,
+      "query_len": 1024,
+      "key_len": 1024,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 16,
+      "block_n": 16,
+      "num_stages": 1,
+      "num_warps": 2
+    },
+    {
+      "compute_capability": "sm_120",
       "route": "varlen",
       "kind": "bwd_kv",
       "seq_bucket": "2048_medium",
@@ -154,6 +186,21 @@
       "block_n": 128,
       "num_stages": 2,
       "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd",
+      "seq_bucket": "1024_exact",
+      "head_dim": 64,
+      "query_len": 1024,
+      "key_len": 1024,
+      "max_batch_size": 4,
+      "causal": false,
+      "block_m": 16,
+      "block_n": 16,
+      "num_stages": 1,
+      "num_warps": 2
     }
   ]
 }

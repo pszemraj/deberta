@@ -13,10 +13,11 @@ wrapper so semantics stay unchanged when the low-level pieces are unavailable.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
+
+from deberta.modeling.flashdeberta_kernel_tuning import FlashKernelContext, resolve_flash_kernel_config
 
 try:
     from flashdeberta.ops.flash_attention import (
@@ -161,12 +162,6 @@ def _fixed_repo_tuned_config(
 ) -> tuple[int, int, int, int] | None:
     """Return repo-local tuned kernel configs for measured hot paths.
 
-    Upstream FlashDeBERTa does not currently special-case ``sm_120``. On the
-    repo's dense DeBERTa ``1024 x 1024`` backward regime, the stock
-    ``64 x 64`` backward tile materially underperforms a smaller ``16 x 16``
-    tile on measured ``sm_120`` hardware. Keep this override narrow and fall
-    back to upstream selection everywhere else.
-
     :param str kind: Either ``"fwd"`` or ``"bwd"``.
     :param int query_len: Query sequence length.
     :param int key_len: Key sequence length.
@@ -180,70 +175,24 @@ def _fixed_repo_tuned_config(
         or ``None`` when no repo-local override applies.
     """
 
-    del dtype
     normalized_kind = str(kind).strip().lower()
     if normalized_kind not in {"fwd", "bwd"}:
         return None
-    if bool(causal) or not bool(disentangled):
-        return None
-    if int(head_dim) > 64:
-        return None
-    if int(query_len) != 1024 or int(key_len) != 1024:
-        return None
-    if int(att_span) < 128:
-        return None
-    capability = _fixed_device_capability(device)
-    if int(capability[0]) < 12:
-        return None
-    if normalized_kind == "fwd":
-        return (64, 64, 2, 4)
-    return (16, 16, 1, 2)
-
-
-def _fixed_kernel_override_from_env(
-    *,
-    kind: str,
-) -> tuple[int, int, int, int] | None:
-    """Return repo-side fixed-kernel overrides when fully specified.
-
-    These overrides intentionally apply only to the repo's fixed-length wrapper.
-    They exist so dense fixed-kernel tuning can be done without also perturbing
-    the padded-varlen path.
-
-    Supported env vars:
-    - ``FLASHDEBERTA_FIXED_FWD_BLOCK_M``
-    - ``FLASHDEBERTA_FIXED_FWD_BLOCK_N``
-    - ``FLASHDEBERTA_FIXED_FWD_NUM_STAGES``
-    - ``FLASHDEBERTA_FIXED_FWD_NUM_WARPS``
-    - ``FLASHDEBERTA_FIXED_BWD_BLOCK_M``
-    - ``FLASHDEBERTA_FIXED_BWD_BLOCK_N``
-    - ``FLASHDEBERTA_FIXED_BWD_NUM_STAGES``
-    - ``FLASHDEBERTA_FIXED_BWD_NUM_WARPS``
-
-    :param str kind: Either ``"fwd"`` or ``"bwd"``.
-    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
-        or ``None`` when unset / invalid / incomplete.
-    """
-
-    normalized = str(kind).strip().lower()
-    if normalized not in {"fwd", "bwd"}:
-        raise ValueError(f"Unsupported fixed kernel override kind: {kind!r}")
-
-    prefix = f"FLASHDEBERTA_FIXED_{normalized.upper()}"
-    names = (
-        f"{prefix}_BLOCK_M",
-        f"{prefix}_BLOCK_N",
-        f"{prefix}_NUM_STAGES",
-        f"{prefix}_NUM_WARPS",
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=_fixed_device_capability(device),
+            route="fixed",
+            kind=normalized_kind,
+            seq_len=max(int(query_len), int(key_len)),
+            query_len=int(query_len),
+            key_len=int(key_len),
+            head_dim=int(head_dim),
+            dtype=str(dtype).removeprefix("torch."),
+            causal=bool(causal),
+            disentangled=bool(disentangled),
+            att_span=int(att_span),
+        )
     )
-    raw = [os.environ.get(name) for name in names]
-    if any(value is None or not str(value).strip() for value in raw):
-        return None
-    try:
-        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
-    except Exception:
-        return None
-    return int(block_m), int(block_n), int(num_stages), int(num_warps)
 
 
 def _fixed_use_triton_op() -> bool:
@@ -315,7 +264,6 @@ def _fixed_forward_config(
     """
 
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
-    override = _fixed_kernel_override_from_env(kind="fwd")
     tuned = _fixed_repo_tuned_config(
         kind="fwd",
         query_len=query_len,
@@ -327,8 +275,6 @@ def _fixed_forward_config(
         dtype=dtype,
         device=device,
     )
-    if override is not None:
-        return override
     if tuned is not None:
         return tuned
     if _get_fwd_config_lowlevel is None:
@@ -376,7 +322,6 @@ def _fixed_backward_config(
     """
 
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
-    override = _fixed_kernel_override_from_env(kind="bwd")
     tuned = _fixed_repo_tuned_config(
         kind="bwd",
         query_len=query_len,
@@ -388,8 +333,6 @@ def _fixed_backward_config(
         dtype=dtype,
         device=device,
     )
-    if override is not None:
-        return override
     if tuned is not None:
         return tuned
     if _get_bwd_config_lowlevel is None:
@@ -1245,6 +1188,5 @@ __all__ = [
     "flashdeberta_compiled_fixed_available",
     "flashdeberta_fixed",
     "flashdeberta_fixed_import_error",
-    "_fixed_kernel_override_from_env",
     "_fixed_repo_tuned_config",
 ]

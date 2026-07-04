@@ -11,6 +11,8 @@ import warnings
 import pytest
 import torch
 
+from deberta.modeling.mask_utils import FlashBatchMeta
+
 
 def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Install a minimal in-memory FlashDeBERTa module tree for tests.
@@ -1198,27 +1200,6 @@ def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
     assert torch.equal(cached_delta, expected_delta)
 
 
-def test_varlen_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
-
-    for name in (
-        "FLASHDEBERTA_VARLEN_BWD_BLOCK_M",
-        "FLASHDEBERTA_VARLEN_BWD_BLOCK_N",
-        "FLASHDEBERTA_VARLEN_BWD_NUM_STAGES",
-        "FLASHDEBERTA_VARLEN_BWD_NUM_WARPS",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") is None
-
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_M", "64")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_STAGES", "3")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_WARPS", "8")
-
-    assert varlen_mod._varlen_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
-
-
 def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch: pytest.MonkeyPatch) -> None:
     module_names = [
         "deberta.modeling.flashdeberta_prefix_pack",
@@ -1494,13 +1475,15 @@ def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cp
         attention_mask=doc_ids.ne(0),
         output_attentions=True,
         rel_embeddings=rel_embeddings,
-        flash_route_hint="docblock",
-        flash_doc_segment_offsets=segment_offsets,
-        flash_doc_segment_lengths=segment_lengths,
-        flash_doc_cu_seqlens=cu_seqlens,
-        flash_active_tokens=seq_len,
-        flash_doc_num_segments=2,
-        flash_doc_max_seqlen=seq_len // 2,
+        flash_meta=FlashBatchMeta(
+            doc_segment_offsets=segment_offsets,
+            doc_segment_lengths=segment_lengths,
+            doc_cu_seqlens=cu_seqlens,
+            active_tokens_host=seq_len,
+            doc_num_segments_host=2,
+            doc_max_segment_length_host=seq_len // 2,
+            route_hint="docblock",
+        ),
     )
 
     assert probs is not None
@@ -1662,13 +1645,15 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
         attention_mask=attention_mask,
         output_attentions=True,
         rel_embeddings=rel_embeddings,
-        flash_route_hint="docblock",
-        flash_doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32),
-        flash_doc_segment_lengths=torch.tensor([2, 1], dtype=torch.int32),
-        flash_doc_cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
-        flash_active_tokens=3,
-        flash_doc_num_segments=2,
-        flash_doc_max_seqlen=2,
+        flash_meta=FlashBatchMeta(
+            doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32),
+            doc_segment_lengths=torch.tensor([2, 1], dtype=torch.int32),
+            doc_cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+            active_tokens_host=3,
+            doc_num_segments_host=2,
+            doc_max_segment_length_host=2,
+            route_hint="docblock",
+        ),
     )
 
     assert probs is None
@@ -1738,7 +1723,7 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
         attention_mask=attention_mask,
         output_attentions=True,
         rel_embeddings=rel_embeddings,
-        flash_route_hint="docblock_bias",
+        flash_meta=FlashBatchMeta(route_hint="docblock_bias"),
     )
 
     assert probs is None
@@ -1877,6 +1862,7 @@ def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
 def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
+    torch.manual_seed(0)
     bucket_index = torch.tensor(
         [
             [1, 1, 2, 3],
@@ -1897,20 +1883,12 @@ def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
     gather_index = bucket_index.view(1, 1, 4, 4).expand(grad.shape[0], grad.shape[1], -1, -1)
     expected = torch.zeros((2, 3, 4, 4), dtype=torch.float32).scatter_add_(-1, gather_index, grad)
 
-    assert torch.allclose(actual, expected)
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_varlen_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_M", "32")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_STAGES", "2")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_NUM_WARPS", "4")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_M", "64")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_NUM_STAGES", "3")
-    monkeypatch.setenv("FLASHDEBERTA_VARLEN_BWD_KV_NUM_WARPS", "8")
     monkeypatch.setattr(varlen_mod, "_varlen_repo_tuned_bwd_config", lambda **kwargs: None)
     monkeypatch.setattr(varlen_mod, "_get_bwd_config_varlen_lowlevel", lambda **kwargs: (16, 16, 1, 2))
 
@@ -1943,8 +1921,8 @@ def test_varlen_bwd_config_resolution_prefers_specific_override(monkeypatch: pyt
         device=torch.device("cpu"),
     )
 
-    assert kv_config == (64, 64, 3, 8)
-    assert q_config == (32, 64, 2, 4)
+    assert kv_config == (16, 16, 1, 2)
+    assert q_config == (16, 16, 1, 2)
 
 
 def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2024,27 +2002,6 @@ def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
     assert dpos_query.stride() == (84, 21, 7, 1)
 
 
-def test_fixed_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    import deberta.modeling.flashdeberta_fixed_op as fixed_mod
-
-    for name in (
-        "FLASHDEBERTA_FIXED_BWD_BLOCK_M",
-        "FLASHDEBERTA_FIXED_BWD_BLOCK_N",
-        "FLASHDEBERTA_FIXED_BWD_NUM_STAGES",
-        "FLASHDEBERTA_FIXED_BWD_NUM_WARPS",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    assert fixed_mod._fixed_kernel_override_from_env(kind="bwd") is None
-
-    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_BLOCK_M", "64")
-    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_NUM_STAGES", "3")
-    monkeypatch.setenv("FLASHDEBERTA_FIXED_BWD_NUM_WARPS", "8")
-
-    assert fixed_mod._fixed_kernel_override_from_env(kind="bwd") == (64, 64, 3, 8)
-
-
 def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_fixed_op as fixed_mod
 
@@ -2090,38 +2047,9 @@ def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.Mo
     )
 
 
-def test_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bias_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_bias_op as bias_mod
 
-    for name in (
-        "FLASHDEBERTA_BIAS_BWD_BLOCK_M",
-        "FLASHDEBERTA_BIAS_BWD_BLOCK_N",
-        "FLASHDEBERTA_BIAS_BWD_NUM_STAGES",
-        "FLASHDEBERTA_BIAS_BWD_NUM_WARPS",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    assert bias_mod._bias_kernel_override_from_env(kind="bwd") is None
-
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_M", "32")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_STAGES", "2")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_WARPS", "4")
-
-    assert bias_mod._bias_kernel_override_from_env(kind="bwd") == (32, 64, 2, 4)
-
-
-def test_bias_bwd_config_resolution_prefers_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    import deberta.modeling.flashdeberta_bias_op as bias_mod
-
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_M", "32")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_STAGES", "2")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_NUM_WARPS", "4")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_BLOCK_M", "64")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_BLOCK_N", "128")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_NUM_STAGES", "3")
-    monkeypatch.setenv("FLASHDEBERTA_BIAS_BWD_KV_NUM_WARPS", "8")
     monkeypatch.setattr(bias_mod, "_bias_repo_tuned_config", lambda **kwargs: None)
     monkeypatch.setattr(bias_mod, "_get_bwd_config_bias_lowlevel", lambda *args, **kwargs: (16, 16, 1, 2))
 
@@ -2148,8 +2076,8 @@ def test_bias_bwd_config_resolution_prefers_specific_override(monkeypatch: pytes
         device=torch.device("cpu"),
     )
 
-    assert kv_config == (64, 128, 3, 8)
-    assert q_config == (32, 64, 2, 4)
+    assert kv_config == (16, 16, 1, 2)
+    assert q_config == (16, 16, 1, 2)
 
 
 def test_bias_backward_dispatches_to_specialized_docblock_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2205,25 +2133,25 @@ def test_bias_backward_dispatches_to_specialized_docblock_path(monkeypatch: pyte
     assert torch.equal(d_bias, torch.ones_like(bias))
 
 
-def test_dense_bias_kernel_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+def test_specialized_docblock_bias_policy_is_table_gated() -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import FlashKernelContext, resolve_flash_kernel_config
 
-    for name in (
-        "FLASHDEBERTA_DENSE_BIAS_BLOCK_M",
-        "FLASHDEBERTA_DENSE_BIAS_BLOCK_N",
-        "FLASHDEBERTA_DENSE_BIAS_NUM_STAGES",
-        "FLASHDEBERTA_DENSE_BIAS_NUM_WARPS",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    base = dict(
+        compute_capability=(12, 0),
+        route="bias_docblock_specialized",
+        kind="bwd",
+        seq_len=1024,
+        query_len=1024,
+        key_len=1024,
+        num_heads=12,
+        head_dim=64,
+        dtype="bfloat16",
+        causal=False,
+        has_mask=True,
+    )
 
-    assert dense_bias_mod._dense_bias_kernel_override_from_env() is None
-
-    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_BLOCK_M", "128")
-    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_BLOCK_N", "64")
-    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_NUM_STAGES", "3")
-    monkeypatch.setenv("FLASHDEBERTA_DENSE_BIAS_NUM_WARPS", "4")
-
-    assert dense_bias_mod._dense_bias_kernel_override_from_env() == (128, 64, 3, 4)
+    assert resolve_flash_kernel_config(FlashKernelContext(batch_size=4, **base)) == (16, 16, 1, 2)
+    assert resolve_flash_kernel_config(FlashKernelContext(batch_size=5, **base)) is None
 
 
 def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: pytest.MonkeyPatch) -> None:

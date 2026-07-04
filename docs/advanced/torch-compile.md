@@ -51,12 +51,12 @@ kernels and backward passes. The current routing contract is:
 That split is deliberate. On the repo's measured unpacked `1024` RTD regime,
 the compile-clean fixed path outperformed the varlen backward kernels, while
 the varlen path pulled back ahead again for longer padded contexts.
-Set `FLASHDEBERTA_VARLEN_MIN_SEQ_LEN=1024` if you need to force the older
+Set `model.hf.flash.varlen_min_seq_len=1024` if you need to force the older
 "all padded batches go varlen" policy for debugging or machine-specific
 comparisons.
 
-Dense packed `1024` has one additional fast path: for small-batch non-causal
-training where DeBERTa relative terms are present, the adapter can materialize
+Dense packed `1024` has one additional fast path: for config-selected small-batch
+non-causal training where DeBERTa relative terms are present, the adapter can materialize
 the dense relative bias matrix and route through FlashDeBERTa's flash-with-bias
 kernels. That path is opaque to Dynamo in the same way as the fixed and varlen
 custom ops, so it behaves like a normal compiled attention primitive instead of
@@ -82,33 +82,29 @@ builder overhead before the flash bias kernels run.
 Its backward path now also saves bucket-range metadata through the custom-op
 context and reduces dense bias gradients with contiguous segment reductions
 instead of the earlier `scatter_add_` / `scatter_reduce_` heavy fallback.
-The builder has its own tuning seam as well:
-- `FLASHDEBERTA_DENSE_BIAS_BLOCK_M`
-- `FLASHDEBERTA_DENSE_BIAS_BLOCK_N`
-- `FLASHDEBERTA_DENSE_BIAS_NUM_STAGES`
-- `FLASHDEBERTA_DENSE_BIAS_NUM_WARPS`
-
-Those overrides affect only the repo-local dense-bias assembly op, not the
-downstream flash-with-bias attention kernels.
+The builder has its own tuning entry in `flashdeberta_kernel_tuning.json`, so
+retuning that assembly op does not perturb the downstream flash-with-bias
+attention kernels.
 The current measured `sm_120` packed-docblock `1024` default for that builder
 is `64 x 128, stages=2, warps=4`.
-That dense flash-with-bias route now has its own repo-local tuning seam too:
-`FLASHDEBERTA_BIAS_FWD_*`, the generic `FLASHDEBERTA_BIAS_BWD_*` fallback, and
-the more specific `FLASHDEBERTA_BIAS_BWD_KV_*` / `FLASHDEBERTA_BIAS_BWD_Q_*`
-overrides are resolved inside the opaque bias wrapper before it falls back to
-upstream FlashDeBERTa config selection, so packed-docblock kernel tuning stays
-isolated from the fixed and varlen routes. The repo now launches the raw bias
-backward `KV` and `Q` Triton kernels directly, which makes those two backward
-surfaces independently tunable without forking the whole attention wrapper.
+That dense flash-with-bias route now has its own repo-local tuning seam too.
+The opaque bias wrapper checks `flashdeberta_kernel_tuning.json` before falling
+back to upstream FlashDeBERTa config selection, so packed-docblock kernel tuning
+stays isolated from the fixed and varlen routes. The repo now launches the raw
+bias backward `KV` and `Q` Triton kernels directly, which makes those two
+backward surfaces independently tunable without forking the whole attention
+wrapper.
 For the measured packed-docblock `1024` hot path, the wrapper now goes one step
 further: when the run is non-causal, bf16/fp16, `D=64`, and the additive bias
-is a full dense `(B,H,1024,1024)` tensor, the backward path dispatches exact-
-match repo-local `_bwd_kv_kernel_docblock1024` / `_bwd_q_kernel_docblock1024`
-Triton kernels instead of the more generic FlashDeBERTa bias backward launcher.
-That specialization is intentionally narrow and stays behind the same opaque
-custom op boundary, so Dynamo still sees one stable flash-with-bias primitive.
-Outside that exact regime, the wrapper falls back to the generic raw bias
-backward kernels and the normal override/tuning path.
+is a full dense `(B,H,1024,1024)` tensor, a matching
+`bias_docblock_specialized` entry in `flashdeberta_kernel_tuning.json` enables
+the exact-match repo-local `_bwd_kv_kernel_docblock1024` /
+`_bwd_q_kernel_docblock1024` Triton kernels instead of the more generic
+FlashDeBERTa bias backward launcher. That specialization is intentionally
+narrow and stays behind the same opaque custom op boundary, so Dynamo still
+sees one stable flash-with-bias primitive. Outside that exact regime or table
+policy, the wrapper falls back to the generic raw bias backward kernels and the
+normal tuning path.
 
 The padded-varlen custom op now uses a `B,S,H,D` internal layout and repo-local
 prefix-pack Triton kernels. Because repo masks use standard prefix padding,
@@ -132,9 +128,7 @@ Those tuned buckets are enough for the current branch to beat eager end to end
 on the provided unpacked `2048` and `4096` configs while staying compile-stable.
 If you need to retune for another GPU, use `tools/flashdeberta_varlen_tune.py`
 first and put durable results in a JSON table selected with
-`model.hf.flash.kernel_overrides_path`. Legacy `FLASHDEBERTA_VARLEN_*`
-environment overrides remain diagnostic-only fallbacks for one-off local
-experiments.
+`model.hf.flash.kernel_overrides_path`.
 
 ## Special case: packed doc-block masks
 
@@ -146,9 +140,11 @@ described above when `model.hf.attention_impl=flash` is set:
 
 Set `model.hf.flash.docblock_bias_seq_len=0` to disable the dense-bias shortcut,
 or point it at a different exact sequence length if another machine bucket
-proves a different crossover. The older `FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN`
-environment variable remains a diagnostic fallback for tooling that does not
-load a repo config.
+proves a different crossover. Set `model.hf.flash.local_bias_max_batch_size=0`
+to disable the small-batch dense local-bias route without changing the doc-block
+sequence split. The older `FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN` environment
+variable remains a diagnostic fallback for tooling that does not load a repo
+config.
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope
 downgrades toward FFN-focused compile to avoid shape-churn recompiles from

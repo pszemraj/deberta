@@ -14,7 +14,6 @@ existing semantics via cached row-range reductions derived from the bucket map.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -87,35 +86,6 @@ def _lookup_registered_op(namespace: str, name: str) -> Any | None:
         return None
     op = getattr(ns, name)
     return getattr(op, "default", op)
-
-
-def _dense_bias_kernel_override_from_env() -> tuple[int, int, int, int] | None:
-    """Return dense-bias builder launch overrides when fully specified.
-
-    Supported env vars:
-    - ``FLASHDEBERTA_DENSE_BIAS_BLOCK_M``
-    - ``FLASHDEBERTA_DENSE_BIAS_BLOCK_N``
-    - ``FLASHDEBERTA_DENSE_BIAS_NUM_STAGES``
-    - ``FLASHDEBERTA_DENSE_BIAS_NUM_WARPS``
-
-    :return tuple[int, int, int, int] | None: Override ``(BLOCK_M, BLOCK_N, stages, warps)``
-        or ``None`` when unset / invalid / incomplete.
-    """
-
-    names = (
-        "FLASHDEBERTA_DENSE_BIAS_BLOCK_M",
-        "FLASHDEBERTA_DENSE_BIAS_BLOCK_N",
-        "FLASHDEBERTA_DENSE_BIAS_NUM_STAGES",
-        "FLASHDEBERTA_DENSE_BIAS_NUM_WARPS",
-    )
-    raw = [os.environ.get(name) for name in names]
-    if any(value is None or not str(value).strip() for value in raw):
-        return None
-    try:
-        block_m, block_n, num_stages, num_warps = (int(str(value).strip()) for value in raw)
-    except Exception:
-        return None
-    return int(block_m), int(block_n), int(num_stages), int(num_warps)
 
 
 def _dense_bias_repo_tuned_config(
@@ -194,9 +164,6 @@ def _dense_bias_kernel_config(
     )
     if tuned is not None:
         return tuned
-    override = _dense_bias_kernel_override_from_env()
-    if override is not None:
-        return override
     return (64, 64, 2, 4)
 
 

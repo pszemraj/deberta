@@ -210,6 +210,21 @@ def _entry_matches(context: FlashKernelContext, entry: dict[str, Any]) -> bool:
         expected = entry.get(key)
         if expected is not None and value is not None and int(expected) != int(value):
             return False
+    range_int_fields = (
+        ("batch_size", context.batch_size),
+        ("query_len", context.query_len),
+        ("key_len", context.key_len),
+        ("num_heads", context.num_heads),
+    )
+    for key, value in range_int_fields:
+        if value is None:
+            continue
+        min_expected = entry.get(f"min_{key}")
+        max_expected = entry.get(f"max_{key}")
+        if min_expected is not None and int(value) < int(min_expected):
+            return False
+        if max_expected is not None and int(value) > int(max_expected):
+            return False
     exact_bool_fields = (
         ("causal", context.causal),
         ("disentangled", context.disentangled),

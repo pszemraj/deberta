@@ -38,6 +38,7 @@ from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling.builder import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
 from deberta.modeling.flashdeberta_patch import enable_flashdeberta_attention  # noqa: E402
+from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
     _maybe_enable_tf32,
@@ -55,7 +56,7 @@ class BatchSample:
     index: int
     input_ids: torch.Tensor
     attention_mask: torch.Tensor | None
-    flash_seq_lengths: torch.Tensor | None
+    flash_meta: FlashBatchMeta | None
     active_tokens: int
     slot_tokens: int
     batch_size: int
@@ -229,14 +230,9 @@ def _sample_batches(
             continue
         input_ids = batch["input_ids"].detach().clone()
         attention_mask = batch.get("attention_mask")
-        flash_seq_lengths = batch.get("flash_seq_lengths")
         seq_len = int(input_ids.shape[-1])
         batch_size = int(input_ids.shape[0])
-        active_tokens_value = batch.get("flash_active_tokens", 0)
-        if isinstance(active_tokens_value, torch.Tensor):
-            active_tokens = int(active_tokens_value.item())
-        else:
-            active_tokens = int(active_tokens_value)
+        active_tokens = int(flash_meta.active_tokens_host or batch.get("flash_active_tokens", 0))
         samples.append(
             BatchSample(
                 index=int(batch_idx),
@@ -244,9 +240,7 @@ def _sample_batches(
                 attention_mask=attention_mask.detach().clone()
                 if isinstance(attention_mask, torch.Tensor)
                 else None,
-                flash_seq_lengths=flash_seq_lengths.detach().clone()
-                if isinstance(flash_seq_lengths, torch.Tensor)
-                else None,
+                flash_meta=flash_meta,
                 active_tokens=active_tokens,
                 slot_tokens=int(batch_size * seq_len),
                 batch_size=batch_size,
@@ -301,6 +295,20 @@ def _run_candidate(
     torch.cuda.reset_peak_memory_stats(device)
     per_sample_times: dict[int, list[float]] = {int(sample.index): [] for sample in samples}
 
+    def _sample_meta(sample: BatchSample) -> FlashBatchMeta | None:
+        if sample.flash_meta is None:
+            return FlashBatchMeta(route_hint=str(route))
+        return FlashBatchMeta(
+            seq_lengths=sample.flash_meta.seq_lengths,
+            doc_segment_offsets=sample.flash_meta.doc_segment_offsets,
+            doc_segment_lengths=sample.flash_meta.doc_segment_lengths,
+            doc_cu_seqlens=sample.flash_meta.doc_cu_seqlens,
+            active_tokens_host=sample.flash_meta.active_tokens_host,
+            doc_num_segments_host=sample.flash_meta.doc_num_segments_host,
+            doc_max_segment_length_host=sample.flash_meta.doc_max_segment_length_host,
+            route_hint=str(route),
+        )
+
     def _run_one(sample: BatchSample) -> float:
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
@@ -308,8 +316,7 @@ def _run_candidate(
         out = model(
             input_ids=sample.input_ids,
             attention_mask=sample.attention_mask,
-            flash_seq_lengths=sample.flash_seq_lengths,
-            flash_route_hint=str(route),
+            flash_meta=_sample_meta(sample),
         ).last_hidden_state
         loss = out.float().pow(2).mean()
         loss.backward()

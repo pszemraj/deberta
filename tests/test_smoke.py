@@ -1428,6 +1428,7 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
 
     pytest.importorskip("transformers")
 
+    from deberta.modeling.mask_utils import FlashBatchMeta
     from deberta.modeling.rtd import EnhancedMaskDecoder
 
     class _Cfg:
@@ -1458,27 +1459,11 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
             query_states: torch.Tensor | None = None,
             relative_pos: torch.Tensor | None = None,
             rel_embeddings: torch.Tensor | None = None,
-            flash_seq_lengths: torch.Tensor | None = None,
-            flash_doc_segment_offsets: torch.Tensor | None = None,
-            flash_doc_segment_lengths: torch.Tensor | None = None,
-            flash_doc_cu_seqlens: torch.Tensor | None = None,
-            flash_active_tokens: int | None = None,
-            flash_doc_num_segments: int | None = None,
-            flash_doc_max_seqlen: int | None = None,
-            flash_route_hint: str | None = None,
+            flash_meta: FlashBatchMeta | None = None,
         ) -> tuple[torch.Tensor, None]:
             del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
             assert query_states is not None
-            self.seen = {
-                "flash_seq_lengths": flash_seq_lengths,
-                "flash_doc_segment_offsets": flash_doc_segment_offsets,
-                "flash_doc_segment_lengths": flash_doc_segment_lengths,
-                "flash_doc_cu_seqlens": flash_doc_cu_seqlens,
-                "flash_active_tokens": flash_active_tokens,
-                "flash_doc_num_segments": flash_doc_num_segments,
-                "flash_doc_max_seqlen": flash_doc_max_seqlen,
-                "flash_route_hint": flash_route_hint,
-            }
+            self.seen = {"flash_meta": flash_meta}
             return query_states, None
 
     class _Encoder(torch.nn.Module):
@@ -1502,6 +1487,16 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
     flash_doc_segment_offsets = torch.tensor([0, 2], dtype=torch.int32)
     flash_doc_segment_lengths = torch.tensor([2, 1], dtype=torch.int32)
     flash_doc_cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    flash_meta = FlashBatchMeta(
+        seq_lengths=flash_seq_lengths,
+        doc_segment_offsets=flash_doc_segment_offsets,
+        doc_segment_lengths=flash_doc_segment_lengths,
+        doc_cu_seqlens=flash_doc_cu_seqlens,
+        active_tokens_host=3,
+        doc_num_segments_host=2,
+        doc_max_segment_length_host=2,
+        route_hint="docblock_bias",
+    )
 
     masked = decoder(
         encoder_hidden_states=encoder_hidden_states,
@@ -1509,25 +1504,20 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
         attention_mask=attention_mask,
         embeddings=embeddings,
         encoder=encoder,
-        flash_seq_lengths=flash_seq_lengths,
-        flash_doc_segment_offsets=flash_doc_segment_offsets,
-        flash_doc_segment_lengths=flash_doc_segment_lengths,
-        flash_doc_cu_seqlens=flash_doc_cu_seqlens,
-        flash_active_tokens=3,
-        flash_doc_num_segments=2,
-        flash_doc_max_seqlen=2,
-        flash_route_hint="docblock_bias",
+        flash_meta=flash_meta,
     )
 
     assert tuple(masked.shape) == (1, 4)
-    assert last_layer.seen["flash_route_hint"] == "docblock_bias"
-    assert torch.equal(last_layer.seen["flash_seq_lengths"], flash_seq_lengths)
-    assert torch.equal(last_layer.seen["flash_doc_segment_offsets"], flash_doc_segment_offsets)
-    assert torch.equal(last_layer.seen["flash_doc_segment_lengths"], flash_doc_segment_lengths)
-    assert torch.equal(last_layer.seen["flash_doc_cu_seqlens"], flash_doc_cu_seqlens)
-    assert last_layer.seen["flash_active_tokens"] == 3
-    assert last_layer.seen["flash_doc_num_segments"] == 2
-    assert last_layer.seen["flash_doc_max_seqlen"] == 2
+    seen_meta = last_layer.seen["flash_meta"]
+    assert isinstance(seen_meta, FlashBatchMeta)
+    assert seen_meta.normalized_route_hint() == "docblock_bias"
+    assert torch.equal(seen_meta.seq_lengths, flash_seq_lengths)
+    assert torch.equal(seen_meta.doc_segment_offsets, flash_doc_segment_offsets)
+    assert torch.equal(seen_meta.doc_segment_lengths, flash_doc_segment_lengths)
+    assert torch.equal(seen_meta.doc_cu_seqlens, flash_doc_cu_seqlens)
+    assert seen_meta.active_tokens_host == 3
+    assert seen_meta.doc_num_segments_host == 2
+    assert seen_meta.doc_max_segment_length_host == 2
 
 
 def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
