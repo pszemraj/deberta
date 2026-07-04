@@ -3122,6 +3122,8 @@ def test_rotary_compile_mode_requires_prefilled_cache(monkeypatch):
         _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
 
     rope.prefill_cache(8, device=device, dtype=torch.float32)
+    assert rope._cache is not None
+    assert rope._cache_device == rope._cache.cos.device
     cos1, sin1 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     cos2, sin2 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     assert cos1.data_ptr() == cos2.data_ptr()

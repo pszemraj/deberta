@@ -133,21 +133,27 @@ first and put durable results in a JSON table selected with
 
 ## Special case: packed doc-block masks
 
-For `hf_deberta_v2`, packed doc-blocking now uses the measured JSON route policy
-described above when `model.hf.attention_impl=flash` is set:
+For `hf_deberta_v2`, packed doc-blocking uses the JSON route policy described
+above when `model.hf.attention_impl=flash` is set:
 
-- exact packed `1024` uses dense flash-with-bias by default
-- longer packed doc-block runs stay on the segment-aware flash custom op
+- packed doc-block batches, including exact `1024`, use the segment-aware flash custom op by default
+- the dense flash-with-bias doc-block route is opt-in because local RTD validation showed collapsed discriminator behavior on that path
+
+Treat the default packed-docblock flash route as correctness-preserving, not as
+the current speed recommendation for `1024`. Local validation found it slower
+than eager because the ragged doc-block path still exposes varying host segment
+stats to Dynamo and spends most time in the varlen/docblock kernels. Use eager
+or the `rope` backbone for speed-critical `1024` packed-docblock runs until the
+doc-block custom op owns that metadata as tensor inputs.
 
 Leave `model.hf.flash.docblock_bias_seq_len` and
 `model.hf.flash.local_bias_max_batch_size` unset to use the table. Set
-`model.hf.flash.docblock_bias_seq_len=0` to disable the dense-bias shortcut, or
-point it at a different exact sequence length if another machine bucket proves
-a different crossover. Set `model.hf.flash.local_bias_max_batch_size=0` to
-disable the small-batch dense local-bias route without changing the doc-block
-sequence split. Route policy is config/table-only; the older FlashDeBERTa route
-environment fallbacks are not consulted by the training path or profiling
-tools.
+`model.hf.flash.docblock_bias_seq_len=<len>` only to explicitly test the
+dense-bias doc-block route at that exact sequence length. Set
+`model.hf.flash.local_bias_max_batch_size=0` to disable the small-batch dense
+local-bias route without changing the doc-block route. Route policy is
+config/table-only; the older FlashDeBERTa route environment fallbacks are not
+consulted by the training path or profiling tools.
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope
 downgrades toward FFN-focused compile to avoid shape-churn recompiles from

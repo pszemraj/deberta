@@ -62,7 +62,7 @@
     "docblock": [
       {
         "seq_bucket": "1024_exact",
-        "choice": "docblock_bias"
+        "choice": "docblock"
       },
       {
         "seq_bucket": "under_2048",

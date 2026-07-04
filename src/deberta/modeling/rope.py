@@ -83,7 +83,10 @@ class RotaryEmbedding(nn.Module):
         if int(seq_len) <= 0:
             raise ValueError(f"seq_len must be > 0 for rotary cache prefill, got {seq_len}.")
         self._cache = self._build_cache(int(seq_len), device=device, dtype=dtype)
-        self._cache_device = device
+        # ``torch.device("cuda")`` materializes tensors on the current concrete
+        # device, e.g. ``cuda:0``. Store the tensor device so compile-time
+        # cache checks compare like-for-like with q/k.device.
+        self._cache_device = self._cache.cos.device
         self._cache_dtype = dtype
 
     def _build_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> RotaryCache:
@@ -136,7 +139,7 @@ class RotaryEmbedding(nn.Module):
             or self._cache.cos.shape[0] < seq_len
         ):
             self._cache = self._build_cache(seq_len, device=device, dtype=dtype)
-            self._cache_device = device
+            self._cache_device = self._cache.cos.device
             self._cache_dtype = dtype
         cos = self._cache.cos[:seq_len]
         sin = self._cache.sin[:seq_len]

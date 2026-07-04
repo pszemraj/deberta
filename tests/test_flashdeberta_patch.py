@@ -200,7 +200,7 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     bucket = flash_seq_bucket(seq_len=2048, total_tokens=3000, batch_size=2)
     assert bucket == "2048_medium"
     assert flash_route_choice(policy="padding", seq_bucket=bucket) == "varlen"
-    assert flash_route_choice(policy="docblock", seq_bucket=flash_seq_bucket(seq_len=1024)) == "docblock_bias"
+    assert flash_route_choice(policy="docblock", seq_bucket=flash_seq_bucket(seq_len=1024)) == "docblock"
     assert resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=(12, 0),
@@ -302,10 +302,17 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
-def test_docblock_bias_zero_config_override_disables_table_route() -> None:
+def test_docblock_bias_route_requires_positive_config_override() -> None:
     from deberta.training.compile import _flash_route_hint_for_docblock_batch
 
-    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
+    assert (
+        _flash_route_hint_for_docblock_batch(
+            seq_len=1024,
+            flash_cfg={"docblock_bias_seq_len": 1024},
+        )
+        == "docblock_bias"
+    )
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,

@@ -188,10 +188,11 @@ def _flash_route_hint_for_padding_batch(
 def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
     """Select the doc-block flash backend for one packed batch.
 
-    The repo's measured packed-docblock ``1024`` regime is not a good fit for
-    the ragged segment-aware varlen path. Route that exact short-sequence case
-    through dense flash-with-bias instead, and keep the ragged doc-block custom
-    op for longer contexts where the quadratic bias route is less practical.
+    The default policy keeps packed doc-block batches on the segment-aware
+    route. The dense ``docblock_bias`` route remains available only through an
+    explicit config override or override table, because local RTD validation
+    showed it can produce collapsed discriminator behavior even when short
+    synthetic parity checks pass.
 
     :param int seq_len: Packed sequence length.
     :param Any | None flash_cfg: Optional resolved flash config.
