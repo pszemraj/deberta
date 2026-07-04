@@ -37,6 +37,7 @@ from deberta.config import load_config, resolve_effective_mixed_precision  # noq
 from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling.builder import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
+from deberta.modeling.flashdeberta_kernel_tuning import flash_seq_bucket  # noqa: E402
 from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
@@ -116,16 +117,6 @@ def _parse_candidate_specs(values: list[str]) -> list[tuple[str, dict[str, str]]
             env_map[key.strip()] = value.strip()
         out.append((name.strip(), env_map))
     return out
-
-
-def _density_bucket(*, seq_len: int, active_tokens: int, batch_size: int) -> str:
-    capacity = max(1, int(seq_len) * max(1, int(batch_size)))
-    density = float(active_tokens) / float(capacity)
-    if int(seq_len) >= 4096:
-        return "4096_plus"
-    if int(seq_len) >= 2048:
-        return "2048_medium" if density >= 0.60 else "2048_sparse"
-    return "1024_dense_or_medium"
 
 
 def _device_capability_text(device: torch.device) -> str:
@@ -248,9 +239,9 @@ def _sample_batches(
                 head_dim=head_dim,
                 att_span=att_span,
                 device_capability=capability_text,
-                density_bucket=_density_bucket(
+                density_bucket=flash_seq_bucket(
                     seq_len=seq_len,
-                    active_tokens=active_tokens,
+                    total_tokens=active_tokens,
                     batch_size=batch_size,
                 ),
             )
