@@ -149,9 +149,9 @@ class ModelHFFlashConfig:
     """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention."""
 
     force_varlen: bool = field(default=False)
-    varlen_min_seq_len: int = field(default=2048)
-    docblock_bias_seq_len: int = field(default=1024)
-    local_bias_max_batch_size: int = field(default=4)
+    varlen_min_seq_len: int | None = field(default=None)
+    docblock_bias_seq_len: int | None = field(default=None)
+    local_bias_max_batch_size: int | None = field(default=None)
     eager_dense_max_seq_len: int = field(default=0)
     kernel_overrides_path: str | None = field(default=None)
 
@@ -1363,9 +1363,12 @@ def validate_model_config(cfg: ModelConfig) -> None:
         cfg.hf, "model_size", _ensure_choice("model.hf.model_size", cfg.hf.model_size, _HF_MODEL_SIZE_CHOICES)
     )
     _cfg_set(cfg.hf.flash, "force_varlen", bool(cfg.hf.flash.force_varlen))
-    _cfg_set(cfg.hf.flash, "varlen_min_seq_len", int(cfg.hf.flash.varlen_min_seq_len))
-    _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
-    _cfg_set(cfg.hf.flash, "local_bias_max_batch_size", int(cfg.hf.flash.local_bias_max_batch_size))
+    if cfg.hf.flash.varlen_min_seq_len is not None:
+        _cfg_set(cfg.hf.flash, "varlen_min_seq_len", int(cfg.hf.flash.varlen_min_seq_len))
+    if cfg.hf.flash.docblock_bias_seq_len is not None:
+        _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
+    if cfg.hf.flash.local_bias_max_batch_size is not None:
+        _cfg_set(cfg.hf.flash, "local_bias_max_batch_size", int(cfg.hf.flash.local_bias_max_batch_size))
     _cfg_set(cfg.hf.flash, "eager_dense_max_seq_len", int(cfg.hf.flash.eager_dense_max_seq_len))
     if cfg.hf.flash.kernel_overrides_path is not None:
         _cfg_set(
@@ -1403,11 +1406,11 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError("model.rope.max_position_embeddings must be > 0 when provided.")
     if float(cfg.rope.rotary_pct) <= 0.0 or float(cfg.rope.rotary_pct) > 1.0:
         raise ValueError("model.rope.rotary_pct must be in (0, 1].")
-    if int(cfg.hf.flash.varlen_min_seq_len) <= 0:
+    if cfg.hf.flash.varlen_min_seq_len is not None and int(cfg.hf.flash.varlen_min_seq_len) <= 0:
         raise ValueError("model.hf.flash.varlen_min_seq_len must be > 0.")
-    if int(cfg.hf.flash.docblock_bias_seq_len) < 0:
+    if cfg.hf.flash.docblock_bias_seq_len is not None and int(cfg.hf.flash.docblock_bias_seq_len) < 0:
         raise ValueError("model.hf.flash.docblock_bias_seq_len must be >= 0.")
-    if int(cfg.hf.flash.local_bias_max_batch_size) < 0:
+    if cfg.hf.flash.local_bias_max_batch_size is not None and int(cfg.hf.flash.local_bias_max_batch_size) < 0:
         raise ValueError("model.hf.flash.local_bias_max_batch_size must be >= 0.")
     if int(cfg.hf.flash.eager_dense_max_seq_len) < 0:
         raise ValueError("model.hf.flash.eager_dense_max_seq_len must be >= 0.")

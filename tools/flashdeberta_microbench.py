@@ -96,9 +96,9 @@ def _build_config(args: argparse.Namespace) -> DebertaV2Config:
     cfg.hf_attention_impl = str(args.mode)
     cfg.hf_flash = {
         "force_varlen": False,
-        "varlen_min_seq_len": 2048,
-        "docblock_bias_seq_len": 1024,
-        "local_bias_max_batch_size": 4,
+        "varlen_min_seq_len": None,
+        "docblock_bias_seq_len": None,
+        "local_bias_max_batch_size": None,
         "eager_dense_max_seq_len": 0,
         "kernel_overrides_path": None,
     }

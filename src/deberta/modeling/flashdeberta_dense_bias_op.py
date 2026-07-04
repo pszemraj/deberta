@@ -14,6 +14,7 @@ existing semantics via cached row-range reductions derived from the bucket map.
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import torch
@@ -36,8 +37,8 @@ except Exception as exc:  # pragma: no cover - optional import
 _DENSE_BIAS_NAMESPACE = "deberta"
 _DENSE_BIAS_OP_NAME = "flashdeberta_dense_bias"
 _DENSE_BUCKET_RANGE_CACHE: dict[
-    tuple[int, int, tuple[int, ...], tuple[int, ...], str, int],
-    tuple[torch.Tensor, torch.Tensor],
+    tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int],
+    tuple[weakref.ReferenceType[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
 ] = {}
 
 
@@ -214,18 +215,18 @@ def _dense_bucket_range_cache_key(
     bucket_index: torch.Tensor,
     *,
     num_buckets: int,
-) -> tuple[int, int, tuple[int, ...], tuple[int, ...], str, int]:
-    """Return a storage-stable cache key for one dense bucket map.
+) -> tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int]:
+    """Return a tensor-stable cache key for one dense bucket map.
 
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
     :param int num_buckets: Positional-bias width.
-    :return tuple[int, int, tuple[int, ...], tuple[int, ...], str, int]:
-        Storage pointer, storage offset, shape, stride, device text, and bucket count.
+    :return tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int]:
+        Tensor id, version, storage offset, shape, stride, device text, and bucket count.
     """
 
-    storage = bucket_index.untyped_storage()
     return (
-        int(storage.data_ptr()),
+        id(bucket_index),
+        int(bucket_index._version),
         int(bucket_index.storage_offset()),
         tuple(int(dim) for dim in bucket_index.shape),
         tuple(int(dim) for dim in bucket_index.stride()),
@@ -250,7 +251,7 @@ def _dense_bucket_ranges(
     :return tuple[torch.Tensor, torch.Tensor]: Inclusive start/end indices in ``(S,P)`` layout.
     """
 
-    cache_key: tuple[int, int, tuple[int, ...], tuple[int, ...], str, int] | None = None
+    cache_key: tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int] | None = None
     if not _is_torch_compiling():
         try:
             cache_key = _dense_bucket_range_cache_key(bucket_index, num_buckets=num_buckets)
@@ -259,7 +260,10 @@ def _dense_bucket_ranges(
         if cache_key is not None:
             cached = _DENSE_BUCKET_RANGE_CACHE.get(cache_key)
             if cached is not None:
-                return cached
+                bucket_ref, ranges = cached
+                if bucket_ref() is bucket_index:
+                    return ranges
+                _DENSE_BUCKET_RANGE_CACHE.pop(cache_key, None)
 
     seq_len = int(bucket_index.shape[0])
     column_ids = torch.arange(seq_len, device=bucket_index.device, dtype=torch.int64)
@@ -296,7 +300,15 @@ def _dense_bucket_ranges(
     )
 
     if cache_key is not None:
-        _DENSE_BUCKET_RANGE_CACHE[cache_key] = (start, end)
+        try:
+            bucket_ref = weakref.ref(
+                bucket_index,
+                lambda _ref, key=cache_key: _DENSE_BUCKET_RANGE_CACHE.pop(key, None),
+            )
+        except TypeError:
+            bucket_ref = None
+        if bucket_ref is not None:
+            _DENSE_BUCKET_RANGE_CACHE[cache_key] = (bucket_ref, (start, end))
         if len(_DENSE_BUCKET_RANGE_CACHE) > 32:
             stale_keys = list(_DENSE_BUCKET_RANGE_CACHE.keys())[:16]
             for stale_key in stale_keys:

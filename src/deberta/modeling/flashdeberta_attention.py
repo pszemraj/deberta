@@ -49,11 +49,11 @@ from deberta.modeling.deberta_v2_native import (
     DisentangledSelfAttention as _EagerDisentangledSelfAttention,
 )
 from deberta.modeling.flashdeberta_bias_op import (
-    flashdeberta_bias,
+    flashdeberta_bias_from_positions,
     flashdeberta_bias_import_error,
     flashdeberta_compiled_bias_available,
+    flashdeberta_compiled_position_bias_available,
 )
-from deberta.modeling.flashdeberta_dense_bias_op import flashdeberta_dense_bias
 from deberta.modeling.flashdeberta_docblock_op import (
     flashdeberta_compiled_docblock_available,
     flashdeberta_docblock,
@@ -63,7 +63,12 @@ from deberta.modeling.flashdeberta_fixed_op import (
     flashdeberta_fixed,
     flashdeberta_fixed_import_error,
 )
-from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    configure_flashdeberta_kernel_overrides,
+    flash_route_choice,
+    flash_route_policy,
+    flash_seq_bucket,
+)
 from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_padded,
@@ -91,9 +96,9 @@ class FlashDebertaRuntimeConfig:
     """
 
     force_varlen: bool = False
-    varlen_min_seq_len: int = 2048
-    docblock_bias_seq_len: int = 1024
-    local_bias_max_batch_size: int = 4
+    varlen_min_seq_len: int | None = None
+    docblock_bias_seq_len: int | None = None
+    local_bias_max_batch_size: int | None = None
     eager_dense_max_seq_len: int = 0
     kernel_overrides_path: str | None = None
     enable_debug_stats: bool = False
@@ -125,6 +130,22 @@ def _truthy_env(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in _TRUTHY
 
 
+def _optional_int(value: Any, *, default: int | None = None) -> int | None:
+    """Return an integer override or None when unset.
+
+    :param Any value: Raw config value.
+    :param int | None default: Fallback value for invalid input.
+    :return int | None: Parsed integer, or None.
+    """
+
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
     """Load debug instrumentation toggles from environment variables.
 
@@ -133,9 +154,9 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
 
     return FlashDebertaRuntimeConfig(
         force_varlen=False,
-        varlen_min_seq_len=2048,
-        docblock_bias_seq_len=1024,
-        local_bias_max_batch_size=4,
+        varlen_min_seq_len=None,
+        docblock_bias_seq_len=None,
+        local_bias_max_batch_size=None,
         eager_dense_max_seq_len=0,
         kernel_overrides_path=None,
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
@@ -181,22 +202,17 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
 
     return FlashDebertaRuntimeConfig(
         force_varlen=bool(getter("force_varlen", getattr(config, "flash_force_varlen", False))),
-        varlen_min_seq_len=max(
-            1,
-            int(getter("varlen_min_seq_len", getattr(config, "flash_varlen_min_seq_len", 2048))),
+        varlen_min_seq_len=_optional_int(
+            getter("varlen_min_seq_len", getattr(config, "flash_varlen_min_seq_len", None))
         ),
-        docblock_bias_seq_len=max(
-            0,
-            int(getter("docblock_bias_seq_len", getattr(config, "flash_docblock_bias_seq_len", 1024))),
+        docblock_bias_seq_len=_optional_int(
+            getter("docblock_bias_seq_len", getattr(config, "flash_docblock_bias_seq_len", None))
         ),
-        local_bias_max_batch_size=max(
-            0,
-            int(
-                getter(
-                    "local_bias_max_batch_size",
-                    getattr(config, "flash_local_bias_max_batch_size", 4),
-                )
-            ),
+        local_bias_max_batch_size=_optional_int(
+            getter(
+                "local_bias_max_batch_size",
+                getattr(config, "flash_local_bias_max_batch_size", None),
+            )
         ),
         eager_dense_max_seq_len=max(
             0,
@@ -383,7 +399,11 @@ def _should_use_varlen(
     if cfg.force_varlen:
         return True
 
-    return int(seq_len) >= int(cfg.varlen_min_seq_len)
+    if cfg.varlen_min_seq_len is not None:
+        return int(seq_len) >= max(1, int(cfg.varlen_min_seq_len))
+
+    seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
+    return flash_route_choice(policy="padding", seq_bucket=seq_bucket) == "varlen"
 
 
 def _normalize_route_hint(route_hint: str | None) -> str | None:
@@ -772,16 +792,31 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if not self.training:
             return False
-        local_bias_max_batch_size = int(self._runtime_config.local_bias_max_batch_size)
+        seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
+        local_bias_policy = flash_route_policy(policy="local_bias", seq_bucket=seq_bucket)
+        local_bias_max_batch_size = self._runtime_config.local_bias_max_batch_size
+        if local_bias_max_batch_size is None:
+            if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
+                return False
+            try:
+                local_bias_max_batch_size = int(local_bias_policy.get("max_batch_size", 0))
+            except Exception:
+                local_bias_max_batch_size = 0
         if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
             return False
-        if int(seq_len) != int(self._runtime_config.docblock_bias_seq_len):
+        local_bias_seq_len = self._runtime_config.docblock_bias_seq_len
+        if local_bias_seq_len is None:
+            if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
+                return False
+        elif int(local_bias_seq_len) <= 0 or int(seq_len) != int(local_bias_seq_len):
             return False
         if pos_key is None and pos_query is None:
             return False
         if flashdeberta_bias_import_error() is not None:
             return False
-        if _is_torch_compiling() and not flashdeberta_compiled_bias_available():
+        if _is_torch_compiling() and not (
+            flashdeberta_compiled_bias_available() and flashdeberta_compiled_position_bias_available()
+        ):
             return False
         return True
 
@@ -816,17 +851,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         del batch_size, num_heads
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_bias_calls")
-        return flashdeberta_bias(
+        return flashdeberta_bias_from_positions(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            bias=flashdeberta_dense_bias(
-                pos_key=pos_key,
-                pos_query=pos_query,
-                bucket_index=bucket_index,
-                keep_mask=None,
-                scale=float(sm_scale),
-            ),
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=None,
+            bias_scale=float(sm_scale),
             sm_scale=sm_scale,
             causal=False,
         )
@@ -969,17 +1002,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        return flashdeberta_bias(
+        return flashdeberta_bias_from_positions(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-            bias=flashdeberta_dense_bias(
-                pos_key=pos_key,
-                pos_query=pos_query,
-                bucket_index=bucket_index,
-                keep_mask=keep_mask,
-                scale=float(sm_scale),
-            ),
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            bias_scale=float(sm_scale),
             sm_scale=sm_scale,
             causal=False,
         )

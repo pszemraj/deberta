@@ -129,6 +129,29 @@ def _flash_cfg_int(
         return int(default)
 
 
+def _flash_cfg_optional_int(
+    flash_cfg: Any | None,
+    *,
+    name: str,
+    default: int | None = None,
+) -> int | None:
+    """Resolve one optional integer flash option.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Config field name.
+    :param int | None default: Default value when config is absent.
+    :return int | None: Resolved integer, or None when unset.
+    """
+
+    value = _flash_cfg_get(flash_cfg, name, default)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 def _flash_mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     """Extract a canonical ``(B,S)`` keep mask from rank-2/4 padding masks.
 

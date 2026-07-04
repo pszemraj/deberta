@@ -154,12 +154,12 @@ def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_siz
     return "default"
 
 
-def flash_route_choice(*, policy: str, seq_bucket: str) -> str | None:
-    """Resolve a route choice from the active tuning table.
+def flash_route_policy(*, policy: str, seq_bucket: str) -> dict[str, Any] | None:
+    """Resolve a route-policy row from the active tuning table.
 
     :param str policy: Route policy namespace such as ``"padding"`` or ``"docblock"``.
     :param str seq_bucket: Sequence bucket returned by :func:`flash_seq_bucket`.
-    :return str | None: Route choice, or None when the table has no entry.
+    :return dict[str, Any] | None: Matching policy row, or None when the table has no entry.
     """
 
     policies = _load_tuning_payload().get("route_policies", {})
@@ -171,6 +171,20 @@ def flash_route_choice(*, policy: str, seq_bucket: str) -> str | None:
             continue
         if str(raw.get("seq_bucket", "")).strip() != str(seq_bucket).strip():
             continue
+        return dict(raw)
+    return None
+
+
+def flash_route_choice(*, policy: str, seq_bucket: str) -> str | None:
+    """Resolve a route choice from the active tuning table.
+
+    :param str policy: Route policy namespace such as ``"padding"`` or ``"docblock"``.
+    :param str seq_bucket: Sequence bucket returned by :func:`flash_seq_bucket`.
+    :return str | None: Route choice, or None when the table has no entry.
+    """
+
+    raw = flash_route_policy(policy=policy, seq_bucket=seq_bucket)
+    if raw is not None:
         choice = raw.get("choice")
         return str(choice).strip() if choice is not None else None
     return None

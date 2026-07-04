@@ -13,6 +13,12 @@ from typing import Any
 
 import torch
 
+from deberta.modeling.flashdeberta_dense_bias_op import (
+    _dense_bias_forward_cuda,
+    _dense_bias_forward_fallback,
+    _dense_bucket_ranges,
+    _dense_bucket_reduce_from_ranges,
+)
 from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
@@ -72,6 +78,8 @@ except Exception as exc:  # pragma: no cover - optional import
 _BIAS_OP_NAMESPACE = "deberta"
 _BIAS_FWD_OP_NAME = "flashdeberta_bias"
 _BIAS_BWD_OP_NAME = "flashdeberta_bias_backward"
+_POSITION_BIAS_FWD_OP_NAME = "flashdeberta_position_bias_attention"
+_POSITION_BIAS_BWD_OP_NAME = "flashdeberta_position_bias_attention_backward"
 
 
 def flashdeberta_bias_import_error() -> Exception | None:
@@ -96,6 +104,18 @@ def flashdeberta_compiled_bias_available() -> bool:
     """
 
     return _FLASHDEBERTA_BIAS_CUSTOM_OP is not None and _FLASHDEBERTA_BIAS_BWD_CUSTOM_OP is not None
+
+
+def flashdeberta_compiled_position_bias_available() -> bool:
+    """Return whether the fused position-bias CUDA op is available.
+
+    :return bool: True when the custom-op based CUDA path is registered.
+    """
+
+    return (
+        _FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP is not None
+        and _FLASHDEBERTA_POSITION_BIAS_BWD_CUSTOM_OP is not None
+    )
 
 
 def _lookup_registered_op(namespace: str, name: str) -> Any | None:
@@ -1307,6 +1327,93 @@ def _bias_eager_backward_impl(
     )
 
 
+def _position_bias_forward_impl(
+    *,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    bucket_index: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Materialize dense positional bias for one attention launch.
+
+    :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param float scale: Scale applied to the additive position bias.
+    :return torch.Tensor: Dense additive bias in ``(B,H,S,S)`` layout.
+    """
+
+    reference = pos_key if pos_key is not None else pos_query
+    if reference is None:
+        raise RuntimeError("FlashDeBERTa position-bias attention requires at least one positional term.")
+    if reference.device.type == "cuda" and triton is not None:
+        return _dense_bias_forward_cuda(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            scale=float(scale),
+        )
+    return _dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=float(scale),
+    )
+
+
+def _position_bias_backward_from_dense_grad(
+    *,
+    d_bias: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    bucket_index: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    scale: float,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Reduce dense additive-bias gradients into positional score tensors.
+
+    :param torch.Tensor d_bias: Dense additive-bias gradient in ``(B,H,S,S)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p term from the forward pass.
+    :param torch.Tensor | None pos_query: Optional p2c term from the forward pass.
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask used by the forward pass.
+    :param float scale: Scale applied to the additive position bias in forward.
+    :return tuple[torch.Tensor | None, torch.Tensor | None]: Gradients for c2p and p2c terms.
+    """
+
+    grad = d_bias.to(dtype=torch.float32)
+    if keep_mask is not None:
+        grad = grad.masked_fill(~keep_mask, 0.0)
+    grad = grad * float(scale)
+
+    dpos_key: torch.Tensor | None = None
+    if pos_key is not None:
+        start_key, end_key = _dense_bucket_ranges(bucket_index, num_buckets=int(pos_key.shape[-1]))
+        dpos_key = _dense_bucket_reduce_from_ranges(
+            grad=grad,
+            start=start_key,
+            end=end_key,
+            output_dtype=pos_key.dtype,
+        )
+
+    dpos_query: torch.Tensor | None = None
+    if pos_query is not None:
+        transposed = bucket_index.transpose(0, 1).contiguous()
+        start_query, end_query = _dense_bucket_ranges(transposed, num_buckets=int(pos_query.shape[-1]))
+        dpos_query = _dense_bucket_reduce_from_ranges(
+            grad=grad.transpose(-1, -2).contiguous(),
+            start=start_query,
+            end=end_query,
+            output_dtype=pos_query.dtype,
+        )
+
+    return dpos_key, dpos_query
+
+
 def _build_bias_custom_ops() -> tuple[Any | None, Any | None]:
     """Register or retrieve the opaque local-bias custom ops.
 
@@ -1518,7 +1625,358 @@ def _build_bias_custom_ops() -> tuple[Any | None, Any | None]:
     return _forward_op, _backward_op
 
 
+def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
+    """Register or retrieve the fused position-bias attention custom ops.
+
+    :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
+    """
+
+    existing_forward = _lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_FWD_OP_NAME)
+    existing_backward = _lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_BWD_OP_NAME)
+    if existing_forward is not None and existing_backward is not None:
+        return existing_forward, existing_backward
+
+    if (
+        triton is None
+        or _flash_attn_v2_fwd_bias_lowlevel is None
+        or _flash_attn_v2_bwd_bias_lowlevel is None
+        or not hasattr(torch, "library")
+        or not hasattr(torch.library, "custom_op")
+    ):
+        return None, None
+
+    @torch.library.custom_op(
+        f"{_BIAS_OP_NAMESPACE}::{_POSITION_BIAS_FWD_OP_NAME}",
+        mutates_args=(),
+        device_types="cuda",
+        schema=(
+            "(Tensor q, Tensor k, Tensor v, Tensor pos_key, Tensor pos_query, Tensor bucket_index, "
+            "Tensor keep_mask, float bias_scale, float sm_scale, bool causal, bool has_pos_key, "
+            "bool has_pos_query, bool has_keep_mask) -> (Tensor, Tensor)"
+        ),
+    )
+    def _forward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pos_key: torch.Tensor,
+        pos_query: torch.Tensor,
+        bucket_index: torch.Tensor,
+        keep_mask: torch.Tensor,
+        bias_scale: float,
+        sm_scale: float,
+        causal: bool,
+        has_pos_key: bool,
+        has_pos_query: bool,
+        has_keep_mask: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run position-bias attention without saving the dense bias.
+
+        :param torch.Tensor q: Queries in ``(B,H,S,D)`` layout.
+        :param torch.Tensor k: Keys in ``(B,H,S,D)`` layout.
+        :param torch.Tensor v: Values in ``(B,H,S,D)`` layout.
+        :param torch.Tensor pos_key: c2p tensor or empty sentinel.
+        :param torch.Tensor pos_query: p2c tensor or empty sentinel.
+        :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+        :param torch.Tensor keep_mask: Keep mask tensor or empty sentinel.
+        :param float bias_scale: Scale applied to the additive position bias.
+        :param float sm_scale: Softmax scale applied to content scores.
+        :param bool causal: Whether causal masking is enabled.
+        :param bool has_pos_key: Whether ``pos_key`` is active.
+        :param bool has_pos_query: Whether ``pos_query`` is active.
+        :param bool has_keep_mask: Whether ``keep_mask`` is active.
+        :return tuple[torch.Tensor, torch.Tensor]: Output and LSE tensors.
+        """
+
+        bias = _position_bias_forward_impl(
+            pos_key=pos_key if bool(has_pos_key) else None,
+            pos_query=pos_query if bool(has_pos_query) else None,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask if bool(has_keep_mask) else None,
+            scale=float(bias_scale),
+        )
+        return _bias_eager_forward_impl(
+            q=q,
+            k=k,
+            v=v,
+            bias=bias,
+            sm_scale=float(sm_scale),
+            causal=bool(causal),
+            require_lse=True,
+        )
+
+    @torch.library.register_fake(_forward_op)
+    def _forward_op_fake(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pos_key: torch.Tensor,
+        pos_query: torch.Tensor,
+        bucket_index: torch.Tensor,
+        keep_mask: torch.Tensor,
+        bias_scale: float,
+        sm_scale: float,
+        causal: bool,
+        has_pos_key: bool,
+        has_pos_query: bool,
+        has_keep_mask: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return fake position-bias attention outputs with static shapes.
+
+        :param torch.Tensor q: Fake query tensor.
+        :param torch.Tensor k: Fake key tensor.
+        :param torch.Tensor v: Fake value tensor.
+        :param torch.Tensor pos_key: Fake c2p tensor or empty sentinel.
+        :param torch.Tensor pos_query: Fake p2c tensor or empty sentinel.
+        :param torch.Tensor bucket_index: Fake dense bucket map.
+        :param torch.Tensor keep_mask: Fake keep mask or empty sentinel.
+        :param float bias_scale: Fake position-bias scale.
+        :param float sm_scale: Fake softmax scale.
+        :param bool causal: Fake causal flag.
+        :param bool has_pos_key: Fake c2p presence flag.
+        :param bool has_pos_query: Fake p2c presence flag.
+        :param bool has_keep_mask: Fake keep-mask presence flag.
+        :return tuple[torch.Tensor, torch.Tensor]: Fake output and LSE tensors.
+        """
+
+        del k, v, pos_key, pos_query, bucket_index, keep_mask, bias_scale
+        del sm_scale, causal, has_pos_key, has_pos_query, has_keep_mask
+        lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        return torch.empty(q.shape, device=q.device, dtype=q.dtype), lse
+
+    @torch.library.custom_op(
+        f"{_BIAS_OP_NAMESPACE}::{_POSITION_BIAS_BWD_OP_NAME}",
+        mutates_args=(),
+        device_types="cuda",
+        schema=(
+            "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor pos_key, Tensor pos_query, "
+            "Tensor bucket_index, Tensor keep_mask, Tensor out, Tensor lse, float bias_scale, "
+            "float sm_scale, bool causal, bool has_pos_key, bool has_pos_query, bool has_keep_mask) "
+            "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+        ),
+    )
+    def _backward_op(
+        grad_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pos_key: torch.Tensor,
+        pos_query: torch.Tensor,
+        bucket_index: torch.Tensor,
+        keep_mask: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        bias_scale: float,
+        sm_scale: float,
+        causal: bool,
+        has_pos_key: bool,
+        has_pos_query: bool,
+        has_keep_mask: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run position-bias attention backward with transient dense bias.
+
+        :param torch.Tensor grad_out: Gradient of the output tensor.
+        :param torch.Tensor q: Forward query tensor.
+        :param torch.Tensor k: Forward key tensor.
+        :param torch.Tensor v: Forward value tensor.
+        :param torch.Tensor pos_key: Forward c2p tensor or empty sentinel.
+        :param torch.Tensor pos_query: Forward p2c tensor or empty sentinel.
+        :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+        :param torch.Tensor keep_mask: Forward keep mask or empty sentinel.
+        :param torch.Tensor out: Forward output tensor.
+        :param torch.Tensor lse: Forward LSE tensor.
+        :param float bias_scale: Scale applied to the additive position bias.
+        :param float sm_scale: Softmax scale applied to content scores.
+        :param bool causal: Whether causal masking is enabled.
+        :param bool has_pos_key: Whether ``pos_key`` is active.
+        :param bool has_pos_query: Whether ``pos_query`` is active.
+        :param bool has_keep_mask: Whether ``keep_mask`` is active.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            Gradients for q/k/v/pos_key/pos_query.
+        """
+
+        pos_key_tensor = pos_key if bool(has_pos_key) else None
+        pos_query_tensor = pos_query if bool(has_pos_query) else None
+        keep_mask_tensor = keep_mask if bool(has_keep_mask) else None
+        bias = _position_bias_forward_impl(
+            pos_key=pos_key_tensor,
+            pos_query=pos_query_tensor,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask_tensor,
+            scale=float(bias_scale),
+        )
+        dq, dk, dv, d_bias = _bias_eager_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
+            bias=bias,
+            out=out,
+            lse=lse,
+            sm_scale=float(sm_scale),
+            causal=bool(causal),
+        )
+        dpos_key, dpos_query = _position_bias_backward_from_dense_grad(
+            d_bias=d_bias,
+            pos_key=pos_key_tensor,
+            pos_query=pos_query_tensor,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask_tensor,
+            scale=float(bias_scale),
+        )
+        return (
+            dq,
+            dk,
+            dv,
+            dpos_key if dpos_key is not None else torch.empty_like(pos_key),
+            dpos_query if dpos_query is not None else torch.empty_like(pos_query),
+        )
+
+    @torch.library.register_fake(_backward_op)
+    def _backward_op_fake(
+        grad_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pos_key: torch.Tensor,
+        pos_query: torch.Tensor,
+        bucket_index: torch.Tensor,
+        keep_mask: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        bias_scale: float,
+        sm_scale: float,
+        causal: bool,
+        has_pos_key: bool,
+        has_pos_query: bool,
+        has_keep_mask: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return fake position-bias backward outputs with static shapes.
+
+        :param torch.Tensor grad_out: Fake output gradient.
+        :param torch.Tensor q: Fake query tensor.
+        :param torch.Tensor k: Fake key tensor.
+        :param torch.Tensor v: Fake value tensor.
+        :param torch.Tensor pos_key: Fake c2p tensor or empty sentinel.
+        :param torch.Tensor pos_query: Fake p2c tensor or empty sentinel.
+        :param torch.Tensor bucket_index: Fake dense bucket map.
+        :param torch.Tensor keep_mask: Fake keep mask or empty sentinel.
+        :param torch.Tensor out: Fake output tensor.
+        :param torch.Tensor lse: Fake LSE tensor.
+        :param float bias_scale: Fake position-bias scale.
+        :param float sm_scale: Fake softmax scale.
+        :param bool causal: Fake causal flag.
+        :param bool has_pos_key: Fake c2p presence flag.
+        :param bool has_pos_query: Fake p2c presence flag.
+        :param bool has_keep_mask: Fake keep-mask presence flag.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            Fake gradients for q/k/v/pos_key/pos_query.
+        """
+
+        del grad_out, bucket_index, keep_mask, out, lse, bias_scale, sm_scale
+        del causal, has_pos_key, has_pos_query, has_keep_mask
+        return (
+            torch.empty(q.shape, device=q.device, dtype=q.dtype),
+            torch.empty(k.shape, device=k.device, dtype=k.dtype),
+            torch.empty(v.shape, device=v.device, dtype=v.dtype),
+            torch.empty(pos_key.shape, device=pos_key.device, dtype=pos_key.dtype),
+            torch.empty(pos_query.shape, device=pos_query.device, dtype=pos_query.dtype),
+        )
+
+    def _setup_context(
+        ctx: Any,
+        inputs: tuple[Any, ...],
+        output: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Save compact inputs needed to recompute dense bias in backward.
+
+        :param Any ctx: Autograd context object.
+        :param tuple[Any, ...] inputs: Forward custom-op inputs.
+        :param tuple[torch.Tensor, torch.Tensor] output: Forward outputs.
+        """
+
+        (
+            q,
+            k,
+            v,
+            pos_key,
+            pos_query,
+            bucket_index,
+            keep_mask,
+            bias_scale,
+            sm_scale,
+            causal,
+            has_pos_key,
+            has_pos_query,
+            has_keep_mask,
+        ) = inputs
+        out, lse = output
+        ctx.save_for_backward(q, k, v, pos_key, pos_query, bucket_index, keep_mask, out, lse)
+        ctx.bias_scale = float(bias_scale)
+        ctx.sm_scale = float(sm_scale)
+        ctx.causal = bool(causal)
+        ctx.has_pos_key = bool(has_pos_key)
+        ctx.has_pos_query = bool(has_pos_query)
+        ctx.has_keep_mask = bool(has_keep_mask)
+
+    def _backward(
+        ctx: Any,
+        grad_out: torch.Tensor | None,
+        grad_lse: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Dispatch fused position-bias backward through an opaque CUDA op.
+
+        :param Any ctx: Autograd context populated by ``_setup_context``.
+        :param torch.Tensor | None grad_out: Gradient of the output tensor.
+        :param torch.Tensor | None grad_lse: Gradient of the LSE output.
+        :return tuple[torch.Tensor | None, ...]: Gradients for the forward inputs.
+        """
+
+        del grad_lse
+        q, k, v, pos_key, pos_query, bucket_index, keep_mask, out, lse = ctx.saved_tensors
+        grad = grad_out if grad_out is not None else torch.zeros_like(out)
+        dq, dk, dv, dpos_key, dpos_query = _backward_op(
+            grad,
+            q,
+            k,
+            v,
+            pos_key,
+            pos_query,
+            bucket_index,
+            keep_mask,
+            out,
+            lse,
+            ctx.bias_scale,
+            ctx.sm_scale,
+            ctx.causal,
+            ctx.has_pos_key,
+            ctx.has_pos_query,
+            ctx.has_keep_mask,
+        )
+        return (
+            dq,
+            dk,
+            dv,
+            dpos_key if ctx.has_pos_key else None,
+            dpos_query if ctx.has_pos_query else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
+    return _forward_op, _backward_op
+
+
 _FLASHDEBERTA_BIAS_CUSTOM_OP, _FLASHDEBERTA_BIAS_BWD_CUSTOM_OP = _build_bias_custom_ops()
+_FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP, _FLASHDEBERTA_POSITION_BIAS_BWD_CUSTOM_OP = (
+    _build_position_bias_custom_ops()
+)
 
 
 def flashdeberta_bias(
@@ -1564,8 +2022,92 @@ def flashdeberta_bias(
     return out
 
 
+def flashdeberta_bias_from_positions(
+    *,
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    bucket_index: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    bias_scale: float,
+    sm_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Run local-bias attention from compact position-bias ingredients.
+
+    :param torch.Tensor query_layer: Queries in ``(B,H,S,D)`` layout.
+    :param torch.Tensor key_layer: Keys in ``(B,H,S,D)`` layout.
+    :param torch.Tensor value_layer: Values in ``(B,H,S,D)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
+    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param float bias_scale: Scale applied to the additive position bias.
+    :param float sm_scale: Softmax scale applied to content scores.
+    :param bool causal: Whether causal masking is enabled.
+    :raises RuntimeError: If both positional terms are missing.
+    :return torch.Tensor: Attention output in ``(B,H,S,D)`` layout.
+    """
+
+    reference = pos_key if pos_key is not None else pos_query
+    if reference is None:
+        raise RuntimeError("FlashDeBERTa position-bias attention requires at least one positional term.")
+
+    if _FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP is not None and query_layer.device.type == "cuda":
+        pos_key_tensor = (
+            pos_key
+            if pos_key is not None
+            else torch.empty((0,), device=reference.device, dtype=reference.dtype)
+        )
+        pos_query_tensor = (
+            pos_query
+            if pos_query is not None
+            else torch.empty((0,), device=reference.device, dtype=reference.dtype)
+        )
+        keep_mask_tensor = (
+            keep_mask
+            if keep_mask is not None
+            else torch.empty((0,), device=reference.device, dtype=torch.bool)
+        )
+        output, _ = _FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP(
+            query_layer,
+            key_layer,
+            value_layer,
+            pos_key_tensor,
+            pos_query_tensor,
+            bucket_index,
+            keep_mask_tensor,
+            float(bias_scale),
+            float(sm_scale),
+            bool(causal),
+            pos_key is not None,
+            pos_query is not None,
+            keep_mask is not None,
+        )
+        return output
+
+    return flashdeberta_bias(
+        query_layer=query_layer,
+        key_layer=key_layer,
+        value_layer=value_layer,
+        bias=_position_bias_forward_impl(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            scale=float(bias_scale),
+        ),
+        sm_scale=sm_scale,
+        causal=causal,
+    )
+
+
 __all__ = [
     "flashdeberta_bias",
+    "flashdeberta_bias_from_positions",
     "flashdeberta_bias_import_error",
     "flashdeberta_compiled_bias_available",
+    "flashdeberta_compiled_position_bias_available",
 ]

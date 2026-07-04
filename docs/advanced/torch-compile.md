@@ -45,12 +45,13 @@ kernels and backward passes. The current routing contract is:
 
 - dense batches use fixed flash
 - padded `1024` batches use fixed flash with per-example `seq_lengths`
-- longer padded batches (`2048+` by default) use varlen flash when the backend
+- longer padded batches (`2048+` in the shipped route table) use varlen flash when the backend
   package exposes the required low-level primitives
 
 That split is deliberate. On the repo's measured unpacked `1024` RTD regime,
 the compile-clean fixed path outperformed the varlen backward kernels, while
 the varlen path pulled back ahead again for longer padded contexts.
+By default this split comes from `src/deberta/modeling/flashdeberta_kernel_tuning.json`.
 Set `model.hf.flash.varlen_min_seq_len=1024` if you need to force the older
 "all padded batches go varlen" policy for debugging or machine-specific
 comparisons.
@@ -132,17 +133,19 @@ first and put durable results in a JSON table selected with
 
 ## Special case: packed doc-block masks
 
-For `hf_deberta_v2`, packed doc-blocking now uses the measured route policy
+For `hf_deberta_v2`, packed doc-blocking now uses the measured JSON route policy
 described above when `model.hf.attention_impl=flash` is set:
 
 - exact packed `1024` uses dense flash-with-bias by default
 - longer packed doc-block runs stay on the segment-aware flash custom op
 
-Set `model.hf.flash.docblock_bias_seq_len=0` to disable the dense-bias shortcut,
-or point it at a different exact sequence length if another machine bucket
-proves a different crossover. Set `model.hf.flash.local_bias_max_batch_size=0`
-to disable the small-batch dense local-bias route without changing the doc-block
-sequence split. Route policy is config-only; the older FlashDeBERTa route
+Leave `model.hf.flash.docblock_bias_seq_len` and
+`model.hf.flash.local_bias_max_batch_size` unset to use the table. Set
+`model.hf.flash.docblock_bias_seq_len=0` to disable the dense-bias shortcut, or
+point it at a different exact sequence length if another machine bucket proves
+a different crossover. Set `model.hf.flash.local_bias_max_batch_size=0` to
+disable the small-batch dense local-bias route without changing the doc-block
+sequence split. Route policy is config/table-only; the older FlashDeBERTa route
 environment fallbacks are not consulted by the training path or profiling
 tools.
 

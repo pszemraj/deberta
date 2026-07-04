@@ -18,7 +18,7 @@ from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     _flash_cfg_bool,
     _flash_cfg_get,
-    _flash_cfg_int,
+    _flash_cfg_optional_int,
     _flash_is_pairwise_mask,
     _flash_mask_to_2d_keep_mask,
     build_doc_block_mask,
@@ -165,6 +165,15 @@ def _flash_route_hint_for_padding_batch(
         default="0",
     ):
         return "varlen"
+    override_varlen_min_seq_len = _flash_cfg_optional_int(
+        flash_cfg,
+        name="varlen_min_seq_len",
+        default=None,
+    )
+    if override_varlen_min_seq_len is not None:
+        threshold = max(1, int(override_varlen_min_seq_len))
+        return "varlen" if int(seq_len) >= threshold else "fixed"
+
     density_bucket = _flash_density_bucket(
         seq_len=int(seq_len),
         active_tokens=int(active_tokens),
@@ -173,15 +182,7 @@ def _flash_route_hint_for_padding_batch(
     table_route = flash_route_choice(policy="padding", seq_bucket=density_bucket)
     if table_route in {"fixed", "varlen"}:
         return table_route
-    default_varlen_min_seq_len = max(
-        1,
-        _flash_cfg_int(
-            flash_cfg,
-            name="varlen_min_seq_len",
-            default=2048,
-        ),
-    )
-    return "varlen" if int(seq_len) >= int(default_varlen_min_seq_len) else "fixed"
+    return "fixed"
 
 
 def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
@@ -197,21 +198,20 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None 
     :return str: Either ``docblock_bias`` or ``docblock``.
     """
 
+    override_bias_seq_len = _flash_cfg_optional_int(
+        flash_cfg,
+        name="docblock_bias_seq_len",
+        default=None,
+    )
+    if override_bias_seq_len is not None:
+        if int(override_bias_seq_len) > 0 and int(seq_len) == int(override_bias_seq_len):
+            return "docblock_bias"
+        return "docblock"
+
     seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
     table_route = flash_route_choice(policy="docblock", seq_bucket=seq_bucket)
     if table_route in {"docblock", "docblock_bias"}:
         return table_route
-
-    bias_seq_len = max(
-        0,
-        _flash_cfg_int(
-            flash_cfg,
-            name="docblock_bias_seq_len",
-            default=1024,
-        ),
-    )
-    if int(bias_seq_len) > 0 and int(seq_len) == int(bias_seq_len):
-        return "docblock_bias"
     return "docblock"
 
 

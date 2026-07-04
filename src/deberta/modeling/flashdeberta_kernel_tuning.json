@@ -18,6 +18,11 @@
       "max_density_exclusive": 0.6
     },
     {
+      "name": "2048_plus",
+      "min_seq_len": 2048,
+      "max_seq_len": 4095
+    },
+    {
       "name": "1024_exact",
       "min_seq_len": 1024,
       "max_seq_len": 1024
@@ -46,6 +51,10 @@
         "choice": "varlen"
       },
       {
+        "seq_bucket": "2048_plus",
+        "choice": "varlen"
+      },
+      {
         "seq_bucket": "4096_plus",
         "choice": "varlen"
       }
@@ -54,6 +63,33 @@
       {
         "seq_bucket": "1024_exact",
         "choice": "docblock_bias"
+      },
+      {
+        "seq_bucket": "under_2048",
+        "choice": "docblock"
+      },
+      {
+        "seq_bucket": "2048_plus",
+        "choice": "docblock"
+      },
+      {
+        "seq_bucket": "2048_medium",
+        "choice": "docblock"
+      },
+      {
+        "seq_bucket": "2048_sparse",
+        "choice": "docblock"
+      },
+      {
+        "seq_bucket": "4096_plus",
+        "choice": "docblock"
+      }
+    ],
+    "local_bias": [
+      {
+        "seq_bucket": "1024_exact",
+        "choice": "local_bias",
+        "max_batch_size": 4
       }
     ]
   },

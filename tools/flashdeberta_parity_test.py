@@ -67,8 +67,8 @@ def _build_tiny_config(*, seq_len: int, flash: bool) -> DebertaV2Config:
     cfg.hf_attention_impl = "flash" if bool(flash) else "eager"
     cfg.hf_flash = {
         "force_varlen": False,
-        "varlen_min_seq_len": 2048,
-        "docblock_bias_seq_len": 1024,
+        "varlen_min_seq_len": None,
+        "docblock_bias_seq_len": None,
         "eager_dense_max_seq_len": 0,
     }
     return cfg

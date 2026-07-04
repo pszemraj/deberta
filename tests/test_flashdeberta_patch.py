@@ -264,6 +264,57 @@ def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
         configure_flashdeberta_kernel_overrides(None)
 
 
+def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+    from deberta.training.compile import (
+        _flash_route_hint_for_docblock_batch,
+        _flash_route_hint_for_padding_batch,
+    )
+
+    override_path = tmp_path / "flash_routes.json"
+    override_path.write_text(
+        """
+{
+  "route_policies": {
+    "padding": [
+      {
+        "seq_bucket": "2048_medium",
+        "choice": "fixed"
+      }
+    ],
+    "docblock": [
+      {
+        "seq_bucket": "1024_exact",
+        "choice": "docblock"
+      }
+    ]
+  }
+}
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        assert _flash_route_hint_for_padding_batch(seq_len=2048, active_tokens=4096, batch_size=2) == "fixed"
+        assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
+def test_docblock_bias_zero_config_override_disables_table_route() -> None:
+    from deberta.training.compile import _flash_route_hint_for_docblock_batch
+
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock_bias"
+    assert (
+        _flash_route_hint_for_docblock_batch(
+            seq_len=1024,
+            flash_cfg={"docblock_bias_seq_len": 0},
+        )
+        == "docblock"
+    )
+
+
 def _small_deberta_config():
     """Build a small config for native DeBERTa patch tests."""
 
@@ -629,18 +680,23 @@ def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
-        bias: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        bucket_index: torch.Tensor,
+        keep_mask: torch.Tensor | None,
+        bias_scale: float,
         sm_scale: float,
         causal: bool,
     ) -> torch.Tensor:
-        """Return zero output while recording dense local-bias inputs."""
+        """Return zero output while recording compact local-bias inputs."""
 
-        del key_layer, value_layer, sm_scale, causal
-        seen["bias_shape"] = tuple(bias.shape)
+        del key_layer, value_layer, pos_key, pos_query, bias_scale, sm_scale, causal
+        seen["bucket_shape"] = tuple(bucket_index.shape)
+        seen["keep_mask"] = keep_mask
         seen["query_shape"] = tuple(query_layer.shape)
         return torch.zeros_like(query_layer)
 
-    monkeypatch.setattr(attention_mod, "flashdeberta_bias", _fake_bias_wrapper)
+    monkeypatch.setattr(attention_mod, "flashdeberta_bias_from_positions", _fake_bias_wrapper)
 
     hidden_states = torch.randn((1, 1024, cfg.hidden_size), dtype=torch.float32)
     rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
@@ -661,7 +717,8 @@ def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest
         1024,
         cfg.hidden_size // cfg.num_attention_heads,
     )
-    assert seen["bias_shape"] == (1, cfg.num_attention_heads, 1024, 1024)
+    assert seen["bucket_shape"] == (1024, 1024)
+    assert seen["keep_mask"] is None
 
     stats = attention_mod.flashdeberta_stats_snapshot()
     assert stats["forward_calls"] == 1
@@ -1684,15 +1741,19 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
-        bias: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        bucket_index: torch.Tensor,
+        keep_mask: torch.Tensor | None,
+        bias_scale: float,
         sm_scale: float,
         causal: bool,
     ) -> torch.Tensor:
-        del key_layer, value_layer, sm_scale, causal
-        seen["bias"] = bias
+        del key_layer, value_layer, pos_key, pos_query, bucket_index, bias_scale, sm_scale, causal
+        seen["keep_mask"] = keep_mask
         return torch.zeros_like(query_layer)
 
-    monkeypatch.setattr(attention_mod, "flashdeberta_bias", _fake_bias_wrapper)
+    monkeypatch.setattr(attention_mod, "flashdeberta_bias_from_positions", _fake_bias_wrapper)
 
     hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
     attention_mask = torch.tensor(
@@ -1719,7 +1780,8 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
 
     assert probs is None
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
-    assert tuple(seen["bias"].shape) == (1, cfg.num_attention_heads, 4, 4)
+    assert seen["keep_mask"] is not None
+    assert tuple(seen["keep_mask"].shape) == (1, 1, 4, 4)
     stats = attention_mod.flashdeberta_stats_snapshot()
     assert stats["forward_calls"] == 1
     assert stats["flash_eligible_calls"] == 1
@@ -1875,6 +1937,282 @@ def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
     expected = torch.zeros((2, 3, 4, 4), dtype=torch.float32).scatter_add_(-1, gather_index, grad)
 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("use_pos_key", "use_pos_query", "use_mask"),
+    [(True, True, True), (True, False, False), (False, True, True)],
+)
+def test_position_bias_dense_grad_reduction_matches_autograd(
+    use_pos_key: bool,
+    use_pos_query: bool,
+    use_mask: bool,
+) -> None:
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    torch.manual_seed(0)
+    batch_size, num_heads, seq_len, num_buckets = 2, 3, 4, 6
+    scale = 0.7
+    bucket_index = torch.tensor(
+        [
+            [2, 2, 3, 4],
+            [1, 2, 2, 3],
+            [1, 1, 2, 2],
+            [0, 1, 1, 2],
+        ],
+        dtype=torch.int64,
+    )
+    keep_mask = None
+    if use_mask:
+        keep_mask = torch.tensor(
+            [
+                [
+                    [
+                        [True, True, False, False],
+                        [True, True, False, False],
+                        [False, False, True, True],
+                        [False, False, True, True],
+                    ]
+                ],
+                [
+                    [
+                        [True, False, False, False],
+                        [False, True, False, False],
+                        [False, False, True, False],
+                        [False, False, False, True],
+                    ]
+                ],
+            ],
+            dtype=torch.bool,
+        )
+    pos_key = (
+        torch.randn((batch_size, num_heads, seq_len, num_buckets), requires_grad=True)
+        if use_pos_key
+        else None
+    )
+    pos_query = (
+        torch.randn((batch_size, num_heads, seq_len, num_buckets), requires_grad=True)
+        if use_pos_query
+        else None
+    )
+    d_bias = torch.randn((batch_size, num_heads, seq_len, seq_len), dtype=torch.float32)
+
+    bias = dense_bias_mod._dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
+    (bias * d_bias).sum().backward()
+
+    actual_key, actual_query = bias_mod._position_bias_backward_from_dense_grad(
+        d_bias=d_bias,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
+
+    if use_pos_key:
+        assert actual_key is not None
+        assert torch.allclose(actual_key, pos_key.grad, atol=1e-6, rtol=1e-6)
+    else:
+        assert actual_key is None
+    if use_pos_query:
+        assert actual_query is not None
+        assert torch.allclose(actual_query, pos_query.grad, atol=1e-6, rtol=1e-6)
+    else:
+        assert actual_query is None
+
+
+def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
+    fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
+
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+
+    if bias_mod._FLASHDEBERTA_POSITION_BIAS_BWD_CUSTOM_OP is None:
+        pytest.skip("Compiled position-bias custom op is unavailable in this environment.")
+
+    with fake_tensor_mod.FakeTensorMode():
+        q = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        k = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        v = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        grad_out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
+        lse = torch.empty((2, 4, 3), device="cuda", dtype=torch.float32)
+        pos_key = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
+        pos_query = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
+        bucket_index = torch.empty((3, 3), device="cuda", dtype=torch.int64)
+        keep_mask = torch.empty((2, 1, 3, 3), device="cuda", dtype=torch.bool)
+
+        dq, dk, dv, dpos_key, dpos_query = bias_mod._FLASHDEBERTA_POSITION_BIAS_BWD_CUSTOM_OP(
+            grad_out,
+            q,
+            k,
+            v,
+            pos_key,
+            pos_query,
+            bucket_index,
+            keep_mask,
+            out,
+            lse,
+            0.5,
+            0.5,
+            False,
+            True,
+            True,
+            True,
+        )
+
+    assert tuple(dq.shape) == tuple(q.shape)
+    assert tuple(dk.shape) == tuple(k.shape)
+    assert tuple(dv.shape) == tuple(v.shape)
+    assert tuple(dpos_key.shape) == tuple(pos_key.shape)
+    assert tuple(dpos_query.shape) == tuple(pos_query.shape)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused position-bias parity.")
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) -> None:
+    import deberta.modeling.flashdeberta_attention as attention_mod
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    if bias_mod._FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP is None:
+        pytest.skip("Compiled position-bias custom op is unavailable in this environment.")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch_size, num_heads, seq_len, head_dim, num_buckets = 1, 2, 32, 64, 16
+    dtype = torch.bfloat16
+    scale = float(head_dim) ** -0.5
+    bucket_index = attention_mod._dense_bucket_index_tensor(
+        seq_len=seq_len,
+        position_buckets=num_buckets // 2,
+        max_relative_distance=seq_len,
+        device=device,
+    )
+    keep_mask = None
+    if use_mask:
+        doc_ids = torch.tensor([[1] * 12 + [2] * 12 + [0] * 8], device=device)
+        keep = doc_ids.ne(0)
+        keep_mask = (
+            keep[:, None, :, None]
+            & keep[:, None, None, :]
+            & doc_ids[:, None, :, None].eq(doc_ids[:, None, None, :])
+        )
+
+    def _leaf(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(shape, device=device, dtype=dtype).requires_grad_()
+
+    q = _leaf((batch_size, num_heads, seq_len, head_dim))
+    k = _leaf((batch_size, num_heads, seq_len, head_dim))
+    v = _leaf((batch_size, num_heads, seq_len, head_dim))
+    pos_key = _leaf((batch_size, num_heads, seq_len, num_buckets))
+    pos_query = _leaf((batch_size, num_heads, seq_len, num_buckets))
+
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+    pos_key_ref = pos_key.detach().clone().requires_grad_()
+    pos_query_ref = pos_query.detach().clone().requires_grad_()
+
+    ref_bias = dense_bias_mod.flashdeberta_dense_bias(
+        pos_key=pos_key_ref,
+        pos_query=pos_query_ref,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
+    ref_out = bias_mod.flashdeberta_bias(
+        query_layer=q_ref,
+        key_layer=k_ref,
+        value_layer=v_ref,
+        bias=ref_bias,
+        sm_scale=scale,
+        causal=False,
+    )
+    fused_out = bias_mod.flashdeberta_bias_from_positions(
+        query_layer=q,
+        key_layer=k,
+        value_layer=v,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        bias_scale=scale,
+        sm_scale=scale,
+        causal=False,
+    )
+
+    grad = torch.randn_like(ref_out)
+    (ref_out.float() * grad.float()).sum().backward()
+    (fused_out.float() * grad.float()).sum().backward()
+
+    torch.testing.assert_close(fused_out, ref_out, atol=2e-2, rtol=2e-2)
+    for actual, expected in (
+        (q.grad, q_ref.grad),
+        (k.grad, k_ref.grad),
+        (v.grad, v_ref.grad),
+        (pos_key.grad, pos_key_ref.grad),
+        (pos_query.grad, pos_query_ref.grad),
+    ):
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for saved-tensor hook coverage.")
+def test_position_bias_attention_cuda_does_not_save_dense_bias_tensor() -> None:
+    import deberta.modeling.flashdeberta_attention as attention_mod
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+
+    if bias_mod._FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP is None:
+        pytest.skip("Compiled position-bias custom op is unavailable in this environment.")
+
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    batch_size, num_heads, seq_len, head_dim, num_buckets = 1, 2, 32, 64, 16
+    dtype = torch.bfloat16
+    scale = float(head_dim) ** -0.5
+    q = torch.randn((batch_size, num_heads, seq_len, head_dim), device=device, dtype=dtype).requires_grad_()
+    k = torch.randn((batch_size, num_heads, seq_len, head_dim), device=device, dtype=dtype).requires_grad_()
+    v = torch.randn((batch_size, num_heads, seq_len, head_dim), device=device, dtype=dtype).requires_grad_()
+    pos_key = torch.randn(
+        (batch_size, num_heads, seq_len, num_buckets), device=device, dtype=dtype
+    ).requires_grad_()
+    pos_query = torch.randn(
+        (batch_size, num_heads, seq_len, num_buckets), device=device, dtype=dtype
+    ).requires_grad_()
+    bucket_index = attention_mod._dense_bucket_index_tensor(
+        seq_len=seq_len,
+        position_buckets=num_buckets // 2,
+        max_relative_distance=seq_len,
+        device=device,
+    )
+    saved_shapes: list[tuple[int, ...]] = []
+
+    def _pack(tensor: torch.Tensor) -> torch.Tensor:
+        saved_shapes.append(tuple(int(dim) for dim in tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(_pack, lambda tensor: tensor):
+        out = bias_mod.flashdeberta_bias_from_positions(
+            query_layer=q,
+            key_layer=k,
+            value_layer=v,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=None,
+            bias_scale=scale,
+            sm_scale=scale,
+            causal=False,
+        )
+        out.float().sum().backward()
+
+    assert (batch_size, num_heads, seq_len, seq_len) not in saved_shapes
 
 
 def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
