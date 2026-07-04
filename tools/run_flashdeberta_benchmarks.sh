@@ -104,7 +104,8 @@ train_flash_case() {
     run_case \
         "${name}" \
         "${env_prefix[@]}" \
-        conda run --name neobert --no-capture-output python tools/train_flashdeberta.py train "${config_path}" \
+        conda run --name neobert --no-capture-output deberta train "${config_path}" \
+        --model.hf.attention_impl flash \
         --train.max_steps "${steps}" \
         --logging.logging_steps "${LOGGING_STEPS}" \
         --train.checkpoint.output_dir "${output_dir}" \

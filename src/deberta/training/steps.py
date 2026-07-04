@@ -340,11 +340,13 @@ def _resolve_window_token_weights(
     )
 
 
-def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     """Move all batch tensors onto a device.
 
-    :param dict[str, torch.Tensor] batch: Tensor batch mapping.
+    :param dict[str, Any] batch: Batch mapping.
     :param torch.device device: Destination device.
-    :return dict[str, torch.Tensor]: Batch placed on ``device``.
+    :return dict[str, Any]: Batch placed on ``device``.
     """
-    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+    return {
+        k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+    }

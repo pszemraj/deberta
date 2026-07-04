@@ -22,10 +22,31 @@ try:  # pragma: no cover - optional Triton dependency
     import triton.language as tl
 
     _TRITON_IMPORT_ERROR: Exception | None = None
+    _TRITON_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - optional Triton dependency
-    triton = None
-    tl = None
+
+    class _MissingTriton:
+        """Minimal stand-in that lets this module define fallback kernels."""
+
+        @staticmethod
+        def jit(fn: object) -> object:
+            """Return ``fn`` unchanged when Triton is unavailable.
+
+            :param object fn: Function object.
+            :return object: The unchanged function object.
+            """
+
+            return fn
+
+    class _MissingTritonLanguage:
+        """Minimal annotation stand-in for ``tl.constexpr``."""
+
+        constexpr = object
+
+    triton = _MissingTriton()
+    tl = _MissingTritonLanguage()
     _TRITON_IMPORT_ERROR = exc
+    _TRITON_AVAILABLE = False
 
 _PACK_BLOCK_ROWS = 32
 _PACK_BLOCK_COLS = 128
@@ -48,7 +69,7 @@ def flashdeberta_prefix_pack_available() -> bool:
     :return bool: True when Triton was imported successfully.
     """
 
-    return triton is not None and tl is not None
+    return _TRITON_AVAILABLE
 
 
 def _traceable_triton_kernel(kernel: object) -> object:

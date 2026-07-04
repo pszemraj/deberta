@@ -103,6 +103,37 @@ def test_load_json_nested_and_flat(tmp_path: Path):
         load_config(flat)
 
 
+def test_load_yaml_hf_flash_config(tmp_path: Path):
+    pytest.importorskip("yaml")
+
+    config_path = tmp_path / "flash.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  backbone_type: hf_deberta_v2",
+                "  hf:",
+                "    attention_impl: flash",
+                "    flash:",
+                "      force_varlen: true",
+                "      varlen_min_seq_len: 4096",
+                "      docblock_bias_seq_len: 0",
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_path)
+
+    assert cfg.model.hf.attention_impl == "flash"
+    assert cfg.model.hf.flash.force_varlen is True
+    assert cfg.model.hf.flash.varlen_min_seq_len == 4096
+    assert cfg.model.hf.flash.docblock_bias_seq_len == 0
+
+
 def test_load_yaml_resolves_variables(tmp_path: Path):
     pytest.importorskip("yaml")
 

@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
-"""Launch the standard training CLI with FlashDeBERTa runtime patches enabled."""
+"""Compatibility shim for the removed FlashDeBERTa training wrapper."""
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 
-def _ensure_src_on_path() -> None:
-    """Add the repository ``src/`` directory to ``sys.path`` for direct script execution."""
+def main() -> int:
+    """Report the supported config-driven FlashDeBERTa entrypoint.
 
-    repo_root = Path(__file__).resolve().parents[1]
-    src_path = str(repo_root / "src")
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
+    :return int: Process exit code.
+    """
 
+    sys.stderr.write(
+        "tools/train_flashdeberta.py has been retired. Use the standard CLI with "
+        "`deberta train ... --model.hf.attention_impl flash` after installing `.[flash]`.\n"
+    )
+    return 2
 
-_ensure_src_on_path()
-
-from deberta.modeling.flashdeberta_patch import enable_flashdeberta_attention  # noqa: E402
-
-enable_flashdeberta_attention(strict=True)
-
-from deberta.cli import main  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

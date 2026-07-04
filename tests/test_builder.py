@@ -457,6 +457,37 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_in_pretrained_
         builder_mod.validate_model_config(cfg)
 
 
+def test_build_hf_configs_propagates_flash_runtime_policy():
+    pytest.importorskip("transformers")
+
+    cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        hf={
+            "attention_impl": "flash",
+            "flash": {
+                "force_varlen": True,
+                "varlen_min_seq_len": 4096,
+                "docblock_bias_seq_len": 0,
+                "eager_dense_max_seq_len": 512,
+            },
+        },
+    )
+    tokenizer = DummyTokenizer(vocab_size=128100)
+
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=64,
+    )
+
+    for built_cfg in (disc_cfg, gen_cfg):
+        assert built_cfg.hf_attention_impl == "flash"
+        assert built_cfg.hf_flash["force_varlen"] is True
+        assert built_cfg.hf_flash["varlen_min_seq_len"] == 4096
+        assert built_cfg.flash_docblock_bias_seq_len == 0
+        assert built_cfg.flash_eager_dense_max_seq_len == 512
+
+
 def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritative(
     monkeypatch: pytest.MonkeyPatch,
 ):

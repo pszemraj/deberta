@@ -103,6 +103,23 @@ from deberta.utils.paths import validate_existing_output_dir
 logger = logging.getLogger(__name__)
 
 
+def _flash_attention_enabled_for_runtime(model_cfg: ModelConfig) -> bool:
+    """Return whether current training can consume FlashDeBERTa metadata.
+
+    :param ModelConfig model_cfg: Resolved model config.
+    :return bool: True when flash attention is enabled by config or legacy patch.
+    """
+
+    hf_cfg = getattr(model_cfg, "hf", None)
+    if str(getattr(hf_cfg, "attention_impl", "eager")).strip().lower() == "flash":
+        return True
+    try:
+        from deberta.modeling import deberta_v2_native as dv2
+    except Exception:
+        return False
+    return bool(getattr(dv2, "_FLASHDEBERTA_ENABLED", False))
+
+
 def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
@@ -1130,9 +1147,11 @@ def run_pretraining(
                         compile_scope=compile_scope,
                         backbone_type=str(model_cfg.backbone_type),
                     )
-                    batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                    batch, flash_meta = prepare_flash_attention_batch_metadata(
                         batch=batch,
                         backbone_type=str(model_cfg.backbone_type),
+                        flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
+                        flash_cfg=getattr(model_cfg.hf, "flash", None),
                     )
                     if compile_enabled:
                         _maybe_cudagraph_mark_step_begin()
@@ -1147,11 +1166,7 @@ def run_pretraining(
                             token_type_ids=batch.get("token_type_ids"),
                             sampling_temperature=train_cfg.sampling_temperature,
                             phase="generator",
-                            flash_seq_lengths=batch.get("flash_seq_lengths"),
-                            flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
-                            flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
-                            flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
-                            flash_route_hint=flash_route_hint,
+                            flash_meta=flash_meta,
                         )
                         gen_loss = gen_phase_out.gen_loss_raw
                         if token_weighted_ga:
@@ -1244,11 +1259,7 @@ def run_pretraining(
                                 "input_ids": batch["input_ids"],
                                 "attention_mask": batch.get("attention_mask"),
                                 "token_type_ids": batch.get("token_type_ids"),
-                                "flash_seq_lengths": batch.get("flash_seq_lengths"),
-                                "flash_doc_segment_offsets": batch.get("flash_doc_segment_offsets"),
-                                "flash_doc_segment_lengths": batch.get("flash_doc_segment_lengths"),
-                                "flash_doc_cu_seqlens": batch.get("flash_doc_cu_seqlens"),
-                                "flash_route_hint": flash_route_hint,
+                                "flash_meta": flash_meta,
                                 "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                                 "disc_labels": gen_phase_out.disc_labels,
                                 "disc_count": float(disc_count),
@@ -1325,11 +1336,7 @@ def run_pretraining(
                                 attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
                                 token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                                 phase="discriminator",
-                                flash_seq_lengths=payload["flash_seq_lengths"],  # type: ignore[arg-type]
-                                flash_doc_segment_offsets=payload["flash_doc_segment_offsets"],  # type: ignore[arg-type]
-                                flash_doc_segment_lengths=payload["flash_doc_segment_lengths"],  # type: ignore[arg-type]
-                                flash_doc_cu_seqlens=payload["flash_doc_cu_seqlens"],  # type: ignore[arg-type]
-                                flash_route_hint=payload["flash_route_hint"],  # type: ignore[arg-type]
+                                flash_meta=payload["flash_meta"],  # type: ignore[arg-type]
                             )
                             disc_loss = disc_phase_out.disc_loss_raw
                             disc_objective_weight = float(payload.get("disc_objective_weight", 1.0))
@@ -1605,9 +1612,11 @@ def run_pretraining(
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
                 )
-                batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                batch, flash_meta = prepare_flash_attention_batch_metadata(
                     batch=batch,
                     backbone_type=str(model_cfg.backbone_type),
+                    flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
+                    flash_cfg=getattr(model_cfg.hf, "flash", None),
                 )
                 if compile_enabled:
                     _maybe_cudagraph_mark_step_begin()
@@ -1624,11 +1633,7 @@ def run_pretraining(
                         sampling_temperature=train_cfg.sampling_temperature,
                         gen_loss_weight=train_cfg.gen_loss_weight,
                         disc_loss_weight=train_cfg.disc_loss_weight,
-                        flash_seq_lengths=batch.get("flash_seq_lengths"),
-                        flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
-                        flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
-                        flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
-                        flash_route_hint=flash_route_hint,
+                        flash_meta=flash_meta,
                     )
 
                     if token_weighted_ga:

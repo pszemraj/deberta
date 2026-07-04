@@ -49,6 +49,7 @@ import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -74,12 +75,12 @@ from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_padded,
 )
-from deberta.modeling.mask_utils import normalize_keep_mask
+from deberta.modeling.flashdeberta_version import flashdeberta_version_error, require_flashdeberta_version
+from deberta.modeling.mask_utils import build_doc_block_mask, doc_ids_from_segments, normalize_keep_mask
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
 _TRUTHY = {"1", "true", "yes", "y", "on"}
-_LOCAL_BIAS_SEQ_LEN = 1024
 _LOCAL_BIAS_MAX_BATCH_SIZE = 4
 _DENSE_BUCKET_INDEX_CACHE: dict[tuple[int, int, int, str, int | None], torch.Tensor] = {}
 
@@ -94,6 +95,7 @@ class FlashDebertaRuntimeConfig:
 
     force_varlen: bool = False
     varlen_min_seq_len: int = 2048
+    docblock_bias_seq_len: int = 1024
     eager_dense_max_seq_len: int = 0
     enable_debug_stats: bool = False
     warn_fallbacks: bool = True
@@ -150,6 +152,7 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
     return FlashDebertaRuntimeConfig(
         force_varlen=_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"),
         varlen_min_seq_len=max(1, _int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 2048)),
+        docblock_bias_seq_len=max(0, _int_env("FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN", 1024)),
         eager_dense_max_seq_len=max(0, _int_env("FLASHDEBERTA_EAGER_DENSE_MAX_SEQ_LEN", 0)),
         enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
         warn_fallbacks=_truthy_env("FLASHDEBERTA_WARN_FALLBACKS", default="1"),
@@ -170,6 +173,47 @@ def refresh_flashdeberta_runtime_config_from_env() -> None:
     _RUNTIME_CONFIG = _read_runtime_config_from_env()
 
 
+def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRuntimeConfig:
+    """Resolve flash runtime policy from a native DeBERTa config object.
+
+    :param Any | None config: Optional backbone config object.
+    :return FlashDebertaRuntimeConfig: Instance-local runtime policy.
+    """
+
+    raw = getattr(config, "hf_flash", None) if config is not None else None
+    if isinstance(raw, dict):
+        getter = raw.get
+    else:
+
+        def getter(key: str, default: Any = None) -> Any:
+            """Read one attribute-style config value.
+
+            :param str key: Attribute name.
+            :param Any default: Default value.
+            :return Any: Resolved value.
+            """
+
+            return getattr(raw, key, default) if raw is not None else default
+
+    return FlashDebertaRuntimeConfig(
+        force_varlen=bool(getter("force_varlen", getattr(config, "flash_force_varlen", False))),
+        varlen_min_seq_len=max(
+            1,
+            int(getter("varlen_min_seq_len", getattr(config, "flash_varlen_min_seq_len", 2048))),
+        ),
+        docblock_bias_seq_len=max(
+            0,
+            int(getter("docblock_bias_seq_len", getattr(config, "flash_docblock_bias_seq_len", 1024))),
+        ),
+        eager_dense_max_seq_len=max(
+            0,
+            int(getter("eager_dense_max_seq_len", getattr(config, "flash_eager_dense_max_seq_len", 0))),
+        ),
+        enable_debug_stats=bool(_RUNTIME_CONFIG.enable_debug_stats),
+        warn_fallbacks=bool(_RUNTIME_CONFIG.warn_fallbacks),
+    )
+
+
 def flashdeberta_import_error() -> Exception | None:
     """Return the fixed-kernel import error, if any.
 
@@ -179,6 +223,9 @@ def flashdeberta_import_error() -> Exception | None:
     :return Exception | None: Stored fixed-kernel import failure, if one occurred.
     """
 
+    version_error = flashdeberta_version_error()
+    if version_error is not None:
+        return version_error
     return flashdeberta_fixed_import_error()
 
 
@@ -310,6 +357,7 @@ def _should_use_varlen(
     *,
     attention_mask: torch.Tensor | None,
     seq_len: int,
+    runtime_config: FlashDebertaRuntimeConfig | None = None,
 ) -> bool:
     """Return whether the varlen kernel should be used for this call.
 
@@ -324,6 +372,7 @@ def _should_use_varlen(
 
     :param torch.Tensor | None attention_mask: Optional attention mask.
     :param int seq_len: Sequence length for the current call.
+    :param FlashDebertaRuntimeConfig | None runtime_config: Optional instance-local runtime policy.
     :return bool: True when the varlen kernel should run.
     """
 
@@ -333,10 +382,11 @@ def _should_use_varlen(
     if _is_torch_compiling() and not flashdeberta_compiled_varlen_available():
         return False
 
-    if _RUNTIME_CONFIG.force_varlen:
+    cfg = runtime_config or _RUNTIME_CONFIG
+    if cfg.force_varlen:
         return True
 
-    return int(seq_len) >= int(_RUNTIME_CONFIG.varlen_min_seq_len)
+    return int(seq_len) >= int(cfg.varlen_min_seq_len)
 
 
 def _normalize_flash_route_hint(flash_route_hint: str | None) -> str | None:
@@ -499,6 +549,18 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
     _warned_reasons: set[str] = set()
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize after enforcing the supported FlashDeBERTa package pin.
+
+        :param Any args: Positional constructor arguments.
+        :param Any kwargs: Keyword constructor arguments.
+        """
+
+        require_flashdeberta_version()
+        config = args[0] if args else kwargs.get("config")
+        self._runtime_config = _runtime_config_from_deberta_config(config)
+        super().__init__(*args, **kwargs)
+
     @classmethod
     def _warn_once(cls, *, reason: str, message: str) -> None:
         """Emit one warning per process for a fallback reason.
@@ -542,7 +604,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         dropout_p = float(getattr(self.dropout, "p", 0.0))
         normalized_flash_route = _normalize_flash_route_hint(flash_route_hint)
 
-        dense_eager_limit = int(_RUNTIME_CONFIG.eager_dense_max_seq_len)
+        dense_eager_limit = int(self._runtime_config.eager_dense_max_seq_len)
         if dense_eager_limit > 0 and attention_mask is None and key_len <= dense_eager_limit:
             return (
                 "dense_short_policy",
@@ -714,7 +776,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if int(batch_size) > _LOCAL_BIAS_MAX_BATCH_SIZE:
             return False
-        if int(seq_len) != _LOCAL_BIAS_SEQ_LEN:
+        if int(seq_len) != int(self._runtime_config.docblock_bias_seq_len):
             return False
         if pos_key is None and pos_query is None:
             return False
@@ -914,6 +976,43 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             causal=False,
         )
 
+    def _eager_fallback_attention_mask(
+        self,
+        *,
+        attention_mask: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        query_states: torch.Tensor,
+        flash_doc_segment_offsets: torch.Tensor | None,
+        flash_doc_segment_lengths: torch.Tensor | None,
+        flash_route_hint: str | None,
+    ) -> torch.Tensor | None:
+        """Rebuild pairwise doc-block masks for eager fallback when needed.
+
+        :param torch.Tensor | None attention_mask: Original attention mask.
+        :param torch.Tensor hidden_states: Key/value hidden states.
+        :param torch.Tensor query_states: Query hidden states.
+        :param torch.Tensor | None flash_doc_segment_offsets: Flat padded row offsets per segment.
+        :param torch.Tensor | None flash_doc_segment_lengths: Per-segment lengths.
+        :param str | None flash_route_hint: Flash route hint.
+        :return torch.Tensor | None: Eager-compatible attention mask.
+        """
+
+        if _normalize_flash_route_hint(flash_route_hint) != "docblock":
+            return attention_mask
+        if flash_doc_segment_offsets is None or flash_doc_segment_lengths is None:
+            return attention_mask
+        key_len = int(hidden_states.shape[-2])
+        query_len = int(query_states.shape[-2])
+        if query_len != key_len:
+            return attention_mask
+        doc_ids = doc_ids_from_segments(
+            offsets=flash_doc_segment_offsets,
+            lengths=flash_doc_segment_lengths,
+            batch_size=int(hidden_states.shape[0]),
+            seq_len=key_len,
+        )
+        return build_doc_block_mask(doc_ids).unsqueeze(1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -948,6 +1047,14 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if query_states is None:
             query_states = hidden_states
+        eager_attention_mask = self._eager_fallback_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            query_states=query_states,
+            flash_doc_segment_offsets=flash_doc_segment_offsets,
+            flash_doc_segment_lengths=flash_doc_segment_lengths,
+            flash_route_hint=flash_route_hint,
+        )
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("forward_calls")
@@ -970,7 +1077,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             # relative-position bias inside eager attention instead.
             return super().forward(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=eager_attention_mask,
                 output_attentions=output_attentions,
                 query_states=query_states,
                 relative_pos=None,
@@ -997,6 +1104,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             use_varlen = _should_use_varlen(
                 attention_mask=attention_mask,
                 seq_len=int(hidden_states.shape[-2]),
+                runtime_config=self._runtime_config,
             )
 
         if use_docblock_bias:
@@ -1017,7 +1125,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
                 return super().forward(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=eager_attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
                     relative_pos=None,
@@ -1034,7 +1142,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
                 return super().forward(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=eager_attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
                     relative_pos=None,
@@ -1053,7 +1161,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
                 return super().forward(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=eager_attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
                     relative_pos=None,
@@ -1078,7 +1186,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
                 return super().forward(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=eager_attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
                     relative_pos=None,
@@ -1095,7 +1203,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
                 return super().forward(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=eager_attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
                     relative_pos=None,
@@ -1114,7 +1222,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
                 return super().forward(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=eager_attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
                     relative_pos=None,
@@ -1145,7 +1253,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             # mismatches instead of reviving the encoder-wide relative_pos tensor.
             return super().forward(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=eager_attention_mask,
                 output_attentions=output_attentions,
                 query_states=query_states,
                 relative_pos=None,

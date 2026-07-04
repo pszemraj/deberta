@@ -29,7 +29,7 @@ pip install -e '.[wandb]'
 pip install -e '.[flash]'
 ```
 
-The `flash` extra installs `flashdeberta` and `triton` for the optional FlashDeBERTa runtime patch used with the native `hf_deberta_v2` backbone.
+The `flash` extra installs the pinned `flashdeberta==0.0.7` package and `triton` for optional FlashDeBERTa attention used with the native `hf_deberta_v2` backbone.
 
 ## Generate API markdown docs
 

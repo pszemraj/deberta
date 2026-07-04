@@ -692,7 +692,13 @@ class DebertaV2Attention(nn.Module):
         :param DebertaV2Config config: Backbone configuration.
         """
         super().__init__()
-        self.self = DisentangledSelfAttention(config)
+        attention_impl = str(getattr(config, "hf_attention_impl", "eager")).strip().lower()
+        if attention_impl == "flash":
+            from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
+
+            self.self = FlashDisentangledSelfAttention(config)
+        else:
+            self.self = DisentangledSelfAttention(config)
         self.output = DebertaV2SelfOutput(config)
 
     def forward(
@@ -1093,6 +1099,9 @@ class DebertaV2Encoder(nn.Module):
         self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
         self.gradient_checkpointing = False
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
+        self.flash_attention_enabled = (
+            str(getattr(config, "hf_attention_impl", "eager")).strip().lower() == "flash"
+        )
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         """Return optionally normalized relative embedding table.
@@ -1164,6 +1173,8 @@ class DebertaV2Encoder(nn.Module):
             return None
         if relative_pos is not None:
             return relative_pos
+        if self.flash_attention_enabled:
+            return None
 
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2]) if query_states is not None else key_len

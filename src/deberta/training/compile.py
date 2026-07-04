@@ -10,11 +10,14 @@ from typing import Any
 import torch
 
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
-from deberta.modeling.mask_utils import normalize_keep_mask
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    build_doc_block_mask,
+    build_doc_segment_metadata,
+    normalize_keep_mask,
+)
 
 logger = logging.getLogger(__name__)
-_DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
-_DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _FLASH_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
@@ -144,6 +147,67 @@ def _flash_int_env(name: str, default: int) -> int:
         return int(default)
 
 
+def _flash_cfg_get(flash_cfg: Any | None, name: str, default: Any) -> Any:
+    """Return one flash config value from a mapping/dataclass/object.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Field name.
+    :param Any default: Default value.
+    :return Any: Resolved value.
+    """
+
+    if flash_cfg is None:
+        return default
+    if isinstance(flash_cfg, dict):
+        return flash_cfg.get(name, default)
+    return getattr(flash_cfg, name, default)
+
+
+def _flash_cfg_bool(
+    flash_cfg: Any | None,
+    *,
+    name: str,
+    env_name: str,
+    default: str,
+) -> bool:
+    """Resolve one boolean flash option from config or environment.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Config field name.
+    :param str env_name: Environment fallback name.
+    :param str default: Environment fallback default.
+    :return bool: Resolved boolean value.
+    """
+
+    if flash_cfg is None:
+        return _flash_truthy_env(env_name, default=default)
+    return bool(_flash_cfg_get(flash_cfg, name, False))
+
+
+def _flash_cfg_int(
+    flash_cfg: Any | None,
+    *,
+    name: str,
+    env_name: str,
+    default: int,
+) -> int:
+    """Resolve one integer flash option from config or environment.
+
+    :param Any | None flash_cfg: Optional config source.
+    :param str name: Config field name.
+    :param str env_name: Environment fallback name.
+    :param int default: Environment fallback default.
+    :return int: Resolved integer value.
+    """
+
+    if flash_cfg is None:
+        return _flash_int_env(env_name, int(default))
+    try:
+        return int(_flash_cfg_get(flash_cfg, name, default))
+    except Exception:
+        return int(default)
+
+
 def _flash_mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     """Extract a canonical ``(B,S)`` keep mask from rank-2/4 padding masks.
 
@@ -200,16 +264,23 @@ def _flash_route_hint_for_padding_batch(
     seq_len: int,
     active_tokens: int,
     batch_size: int,
+    flash_cfg: Any | None = None,
 ) -> str:
     """Select a fixed-vs-varlen route for one standard padded batch.
 
     :param int seq_len: Padded sequence length.
     :param int active_tokens: Total active tokens across the batch.
     :param int batch_size: Batch size.
+    :param Any | None flash_cfg: Optional resolved flash config.
     :return str: Either ``fixed`` or ``varlen``.
     """
 
-    if _flash_truthy_env("FLASHDEBERTA_FORCE_VARLEN", default="0"):
+    if _flash_cfg_bool(
+        flash_cfg,
+        name="force_varlen",
+        env_name="FLASHDEBERTA_FORCE_VARLEN",
+        default="0",
+    ):
         return "varlen"
     density_bucket = _flash_density_bucket(
         seq_len=int(seq_len),
@@ -222,12 +293,20 @@ def _flash_route_hint_for_padding_batch(
         "2048_sparse": "varlen",
         "4096_plus": "varlen",
     }
-    default_varlen_min_seq_len = max(1, _flash_int_env("FLASHDEBERTA_VARLEN_MIN_SEQ_LEN", 2048))
+    default_varlen_min_seq_len = max(
+        1,
+        _flash_cfg_int(
+            flash_cfg,
+            name="varlen_min_seq_len",
+            env_name="FLASHDEBERTA_VARLEN_MIN_SEQ_LEN",
+            default=2048,
+        ),
+    )
     default_route = "varlen" if int(seq_len) >= int(default_varlen_min_seq_len) else "fixed"
     return route_by_bucket.get(density_bucket, default_route)
 
 
-def _flash_route_hint_for_docblock_batch(*, seq_len: int) -> str:
+def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
     """Select the doc-block flash backend for one packed batch.
 
     The repo's measured packed-docblock ``1024`` regime is not a good fit for
@@ -236,10 +315,19 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int) -> str:
     op for longer contexts where the quadratic bias route is less practical.
 
     :param int seq_len: Packed sequence length.
+    :param Any | None flash_cfg: Optional resolved flash config.
     :return str: Either ``docblock_bias`` or ``docblock``.
     """
 
-    bias_seq_len = max(0, _flash_int_env("FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN", 1024))
+    bias_seq_len = max(
+        0,
+        _flash_cfg_int(
+            flash_cfg,
+            name="docblock_bias_seq_len",
+            env_name="FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN",
+            default=1024,
+        ),
+    )
     if int(bias_seq_len) > 0 and int(seq_len) == int(bias_seq_len):
         return "docblock_bias"
     return "docblock"
@@ -248,72 +336,29 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int) -> str:
 def _build_doc_segment_metadata(
     doc_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Build contiguous document-segment metadata from compact ``doc_ids``.
+    """Compatibility wrapper for shared doc-segment metadata construction.
 
-    The collator already guarantees that packed document ids are block-diagonal:
-    each document occupies one contiguous token span, and padding is encoded as
-    ``0``. That lets the flash path repack documents into a ragged batch without
-    ever materializing a dense pairwise mask.
-
-    :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with ``0`` for padding.
-    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        Fixed-shape flat padded row offsets per segment, fixed-shape per-segment
-        lengths, fixed-shape cumulative packed offsets, and total active tokens.
+    :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]: Segment metadata.
     """
 
-    if doc_ids.ndim != 2:
-        raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
-
-    batch_size, seq_len = int(doc_ids.shape[0]), int(doc_ids.shape[1])
-    max_segments = max(1, batch_size * seq_len)
-    segment_offsets_padded = torch.zeros((max_segments,), device=doc_ids.device, dtype=torch.int32)
-    segment_lengths_padded = torch.zeros((max_segments,), device=doc_ids.device, dtype=torch.int32)
-    cu_seqlens_padded = torch.zeros((max_segments + 1,), device=doc_ids.device, dtype=torch.int32)
-
-    active = doc_ids.ne(0)
-    if not bool(active.any().item()):
-        return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, 0
-
-    prev = torch.zeros_like(doc_ids)
-    prev[:, 1:] = doc_ids[:, :-1]
-    next_ids = torch.zeros_like(doc_ids)
-    next_ids[:, :-1] = doc_ids[:, 1:]
-
-    start_mask = active & doc_ids.ne(prev)
-    end_mask = active & doc_ids.ne(next_ids)
-
-    start_idx = start_mask.nonzero(as_tuple=False)
-    end_idx = end_mask.nonzero(as_tuple=False)
-    if int(start_idx.shape[0]) != int(end_idx.shape[0]):
-        raise RuntimeError("doc-block segment boundary count mismatch.")
-
-    segment_starts = start_idx[:, 1].to(dtype=torch.int32)
-    segment_ends = end_idx[:, 1].to(dtype=torch.int32)
-    segment_lengths = (segment_ends - segment_starts + 1).to(dtype=torch.int32)
-    batch_rows = start_idx[:, 0].to(dtype=torch.int32)
-    segment_offsets = batch_rows * int(seq_len) + segment_starts
-    cu_seqlens = torch.nn.functional.pad(
-        torch.cumsum(segment_lengths, dim=0, dtype=torch.int32),
-        (1, 0),
-    )
-    num_segments = int(segment_lengths.shape[0])
-    segment_offsets_padded[:num_segments] = segment_offsets
-    segment_lengths_padded[:num_segments] = segment_lengths
-    cu_seqlens_padded[: num_segments + 1] = cu_seqlens
-    total_tokens = int(cu_seqlens[-1].item())
-    return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, total_tokens
+    return build_doc_segment_metadata(doc_ids)
 
 
 def prepare_flash_attention_batch_metadata(
     *,
     batch: dict[str, Any],
     backbone_type: str,
-) -> tuple[dict[str, Any], str | None]:
-    """Attach precomputed flash metadata and return an out-of-graph route hint.
+    flash_enabled: bool = False,
+    flash_cfg: Any | None = None,
+) -> tuple[dict[str, Any], FlashBatchMeta | None]:
+    """Attach precomputed flash metadata and return an out-of-graph metadata bundle.
 
     :param dict[str, Any] batch: Device-local batch mapping.
     :param str backbone_type: Backbone type string.
-    :return tuple[dict[str, Any], str | None]: Updated batch and selected route hint.
+    :param bool flash_enabled: Whether the active backend can consume flash metadata.
+    :param Any | None flash_cfg: Optional resolved flash config for route selection.
+    :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
     """
 
     btype = str(backbone_type).strip().lower()
@@ -333,27 +378,44 @@ def prepare_flash_attention_batch_metadata(
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
-        route_hint = _flash_route_hint_for_docblock_batch(seq_len=int(input_ids.shape[-1]))
+        route_hint = _flash_route_hint_for_docblock_batch(
+            seq_len=int(input_ids.shape[-1]),
+            flash_cfg=flash_cfg,
+        )
         keep_mask = doc_ids.ne(0)
         seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
         active_tokens = int(seq_lengths.sum(dtype=torch.int32).item())
-        batch["attention_mask"] = (
-            _build_doc_block_mask(doc_ids) if route_hint == "docblock_bias" else keep_mask
-        )
         batch["flash_seq_lengths"] = seq_lengths
         batch["flash_active_tokens"] = torch.tensor(
             int(active_tokens), device=seq_lengths.device, dtype=torch.int32
         )
-        if route_hint == "docblock_bias":
+        if (not bool(flash_enabled)) or route_hint == "docblock_bias":
+            batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+            if not bool(flash_enabled):
+                batch.pop("flash_seq_lengths", None)
+                batch.pop("flash_active_tokens", None)
             batch.pop("flash_doc_segment_offsets", None)
             batch.pop("flash_doc_segment_lengths", None)
             batch.pop("flash_doc_cu_seqlens", None)
-            return batch, route_hint
+            meta = FlashBatchMeta(
+                seq_lengths=seq_lengths if bool(flash_enabled) else None,
+                active_tokens_host=active_tokens,
+                route_hint=route_hint if bool(flash_enabled) else "pairwise",
+            )
+            return batch, meta if bool(flash_enabled) else None
+        batch["attention_mask"] = keep_mask
         segment_offsets, segment_lengths, cu_seqlens, _ = _build_doc_segment_metadata(doc_ids)
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
-        return batch, route_hint
+        return batch, FlashBatchMeta(
+            seq_lengths=seq_lengths,
+            doc_segment_offsets=segment_offsets,
+            doc_segment_lengths=segment_lengths,
+            doc_cu_seqlens=cu_seqlens,
+            active_tokens_host=active_tokens,
+            route_hint=route_hint,
+        )
 
     attention_mask = batch.get("attention_mask")
     seq_len = int(input_ids.shape[-1])
@@ -363,16 +425,24 @@ def prepare_flash_attention_batch_metadata(
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
-        return batch, "dense"
+        return batch, FlashBatchMeta(route_hint="dense") if bool(flash_enabled) else None
     if _flash_is_pairwise_mask(attention_mask, seq_len=int(seq_len)):
         batch.pop("flash_seq_lengths", None)
         batch.pop("flash_active_tokens", None)
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
-        return batch, "pairwise"
+        return batch, None
 
     if not isinstance(attention_mask, torch.Tensor):
+        batch.pop("flash_seq_lengths", None)
+        batch.pop("flash_active_tokens", None)
+        batch.pop("flash_doc_segment_offsets", None)
+        batch.pop("flash_doc_segment_lengths", None)
+        batch.pop("flash_doc_cu_seqlens", None)
+        return batch, None
+
+    if not bool(flash_enabled):
         batch.pop("flash_seq_lengths", None)
         batch.pop("flash_active_tokens", None)
         batch.pop("flash_doc_segment_offsets", None)
@@ -387,13 +457,18 @@ def prepare_flash_attention_batch_metadata(
         seq_len=seq_len,
         active_tokens=active_tokens,
         batch_size=int(input_ids.shape[0]),
+        flash_cfg=flash_cfg,
     )
     batch["flash_seq_lengths"] = seq_lengths
     batch["flash_active_tokens"] = torch.tensor(active_tokens, device=seq_lengths.device, dtype=torch.int32)
     batch.pop("flash_doc_segment_offsets", None)
     batch.pop("flash_doc_segment_lengths", None)
     batch.pop("flash_doc_cu_seqlens", None)
-    return batch, route_hint
+    return batch, FlashBatchMeta(
+        seq_lengths=seq_lengths,
+        active_tokens_host=active_tokens,
+        route_hint=route_hint,
+    )
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:
@@ -1274,45 +1349,13 @@ def _prefill_rotary_caches_for_compile(
 
 
 def _build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-    """Build a pairwise ``(B, S, S)`` keep-mask from document ids on-device.
+    """Compatibility wrapper for shared doc-block mask construction.
 
-    Contract:
-
-    - Active tokens (``doc_id != 0``) attend only within the same document.
-    - The diagonal encodes query activity (active ``True``, pad/inactive ``False``).
-    - Inactive/pad queries get a single keep-edge to the CLS key (position 0) so SDPA
-      never sees all-False rows.
-
-    :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with 0 for padding.
-    :return torch.Tensor: Bool keep-mask ``(B, S, S)``.
+    :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
+    :return torch.Tensor: Boolean keep mask ``(B,S,S)``.
     """
-    if doc_ids.ndim != 2:
-        raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
 
-    bsz, seq_len = int(doc_ids.shape[0]), int(doc_ids.shape[1])
-    device = doc_ids.device
-
-    key = (seq_len, str(device.type), int(device.index) if device.index is not None else None)
-    eye = _DOC_BLOCK_EYE_CACHE.get(key)
-    if eye is None or eye.device != device or eye.shape != (seq_len, seq_len):
-        eye = torch.eye(seq_len, dtype=torch.bool, device=device)
-        _DOC_BLOCK_EYE_CACHE[key] = eye
-
-    cls_key = _DOC_BLOCK_CLS_KEY_CACHE.get(key)
-    if cls_key is None or cls_key.device != device or cls_key.shape != (seq_len,):
-        cls_key = torch.zeros(seq_len, dtype=torch.bool, device=device)
-        cls_key[0] = True
-        _DOC_BLOCK_CLS_KEY_CACHE[key] = cls_key
-
-    active = doc_ids.ne(0)  # (B,S)
-    same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])  # (B,S,S)
-    keep = same_doc & active[:, :, None] & active[:, None, :]
-    keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
-    keep = (keep & ~eye[None, :, :]) | (eye[None, :, :] & active[:, :, None])
-
-    if int(keep.shape[0]) != bsz:
-        raise RuntimeError("doc-block mask batch dimension mismatch.")
-    return keep
+    return build_doc_block_mask(doc_ids)
 
 
 def _stabilize_compile_attention_mask(

@@ -19,6 +19,7 @@ _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
 _MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
 _NORM_ARCH_CHOICES = {"post", "keel"}
 _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
+_HF_ATTN_IMPL_CHOICES = {"eager", "flash"}
 _FFN_CHOICES = {"swiglu", "mlp"}
 _EMBED_SHARING_CHOICES = {"none", "es", "gdes"}
 _LOGGING_BACKEND_CHOICES = {"none", "tensorboard"}
@@ -126,7 +127,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 4
+RUN_CONFIG_SCHEMA_VERSION = 5
 _VAR_FULL_RE = re.compile(r"^\$variables\.([A-Za-z0-9_.-]+)$")
 _VAR_INLINE_RE = re.compile(r"\{\$variables\.([A-Za-z0-9_.-]+)\}")
 _VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")
@@ -144,12 +145,31 @@ class ModelTokenizerConfig:
 
 
 @dataclass(frozen=True)
+class ModelHFFlashConfig:
+    """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention."""
+
+    force_varlen: bool = field(default=False)
+    varlen_min_seq_len: int = field(default=2048)
+    docblock_bias_seq_len: int = field(default=1024)
+    eager_dense_max_seq_len: int = field(default=0)
+    kernel_overrides_path: str | None = field(default=None)
+
+
+@dataclass(frozen=True)
 class ModelHFConfig:
     """HF DeBERTa-v2/v3 backbone synthesis options."""
 
     model_size: str = field(default="base")
     attention_kernel: str = field(default="dynamic")
+    attention_impl: str = field(default="eager")
+    flash: ModelHFFlashConfig = field(default_factory=ModelHFFlashConfig)
     max_position_embeddings: int | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        """Coerce direct mapping construction for nested flash settings."""
+
+        if isinstance(self.flash, dict):
+            object.__setattr__(self, "flash", ModelHFFlashConfig(**self.flash))
 
 
 @dataclass(frozen=True)
@@ -333,6 +353,7 @@ class ModelConfig:
         "tokenizer_vocab_target": "tokenizer.vocab_target",
         "tokenizer_vocab_multiple": "tokenizer.vocab_multiple",
         "hf_attention_kernel": "hf.attention_kernel",
+        "hf_attention_impl": "hf.attention_impl",
         "hf_model_size": "hf.model_size",
         "hf_max_position_embeddings": "hf.max_position_embeddings",
         "pretrained_discriminator_path": "pretrained.discriminator_path",
@@ -1216,6 +1237,16 @@ def _normalize_hf_attention_kernel(value: str) -> str:
     )
 
 
+def _normalize_hf_attention_impl(value: str) -> str:
+    """Normalize and validate native hf_deberta_v2 attention implementation values.
+
+    :param str value: Raw attention implementation value.
+    :return str: Canonical attention implementation name.
+    """
+
+    return _ensure_choice("model.hf.attention_impl", value, _HF_ATTN_IMPL_CHOICES)
+
+
 def normalize_mixed_precision(value: object) -> str:
     """Normalize and validate mixed precision values.
 
@@ -1326,9 +1357,18 @@ def validate_model_config(cfg: ModelConfig) -> None:
     )
 
     _cfg_set(cfg.hf, "attention_kernel", _normalize_hf_attention_kernel(cfg.hf.attention_kernel))
+    _cfg_set(cfg.hf, "attention_impl", _normalize_hf_attention_impl(cfg.hf.attention_impl))
     _cfg_set(
         cfg.hf, "model_size", _ensure_choice("model.hf.model_size", cfg.hf.model_size, _HF_MODEL_SIZE_CHOICES)
     )
+    _cfg_set(cfg.hf.flash, "force_varlen", bool(cfg.hf.flash.force_varlen))
+    _cfg_set(cfg.hf.flash, "varlen_min_seq_len", int(cfg.hf.flash.varlen_min_seq_len))
+    _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
+    _cfg_set(cfg.hf.flash, "eager_dense_max_seq_len", int(cfg.hf.flash.eager_dense_max_seq_len))
+    if cfg.hf.flash.kernel_overrides_path is not None:
+        _cfg_set(
+            cfg.hf.flash, "kernel_overrides_path", str(cfg.hf.flash.kernel_overrides_path).strip() or None
+        )
 
     _cfg_set(
         cfg.rope, "norm_arch", _ensure_choice("model.rope.norm_arch", cfg.rope.norm_arch, _NORM_ARCH_CHOICES)
@@ -1361,6 +1401,16 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError("model.rope.max_position_embeddings must be > 0 when provided.")
     if float(cfg.rope.rotary_pct) <= 0.0 or float(cfg.rope.rotary_pct) > 1.0:
         raise ValueError("model.rope.rotary_pct must be in (0, 1].")
+    if int(cfg.hf.flash.varlen_min_seq_len) <= 0:
+        raise ValueError("model.hf.flash.varlen_min_seq_len must be > 0.")
+    if int(cfg.hf.flash.docblock_bias_seq_len) < 0:
+        raise ValueError("model.hf.flash.docblock_bias_seq_len must be >= 0.")
+    if int(cfg.hf.flash.eager_dense_max_seq_len) < 0:
+        raise ValueError("model.hf.flash.eager_dense_max_seq_len must be >= 0.")
+    if cfg.backbone_type != "hf_deberta_v2" and cfg.hf.attention_impl == "flash":
+        raise ValueError(
+            "model.hf.attention_impl='flash' is only supported with model.backbone_type='hf_deberta_v2'."
+        )
     if int(cfg.tokenizer.vocab_multiple) <= 0:
         raise ValueError("model.tokenizer.vocab_multiple must be >= 1.")
     if cfg.tokenizer.vocab_target is not None and int(cfg.tokenizer.vocab_target) <= 0:
@@ -2001,6 +2051,7 @@ def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
         "tokenizer_vocab_multiple": "model.tokenizer.vocab_multiple",
         "hf_model_size": "model.hf.model_size",
         "hf_attention_kernel": "model.hf.attention_kernel",
+        "hf_attention_impl": "model.hf.attention_impl",
         "hf_max_position_embeddings": "model.hf.max_position_embeddings",
         "pretrained_discriminator_path": "model.pretrained.discriminator_path",
         "pretrained_generator_path": "model.pretrained.generator_path",
@@ -2534,6 +2585,8 @@ asdict_without_private = _asdict_without_private
 __all__ = [
     "RUN_CONFIG_SCHEMA_VERSION",
     "Config",
+    "ModelHFFlashConfig",
+    "ModelHFConfig",
     "ModelConfig",
     "DataConfig",
     "TrainConfig",

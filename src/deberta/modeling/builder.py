@@ -607,6 +607,19 @@ def _apply_hf_config_normalization(
         cfg.max_position_embeddings = int(model_cfg.hf_max_position_embeddings)
     _apply_dropout_overrides(cfg, model_cfg)
     cfg.hf_attention_kernel = str(model_cfg.hf_attention_kernel)
+    cfg.hf_attention_impl = str(model_cfg.hf.attention_impl)
+    cfg.hf_flash = {
+        "force_varlen": bool(model_cfg.hf.flash.force_varlen),
+        "varlen_min_seq_len": int(model_cfg.hf.flash.varlen_min_seq_len),
+        "docblock_bias_seq_len": int(model_cfg.hf.flash.docblock_bias_seq_len),
+        "eager_dense_max_seq_len": int(model_cfg.hf.flash.eager_dense_max_seq_len),
+        "kernel_overrides_path": model_cfg.hf.flash.kernel_overrides_path,
+    }
+    cfg.flash_force_varlen = bool(model_cfg.hf.flash.force_varlen)
+    cfg.flash_varlen_min_seq_len = int(model_cfg.hf.flash.varlen_min_seq_len)
+    cfg.flash_docblock_bias_seq_len = int(model_cfg.hf.flash.docblock_bias_seq_len)
+    cfg.flash_eager_dense_max_seq_len = int(model_cfg.hf.flash.eager_dense_max_seq_len)
+    cfg.flash_kernel_overrides_path = model_cfg.hf.flash.kernel_overrides_path
     cfg.use_rmsnorm_heads = False
 
 

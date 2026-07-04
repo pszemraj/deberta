@@ -13,6 +13,7 @@ import os
 import warnings
 from typing import Any
 
+from deberta.modeling.flashdeberta_version import require_flashdeberta_version
 from deberta.modeling.mask_utils import normalize_keep_mask
 
 
@@ -48,10 +49,12 @@ def enable_flashdeberta_attention(*, strict: bool = True) -> None:
 
     try:
         importlib.import_module("flashdeberta")
+        require_flashdeberta_version()
     except Exception as exc:
         if strict:
             raise RuntimeError(
-                "flashdeberta is not installed. Install the optional flash runtime with: pip install flashdeberta triton"
+                "flashdeberta is unavailable or not at the supported pin. "
+                "Install the optional flash runtime with: pip install -e '.[flash]'"
             ) from exc
         return
 

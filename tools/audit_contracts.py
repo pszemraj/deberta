@@ -365,10 +365,13 @@ def _exec_extracted_function(path: Path, func_name: str, globals_dict: dict[str,
 
 def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
     path = repo_root / "src" / "deberta" / "training" / "compile.py"
+    from deberta.modeling.mask_utils import build_doc_block_mask
+
     g = {
         "torch": torch,
         "_DOC_BLOCK_EYE_CACHE": {},
         "_DOC_BLOCK_CLS_KEY_CACHE": {},
+        "build_doc_block_mask": build_doc_block_mask,
     }
     try:
         build_mask = _exec_extracted_function(path, "_build_doc_block_mask", g)
@@ -445,6 +448,97 @@ def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
                     )
 
     return _pass("doc_block_mask_contract")
+
+
+def check_flash_batch_metadata_contract(repo_root: Path) -> CheckResult:
+    """Check CPU-safe FlashBatchMeta routing and mask-encoding contracts."""
+
+    del repo_root
+    name = "flash_batch_metadata_contract"
+    try:
+        from deberta.modeling.mask_utils import build_doc_block_mask, doc_ids_from_segments
+        from deberta.training.compile import prepare_flash_attention_batch_metadata
+    except Exception as e:
+        return _fail(name, f"Failed to import flash metadata helpers: {type(e).__name__}: {e}")
+
+    doc_ids = torch.tensor([[1, 1, 2, 2, 0], [1, 2, 2, 0, 0]], dtype=torch.long)
+    batch = {"input_ids": torch.zeros((2, 5), dtype=torch.long), "doc_ids": doc_ids.clone()}
+    prepared, meta = prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+        flash_cfg={"docblock_bias_seq_len": 0, "force_varlen": False, "varlen_min_seq_len": 2048},
+    )
+    if meta is None or meta.normalized_route_hint() != "docblock":
+        return _fail(name, "Doc-block flash route did not return FlashBatchMeta(route_hint='docblock').")
+    if tuple(prepared["attention_mask"].shape) != tuple(doc_ids.shape):
+        return _fail(name, "Doc-block flash route must keep a compact 2D attention mask.")
+    if meta.seq_lengths is None or not torch.equal(
+        meta.seq_lengths, prepared["attention_mask"].sum(-1, dtype=torch.int32)
+    ):
+        return _fail(name, "FlashBatchMeta.seq_lengths must equal attention_mask.sum(-1).")
+    if meta.doc_segment_offsets is None or meta.doc_segment_lengths is None or meta.doc_cu_seqlens is None:
+        return _fail(
+            name, "Doc-block flash route must include segment offsets, lengths, and cumulative lengths."
+        )
+    if tuple(meta.doc_segment_offsets.shape) != (10,) or tuple(meta.doc_cu_seqlens.shape) != (11,):
+        return _fail(name, "Doc-block segment descriptors must use fixed B*S and B*S+1 shapes.")
+    reconstructed = doc_ids_from_segments(
+        offsets=meta.doc_segment_offsets,
+        lengths=meta.doc_segment_lengths,
+        batch_size=2,
+        seq_len=5,
+    )
+    if not torch.equal(build_doc_block_mask(reconstructed), build_doc_block_mask(doc_ids)):
+        return _fail(name, "Doc-block segment descriptors do not round-trip to the same pairwise mask.")
+
+    eager_batch = {"input_ids": torch.zeros((2, 5), dtype=torch.long), "doc_ids": doc_ids.clone()}
+    eager_prepared, eager_meta = prepare_flash_attention_batch_metadata(
+        batch=eager_batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=False,
+    )
+    if eager_meta is not None or tuple(eager_prepared["attention_mask"].shape) != (2, 5, 5):
+        return _fail(
+            name, "Non-flash doc-block consumers must receive a full pairwise keep mask and no metadata."
+        )
+
+    bias_batch = {"input_ids": torch.zeros((2, 5), dtype=torch.long), "doc_ids": doc_ids.clone()}
+    bias_prepared, bias_meta = prepare_flash_attention_batch_metadata(
+        batch=bias_batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+        flash_cfg={"docblock_bias_seq_len": 5},
+    )
+    if bias_meta is None or bias_meta.normalized_route_hint() != "docblock_bias":
+        return _fail(name, "Doc-block bias route did not return route_hint='docblock_bias'.")
+    if tuple(bias_prepared["attention_mask"].shape) != (2, 5, 5):
+        return _fail(name, "Doc-block bias route must materialize a pairwise keep mask.")
+    if "flash_doc_segment_offsets" in bias_prepared:
+        return _fail(name, "Doc-block bias route must not emit ragged segment metadata.")
+
+    dense_batch = {"input_ids": torch.zeros((1, 4), dtype=torch.long)}
+    _, dense_meta = prepare_flash_attention_batch_metadata(
+        batch=dense_batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+    )
+    padded_batch = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "attention_mask": torch.tensor([[True, True, False, False]], dtype=torch.bool),
+    }
+    _, padded_meta = prepare_flash_attention_batch_metadata(
+        batch=padded_batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+        flash_cfg={"force_varlen": True},
+    )
+    if dense_meta is None or dense_meta.normalized_route_hint() != "dense":
+        return _fail(name, "Dense maskless route must be total and produce route_hint='dense'.")
+    if padded_meta is None or padded_meta.normalized_route_hint() != "varlen":
+        return _fail(name, "Forced padded route must be total and produce route_hint='varlen'.")
+
+    return _pass(name)
 
 
 def check_attention_mask_to_active_tokens_contract(repo_root: Path) -> CheckResult:
@@ -661,10 +755,17 @@ def check_rope_attention_mask_leak(repo_root: Path) -> CheckResult:
     # Prefer testing the *repo's* packed/doc-block mask builder, without importing the whole training module.
     build_mask = None
     try:
+        from deberta.modeling.mask_utils import build_doc_block_mask
+
         build_mask = _exec_extracted_function(
             repo_root / "src" / "deberta" / "training" / "compile.py",
             "_build_doc_block_mask",
-            {"torch": torch, "_DOC_BLOCK_EYE_CACHE": {}, "_DOC_BLOCK_CLS_KEY_CACHE": {}},
+            {
+                "torch": torch,
+                "_DOC_BLOCK_EYE_CACHE": {},
+                "_DOC_BLOCK_CLS_KEY_CACHE": {},
+                "build_doc_block_mask": build_doc_block_mask,
+            },
         )
     except Exception:
         build_mask = None  # We'll fall back to a minimal within-doc mask (no padding edge cases).
@@ -1259,6 +1360,7 @@ def main(argv: list[str] | None = None) -> int:
     results.append(check_collator_determinism(repo_root))
     results.append(check_optimizer_state_ordering_risk(repo_root))
     results.append(check_doc_block_mask_contract(repo_root))
+    results.append(check_flash_batch_metadata_contract(repo_root))
     results.append(check_attention_mask_to_active_tokens_contract(repo_root))
     results.append(check_rope_ffn_gating(repo_root))
 

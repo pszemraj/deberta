@@ -1044,6 +1044,53 @@ def test_pretrainer_forward_smoke():
     assert out.disc_accuracy.ndim == 0
 
 
+def test_rope_pretrainer_ignores_flash_metadata_boundary():
+    """RoPE RTD should run when flash metadata is present at the RTD boundary."""
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.mask_utils import FlashBatchMeta
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=24,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=48,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="gdes",
+    )
+    input_ids = torch.randint(low=0, high=64, size=(2, 8), dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[:, 2] = input_ids[:, 2]
+    flash_meta = FlashBatchMeta(
+        seq_lengths=torch.tensor([8, 7], dtype=torch.int32),
+        active_tokens_host=15,
+        route_hint="fixed",
+    )
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=torch.ones_like(input_ids),
+        flash_meta=flash_meta,
+    )
+
+    assert out.loss.ndim == 0
+    assert torch.isfinite(out.loss)
+
+
 def test_pretrainer_sampler_avoids_configured_special_ids():
     import pytest
 

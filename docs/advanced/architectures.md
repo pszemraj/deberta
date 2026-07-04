@@ -56,6 +56,11 @@ Use explicit config values when you want different behavior.
 - The fused dense-bias builder itself now has a separate tuning seam too. `src/deberta/modeling/flashdeberta_dense_bias_op.py` resolves `FLASHDEBERTA_DENSE_BIAS_*` overrides for the repo-local `(B,H,S,S)` bias assembly kernel, so tuning the builder no longer needs to perturb the downstream flash-with-bias attention kernels. Its backward rule now saves per-row bucket ranges and reduces dense bias gradients with contiguous segment reductions, which removed the old scatter-heavy backward hotspot from the packed-docblock `1024` profile. On the current measured `sm_120` packed-docblock `1024` hot path, the promoted builder tile is `BLOCK_M=64`, `BLOCK_N=128`, `stages=2`, `warps=4`.
 - `tools/flashdeberta_varlen_tune.py` is the supported path for refreshing these heuristics on another GPU or after larger kernel changes. It samples the real unpacked loader and persists route/kernel summaries under `local-scratch/benchmarks/flashdeberta/...`.
 - TODO (flash optimization follow-up): benchmark and, only if warranted, add the upstream small-batch local-bias path for `512 < seq_len < 1024` with very small training batches.
+- TODO (F9 route tuning follow-up): collapse the route/tuning tables into a single measured policy artifact once more hardware buckets exist; keep the current hard-coded split until there is enough evidence to justify a table format.
+- TODO (F12 dense-bias memory follow-up): reduce the dense flash-with-bias memory footprint for packed doc-block `1024` so the short-route win is not coupled to materializing a full `(B,H,S,S)` bias tensor.
+- TODO (F13 recompute follow-up): evaluate recomputing position/bucket tensors in backward versus saving them, especially for longer contexts where saved tensors pressure memory.
+- TODO (F14 deterministic kernel follow-up): add a bucket-LUT path and deterministic position-gradient Triton kernels before treating the dense-bias builder as kernel-owned infrastructure.
+- TODO (flash dependency ownership): vendor or replace the upstream FlashDeBERTa kernels if this integration becomes a long-lived training dependency; the current branch pins `flashdeberta==0.0.7`.
 
 ## RoPE-specific controls
 

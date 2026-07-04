@@ -24,9 +24,31 @@ import torch.nn.functional as F
 try:  # pragma: no cover - optional Triton dependency
     import triton
     import triton.language as tl
+
+    _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover - optional Triton dependency
-    triton = None
-    tl = None
+
+    class _MissingTriton:
+        """Minimal stand-in that lets this module define fallback kernels."""
+
+        @staticmethod
+        def jit(fn: object) -> object:
+            """Return ``fn`` unchanged when Triton is unavailable.
+
+            :param object fn: Function object.
+            :return object: The unchanged function object.
+            """
+
+            return fn
+
+    class _MissingTritonLanguage:
+        """Minimal annotation stand-in for ``tl.constexpr``."""
+
+        constexpr = object
+
+    triton = _MissingTriton()
+    tl = _MissingTritonLanguage()
+    _TRITON_AVAILABLE = False
 
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_padded_rows,
@@ -150,7 +172,6 @@ _MASK_METADATA_CACHE: dict[
 ] = {}
 _CU_SEQLENS_HOST_CACHE: dict[int, _CuSeqlensHostCacheEntry] = {}
 _MID_TENSOR_CACHE: dict[tuple[int, int, str, int | None], _MidTensorCacheEntry] = {}
-_FORWARD_AUX_CACHE: dict[int, _ForwardAuxCacheEntry] = {}
 
 
 def flashdeberta_varlen_import_error() -> Exception | None:
@@ -510,12 +531,12 @@ def _clear_unpad_metadata_cache() -> None:
 
 
 def _clear_forward_aux_cache() -> None:
-    """Clear cached forward tensors reused by the padded backward helper.
+    """Compatibility no-op for the removed forward aux side channel.
 
     This exists primarily for tests.
     """
 
-    _FORWARD_AUX_CACHE.clear()
+    return None
 
 
 def _clear_mid_tensor_cache() -> None:
@@ -860,8 +881,7 @@ def _pack_grad_and_delta_from_padded(
         return out_unpad, grad_unpad, delta
 
     can_use_triton = (
-        triton is not None
-        and tl is not None
+        _TRITON_AVAILABLE
         and hasattr(torch, "library")
         and hasattr(torch.library, "wrap_triton")
         and grad_output.device.type == "cuda"
@@ -1252,7 +1272,7 @@ def _store_forward_aux_cache(
     pos_key_unpad: torch.Tensor | None,
     pos_query_unpad: torch.Tensor | None,
 ) -> None:
-    """Stash forward unpadded tensors so backward does not rebuild them.
+    """Compatibility no-op for the removed forward aux side channel.
 
     :param torch.Tensor output_padded: Returned padded attention output tensor.
     :param torch.Tensor seqlens: Per-example active lengths.
@@ -1268,44 +1288,32 @@ def _store_forward_aux_cache(
     :param torch.Tensor | None pos_query_unpad: Optional unpadded p2c tensor.
     """
 
-    cache_key = id(output_padded)
-    output_ref: weakref.ReferenceType[torch.Tensor] | None = None
-    try:
-        output_ref = weakref.ref(output_padded, lambda _ref, key=cache_key: _FORWARD_AUX_CACHE.pop(key, None))
-    except TypeError:
-        output_ref = None
-
-    _FORWARD_AUX_CACHE[cache_key] = _ForwardAuxCacheEntry(
-        output_ref=output_ref,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        total_tokens=int(total_tokens),
-        q_unpad=q_unpad,
-        k_unpad=k_unpad,
-        v_unpad=v_unpad,
-        out_unpad=out_unpad,
-        lse_unpad=lse_unpad,
-        pos_key_unpad=pos_key_unpad,
-        pos_query_unpad=pos_query_unpad,
+    del (
+        output_padded,
+        seqlens,
+        cu_seqlens,
+        max_seqlen,
+        total_tokens,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        pos_key_unpad,
+        pos_query_unpad,
     )
+    return None
 
 
 def _pop_forward_aux_cache(output_padded: torch.Tensor) -> _ForwardAuxCacheEntry | None:
-    """Return and remove cached forward aux tensors for one output tensor.
+    """Compatibility no-op for the removed forward aux side channel.
 
     :param torch.Tensor output_padded: Padded output tensor returned by the custom op.
-    :return _ForwardAuxCacheEntry | None: Cached aux entry or ``None``.
+    :return _ForwardAuxCacheEntry | None: Always ``None``.
     """
 
-    cache_key = id(output_padded)
-    cached = _FORWARD_AUX_CACHE.pop(cache_key, None)
-    if cached is None:
-        return None
-    cached_output = cached.output_ref() if cached.output_ref is not None else None
-    if cached.output_ref is not None and cached_output is not output_padded:
-        return None
-    return cached
+    del output_padded
+    return None
 
 
 def _varlen_eager_forward_impl(
@@ -1839,7 +1847,7 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
             max_relative_distance=max_relative_distance,
             causal=causal,
             require_lse=True,
-            stash_backward_cache=True,
+            stash_backward_cache=False,
         )
 
     @torch.library.register_fake(_forward_op)

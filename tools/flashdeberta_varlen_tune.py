@@ -218,10 +218,13 @@ def _sample_batches(
             compile_scope="backbones",
             backbone_type=str(model_cfg.backbone_type),
         )
-        batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+        batch, flash_meta = prepare_flash_attention_batch_metadata(
             batch=batch,
             backbone_type=str(model_cfg.backbone_type),
+            flash_enabled=True,
+            flash_cfg=getattr(model_cfg.hf, "flash", None),
         )
+        flash_route_hint = flash_meta.normalized_route_hint() if flash_meta is not None else None
         if flash_route_hint not in {"fixed", "varlen"}:
             continue
         input_ids = batch["input_ids"].detach().clone()

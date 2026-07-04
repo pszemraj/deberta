@@ -139,14 +139,16 @@ first and prefer the split overrides:
 ## Special case: packed doc-block masks
 
 For `hf_deberta_v2`, packed doc-blocking now uses the measured route policy
-described above when the FlashDeBERTa runtime patch is enabled:
+described above when `model.hf.attention_impl=flash` is set:
 
 - exact packed `1024` uses dense flash-with-bias by default
 - longer packed doc-block runs stay on the segment-aware flash custom op
 
-Set `FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN=0` to disable the dense-bias shortcut,
+Set `model.hf.flash.docblock_bias_seq_len=0` to disable the dense-bias shortcut,
 or point it at a different exact sequence length if another machine bucket
-proves a different crossover.
+proves a different crossover. The older `FLASHDEBERTA_DOCBLOCK_BIAS_SEQ_LEN`
+environment variable remains a diagnostic fallback for tooling that does not
+load a repo config.
 
 For `rope` with `data.packing.block_cross_document_attention=true`, auto scope
 downgrades toward FFN-focused compile to avoid shape-churn recompiles from

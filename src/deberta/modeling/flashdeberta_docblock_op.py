@@ -56,9 +56,6 @@ class _DocBlockForwardAuxCacheEntry:
     pos_query_unpad: torch.Tensor | None
 
 
-_DOCBLOCK_FORWARD_AUX_CACHE: dict[int, _DocBlockForwardAuxCacheEntry] = {}
-
-
 @dataclass(frozen=True)
 class _DocBlockRowPartition:
     """Per-row split between dense single-segment rows and ragged multi rows."""
@@ -369,7 +366,7 @@ def _store_forward_aux_cache(
     pos_key_unpad: torch.Tensor | None,
     pos_query_unpad: torch.Tensor | None,
 ) -> None:
-    """Stash forward packed tensors so backward does not rebuild them.
+    """Compatibility no-op for the removed forward aux side channel.
 
     :param torch.Tensor output_padded: Returned padded attention output tensor.
     :param torch.Tensor single_rows: Batch rows handled by the fixed single-segment path.
@@ -389,50 +386,36 @@ def _store_forward_aux_cache(
     :param torch.Tensor | None pos_query_unpad: Optional packed p2c tensor.
     """
 
-    cache_key = id(output_padded)
-    output_ref: weakref.ReferenceType[torch.Tensor] | None = None
-    try:
-        output_ref = weakref.ref(
-            output_padded, lambda _ref, key=cache_key: _DOCBLOCK_FORWARD_AUX_CACHE.pop(key, None)
-        )
-    except TypeError:
-        output_ref = None
-
-    _DOCBLOCK_FORWARD_AUX_CACHE[cache_key] = _DocBlockForwardAuxCacheEntry(
-        output_ref=output_ref,
-        single_rows=single_rows,
-        single_seq_lengths=single_seq_lengths,
-        multi_rows=multi_rows,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=int(max_seqlen),
-        total_tokens=int(total_tokens),
-        q_unpad=q_unpad,
-        k_unpad=k_unpad,
-        v_unpad=v_unpad,
-        out_unpad=out_unpad,
-        lse_unpad=lse_unpad,
-        pos_key_unpad=pos_key_unpad,
-        pos_query_unpad=pos_query_unpad,
+    del (
+        output_padded,
+        single_rows,
+        single_seq_lengths,
+        multi_rows,
+        segment_offsets,
+        segment_lengths,
+        cu_seqlens,
+        max_seqlen,
+        total_tokens,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        pos_key_unpad,
+        pos_query_unpad,
     )
+    return None
 
 
 def _pop_forward_aux_cache(output_padded: torch.Tensor) -> _DocBlockForwardAuxCacheEntry | None:
-    """Return and remove cached forward aux tensors for one output tensor.
+    """Compatibility no-op for the removed forward aux side channel.
 
     :param torch.Tensor output_padded: Padded output tensor returned by the custom op.
-    :return _DocBlockForwardAuxCacheEntry | None: Cached aux entry or ``None``.
+    :return _DocBlockForwardAuxCacheEntry | None: Always ``None``.
     """
 
-    cache_key = id(output_padded)
-    cached = _DOCBLOCK_FORWARD_AUX_CACHE.pop(cache_key, None)
-    if cached is None:
-        return None
-    cached_output = cached.output_ref() if cached.output_ref is not None else None
-    if cached.output_ref is not None and cached_output is not output_padded:
-        return None
-    return cached
+    del output_padded
+    return None
 
 
 def _docblock_forward_impl(
@@ -1164,7 +1147,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             max_relative_distance=max_relative_distance,
             causal=causal,
             require_lse=True,
-            stash_backward_cache=True,
+            stash_backward_cache=False,
         )
 
     @torch.library.register_fake(_forward_op)

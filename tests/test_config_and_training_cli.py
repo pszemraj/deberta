@@ -969,6 +969,24 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
     assert cfg.hf_attention_kernel == "stable"
 
 
+def test_validate_model_config_normalizes_hf_flash_config():
+    cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        hf={"attention_impl": "flash", "flash": {"force_varlen": True, "varlen_min_seq_len": "4096"}},
+    )
+    validate_model_config(cfg)
+
+    assert cfg.hf.attention_impl == "flash"
+    assert cfg.hf.flash.force_varlen is True
+    assert cfg.hf.flash.varlen_min_seq_len == 4096
+
+
+def test_validate_model_config_rejects_flash_attention_for_rope():
+    cfg = ModelConfig(backbone_type="rope", hf={"attention_impl": "flash"})
+    with pytest.raises(ValueError, match="only supported with model.backbone_type='hf_deberta_v2'"):
+        validate_model_config(cfg)
+
+
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_multiple():
     cfg = ModelConfig(tokenizer_vocab_multiple=0)
     with pytest.raises(ValueError, match="model.tokenizer.vocab_multiple"):
@@ -1386,6 +1404,27 @@ def test_build_run_metadata_scope_fields(
     assert meta["effective_compile_scope"] == expected_scope
     assert meta["compile_scope_reason"] == expected_reason
     assert "config_schema_version" in meta
+
+
+def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPatch):
+    import importlib.metadata as importlib_metadata
+
+    monkeypatch.setattr(
+        importlib_metadata,
+        "version",
+        lambda name: "0.0.7" if str(name) == "flashdeberta" else "0.0.0",
+    )
+    model_cfg = ModelConfig(
+        backbone_type="hf_deberta_v2",
+        hf={"attention_impl": "flash", "flash": {"force_varlen": True}},
+    )
+    validate_model_config(model_cfg)
+
+    meta = _build_run_metadata(model_cfg=model_cfg)
+
+    assert meta["flash_attention"]["attention_impl"] == "flash"
+    assert meta["flash_attention"]["flash"]["force_varlen"] is True
+    assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
 
 
 def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_path: Path):

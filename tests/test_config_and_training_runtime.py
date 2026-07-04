@@ -1232,8 +1232,23 @@ def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_s
             output_attentions: bool,
             output_hidden_states: bool,
             return_dict: bool,
+            flash_seq_lengths: torch.Tensor | None = None,
+            flash_doc_segment_offsets: torch.Tensor | None = None,
+            flash_doc_segment_lengths: torch.Tensor | None = None,
+            flash_doc_cu_seqlens: torch.Tensor | None = None,
+            flash_route_hint: str | None = None,
         ) -> tuple[str, bool, bool, bool, torch.Tensor]:
-            del input_ids, token_type_ids, position_ids, inputs_embeds
+            del (
+                input_ids,
+                token_type_ids,
+                position_ids,
+                inputs_embeds,
+                flash_seq_lengths,
+                flash_doc_segment_offsets,
+                flash_doc_segment_lengths,
+                flash_doc_cu_seqlens,
+                flash_route_hint,
+            )
             return (
                 f"{self.label}:masked",
                 bool(output_attentions),
@@ -1265,12 +1280,28 @@ def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_s
         "generator[dense_hs1]",
         "generator[masked_hs0]",
         "generator[masked_hs1]",
+        "generator[masked_fixed_hs0]",
+        "generator[masked_fixed_hs1]",
+        "generator[masked_varlen_hs0]",
+        "generator[masked_varlen_hs1]",
+        "generator[masked_docblock_hs0]",
+        "generator[masked_docblock_hs1]",
+        "generator[masked_docblock_bias_hs0]",
+        "generator[masked_docblock_bias_hs1]",
         "discriminator[dense_hs0]",
         "discriminator[dense_hs1]",
         "discriminator[masked_hs0]",
         "discriminator[masked_hs1]",
+        "discriminator[masked_fixed_hs0]",
+        "discriminator[masked_fixed_hs1]",
+        "discriminator[masked_varlen_hs0]",
+        "discriminator[masked_varlen_hs1]",
+        "discriminator[masked_docblock_hs0]",
+        "discriminator[masked_docblock_hs1]",
+        "discriminator[masked_docblock_bias_hs0]",
+        "discriminator[masked_docblock_bias_hs1]",
     ]
-    assert len(compile_calls) == 8
+    assert len(compile_calls) == 24
     for _, kwargs in compile_calls:
         assert kwargs == {"mode": "default", "backend": "inductor", "dynamic": False}
 

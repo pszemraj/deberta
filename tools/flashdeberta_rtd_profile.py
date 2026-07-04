@@ -261,6 +261,7 @@ def _run_decoupled_window(
     compile_enabled: bool,
     compile_scope: str,
     backbone_type: str,
+    flash_cfg: Any | None,
     gen_optimizer: torch.optim.Optimizer,
     disc_optimizer: torch.optim.Optimizer,
     gen_lr_scheduler: Any,
@@ -295,7 +296,7 @@ def _run_decoupled_window(
         gen_optimizer.zero_grad(set_to_none=True)
         disc_optimizer.zero_grad(set_to_none=True)
 
-        disc_phase_inputs: list[dict[str, torch.Tensor | float | None]] = []
+        disc_phase_inputs: list[dict[str, Any]] = []
         gen_loss_num = 0.0
         disc_loss_num = 0.0
         disc_acc_num = 0.0
@@ -316,9 +317,11 @@ def _run_decoupled_window(
                     compile_scope=compile_scope,
                     backbone_type=backbone_type,
                 )
-                batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                batch, flash_meta = prepare_flash_attention_batch_metadata(
                     batch=batch,
                     backbone_type=backbone_type,
+                    flash_enabled=True,
+                    flash_cfg=flash_cfg,
                 )
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()
@@ -332,11 +335,7 @@ def _run_decoupled_window(
                         token_type_ids=batch.get("token_type_ids"),
                         sampling_temperature=float(sampling_temperature),
                         phase="generator",
-                        flash_seq_lengths=batch.get("flash_seq_lengths"),
-                        flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
-                        flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
-                        flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
-                        flash_route_hint=flash_route_hint,
+                        flash_meta=flash_meta,
                     )
 
             gen_loss = gen_phase_out.gen_loss_raw
@@ -362,11 +361,7 @@ def _run_decoupled_window(
                     "input_ids": batch["input_ids"],
                     "attention_mask": batch.get("attention_mask"),
                     "token_type_ids": batch.get("token_type_ids"),
-                    "flash_seq_lengths": batch.get("flash_seq_lengths"),
-                    "flash_doc_segment_offsets": batch.get("flash_doc_segment_offsets"),
-                    "flash_doc_segment_lengths": batch.get("flash_doc_segment_lengths"),
-                    "flash_doc_cu_seqlens": batch.get("flash_doc_cu_seqlens"),
-                    "flash_route_hint": flash_route_hint,
+                    "flash_meta": flash_meta,
                     "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                     "disc_labels": gen_phase_out.disc_labels,
                     "disc_count": float(disc_count),
@@ -397,11 +392,7 @@ def _run_decoupled_window(
                         attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
                         token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
                         phase="discriminator",
-                        flash_seq_lengths=payload["flash_seq_lengths"],  # type: ignore[arg-type]
-                        flash_doc_segment_offsets=payload["flash_doc_segment_offsets"],  # type: ignore[arg-type]
-                        flash_doc_segment_lengths=payload["flash_doc_segment_lengths"],  # type: ignore[arg-type]
-                        flash_doc_cu_seqlens=payload["flash_doc_cu_seqlens"],  # type: ignore[arg-type]
-                        flash_route_hint=payload["flash_route_hint"],  # type: ignore[arg-type]
+                        flash_meta=payload["flash_meta"],  # type: ignore[arg-type]
                     )
 
             disc_loss = disc_phase_out.disc_loss_raw
@@ -467,6 +458,7 @@ def _run_coupled_window(
     compile_enabled: bool,
     compile_scope: str,
     backbone_type: str,
+    flash_cfg: Any | None,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: Any,
     phase_times_ms: dict[str, list[float]],
@@ -519,9 +511,11 @@ def _run_coupled_window(
                     compile_scope=compile_scope,
                     backbone_type=backbone_type,
                 )
-                batch, flash_route_hint = prepare_flash_attention_batch_metadata(
+                batch, flash_meta = prepare_flash_attention_batch_metadata(
                     batch=batch,
                     backbone_type=backbone_type,
+                    flash_enabled=True,
+                    flash_cfg=flash_cfg,
                 )
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()
@@ -536,11 +530,7 @@ def _run_coupled_window(
                         sampling_temperature=float(sampling_temperature),
                         gen_loss_weight=gen_loss_weight,
                         disc_loss_weight=disc_loss_weight,
-                        flash_seq_lengths=batch.get("flash_seq_lengths"),
-                        flash_doc_segment_offsets=batch.get("flash_doc_segment_offsets"),
-                        flash_doc_segment_lengths=batch.get("flash_doc_segment_lengths"),
-                        flash_doc_cu_seqlens=batch.get("flash_doc_cu_seqlens"),
-                        flash_route_hint=flash_route_hint,
+                        flash_meta=flash_meta,
                     )
 
             if token_weighted_ga:
@@ -707,6 +697,7 @@ def main() -> None:
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
                 backbone_type=str(model_cfg.backbone_type),
+                flash_cfg=getattr(model_cfg.hf, "flash", None),
                 gen_optimizer=gen_optimizer,
                 disc_optimizer=disc_optimizer,
                 gen_lr_scheduler=gen_lr_scheduler,
@@ -727,6 +718,7 @@ def main() -> None:
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
                 backbone_type=str(model_cfg.backbone_type),
+                flash_cfg=getattr(model_cfg.hf, "flash", None),
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 phase_times_ms=defaultdict(list),
@@ -756,6 +748,7 @@ def main() -> None:
                     compile_enabled=compile_enabled,
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
+                    flash_cfg=getattr(model_cfg.hf, "flash", None),
                     gen_optimizer=gen_optimizer,
                     disc_optimizer=disc_optimizer,
                     gen_lr_scheduler=gen_lr_scheduler,
@@ -776,6 +769,7 @@ def main() -> None:
                     compile_enabled=compile_enabled,
                     compile_scope=compile_scope,
                     backbone_type=str(model_cfg.backbone_type),
+                    flash_cfg=getattr(model_cfg.hf, "flash", None),
                     optimizer=optimizer,
                     lr_scheduler=lr_scheduler,
                     phase_times_ms=phase_times_ms,
