@@ -934,13 +934,28 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :return torch.Tensor: Flash output in ``(B, S, H, D)`` layout.
         """
 
+        active_tokens = (
+            flash_meta.active_tokens_scalar
+            if flash_meta.active_tokens_scalar is not None
+            else flash_meta.active_tokens_host
+        )
+        doc_num_segments = (
+            flash_meta.doc_num_segments_scalar
+            if flash_meta.doc_num_segments_scalar is not None
+            else flash_meta.doc_num_segments_host
+        )
+        doc_max_segment_length = (
+            flash_meta.doc_max_segment_length_scalar
+            if flash_meta.doc_max_segment_length_scalar is not None
+            else flash_meta.doc_max_segment_length_host
+        )
         if (
             flash_meta.doc_segment_offsets is None
             or flash_meta.doc_segment_lengths is None
             or flash_meta.doc_cu_seqlens is None
-            or flash_meta.active_tokens_host is None
-            or flash_meta.doc_num_segments_host is None
-            or flash_meta.doc_max_segment_length_host is None
+            or active_tokens is None
+            or doc_num_segments is None
+            or doc_max_segment_length is None
         ):
             raise RuntimeError("Doc-block flash route requires complete FlashBatchMeta.")
         out = flashdeberta_docblock(
@@ -955,9 +970,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             sm_scale=sm_scale,
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
-            num_segments=int(flash_meta.doc_num_segments_host),
-            max_seqlen=int(flash_meta.doc_max_segment_length_host),
-            total_tokens=int(flash_meta.active_tokens_host),
+            num_segments=doc_num_segments,
+            max_seqlen=doc_max_segment_length,
+            total_tokens=active_tokens,
             causal=False,
         )
         if _RUNTIME_CONFIG.enable_debug_stats:
@@ -1048,6 +1063,42 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         )
         return build_doc_block_mask(doc_ids).unsqueeze(1)
 
+    def _eager_forward_fallback(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        output_attentions: bool,
+        query_states: torch.Tensor,
+        rel_embeddings: torch.Tensor | None,
+        flash_meta: FlashBatchMeta | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run eager attention with doc-block fallback masks rebuilt only on demand.
+
+        :param torch.Tensor hidden_states: Key/value hidden states.
+        :param torch.Tensor | None attention_mask: Original attention mask.
+        :param bool output_attentions: Whether to return attention probabilities.
+        :param torch.Tensor query_states: Query hidden states.
+        :param torch.Tensor | None rel_embeddings: Relative embedding table.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return tuple[torch.Tensor, torch.Tensor | None]: Eager attention output and optional probs.
+        """
+
+        eager_attention_mask = self._eager_fallback_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            query_states=query_states,
+            flash_meta=flash_meta,
+        )
+        return super().forward(
+            hidden_states=hidden_states,
+            attention_mask=eager_attention_mask,
+            output_attentions=output_attentions,
+            query_states=query_states,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1074,12 +1125,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if query_states is None:
             query_states = hidden_states
-        eager_attention_mask = self._eager_fallback_attention_mask(
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-            query_states=query_states,
-            flash_meta=flash_meta,
-        )
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("forward_calls")
@@ -1100,13 +1145,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             # The encoder-level get_rel_pos patch suppresses the shared (S,S)
             # allocation globally. Unsupported correctness fallbacks rebuild
             # relative-position bias inside eager attention instead.
-            return super().forward(
+            return self._eager_forward_fallback(
                 hidden_states=hidden_states,
-                attention_mask=eager_attention_mask,
+                attention_mask=attention_mask,
                 output_attentions=output_attentions,
                 query_states=query_states,
-                relative_pos=None,
                 rel_embeddings=rel_embeddings,
+                flash_meta=flash_meta,
             )
 
         if flashdeberta_fixed_import_error() is not None:  # pragma: no cover - guarded above
@@ -1148,13 +1193,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                         "using eager attention."
                     ),
                 )
-                return super().forward(
+                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
-                    attention_mask=eager_attention_mask,
+                    attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
-                    relative_pos=None,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
             bias_import_error = flashdeberta_bias_import_error()
             if bias_import_error is not None:
@@ -1165,13 +1210,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     reason="docblock_bias_missing",
                     message=("FlashDeBERTa dense doc-block bias path is unavailable; using eager attention."),
                 )
-                return super().forward(
+                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
-                    attention_mask=eager_attention_mask,
+                    attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
-                    relative_pos=None,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
             if _is_torch_compiling() and not flashdeberta_compiled_bias_available():
                 if _RUNTIME_CONFIG.enable_debug_stats:
@@ -1184,24 +1229,33 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                         "using eager attention."
                     ),
                 )
-                return super().forward(
+                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
-                    attention_mask=eager_attention_mask,
+                    attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
-                    relative_pos=None,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
 
         if use_docblock:
+            docblock_active_tokens = None if flash_meta is None else flash_meta.active_tokens_scalar
+            if docblock_active_tokens is None and flash_meta is not None:
+                docblock_active_tokens = flash_meta.active_tokens_host
+            docblock_num_segments = None if flash_meta is None else flash_meta.doc_num_segments_scalar
+            if docblock_num_segments is None and flash_meta is not None:
+                docblock_num_segments = flash_meta.doc_num_segments_host
+            docblock_max_segment = None if flash_meta is None else flash_meta.doc_max_segment_length_scalar
+            if docblock_max_segment is None and flash_meta is not None:
+                docblock_max_segment = flash_meta.doc_max_segment_length_host
             if (
                 flash_meta is None
                 or flash_meta.doc_segment_offsets is None
                 or flash_meta.doc_segment_lengths is None
                 or flash_meta.doc_cu_seqlens is None
-                or flash_meta.active_tokens_host is None
-                or flash_meta.doc_num_segments_host is None
-                or flash_meta.doc_max_segment_length_host is None
+                or docblock_active_tokens is None
+                or docblock_num_segments is None
+                or docblock_max_segment is None
             ):
                 if _RUNTIME_CONFIG.enable_debug_stats:
                     _record_stat("fallback_calls")
@@ -1213,13 +1267,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                         "using eager attention."
                     ),
                 )
-                return super().forward(
+                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
-                    attention_mask=eager_attention_mask,
+                    attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
-                    relative_pos=None,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
             docblock_import_error = flashdeberta_docblock_import_error()
             if docblock_import_error is not None:
@@ -1230,13 +1284,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     reason="docblock_missing",
                     message=("FlashDeBERTa doc-block flash path is unavailable; using eager attention."),
                 )
-                return super().forward(
+                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
-                    attention_mask=eager_attention_mask,
+                    attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
-                    relative_pos=None,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
             if _is_torch_compiling() and not flashdeberta_compiled_docblock_available():
                 if _RUNTIME_CONFIG.enable_debug_stats:
@@ -1249,13 +1303,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                         "using eager attention."
                     ),
                 )
-                return super().forward(
+                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
-                    attention_mask=eager_attention_mask,
+                    attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
-                    relative_pos=None,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
 
         if use_varlen:
@@ -1280,13 +1334,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             self._warn_once(reason=key, message=message)
             # Keep the same eager fallback contract here for dtype/layout
             # mismatches instead of reviving the encoder-wide relative_pos tensor.
-            return super().forward(
+            return self._eager_forward_fallback(
                 hidden_states=hidden_states,
-                attention_mask=eager_attention_mask,
+                attention_mask=attention_mask,
                 output_attentions=output_attentions,
                 query_states=query_states,
-                relative_pos=None,
                 rel_embeddings=rel_embeddings,
+                flash_meta=flash_meta,
             )
 
         pos_key: torch.Tensor | None = None

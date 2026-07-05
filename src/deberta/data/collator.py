@@ -193,8 +193,11 @@ class DebertaV3ElectraCollator:
         )
         batch["flash_seq_lengths"] = seq_lengths
         batch["flash_active_tokens"] = int(active_tokens)
+        batch["flash_active_tokens_scalar"] = torch.tensor(int(active_tokens), dtype=torch.int32)
         batch["flash_doc_num_segments"] = int(num_segments)
+        batch["flash_doc_num_segments_scalar"] = torch.tensor(int(num_segments), dtype=torch.int32)
         batch["flash_doc_max_seqlen"] = int(max_segment_length)
+        batch["flash_doc_max_seqlen_scalar"] = torch.tensor(int(max_segment_length), dtype=torch.int32)
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
@@ -211,8 +214,10 @@ class DebertaV3ElectraCollator:
             return
         keep_mask = attention_mask.to(dtype=torch.bool)
         seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        active_tokens = int(seq_lengths.sum(dtype=torch.int32))
         batch["flash_seq_lengths"] = seq_lengths
-        batch["flash_active_tokens"] = int(seq_lengths.sum(dtype=torch.int32))
+        batch["flash_active_tokens"] = active_tokens
+        batch["flash_active_tokens_scalar"] = torch.tensor(active_tokens, dtype=torch.int32)
 
     def _harmonize_optional_attention_masks(self, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Ensure optional ``attention_mask`` keys are consistent before tokenizer padding.

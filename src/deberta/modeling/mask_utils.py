@@ -21,6 +21,9 @@ class FlashBatchMeta:
     :param int | None active_tokens_host: Optional host-side active token count.
     :param int | None doc_num_segments_host: Optional host-side active doc segment count.
     :param int | None doc_max_segment_length_host: Optional host-side max doc segment length.
+    :param torch.Tensor | None active_tokens_scalar: Optional CPU scalar active-token tensor for compiled routes.
+    :param torch.Tensor | None doc_num_segments_scalar: Optional CPU scalar segment-count tensor for compiled routes.
+    :param torch.Tensor | None doc_max_segment_length_scalar: Optional CPU scalar max-segment tensor for compiled routes.
     :param str | None route_hint: Optional normalized flash route hint.
     """
 
@@ -31,6 +34,9 @@ class FlashBatchMeta:
     active_tokens_host: int | None = None
     doc_num_segments_host: int | None = None
     doc_max_segment_length_host: int | None = None
+    active_tokens_scalar: torch.Tensor | None = None
+    doc_num_segments_scalar: torch.Tensor | None = None
+    doc_max_segment_length_scalar: torch.Tensor | None = None
     route_hint: str | None = None
 
     def normalized_route_hint(self) -> str | None:

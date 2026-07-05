@@ -16,8 +16,6 @@ import torch
 from deberta.modeling.flashdeberta_dense_bias_op import (
     _dense_bias_forward_cuda,
     _dense_bias_forward_fallback,
-    _dense_bucket_ranges,
-    _dense_bucket_reduce_from_ranges,
 )
 from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
@@ -438,6 +436,80 @@ def _should_use_specialized_docblock_bias_backward(
     return True
 
 
+def _resolve_docblock_specialized_bwd_kernel_config(
+    *,
+    kind: str,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int]:
+    """Resolve the short doc-block dense-bias backward launch tuple.
+
+    The specialized doc-block kernels are not the generic dense-bias kernels:
+    their best tile can differ because the hot path always writes a full
+    dense ``d_bias`` for later positional-bucket reduction. Prefer rows in the
+    ``bias_docblock_specialized`` tuning namespace, with a generic ``bwd`` row
+    shared by the KV and Q launches when no per-launch row is present.
+
+    :param str kind: Either ``"kv"`` or ``"q"``.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :raises ValueError: If ``kind`` is unsupported.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    normalized_kind = str(kind).strip().lower()
+    if normalized_kind not in {"kv", "q"}:
+        raise ValueError(f"Unsupported doc-block bias backward kernel kind: {kind!r}")
+
+    capability = _bias_device_capability(device)
+    context_kwargs = {
+        "compute_capability": capability,
+        "route": "bias_docblock_specialized",
+        "seq_len": max(int(query_len), int(key_len)),
+        "batch_size": int(batch_size),
+        "query_len": int(query_len),
+        "key_len": int(key_len),
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "dtype": _kernel_dtype_name(dtype),
+        "causal": bool(causal),
+        "has_mask": True,
+    }
+    for table_kind in (f"bwd_{normalized_kind}", "bwd"):
+        table_config = resolve_flash_kernel_config(
+            FlashKernelContext(
+                kind=table_kind,
+                **context_kwargs,
+            )
+        )
+        if table_config is not None:
+            return table_config
+
+    return _resolve_bias_bwd_kernel_config(
+        kind=normalized_kind,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=causal,
+        dtype=dtype,
+        device=device,
+    )
+
+
 if triton is not None:
 
     @triton.jit
@@ -763,7 +835,7 @@ def _bias_specialized_docblock_backward_impl(
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
-    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_bias_bwd_kernel_config(
+    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_docblock_specialized_bwd_kernel_config(
         kind="kv",
         batch_size=batch_size,
         num_heads=num_heads,
@@ -774,7 +846,7 @@ def _bias_specialized_docblock_backward_impl(
         dtype=q.dtype,
         device=q.device,
     )
-    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_bias_bwd_kernel_config(
+    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_docblock_specialized_bwd_kernel_config(
         kind="q",
         batch_size=batch_size,
         num_heads=num_heads,
@@ -1388,24 +1460,56 @@ def _position_bias_backward_from_dense_grad(
         grad = grad.masked_fill(~keep_mask, 0.0)
     grad = grad * float(scale)
 
+    def _scatter_bucket_reduce(
+        *,
+        grad_tensor: torch.Tensor,
+        index: torch.Tensor,
+        num_buckets: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Reduce dense bias gradients into bucket space with one scatter-add.
+
+        :param torch.Tensor grad_tensor: Dense gradient tensor in ``(B,H,S,S)`` layout.
+        :param torch.Tensor index: Bucket map in ``(S,S)`` layout.
+        :param int num_buckets: Output bucket width.
+        :param torch.dtype output_dtype: Final gradient dtype.
+        :return torch.Tensor: Reduced gradients in ``(B,H,S,P)`` layout.
+        """
+
+        output = grad_tensor.new_zeros(
+            (*grad_tensor.shape[:3], int(num_buckets)),
+            dtype=grad_tensor.dtype,
+        )
+        scatter_index = index.to(device=grad_tensor.device, dtype=torch.int64).view(
+            1,
+            1,
+            int(index.shape[0]),
+            int(index.shape[1]),
+        )
+        scatter_index = scatter_index.expand(
+            int(grad_tensor.shape[0]),
+            int(grad_tensor.shape[1]),
+            -1,
+            -1,
+        )
+        output.scatter_add_(-1, scatter_index, grad_tensor)
+        return output.to(dtype=output_dtype)
+
     dpos_key: torch.Tensor | None = None
     if pos_key is not None:
-        start_key, end_key = _dense_bucket_ranges(bucket_index, num_buckets=int(pos_key.shape[-1]))
-        dpos_key = _dense_bucket_reduce_from_ranges(
-            grad=grad,
-            start=start_key,
-            end=end_key,
+        dpos_key = _scatter_bucket_reduce(
+            grad_tensor=grad,
+            index=bucket_index,
+            num_buckets=int(pos_key.shape[-1]),
             output_dtype=pos_key.dtype,
         )
 
     dpos_query: torch.Tensor | None = None
     if pos_query is not None:
-        transposed = bucket_index.transpose(0, 1).contiguous()
-        start_query, end_query = _dense_bucket_ranges(transposed, num_buckets=int(pos_query.shape[-1]))
-        dpos_query = _dense_bucket_reduce_from_ranges(
-            grad=grad.transpose(-1, -2).contiguous(),
-            start=start_query,
-            end=end_query,
+        dpos_query = _scatter_bucket_reduce(
+            grad_tensor=grad.transpose(-1, -2),
+            index=bucket_index.transpose(0, 1),
+            num_buckets=int(pos_query.shape[-1]),
             output_dtype=pos_query.dtype,
         )
 

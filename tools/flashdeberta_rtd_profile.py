@@ -106,6 +106,18 @@ def _parse_args() -> argparse.Namespace:
         help="Optional override for gradient accumulation steps used in the profiler loop.",
     )
     parser.add_argument("--dense-policy", type=int, default=None)
+    parser.add_argument(
+        "--docblock-bias-seq-len",
+        type=int,
+        default=None,
+        help="Optional override for model.hf.flash.docblock_bias_seq_len.",
+    )
+    parser.add_argument(
+        "--kernel-overrides-path",
+        type=Path,
+        default=None,
+        help="Optional override for model.hf.flash.kernel_overrides_path.",
+    )
     parser.add_argument("--profile-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -168,6 +180,10 @@ def _maybe_override_config(args: argparse.Namespace) -> list[str]:
     ]
     if args.dense_policy is not None:
         overrides.append(f"model.hf.flash.eager_dense_max_seq_len={int(args.dense_policy)}")
+    if args.docblock_bias_seq_len is not None:
+        overrides.append(f"model.hf.flash.docblock_bias_seq_len={int(args.docblock_bias_seq_len)}")
+    if args.kernel_overrides_path is not None:
+        overrides.append(f"model.hf.flash.kernel_overrides_path={args.kernel_overrides_path}")
     if args.packing_enabled is not None:
         overrides.append(f"data.packing.enabled={str(_bool_text(args.packing_enabled)).lower()}")
     if args.block_cross_document_attention is not None:

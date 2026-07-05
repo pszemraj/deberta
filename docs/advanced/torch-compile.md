@@ -63,18 +63,18 @@ kernels. That path is opaque to Dynamo in the same way as the fixed and varlen
 custom ops, so it behaves like a normal compiled attention primitive instead of
 tracing through Python-side launcher code.
 
-Packed doc-block batches on `hf_deberta_v2` use a fourth route family with a
-measured split by sequence regime. Exact packed `1024` batches route through a
-dense flash-with-bias path by default, because that short packed-docblock case
-is better served by the quadratic bias kernel than by the ragged varlen
-backward path on current GPUs. Longer packed doc-block batches keep the
-segment-aware route. In that path, compile metadata keeps the 2D keep mask plus
+Packed doc-block batches on `hf_deberta_v2` use a fourth route family. The
+safe default is the segment-aware `docblock` route for all shipped packed
+sequence lengths. In that path, compile metadata keeps the 2D keep mask plus
 fixed-shape segment descriptors sized to `B*S`, and the opaque doc-block custom
 op slices the active segment prefix, repacks those document spans into a ragged
 batch, runs the existing disentangled varlen flash kernels, and scatters the
 results back into the original packed layout. The fixed-shape metadata contract
 is important: it keeps the compiled `masked_docblock_*` entrypoints from
-recompiling when the number of documents per packed batch changes.
+recompiling when the number of documents per packed batch changes. The dense
+flash-with-bias `docblock_bias` route is an explicit validation override, not a
+default, because local 1000-step RTD training exposed degenerate convergence on
+that route even though isolated profiles looked competitive.
 The dense-bias branch now builds its `(B,H,S,S)` additive bias through a
 repo-local opaque custom op instead of tracing the earlier
 `take_along_dim`/mask-scaling chain in eager Python. That keeps dense-bias
@@ -86,8 +86,9 @@ instead of the earlier `scatter_add_` / `scatter_reduce_` heavy fallback.
 The builder has its own tuning entry in `flashdeberta_kernel_tuning.json`, so
 retuning that assembly op does not perturb the downstream flash-with-bias
 attention kernels.
-The current measured `sm_120` packed-docblock `1024` default for that builder
-is `64 x 128, stages=2, warps=4`.
+The current measured `sm_120` packed-docblock `1024` builder candidate is
+`64 x 128, stages=2, warps=4`, but it is only used when dense `docblock_bias`
+is explicitly selected.
 That dense flash-with-bias route now has its own repo-local tuning seam too.
 The opaque bias wrapper checks `flashdeberta_kernel_tuning.json` before falling
 back to upstream FlashDeBERTa config selection, so packed-docblock kernel tuning
@@ -95,9 +96,9 @@ stays isolated from the fixed and varlen routes. The repo now launches the raw
 bias backward `KV` and `Q` Triton kernels directly, which makes those two
 backward surfaces independently tunable without forking the whole attention
 wrapper.
-For the measured packed-docblock `1024` hot path, the wrapper now goes one step
-further: when the run is non-causal, bf16/fp16, `D=64`, and the additive bias
-is a full dense `(B,H,1024,1024)` tensor, a matching
+For the experimental packed-docblock `1024` dense path, the wrapper now goes
+one step further: when the run is non-causal, bf16/fp16, `D=64`, and the
+additive bias is a full dense `(B,H,1024,1024)` tensor, a matching
 `bias_docblock_specialized` entry in `flashdeberta_kernel_tuning.json` enables
 the exact-match repo-local `_bwd_kv_kernel_docblock1024` /
 `_bwd_q_kernel_docblock1024` Triton kernels instead of the more generic
@@ -136,20 +137,24 @@ first and put durable results in a JSON table selected with
 For `hf_deberta_v2`, packed doc-blocking uses the JSON route policy described
 above when `model.hf.attention_impl=flash` is set:
 
-- packed doc-block batches, including exact `1024`, use the segment-aware flash custom op by default
-- the dense flash-with-bias doc-block route is opt-in because local RTD validation showed collapsed discriminator behavior on that path
+- packed doc-block batches use the segment-aware flash custom op by default,
+  avoiding dense pairwise bias materialization
+- exact packed lengths can opt into dense flash-with-bias `docblock_bias` with
+  `model.hf.flash.docblock_bias_seq_len=<len>` for isolated validation
 
-Treat the default packed-docblock flash route as correctness-preserving, not as
-the current speed recommendation for `1024`. Local validation found it slower
-than eager because the ragged doc-block path still exposes varying host segment
-stats to Dynamo and spends most time in the varlen/docblock kernels. Use eager
-or the `rope` backbone for speed-critical `1024` packed-docblock runs until the
-doc-block custom op owns that metadata as tensor inputs.
+The dense `1024` route is intentionally not promoted from profile-only evidence.
+The local profile window under
+`local-scratch/benchmarks/flashdeberta/docblock_goal_20260705/` measured a
+competitive isolated step time, but a matched 1000-step RTD run stayed near
+`11.3` loss while eager reached about `7.5`. Treat dense doc-block bias as an
+experimental debug route until real packed-batch parity and convergence are
+fixed.
 
 Leave `model.hf.flash.docblock_bias_seq_len` and
 `model.hf.flash.local_bias_max_batch_size` unset to use the table. Set
-`model.hf.flash.docblock_bias_seq_len=<len>` only to explicitly test the
-dense-bias doc-block route at that exact sequence length. Set
+`model.hf.flash.docblock_bias_seq_len=<len>` to force the dense-bias doc-block
+route only at that exact sequence length for validation, or set it to `0` to
+force-disable the dense-bias doc-block route while keeping flash enabled. Set
 `model.hf.flash.local_bias_max_batch_size=0` to disable the small-batch dense
 local-bias route without changing the doc-block route. Route policy is
 config/table-only; the older FlashDeBERTa route environment fallbacks are not

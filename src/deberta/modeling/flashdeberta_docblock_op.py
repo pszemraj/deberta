@@ -23,6 +23,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     resolve_flash_kernel_config,
 )
 from deberta.modeling.flashdeberta_segment_pack import (
+    segment_pack_grad_and_delta_from_padded,
     segment_pack_padded_rows,
     segment_pack_padded_rows_pair,
     segment_pack_padded_rows_triple,
@@ -34,6 +35,44 @@ from deberta.modeling.flashdeberta_segment_pack import (
 _DOCBLOCK_OP_NAMESPACE = "deberta"
 _DOCBLOCK_FWD_OP_NAME = "flashdeberta_docblock"
 _DOCBLOCK_BWD_OP_NAME = "flashdeberta_docblock_backward"
+
+
+def _scalar_int(value: int | torch.Tensor, *, name: str) -> int:
+    """Return a Python int from a host scalar.
+
+    :param int | torch.Tensor value: Python integer or scalar tensor.
+    :param str name: Name used in validation errors.
+    :raises ValueError: If a tensor value is not scalar.
+    :return int: Host integer value.
+    """
+
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0:
+            raise ValueError(f"{name} must be a scalar tensor, got shape {tuple(value.shape)}.")
+        if value.device.type == "cpu":
+            return int(value)
+        return int(value.detach().cpu().item())
+    return int(value)
+
+
+def _scalar_tensor(value: int | torch.Tensor, *, name: str) -> torch.Tensor:
+    """Return a CPU scalar tensor for compile-stable custom-op inputs.
+
+    :param int | torch.Tensor value: Python integer or scalar tensor.
+    :param str name: Name used in validation errors.
+    :raises ValueError: If a tensor value is not scalar.
+    :return torch.Tensor: CPU scalar int32 tensor.
+    """
+
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0:
+            raise ValueError(f"{name} must be a scalar tensor, got shape {tuple(value.shape)}.")
+        if value.device.type == "cpu" and value.dtype == torch.int32:
+            return value
+        if value.device.type == "cpu":
+            return value.to(dtype=torch.int32)
+        return torch.tensor(int(value.detach().cpu().item()), dtype=torch.int32)
+    return torch.tensor(int(value), dtype=torch.int32)
 
 
 def flashdeberta_docblock_import_error() -> Exception | None:
@@ -106,6 +145,42 @@ def _active_docblock_metadata(
         max(0, int(max_seqlen)),
         max(0, int(total_tokens)),
     )
+
+
+def _pad_packed_aux(tensor: torch.Tensor | None, *, capacity: int) -> torch.Tensor | None:
+    """Return ``tensor`` with a fixed packed-row capacity for saved aux outputs.
+
+    :param torch.Tensor | None tensor: Packed tensor with active rows.
+    :param int capacity: Desired first-dimension capacity.
+    :return torch.Tensor | None: Tensor with ``capacity`` rows, or ``None``.
+    """
+
+    if tensor is None:
+        return None
+    capacity = max(0, int(capacity))
+    if int(tensor.shape[0]) == capacity:
+        return tensor
+    padded = tensor.new_empty((capacity,) + tuple(tensor.shape[1:]))
+    active_rows = min(int(tensor.shape[0]), capacity)
+    if active_rows > 0:
+        padded[:active_rows].copy_(tensor[:active_rows])
+    return padded
+
+
+def _active_packed_prefix(tensor: torch.Tensor | None, *, total_tokens: int) -> torch.Tensor | None:
+    """Return the active packed prefix from a possibly fixed-capacity aux tensor.
+
+    :param torch.Tensor | None tensor: Packed auxiliary tensor.
+    :param int total_tokens: Active packed-token count.
+    :return torch.Tensor | None: Active prefix view, or ``None``.
+    """
+
+    if tensor is None:
+        return None
+    total = max(0, int(total_tokens))
+    if int(tensor.shape[0]) == total:
+        return tensor
+    return tensor[:total]
 
 
 def _select_rows_or_none(tensor: torch.Tensor | None, rows: torch.Tensor) -> torch.Tensor | None:
@@ -259,7 +334,18 @@ def _docblock_forward_impl(
     max_seqlen: int,
     total_tokens: int,
     require_lse: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    aux_capacity: int | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Run doc-block-aware attention over packed contiguous document segments.
 
     :param torch.Tensor query_layer: Queries in ``(B, S, H, D)`` layout.
@@ -278,8 +364,12 @@ def _docblock_forward_impl(
     :param int max_seqlen: Host-side maximum segment length.
     :param int total_tokens: Host-side total active token count.
     :param bool require_lse: Whether the caller also needs padded LSE values.
+    :param int | None aux_capacity: Optional fixed packed-buffer capacity for
+        compile-stable auxiliary outputs.
     :raises RuntimeError: If the low-level varlen kernels are unavailable.
-    :return tuple[torch.Tensor, torch.Tensor | None]: Padded output and optional padded LSE.
+    :return tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Padded output, optional padded LSE, and packed forward auxiliaries.
     """
 
     if (
@@ -311,17 +401,42 @@ def _docblock_forward_impl(
         total_tokens=total_tokens,
     )
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
+    packed_capacity = max(0, int(total_tokens))
+    if aux_capacity is not None:
+        packed_capacity = max(packed_capacity, int(aux_capacity))
 
     if total_tokens == 0:
         output = torch.zeros_like(query_layer)
+        q_empty = query_layer.new_empty(
+            (packed_capacity, int(query_layer.shape[2]), int(query_layer.shape[3]))
+        )
+        k_empty = key_layer.new_empty((packed_capacity, int(key_layer.shape[2]), int(key_layer.shape[3])))
+        v_empty = value_layer.new_empty(
+            (packed_capacity, int(value_layer.shape[2]), int(value_layer.shape[3]))
+        )
+        lse_empty = torch.empty(
+            (packed_capacity, int(query_layer.shape[2])),
+            device=query_layer.device,
+            dtype=torch.float32,
+        )
+        pos_key_empty = (
+            pos_key.new_empty((packed_capacity, int(pos_key.shape[2]), int(pos_key.shape[3])))
+            if pos_key is not None
+            else None
+        )
+        pos_query_empty = (
+            pos_query.new_empty((packed_capacity, int(pos_query.shape[2]), int(pos_query.shape[3])))
+            if pos_query is not None
+            else None
+        )
         if require_lse:
             lse = torch.zeros(
                 (batch_size, seq_len, int(query_layer.shape[2])),
                 device=query_layer.device,
                 dtype=torch.float32,
             )
-            return output, lse
-        return output, None
+            return output, lse, q_empty, k_empty, v_empty, q_empty, lse_empty, pos_key_empty, pos_query_empty
+        return output, None, q_empty, k_empty, v_empty, q_empty, lse_empty, pos_key_empty, pos_query_empty
 
     q_unpad, k_unpad, v_unpad = segment_pack_padded_rows_triple(
         query_layer,
@@ -447,8 +562,25 @@ def _docblock_forward_impl(
         seq_len=seq_len,
         max_segment_length=max_seqlen,
     )
+    q_aux = _pad_packed_aux(q_unpad, capacity=packed_capacity)
+    k_aux = _pad_packed_aux(k_unpad, capacity=packed_capacity)
+    v_aux = _pad_packed_aux(v_unpad, capacity=packed_capacity)
+    out_aux = _pad_packed_aux(out_unpad, capacity=packed_capacity)
+    lse_aux = _pad_packed_aux(lse_unpad, capacity=packed_capacity)
+    pos_key_aux = _pad_packed_aux(pos_key_unpad, capacity=packed_capacity)
+    pos_query_aux = _pad_packed_aux(pos_query_unpad, capacity=packed_capacity)
     if not require_lse:
-        return out_padded, None
+        return (
+            out_padded,
+            None,
+            q_aux,
+            k_aux,
+            v_aux,
+            out_aux,
+            lse_aux if lse_aux is not None else torch.empty((0,), device=query_layer.device),
+            pos_key_aux,
+            pos_query_aux,
+        )
     if lse_unpad is None:
         raise RuntimeError(
             "Compiled FlashDeBERTa doc-block attention requires low-level forward primitives with LSE support."
@@ -462,7 +594,7 @@ def _docblock_forward_impl(
         seq_len=seq_len,
         max_segment_length=max_seqlen,
     ).contiguous()
-    return out_padded, lse_padded
+    return out_padded, lse_padded, q_aux, k_aux, v_aux, out_aux, lse_aux, pos_key_aux, pos_query_aux
 
 
 def _docblock_backward_impl(
@@ -561,6 +693,11 @@ def _docblock_backward_impl(
             total_tokens=total_tokens,
             max_segment_length=max_seqlen,
         )
+    q_unpad = _active_packed_prefix(q_unpad, total_tokens=total_tokens)
+    k_unpad = _active_packed_prefix(k_unpad, total_tokens=total_tokens)
+    v_unpad = _active_packed_prefix(v_unpad, total_tokens=total_tokens)
+    if q_unpad is None or k_unpad is None or v_unpad is None:
+        raise RuntimeError("Doc-block backward expected packed q/k/v auxiliaries.")
     if out_unpad is None:
         out_unpad = segment_pack_padded_rows(
             output_padded,
@@ -570,15 +707,18 @@ def _docblock_backward_impl(
             total_tokens=total_tokens,
             max_segment_length=max_seqlen,
         )
-    grad_unpad = segment_pack_padded_rows(
-        grad_output,
+    out_unpad = _active_packed_prefix(out_unpad, total_tokens=total_tokens)
+    if out_unpad is None:
+        raise RuntimeError("Doc-block backward expected packed output auxiliary.")
+    grad_unpad, delta = segment_pack_grad_and_delta_from_padded(
+        grad_output=grad_output,
+        out_unpad=out_unpad,
         segment_offsets=active_segment_offsets,
         segment_lengths=active_segment_lengths,
         cu_seqlens=active_cu_seqlens,
         total_tokens=total_tokens,
         max_segment_length=max_seqlen,
     )
-    delta = (out_unpad * grad_unpad).sum(dim=-1)
     if lse_unpad is None:
         lse_unpad = segment_pack_padded_rows(
             lse_padded,
@@ -588,6 +728,9 @@ def _docblock_backward_impl(
             total_tokens=total_tokens,
             max_segment_length=max_seqlen,
         )
+    lse_unpad = _active_packed_prefix(lse_unpad, total_tokens=total_tokens)
+    if lse_unpad is None:
+        raise RuntimeError("Doc-block backward expected packed LSE auxiliary.")
     if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
         pos_key_unpad, pos_query_unpad = segment_pack_padded_rows_pair(
             pos_key,
@@ -617,6 +760,11 @@ def _docblock_backward_impl(
                 total_tokens=total_tokens,
                 max_segment_length=max_seqlen,
             )
+
+    if pos_key is not None:
+        pos_key_unpad = _active_packed_prefix(pos_key_unpad, total_tokens=total_tokens)
+    if pos_query is not None:
+        pos_query_unpad = _active_packed_prefix(pos_query_unpad, total_tokens=total_tokens)
 
     dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad = _varlen_mod._varlen_backward_raw_impl(
         q_unpad=q_unpad,
@@ -723,7 +871,8 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor segment_offsets, Tensor segment_lengths, Tensor cu_seqlens, "
             "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, int max_relative_distance, "
-            "int num_segments, int max_seqlen, int total_tokens, bool causal) -> (Tensor, Tensor)"
+            "Tensor num_segments, Tensor max_seqlen, Tensor total_tokens, bool causal) -> "
+            "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
     )
     def _forward_op(
@@ -738,11 +887,21 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
-        num_segments: int,
-        max_seqlen: int,
-        total_tokens: int,
+        num_segments: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        total_tokens: torch.Tensor,
         causal: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Run doc-block-aware forward as one opaque CUDA op.
 
         :param torch.Tensor q: Padded queries in ``(B, S, H, D)`` layout.
@@ -756,30 +915,46 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param float sm_scale: Softmax scale.
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
-        :param int num_segments: Host-side number of active document segments.
-        :param int max_seqlen: Host-side maximum document segment length.
-        :param int total_tokens: Host-side active token count.
+        :param torch.Tensor num_segments: Host-side number of active document segments.
+        :param torch.Tensor max_seqlen: Host-side maximum document segment length.
+        :param torch.Tensor total_tokens: Host-side active token count.
         :param bool causal: Whether causal masking is enabled.
-        :return tuple[torch.Tensor, torch.Tensor]: Padded output and padded LSE tensors.
+        :return tuple[torch.Tensor, ...]: Padded output/LSE plus packed forward auxiliaries.
         """
 
-        return _docblock_forward_impl(
-            query_layer=q,
-            key_layer=k,
-            value_layer=v,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            pos_key=pos_key,
-            pos_query=pos_query,
-            sm_scale=sm_scale,
-            position_buckets=position_buckets,
-            max_relative_distance=max_relative_distance,
-            num_segments=num_segments,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-            causal=causal,
-            require_lse=True,
+        output, lse, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad, pos_key_unpad, pos_query_unpad = (
+            _docblock_forward_impl(
+                query_layer=q,
+                key_layer=k,
+                value_layer=v,
+                segment_offsets=segment_offsets,
+                segment_lengths=segment_lengths,
+                cu_seqlens=cu_seqlens,
+                pos_key=pos_key,
+                pos_query=pos_query,
+                sm_scale=sm_scale,
+                position_buckets=position_buckets,
+                max_relative_distance=max_relative_distance,
+                num_segments=_scalar_int(num_segments, name="num_segments"),
+                max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
+                total_tokens=_scalar_int(total_tokens, name="total_tokens"),
+                causal=causal,
+                require_lse=True,
+                aux_capacity=int(q.shape[0]) * int(q.shape[1]),
+            )
+        )
+        if lse is None:  # pragma: no cover - require_lse=True above
+            raise RuntimeError("Doc-block custom op expected padded LSE output.")
+        return (
+            output,
+            lse,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad if pos_key_unpad is not None else q.new_empty((0,)),
+            pos_query_unpad if pos_query_unpad is not None else q.new_empty((0,)),
         )
 
     @torch.library.register_fake(_forward_op)
@@ -795,11 +970,21 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
-        num_segments: int,
-        max_seqlen: int,
-        total_tokens: int,
+        num_segments: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        total_tokens: torch.Tensor,
         causal: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Return fake forward outputs with static padded shapes.
 
         :param torch.Tensor q: Fake query tensor.
@@ -813,21 +998,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param float sm_scale: Fake softmax scale.
         :param int position_buckets: Fake bucket count.
         :param int max_relative_distance: Fake maximum relative distance.
-        :param int num_segments: Fake host-side number of active document segments.
-        :param int max_seqlen: Fake host-side maximum document segment length.
-        :param int total_tokens: Fake host-side active token count.
+        :param torch.Tensor num_segments: Fake host-side number of active document segments.
+        :param torch.Tensor max_seqlen: Fake host-side maximum document segment length.
+        :param torch.Tensor total_tokens: Fake host-side active token count.
         :param bool causal: Fake causal flag.
-        :return tuple[torch.Tensor, torch.Tensor]: Fake padded output and padded LSE tensors.
+        :return tuple[torch.Tensor, ...]: Fake padded outputs and packed auxiliaries.
         """
 
         del (
-            k,
-            v,
             segment_offsets,
             segment_lengths,
             cu_seqlens,
-            pos_key,
-            pos_query,
             sm_scale,
             position_buckets,
             max_relative_distance,
@@ -836,8 +1017,37 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             total_tokens,
             causal,
         )
+        capacity = q.shape[0] * q.shape[1]
+        packed_shape = (capacity, q.shape[2], q.shape[3])
         lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        return torch.empty(q.shape, device=q.device, dtype=q.dtype), lse
+        lse_unpad = torch.empty((capacity, q.shape[2]), device=q.device, dtype=torch.float32)
+        pos_key_aux = (
+            torch.empty(
+                (capacity, pos_key.shape[2], pos_key.shape[3]), device=pos_key.device, dtype=pos_key.dtype
+            )
+            if pos_key is not None
+            else torch.empty((0,), device=q.device, dtype=q.dtype)
+        )
+        pos_query_aux = (
+            torch.empty(
+                (capacity, pos_query.shape[2], pos_query.shape[3]),
+                device=pos_query.device,
+                dtype=pos_query.dtype,
+            )
+            if pos_query is not None
+            else torch.empty((0,), device=q.device, dtype=q.dtype)
+        )
+        return (
+            torch.empty(q.shape, device=q.device, dtype=q.dtype),
+            lse,
+            torch.empty(packed_shape, device=q.device, dtype=q.dtype),
+            torch.empty(packed_shape, device=k.device, dtype=k.dtype),
+            torch.empty(packed_shape, device=v.device, dtype=v.dtype),
+            torch.empty(packed_shape, device=q.device, dtype=q.dtype),
+            lse_unpad,
+            pos_key_aux,
+            pos_query_aux,
+        )
 
     @torch.library.custom_op(
         f"{_DOCBLOCK_OP_NAMESPACE}::{_DOCBLOCK_BWD_OP_NAME}",
@@ -846,8 +1056,9 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor segment_offsets, Tensor segment_lengths, "
             "Tensor cu_seqlens, Tensor out, Tensor lse, Tensor? pos_key, Tensor? pos_query, float sm_scale, "
-            "int position_buckets, int max_relative_distance, int num_segments, int max_seqlen, "
-            "int total_tokens, bool causal) -> "
+            "int position_buckets, int max_relative_distance, Tensor num_segments, Tensor max_seqlen, "
+            "Tensor total_tokens, bool causal, Tensor q_unpad, Tensor k_unpad, Tensor v_unpad, Tensor out_unpad, "
+            "Tensor lse_unpad, Tensor? pos_key_unpad, Tensor? pos_query_unpad) -> "
             "(Tensor, Tensor, Tensor, Tensor?, Tensor?)"
         ),
     )
@@ -866,10 +1077,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
-        num_segments: int,
-        max_seqlen: int,
-        total_tokens: int,
+        num_segments: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        total_tokens: torch.Tensor,
         causal: bool,
+        q_unpad: torch.Tensor,
+        k_unpad: torch.Tensor,
+        v_unpad: torch.Tensor,
+        out_unpad: torch.Tensor,
+        lse_unpad: torch.Tensor,
+        pos_key_unpad: torch.Tensor | None,
+        pos_query_unpad: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Run doc-block-aware backward as one opaque CUDA op.
 
@@ -887,10 +1105,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param float sm_scale: Softmax scale.
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
-        :param int num_segments: Host-side number of active document segments.
-        :param int max_seqlen: Host-side maximum document segment length.
-        :param int total_tokens: Host-side active token count.
+        :param torch.Tensor num_segments: Host-side number of active document segments.
+        :param torch.Tensor max_seqlen: Host-side maximum document segment length.
+        :param torch.Tensor total_tokens: Host-side active token count.
         :param bool causal: Whether causal masking is enabled.
+        :param torch.Tensor q_unpad: Packed forward queries.
+        :param torch.Tensor k_unpad: Packed forward keys.
+        :param torch.Tensor v_unpad: Packed forward values.
+        :param torch.Tensor out_unpad: Packed forward output.
+        :param torch.Tensor lse_unpad: Packed forward LSE.
+        :param torch.Tensor | None pos_key_unpad: Optional packed c2p tensor.
+        :param torch.Tensor | None pos_query_unpad: Optional packed p2c tensor.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
             Padded gradients for q/k/v and optional positional tensors.
         """
@@ -910,17 +1135,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             sm_scale=sm_scale,
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
-            num_segments=num_segments,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
+            num_segments=_scalar_int(num_segments, name="num_segments"),
+            max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
+            total_tokens=_scalar_int(total_tokens, name="total_tokens"),
             causal=causal,
-            q_unpad=None,
-            k_unpad=None,
-            v_unpad=None,
-            out_unpad=None,
-            lse_unpad=None,
-            pos_key_unpad=None,
-            pos_query_unpad=None,
+            q_unpad=q_unpad,
+            k_unpad=k_unpad,
+            v_unpad=v_unpad,
+            out_unpad=out_unpad,
+            lse_unpad=lse_unpad,
+            pos_key_unpad=pos_key_unpad,
+            pos_query_unpad=pos_query_unpad,
         )
 
     @torch.library.register_fake(_backward_op)
@@ -939,10 +1164,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
-        num_segments: int,
-        max_seqlen: int,
-        total_tokens: int,
+        num_segments: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        total_tokens: torch.Tensor,
         causal: bool,
+        q_unpad: torch.Tensor,
+        k_unpad: torch.Tensor,
+        v_unpad: torch.Tensor,
+        out_unpad: torch.Tensor,
+        lse_unpad: torch.Tensor,
+        pos_key_unpad: torch.Tensor | None,
+        pos_query_unpad: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Return fake backward outputs with static padded shapes.
 
@@ -960,10 +1192,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param float sm_scale: Fake softmax scale.
         :param int position_buckets: Fake bucket count.
         :param int max_relative_distance: Fake maximum relative distance.
-        :param int num_segments: Fake host-side number of active document segments.
-        :param int max_seqlen: Fake host-side maximum document segment length.
-        :param int total_tokens: Fake host-side active token count.
+        :param torch.Tensor num_segments: Fake host-side number of active document segments.
+        :param torch.Tensor max_seqlen: Fake host-side maximum document segment length.
+        :param torch.Tensor total_tokens: Fake host-side active token count.
         :param bool causal: Fake causal flag.
+        :param torch.Tensor q_unpad: Fake packed query auxiliary.
+        :param torch.Tensor k_unpad: Fake packed key auxiliary.
+        :param torch.Tensor v_unpad: Fake packed value auxiliary.
+        :param torch.Tensor out_unpad: Fake packed output auxiliary.
+        :param torch.Tensor lse_unpad: Fake packed LSE auxiliary.
+        :param torch.Tensor | None pos_key_unpad: Fake packed c2p auxiliary.
+        :param torch.Tensor | None pos_query_unpad: Fake packed p2c auxiliary.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
             Fake padded gradients for q/k/v and optional positional tensors.
         """
@@ -975,6 +1214,13 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             cu_seqlens,
             out,
             lse,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
             sm_scale,
             position_buckets,
             max_relative_distance,
@@ -1004,7 +1250,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
     def _setup_context(
         ctx: Any,
         inputs: tuple[Any, ...],
-        output: tuple[torch.Tensor, torch.Tensor],
+        output: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
     ) -> None:
         """Save forward inputs and outputs needed by the doc-block backward helper.
 
@@ -1030,44 +1286,116 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             total_tokens,
             causal,
         ) = inputs
-        out, lse = output
-        saved: list[torch.Tensor] = [q, k, v, segment_offsets, segment_lengths, cu_seqlens, out, lse]
+        out, lse, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad, pos_key_unpad, pos_query_unpad = output
+        saved: list[torch.Tensor] = [
+            q,
+            k,
+            v,
+            segment_offsets,
+            segment_lengths,
+            cu_seqlens,
+            out,
+            lse,
+            num_segments,
+            max_seqlen,
+            total_tokens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+        ]
         if pos_key is not None:
             saved.append(pos_key)
+            saved.append(pos_key_unpad)
         if pos_query is not None:
             saved.append(pos_query)
+            saved.append(pos_query_unpad)
+        if hasattr(ctx, "mark_non_differentiable"):
+            non_diff = [lse, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad]
+            if pos_key is not None:
+                non_diff.append(pos_key_unpad)
+            if pos_query is not None:
+                non_diff.append(pos_query_unpad)
+            ctx.mark_non_differentiable(*non_diff)
         ctx.has_pos_key = pos_key is not None
         ctx.has_pos_query = pos_query is not None
         ctx.save_for_backward(*saved)
         ctx.sm_scale = float(sm_scale)
         ctx.position_buckets = int(position_buckets)
         ctx.max_relative_distance = int(max_relative_distance)
-        ctx.num_segments = int(num_segments)
-        ctx.max_seqlen = int(max_seqlen)
-        ctx.total_tokens = int(total_tokens)
         ctx.causal = bool(causal)
 
     def _backward(
         ctx: Any,
         grad_out: torch.Tensor | None,
         grad_lse: torch.Tensor | None,
+        grad_q_unpad: torch.Tensor | None,
+        grad_k_unpad: torch.Tensor | None,
+        grad_v_unpad: torch.Tensor | None,
+        grad_out_unpad: torch.Tensor | None,
+        grad_lse_unpad: torch.Tensor | None,
+        grad_pos_key_unpad: torch.Tensor | None,
+        grad_pos_query_unpad: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
         """Dispatch backward through the opaque doc-block backward helper.
 
         :param Any ctx: Autograd context populated by ``_setup_context``.
         :param torch.Tensor | None grad_out: Gradient of padded output.
         :param torch.Tensor | None grad_lse: Gradient of padded LSE output.
+        :param torch.Tensor | None grad_q_unpad: Ignored gradient for packed query auxiliary.
+        :param torch.Tensor | None grad_k_unpad: Ignored gradient for packed key auxiliary.
+        :param torch.Tensor | None grad_v_unpad: Ignored gradient for packed value auxiliary.
+        :param torch.Tensor | None grad_out_unpad: Ignored gradient for packed output auxiliary.
+        :param torch.Tensor | None grad_lse_unpad: Ignored gradient for packed LSE auxiliary.
+        :param torch.Tensor | None grad_pos_key_unpad: Ignored gradient for packed c2p auxiliary.
+        :param torch.Tensor | None grad_pos_query_unpad: Ignored gradient for packed p2c auxiliary.
         :return tuple[torch.Tensor | None, ...]: Gradients for the forward custom-op inputs.
         """
 
-        del grad_lse
+        del (
+            grad_lse,
+            grad_q_unpad,
+            grad_k_unpad,
+            grad_v_unpad,
+            grad_out_unpad,
+            grad_lse_unpad,
+            grad_pos_key_unpad,
+            grad_pos_query_unpad,
+        )
         saved = list(ctx.saved_tensors)
-        q, k, v, segment_offsets, segment_lengths, cu_seqlens, out, lse = saved[:8]
-        next_idx = 8
+        (
+            q,
+            k,
+            v,
+            segment_offsets,
+            segment_lengths,
+            cu_seqlens,
+            out,
+            lse,
+            num_segments,
+            max_seqlen,
+            total_tokens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+        ) = saved[:16]
+        next_idx = 16
         pos_key = saved[next_idx] if bool(ctx.has_pos_key) else None
         if bool(ctx.has_pos_key):
             next_idx += 1
+            pos_key_unpad = saved[next_idx]
+            next_idx += 1
+        else:
+            pos_key_unpad = None
         pos_query = saved[next_idx] if bool(ctx.has_pos_query) else None
+        if bool(ctx.has_pos_query):
+            next_idx += 1
+            pos_query_unpad = saved[next_idx]
+        else:
+            pos_query_unpad = None
         grad = grad_out if grad_out is not None else torch.zeros_like(out)
         dq, dk, dv, dpos_key, dpos_query = _backward_op(
             grad,
@@ -1084,10 +1412,17 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             ctx.sm_scale,
             ctx.position_buckets,
             ctx.max_relative_distance,
-            ctx.num_segments,
-            ctx.max_seqlen,
-            ctx.total_tokens,
+            num_segments,
+            max_seqlen,
+            total_tokens,
             ctx.causal,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
         )
         return (
             dq,
@@ -1127,9 +1462,9 @@ def flashdeberta_docblock(
     sm_scale: float,
     position_buckets: int,
     max_relative_distance: int,
-    num_segments: int,
-    max_seqlen: int,
-    total_tokens: int,
+    num_segments: int | torch.Tensor,
+    max_seqlen: int | torch.Tensor,
+    total_tokens: int | torch.Tensor,
     causal: bool,
 ) -> torch.Tensor:
     """Run doc-block-aware FlashDeBERTa attention.
@@ -1145,15 +1480,18 @@ def flashdeberta_docblock(
     :param float sm_scale: Softmax scale.
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
-    :param int num_segments: Host-side active segment count.
-    :param int max_seqlen: Host-side maximum segment length.
-    :param int total_tokens: Host-side total active token count.
+    :param int | torch.Tensor num_segments: Host-side active segment count.
+    :param int | torch.Tensor max_seqlen: Host-side maximum segment length.
+    :param int | torch.Tensor total_tokens: Host-side total active token count.
     :param bool causal: Whether causal masking is enabled.
     :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
     """
 
     if _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP is not None and query_layer.device.type == "cuda":
-        output, _ = _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP(
+        num_segments_tensor = _scalar_tensor(num_segments, name="num_segments")
+        max_seqlen_tensor = _scalar_tensor(max_seqlen, name="max_seqlen")
+        total_tokens_tensor = _scalar_tensor(total_tokens, name="total_tokens")
+        output, *_ = _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP(
             query_layer,
             key_layer,
             value_layer,
@@ -1165,14 +1503,14 @@ def flashdeberta_docblock(
             float(sm_scale),
             int(position_buckets),
             int(max_relative_distance),
-            int(num_segments),
-            int(max_seqlen),
-            int(total_tokens),
+            num_segments_tensor,
+            max_seqlen_tensor,
+            total_tokens_tensor,
             bool(causal),
         )
         return output
 
-    output, _ = _docblock_forward_impl(
+    output, *_ = _docblock_forward_impl(
         query_layer=query_layer,
         key_layer=key_layer,
         value_layer=value_layer,
@@ -1184,9 +1522,9 @@ def flashdeberta_docblock(
         sm_scale=sm_scale,
         position_buckets=position_buckets,
         max_relative_distance=max_relative_distance,
-        num_segments=num_segments,
-        max_seqlen=max_seqlen,
-        total_tokens=total_tokens,
+        num_segments=_scalar_int(num_segments, name="num_segments"),
+        max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
+        total_tokens=_scalar_int(total_tokens, name="total_tokens"),
         causal=causal,
         require_lse=False,
     )

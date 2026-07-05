@@ -188,11 +188,11 @@ def _flash_route_hint_for_padding_batch(
 def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
     """Select the doc-block flash backend for one packed batch.
 
-    The default policy keeps packed doc-block batches on the segment-aware
-    route. The dense ``docblock_bias`` route remains available only through an
-    explicit config override or override table, because local RTD validation
-    showed it can produce collapsed discriminator behavior even when short
-    synthetic parity checks pass.
+    The default policy comes from the repo-local JSON route table and stays on
+    the segment-aware ``docblock`` route unless an exact-length dense
+    ``docblock_bias`` override is provided. Dense doc-block bias routing is
+    intentionally opt-in while real-batch RTD convergence and parity remain
+    under validation.
 
     :param int seq_len: Packed sequence length.
     :param Any | None flash_cfg: Optional resolved flash config.
@@ -258,6 +258,28 @@ def _flash_active_tokens_host(value: Any) -> int | None:
     return None
 
 
+def _flash_scalar_tensor(value: Any) -> torch.Tensor | None:
+    """Return a CPU scalar tensor when one is already available.
+
+    :param Any value: Candidate scalar tensor from the batch.
+    :return torch.Tensor | None: CPU scalar int tensor or ``None``.
+    """
+
+    return (
+        value if isinstance(value, torch.Tensor) and value.ndim == 0 and value.device.type == "cpu" else None
+    )
+
+
+def _cpu_int_scalar(value: int | None) -> torch.Tensor | None:
+    """Return a CPU int32 scalar tensor for a known host integer.
+
+    :param int | None value: Host integer value.
+    :return torch.Tensor | None: CPU scalar tensor or ``None``.
+    """
+
+    return torch.tensor(int(value), dtype=torch.int32) if value is not None else None
+
+
 def _flash_meta_with_route(
     flash_meta: FlashBatchMeta | None, route_hint: str | None
 ) -> FlashBatchMeta | None:
@@ -283,6 +305,9 @@ def _flash_meta_with_route(
         active_tokens_host=flash_meta.active_tokens_host,
         doc_num_segments_host=flash_meta.doc_num_segments_host,
         doc_max_segment_length_host=flash_meta.doc_max_segment_length_host,
+        active_tokens_scalar=flash_meta.active_tokens_scalar,
+        doc_num_segments_scalar=flash_meta.doc_num_segments_scalar,
+        doc_max_segment_length_scalar=flash_meta.doc_max_segment_length_scalar,
         route_hint=route,
     )
 
@@ -332,6 +357,18 @@ def _pop_flash_doc_segment_host_stats(batch: dict[str, Any]) -> None:
 
     batch.pop("flash_doc_num_segments", None)
     batch.pop("flash_doc_max_seqlen", None)
+    batch.pop("flash_doc_num_segments_scalar", None)
+    batch.pop("flash_doc_max_seqlen_scalar", None)
+
+
+def _pop_flash_active_token_stats(batch: dict[str, Any]) -> None:
+    """Remove active-token host stats from a batch.
+
+    :param dict[str, Any] batch: Batch mapping.
+    """
+
+    batch.pop("flash_active_tokens", None)
+    batch.pop("flash_active_tokens_scalar", None)
 
 
 def prepare_flash_attention_batch_metadata(
@@ -355,14 +392,14 @@ def prepare_flash_attention_batch_metadata(
     btype = str(backbone_type).strip().lower()
     if btype != "hf_deberta_v2":
         batch.pop("flash_seq_lengths", None)
-        batch.pop("flash_active_tokens", None)
+        _pop_flash_active_token_stats(batch)
         _pop_flash_doc_segment_host_stats(batch)
         return batch, None
 
     input_ids = batch.get("input_ids")
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
         batch.pop("flash_seq_lengths", None)
-        batch.pop("flash_active_tokens", None)
+        _pop_flash_active_token_stats(batch)
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
@@ -380,16 +417,27 @@ def prepare_flash_attention_batch_metadata(
         if seq_lengths is None:
             seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
         active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
+        active_tokens_scalar = _flash_scalar_tensor(batch.get("flash_active_tokens_scalar"))
+        if active_tokens is None and active_tokens_scalar is not None:
+            active_tokens = int(active_tokens_scalar)
         if active_tokens is None:
             active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
+        if active_tokens_scalar is None:
+            active_tokens_scalar = _cpu_int_scalar(active_tokens)
         batch["flash_seq_lengths"] = seq_lengths
         if active_tokens is not None:
             batch["flash_active_tokens"] = int(active_tokens)
+        else:
+            batch.pop("flash_active_tokens", None)
+        if active_tokens_scalar is not None:
+            batch["flash_active_tokens_scalar"] = active_tokens_scalar
+        else:
+            batch.pop("flash_active_tokens_scalar", None)
         if (not bool(flash_enabled)) or route_hint == "docblock_bias":
             batch["attention_mask"] = _build_doc_block_mask(doc_ids)
             if not bool(flash_enabled):
                 batch.pop("flash_seq_lengths", None)
-                batch.pop("flash_active_tokens", None)
+                _pop_flash_active_token_stats(batch)
             batch.pop("flash_doc_segment_offsets", None)
             batch.pop("flash_doc_segment_lengths", None)
             batch.pop("flash_doc_cu_seqlens", None)
@@ -397,6 +445,7 @@ def prepare_flash_attention_batch_metadata(
             meta = FlashBatchMeta(
                 seq_lengths=seq_lengths if bool(flash_enabled) else None,
                 active_tokens_host=active_tokens,
+                active_tokens_scalar=active_tokens_scalar if bool(flash_enabled) else None,
                 route_hint=route_hint if bool(flash_enabled) else "pairwise",
             )
             return batch, meta if bool(flash_enabled) else None
@@ -416,11 +465,21 @@ def prepare_flash_attention_batch_metadata(
                 )
             segment_offsets, segment_lengths, cu_seqlens, _ = _build_doc_segment_metadata(doc_ids)
         doc_num_segments, doc_max_seqlen = _flash_doc_segment_host_stats(batch)
+        doc_num_segments_scalar = _flash_scalar_tensor(batch.get("flash_doc_num_segments_scalar"))
+        doc_max_seqlen_scalar = _flash_scalar_tensor(batch.get("flash_doc_max_seqlen_scalar"))
+        if doc_num_segments is None and doc_num_segments_scalar is not None:
+            doc_num_segments = int(doc_num_segments_scalar)
+        if doc_max_seqlen is None and doc_max_seqlen_scalar is not None:
+            doc_max_seqlen = int(doc_max_seqlen_scalar)
         if doc_num_segments is None or doc_max_seqlen is None:
             doc_num_segments, doc_max_seqlen, _ = doc_segment_metadata_host_stats(
                 segment_lengths,
                 active_tokens=active_tokens,
             )
+        if doc_num_segments_scalar is None:
+            doc_num_segments_scalar = _cpu_int_scalar(doc_num_segments)
+        if doc_max_seqlen_scalar is None:
+            doc_max_seqlen_scalar = _cpu_int_scalar(doc_max_seqlen)
         if doc_num_segments is None or doc_max_seqlen is None:
             raise RuntimeError(
                 "Flash doc-block host stats are missing for a device batch. "
@@ -431,6 +490,10 @@ def prepare_flash_attention_batch_metadata(
         batch["flash_doc_cu_seqlens"] = cu_seqlens
         batch["flash_doc_num_segments"] = int(doc_num_segments)
         batch["flash_doc_max_seqlen"] = int(doc_max_seqlen)
+        if doc_num_segments_scalar is not None:
+            batch["flash_doc_num_segments_scalar"] = doc_num_segments_scalar
+        if doc_max_seqlen_scalar is not None:
+            batch["flash_doc_max_seqlen_scalar"] = doc_max_seqlen_scalar
         return batch, FlashBatchMeta(
             seq_lengths=seq_lengths,
             doc_segment_offsets=segment_offsets,
@@ -439,6 +502,9 @@ def prepare_flash_attention_batch_metadata(
             active_tokens_host=active_tokens,
             doc_num_segments_host=doc_num_segments,
             doc_max_segment_length_host=doc_max_seqlen,
+            active_tokens_scalar=active_tokens_scalar,
+            doc_num_segments_scalar=doc_num_segments_scalar,
+            doc_max_segment_length_scalar=doc_max_seqlen_scalar,
             route_hint=route_hint,
         )
 
@@ -446,7 +512,7 @@ def prepare_flash_attention_batch_metadata(
     seq_len = int(input_ids.shape[-1])
     if attention_mask is None:
         batch.pop("flash_seq_lengths", None)
-        batch.pop("flash_active_tokens", None)
+        _pop_flash_active_token_stats(batch)
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
@@ -454,7 +520,7 @@ def prepare_flash_attention_batch_metadata(
         return batch, FlashBatchMeta(route_hint="dense") if bool(flash_enabled) else None
     if _flash_is_pairwise_mask(attention_mask, seq_len=int(seq_len)):
         batch.pop("flash_seq_lengths", None)
-        batch.pop("flash_active_tokens", None)
+        _pop_flash_active_token_stats(batch)
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
@@ -463,7 +529,7 @@ def prepare_flash_attention_batch_metadata(
 
     if not isinstance(attention_mask, torch.Tensor):
         batch.pop("flash_seq_lengths", None)
-        batch.pop("flash_active_tokens", None)
+        _pop_flash_active_token_stats(batch)
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
@@ -472,7 +538,7 @@ def prepare_flash_attention_batch_metadata(
 
     if not bool(flash_enabled):
         batch.pop("flash_seq_lengths", None)
-        batch.pop("flash_active_tokens", None)
+        _pop_flash_active_token_stats(batch)
         batch.pop("flash_doc_segment_offsets", None)
         batch.pop("flash_doc_segment_lengths", None)
         batch.pop("flash_doc_cu_seqlens", None)
@@ -484,8 +550,13 @@ def prepare_flash_attention_batch_metadata(
     if seq_lengths is None:
         seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
     active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
+    active_tokens_scalar = _flash_scalar_tensor(batch.get("flash_active_tokens_scalar"))
+    if active_tokens is None and active_tokens_scalar is not None:
+        active_tokens = int(active_tokens_scalar)
     if active_tokens is None:
         active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
+    if active_tokens_scalar is None:
+        active_tokens_scalar = _cpu_int_scalar(active_tokens)
     route_active_tokens = (
         int(active_tokens) if active_tokens is not None else int(seq_len) * int(input_ids.shape[0])
     )
@@ -500,6 +571,10 @@ def prepare_flash_attention_batch_metadata(
         batch["flash_active_tokens"] = int(active_tokens)
     else:
         batch.pop("flash_active_tokens", None)
+    if active_tokens_scalar is not None:
+        batch["flash_active_tokens_scalar"] = active_tokens_scalar
+    else:
+        batch.pop("flash_active_tokens_scalar", None)
     batch.pop("flash_doc_segment_offsets", None)
     batch.pop("flash_doc_segment_lengths", None)
     batch.pop("flash_doc_cu_seqlens", None)
@@ -507,6 +582,7 @@ def prepare_flash_attention_batch_metadata(
     return batch, FlashBatchMeta(
         seq_lengths=seq_lengths,
         active_tokens_host=active_tokens,
+        active_tokens_scalar=active_tokens_scalar,
         route_hint=route_hint,
     )
 

@@ -76,7 +76,7 @@ model:
     # Guidance: Native eager DeBERTa attention implementation choice. Applies only to `hf_deberta_v2`; ignored for `rope`.
     attention_kernel: "dynamic"
     # Type: str. Default: "eager". Required: no. Valid values: `eager` | `flash`.
-    # Guidance: `eager` is stable. `flash` is experimental, only valid with `model.backbone_type=hf_deberta_v2`, and requires dropout disabled.
+    # Guidance: `eager` is the portability default. `flash` is valid only with `model.backbone_type=hf_deberta_v2`, requires dropout disabled, and uses the JSON route/kernel policy under `model.hf.flash.*`; validate throughput on new GPU types before treating measured table defaults as portable.
     attention_impl: "eager"
     flash:
       # Type: bool. Default: false. Required: no.
@@ -86,7 +86,7 @@ model:
       # Guidance: Only used when `model.hf.attention_impl=flash`. Optional varlen threshold. `null` uses the JSON route table; if set, must be > 0.
       varlen_min_seq_len: null
       # Type: int | None. Default: null. Required: no.
-      # Guidance: Only used when `model.hf.attention_impl=flash`. Experimental dense doc-block route opt-in. `null` uses the table, whose safe default is segment-aware docblock. Set a positive exact length only after local parity and RTD validation; `0` disables.
+      # Guidance: Only used when `model.hf.attention_impl=flash`. Exact-length dense doc-block route override. `null` uses the JSON table, whose safe default keeps packed doc-block batches on segment-aware `docblock`. Set a positive exact sequence length only for isolated dense `docblock_bias` validation; set `0` to force-disable dense doc-block routing.
       docblock_bias_seq_len: null
       # Type: int | None. Default: null. Required: no.
       # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route cap. `null` uses table policy; `0` disables. Dense routes can be memory-heavy and hardware-sensitive.

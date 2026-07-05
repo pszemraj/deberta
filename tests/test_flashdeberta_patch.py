@@ -302,7 +302,7 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
-def test_docblock_bias_route_requires_positive_config_override() -> None:
+def test_docblock_bias_route_is_explicit_config_override() -> None:
     from deberta.training.compile import _flash_route_hint_for_docblock_batch
 
     assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
@@ -813,6 +813,7 @@ def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
 
 def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
     from deberta.modeling.flashdeberta_segment_pack import (
+        segment_pack_grad_and_delta_from_padded,
         segment_pack_padded_rows_pair,
         segment_pack_padded_rows_triple,
         segment_unpack_padded_rows_pair,
@@ -852,11 +853,23 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
     expected_a = torch.cat((a[0, :2], a[0, 2:4], a[1, :1], a[1, 1:3]), dim=0)
     expected_b = torch.cat((b[0, :2], b[0, 2:4], b[1, :1], b[1, 1:3]), dim=0)
     expected_c = torch.cat((c[0, :2], c[0, 2:4], c[1, :1], c[1, 1:3]), dim=0)
+    expected_base = torch.cat((base[0, :2], base[0, 2:4], base[1, :1], base[1, 1:3]), dim=0)
     assert torch.equal(packed_a, expected_a)
     assert torch.equal(packed_b, expected_b)
     assert torch.equal(packed_c1, expected_a)
     assert torch.equal(packed_c2, expected_b)
     assert torch.equal(packed_c3, expected_c)
+
+    grad_unpad, delta = segment_pack_grad_and_delta_from_padded(
+        grad_output=base,
+        out_unpad=expected_base + 1.0,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+        total_tokens=7,
+    )
+    assert torch.equal(grad_unpad, expected_base)
+    assert torch.equal(delta, ((expected_base + 1.0) * expected_base).sum(dim=-1))
 
     unpacked_a, unpacked_b = segment_unpack_padded_rows_pair(
         packed_a,
@@ -898,6 +911,214 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
     assert torch.equal(unpacked_c1, expected_unpacked_a)
     assert torch.equal(unpacked_c2, expected_unpacked_b)
     assert torch.equal(unpacked_c3, expected_unpacked_c)
+
+
+def test_docblock_forward_pads_saved_aux_without_expanding_kernel_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.modeling.flashdeberta_docblock_op as docblock_mod
+
+    seen: dict[str, int] = {}
+
+    def _fake_fwd(
+        q,
+        k,
+        v,
+        pos_key,
+        pos_query,
+        cu_q,
+        cu_k,
+        max_q,
+        max_k,
+        causal,
+        sm_scale,
+        block_m,
+        block_n,
+        position_buckets,
+        max_relative_distance,
+        num_warps,
+        num_stages,
+        att_span,
+    ):
+        del (
+            k,
+            v,
+            pos_key,
+            pos_query,
+            cu_q,
+            cu_k,
+            max_q,
+            max_k,
+            causal,
+            sm_scale,
+            block_m,
+            block_n,
+            position_buckets,
+            max_relative_distance,
+            num_warps,
+            num_stages,
+            att_span,
+        )
+        seen["tokens"] = int(q.shape[0])
+        return q + 1.0, torch.zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
+
+    monkeypatch.setattr(docblock_mod._varlen_mod, "_flash_attn_v2_fwd_dise_lowlevel", _fake_fwd)
+    monkeypatch.setattr(
+        docblock_mod._varlen_mod,
+        "_get_fwd_config_lowlevel",
+        lambda **kwargs: (16, 16, 1, 1),
+    )
+
+    q = torch.arange(1 * 5 * 2 * 3, dtype=torch.float32).view(1, 5, 2, 3)
+    pos = torch.arange(1 * 5 * 2 * 4, dtype=torch.float32).view(1, 5, 2, 4)
+    segment_offsets = torch.tensor([0, 3], dtype=torch.int32)
+    segment_lengths = torch.tensor([2, 1], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+
+    output, lse, q_aux, k_aux, v_aux, out_aux, lse_aux, pos_key_aux, pos_query_aux = (
+        docblock_mod._docblock_forward_impl(
+            query_layer=q,
+            key_layer=q + 10,
+            value_layer=q + 20,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            pos_key=pos,
+            pos_query=pos + 10,
+            sm_scale=1.0,
+            position_buckets=4,
+            max_relative_distance=4,
+            causal=False,
+            num_segments=2,
+            max_seqlen=2,
+            total_tokens=3,
+            require_lse=True,
+            aux_capacity=5,
+        )
+    )
+
+    assert seen["tokens"] == 3
+    assert q_aux.shape[0] == 5
+    assert k_aux.shape[0] == 5
+    assert v_aux.shape[0] == 5
+    assert out_aux.shape[0] == 5
+    assert lse_aux.shape[0] == 5
+    assert pos_key_aux is not None and pos_key_aux.shape[0] == 5
+    assert pos_query_aux is not None and pos_query_aux.shape[0] == 5
+    assert lse is not None and lse.shape == (1, 5, 2)
+    expected = torch.zeros_like(q)
+    expected[0, :2] = q[0, :2] + 1.0
+    expected[0, 3:4] = q[0, 3:4] + 1.0
+    assert torch.equal(output, expected)
+
+
+def test_docblock_backward_narrows_fixed_capacity_saved_aux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.modeling.flashdeberta_docblock_op as docblock_mod
+
+    seen: dict[str, int] = {}
+
+    def _fake_backward_raw(
+        *,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        grad_unpad,
+        lse_unpad,
+        delta,
+        pos_key_unpad,
+        pos_query_unpad,
+        cu_seqlens,
+        batch_size,
+        seq_bound,
+        token_capacity,
+        sm_scale,
+        position_buckets,
+        max_relative_distance,
+        causal,
+        dense_mid_tensors,
+    ):
+        del (
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            grad_unpad,
+            lse_unpad,
+            delta,
+            cu_seqlens,
+            batch_size,
+            seq_bound,
+            sm_scale,
+            position_buckets,
+            max_relative_distance,
+            causal,
+            dense_mid_tensors,
+        )
+        seen["q_tokens"] = int(q_unpad.shape[0])
+        seen["pos_tokens"] = int(pos_key_unpad.shape[0]) if pos_key_unpad is not None else -1
+        seen["capacity"] = int(token_capacity)
+        dpos_key = torch.full_like(pos_key_unpad, 4.0) if pos_key_unpad is not None else None
+        dpos_query = torch.full_like(pos_query_unpad, 5.0) if pos_query_unpad is not None else None
+        return (
+            torch.ones_like(q_unpad),
+            torch.full_like(q_unpad, 2.0),
+            torch.full_like(q_unpad, 3.0),
+            dpos_key,
+            dpos_query,
+        )
+
+    monkeypatch.setattr(docblock_mod._varlen_mod, "_varlen_backward_raw_impl", _fake_backward_raw)
+
+    q = torch.zeros((1, 5, 2, 3), dtype=torch.float32)
+    pos = torch.zeros((1, 5, 2, 4), dtype=torch.float32)
+    segment_offsets = torch.tensor([0, 3], dtype=torch.int32)
+    segment_lengths = torch.tensor([2, 1], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    q_aux = torch.randn((5, 2, 3))
+    out_aux = torch.randn((5, 2, 3))
+    lse_aux = torch.randn((5, 2))
+    pos_aux = torch.randn((5, 2, 4))
+
+    dq, dk, dv, dpos_key, dpos_query = docblock_mod._docblock_backward_impl(
+        grad_output=torch.ones_like(q),
+        query_layer=q,
+        key_layer=q,
+        value_layer=q,
+        output_padded=q,
+        lse_padded=torch.zeros((1, 5, 2), dtype=torch.float32),
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+        pos_key=pos,
+        pos_query=pos,
+        sm_scale=1.0,
+        position_buckets=4,
+        max_relative_distance=4,
+        causal=False,
+        num_segments=2,
+        max_seqlen=2,
+        total_tokens=3,
+        q_unpad=q_aux,
+        k_unpad=q_aux,
+        v_unpad=q_aux,
+        out_unpad=out_aux,
+        lse_unpad=lse_aux,
+        pos_key_unpad=pos_aux,
+        pos_query_unpad=pos_aux,
+    )
+
+    assert seen == {"q_tokens": 3, "pos_tokens": 3, "capacity": 3}
+    assert torch.equal(dq[0, :2], torch.ones_like(dq[0, :2]))
+    assert torch.equal(dq[0, 3:4], torch.ones_like(dq[0, 3:4]))
+    assert torch.equal(dk[0, :2], torch.full_like(dk[0, :2], 2.0))
+    assert torch.equal(dv[0, 3:4], torch.full_like(dv[0, 3:4], 3.0))
+    assert dpos_key is not None and torch.equal(dpos_key[0, 3:4], torch.full_like(dpos_key[0, 3:4], 4.0))
+    assert dpos_query is not None and torch.equal(
+        dpos_query[0, :2],
+        torch.full_like(dpos_query[0, :2], 5.0),
+    )
 
 
 def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1610,6 +1831,18 @@ def test_prepare_flash_attention_batch_metadata_docblock_host_stats() -> None:
     assert meta is not None
     assert meta.doc_num_segments_host == 4
     assert meta.doc_max_segment_length_host == 2
+    assert meta.active_tokens_scalar is not None
+    assert meta.active_tokens_scalar.device.type == "cpu"
+    assert meta.active_tokens_scalar.ndim == 0
+    assert int(meta.active_tokens_scalar) == 7
+    assert meta.doc_num_segments_scalar is not None
+    assert meta.doc_num_segments_scalar.device.type == "cpu"
+    assert meta.doc_num_segments_scalar.ndim == 0
+    assert int(meta.doc_num_segments_scalar) == 4
+    assert meta.doc_max_segment_length_scalar is not None
+    assert meta.doc_max_segment_length_scalar.device.type == "cpu"
+    assert meta.doc_max_segment_length_scalar.ndim == 0
+    assert int(meta.doc_max_segment_length_scalar) == 2
 
 
 def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
@@ -1636,6 +1869,10 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
     assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([2, 3], dtype=torch.int32))
     assert prepared["flash_active_tokens"] == 5
     assert meta.active_tokens_host == 5
+    assert meta.active_tokens_scalar is not None
+    assert meta.active_tokens_scalar.device.type == "cpu"
+    assert meta.active_tokens_scalar.ndim == 0
+    assert int(meta.active_tokens_scalar) == 5
 
 
 def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1648,6 +1885,11 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
     monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
     monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(
+        attention,
+        "_eager_fallback_attention_mask",
+        lambda **kwargs: pytest.fail("docblock flash fast path should not build eager fallback masks"),
+    )
     monkeypatch.setattr(attention_mod, "flashdeberta_docblock_import_error", lambda: None)
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_docblock_available", lambda: True)
     seen: dict[str, torch.Tensor] = {}
@@ -1665,9 +1907,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
-        num_segments: int,
-        max_seqlen: int,
-        total_tokens: int,
+        num_segments: int | torch.Tensor,
+        max_seqlen: int | torch.Tensor,
+        total_tokens: int | torch.Tensor,
         causal: bool,
     ) -> torch.Tensor:
         del (
@@ -1683,9 +1925,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
         seen["segment_offsets"] = segment_offsets
         seen["segment_lengths"] = segment_lengths
         seen["cu_seqlens"] = cu_seqlens
-        seen["num_segments"] = torch.tensor(num_segments)
-        seen["max_seqlen"] = torch.tensor(max_seqlen)
-        seen["total_tokens"] = torch.tensor(total_tokens)
+        seen["num_segments"] = torch.as_tensor(num_segments).cpu()
+        seen["max_seqlen"] = torch.as_tensor(max_seqlen).cpu()
+        seen["total_tokens"] = torch.as_tensor(total_tokens).cpu()
         return torch.zeros_like(query_layer)
 
     monkeypatch.setattr(attention_mod, "flashdeberta_docblock", _fake_docblock_wrapper)
@@ -1707,6 +1949,9 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
             active_tokens_host=3,
             doc_num_segments_host=2,
             doc_max_segment_length_host=2,
+            active_tokens_scalar=torch.tensor(3, dtype=torch.int32),
+            doc_num_segments_scalar=torch.tensor(2, dtype=torch.int32),
+            doc_max_segment_length_scalar=torch.tensor(2, dtype=torch.int32),
             route_hint="docblock",
         ),
     )
@@ -2521,6 +2766,12 @@ def test_specialized_docblock_bias_policy_is_table_gated() -> None:
     )
 
     assert resolve_flash_kernel_config(FlashKernelContext(batch_size=4, **base)) == (16, 16, 1, 2)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(batch_size=4, kind="bwd_kv", **{k: v for k, v in base.items() if k != "kind"})
+    ) == (16, 32, 1, 4)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(batch_size=4, kind="bwd_q", **{k: v for k, v in base.items() if k != "kind"})
+    ) == (64, 64, 2, 4)
     assert resolve_flash_kernel_config(FlashKernelContext(batch_size=5, **base)) is None
 
 
