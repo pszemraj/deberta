@@ -188,11 +188,10 @@ def _flash_route_hint_for_padding_batch(
 def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
     """Select the doc-block flash backend for one packed batch.
 
-    The default policy comes from the repo-local JSON route table and stays on
-    the segment-aware ``docblock`` route unless an exact-length dense
-    ``docblock_bias`` override is provided. Dense doc-block bias routing is
-    intentionally opt-in while real-batch RTD convergence and parity remain
-    under validation.
+    The default policy comes from the repo-local JSON route table. Measured
+    packed RTD sequence buckets can choose dense ``docblock_bias`` when that
+    route is faster and parity-covered; set ``docblock_bias_seq_len=0`` to
+    force the segment-aware ragged ``docblock`` route for ablations.
 
     :param int seq_len: Packed sequence length.
     :param Any | None flash_cfg: Optional resolved flash config.

@@ -200,7 +200,67 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     bucket = flash_seq_bucket(seq_len=2048, total_tokens=3000, batch_size=2)
     assert bucket == "2048_medium"
     assert flash_route_choice(policy="padding", seq_bucket=bucket) == "varlen"
-    assert flash_route_choice(policy="docblock", seq_bucket=flash_seq_bucket(seq_len=1024)) == "docblock"
+    assert flash_route_choice(policy="docblock", seq_bucket=flash_seq_bucket(seq_len=1024)) == "docblock_bias"
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="docblock",
+            kind="bwd_kv",
+            seq_len=1024,
+            total_tokens=4096,
+            batch_size=8,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+            disentangled=True,
+            att_span=256,
+        )
+    ) == (16, 16, 1, 2)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="docblock",
+            kind="bwd_q",
+            seq_len=1024,
+            total_tokens=4096,
+            batch_size=8,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+            disentangled=True,
+            att_span=256,
+        )
+    ) == (32, 32, 2, 4)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="docblock",
+            kind="bwd_kv",
+            seq_len=2048,
+            total_tokens=4096,
+            batch_size=2,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+            disentangled=True,
+            att_span=256,
+        )
+    ) == (64, 32, 2, 4)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="docblock",
+            kind="bwd_q",
+            seq_len=4096,
+            total_tokens=4096,
+            batch_size=1,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+            disentangled=True,
+            att_span=256,
+        )
+    ) == (64, 64, 3, 8)
     assert resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=(12, 0),
@@ -216,6 +276,35 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
             att_span=256,
         )
     ) == (64, 32, 2, 4)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="dense_bias",
+            kind="fwd",
+            seq_len=4096,
+            batch_size=1,
+            num_heads=12,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+        )
+    ) == (64, 128, 2, 4)
+    assert resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=(12, 0),
+            route="bias_docblock_specialized",
+            kind="bwd_kv",
+            seq_len=4096,
+            batch_size=1,
+            query_len=4096,
+            key_len=4096,
+            num_heads=12,
+            head_dim=64,
+            dtype="bfloat16",
+            causal=False,
+            has_mask=True,
+        )
+    ) == (16, 32, 1, 4)
 
 
 def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
@@ -302,10 +391,12 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
-def test_docblock_bias_route_is_explicit_config_override() -> None:
+def test_docblock_bias_route_uses_table_with_ragged_override() -> None:
     from deberta.training.compile import _flash_route_hint_for_docblock_batch
 
-    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=2048) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=4096) == "docblock_bias"
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
@@ -2003,7 +2094,11 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     ) -> torch.Tensor:
         del key_layer, value_layer, pos_key, pos_query, bucket_index, bias_scale, sm_scale, causal
         seen["keep_mask"] = keep_mask
-        return torch.zeros_like(query_layer)
+        out = torch.empty_like(query_layer)
+        for head_idx in range(int(query_layer.shape[1])):
+            for seq_idx in range(int(query_layer.shape[2])):
+                out[:, head_idx, seq_idx, :] = float(head_idx * 100 + seq_idx)
+        return out
 
     monkeypatch.setattr(attention_mod, "flashdeberta_bias_from_positions", _fake_bias_wrapper)
 
@@ -2032,6 +2127,12 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
 
     assert probs is None
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    for seq_idx in range(4):
+        for head_idx in range(cfg.num_attention_heads):
+            start = head_idx * head_dim
+            end = start + head_dim
+            assert torch.all(output[0, seq_idx, start:end].eq(float(head_idx * 100 + seq_idx)))
     assert seen["keep_mask"] is not None
     assert tuple(seen["keep_mask"].shape) == (1, 1, 4, 4)
     stats = attention_mod.flashdeberta_stats_snapshot()
@@ -2295,6 +2396,7 @@ def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
         grad_out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
         out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
         lse = torch.empty((2, 4, 3), device="cuda", dtype=torch.float32)
+        bias = torch.empty((2, 4, 3, 3), device="cuda", dtype=torch.bfloat16)
         pos_key = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
         pos_query = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
         bucket_index = torch.empty((3, 3), device="cuda", dtype=torch.int64)
@@ -2309,6 +2411,7 @@ def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
             pos_query,
             bucket_index,
             keep_mask,
+            bias,
             out,
             lse,
             0.5,
@@ -2416,7 +2519,7 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for saved-tensor hook coverage.")
-def test_position_bias_attention_cuda_does_not_save_dense_bias_tensor() -> None:
+def test_position_bias_attention_cuda_saves_dense_bias_aux_tensor() -> None:
     import deberta.modeling.flashdeberta_attention as attention_mod
     import deberta.modeling.flashdeberta_bias_op as bias_mod
 
@@ -2464,7 +2567,7 @@ def test_position_bias_attention_cuda_does_not_save_dense_bias_tensor() -> None:
         )
         out.float().sum().backward()
 
-    assert (batch_size, num_heads, seq_len, seq_len) not in saved_shapes
+    assert (batch_size, num_heads, seq_len, seq_len) in saved_shapes
 
 
 def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2846,3 +2949,39 @@ def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch
     assert tuple(output.last_hidden_state.shape) == (1, 4, cfg.hidden_size)
 
     patch_mod.disable_flashdeberta_attention()
+
+
+def test_docblock_varlen_backward_uses_docblock_tuning_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    seen: dict[str, str] = {}
+
+    def _fake_resolve(context):
+        seen["route"] = context.route
+        seen["kind"] = context.kind
+        return (16, 32, 1, 4)
+
+    monkeypatch.setattr(varlen_mod, "resolve_flash_kernel_config", _fake_resolve)
+    monkeypatch.setattr(varlen_mod, "_varlen_device_capability", lambda _device: (12, 0))
+    monkeypatch.setattr(
+        varlen_mod,
+        "_get_bwd_config_varlen_lowlevel",
+        lambda **_kwargs: pytest.fail("docblock route should resolve through the tuning table"),
+    )
+
+    assert varlen_mod._resolve_varlen_bwd_kernel_config(
+        route="docblock",
+        kind="kv",
+        total_tokens_q=4096,
+        total_tokens_k=4096,
+        max_seqlen_q=1024,
+        max_seqlen_k=1024,
+        batch_size=8,
+        head_dim=64,
+        causal=False,
+        disentangled=True,
+        att_span=256,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    ) == (16, 32, 1, 4)
+    assert seen == {"route": "docblock", "kind": "bwd_kv"}

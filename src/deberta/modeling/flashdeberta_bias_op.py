@@ -76,8 +76,8 @@ except Exception as exc:  # pragma: no cover - optional import
 _BIAS_OP_NAMESPACE = "deberta"
 _BIAS_FWD_OP_NAME = "flashdeberta_bias"
 _BIAS_BWD_OP_NAME = "flashdeberta_bias_backward"
-_POSITION_BIAS_FWD_OP_NAME = "flashdeberta_position_bias_attention"
-_POSITION_BIAS_BWD_OP_NAME = "flashdeberta_position_bias_attention_backward"
+_POSITION_BIAS_FWD_OP_NAME = "flashdeberta_position_bias_attention_v2"
+_POSITION_BIAS_BWD_OP_NAME = "flashdeberta_position_bias_attention_backward_v2"
 
 
 def flashdeberta_bias_import_error() -> Exception | None:
@@ -383,9 +383,10 @@ def _should_use_specialized_docblock_bias_backward(
 ) -> bool:
     """Return whether the repo-local short doc-block bias backward should run.
 
-    This path is intentionally narrow: it targets the measured packed doc-block
-    RTD hot path where FlashDeBERTa already wins overall but still spends most
-    of its remaining attention time in the generic local-bias backward kernels.
+    This path is intentionally narrow: it targets measured packed doc-block
+    RTD hot paths where the dense-bias route is viable but the generic
+    local-bias backward still spends significant time in dense positional
+    gradient reduction.
 
     :param torch.Tensor q: Forward query tensor in ``(B,H,S,D)`` layout.
     :param torch.Tensor k: Forward key tensor in ``(B,H,S,D)`` layout.
@@ -425,11 +426,15 @@ def _should_use_specialized_docblock_bias_backward(
     )
     if policy is None:
         return False
-    if int(q.shape[-2]) != 1024 or int(k.shape[-2]) != 1024 or int(v.shape[-2]) != 1024:
+    query_len = int(q.shape[-2])
+    key_len = int(k.shape[-2])
+    if query_len != key_len or int(v.shape[-2]) != key_len:
+        return False
+    if query_len not in {1024, 2048, 4096}:
         return False
     if tuple(q.shape[:2]) != tuple(k.shape[:2]) or tuple(q.shape[:2]) != tuple(v.shape[:2]):
         return False
-    if tuple(bias.shape) != (int(q.shape[0]), int(q.shape[1]), 1024, 1024):
+    if tuple(bias.shape) != (int(q.shape[0]), int(q.shape[1]), query_len, key_len):
         return False
     if int(bias.stride(0)) == 0 or int(bias.stride(1)) == 0:
         return False
@@ -523,6 +528,9 @@ if triton is not None:
         DK: None,
         DV: None,
         DS: None,
+        DPOS_KEY: None,
+        BUCKET: None,
+        KEEP_MASK: None,
         L: None,
         D: None,
         stride_qz: int,
@@ -553,14 +561,29 @@ if triton is not None:
         stride_dvh: int,
         stride_dvn: int,
         stride_dvk: int,
+        stride_dpkz: int,
+        stride_dpkh: int,
+        stride_dpkm: int,
+        stride_dpkp: int,
+        stride_bucket_m: int,
+        stride_bucket_n: int,
+        stride_mask_b: int,
+        stride_mask_h: int,
+        stride_mask_m: int,
+        stride_mask_n: int,
         H: int,
         M: int,
         N: int,
+        P: int,
+        bias_scale: float,
+        HAS_POS_KEY: tl.constexpr,
+        HAS_KEEP_MASK: tl.constexpr,
+        WRITE_DBIAS: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ) -> None:
-        """Specialized dense-bias KV backward for non-causal full-bias ``1024 x 1024``.
+        """Specialized dense-bias KV backward for measured non-causal full-bias squares.
 
         :param Any Q: Triton pointer to the query tensor.
         :param Any K: Triton pointer to the key tensor.
@@ -571,6 +594,9 @@ if triton is not None:
         :param Any DK: Triton pointer to the key gradient tensor.
         :param Any DV: Triton pointer to the value gradient tensor.
         :param Any DS: Triton pointer to the dense bias gradient tensor.
+        :param Any DPOS_KEY: Triton pointer to the optional c2p positional-gradient tensor.
+        :param Any BUCKET: Triton pointer to the dense bucket map.
+        :param Any KEEP_MASK: Triton pointer to the optional document keep mask.
         :param Any L: Triton pointer to the per-row log-sum-exp tensor.
         :param Any D: Triton pointer to the per-row delta tensor.
         :param int stride_qz: Query batch stride.
@@ -601,9 +627,24 @@ if triton is not None:
         :param int stride_dvh: Value-gradient head stride.
         :param int stride_dvn: Value-gradient row stride.
         :param int stride_dvk: Value-gradient column stride.
+        :param int stride_dpkz: Pos-key gradient batch stride.
+        :param int stride_dpkh: Pos-key gradient head stride.
+        :param int stride_dpkm: Pos-key gradient sequence stride.
+        :param int stride_dpkp: Pos-key gradient bucket stride.
+        :param int stride_bucket_m: Bucket-map row stride.
+        :param int stride_bucket_n: Bucket-map column stride.
+        :param int stride_mask_b: Keep-mask batch stride.
+        :param int stride_mask_h: Keep-mask head stride.
+        :param int stride_mask_m: Keep-mask row stride.
+        :param int stride_mask_n: Keep-mask column stride.
         :param int H: Number of heads.
         :param int M: Query sequence length.
         :param int N: Key sequence length.
+        :param int P: Positional bucket width.
+        :param float bias_scale: Scale applied to positional-bias gradients.
+        :param Any HAS_POS_KEY: Whether to accumulate c2p positional gradients.
+        :param Any HAS_KEEP_MASK: Whether the keep mask is active.
+        :param Any WRITE_DBIAS: Whether to materialize dense ``d_bias``.
         :param Any BLOCK_M: Query tile height.
         :param Any BLOCK_DMODEL: Head dimension tile width.
         :param Any BLOCK_N: Key tile width.
@@ -662,7 +703,35 @@ if triton is not None:
             dp = tl.dot(do, tl.trans(v))
             ds = (p * (dp - delta[:, None])).to(input_dtype)
             dk += tl.dot(tl.trans(ds), q)
-            tl.store(ds_ptrs, ds)
+            if WRITE_DBIAS:
+                tl.store(ds_ptrs, ds)
+            if HAS_POS_KEY:
+                bucket = tl.load(
+                    BUCKET + offs_m[:, None] * stride_bucket_m + offs_n[None, :] * stride_bucket_n
+                ).to(tl.int32)
+                dpos_key_ptrs = (
+                    DPOS_KEY
+                    + off_z * stride_dpkz
+                    + off_h * stride_dpkh
+                    + offs_m[:, None] * stride_dpkm
+                    + bucket * stride_dpkp
+                )
+                dpos_mask = bucket < P
+                if HAS_KEEP_MASK:
+                    keep = tl.load(
+                        KEEP_MASK
+                        + off_z * stride_mask_b
+                        + offs_m[:, None] * stride_mask_m
+                        + offs_n[None, :] * stride_mask_n
+                    )
+                    dpos_mask = dpos_mask & keep.to(tl.int1)
+                tl.atomic_add(
+                    dpos_key_ptrs,
+                    ds.to(tl.float32) * bias_scale,
+                    mask=dpos_mask,
+                    sem="relaxed",
+                    scope="gpu",
+                )
 
         dk *= sm_scale
         tl.store(dk_ptrs, dk.to(input_dtype))
@@ -677,6 +746,9 @@ if triton is not None:
         sm_scale: float,
         DO: None,
         DQ: None,
+        DPOS_QUERY: None,
+        BUCKET: None,
+        KEEP_MASK: None,
         L: None,
         D: None,
         stride_qz: int,
@@ -703,14 +775,28 @@ if triton is not None:
         stride_dqh: int,
         stride_dqm: int,
         stride_dqk: int,
+        stride_dpqz: int,
+        stride_dpqh: int,
+        stride_dpqm: int,
+        stride_dpqp: int,
+        stride_bucket_m: int,
+        stride_bucket_n: int,
+        stride_mask_b: int,
+        stride_mask_h: int,
+        stride_mask_m: int,
+        stride_mask_n: int,
         H: int,
         M: int,
         N: int,
+        P: int,
+        bias_scale: float,
+        HAS_POS_QUERY: tl.constexpr,
+        HAS_KEEP_MASK: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ) -> None:
-        """Specialized dense-bias Q backward for non-causal full-bias ``1024 x 1024``.
+        """Specialized dense-bias Q backward for measured non-causal full-bias squares.
 
         :param Any Q: Triton pointer to the query tensor.
         :param Any K: Triton pointer to the key tensor.
@@ -719,6 +805,9 @@ if triton is not None:
         :param float sm_scale: Softmax scale factor.
         :param Any DO: Triton pointer to the output gradient tensor.
         :param Any DQ: Triton pointer to the query gradient tensor.
+        :param Any DPOS_QUERY: Triton pointer to the optional p2c positional-gradient tensor.
+        :param Any BUCKET: Triton pointer to the dense bucket map.
+        :param Any KEEP_MASK: Triton pointer to the optional document keep mask.
         :param Any L: Triton pointer to the per-row log-sum-exp tensor.
         :param Any D: Triton pointer to the per-row delta tensor.
         :param int stride_qz: Query batch stride.
@@ -745,9 +834,23 @@ if triton is not None:
         :param int stride_dqh: Query-gradient head stride.
         :param int stride_dqm: Query-gradient row stride.
         :param int stride_dqk: Query-gradient column stride.
+        :param int stride_dpqz: Pos-query gradient batch stride.
+        :param int stride_dpqh: Pos-query gradient head stride.
+        :param int stride_dpqm: Pos-query gradient sequence stride.
+        :param int stride_dpqp: Pos-query gradient bucket stride.
+        :param int stride_bucket_m: Bucket-map row stride.
+        :param int stride_bucket_n: Bucket-map column stride.
+        :param int stride_mask_b: Keep-mask batch stride.
+        :param int stride_mask_h: Keep-mask head stride.
+        :param int stride_mask_m: Keep-mask row stride.
+        :param int stride_mask_n: Keep-mask column stride.
         :param int H: Number of heads.
         :param int M: Query sequence length.
         :param int N: Key sequence length.
+        :param int P: Positional bucket width.
+        :param float bias_scale: Scale applied to positional-bias gradients.
+        :param Any HAS_POS_QUERY: Whether to accumulate p2c positional gradients.
+        :param Any HAS_KEEP_MASK: Whether the keep mask is active.
         :param Any BLOCK_M: Query tile height.
         :param Any BLOCK_DMODEL: Head dimension tile width.
         :param Any BLOCK_N: Key tile width.
@@ -799,6 +902,33 @@ if triton is not None:
             dp = tl.dot(do.to(input_dtype), tl.trans(v))
             ds = (p * (dp - delta[:, None])).to(input_dtype)
             dq += tl.dot(ds, k)
+            if HAS_POS_QUERY:
+                bucket = tl.load(
+                    BUCKET + offs_n[None, :] * stride_bucket_m + offs_m[:, None] * stride_bucket_n
+                ).to(tl.int32)
+                dpos_query_ptrs = (
+                    DPOS_QUERY
+                    + off_z * stride_dpqz
+                    + off_h * stride_dpqh
+                    + offs_n[None, :] * stride_dpqm
+                    + bucket * stride_dpqp
+                )
+                dpos_mask = bucket < P
+                if HAS_KEEP_MASK:
+                    keep = tl.load(
+                        KEEP_MASK
+                        + off_z * stride_mask_b
+                        + offs_m[:, None] * stride_mask_m
+                        + offs_n[None, :] * stride_mask_n
+                    )
+                    dpos_mask = dpos_mask & keep.to(tl.int1)
+                tl.atomic_add(
+                    dpos_query_ptrs,
+                    ds.to(tl.float32) * bias_scale,
+                    mask=dpos_mask,
+                    sem="relaxed",
+                    scope="gpu",
+                )
 
         dq *= sm_scale
         tl.store(dq_ptrs, dq.to(input_dtype))
@@ -860,8 +990,6 @@ def _bias_specialized_docblock_backward_impl(
     if (
         _bwd_kv_kernel_docblock1024 is None
         or _bwd_q_kernel_docblock1024 is None
-        or int(query_len) != 1024
-        or int(key_len) != 1024
         or int(head_dim) != 64
         or int(query_len) % int(kv_block_m) != 0
         or int(key_len) % int(kv_block_n) != 0
@@ -912,6 +1040,9 @@ def _bias_specialized_docblock_backward_impl(
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
     d_bias = torch.empty_like(bias)
+    empty_float = torch.empty((0,), device=q.device, dtype=torch.float32)
+    empty_int = torch.empty((0,), device=q.device, dtype=torch.int32)
+    empty_bool = torch.empty((0,), device=q.device, dtype=torch.bool)
     kv_grid = (
         -(-int(key_len) // int(kv_block_n)),
         int(num_heads),
@@ -928,6 +1059,9 @@ def _bias_specialized_docblock_backward_impl(
             dk,
             dv,
             d_bias,
+            empty_float,
+            empty_int,
+            empty_bool,
             lse,
             delta,
             q.stride(0),
@@ -958,9 +1092,24 @@ def _bias_specialized_docblock_backward_impl(
             dv.stride(1),
             dv.stride(2),
             dv.stride(3),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             int(num_heads),
             int(query_len),
             int(key_len),
+            0,
+            0.0,
+            HAS_POS_KEY=False,
+            HAS_KEEP_MASK=False,
+            WRITE_DBIAS=True,
             BLOCK_M=int(kv_block_m),
             BLOCK_DMODEL=int(head_dim),
             BLOCK_N=int(kv_block_n),
@@ -983,6 +1132,9 @@ def _bias_specialized_docblock_backward_impl(
             float(sm_scale),
             grad_out,
             dq,
+            empty_float,
+            empty_int,
+            empty_bool,
             lse,
             delta,
             q.stride(0),
@@ -1009,9 +1161,23 @@ def _bias_specialized_docblock_backward_impl(
             dq.stride(1),
             dq.stride(2),
             dq.stride(3),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             int(num_heads),
             int(query_len),
             int(key_len),
+            0,
+            0.0,
+            HAS_POS_QUERY=False,
+            HAS_KEEP_MASK=False,
             BLOCK_M=int(q_block_m),
             BLOCK_DMODEL=int(head_dim),
             BLOCK_N=int(q_block_n),
@@ -1019,6 +1185,338 @@ def _bias_specialized_docblock_backward_impl(
             num_warps=int(q_num_warps),
         )
     return dq, dk, dv, d_bias
+
+
+def _should_use_specialized_docblock_position_bias_backward(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    bucket_index: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    causal: bool,
+) -> bool:
+    """Return whether dense doc-block bias backward can accumulate positional grads directly.
+
+    :param torch.Tensor q: Forward query tensor in ``(B,H,S,D)`` layout.
+    :param torch.Tensor k: Forward key tensor in ``(B,H,S,D)`` layout.
+    :param torch.Tensor v: Forward value tensor in ``(B,H,S,D)`` layout.
+    :param torch.Tensor bias: Dense additive bias tensor in ``(B,H,S,S)`` layout.
+    :param torch.Tensor bucket_index: Bucket map in ``(S,S)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B,H,S,P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B,H,S,P)`` layout.
+    :param bool causal: Whether causal masking is active.
+    :return bool: True when the direct positional-gradient specialization should run.
+    """
+
+    if not _should_use_specialized_docblock_bias_backward(q=q, k=k, v=v, bias=bias, causal=causal):
+        return False
+    seq_len = int(q.shape[-2])
+    if bucket_index.device.type != "cuda" or tuple(bucket_index.shape) != (seq_len, seq_len):
+        return False
+    if pos_key is None and pos_query is None:
+        return False
+    for tensor in (pos_key, pos_query):
+        if tensor is None:
+            continue
+        if tensor.device != q.device or tensor.dtype != q.dtype:
+            return False
+        if tuple(tensor.shape[:3]) != tuple(q.shape[:3]):
+            return False
+    return True
+
+
+def _position_bias_specialized_docblock_backward_impl(
+    *,
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    bucket_index: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    bias_scale: float,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run short doc-block dense-bias backward with fused positional-gradient accumulation.
+
+    The generic dense route materializes ``d_bias`` and then reduces it into
+    c2p/p2c bucket tensors with PyTorch scatter operations. This narrow
+    specialization keeps the same attention backward math but atomically
+    accumulates positional gradients from the Triton backward tiles, avoiding
+    the full dense ``d_bias`` write plus the separate reduction pass.
+
+    :param torch.Tensor grad_out: Gradient of the output tensor.
+    :param torch.Tensor q: Forward queries.
+    :param torch.Tensor k: Forward keys.
+    :param torch.Tensor v: Forward values.
+    :param torch.Tensor bias: Forward dense additive bias tensor.
+    :param torch.Tensor out: Forward output tensor.
+    :param torch.Tensor lse: Forward LSE tensor.
+    :param torch.Tensor | None pos_key: Optional c2p tensor.
+    :param torch.Tensor | None pos_query: Optional p2c tensor.
+    :param torch.Tensor bucket_index: Dense bucket map.
+    :param torch.Tensor | None keep_mask: Optional keep mask.
+    :param float bias_scale: Scale applied to positional-bias gradients.
+    :param float sm_scale: Attention score scale.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Gradients for q/k/v and optional c2p/p2c positional tensors.
+    """
+
+    batch_size, num_heads, query_len, head_dim = q.shape
+    key_len = int(k.shape[2])
+    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_docblock_specialized_bwd_kernel_config(
+        kind="kv",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=False,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_docblock_specialized_bwd_kernel_config(
+        kind="q",
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=False,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    if (
+        _bwd_kv_kernel_docblock1024 is None
+        or _bwd_q_kernel_docblock1024 is None
+        or int(head_dim) != 64
+        or int(query_len) % int(kv_block_m) != 0
+        or int(key_len) % int(kv_block_n) != 0
+        or int(query_len) % int(q_block_m) != 0
+        or int(key_len) % int(q_block_n) != 0
+    ):
+        bias_dq, bias_dk, bias_dv, d_bias = _bias_generic_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
+            bias=bias,
+            out=out,
+            lse=lse,
+            sm_scale=sm_scale,
+            causal=False,
+        )
+        dpos_key, dpos_query = _position_bias_backward_from_dense_grad(
+            d_bias=d_bias,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            scale=bias_scale,
+        )
+        return bias_dq, bias_dk, bias_dv, dpos_key, dpos_query
+
+    preprocess_block_m = max(int(kv_block_m), int(q_block_m))
+    preprocess_grid = (
+        -(-int(query_len) // int(preprocess_block_m)),
+        int(num_heads),
+        int(batch_size),
+    )
+    delta = torch.empty_like(lse)
+    with torch.cuda.device(q.device.index):
+        _bwd_preprocess_bias_raw[preprocess_grid](
+            out,
+            grad_out,
+            delta,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            delta.stride(0),
+            delta.stride(1),
+            delta.stride(2),
+            int(query_len),
+            BLOCK_M=int(preprocess_block_m),
+            D_HEAD=int(head_dim),
+            DIVISIBLE_M=bool(int(query_len) % int(preprocess_block_m) == 0),
+        )
+
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    dq = torch.empty_like(q)
+    dpos_key_accum = torch.zeros_like(pos_key, dtype=torch.float32) if pos_key is not None else None
+    dpos_query_accum = torch.zeros_like(pos_query, dtype=torch.float32) if pos_query is not None else None
+    empty_float = torch.empty((0,), device=q.device, dtype=torch.float32)
+    empty_int = torch.empty((0,), device=q.device, dtype=torch.int32)
+    empty_bool = torch.empty((0,), device=q.device, dtype=torch.bool)
+    keep_mask_tensor = keep_mask if keep_mask is not None else empty_bool
+    dpos_key_tensor = dpos_key_accum if dpos_key_accum is not None else empty_float
+    dpos_query_tensor = dpos_query_accum if dpos_query_accum is not None else empty_float
+    bucket_tensor = bucket_index if bucket_index is not None else empty_int
+
+    kv_grid = (
+        -(-int(key_len) // int(kv_block_n)),
+        int(num_heads),
+        int(batch_size),
+    )
+    with torch.cuda.device(q.device.index):
+        _bwd_kv_kernel_docblock1024[kv_grid](
+            q,
+            k,
+            v,
+            bias,
+            float(sm_scale),
+            grad_out,
+            dk,
+            dv,
+            empty_float,
+            dpos_key_tensor,
+            bucket_tensor,
+            keep_mask_tensor,
+            lse,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            bias.stride(0),
+            bias.stride(1),
+            bias.stride(2),
+            bias.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            dk.stride(3),
+            dv.stride(0),
+            dv.stride(1),
+            dv.stride(2),
+            dv.stride(3),
+            dpos_key_tensor.stride(0) if dpos_key_accum is not None else 0,
+            dpos_key_tensor.stride(1) if dpos_key_accum is not None else 0,
+            dpos_key_tensor.stride(2) if dpos_key_accum is not None else 0,
+            dpos_key_tensor.stride(3) if dpos_key_accum is not None else 0,
+            bucket_tensor.stride(0) if bucket_index is not None else 0,
+            bucket_tensor.stride(1) if bucket_index is not None else 0,
+            keep_mask_tensor.stride(0) if keep_mask is not None else 0,
+            keep_mask_tensor.stride(1) if keep_mask is not None else 0,
+            keep_mask_tensor.stride(2) if keep_mask is not None else 0,
+            keep_mask_tensor.stride(3) if keep_mask is not None else 0,
+            int(num_heads),
+            int(query_len),
+            int(key_len),
+            int(dpos_key_tensor.shape[-1]) if dpos_key_accum is not None else 0,
+            float(bias_scale),
+            HAS_POS_KEY=dpos_key_accum is not None,
+            HAS_KEEP_MASK=keep_mask is not None,
+            WRITE_DBIAS=False,
+            BLOCK_M=int(kv_block_m),
+            BLOCK_DMODEL=int(head_dim),
+            BLOCK_N=int(kv_block_n),
+            num_stages=int(kv_num_stages),
+            num_warps=int(kv_num_warps),
+        )
+
+    q_grid = (
+        -(-int(query_len) // int(q_block_m)),
+        int(num_heads),
+        int(batch_size),
+    )
+    with torch.cuda.device(q.device.index):
+        _bwd_q_kernel_docblock1024[q_grid](
+            q,
+            k,
+            v,
+            bias,
+            float(sm_scale),
+            grad_out,
+            dq,
+            dpos_query_tensor,
+            bucket_tensor,
+            keep_mask_tensor,
+            lse,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            bias.stride(0),
+            bias.stride(1),
+            bias.stride(2),
+            bias.stride(3),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            grad_out.stride(3),
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            dq.stride(3),
+            dpos_query_tensor.stride(0) if dpos_query_accum is not None else 0,
+            dpos_query_tensor.stride(1) if dpos_query_accum is not None else 0,
+            dpos_query_tensor.stride(2) if dpos_query_accum is not None else 0,
+            dpos_query_tensor.stride(3) if dpos_query_accum is not None else 0,
+            bucket_tensor.stride(0) if bucket_index is not None else 0,
+            bucket_tensor.stride(1) if bucket_index is not None else 0,
+            keep_mask_tensor.stride(0) if keep_mask is not None else 0,
+            keep_mask_tensor.stride(1) if keep_mask is not None else 0,
+            keep_mask_tensor.stride(2) if keep_mask is not None else 0,
+            keep_mask_tensor.stride(3) if keep_mask is not None else 0,
+            int(num_heads),
+            int(query_len),
+            int(key_len),
+            int(dpos_query_tensor.shape[-1]) if dpos_query_accum is not None else 0,
+            float(bias_scale),
+            HAS_POS_QUERY=dpos_query_accum is not None,
+            HAS_KEEP_MASK=keep_mask is not None,
+            BLOCK_M=int(q_block_m),
+            BLOCK_DMODEL=int(head_dim),
+            BLOCK_N=int(q_block_n),
+            num_stages=int(q_num_stages),
+            num_warps=int(q_num_warps),
+        )
+
+    return (
+        dq,
+        dk,
+        dv,
+        dpos_key_accum.to(dtype=pos_key.dtype)
+        if dpos_key_accum is not None and pos_key is not None
+        else None,
+        dpos_query_accum.to(dtype=pos_query.dtype)
+        if dpos_query_accum is not None and pos_query is not None
+        else None,
+    )
 
 
 def _bias_eager_forward_impl(
@@ -1754,7 +2252,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor pos_key, Tensor pos_query, Tensor bucket_index, "
             "Tensor keep_mask, float bias_scale, float sm_scale, bool causal, bool has_pos_key, "
-            "bool has_pos_query, bool has_keep_mask) -> (Tensor, Tensor)"
+            "bool has_pos_query, bool has_keep_mask) -> (Tensor, Tensor, Tensor)"
         ),
     )
     def _forward_op(
@@ -1771,8 +2269,8 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         has_pos_key: bool,
         has_pos_query: bool,
         has_keep_mask: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run position-bias attention without saving the dense bias.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run position-bias attention and return dense bias as autograd-owned aux.
 
         :param torch.Tensor q: Queries in ``(B,H,S,D)`` layout.
         :param torch.Tensor k: Keys in ``(B,H,S,D)`` layout.
@@ -1787,7 +2285,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param bool has_pos_key: Whether ``pos_key`` is active.
         :param bool has_pos_query: Whether ``pos_query`` is active.
         :param bool has_keep_mask: Whether ``keep_mask`` is active.
-        :return tuple[torch.Tensor, torch.Tensor]: Output and LSE tensors.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Output, LSE, and dense bias aux.
         """
 
         bias = _position_bias_forward_impl(
@@ -1797,7 +2295,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             keep_mask=keep_mask if bool(has_keep_mask) else None,
             scale=float(bias_scale),
         )
-        return _bias_eager_forward_impl(
+        out, lse = _bias_eager_forward_impl(
             q=q,
             k=k,
             v=v,
@@ -1806,6 +2304,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             causal=bool(causal),
             require_lse=True,
         )
+        return out, lse, bias
 
     @torch.library.register_fake(_forward_op)
     def _forward_op_fake(
@@ -1822,7 +2321,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         has_pos_key: bool,
         has_pos_query: bool,
         has_keep_mask: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return fake position-bias attention outputs with static shapes.
 
         :param torch.Tensor q: Fake query tensor.
@@ -1838,13 +2337,18 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param bool has_pos_key: Fake c2p presence flag.
         :param bool has_pos_query: Fake p2c presence flag.
         :param bool has_keep_mask: Fake keep-mask presence flag.
-        :return tuple[torch.Tensor, torch.Tensor]: Fake output and LSE tensors.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Fake output, LSE, and dense bias aux.
         """
 
-        del k, v, pos_key, pos_query, bucket_index, keep_mask, bias_scale
+        del v, pos_key, pos_query, bucket_index, keep_mask, bias_scale
         del sm_scale, causal, has_pos_key, has_pos_query, has_keep_mask
         lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        return torch.empty(q.shape, device=q.device, dtype=q.dtype), lse
+        bias = torch.empty(
+            (q.shape[0], q.shape[1], q.shape[2], k.shape[2]),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        return torch.empty(q.shape, device=q.device, dtype=q.dtype), lse, bias
 
     @torch.library.custom_op(
         f"{_BIAS_OP_NAMESPACE}::{_POSITION_BIAS_BWD_OP_NAME}",
@@ -1852,7 +2356,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         device_types="cuda",
         schema=(
             "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor pos_key, Tensor pos_query, "
-            "Tensor bucket_index, Tensor keep_mask, Tensor out, Tensor lse, float bias_scale, "
+            "Tensor bucket_index, Tensor keep_mask, Tensor bias, Tensor out, Tensor lse, float bias_scale, "
             "float sm_scale, bool causal, bool has_pos_key, bool has_pos_query, bool has_keep_mask) "
             "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
@@ -1866,6 +2370,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         pos_query: torch.Tensor,
         bucket_index: torch.Tensor,
         keep_mask: torch.Tensor,
+        bias: torch.Tensor,
         out: torch.Tensor,
         lse: torch.Tensor,
         bias_scale: float,
@@ -1875,7 +2380,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         has_pos_query: bool,
         has_keep_mask: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run position-bias attention backward with transient dense bias.
+        """Run position-bias attention backward with saved dense bias.
 
         :param torch.Tensor grad_out: Gradient of the output tensor.
         :param torch.Tensor q: Forward query tensor.
@@ -1885,6 +2390,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor pos_query: Forward p2c tensor or empty sentinel.
         :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
         :param torch.Tensor keep_mask: Forward keep mask or empty sentinel.
+        :param torch.Tensor bias: Forward dense additive bias tensor.
         :param torch.Tensor out: Forward output tensor.
         :param torch.Tensor lse: Forward LSE tensor.
         :param float bias_scale: Scale applied to the additive position bias.
@@ -1900,32 +2406,51 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         pos_key_tensor = pos_key if bool(has_pos_key) else None
         pos_query_tensor = pos_query if bool(has_pos_query) else None
         keep_mask_tensor = keep_mask if bool(has_keep_mask) else None
-        bias = _position_bias_forward_impl(
-            pos_key=pos_key_tensor,
-            pos_query=pos_query_tensor,
-            bucket_index=bucket_index,
-            keep_mask=keep_mask_tensor,
-            scale=float(bias_scale),
-        )
-        dq, dk, dv, d_bias = _bias_eager_backward_impl(
-            grad_out=grad_out,
+        if _should_use_specialized_docblock_position_bias_backward(
             q=q,
             k=k,
             v=v,
             bias=bias,
-            out=out,
-            lse=lse,
-            sm_scale=float(sm_scale),
-            causal=bool(causal),
-        )
-        dpos_key, dpos_query = _position_bias_backward_from_dense_grad(
-            d_bias=d_bias,
+            bucket_index=bucket_index,
             pos_key=pos_key_tensor,
             pos_query=pos_query_tensor,
-            bucket_index=bucket_index,
-            keep_mask=keep_mask_tensor,
-            scale=float(bias_scale),
-        )
+            causal=bool(causal),
+        ):
+            dq, dk, dv, dpos_key, dpos_query = _position_bias_specialized_docblock_backward_impl(
+                grad_out=grad_out,
+                q=q,
+                k=k,
+                v=v,
+                bias=bias,
+                out=out,
+                lse=lse,
+                pos_key=pos_key_tensor,
+                pos_query=pos_query_tensor,
+                bucket_index=bucket_index,
+                keep_mask=keep_mask_tensor,
+                bias_scale=float(bias_scale),
+                sm_scale=float(sm_scale),
+            )
+        else:
+            dq, dk, dv, d_bias = _bias_eager_backward_impl(
+                grad_out=grad_out,
+                q=q,
+                k=k,
+                v=v,
+                bias=bias,
+                out=out,
+                lse=lse,
+                sm_scale=float(sm_scale),
+                causal=bool(causal),
+            )
+            dpos_key, dpos_query = _position_bias_backward_from_dense_grad(
+                d_bias=d_bias,
+                pos_key=pos_key_tensor,
+                pos_query=pos_query_tensor,
+                bucket_index=bucket_index,
+                keep_mask=keep_mask_tensor,
+                scale=float(bias_scale),
+            )
         return (
             dq,
             dk,
@@ -1944,6 +2469,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         pos_query: torch.Tensor,
         bucket_index: torch.Tensor,
         keep_mask: torch.Tensor,
+        bias: torch.Tensor,
         out: torch.Tensor,
         lse: torch.Tensor,
         bias_scale: float,
@@ -1963,6 +2489,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor pos_query: Fake p2c tensor or empty sentinel.
         :param torch.Tensor bucket_index: Fake dense bucket map.
         :param torch.Tensor keep_mask: Fake keep mask or empty sentinel.
+        :param torch.Tensor bias: Fake dense additive bias tensor.
         :param torch.Tensor out: Fake output tensor.
         :param torch.Tensor lse: Fake LSE tensor.
         :param float bias_scale: Fake position-bias scale.
@@ -1975,7 +2502,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             Fake gradients for q/k/v/pos_key/pos_query.
         """
 
-        del grad_out, bucket_index, keep_mask, out, lse, bias_scale, sm_scale
+        del grad_out, bucket_index, keep_mask, bias, out, lse, bias_scale, sm_scale
         del causal, has_pos_key, has_pos_query, has_keep_mask
         return (
             torch.empty(q.shape, device=q.device, dtype=q.dtype),
@@ -1988,13 +2515,13 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
     def _setup_context(
         ctx: Any,
         inputs: tuple[Any, ...],
-        output: tuple[torch.Tensor, torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> None:
-        """Save compact inputs needed to recompute dense bias in backward.
+        """Save inputs and forward dense bias needed by backward.
 
         :param Any ctx: Autograd context object.
         :param tuple[Any, ...] inputs: Forward custom-op inputs.
-        :param tuple[torch.Tensor, torch.Tensor] output: Forward outputs.
+        :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] output: Forward outputs.
         """
 
         (
@@ -2012,8 +2539,9 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             has_pos_query,
             has_keep_mask,
         ) = inputs
-        out, lse = output
-        ctx.save_for_backward(q, k, v, pos_key, pos_query, bucket_index, keep_mask, out, lse)
+        out, lse, bias = output
+        ctx.mark_non_differentiable(lse, bias)
+        ctx.save_for_backward(q, k, v, pos_key, pos_query, bucket_index, keep_mask, bias, out, lse)
         ctx.bias_scale = float(bias_scale)
         ctx.sm_scale = float(sm_scale)
         ctx.causal = bool(causal)
@@ -2025,17 +2553,19 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         ctx: Any,
         grad_out: torch.Tensor | None,
         grad_lse: torch.Tensor | None,
+        grad_bias: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
         """Dispatch fused position-bias backward through an opaque CUDA op.
 
         :param Any ctx: Autograd context populated by ``_setup_context``.
         :param torch.Tensor | None grad_out: Gradient of the output tensor.
         :param torch.Tensor | None grad_lse: Gradient of the LSE output.
+        :param torch.Tensor | None grad_bias: Ignored gradient for dense-bias aux output.
         :return tuple[torch.Tensor | None, ...]: Gradients for the forward inputs.
         """
 
-        del grad_lse
-        q, k, v, pos_key, pos_query, bucket_index, keep_mask, out, lse = ctx.saved_tensors
+        del grad_lse, grad_bias
+        q, k, v, pos_key, pos_query, bucket_index, keep_mask, bias, out, lse = ctx.saved_tensors
         grad = grad_out if grad_out is not None else torch.zeros_like(out)
         dq, dk, dv, dpos_key, dpos_query = _backward_op(
             grad,
@@ -2046,6 +2576,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             pos_query,
             bucket_index,
             keep_mask,
+            bias,
             out,
             lse,
             ctx.bias_scale,
@@ -2173,7 +2704,7 @@ def flashdeberta_bias_from_positions(
             if keep_mask is not None
             else torch.empty((0,), device=reference.device, dtype=torch.bool)
         )
-        output, _ = _FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP(
+        output, _, _ = _FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP(
             query_layer,
             key_layer,
             value_layer,

@@ -1380,7 +1380,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 pos_query=pos_query,
                 sm_scale=sm_scale,
             )
-            output = output.contiguous().view(bsz, query_len, self.all_head_size)
+            output = output.transpose(1, 2).contiguous().view(bsz, query_len, self.all_head_size)
         elif use_docblock:
             output = self._flash_docblock(
                 query_layer=query_layer,

@@ -62,7 +62,7 @@
     "docblock": [
       {
         "seq_bucket": "1024_exact",
-        "choice": "docblock"
+        "choice": "docblock_bias"
       },
       {
         "seq_bucket": "under_2048",
@@ -70,19 +70,19 @@
       },
       {
         "seq_bucket": "2048_plus",
-        "choice": "docblock"
+        "choice": "docblock_bias"
       },
       {
         "seq_bucket": "2048_medium",
-        "choice": "docblock"
+        "choice": "docblock_bias"
       },
       {
         "seq_bucket": "2048_sparse",
-        "choice": "docblock"
+        "choice": "docblock_bias"
       },
       {
         "seq_bucket": "4096_plus",
-        "choice": "docblock"
+        "choice": "docblock_bias"
       }
     ],
     "local_bias": [
@@ -125,6 +125,118 @@
       "block_n": 16,
       "num_stages": 1,
       "num_warps": 2
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_kv",
+      "seq_bucket": "1024_exact",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 16,
+      "block_n": 16,
+      "num_stages": 1,
+      "num_warps": 2
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_q",
+      "seq_bucket": "1024_exact",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 32,
+      "block_n": 32,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_kv",
+      "seq_bucket": "2048_medium",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 64,
+      "block_n": 32,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_kv",
+      "seq_bucket": "2048_sparse",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 64,
+      "block_n": 32,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_kv",
+      "seq_bucket": "4096_plus",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 32,
+      "block_n": 64,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_q",
+      "seq_bucket": "2048_medium",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 32,
+      "block_n": 64,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_q",
+      "seq_bucket": "2048_sparse",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 32,
+      "block_n": 64,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "docblock",
+      "kind": "bwd_q",
+      "seq_bucket": "4096_plus",
+      "head_dim": 64,
+      "causal": false,
+      "disentangled": true,
+      "att_span_min": 128,
+      "block_m": 64,
+      "block_n": 64,
+      "num_stages": 3,
+      "num_warps": 8
     },
     {
       "compute_capability": "sm_120",
@@ -281,6 +393,32 @@
     },
     {
       "compute_capability": "sm_120",
+      "route": "dense_bias",
+      "kind": "fwd",
+      "seq_bucket": "2048_plus",
+      "head_dim": "*",
+      "batch_size": 2,
+      "num_heads": 12,
+      "block_m": 64,
+      "block_n": 128,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "dense_bias",
+      "kind": "fwd",
+      "seq_bucket": "4096_plus",
+      "head_dim": "*",
+      "batch_size": 1,
+      "num_heads": 12,
+      "block_m": 64,
+      "block_n": 128,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
       "route": "bias_docblock_specialized",
       "kind": "bwd",
       "seq_bucket": "1024_exact",
@@ -318,6 +456,96 @@
       "query_len": 1024,
       "key_len": 1024,
       "max_batch_size": 4,
+      "causal": false,
+      "block_m": 64,
+      "block_n": 64,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd",
+      "seq_bucket": "2048_plus",
+      "head_dim": 64,
+      "query_len": 2048,
+      "key_len": 2048,
+      "max_batch_size": 2,
+      "causal": false,
+      "block_m": 16,
+      "block_n": 32,
+      "num_stages": 1,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd_kv",
+      "seq_bucket": "2048_plus",
+      "head_dim": 64,
+      "query_len": 2048,
+      "key_len": 2048,
+      "max_batch_size": 2,
+      "causal": false,
+      "block_m": 16,
+      "block_n": 32,
+      "num_stages": 1,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd_q",
+      "seq_bucket": "2048_plus",
+      "head_dim": 64,
+      "query_len": 2048,
+      "key_len": 2048,
+      "max_batch_size": 2,
+      "causal": false,
+      "block_m": 64,
+      "block_n": 64,
+      "num_stages": 2,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd",
+      "seq_bucket": "4096_plus",
+      "head_dim": 64,
+      "query_len": 4096,
+      "key_len": 4096,
+      "max_batch_size": 1,
+      "causal": false,
+      "block_m": 16,
+      "block_n": 32,
+      "num_stages": 1,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd_kv",
+      "seq_bucket": "4096_plus",
+      "head_dim": 64,
+      "query_len": 4096,
+      "key_len": 4096,
+      "max_batch_size": 1,
+      "causal": false,
+      "block_m": 16,
+      "block_n": 32,
+      "num_stages": 1,
+      "num_warps": 4
+    },
+    {
+      "compute_capability": "sm_120",
+      "route": "bias_docblock_specialized",
+      "kind": "bwd_q",
+      "seq_bucket": "4096_plus",
+      "head_dim": 64,
+      "query_len": 4096,
+      "key_len": 4096,
+      "max_batch_size": 1,
       "causal": false,
       "block_m": 64,
       "block_n": 64,

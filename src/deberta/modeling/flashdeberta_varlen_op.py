@@ -268,6 +268,7 @@ def _kernel_dtype_name(dtype: torch.dtype) -> str:
 
 def _varlen_repo_tuned_bwd_config(
     *,
+    route: str = "varlen",
     kind: str,
     seq_len: int,
     total_tokens: int,
@@ -281,6 +282,7 @@ def _varlen_repo_tuned_bwd_config(
 ) -> tuple[int, int, int, int] | None:
     """Return repo-local backward-kernel heuristics for measured hot paths.
 
+    :param str route: Tuning-table route namespace.
     :param str kind: Either ``"kv"`` or ``"q"``.
     :param int seq_len: Padded sequence length.
     :param int total_tokens: Total active tokens in the packed batch.
@@ -302,7 +304,7 @@ def _varlen_repo_tuned_bwd_config(
     return resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=capability,
-            route="varlen",
+            route=str(route),
             kind=f"bwd_{normalized_kind}",
             seq_len=int(seq_len),
             total_tokens=int(total_tokens),
@@ -361,6 +363,7 @@ def _varlen_repo_tuned_fwd_config(
 
 def _resolve_varlen_bwd_kernel_config(
     *,
+    route: str = "varlen",
     kind: str,
     total_tokens_q: int,
     total_tokens_k: int,
@@ -376,6 +379,7 @@ def _resolve_varlen_bwd_kernel_config(
 ) -> tuple[int, int, int, int]:
     """Resolve one repo-local varlen backward kernel config.
 
+    :param str route: Tuning-table route namespace.
     :param str kind: Either ``"kv"`` or ``"q"``.
     :param int total_tokens_q: Total query tokens.
     :param int total_tokens_k: Total key tokens.
@@ -392,6 +396,7 @@ def _resolve_varlen_bwd_kernel_config(
     """
 
     repo_tuned = _varlen_repo_tuned_bwd_config(
+        route=route,
         kind=kind,
         seq_len=max(max_seqlen_q, max_seqlen_k),
         total_tokens=max(total_tokens_q, total_tokens_k),
@@ -925,6 +930,7 @@ def _varlen_backward_raw_impl(
     max_relative_distance: int,
     causal: bool,
     dense_mid_tensors: bool,
+    route: str = "varlen",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Launch raw varlen backward Triton kernels over already packed tensors.
 
@@ -946,12 +952,14 @@ def _varlen_backward_raw_impl(
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
     :param bool dense_mid_tensors: Whether to build fixed-capacity dense mid tensors.
+    :param str route: Tuning-table route namespace.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Packed gradients for q/k/v and optional positional tensors.
     """
 
     att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
     kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_varlen_bwd_kernel_config(
+        route=route,
         kind="kv",
         total_tokens_q=int(token_capacity),
         total_tokens_k=int(token_capacity),
@@ -966,6 +974,7 @@ def _varlen_backward_raw_impl(
         device=q_unpad.device,
     )
     q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_varlen_bwd_kernel_config(
+        route=route,
         kind="q",
         total_tokens_q=int(token_capacity),
         total_tokens_k=int(token_capacity),

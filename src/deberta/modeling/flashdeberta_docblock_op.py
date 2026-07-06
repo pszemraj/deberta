@@ -33,8 +33,8 @@ from deberta.modeling.flashdeberta_segment_pack import (
 )
 
 _DOCBLOCK_OP_NAMESPACE = "deberta"
-_DOCBLOCK_FWD_OP_NAME = "flashdeberta_docblock"
-_DOCBLOCK_BWD_OP_NAME = "flashdeberta_docblock_backward"
+_DOCBLOCK_FWD_OP_NAME = "flashdeberta_docblock_v2"
+_DOCBLOCK_BWD_OP_NAME = "flashdeberta_docblock_backward_v2"
 
 
 def _scalar_int(value: int | torch.Tensor, *, name: str) -> int:
@@ -785,6 +785,7 @@ def _docblock_backward_impl(
         max_relative_distance=max_relative_distance,
         causal=causal,
         dense_mid_tensors=False,
+        route="docblock",
     )
 
     dq, dk, dv = segment_unpack_padded_rows_triple(
