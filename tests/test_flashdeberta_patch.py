@@ -1580,12 +1580,13 @@ def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
 
 
 def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch: pytest.MonkeyPatch) -> None:
-    module_names = [
-        "deberta.modeling.flashdeberta_prefix_pack",
-        "deberta.modeling.flashdeberta_segment_pack",
-        "deberta.modeling.flashdeberta_varlen_op",
-    ]
-    for name in module_names:
+    # Re-importing these modules chain-imports the rest of the flash tree
+    # (fixed_op, upstream flashdeberta) under the poisoned triton. Snapshot the
+    # whole affected namespace and restore the original healthy module objects
+    # afterwards so later tests never see import state cached under triton=None.
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
         sys.modules.pop(name, None)
     monkeypatch.setitem(sys.modules, "triton", None)
     monkeypatch.setitem(sys.modules, "triton.language", None)
@@ -1594,13 +1595,25 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         prefix_mod = importlib.import_module("deberta.modeling.flashdeberta_prefix_pack")
         segment_mod = importlib.import_module("deberta.modeling.flashdeberta_segment_pack")
         varlen_mod = importlib.import_module("deberta.modeling.flashdeberta_varlen_op")
+        docblock_mod = importlib.import_module("deberta.modeling.flashdeberta_docblock_op")
+        bias_mod = importlib.import_module("deberta.modeling.flashdeberta_bias_op")
+        dense_bias_mod = importlib.import_module("deberta.modeling.flashdeberta_dense_bias_op")
 
         assert prefix_mod.flashdeberta_prefix_pack_available() is False
         assert segment_mod.flashdeberta_segment_pack_available() is False
         assert varlen_mod.flashdeberta_compiled_varlen_available() is False
+        # The custom-op modules recover previously registered ops from the
+        # process-global torch.library registry, so availability can be True
+        # here when an earlier healthy import registered them. The contract
+        # under test is import safety: the calls must not raise.
+        assert isinstance(docblock_mod.flashdeberta_compiled_docblock_available(), bool)
+        assert isinstance(bias_mod.flashdeberta_compiled_bias_available(), bool)
+        assert isinstance(bias_mod.flashdeberta_compiled_position_bias_available(), bool)
+        assert isinstance(dense_bias_mod.flashdeberta_compiled_dense_bias_available(), bool)
     finally:
-        for name in module_names:
+        for name in [n for n in sys.modules if n.startswith(affected_prefixes)]:
             sys.modules.pop(name, None)
+        sys.modules.update(saved)
 
 
 def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded() -> None:
@@ -1793,11 +1806,11 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_large_pairwi
     assert not bool(prepared["attention_mask"][0, seq_len // 2, 0])
 
 
-def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu() -> None:
+@pytest.mark.parametrize("seq_len", [1024, 2048])
+def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu(seq_len: int) -> None:
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
     from deberta.modeling.mask_utils import build_doc_block_mask
 
-    seq_len = 2048
     cfg = _docblock_attention_config(seq_len=seq_len)
     attention = DisentangledSelfAttention(cfg).eval()
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
@@ -1823,14 +1836,15 @@ def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu() -> Non
     assert float(probs[0, 0, seq_len // 2, : seq_len // 2].detach().abs().max()) == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("seq_len", [1024, 2048])
 def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cpu(
     monkeypatch: pytest.MonkeyPatch,
+    seq_len: int,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()
     from deberta.modeling.mask_utils import build_doc_segment_metadata
 
-    seq_len = 2048
     cfg = _docblock_attention_config(seq_len=seq_len)
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
@@ -2570,6 +2584,134 @@ def test_position_bias_attention_cuda_saves_dense_bias_aux_tensor() -> None:
         out.float().sum().backward()
 
     assert (batch_size, num_heads, seq_len, seq_len) in saved_shapes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for real-kernel leakage checks.")
+@pytest.mark.parametrize("route", ["docblock", "docblock_bias"])
+def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str) -> None:
+    """Gradient-isolation leakage check on the actual Triton doc-block routes.
+
+    Doc-1 query outputs must carry exactly zero gradient back to doc-2 hidden
+    states; any nonzero gradient means cross-document attention leaked. The
+    route counters prove the flash kernel actually ran instead of a silent
+    eager fallback (which would also block correctly and mask a kernel bug).
+
+    Other tests in this file reload the flash module tree against fake
+    flashdeberta packages and leave those reloaded twins cached, so this test
+    re-imports a clean real-kernel tree and restores the prior modules after.
+    """
+
+    import dataclasses
+
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
+        sys.modules.pop(name, None)
+    try:
+        attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
+        if attention_mod.flashdeberta_fixed_import_error() is not None:
+            pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
+        # The fresh module instance is discarded in the finally block, so
+        # mutating its runtime config does not need monkeypatch cleanup.
+        attention_mod._RUNTIME_CONFIG = dataclasses.replace(
+            attention_mod._RUNTIME_CONFIG, enable_debug_stats=True
+        )
+        _run_docblock_real_kernel_leak_check(attention_mod=attention_mod, route=route)
+    finally:
+        for name in [n for n in sys.modules if n.startswith(affected_prefixes)]:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+
+def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Config
+    from deberta.modeling.mask_utils import (
+        build_doc_block_mask,
+        build_doc_segment_metadata,
+        doc_segment_metadata_host_stats,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    seq_len = 1024
+    boundary = seq_len // 2
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=seq_len,
+        type_vocab_size=0,
+        relative_attention=True,
+        position_buckets=32,
+        max_relative_positions=seq_len,
+        pos_att_type=["c2p", "p2c"],
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        position_biased_input=False,
+    )
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
+
+    doc_ids = torch.cat(
+        (
+            torch.ones((1, boundary), dtype=torch.long),
+            torch.full((1, seq_len - boundary), 2, dtype=torch.long),
+        ),
+        dim=1,
+    )
+    if route == "docblock_bias":
+        attention_mask: torch.Tensor = build_doc_block_mask(doc_ids.to(device=device))
+        flash_meta = FlashBatchMeta(
+            seq_lengths=doc_ids.ne(0).sum(-1, dtype=torch.int32).to(device=device),
+            active_tokens_host=seq_len,
+            route_hint="docblock_bias",
+        )
+    else:
+        segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(doc_ids)
+        num_segments, max_seqlen, _ = doc_segment_metadata_host_stats(
+            segment_lengths,
+            active_tokens=active_tokens,
+        )
+        attention_mask = doc_ids.ne(0).to(device=device)
+        flash_meta = FlashBatchMeta(
+            seq_lengths=doc_ids.ne(0).sum(-1, dtype=torch.int32).to(device=device),
+            doc_segment_offsets=segment_offsets.to(device=device),
+            doc_segment_lengths=segment_lengths.to(device=device),
+            doc_cu_seqlens=cu_seqlens.to(device=device),
+            active_tokens_host=active_tokens,
+            doc_num_segments_host=num_segments,
+            doc_max_segment_length_host=max_seqlen,
+            route_hint="docblock",
+        )
+
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), device=device, dtype=dtype).requires_grad_()
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), device=device, dtype=dtype)
+
+    attention_mod.reset_flashdeberta_stats()
+    output, _ = attention(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        output_attentions=False,
+        rel_embeddings=rel_embeddings,
+        flash_meta=flash_meta,
+    )
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    expected_counter = "flash_docblock_bias_calls" if route == "docblock_bias" else "flash_docblock_calls"
+    assert stats.get(expected_counter, 0) >= 1, f"flash {route} route did not run: stats={stats}"
+    assert stats.get("fallback_calls", 0) == 0, f"unexpected eager fallback: stats={stats}"
+
+    output[0, :boundary].float().square().sum().backward()
+
+    assert hidden_states.grad is not None
+    doc2_grad = hidden_states.grad[0, boundary:]
+    assert torch.all(doc2_grad == 0), (
+        f"cross-document gradient leak on {route}: max abs doc-2 grad {float(doc2_grad.abs().max()):.3e}"
+    )
+    doc1_grad = hidden_states.grad[0, :boundary]
+    assert float(doc1_grad.abs().max()) > 0.0
 
 
 def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
