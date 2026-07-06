@@ -443,3 +443,115 @@ Decision: promote dense `docblock_bias` through the JSON route table for the
 measured packed `1024`/`2048`/`4096` buckets. Keep ragged `docblock` as a
 forced ablation/hardware-retuning route via
 `model.hf.flash.docblock_bias_seq_len=0`.
+
+## 2026-07-06 - FlashDeBERTa Docblock Validation Campaign (goal close-out)
+
+Goal: validate the committed `feat/flash` HEAD (`486174a` + this campaign's
+commits) end to end - correctness, speed gates, and training equivalence - and
+make the final route-policy call. Artifacts:
+`local-scratch/benchmarks/flashdeberta/resume_20260706/` (phase0/1/2/4 dirs,
+each profiler `summary.json` carries GPU/driver/torch/triton/config-hash
+provenance). Environment: RTX 5090, driver `580.159.04`, torch `2.9.1+cu128`.
+
+### Timeline Finding That Reframed The Open Questions
+
+Artifact mtimes prove the alarming Jul 5 training comparison was stale
+evidence: the `train300_*` runs (13:19-13:38, flash `0.895x` tokens/sec and
+gen `6.4850` vs eager `6.1700`) predate the first direct positional-gradient
+backward artifacts (13:50-13:52) and the formal speed gates (14:19-14:55).
+The bad training numbers measured the old `scatter_add_` dense backward; no
+training run had ever executed the code now at HEAD.
+
+### Phase 0 - Correctness Gate At HEAD
+
+- Found and fixed two commit-split regressions that existed at `486174a`:
+  a stale test fake missing the new `route` kwarg
+  (`test_docblock_backward_narrows_fixed_capacity_saved_aux`), and
+  `tools/generate_config_reference.py` lagging the hand-updated route-policy
+  prose in `docs/guides/config-reference.md`.
+- `tools/audit_contracts.py --strict`: 14 PASS, 0 WARN/SKIP/FAIL.
+- Full parity matrix (`tools/flashdeberta_parity_test.py`): pass at HEAD,
+  including strict `docblock`/`docbias` cases at `1024`/`2048`/`4096`.
+- Suite green after fixes (later in the campaign: `546 passed, 4 skipped`
+  with CUDA visible, `phase0/pytest_final_gpu.log`).
+
+### Phase 1 - Formal Speed Gates At HEAD (10 warmup / 50 steps, GA=8)
+
+| S | eager tok/s | flash tok/s | ratio | peak mem eager -> flash |
+|---|---|---|---|---|
+| 1024 | 34886 | 44805 | 1.28x | 7.71 -> 6.79 GiB |
+| 2048 | 18439 | 25123 | 1.36x | 11.38 -> 7.89 GiB |
+| 4096 | 11501 | 15335 | 1.33x | 18.46 -> 10.33 GiB |
+
+Eager baselines reproduce Jul 5 within 0.4%; flash at `4096` matches the Jul 5
+saved-bias probe within 0.03%. Flash `1024`/`2048` improved ~7% over the Jul 5
+gates because the saved-bias aux change landed after those gates were recorded.
+
+### Phase 2 - Throughput/Learning Discrepancy Resolved
+
+- Long-window probe (20 warmup / 300 steps, flash `1024`): `44742` tok/s -
+  identical to the 50-step gate, so the profiler methodology is sound.
+- One-step compare (`tools/flashdeberta_rtd_compare_step.py`, dense route):
+  matches the post-layout-fix reference (gen hidden mean-abs `2.6e-3`,
+  1 corrupted-token mismatch, disc logits mean-abs `1.03e-3`).
+- Fresh 300-step training pair on HEAD: eager reproduces Jul 5
+  (`gen=6.1672`, `34841` tok/s); flash now `gen=6.1679` (+0.011%) at
+  `44640` tok/s (`1.28x`). Both Jul 5 anomalies are gone; stale-evidence
+  hypothesis confirmed. No further diagnostics needed.
+
+### Phase 4 - Training-Equivalence Battery
+
+Four sequential arms at packed `1024` x 1000 steps (wandb offline with
+gradient watch, debug metrics JSONL), plus a `2048` x 500 confirmation pair
+using the new committed `_docblock` configs. Final-step values:
+
+| arm | loss | gen | disc | acc | tok/s |
+|---|---|---|---|---|---|
+| eager seed 42 | 7.5408 | 4.3959 | 0.3145 | 0.8846 | 34571 |
+| eager seed 1337 | 6.9337 | 4.0594 | 0.2874 | 0.8942 | 34286 |
+| flash seed 42 (a) | 7.6114 | 4.3954 | 0.3216 | 0.8833 | 44098 |
+| flash seed 42 (b) | 7.4817 | 4.3906 | 0.3091 | 0.8855 | 44265 |
+
+- Seed-noise floor (eager 42 vs 1337): ~8% relative on loss/gen.
+- Atomics-noise floor (flash repeat spread): ~1.7% on loss, 0.11% on gen.
+- Flash-vs-eager same seed: <=0.94% on every metric, with eager's final loss
+  landing between the two flash repeats - flash is indistinguishable from its
+  own run-to-run noise and an order of magnitude inside the seed floor.
+- `2048` x 500 confirm: flash `gen=5.4189` vs eager `5.4075` (+0.21%), acc
+  `0.8705` vs `0.8708`, `1.32x` tokens/sec. Passes the <=1% relative bar.
+- Comparison tables/plots: `phase4/battery_1024_curves.png`,
+  `phase4/confirm_2048_curves.png` via `resume_20260706/analyze_phase4.py`.
+
+### Route-Policy Decision (final)
+
+Keep dense `docblock_bias` as the JSON-table default for packed
+`1024`/`2048`/`4096`; keep ragged `docblock` as the forced ablation and
+non-`sm_120` fallback route. Two accepted caveats are now documented in
+`docs/advanced/architectures.md`: flash gradients are not bitwise reproducible
+(atomic positional-gradient accumulation - resume/drift tooling must not
+assert bit-exact replay), and the dense route saves the `(B,H,S,S)` bias for
+backward (memory-for-recompute trade; a recompute knob is a prerequisite for
+contexts beyond `4096`).
+
+### Validation Coverage Closed This Campaign
+
+- CPU leakage tests parametrized over `S in {1024, 2048}`.
+- New CUDA-gated gradient-isolation leakage test drives the real Triton
+  `docblock` and `docblock_bias` routes (route stat counters prove no silent
+  eager fallback) and asserts exactly zero cross-document hidden-state
+  gradients.
+- No-Triton import test now covers all six flash modules and
+  snapshot/restores the flash module namespace so import state cached under
+  `triton=None` cannot leak into later tests (the custom-op modules may
+  legitimately report available via the process-global torch.library registry).
+- Committed `configs/custom/..._{2048,4096}_wp32k_v2_docblock.yaml` so packed
+  doc-block benchmark arms are config-owned instead of CLI-override-owned.
+
+### Still Open (deliberately deferred)
+
+- Fresh-venv no-Triton environment artifact (low marginal value now that the
+  in-process test covers 6/6 modules).
+- Dense-bias recompute-in-backward knob (needed before >4096 contexts).
+- Ragged `docblock` kernel ownership (bucket LUT, deterministic segmented
+  position-gradient backward) - only worth it if a deterministic-gradient or
+  non-`sm_120` requirement materializes.
