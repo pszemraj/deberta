@@ -1130,6 +1130,7 @@ def test_docblock_backward_narrows_fixed_capacity_saved_aux(
         max_relative_distance,
         causal,
         dense_mid_tensors,
+        route,
     ):
         del (
             k_unpad,
@@ -1147,6 +1148,7 @@ def test_docblock_backward_narrows_fixed_capacity_saved_aux(
             causal,
             dense_mid_tensors,
         )
+        seen["route"] = str(route)
         seen["q_tokens"] = int(q_unpad.shape[0])
         seen["pos_tokens"] = int(pos_key_unpad.shape[0]) if pos_key_unpad is not None else -1
         seen["capacity"] = int(token_capacity)
@@ -1200,7 +1202,7 @@ def test_docblock_backward_narrows_fixed_capacity_saved_aux(
         pos_query_unpad=pos_aux,
     )
 
-    assert seen == {"q_tokens": 3, "pos_tokens": 3, "capacity": 3}
+    assert seen == {"route": "docblock", "q_tokens": 3, "pos_tokens": 3, "capacity": 3}
     assert torch.equal(dq[0, :2], torch.ones_like(dq[0, :2]))
     assert torch.equal(dq[0, 3:4], torch.ones_like(dq[0, 3:4]))
     assert torch.equal(dk[0, :2], torch.full_like(dk[0, :2], 2.0))
