@@ -137,24 +137,24 @@ first and put durable results in a JSON table selected with
 For `hf_deberta_v2`, packed doc-blocking uses the JSON route policy described
 above when `model.hf.attention_impl=flash` is set:
 
-- packed doc-block batches use the segment-aware flash custom op by default,
-  avoiding dense pairwise bias materialization
-- exact packed lengths can opt into dense flash-with-bias `docblock_bias` with
-  `model.hf.flash.docblock_bias_seq_len=<len>` for isolated validation
+- measured packed `1024`/`2048`/`4096` buckets use dense flash-with-bias
+  `docblock_bias` by default because the direct positional-gradient backward is
+  parity-covered and faster than the segment-aware ragged route on the local
+  `sm_120` benchmark GPU
+- the segment-aware ragged `docblock` route remains available for ablations and
+  hardware retuning with `model.hf.flash.docblock_bias_seq_len=0`
 
-The dense `1024` route is intentionally not promoted from profile-only evidence.
-The local profile window under
-`local-scratch/benchmarks/flashdeberta/docblock_goal_20260705/` measured a
-competitive isolated step time, but a matched 1000-step RTD run stayed near
-`11.3` loss while eager reached about `7.5`. Treat dense doc-block bias as an
-experimental debug route until real packed-batch parity and convergence are
-fixed.
+The old dense-route learning collapse was traced to an adapter layout bug: the
+flash-with-bias kernel returned `(B,H,S,D)` but the adapter viewed it directly as
+`(B,S,H*D)`. The adapter now transposes before flattening, and dense doc-block
+parity covers `1024`, `2048`, and `4096` forward plus word embedding, relative
+embedding, query-projection, and value-projection gradients.
 
 Leave `model.hf.flash.docblock_bias_seq_len` and
 `model.hf.flash.local_bias_max_batch_size` unset to use the table. Set
 `model.hf.flash.docblock_bias_seq_len=<len>` to force the dense-bias doc-block
-route only at that exact sequence length for validation, or set it to `0` to
-force-disable the dense-bias doc-block route while keeping flash enabled. Set
+route only at that exact sequence length, or set it to `0` to force-disable the
+dense-bias doc-block route while keeping flash enabled. Set
 `model.hf.flash.local_bias_max_batch_size=0` to disable the small-batch dense
 local-bias route without changing the doc-block route. Route policy is
 config/table-only; the older FlashDeBERTa route environment fallbacks are not

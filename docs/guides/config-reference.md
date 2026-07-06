@@ -86,7 +86,7 @@ model:
       # Guidance: Only used when `model.hf.attention_impl=flash`. Optional varlen threshold. `null` uses the JSON route table; if set, must be > 0.
       varlen_min_seq_len: null
       # Type: int | None. Default: null. Required: no.
-      # Guidance: Only used when `model.hf.attention_impl=flash`. Exact-length dense doc-block route override. `null` uses the JSON table, whose safe default keeps packed doc-block batches on segment-aware `docblock`. Set a positive exact sequence length only for isolated dense `docblock_bias` validation; set `0` to force-disable dense doc-block routing.
+      # Guidance: Only used when `model.hf.attention_impl=flash`. Exact-length dense doc-block route override. `null` uses the JSON table, which selects dense `docblock_bias` for measured packed `1024`/`2048`/`4096` buckets and uses ragged `docblock` elsewhere. Set a positive exact sequence length to force dense only at that length; set `0` to force-disable dense doc-block routing and use ragged segment metadata.
       docblock_bias_seq_len: null
       # Type: int | None. Default: null. Required: no.
       # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route cap. `null` uses table policy; `0` disables. Dense routes can be memory-heavy and hardware-sensitive.

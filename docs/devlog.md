@@ -1,0 +1,445 @@
+# Development Log
+
+This file tracks active branch investigations that need more context than a
+commit message. Keep entries factual: what changed, what was measured, what
+failed, and what remains.
+
+## 2026-07-05 - FlashDeBERTa Packed Doc-Block Remediation
+
+Active goal: make both packed doc-block FlashDeBERTa routes correct and
+end-to-end faster than eager for the repo's packed RTD configs, with committed
+tests plus benchmark/training artifacts.
+
+### Current State
+
+- Checkpoint commit: `e624482 fix: keep docblock flash correctness-first`.
+- Route policy updated after dense correctness and speed fixes: default packed
+  doc-block route now uses table-selected dense `docblock_bias` for the shipped
+  `1024`/`2048`/`4096` packed lengths. Set
+  `model.hf.flash.docblock_bias_seq_len=0` to force the segment-aware ragged
+  `docblock` route for ablations or hardware retuning.
+- CUDA access requires escalated permissions in this environment. Sandboxed
+  `torch.cuda.is_available()` can be false even when the RTX 5090 is available.
+  Local `AGENTS.md` now records the escalation rule.
+- Escalated CUDA visibility works:
+  - GPU: NVIDIA GeForce RTX 5090
+  - Driver: 580.159.04
+  - VRAM: 32607 MiB total, about 32109 MiB free at check time
+  - Torch: `2.9.1+cu128`
+
+### Implemented Since `e624482`
+
+- Versioned the internal doc-block custom-op names from
+  `deberta::flashdeberta_docblock` / `deberta::flashdeberta_docblock_backward`
+  to `deberta::flashdeberta_docblock_v2` /
+  `deberta::flashdeberta_docblock_backward_v2`.
+  - Why: `torch.compile` reused a stale generated backward call with the old
+    schema after the custom op began returning/saving packed aux tensors.
+  - Evidence: flash profile initially failed with
+    `flashdeberta_docblock_backward() is missing value for argument 'q_unpad'`.
+    The versioned op profile ran through compiled backward.
+- Added route-specific varlen backward tuning support:
+  - `_varlen_backward_raw_impl(..., route="varlen")`
+  - doc-block backward now calls it with `route="docblock"`.
+  - Added a unit test to ensure doc-block backward resolves tuning rows from
+    the `docblock` namespace rather than generic `varlen`.
+
+### GPU Profile Evidence
+
+Artifacts live under:
+`local-scratch/benchmarks/flashdeberta/docblock_goal_20260705/`.
+
+Packed `1024` doc-block eager profile:
+
+- Directory: `rtd_eager_after_aux_patch/`
+- Command shape: `tools/flashdeberta_rtd_profile.py ... --mode eager
+  --warmup-steps 4 --profile-steps 8`
+- Median step: `955.20 ms`
+- Mean step: `1171.95 ms`
+- Peak memory: `7.71 GiB`
+- Median generator backward: `12.48 ms`
+- Median discriminator backward: `14.32 ms`
+
+Packed `1024` segment-aware flash profile after aux-save and v2 op:
+
+- Directory: `rtd_flash_segment_after_aux_patch_v2op/`
+- Command shape: `tools/flashdeberta_rtd_profile.py ... --mode flash
+  --warmup-steps 4 --profile-steps 8`
+- Median step: `1501.21 ms`
+- Mean step: `1747.31 ms`
+- Peak memory: `6.86 GiB`
+- Median generator backward: `56.81 ms`
+- Median discriminator backward: `91.21 ms`
+- Current result: correct-running but too slow. This fails the speed gate.
+
+Profiler hotspot for segment-aware flash:
+
+- `_bwd_kv_dise_kernel_varlen`: `5.751 s` CUDA over the window, about `52.7%`
+  of CUDA time.
+- `deberta::flashdeberta_docblock_backward_v2`: `6.712 s` self CUDA over
+  `1100` calls.
+- Segment pack/unpack kernels are now secondary:
+  - `_pack_segment_grad_and_delta_kernel`: `88.45 ms`
+  - `_pack_segment_rows_pair_kernel`: `130.06 ms`
+  - `_unpack_segment_rows_pair_kernel`: `144.29 ms`
+
+Interpretation: shaving metadata or pack/unpack overhead will not make the
+ragged route faster at `1024`; the upstream varlen KV backward kernel dominates.
+
+### Latest Experiment
+
+Probe file:
+`local-scratch/benchmarks/flashdeberta/docblock_goal_20260705/docblock_bwd_16x16_override.json`
+
+Purpose: test whether smaller doc-block-specific KV tiles help the `1024`
+ragged route.
+
+Override:
+
+- `route=docblock`, `kind=bwd_kv`, `seq_bucket=1024_exact`:
+  `BLOCK_M=16`, `BLOCK_N=16`, `stages=1`, `warps=2`
+- `route=docblock`, `kind=bwd_q`, `seq_bucket=1024_exact`:
+  `BLOCK_M=32`, `BLOCK_N=32`, `stages=2`, `warps=4`
+
+Running command shape:
+
+```bash
+env TORCH_BLAS_PREFER_CUBLASLT=1 TOKENIZERS_PARALLELISM=false \
+  conda run --name neobert --no-capture-output \
+  python tools/flashdeberta_rtd_profile.py \
+    configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
+    --mode flash \
+    --warmup-steps 2 \
+    --profile-steps 4 \
+    --kernel-overrides-path local-scratch/benchmarks/flashdeberta/docblock_goal_20260705/docblock_bwd_16x16_override.json \
+    --profile-dir local-scratch/benchmarks/flashdeberta/docblock_goal_20260705/rtd_flash_docblock_bwd_16x16_probe
+```
+
+Result:
+
+- Directory: `rtd_flash_docblock_bwd_16x16_probe/`
+- Median step: `1330.95 ms`
+- Mean step: `1607.00 ms`
+- Peak memory: `6.86 GiB`
+- Median generator backward: `45.17 ms`
+- Median discriminator backward: `72.86 ms`
+- `_bwd_kv_dise_kernel_varlen`: `3.62 ms/call`, down from `5.23 ms/call`.
+
+Interpretation: doc-block-specific KV tile tuning helps, but only narrows the
+gap. Eager remains about `955 ms` median step on the same config, so the ragged
+route is still slower than eager and fails the speed gate. The remaining hotspot
+is still the generic upstream varlen backward kernel; the fix needs to be
+kernel-level or replaced by a dense route that is both correct and faster.
+
+Follow-up default-table validation:
+
+- Added the same measured `docblock` `bwd_kv` / `bwd_q` rows to
+  `src/deberta/modeling/flashdeberta_kernel_tuning.json`.
+- Added tests that prove the default table resolves those rows and that the
+  doc-block backward asks the table using `route="docblock"` instead of the
+  generic `varlen` namespace.
+- Directory: `rtd_flash_docblock_default_table_after_tuning/`
+- Median step: `1333.10 ms`
+- Mean step: `1605.22 ms`
+- Peak memory: `6.86 GiB`
+- `_bwd_kv_dise_kernel_varlen`: `3.62 ms/call`
+
+Interpretation: the checked-in table matches the local override profile. This
+is an ownership improvement and a real speedup over the previous `1501 ms`
+flash median, but it is not enough for the speed gate.
+
+### Correctness Coverage Status
+
+Already present:
+
+- `tools/audit_contracts.py --strict` includes CPU-safe flash metadata checks:
+  segment descriptor round-trip, route-implies-mask encoding, fixed descriptor
+  shape, non-flash pairwise mask.
+- `tests/test_flashdeberta_patch.py` covers doc-block fallback mask rebuilds,
+  route selection, no-Triton imports for pack/varlen modules, segment pack
+  round-trips, fused segment grad/delta fallback, and the v2 doc-block aux
+  contract.
+- Existing parity tool exits non-zero on failure and covers gradients for word
+  embeddings, relative embeddings, and layer-0 query/value projections.
+
+Still missing against the updated goal:
+
+- Leakage pytest must cover `S in {1024, 2048}` and all three consumers:
+  eager/no-flash, flash `docblock`, and forced eager fallback.
+- Parity matrix must cover `docblock` and `docblock_bias` at
+  `S in {1024, 2048, 4096}` with at least three docs per row and ragged tails.
+  Current parity coverage is weaker: `docblock` at `S=256` and optional
+  `docblock_bias` at `S=1024`, two-doc synthetic rows.
+- Fresh venv/no-Triton full import and test collection artifact still needs to
+  be recorded.
+- Baseline branch failure set versus final non-regression set still needs a
+  committed summary artifact.
+
+### Speed And Training Gates Still Open
+
+- Gate 6 speed matrix is not met. Current `1024` ragged route is slower than
+  eager, not `>=1.10x` tokens/sec.
+- Current dense `docblock_bias` training still reproduces the bad learning
+  trend on this code state:
+  - Directory: `train300_flash_dense_current_ckpt/`
+  - Log: `train300_flash_dense_current.log`
+  - Config: packed 1024 doc-block config, `attention_impl=flash`,
+    `docblock_bias_seq_len=1024`, compile enabled, `max_steps=300`
+  - Step 300: `loss=11.4384`, `gen=7.3779`, `disc=0.4060`, `acc=0.8511`,
+    `tok/s=31258.0`
+  - This is consistent with the earlier 1000-step dense route collapse and is
+    not acceptable even though the dense route is faster than the ragged route.
+- Current eager control on the same code/config:
+  - Directory: `train300_eager_current_ckpt/`
+  - Log: `train300_eager_current.log`
+  - Step 300: `loss=10.0244`, `gen=6.1700`, `disc=0.3854`, `acc=0.8617`,
+    `tok/s=34915.4`
+  - Dense flash is about `0.895x` eager tokens/sec for this actual training
+    run, and the generator loss is materially worse. The issue is not just
+    speed; the dense route is still corrupting learning.
+  - Added `tools/flashdeberta_rtd_compare_step.py` to compare eager vs dense
+    flash on one identical packed batch and identical initial weights.
+- Need end-to-end packed config speed artifacts for `S in {1024, 2048, 4096}`
+  with GPU name, driver, torch/triton versions, config hash, and tokens/sec for
+  both eager and flash arms.
+- Need one `>=500` step packed `2048` training run per arm with compressed
+  metrics and final MLM loss/discriminator accuracy within 1% relative.
+
+### Likely Next Fix Areas
+
+- Dense `docblock_bias` route:
+  - Found a concrete layout bug: `_flash_docblock_bias` returns `(B,H,S,D)`,
+    but the adapter viewed it directly as `(B,S,H*D)` instead of transposing to
+    `(B,S,H,D)` first.
+  - Added a regression in
+    `tests/test_flashdeberta_patch.py::test_flash_attention_docblock_bias_path_records_stats`
+    with per-head/per-token sentinels that fails on the bad layout.
+  - Paired one-step diagnostic before fix:
+    `rtd_compare_docbias_step0.json`
+    - generator active hidden mean abs `0.2196`
+    - generator masked-logit mean abs `0.1366`
+    - discriminator active-logit mean abs `0.0598`
+    - corrupted token mismatches: `50`
+  - Paired one-step diagnostic after layout fix:
+    `rtd_compare_docbias_step0_after_layout_fix.json`
+    - generator active hidden mean abs `0.0026`
+    - generator masked-logit mean abs `0.00275`
+    - discriminator active-logit mean abs `0.00103`
+    - corrupted token mismatches: `1`
+  - Dense flash 300-step validation after layout fix:
+    - Directory: `train300_flash_dense_after_layout_fix_ckpt/`
+    - Log: `train300_flash_dense_after_layout_fix.log`
+    - Step 300: `loss=10.5376`, `gen=6.4850`, `disc=0.4053`,
+      `acc=0.8576`, `tok/s=31233.0`
+    - This is no longer degenerate like the pre-fix dense flash run
+      (`gen=7.3779`, `acc=0.8511`), but it is still behind eager
+      (`gen=6.1700`, `acc=0.8617`, `tok/s=34915.4`).
+    - RTD prediction inspection after fix:
+      `rtd_prediction_inspect_flash_dense_after_layout_fix300.json`
+      - active probability mean `0.1353`, std `0.0560`
+      - replaced probability mean `0.1512`, std `0.0674`, max `0.6602`
+      - original probability mean `0.1328`, std `0.0534`
+      - discriminator accuracy `0.8613`, generator loss `6.1681` on the
+        inspection batch
+    - Current eager 300-step inspection:
+      `rtd_prediction_inspect_eager_current300.json`
+      - replaced probability mean `0.1609`, std `0.0906`, max `0.5521`
+      - discriminator accuracy `0.8655`, generator loss `5.7707`
+    - The old pre-fix flash 1000-step inspection had replaced probabilities
+      nearly collapsed around `0.168`. The layout fix removes that flat
+      discriminator behavior, but the route still trails eager and the speed
+      gate still fails.
+    - Dense post-layout parity:
+      `parity_docbias_after_layout_fix.log`
+      - `docbias_1024`: pass
+      - `docbias_2048`: pass; this was the previous failing dense case.
+      - `docbias_4096`: pass
+      - Checked tensors: last hidden state, word embedding gradient, relative
+        embedding gradient, layer-0 query gradient, and layer-0 value gradient.
+      - The largest dense output error now matches eager bf16 error against
+        fp32 reference instead of exceeding the strict `3x` threshold.
+- Ragged `docblock` route:
+  - Current bottleneck is `_bwd_kv_dise_kernel_varlen`, not pack/unpack.
+  - If tile tuning is insufficient, real fixes are kernel-level: bucket LUT,
+    deterministic/segmented position-gradient accumulation, or a true
+    doc-block-specialized backward kernel rather than generic varlen.
+
+### Failed Speed Attempt: Dense Bias Bucket Reduce Reuse
+
+Attempted to replace the dense `docblock_bias` backward's local
+`scatter_add_` bucket reduction with the existing `_dense_bucket_reduce`
+helper from `flashdeberta_dense_bias_op.py`.
+
+- Correctness tests passed:
+  `pytest tests/test_flashdeberta_patch.py -k "dense_bias or bucket_reduce or docblock_bias or position_bias" -q`
+  reported `10 passed, 4 skipped, 48 deselected`.
+- Profile directory: `rtd_flash_dense_after_bucket_reduce_profile/`
+- Median step worsened from `1078.76 ms` to `1385.11 ms`.
+- Mean step worsened from `1301.06 ms` to `1603.29 ms`.
+- Peak memory increased from `5.93 GiB` to `6.47 GiB`.
+- The `scatter_add_` hotspot disappeared, but was replaced by large
+  `aten::gather`, `aten::cumsum`, and `aten::where` costs.
+
+Decision: revert this attempt. The dense-route speed fix needs to move the
+position-gradient bucket reduction into a Triton/custom-op path or into the
+specialized attention backward itself. A PyTorch `cumsum/gather/where`
+post-process is slower at the target 1024 shape.
+
+### Dense Docblock Direct Positional-Gradient Backward
+
+Implemented the next kernel-level attempt for dense `docblock_bias`: the exact
+1024 specialized Triton backward now optionally accumulates `dpos_key` and
+`dpos_query` directly from the KV/Q backward tiles with `tl.atomic_add`, instead
+of materializing full dense `d_bias` and reducing it through PyTorch.
+
+Correctness:
+
+- `parity_docbias_1024_direct_dpos.log`: pass.
+- `parity_docbias_direct_dpos.log`: pass for `docbias_1024`,
+  `docbias_2048`, and `docbias_4096`.
+- Checked tensors remained: last hidden state, word embedding gradient,
+  relative embedding gradient, layer-0 query gradient, and layer-0 value
+  gradient.
+
+Profiles:
+
+- GA=8 profile directory: `rtd_flash_dense_direct_dpos_profile/`
+  - Median step improved from the post-layout `1078.76 ms` baseline to
+    `804.60 ms`.
+  - Peak memory improved from `5.93 GiB` to `5.76 GiB`.
+  - `aten::scatter_add_` disappeared from the CUDA hotspot table.
+  - Kernel time shifted into `_bwd_kv_kernel_docblock1024` and
+    `_bwd_q_kernel_docblock1024`, as expected from direct atomics.
+- Apples-to-apples GA=1 warm6 profile directory:
+  `rtd_flash_dense_direct_dpos_warm6/`
+  - Eager warm6 median step: `130.57 ms`.
+  - Old dense flash warm6 median step: `200.61 ms`.
+  - Direct dense flash warm6 median step: `111.08 ms`.
+  - Direct dense flash is `1.18x` faster than eager at 1024 and uses
+    `5.26 GiB` peak memory versus eager `7.26 GiB`.
+
+Interpretation: the dense 1024 route now satisfies the 1024 speed target on
+the local RTX 5090 and no longer shows the earlier degenerate learning
+behavior. The remaining speed gate is the ragged `docblock` route at 2048 and
+4096.
+
+### 2048 And 4096 Packed Docblock Profiles
+
+All profiles below used `block_cross_document_attention=true` and the packed
+RTD configs under `configs/custom/`. These are end-to-end RTD optimizer-step
+measurements, not attention-only microbenchmarks.
+
+Fresh 2048 pairwise eager baseline:
+
+- Directory: `rtd_eager_docblock2048/`
+- Median step: `1799.98 ms`
+- Peak memory: `11.37 GiB`
+
+Fresh 2048 ragged `docblock` flash:
+
+- Directory: `rtd_flash_docblock2048/`
+- Median step: `2298.84 ms`
+- Peak memory: `6.87 GiB`
+- Hotspot: `_bwd_kv_dise_kernel_varlen`, about `8.26 ms/call`.
+
+Result: ragged 2048 saves memory but is slower than eager. It fails the speed
+gate and confirms the same root cause seen at 1024: generic varlen backward is
+not competitive for packed doc-block RTD.
+
+2048 dense `docblock_bias` with direct positional-gradient backward:
+
+- Directory: `rtd_flash_docblock_bias2048_direct_probe/`
+- Median step: `1169.59 ms`
+- Peak memory: `5.83 GiB`
+- Speedup versus 2048 eager: `1.54x`
+- `aten::scatter_add_` is gone from the CUDA hotspot table.
+- Main kernels:
+  - `_bwd_kv_kernel_docblock1024`: about `1.59 ms/call`
+  - `_bwd_q_kernel_docblock1024`: about `1.42 ms/call`
+  - `_dense_bias_fwd_kernel`: about `0.62 ms/call`
+
+Result: dense 2048 is now both correct by parity and faster than eager by more
+than the `1.25x` target. This route remains O(S^2) in the dense-bias forward,
+so the route-policy question needs an explicit documented decision rather than
+being hidden in the benchmark command.
+
+Fresh 4096 pairwise eager baseline:
+
+- Directory: `rtd_eager_docblock4096_probe/`
+- Median step: `2887.31 ms`
+- Peak memory: `18.44 GiB`
+
+Fresh 4096 ragged `docblock` flash:
+
+- Directory: `rtd_flash_docblock4096_probe/`
+- Median step: `2647.20 ms`
+- Peak memory: `6.90 GiB`
+- Speedup versus 4096 eager: `1.09x`
+- Hotspot: `_bwd_kv_dise_kernel_varlen`, about `10.83 ms/call`.
+
+Result: ragged 4096 is faster than eager but misses the `1.25x` gate. The
+generic varlen backward is still the bottleneck.
+
+4096 dense `docblock_bias` before direct positional-gradient specialization:
+
+- Directory: `rtd_flash_docblock_bias4096_warm_probe/`
+- Median step: `2889.20 ms`
+- Peak memory: `7.79 GiB`
+- Hotspot: `aten::scatter_add_`, about `1.95 s` over the profiled window.
+- Dense-bias forward cost: about `1.16 s` over the profiled window.
+
+Result: dense 4096 without direct positional-gradient accumulation is roughly
+tied with eager and fails the speed gate. The next concrete hypothesis is that
+enabling the direct positional-gradient kernels for 4096 can remove the
+`scatter_add_` cost and possibly bring median step time under the `2310 ms`
+threshold needed for a `1.25x` speedup versus eager.
+
+4096 dense `docblock_bias` with direct positional-gradient backward:
+
+- Code change under test:
+  - Widened the table-gated dense doc-block specialization from
+    `{1024, 2048}` to `{1024, 2048, 4096}`.
+  - Added `sm_120` tuning-table rows for `dense_bias/fwd` and
+    `bias_docblock_specialized/{bwd,bwd_kv,bwd_q}` at `4096_plus`.
+  - Added a resolver regression so missing rows fail in pytest instead of
+    silently falling back to the PyTorch dense positional-gradient reduction.
+- Correctness:
+  - `parity_docbias_4096_direct_specialized.log`: pass.
+  - Largest output error matched eager bf16 versus fp32 reference:
+    `3.2894e-02`.
+  - Checked gradient tensors passed: word embeddings, relative embeddings,
+    layer-0 query projection, and layer-0 value projection.
+- Profile directory: `rtd_flash_docblock_bias4096_direct_probe/`
+- Median step: `1979.94 ms`
+- Peak memory: `6.18 GiB`
+- Speedup versus 4096 eager probe: `1.46x`
+- Main kernels:
+  - `_dense_bias_fwd_kernel`: about `1.77 ms/call`
+  - `_bwd_q_kernel_docblock1024`: about `2.79 ms/call`
+  - `_bwd_kv_kernel_docblock1024`: about `2.78 ms/call`
+
+Result: the direct dense 4096 route now clears the `1.25x` probe target and
+removes the PyTorch `scatter_add_` hotspot. This still needs the formal
+`>=10` warmup / `>=50` step profiling window before it can count for the speed
+gate.
+
+### Route-Policy Decision
+
+Before the layout and direct-position-gradient fixes, dense `docblock_bias`
+could not be the default: it was degenerate in short RTD training and slower in
+several end-to-end runs. That is no longer the current state:
+
+- The adapter layout bug is fixed and protected by a sentinel regression.
+- Dense parity now covers `docbias_1024`, `docbias_2048`, and `docbias_4096`.
+- Dense direct-position-gradient probes beat eager at all shipped packed
+  lengths:
+  - `1024`: `111.08 ms` versus eager `130.57 ms` (`1.18x`)
+  - `2048`: `1169.59 ms` versus eager `1799.98 ms` (`1.54x`)
+  - `4096`: `1979.94 ms` versus eager `2887.31 ms` (`1.46x`)
+- Ragged `docblock` remains correct but is still bottlenecked by generic
+  varlen backward at `2048`/`4096`.
+
+Decision: promote dense `docblock_bias` through the JSON route table for the
+measured packed `1024`/`2048`/`4096` buckets. Keep ragged `docblock` as a
+forced ablation/hardware-retuning route via
+`model.hf.flash.docblock_bias_seq_len=0`.
