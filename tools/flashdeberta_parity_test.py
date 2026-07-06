@@ -7,6 +7,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -41,6 +42,7 @@ class ParityCase:
     route_hint: str
     pad_tail: int = 0
     docblock: bool = False
+    strict_ratio: bool = False
 
 
 def _build_tiny_config(*, seq_len: int, flash: bool) -> DebertaV2Config:
@@ -82,9 +84,41 @@ def _copy_weights(src: torch.nn.Module, dst: torch.nn.Module) -> None:
     dst.load_state_dict(src.state_dict(), strict=True)
 
 
-def _case_payload(
-    case: ParityCase, *, cfg: DebertaV2Config, device: torch.device
-) -> dict[str, torch.Tensor | FlashBatchMeta | None]:
+def _doc_ids_for_case(case: ParityCase) -> torch.Tensor:
+    """Build packed document ids with at least three docs per active row.
+
+    :param ParityCase case: Doc-block parity case.
+    :return torch.Tensor: CPU doc ids in ``(B,S)`` layout.
+    """
+
+    if not case.docblock:
+        raise ValueError("_doc_ids_for_case requires a doc-block case.")
+    active_len = int(case.seq_len) - int(case.pad_tail)
+    if active_len < 3:
+        raise ValueError(f"Doc-block parity case needs at least three active tokens: {case}")
+    first = max(1, active_len // 5)
+    second = max(1, active_len // 3)
+    third = active_len - first - second
+    if third <= 0:
+        third = 1
+        second = max(1, active_len - first - third)
+    lengths = (first, second, third)
+
+    doc_ids = torch.zeros((case.batch_size, case.seq_len), dtype=torch.long)
+    for row in range(case.batch_size):
+        cursor = 0
+        rotation = row % len(lengths)
+        row_lengths = lengths[rotation:] + lengths[:rotation]
+        for doc_idx, length in enumerate(row_lengths, start=1):
+            next_cursor = min(active_len, cursor + int(length))
+            doc_ids[row, cursor:next_cursor] = int(doc_idx)
+            cursor = next_cursor
+        if cursor < active_len:
+            doc_ids[row, cursor:active_len] = len(row_lengths)
+    return doc_ids
+
+
+def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.device) -> dict[str, Any]:
     """Build inputs and flash metadata for one route case."""
 
     input_ids = torch.randint(5, cfg.vocab_size, (case.batch_size, case.seq_len), device=device)
@@ -98,10 +132,7 @@ def _case_payload(
     doc_max_seqlen: int | None = None
 
     if case.docblock:
-        doc_ids_cpu = torch.zeros((case.batch_size, case.seq_len), dtype=torch.long)
-        split = max(2, case.seq_len // 2)
-        doc_ids_cpu[:, :split] = 1
-        doc_ids_cpu[:, split : case.seq_len - case.pad_tail] = 2
+        doc_ids_cpu = _doc_ids_for_case(case)
         if case.pad_tail > 0:
             input_ids[:, -case.pad_tail :] = int(cfg.pad_token_id)
         doc_ids = doc_ids_cpu.to(device=device)
@@ -144,18 +175,27 @@ def _case_payload(
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "flash_meta": flash_meta,
+        "loss_mask": doc_ids_cpu.ne(0).to(device=device)
+        if case.docblock
+        else (
+            attention_mask.bool()
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2
+            else None
+        ),
     }
 
 
-def _run(
-    model: DebertaV2Model,
-    payload: dict[str, torch.Tensor | FlashBatchMeta | None],
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+def _run(model: DebertaV2Model, payload: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run one forward/backward pass and return selected gradients."""
 
     model.zero_grad(set_to_none=True)
-    out = model(**payload).last_hidden_state
-    loss = out.float().pow(2).mean()
+    model_payload = dict(payload)
+    loss_mask = model_payload.pop("loss_mask", None)
+    out = model(**model_payload).last_hidden_state
+    if isinstance(loss_mask, torch.Tensor):
+        loss = out.float()[loss_mask.bool()].pow(2).mean()
+    else:
+        loss = out.float().pow(2).mean()
     loss.backward()
     grads = {
         "word_embeddings": model.embeddings.word_embeddings.weight.grad,
@@ -196,6 +236,42 @@ def _assert_close_to_reference(
     return max_abs, mean_abs
 
 
+def _assert_ratio_to_reference(
+    *,
+    case_name: str,
+    label: str,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    eager_err: tuple[float, float],
+) -> tuple[float, float]:
+    """Assert flash error stays within the eager-bf16 error envelope.
+
+    :param str case_name: Case name.
+    :param str label: Tensor label.
+    :param torch.Tensor actual: Flash tensor.
+    :param torch.Tensor reference: fp32 eager reference tensor.
+    :param tuple[float, float] eager_err: Eager ``(max_abs, mean_abs)`` errors.
+    :return tuple[float, float]: Observed flash errors.
+    """
+
+    diff = (actual.float() - reference.float()).abs()
+    max_abs = float(diff.max().item())
+    mean_abs = float(diff.mean().item())
+    max_limit = max(3.0 * float(eager_err[0]), 1e-7)
+    mean_limit = max(3.0 * float(eager_err[1]), 1e-8)
+    print(
+        f"{case_name:14s} {label:18s} max_abs={max_abs:.4e} "
+        f"mean_abs={mean_abs:.4e} limits=({max_limit:.4e},{mean_limit:.4e})"
+    )
+    if max_abs > max_limit or mean_abs > mean_limit:
+        raise AssertionError(
+            f"{case_name} {label} exceeded 3x eager-bf16 error: "
+            f"max_abs={max_abs:.4e} > {max_limit:.4e} or "
+            f"mean_abs={mean_abs:.4e} > {mean_limit:.4e}"
+        )
+    return max_abs, mean_abs
+
+
 def _scaled_grad_limits(reference: torch.Tensor, *, max_rel: float, mean_rel: float) -> tuple[float, float]:
     """Return scale-aware absolute limits for a gradient tensor."""
 
@@ -220,15 +296,18 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
     ref_payload = dict(payload)
     ref_payload.pop("flash_meta")
     if case.route_hint == "docblock":
-        doc_ids = torch.zeros((case.batch_size, case.seq_len), device=device, dtype=torch.long)
-        split = max(2, case.seq_len // 2)
-        doc_ids[:, :split] = 1
-        doc_ids[:, split : case.seq_len - case.pad_tail] = 2
+        doc_ids = _doc_ids_for_case(case).to(device=device)
         ref_payload["attention_mask"] = build_doc_block_mask(doc_ids)
 
     ref_out, ref_grads = _run(ref, ref_payload)
     eager_out, eager_grads = _run(eager, ref_payload)
     flash_out, flash_grads = _run(flash, payload)
+    compare_mask = payload.get("loss_mask")
+    if isinstance(compare_mask, torch.Tensor):
+        mask = compare_mask.bool()
+        ref_out = ref_out[mask]
+        eager_out = eager_out[mask]
+        flash_out = flash_out[mask]
 
     eager_out_max, eager_out_mean = _assert_close_to_reference(
         case_name=case.name,
@@ -238,14 +317,23 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
         max_abs_limit=5e-2,
         mean_abs_limit=8e-3,
     )
-    _assert_close_to_reference(
-        case_name=case.name,
-        label="flash_bf16_out",
-        actual=flash_out,
-        reference=ref_out,
-        max_abs_limit=max(3.0 * eager_out_max, 7e-2),
-        mean_abs_limit=max(3.0 * eager_out_mean, 1.2e-2),
-    )
+    if case.strict_ratio:
+        _assert_ratio_to_reference(
+            case_name=case.name,
+            label="flash_bf16_out",
+            actual=flash_out,
+            reference=ref_out,
+            eager_err=(eager_out_max, eager_out_mean),
+        )
+    else:
+        _assert_close_to_reference(
+            case_name=case.name,
+            label="flash_bf16_out",
+            actual=flash_out,
+            reference=ref_out,
+            max_abs_limit=max(3.0 * eager_out_max, 7e-2),
+            mean_abs_limit=max(3.0 * eager_out_mean, 1.2e-2),
+        )
     for key in ("word_embeddings", "rel_embeddings", "query", "value"):
         eager_max_limit, eager_mean_limit = _scaled_grad_limits(
             ref_grads[key],
@@ -260,19 +348,28 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
             max_abs_limit=eager_max_limit,
             mean_abs_limit=eager_mean_limit,
         )
-        flash_max_limit, flash_mean_limit = _scaled_grad_limits(
-            ref_grads[key],
-            max_rel=0.5,
-            mean_rel=0.5,
-        )
-        _assert_close_to_reference(
-            case_name=case.name,
-            label=f"flash_grad_{key}",
-            actual=flash_grads[key],
-            reference=ref_grads[key],
-            max_abs_limit=max(3.0 * eager_grad_max, flash_max_limit),
-            mean_abs_limit=max(3.0 * eager_grad_mean, flash_mean_limit),
-        )
+        if case.strict_ratio:
+            _assert_ratio_to_reference(
+                case_name=case.name,
+                label=f"flash_grad_{key}",
+                actual=flash_grads[key],
+                reference=ref_grads[key],
+                eager_err=(eager_grad_max, eager_grad_mean),
+            )
+        else:
+            flash_max_limit, flash_mean_limit = _scaled_grad_limits(
+                ref_grads[key],
+                max_rel=0.5,
+                mean_rel=0.5,
+            )
+            _assert_close_to_reference(
+                case_name=case.name,
+                label=f"flash_grad_{key}",
+                actual=flash_grads[key],
+                reference=ref_grads[key],
+                max_abs_limit=max(3.0 * eager_grad_max, flash_max_limit),
+                mean_abs_limit=max(3.0 * eager_grad_mean, flash_mean_limit),
+            )
 
 
 def main() -> None:
@@ -288,15 +385,94 @@ def main() -> None:
         ParityCase("varlen", seq_len=256, batch_size=2, route_hint="varlen", pad_tail=64),
         ParityCase("local_bias", seq_len=1024, batch_size=2, route_hint="dense"),
         ParityCase("docblock", seq_len=256, batch_size=2, route_hint="docblock", pad_tail=32, docblock=True),
+        ParityCase(
+            "docblock_1024",
+            seq_len=1024,
+            batch_size=1,
+            route_hint="docblock",
+            pad_tail=96,
+            docblock=True,
+            strict_ratio=True,
+        ),
+        ParityCase(
+            "docblock_2048",
+            seq_len=2048,
+            batch_size=1,
+            route_hint="docblock",
+            pad_tail=160,
+            docblock=True,
+            strict_ratio=True,
+        ),
+        ParityCase(
+            "docblock_4096",
+            seq_len=4096,
+            batch_size=1,
+            route_hint="docblock",
+            pad_tail=256,
+            docblock=True,
+            strict_ratio=True,
+        ),
     ]
-    if str(os.environ.get("FLASHDEBERTA_INCLUDE_EXPERIMENTAL_DOCBLOCK_BIAS", "")).strip().lower() in {
+    include_docblock_bias = str(
+        os.environ.get("FLASHDEBERTA_SKIP_DOCBLOCK_BIAS", "")
+    ).strip().lower() not in {
         "1",
         "true",
         "yes",
-    }:
+    }
+    if include_docblock_bias:
         cases.append(
             ParityCase("docblock_bias", seq_len=1024, batch_size=2, route_hint="docblock_bias", docblock=True)
         )
+        cases.extend(
+            [
+                ParityCase(
+                    "docbias_1024_b4",
+                    seq_len=1024,
+                    batch_size=4,
+                    route_hint="docblock_bias",
+                    docblock=True,
+                    strict_ratio=True,
+                ),
+                ParityCase(
+                    "docbias_1024",
+                    seq_len=1024,
+                    batch_size=1,
+                    route_hint="docblock_bias",
+                    pad_tail=96,
+                    docblock=True,
+                    strict_ratio=True,
+                ),
+                ParityCase(
+                    "docbias_2048",
+                    seq_len=2048,
+                    batch_size=1,
+                    route_hint="docblock_bias",
+                    pad_tail=160,
+                    docblock=True,
+                    strict_ratio=True,
+                ),
+                ParityCase(
+                    "docbias_4096",
+                    seq_len=4096,
+                    batch_size=1,
+                    route_hint="docblock_bias",
+                    pad_tail=256,
+                    docblock=True,
+                    strict_ratio=True,
+                ),
+            ]
+        )
+    requested_cases = {
+        item.strip()
+        for item in str(os.environ.get("FLASHDEBERTA_PARITY_CASES", "")).split(",")
+        if item.strip()
+    }
+    if requested_cases:
+        cases = [case for case in cases if case.name in requested_cases]
+        missing = requested_cases.difference(case.name for case in cases)
+        if missing:
+            raise ValueError(f"Unknown parity cases requested: {sorted(missing)}")
     for case in cases:
         _run_case(case, device=device)
     print("OK")

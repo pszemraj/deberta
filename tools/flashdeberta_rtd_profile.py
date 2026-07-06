@@ -15,9 +15,12 @@ It is intentionally single-process and profiler-first:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -118,6 +121,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional override for model.hf.flash.kernel_overrides_path.",
     )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Measure wall-clock phases without torch.profiler traces or profiler overhead.",
+    )
     parser.add_argument("--profile-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -149,6 +157,56 @@ def _write_profiler_outputs(profile_dir: Path, profiler: torch.profiler.profile)
     cpu_table = profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=120)
     (profile_dir / "key_averages_cuda.txt").write_text(cuda_table + "\n", encoding="utf-8")
     (profile_dir / "key_averages_cpu.txt").write_text(cpu_table + "\n", encoding="utf-8")
+
+
+def _package_version(name: str) -> str | None:
+    """Return an installed package version when available."""
+
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _nvidia_driver_version() -> str | None:
+    """Return the NVIDIA driver version from ``nvidia-smi`` when available."""
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader,nounits"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    line = result.stdout.strip().splitlines()
+    return line[0].strip() if line else None
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the SHA256 digest for a local file."""
+
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _run_config_hash(*, config: str, config_sha256: str, overrides: list[str]) -> str:
+    """Return a stable hash for the config file plus runtime overrides."""
+
+    payload = json.dumps(
+        {
+            "config": str(config),
+            "config_sha256": str(config_sha256),
+            "overrides": list(overrides),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class _TimedPhase:
@@ -742,62 +800,68 @@ def main() -> None:
                 max_grad_norm=float(train_cfg.max_grad_norm),
             )
 
-    metrics: list[dict[str, float]] = []
-    with torch.profiler.profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=False,
-    ) as profiler:
-        for _ in range(int(args.profile_steps)):
-            if effective_decoupled_training:
-                step_metrics = _run_decoupled_window(
-                    model=model,
-                    train_iter=train_iter,
-                    ga_steps=ga_steps,
-                    token_weighted_ga=token_weighted_ga,
-                    disc_pad_token_id=disc_pad_token_id,
-                    device=device,
-                    compile_enabled=compile_enabled,
-                    compile_scope=compile_scope,
-                    backbone_type=str(model_cfg.backbone_type),
-                    flash_enabled=flash_enabled,
-                    flash_cfg=getattr(model_cfg.hf, "flash", None),
-                    gen_optimizer=gen_optimizer,
-                    disc_optimizer=disc_optimizer,
-                    gen_lr_scheduler=gen_lr_scheduler,
-                    disc_lr_scheduler=disc_lr_scheduler,
-                    phase_times_ms=phase_times_ms,
-                    mixed_precision=mixed_precision,
-                    sampling_temperature=float(train_cfg.sampling_temperature),
-                    max_grad_norm=float(train_cfg.max_grad_norm),
-                )
-            else:
-                step_metrics = _run_coupled_window(
-                    model=model,
-                    train_iter=train_iter,
-                    ga_steps=ga_steps,
-                    token_weighted_ga=token_weighted_ga,
-                    disc_pad_token_id=disc_pad_token_id,
-                    device=device,
-                    compile_enabled=compile_enabled,
-                    compile_scope=compile_scope,
-                    backbone_type=str(model_cfg.backbone_type),
-                    flash_enabled=flash_enabled,
-                    flash_cfg=getattr(model_cfg.hf, "flash", None),
-                    optimizer=optimizer,
-                    lr_scheduler=lr_scheduler,
-                    phase_times_ms=phase_times_ms,
-                    mixed_precision=mixed_precision,
-                    gen_loss_weight=float(train_cfg.gen_loss_weight),
-                    disc_loss_weight=float(train_cfg.disc_loss_weight),
-                    sampling_temperature=float(train_cfg.sampling_temperature),
-                    max_grad_norm=float(train_cfg.max_grad_norm),
-                )
-            metrics.append(step_metrics)
-            profiler.step()
+    def _run_measured_window() -> dict[str, float]:
+        """Run one measured optimizer window."""
 
-    _write_profiler_outputs(args.profile_dir, profiler)
+        if effective_decoupled_training:
+            return _run_decoupled_window(
+                model=model,
+                train_iter=train_iter,
+                ga_steps=ga_steps,
+                token_weighted_ga=token_weighted_ga,
+                disc_pad_token_id=disc_pad_token_id,
+                device=device,
+                compile_enabled=compile_enabled,
+                compile_scope=compile_scope,
+                backbone_type=str(model_cfg.backbone_type),
+                flash_enabled=flash_enabled,
+                flash_cfg=getattr(model_cfg.hf, "flash", None),
+                gen_optimizer=gen_optimizer,
+                disc_optimizer=disc_optimizer,
+                gen_lr_scheduler=gen_lr_scheduler,
+                disc_lr_scheduler=disc_lr_scheduler,
+                phase_times_ms=phase_times_ms,
+                mixed_precision=mixed_precision,
+                sampling_temperature=float(train_cfg.sampling_temperature),
+                max_grad_norm=float(train_cfg.max_grad_norm),
+            )
+        return _run_coupled_window(
+            model=model,
+            train_iter=train_iter,
+            ga_steps=ga_steps,
+            token_weighted_ga=token_weighted_ga,
+            disc_pad_token_id=disc_pad_token_id,
+            device=device,
+            compile_enabled=compile_enabled,
+            compile_scope=compile_scope,
+            backbone_type=str(model_cfg.backbone_type),
+            flash_enabled=flash_enabled,
+            flash_cfg=getattr(model_cfg.hf, "flash", None),
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            phase_times_ms=phase_times_ms,
+            mixed_precision=mixed_precision,
+            gen_loss_weight=float(train_cfg.gen_loss_weight),
+            disc_loss_weight=float(train_cfg.disc_loss_weight),
+            sampling_temperature=float(train_cfg.sampling_temperature),
+            max_grad_norm=float(train_cfg.max_grad_norm),
+        )
+
+    metrics: list[dict[str, float]] = []
+    if bool(args.summary_only):
+        for _ in range(int(args.profile_steps)):
+            metrics.append(_run_measured_window())
+    else:
+        with torch.profiler.profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        ) as profiler:
+            for _ in range(int(args.profile_steps)):
+                metrics.append(_run_measured_window())
+                profiler.step()
+        _write_profiler_outputs(args.profile_dir, profiler)
 
     phase_summary: dict[str, dict[str, float]] = {}
     for name, values in sorted(phase_times_ms.items()):
@@ -809,9 +873,33 @@ def main() -> None:
             "count": float(len(values)),
         }
 
+    config_path = Path(args.config)
+    config_sha256 = _sha256_file(config_path)
+    step_total_ms = [float(value) for value in phase_times_ms.get("step_total", [])]
+    input_tokens_per_sec = [
+        float(metric["input_tokens"]) / (float(step_ms) / 1000.0)
+        for metric, step_ms in zip(metrics, step_total_ms, strict=False)
+        if float(step_ms) > 0.0
+    ]
     summary = {
         "mode": str(args.mode),
         "config": str(args.config),
+        "config_file_sha256": config_sha256,
+        "run_config_hash": _run_config_hash(
+            config=str(args.config),
+            config_sha256=config_sha256,
+            overrides=overrides,
+        ),
+        "overrides": list(overrides),
+        "environment": {
+            "gpu_name": torch.cuda.get_device_name(device),
+            "cuda_device_capability": list(torch.cuda.get_device_capability(device)),
+            "nvidia_driver_version": _nvidia_driver_version(),
+            "torch_version": torch.__version__,
+            "torch_cuda_version": torch.version.cuda,
+            "triton_version": _package_version("triton"),
+            "flashdeberta_version": _package_version("flashdeberta"),
+        },
         "packing_enabled": bool(data_cfg.pack_sequences),
         "compile_enabled": bool(compile_enabled),
         "compile_scope": str(compile_scope),
@@ -819,12 +907,21 @@ def main() -> None:
         "token_weighted_ga": bool(token_weighted_ga),
         "warmup_steps": int(args.warmup_steps),
         "profile_steps": int(args.profile_steps),
+        "summary_only": bool(args.summary_only),
         "max_memory_gib": float(torch.cuda.max_memory_allocated(device) / (1024**3)),
         "step_metrics_mean": {
             key: float(statistics.mean([float(m[key]) for m in metrics])) for key in sorted(metrics[0].keys())
         }
         if metrics
         else {},
+        "throughput": {
+            "input_tokens_per_sec_mean": float(statistics.mean(input_tokens_per_sec))
+            if input_tokens_per_sec
+            else float("nan"),
+            "input_tokens_per_sec_median": float(statistics.median(input_tokens_per_sec))
+            if input_tokens_per_sec
+            else float("nan"),
+        },
         "phase_summary": phase_summary,
     }
     (args.profile_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
