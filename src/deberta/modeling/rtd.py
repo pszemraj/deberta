@@ -650,10 +650,7 @@ class RTDHead(nn.Module):
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return bool: ``True`` when global CLS conditioning should be applied.
         """
-        if flash_meta is not None and (
-            flash_meta.normalized_route_hint() in {"docblock", "docblock_bias"}
-            or flash_meta.doc_segment_offsets is not None
-        ):
+        if flash_meta is not None and flash_meta.is_cross_document():
             return False
         if attention_mask is None:
             return True

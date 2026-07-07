@@ -50,6 +50,23 @@ class FlashBatchMeta:
         text = str(self.route_hint).strip().lower()
         return text if text else None
 
+    def is_cross_document(self) -> bool:
+        """Return whether this batch carries packed cross-document semantics.
+
+        This is the single source of truth for "is this a doc-block batch".
+        Consumers that mix information across sequence positions (for example
+        global CLS conditioning) must check it before doing so, because
+        doc-block batches ship a compact 2D keep mask whose pairwise
+        document-blocking semantics live in this metadata instead.
+
+        :return bool: True when the batch routes through a doc-block path or ships doc-segment metadata.
+        """
+
+        return (
+            self.normalized_route_hint() in {"docblock", "docblock_bias"}
+            or self.doc_segment_offsets is not None
+        )
+
 
 def normalize_keep_mask(mask: torch.Tensor, *, name: str = "attention_mask") -> torch.Tensor:
     """Normalize a keep-mask tensor to boolean without lossy float coercion.

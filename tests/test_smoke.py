@@ -1818,6 +1818,21 @@ def test_rtd_head_skips_cls_conditioning_for_docblock_flash_meta():
     )
 
 
+def test_flash_batch_meta_is_cross_document_predicate():
+    from deberta.modeling.mask_utils import FlashBatchMeta
+
+    assert FlashBatchMeta().is_cross_document() is False
+    assert FlashBatchMeta(route_hint="dense").is_cross_document() is False
+    assert FlashBatchMeta(route_hint="varlen").is_cross_document() is False
+    assert FlashBatchMeta(route_hint="docblock").is_cross_document() is True
+    assert FlashBatchMeta(route_hint="docblock_bias").is_cross_document() is True
+    assert FlashBatchMeta(route_hint=" DOCBLOCK ").is_cross_document() is True
+    assert (
+        FlashBatchMeta(doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32)).is_cross_document()
+        is True
+    )
+
+
 def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
     import pytest
 
