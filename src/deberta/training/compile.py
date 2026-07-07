@@ -11,6 +11,7 @@ import torch
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
 from deberta.modeling.flashdeberta_kernel_tuning import (
     configure_flashdeberta_kernel_overrides,
+    flash_padding_route,
     flash_route_choice,
     flash_seq_bucket,
 )
@@ -127,22 +128,6 @@ def _resolve_compile_enabled_or_raise(requested: bool) -> bool:
     return True
 
 
-def _flash_density_bucket(*, seq_len: int, active_tokens: int, batch_size: int) -> str:
-    """Return the repo-local density bucket for one padded batch.
-
-    :param int seq_len: Padded sequence length.
-    :param int active_tokens: Total active tokens across the batch.
-    :param int batch_size: Batch size.
-    :return str: Density bucket label.
-    """
-
-    return flash_seq_bucket(
-        seq_len=int(seq_len),
-        total_tokens=int(active_tokens),
-        batch_size=int(batch_size),
-    )
-
-
 def _flash_route_hint_for_padding_batch(
     *,
     seq_len: int,
@@ -159,30 +144,13 @@ def _flash_route_hint_for_padding_batch(
     :return str: Either ``fixed`` or ``varlen``.
     """
 
-    if _flash_cfg_bool(
-        flash_cfg,
-        name="force_varlen",
-        default="0",
-    ):
-        return "varlen"
-    override_varlen_min_seq_len = _flash_cfg_optional_int(
-        flash_cfg,
-        name="varlen_min_seq_len",
-        default=None,
-    )
-    if override_varlen_min_seq_len is not None:
-        threshold = max(1, int(override_varlen_min_seq_len))
-        return "varlen" if int(seq_len) >= threshold else "fixed"
-
-    density_bucket = _flash_density_bucket(
+    return flash_padding_route(
         seq_len=int(seq_len),
-        active_tokens=int(active_tokens),
+        total_tokens=int(active_tokens),
         batch_size=int(batch_size),
+        force_varlen=_flash_cfg_bool(flash_cfg, name="force_varlen", default="0"),
+        varlen_min_seq_len=_flash_cfg_optional_int(flash_cfg, name="varlen_min_seq_len", default=None),
     )
-    table_route = flash_route_choice(policy="padding", seq_bucket=density_bucket)
-    if table_route in {"fixed", "varlen"}:
-        return table_route
-    return "fixed"
 
 
 def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:

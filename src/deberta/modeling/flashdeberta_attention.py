@@ -65,7 +65,7 @@ from deberta.modeling.flashdeberta_fixed_op import (
 )
 from deberta.modeling.flashdeberta_kernel_tuning import (
     configure_flashdeberta_kernel_overrides,
-    flash_route_choice,
+    flash_padding_route,
     flash_route_policy,
     flash_seq_bucket,
 )
@@ -380,11 +380,16 @@ def _should_use_varlen(
     This deliberately does not inspect tensor contents. In this repository's
     training path, the collator already drops all-ones masks, so
     ``attention_mask is None`` is the dense signal and ``attention_mask is not None``
-    is the padded signal. The repo defaults masked ``1024`` batches to the
-    fixed flash path because that measured faster than varlen on the current
-    RTD stack, while longer padded batches still route to varlen. When
-    ``torch.compile`` is active we require the opaque custom-op varlen wrapper
-    so Dynamo does not trace into FlashDeBERTa's Python/Triton launcher.
+    is the padded signal. When ``torch.compile`` is active we require the
+    opaque custom-op varlen wrapper so Dynamo does not trace into
+    FlashDeBERTa's Python/Triton launcher.
+
+    Route policy is shared with the training loop through
+    :func:`flash_padding_route`. This fallback only runs when no
+    ``flash_meta`` route hint was provided, and it cannot know batch density
+    without a host sync, so density-gated table buckets resolve to their
+    density-agnostic fallback rows here; the training path passes the
+    density-aware hint through ``FlashBatchMeta`` instead.
 
     :param torch.Tensor | None attention_mask: Optional attention mask.
     :param int seq_len: Sequence length for the current call.
@@ -399,14 +404,14 @@ def _should_use_varlen(
         return False
 
     cfg = runtime_config or _RUNTIME_CONFIG
-    if cfg.force_varlen:
-        return True
-
-    if cfg.varlen_min_seq_len is not None:
-        return int(seq_len) >= max(1, int(cfg.varlen_min_seq_len))
-
-    seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
-    return flash_route_choice(policy="padding", seq_bucket=seq_bucket) == "varlen"
+    return (
+        flash_padding_route(
+            seq_len=int(seq_len),
+            force_varlen=bool(cfg.force_varlen),
+            varlen_min_seq_len=cfg.varlen_min_seq_len,
+        )
+        == "varlen"
+    )
 
 
 def _normalize_route_hint(route_hint: str | None) -> str | None:

@@ -204,6 +204,45 @@ def flash_route_choice(*, policy: str, seq_bucket: str) -> str | None:
     return None
 
 
+def flash_padding_route(
+    *,
+    seq_len: int,
+    total_tokens: int | None = None,
+    batch_size: int | None = None,
+    force_varlen: bool = False,
+    varlen_min_seq_len: int | None = None,
+) -> str:
+    """Resolve the fixed-vs-varlen route for one padded batch shape.
+
+    This is the single policy resolver shared by the training-loop route-hint
+    path (which knows batch density) and the model-internal fallback (which
+    does not). When ``total_tokens`` is unknown, density-gated table buckets
+    are skipped, so callers with density information should always pass it.
+
+    :param int seq_len: Padded sequence length.
+    :param int | None total_tokens: Active token count, when known.
+    :param int | None batch_size: Batch size, when known.
+    :param bool force_varlen: Config override that forces the varlen route.
+    :param int | None varlen_min_seq_len: Optional config threshold overriding the table.
+    :return str: Either ``"fixed"`` or ``"varlen"``.
+    """
+
+    if force_varlen:
+        return "varlen"
+    if varlen_min_seq_len is not None:
+        threshold = max(1, int(varlen_min_seq_len))
+        return "varlen" if int(seq_len) >= threshold else "fixed"
+    seq_bucket = flash_seq_bucket(
+        seq_len=int(seq_len),
+        total_tokens=total_tokens,
+        batch_size=batch_size,
+    )
+    table_route = flash_route_choice(policy="padding", seq_bucket=seq_bucket)
+    if table_route in {"fixed", "varlen"}:
+        return table_route
+    return "fixed"
+
+
 def _entry_matches(context: FlashKernelContext, entry: dict[str, Any]) -> bool:
     """Return whether a table entry applies to one kernel context.
 

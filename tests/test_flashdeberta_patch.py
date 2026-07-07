@@ -442,6 +442,25 @@ def test_docblock_bias_route_uses_table_with_ragged_override() -> None:
     )
 
 
+def test_flash_padding_route_shared_resolver_precedence() -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        configure_flashdeberta_kernel_overrides,
+        flash_padding_route,
+    )
+
+    configure_flashdeberta_kernel_overrides(None)
+    # Config overrides outrank the table.
+    assert flash_padding_route(seq_len=1024, force_varlen=True) == "varlen"
+    assert flash_padding_route(seq_len=1024, varlen_min_seq_len=1024) == "varlen"
+    assert flash_padding_route(seq_len=1023, varlen_min_seq_len=1024) == "fixed"
+    # Table policy, density-aware and density-blind.
+    assert flash_padding_route(seq_len=1024) == "fixed"
+    assert flash_padding_route(seq_len=2048, total_tokens=3000, batch_size=2) == "varlen"
+    assert flash_padding_route(seq_len=2048) == flash_padding_route(
+        seq_len=2048, total_tokens=3000, batch_size=2
+    )
+
+
 def _small_deberta_config():
     """Build a small config for native DeBERTa patch tests."""
 
