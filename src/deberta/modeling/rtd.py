@@ -633,16 +633,28 @@ class RTDHead(nn.Module):
         self.classifier = nn.Linear(hidden_size, 1)
 
     @staticmethod
-    def _use_global_cls_context(attention_mask: torch.Tensor | None) -> bool:
-        """Return whether global CLS conditioning is safe for this attention mask.
+    def _use_global_cls_context(
+        attention_mask: torch.Tensor | None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> bool:
+        """Return whether global CLS conditioning is safe for this batch.
 
         Pairwise masks with an explicit query axis encode per-query visibility
         (for example packed doc-block masks). In that regime, adding one global
         CLS vector to all tokens would reintroduce cross-segment information flow.
+        Flash doc-block routes encode the same packed-document semantics in
+        ``FlashBatchMeta`` while shipping a compact 2D keep mask, so doc-block
+        metadata must disable global CLS exactly like a pairwise mask does.
 
         :param torch.Tensor | None attention_mask: Optional attention keep mask.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return bool: ``True`` when global CLS conditioning should be applied.
         """
+        if flash_meta is not None and (
+            flash_meta.normalized_route_hint() in {"docblock", "docblock_bias"}
+            or flash_meta.doc_segment_offsets is not None
+        ):
+            return False
         if attention_mask is None:
             return True
 
@@ -657,15 +669,17 @@ class RTDHead(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> torch.Tensor:
         """Compute per-token replacement logits.
 
         :param torch.Tensor hidden_states: Discriminator hidden states ``(B,S,H)``.
         :param torch.Tensor | None attention_mask: Optional discriminator attention mask.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return torch.Tensor: Per-token logits ``(B,S)``.
         """
         # hidden_states: (B,S,H)
-        if self._use_global_cls_context(attention_mask):
+        if self._use_global_cls_context(attention_mask, flash_meta=flash_meta):
             ctx = hidden_states[:, 0:1, :]  # (B,1,H)
             x = self.norm(hidden_states + ctx)
         else:
@@ -1179,7 +1193,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             disc_forward_kwargs["flash_meta"] = flash_meta
         disc_out = self.discriminator(**disc_forward_kwargs)
         disc_hidden = disc_out.last_hidden_state
-        disc_logits = self.discriminator_head(disc_hidden, attention_mask=attention_mask)
+        disc_logits = self.discriminator_head(
+            disc_hidden, attention_mask=attention_mask, flash_meta=flash_meta
+        )
 
         pad_token_id = getattr(self.disc_config, "pad_token_id", None)
         active = attention_mask_to_active_tokens(

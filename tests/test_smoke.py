@@ -1747,6 +1747,77 @@ def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
     assert logits.shape == (2, 3)
 
 
+def test_rtd_head_skips_cls_conditioning_for_docblock_flash_meta():
+    """Doc-block flash metadata must disable global CLS like a pairwise mask.
+
+    The ragged flash `docblock` route ships a compact 2D keep mask plus
+    `FlashBatchMeta` segment metadata. Position 0 of a packed row belongs to
+    the first document only, so adding it globally would leak document 1 into
+    every other document in the row (regression for the P1 review finding).
+    """
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from deberta.modeling.mask_utils import FlashBatchMeta
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import RTDHead
+
+    class _Spy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: torch.Tensor | None = None
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.seen = x.detach().clone()
+            return x
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+    )
+    head = RTDHead(cfg)
+
+    norm_spy = _Spy()
+    head.norm = norm_spy
+    head.act = torch.nn.Identity()
+
+    hidden = torch.arange(0, 2 * 4 * cfg.hidden_size, dtype=torch.float32).view(2, 4, cfg.hidden_size)
+    keep_mask_2d = torch.ones((2, 4), dtype=torch.bool)
+    docblock_meta = FlashBatchMeta(
+        doc_segment_offsets=torch.tensor([0, 2, 4, 6], dtype=torch.int32),
+        doc_segment_lengths=torch.tensor([2, 2, 2, 2], dtype=torch.int32),
+        doc_cu_seqlens=torch.tensor([0, 2, 4, 6, 8], dtype=torch.int32),
+        active_tokens_host=8,
+        doc_num_segments_host=4,
+        doc_max_segment_length_host=2,
+        route_hint="docblock",
+    )
+
+    _ = head(hidden, attention_mask=keep_mask_2d, flash_meta=docblock_meta)
+    assert norm_spy.seen is not None
+    torch.testing.assert_close(norm_spy.seen, hidden)
+
+    # The same 2D mask without doc-block metadata keeps the original
+    # single-document behavior: global CLS conditioning stays enabled.
+    _ = head(hidden, attention_mask=keep_mask_2d)
+    torch.testing.assert_close(norm_spy.seen, hidden + hidden[:, 0:1, :])
+
+    assert RTDHead._use_global_cls_context(keep_mask_2d, flash_meta=docblock_meta) is False
+    assert (
+        RTDHead._use_global_cls_context(keep_mask_2d, flash_meta=FlashBatchMeta(route_hint="docblock_bias"))
+        is False
+    )
+    assert (
+        RTDHead._use_global_cls_context(keep_mask_2d, flash_meta=FlashBatchMeta(route_hint="varlen")) is True
+    )
+
+
 def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
     import pytest
 
