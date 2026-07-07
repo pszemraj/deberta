@@ -578,3 +578,85 @@ Two unresolved PR #5 review findings were verified and fixed:
   `_build_dense_flash_bias` duplicate was removed and its self-confirming
   test replaced with an explicit loop-reference test on an asymmetric bucket
   map. Full suite (546) and the whole parity matrix re-passed on GPU.
+
+## 2026-07-07 - PR #5 Review Remediation Campaign
+
+A multi-agent review of PR #5 surfaced two live defects plus a cluster of
+verified duplication/altitude debt. All were fixed as atomic commits on
+`feat/flash` (from `fix(flash): make kernel-override reconfiguration
+idempotent` through `refactor(flash): consolidate duplicated op
+infrastructure helpers`).
+
+### Live defects
+
+- Per-micro-step tuning-table reload: `configure_flashdeberta_kernel_overrides`
+  cleared the payload cache unconditionally and runs at the top of
+  `prepare_flash_attention_batch_metadata` every micro-step, so every step
+  re-read and re-parsed `flashdeberta_kernel_tuning.json` from disk
+  (empirically 20 calls -> 20 `read_text`s; affected effectively all runs
+  because `model.hf.flash` is never `None`). Reconfiguration is now a no-op
+  for an unchanged path, and `flash_seq_bucket` /
+  `resolve_flash_kernel_config` are `functools.cache`d with coordinated
+  invalidation (the per-layer fwd/bwd table scans ran inside the opaque
+  custom-op wrappers, invisible to `torch.compile`).
+- `docblock_bias_seq_len` cross-coupling: `_should_use_local_bias` gated the
+  plain-batch dense local-bias route on the packed doc-block override, so the
+  documented `docblock_bias_seq_len=0` ablation silently disabled the
+  unrelated local-bias kernel for every plain batch (git history shows the
+  gate was an independent `_LOCAL_BIAS_SEQ_LEN` constant collapsed onto the
+  docblock field in `bd2132e`). Added a dedicated
+  `model.hf.flash.local_bias_seq_len` field with null/0/exact-length
+  semantics; both knobs are now documented as independent.
+
+### Structural fixes (verified findings, behavior-preserving)
+
+- One `_clear_flash_batch_metadata` helper replaces the six-statement pop
+  block copy-pasted at five early returns in
+  `prepare_flash_attention_batch_metadata`; the sixth (non-`hf_deberta_v2`)
+  early return had already drifted and left stale `flash_doc_segment_*`
+  tensors in rope doc-block batches - now cleared and contract-tested.
+- `FlashBatchMeta.is_cross_document()` is the single predicate for "packed
+  cross-document batch" (the e6fd72b CLS-leak fix had hand-rolled this check
+  at one call site); the RTD head now uses it.
+- Fixed-vs-varlen padded routing has one resolver (`flash_padding_route` in
+  `flashdeberta_kernel_tuning.py`); the training hint path and the
+  model-internal density-blind fallback both delegate, so retuning
+  density-gated table rows can no longer silently diverge the two.
+- The four `_forward_{dense,masked}_hs{0,1}` fast paths are one-line
+  delegations to `_forward_*_resolved` (~280 duplicated lines removed);
+  compile.py's fallback closures already proved the pattern compile-stable,
+  and eager + `torch.compile` (aot_eager) parity was verified directly. The
+  dense fast path's lack of a `flash_meta` parameter is now a documented
+  contract (dense-route metadata is semantically empty).
+- `_dense_bucket_index_tensor` now composes the eager backbone's
+  `build_relative_position` instead of re-deriving the log-bucket formula;
+  a reference test locks equality with the prior math in the shipped regime
+  (`max_relative_positions >= seq_len`), and beyond it the shared math now
+  saturates like eager (distant-negative offsets bucket to row 1, where the
+  standalone formula drifted to row 0 - latent only, unreachable in shipped
+  configs).
+- Dropped the six dead flat `cfg.flash_*` mirrors (only `cfg.hf_flash` was
+  ever consumed); consolidated `is_torch_compiling` (5 copies -> mask_utils),
+  `lookup_registered_op` and `device_compute_capability` (5-6 copies each ->
+  new `flashdeberta_op_utils.py`); tuning tools compose
+  `compute_capability_key` with the shared resolver.
+
+### Validation
+
+- Full suite with CUDA visible: `552 passed, 4 skipped` (6 new regression
+  tests over the campaign baseline; skips are the usual compiled
+  position-bias environment gates).
+- `tools/flashdeberta_parity_test.py`: full matrix passes at HEAD after the
+  bucket-math consolidation and again after the helper consolidation.
+- `tools/audit_contracts.py --strict`: 14 PASS, 0 WARN/SKIP/FAIL.
+- No-triton import test still covers the flash module tree including the new
+  `flashdeberta_op_utils`.
+
+### Review findings intentionally not "fixed"
+
+- Golden test pinning shipped `sm_120` table rows: deliberate per the
+  2026-07-06 campaign notes; will churn on retune by design.
+- Compiled dense route dropping `route_hint="dense"` metadata: confirmed
+  inert (doc-block batches always carry a real mask and cannot reach the
+  dense branch); resolved by documenting the tensor-only dense contract
+  rather than threading a semantically empty object through Dynamo guards.
