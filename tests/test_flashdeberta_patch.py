@@ -320,6 +320,8 @@ def test_flashdeberta_kernel_overrides_same_path_reconfigure_keeps_cache(monkeyp
 
     monkeypatch.setattr(tuning, "_read_json", _counting_read)
     tuning._load_tuning_payload.cache_clear()
+    tuning.flash_seq_bucket.cache_clear()
+    tuning.resolve_flash_kernel_config.cache_clear()
 
     baseline_bucket = tuning.flash_seq_bucket(seq_len=1024)
     first_reads = reads["count"]
@@ -360,21 +362,24 @@ def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
         encoding="utf-8",
     )
 
+    context = FlashKernelContext(
+        compute_capability=(12, 0),
+        route="varlen",
+        kind="bwd_kv",
+        seq_len=2048,
+        total_tokens=3000,
+        batch_size=2,
+        head_dim=64,
+    )
+    configure_flashdeberta_kernel_overrides(None)
+    shipped = resolve_flash_kernel_config(context)
+    assert shipped == (64, 32, 2, 4)
     try:
         configure_flashdeberta_kernel_overrides(str(override_path))
-        assert resolve_flash_kernel_config(
-            FlashKernelContext(
-                compute_capability=(12, 0),
-                route="varlen",
-                kind="bwd_kv",
-                seq_len=2048,
-                total_tokens=3000,
-                batch_size=2,
-                head_dim=64,
-            )
-        ) == (16, 32, 1, 2)
+        assert resolve_flash_kernel_config(context) == (16, 32, 1, 2)
     finally:
         configure_flashdeberta_kernel_overrides(None)
+    assert resolve_flash_kernel_config(context) == shipped
 
 
 def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> None:

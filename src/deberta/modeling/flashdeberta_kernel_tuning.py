@@ -48,6 +48,8 @@ def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
         return
     _ACTIVE_OVERRIDES_PATH = resolved
     _load_tuning_payload.cache_clear()
+    flash_seq_bucket.cache_clear()
+    resolve_flash_kernel_config.cache_clear()
 
 
 def active_flashdeberta_kernel_overrides_path() -> str | None:
@@ -124,6 +126,9 @@ _load_tuning_payload = cache(_load_tuning_payload)
 def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_size: int | None = None) -> str:
     """Resolve the measured-policy sequence bucket for one batch shape.
 
+    Results are cached per argument tuple until
+    :func:`configure_flashdeberta_kernel_overrides` changes the active table.
+
     :param int seq_len: Padded sequence length.
     :param int | None total_tokens: Active token count, when known.
     :param int | None batch_size: Batch size, when known.
@@ -158,6 +163,9 @@ def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_siz
         if isinstance(name, str) and name:
             return name
     return "default"
+
+
+flash_seq_bucket = cache(flash_seq_bucket)
 
 
 def flash_route_policy(*, policy: str, seq_bucket: str) -> dict[str, Any] | None:
@@ -270,6 +278,10 @@ def _entry_matches(context: FlashKernelContext, entry: dict[str, Any]) -> bool:
 def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, int, int] | None:
     """Resolve a measured kernel launch tuple from the active tuning table.
 
+    Results are cached per context until
+    :func:`configure_flashdeberta_kernel_overrides` changes the active table,
+    keeping the per-layer forward/backward table scans off the hot path.
+
     :param FlashKernelContext context: Runtime kernel context.
     :return tuple[int, int, int, int] | None: ``(BLOCK_M, BLOCK_N, stages, warps)`` or None.
     """
@@ -290,3 +302,6 @@ def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, 
         except Exception:
             return None
     return None
+
+
+resolve_flash_kernel_config = cache(resolve_flash_kernel_config)
