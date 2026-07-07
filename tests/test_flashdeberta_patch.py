@@ -442,6 +442,52 @@ def test_docblock_bias_route_uses_table_with_ragged_override() -> None:
     )
 
 
+def test_dense_bucket_index_reuses_native_log_bucket_math(monkeypatch: pytest.MonkeyPatch) -> None:
+    import math as _math
+
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    _dense_bucket_index_tensor = attention_mod._dense_bucket_index_tensor
+
+    def _prior_formula(seq_len: int, buckets: int, max_rel: int) -> torch.Tensor:
+        """Re-derive the pre-refactor standalone bucket math as a reference."""
+
+        positions = torch.arange(seq_len, dtype=torch.int32)
+        rel = positions[:, None] - positions[None, :]
+        mid = max(1, buckets // 2)
+        sign = torch.sign(rel.to(torch.float32))
+        abs_rel = rel.abs()
+        near = (rel < mid) & (rel > -mid)
+        abs_pos = torch.where(near, torch.full_like(abs_rel, mid - 1), abs_rel)
+        log_denom = _math.log((max_rel - 1) / mid)
+        log_scaled = torch.log(abs_pos.to(torch.float32).clamp_min(float(mid)) / mid) / log_denom * (mid - 1)
+        log_pos = torch.ceil(log_scaled) + mid
+        bucket_pos = torch.where(abs_pos <= mid, rel.to(torch.float32), log_pos * sign)
+        return (bucket_pos + buckets).clamp_(0.0, float(2 * buckets - 1)).to(torch.int64)
+
+    # In the shipped regime (max_relative_positions >= seq_len) the shared
+    # native math must agree exactly with the prior standalone formula.
+    for seq_len, buckets, max_rel in ((16, 8, 16), (64, 32, 64), (128, 32, 512), (32, 256, 512)):
+        got = _dense_bucket_index_tensor(
+            seq_len=seq_len,
+            position_buckets=buckets,
+            max_relative_distance=max_rel,
+            device=torch.device("cpu"),
+        )
+        assert torch.equal(got, _prior_formula(seq_len, buckets, max_rel))
+
+    # Beyond max_relative_positions the native math saturates like the eager
+    # backbone: distant-negative offsets bucket to embedding row 1, not 0.
+    saturated = _dense_bucket_index_tensor(
+        seq_len=64,
+        position_buckets=8,
+        max_relative_distance=32,
+        device=torch.device("cpu"),
+    )
+    assert saturated[63, 0].item() == 15
+    assert saturated[0, 63].item() == 1
+
+
 def test_flash_padding_route_shared_resolver_precedence() -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         configure_flashdeberta_kernel_overrides,

@@ -48,6 +48,9 @@ import torch
 from deberta.modeling.deberta_v2_native import (
     DisentangledSelfAttention as _EagerDisentangledSelfAttention,
 )
+from deberta.modeling.deberta_v2_native import (
+    build_relative_position as _build_relative_position,
+)
 from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_from_positions,
     flashdeberta_bias_import_error,
@@ -468,6 +471,12 @@ def _dense_bucket_index_tensor(
 ) -> torch.Tensor:
     """Return a cached dense DeBERTa bucket-index matrix ``(S, S)``.
 
+    The log-bucket math is shared with the eager backbone through
+    :func:`deberta.modeling.deberta_v2_native.build_relative_position`; this
+    helper only adds the ``+position_buckets`` embedding-row offset expected
+    by the flash bias kernels. Sharing one implementation keeps eager-vs-flash
+    relative-position parity by construction.
+
     :param int seq_len: Sequence length.
     :param int position_buckets: Relative bucket count.
     :param int max_relative_distance: Maximum relative distance.
@@ -488,32 +497,16 @@ def _dense_bucket_index_tensor(
     if cached is not None:
         return cached
 
-    positions = torch.arange(int(seq_len), device=device, dtype=torch.int32)
-    relative_positions = positions[:, None] - positions[None, :]
-    mid_val = max(1, int(position_buckets) // 2)
-    sign = torch.sign(relative_positions.to(dtype=torch.float32))
-    abs_relative = relative_positions.abs()
-    condition = (relative_positions < mid_val) & (relative_positions > -mid_val)
-    abs_pos = torch.where(condition, torch.full_like(abs_relative, mid_val - 1), abs_relative)
-
-    if max_rel <= mid_val:
-        bucket_pos = relative_positions.to(dtype=torch.float32)
-    else:
-        log_denom = math.log((int(max_rel) - 1) / int(mid_val))
-        log_scaled = (
-            torch.log(abs_pos.to(dtype=torch.float32).clamp_min(float(mid_val)) / float(mid_val))
-            / float(log_denom)
-            * float(mid_val - 1)
-        )
-        log_pos = torch.ceil(log_scaled) + float(mid_val)
-        bucket_pos = torch.where(
-            abs_pos <= mid_val, relative_positions.to(dtype=torch.float32), log_pos * sign
-        )
-
     bucket_index = (
-        (bucket_pos + float(position_buckets))
-        .clamp_(0.0, float(2 * int(position_buckets) - 1))
-        .to(dtype=torch.int64)
+        _build_relative_position(
+            int(seq_len),
+            int(seq_len),
+            bucket_size=int(position_buckets),
+            max_position=max_rel,
+            device=device,
+        )
+        .add_(int(position_buckets))
+        .clamp_(0, 2 * int(position_buckets) - 1)
     )
     _DENSE_BUCKET_INDEX_CACHE[key] = bucket_index
     if len(_DENSE_BUCKET_INDEX_CACHE) > 8:
