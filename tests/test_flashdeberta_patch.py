@@ -2159,71 +2159,19 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     assert stats.get("fallback_calls", 0) == 0
 
 
-def test_build_dense_flash_bias_matches_reference() -> None:
-    import deberta.modeling.flashdeberta_attention as attention_mod
-
-    batch_size = 2
-    num_heads = 3
-    seq_len = 4
-    buckets = 7
-
-    pos_key = torch.randn((batch_size, num_heads, seq_len, buckets), dtype=torch.float32)
-    pos_query = torch.randn((batch_size, num_heads, seq_len, buckets), dtype=torch.float32)
-    bucket_index = torch.tensor(
-        [
-            [0, 1, 2, 3],
-            [1, 0, 3, 4],
-            [2, 3, 0, 5],
-            [3, 4, 5, 0],
-        ],
-        dtype=torch.int64,
-    )
-    keep_mask = torch.tensor(
-        [
-            [
-                [
-                    [True, True, False, False],
-                    [True, True, False, False],
-                    [False, False, True, True],
-                    [False, False, True, True],
-                ]
-            ],
-            [
-                [
-                    [True, False, False, False],
-                    [False, True, False, False],
-                    [False, False, True, False],
-                    [False, False, False, True],
-                ]
-            ],
-        ],
-        dtype=torch.bool,
-    )
-
-    index = bucket_index.view(1, 1, seq_len, seq_len).expand(batch_size, num_heads, seq_len, seq_len)
-    reference = torch.gather(pos_key, dim=-1, index=index)
-    reverse = (
-        bucket_index.t()
-        .contiguous()
-        .view(1, 1, seq_len, seq_len)
-        .expand(batch_size, num_heads, seq_len, seq_len)
-    )
-    reference = reference + torch.gather(pos_query, dim=-1, index=reverse).transpose(-1, -2)
-    reference = reference.masked_fill(~keep_mask, -1.0e4)
-
-    actual = attention_mod._build_dense_flash_bias(
-        pos_key=pos_key,
-        pos_query=pos_query,
-        bucket_index=bucket_index,
-        keep_mask=keep_mask,
-    )
-
-    assert torch.equal(actual, reference)
-
-
 def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
+    """CPU dense-bias fallback must match the eager DeBERTa gather convention.
+
+    The reference is an explicit per-element loop:
+    ``bias[m, n] = pos_key[m, bucket[m, n]] + pos_query[n, bucket[n, m]]``.
+    The bucket map is deliberately asymmetric because signed relative-position
+    buckets are not symmetric; a p2c gather that uses ``bucket[m, n]`` instead
+    of ``bucket[n, m]`` (the pre-fix fallback bug) fails this test.
+    """
+
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
+    torch.manual_seed(0)
     batch_size = 2
     num_heads = 3
     seq_len = 4
@@ -2235,12 +2183,13 @@ def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
     bucket_index = torch.tensor(
         [
             [0, 1, 2, 3],
-            [1, 0, 3, 4],
-            [2, 3, 0, 5],
-            [3, 4, 5, 0],
+            [4, 0, 1, 2],
+            [5, 4, 0, 1],
+            [6, 5, 4, 0],
         ],
         dtype=torch.int64,
     )
+    assert not torch.equal(bucket_index, bucket_index.t())
     keep_mask = torch.tensor(
         [
             [
@@ -2263,22 +2212,33 @@ def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
         dtype=torch.bool,
     )
 
-    expected = dense_bias_mod._dense_bias_forward_fallback(
-        pos_key=pos_key,
-        pos_query=pos_query,
-        bucket_index=bucket_index,
-        keep_mask=keep_mask,
-        scale=scale,
-    )
-    actual = dense_bias_mod.flashdeberta_dense_bias(
-        pos_key=pos_key,
-        pos_query=pos_query,
-        bucket_index=bucket_index,
-        keep_mask=keep_mask,
-        scale=scale,
-    )
+    expected = torch.empty((batch_size, num_heads, seq_len, seq_len), dtype=torch.float32)
+    for b in range(batch_size):
+        for h in range(num_heads):
+            for m in range(seq_len):
+                for n in range(seq_len):
+                    c2p = pos_key[b, h, m, int(bucket_index[m, n])]
+                    p2c = pos_query[b, h, n, int(bucket_index[n, m])]
+                    expected[b, h, m, n] = (c2p + p2c) * scale
+    expected = expected.masked_fill(~keep_mask, -1.0e4 * scale)
 
-    assert torch.equal(actual, expected)
+    for actual in (
+        dense_bias_mod._dense_bias_forward_fallback(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            scale=scale,
+        ),
+        dense_bias_mod.flashdeberta_dense_bias(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            scale=scale,
+        ),
+    ):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
@@ -2498,6 +2458,15 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
         keep_mask=keep_mask,
         scale=scale,
     )
+    with torch.no_grad():
+        fallback_bias = dense_bias_mod._dense_bias_forward_fallback(
+            pos_key=pos_key.detach(),
+            pos_query=pos_query.detach(),
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            scale=scale,
+        )
+    torch.testing.assert_close(fallback_bias, ref_bias.detach(), atol=2e-2, rtol=2e-2)
     ref_out = bias_mod.flashdeberta_bias(
         query_layer=q_ref,
         key_layer=k_ref,

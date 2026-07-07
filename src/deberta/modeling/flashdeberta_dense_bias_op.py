@@ -195,8 +195,11 @@ def _dense_bias_forward_fallback(
         bias = torch.take_along_dim(pos_key, gather_index, dim=-1)
 
     if pos_query is not None:
-        reverse_index = bucket_index.transpose(0, 1).view(1, 1, seq_len, seq_len)
-        p2c_bias = torch.take_along_dim(pos_query, reverse_index, dim=-1).transpose(-1, -2)
+        # p2c at (query m, key n) reads pos_query[n, bucket_index[n, m]]: gather
+        # each key row with its own signed bucket map, then transpose to (m, n).
+        # Gathering the transposed map instead would flip the signed bucket and
+        # diverge from the Triton builder and eager attention.
+        p2c_bias = torch.take_along_dim(pos_query, gather_index, dim=-1).transpose(-1, -2)
         if bias is None:
             bias = p2c_bias
         else:
@@ -716,8 +719,11 @@ def _build_dense_bias_custom_op() -> Any | None:
         if bool(has_pos_key):
             start_key, end_key = _dense_bucket_ranges(bucket_index, num_buckets=num_key_buckets)
         if bool(has_pos_query):
-            transposed = bucket_index.transpose(0, 1).contiguous()
-            start_query, end_query = _dense_bucket_ranges(transposed, num_buckets=num_query_buckets)
+            # p2c forward reads pos_query[n, bucket_index[n, m]], so the p2c
+            # gradient for key row n reduces grad^T[n, :] over row n of the
+            # plain bucket map - the same row orientation as c2p, not the
+            # transposed map (which flips the signed relative bucket).
+            start_query, end_query = _dense_bucket_ranges(bucket_index, num_buckets=num_query_buckets)
         ctx.save_for_backward(pos_key, pos_query, keep_mask, start_key, end_key, start_query, end_query)
         ctx.scale = float(scale)
         ctx.has_pos_key = bool(has_pos_key)

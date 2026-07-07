@@ -515,52 +515,6 @@ def _dense_bucket_index_tensor(
     return bucket_index
 
 
-def _build_dense_flash_bias(
-    *,
-    pos_key: torch.Tensor | None,
-    pos_query: torch.Tensor | None,
-    bucket_index: torch.Tensor,
-    keep_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Build a dense FlashDeBERTa bias tensor from disentangled position terms.
-
-    ``torch.take_along_dim`` broadcasts the shared ``(S,S)`` bucket map across
-    batch and head dimensions, which avoids materializing expanded index tensors
-    before the gather. The doc-block route also keeps the pairwise mask in
-    ``(B,1,S,S)`` form so masked fill broadcasts across heads instead of
-    expanding the mask eagerly.
-
-    :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
-    :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
-    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
-    :raises RuntimeError: If both positional terms are missing.
-    :return torch.Tensor: Dense additive bias in ``(B,H,S,S)`` layout.
-    """
-
-    seq_len = int(bucket_index.shape[0])
-    gather_index = bucket_index.view(1, 1, seq_len, seq_len)
-    bias: torch.Tensor | None = None
-
-    if pos_key is not None:
-        bias = torch.take_along_dim(pos_key, gather_index, dim=-1)
-
-    if pos_query is not None:
-        reverse_index = bucket_index.transpose(0, 1).view(1, 1, seq_len, seq_len)
-        p2c_bias = torch.take_along_dim(pos_query, reverse_index, dim=-1).transpose(-1, -2)
-        if bias is None:
-            bias = p2c_bias
-        else:
-            bias.add_(p2c_bias)
-
-    if bias is None:  # pragma: no cover - guarded by callers
-        raise RuntimeError("FlashDeBERTa dense bias construction requires at least one positional term.")
-
-    if keep_mask is not None:
-        bias.masked_fill_(~keep_mask, -1.0e4)
-    return bias
-
-
 class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     """FlashDeBERTa-backed variant of native disentangled self-attention."""
 

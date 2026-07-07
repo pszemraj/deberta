@@ -2004,9 +2004,12 @@ def _position_bias_backward_from_dense_grad(
 
     dpos_query: torch.Tensor | None = None
     if pos_query is not None:
+        # p2c forward reads pos_query[n, bucket_index[n, m]], so the p2c
+        # gradient scatters grad^T rows along the plain bucket map, not the
+        # transposed map (which would flip the signed relative bucket).
         dpos_query = _scatter_bucket_reduce(
             grad_tensor=grad.transpose(-1, -2),
-            index=bucket_index.transpose(0, 1),
+            index=bucket_index,
             num_buckets=int(pos_query.shape[-1]),
             output_dtype=pos_query.dtype,
         )
