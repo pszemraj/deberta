@@ -23,6 +23,8 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
+from deberta.modeling.mask_utils import is_torch_compiling
 
 try:
     import triton
@@ -42,20 +44,6 @@ _DENSE_BUCKET_RANGE_CACHE: dict[
 ] = {}
 
 
-def _is_torch_compiling() -> bool:
-    """Return whether execution is happening under ``torch.compile``.
-
-    :return bool: True when inside compiled/traced execution.
-    """
-
-    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
-        return False
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
-
-
 def flashdeberta_compiled_dense_bias_available() -> bool:
     """Return whether the opaque dense-bias CUDA op is available.
 
@@ -72,21 +60,6 @@ def flashdeberta_dense_bias_import_error() -> Exception | None:
     """
 
     return _TRITON_IMPORT_ERROR
-
-
-def _lookup_registered_op(namespace: str, name: str) -> Any | None:
-    """Return a previously registered custom op overload, if one exists.
-
-    :param str namespace: Operator namespace.
-    :param str name: Operator name.
-    :return Any | None: Registered overload or ``None``.
-    """
-
-    ns = getattr(torch.ops, namespace, None)
-    if ns is None or not hasattr(ns, name):
-        return None
-    op = getattr(ns, name)
-    return getattr(op, "default", op)
 
 
 def _dense_bias_repo_tuned_config(
@@ -115,11 +88,7 @@ def _dense_bias_repo_tuned_config(
 
     if device.type != "cuda" or dtype not in {torch.float16, torch.bfloat16}:
         return None
-    capability = (
-        torch.cuda.get_device_capability(device.index)
-        if device.index is not None
-        else torch.cuda.get_device_capability()
-    )
+    capability = device_compute_capability(device)
     return resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=capability,
@@ -255,7 +224,7 @@ def _dense_bucket_ranges(
     """
 
     cache_key: tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int] | None = None
-    if not _is_torch_compiling():
+    if not is_torch_compiling():
         try:
             cache_key = _dense_bucket_range_cache_key(bucket_index, num_buckets=num_buckets)
         except Exception:
@@ -619,7 +588,7 @@ def _build_dense_bias_custom_op() -> Any | None:
     :return Any | None: Forward custom-op handle or ``None`` when unavailable.
     """
 
-    existing = _lookup_registered_op(_DENSE_BIAS_NAMESPACE, _DENSE_BIAS_OP_NAME)
+    existing = lookup_registered_op(_DENSE_BIAS_NAMESPACE, _DENSE_BIAS_OP_NAME)
     if existing is not None:
         return existing
     if triton is None or not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):

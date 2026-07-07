@@ -7,18 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-
-def _is_torch_compiling() -> bool:
-    """Return whether execution is inside a torch.compile graph.
-
-    :return bool: True when currently executing inside torch.compile.
-    """
-    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
-        return False
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
+from deberta.modeling.mask_utils import is_torch_compiling
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -118,7 +107,7 @@ class RotaryEmbedding(nn.Module):
         """
         # Under compile, this must be a pure slice over an already-prefilled
         # module cache to avoid per-step allocations and storage mutation.
-        if _is_torch_compiling():
+        if is_torch_compiling():
             if self._cache is None or self._cache_device != device or self._cache_dtype != dtype:
                 raise RuntimeError(
                     "Rotary cache is not prefilled for compiled execution. "

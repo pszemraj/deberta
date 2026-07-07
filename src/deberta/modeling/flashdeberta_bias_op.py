@@ -21,6 +21,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
 
 try:
     import triton
@@ -116,36 +117,6 @@ def flashdeberta_compiled_position_bias_available() -> bool:
     )
 
 
-def _lookup_registered_op(namespace: str, name: str) -> Any | None:
-    """Return a previously registered custom op overload, if one exists.
-
-    :param str namespace: Operator namespace.
-    :param str name: Operator name.
-    :return Any | None: Registered overload or ``None``.
-    """
-
-    ns = getattr(torch.ops, namespace, None)
-    if ns is None or not hasattr(ns, name):
-        return None
-    op = getattr(ns, name)
-    return getattr(op, "default", op)
-
-
-def _bias_device_capability(device: torch.device) -> tuple[int, int]:
-    """Return CUDA device capability for the given tensor device.
-
-    :param torch.device device: CUDA device to query.
-    :return tuple[int, int]: ``(major, minor)`` compute capability.
-    """
-
-    if device.type != "cuda":
-        return (0, 0)
-    index = device.index
-    if index is None:
-        return torch.cuda.get_device_capability()
-    return torch.cuda.get_device_capability(index)
-
-
 def _kernel_dtype_name(dtype: torch.dtype) -> str:
     """Return a compact dtype name for tuning-table matching.
 
@@ -196,7 +167,7 @@ def _bias_repo_tuned_config(
         return None
     if int(head_dim) > 64:
         return None
-    capability = _bias_device_capability(device)
+    capability = device_compute_capability(device)
     return resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=capability,
@@ -410,7 +381,7 @@ def _should_use_specialized_docblock_bias_backward(
         return False
     policy = resolve_flash_kernel_config(
         FlashKernelContext(
-            compute_capability=_bias_device_capability(q.device),
+            compute_capability=device_compute_capability(q.device),
             route="bias_docblock_specialized",
             kind="bwd",
             seq_len=max(int(q.shape[-2]), int(k.shape[-2])),
@@ -478,7 +449,7 @@ def _resolve_docblock_specialized_bwd_kernel_config(
     if normalized_kind not in {"kv", "q"}:
         raise ValueError(f"Unsupported doc-block bias backward kernel kind: {kind!r}")
 
-    capability = _bias_device_capability(device)
+    capability = device_compute_capability(device)
     context_kwargs = {
         "compute_capability": capability,
         "route": "bias_docblock_specialized",
@@ -2023,8 +1994,8 @@ def _build_bias_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = _lookup_registered_op(_BIAS_OP_NAMESPACE, _BIAS_FWD_OP_NAME)
-    existing_backward = _lookup_registered_op(_BIAS_OP_NAMESPACE, _BIAS_BWD_OP_NAME)
+    existing_forward = lookup_registered_op(_BIAS_OP_NAMESPACE, _BIAS_FWD_OP_NAME)
+    existing_backward = lookup_registered_op(_BIAS_OP_NAMESPACE, _BIAS_BWD_OP_NAME)
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 
@@ -2234,8 +2205,8 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = _lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_FWD_OP_NAME)
-    existing_backward = _lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_BWD_OP_NAME)
+    existing_forward = lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_FWD_OP_NAME)
+    existing_backward = lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_BWD_OP_NAME)
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 

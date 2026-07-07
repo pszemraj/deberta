@@ -37,7 +37,11 @@ from deberta.config import load_config, resolve_effective_mixed_precision  # noq
 from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling.builder import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
-from deberta.modeling.flashdeberta_kernel_tuning import flash_seq_bucket  # noqa: E402
+from deberta.modeling.flashdeberta_kernel_tuning import (  # noqa: E402
+    compute_capability_key,
+    flash_seq_bucket,
+)
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability  # noqa: E402
 from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
     _bf16_runtime_sanity_check,
@@ -120,12 +124,7 @@ def _parse_candidate_specs(values: list[str]) -> list[tuple[str, dict[str, str]]
 
 
 def _device_capability_text(device: torch.device) -> str:
-    index = device.index
-    if index is None:
-        major, minor = torch.cuda.get_device_capability()
-    else:
-        major, minor = torch.cuda.get_device_capability(index)
-    return f"sm_{major}{minor}"
+    return compute_capability_key(device_compute_capability(device))
 
 
 def _resolve_out_dir(path: Path | None) -> Path:

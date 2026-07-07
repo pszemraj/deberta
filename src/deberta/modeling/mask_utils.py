@@ -10,6 +10,20 @@ import torch
 _FLASH_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
+def is_torch_compiling() -> bool:
+    """Return whether execution is happening under ``torch.compile``.
+
+    :return bool: True when inside compiled/traced execution.
+    """
+
+    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
+        return False
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class FlashBatchMeta:
     """Batch-scoped FlashDeBERTa metadata.

@@ -18,6 +18,7 @@ from typing import Any
 import torch
 
 from deberta.modeling.flashdeberta_kernel_tuning import FlashKernelContext, resolve_flash_kernel_config
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
 
 try:
     from flashdeberta.ops.flash_attention import (
@@ -96,21 +97,6 @@ def flashdeberta_compiled_fixed_available() -> bool:
     return _FLASHDEBERTA_FIXED_CUSTOM_OP is not None and _FLASHDEBERTA_FIXED_BWD_CUSTOM_OP is not None
 
 
-def _lookup_registered_op(namespace: str, name: str) -> Any | None:
-    """Return a previously registered custom op overload, if one exists.
-
-    :param str namespace: Operator namespace.
-    :param str name: Operator name.
-    :return Any | None: Registered overload or ``None``.
-    """
-
-    ns = getattr(torch.ops, namespace, None)
-    if ns is None or not hasattr(ns, name):
-        return None
-    op = getattr(ns, name)
-    return getattr(op, "default", op)
-
-
 def _cdiv(a: int, b: int) -> int:
     """Return ceil-division for positive integers.
 
@@ -131,21 +117,6 @@ def _fixed_attention_span(position_buckets: int, max_relative_distance: int) -> 
     """
 
     return int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
-
-
-def _fixed_device_capability(device: torch.device) -> tuple[int, int]:
-    """Return CUDA device capability for the given tensor device.
-
-    :param torch.device device: CUDA device to query.
-    :return tuple[int, int]: ``(major, minor)`` compute capability.
-    """
-
-    if device.type != "cuda":
-        return (0, 0)
-    index = device.index
-    if index is None:
-        return torch.cuda.get_device_capability()
-    return torch.cuda.get_device_capability(index)
 
 
 def _fixed_repo_tuned_config(
@@ -180,7 +151,7 @@ def _fixed_repo_tuned_config(
         return None
     return resolve_flash_kernel_config(
         FlashKernelContext(
-            compute_capability=_fixed_device_capability(device),
+            compute_capability=device_compute_capability(device),
             route="fixed",
             kind=normalized_kind,
             seq_len=max(int(query_len), int(key_len)),
@@ -905,8 +876,8 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = _lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME)
-    existing_backward = _lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_BWD_OP_NAME)
+    existing_forward = lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME)
+    existing_backward = lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_BWD_OP_NAME)
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 

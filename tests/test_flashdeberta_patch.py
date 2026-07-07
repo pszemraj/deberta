@@ -1348,7 +1348,7 @@ def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.Mon
     attention_mod._record_stat("forward_calls")
     assert attention_mod.flashdeberta_stats_snapshot()["forward_calls"] == 1
 
-    monkeypatch.setattr(attention_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: True)
     attention_mod._record_stat("forward_calls")
 
     assert attention_mod.flashdeberta_stats_snapshot()["forward_calls"] == 1
@@ -1371,7 +1371,7 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
-    monkeypatch.setattr(attention_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: True)
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
@@ -1391,7 +1391,7 @@ def test_varlen_min_seq_len_config_override_restores_1024_varlen(
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
-    monkeypatch.setattr(attention_mod, "_is_torch_compiling", lambda: False)
+    monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: False)
 
     assert (
         attention_mod._should_use_varlen(
@@ -1425,7 +1425,7 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
             device=args[0].device,
         )
 
-    monkeypatch.setattr(varlen_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(varlen_mod, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(varlen_mod, "_FLASHDEBERTA_VARLEN_TRITON_OP", _fake_triton_op)
     monkeypatch.setattr(varlen_mod, "_FLASHDEBERTA_VARLEN_CUSTOM_OP", _fake_custom_op)
 
@@ -2874,7 +2874,7 @@ def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest
 def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    monkeypatch.setattr(varlen_mod, "_varlen_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(varlen_mod, "device_compute_capability", lambda device: (12, 0))
 
     sparse_cfg = varlen_mod._varlen_repo_tuned_bwd_config(
         kind="kv",
@@ -3176,7 +3176,7 @@ def test_encoder_compile_hidden_state_snapshots_clone_outputs(monkeypatch: pytes
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8), dtype=torch.long)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-    monkeypatch.setattr(dv2, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(dv2, "is_torch_compiling", lambda: True)
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -3224,7 +3224,7 @@ def test_docblock_varlen_backward_uses_docblock_tuning_namespace(monkeypatch: py
         return (16, 32, 1, 4)
 
     monkeypatch.setattr(varlen_mod, "resolve_flash_kernel_config", _fake_resolve)
-    monkeypatch.setattr(varlen_mod, "_varlen_device_capability", lambda _device: (12, 0))
+    monkeypatch.setattr(varlen_mod, "device_compute_capability", lambda _device: (12, 0))
     monkeypatch.setattr(
         varlen_mod,
         "_get_bwd_config_varlen_lowlevel",

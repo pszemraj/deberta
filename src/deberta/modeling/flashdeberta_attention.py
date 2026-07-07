@@ -81,6 +81,7 @@ from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     build_doc_block_mask,
     doc_ids_from_segments,
+    is_torch_compiling,
     normalize_keep_mask,
 )
 
@@ -107,20 +108,6 @@ class FlashDebertaRuntimeConfig:
     kernel_overrides_path: str | None = None
     enable_debug_stats: bool = False
     warn_fallbacks: bool = True
-
-
-def _is_torch_compiling() -> bool:
-    """Return whether execution is happening under ``torch.compile``.
-
-    :return bool: True when inside compiled/traced execution.
-    """
-
-    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
-        return False
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -262,7 +249,7 @@ def _record_stat(name: str, value: int = 1) -> None:
 
     if not _RUNTIME_CONFIG.enable_debug_stats:
         return
-    if _is_torch_compiling():
+    if is_torch_compiling():
         return
     _FLASH_STATS[name] += int(value)
 
@@ -388,7 +375,7 @@ def _should_use_varlen(
     if attention_mask is None:
         return False
 
-    if _is_torch_compiling() and not flashdeberta_compiled_varlen_available():
+    if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
         return False
 
     cfg = runtime_config or _RUNTIME_CONFIG
@@ -531,7 +518,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if not _RUNTIME_CONFIG.warn_fallbacks:
             return
-        if _is_torch_compiling():
+        if is_torch_compiling():
             return
         if reason in cls._warned_reasons:
             return
@@ -754,7 +741,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if flashdeberta_bias_import_error() is not None:
             return False
-        if _is_torch_compiling() and not (
+        if is_torch_compiling() and not (
             flashdeberta_compiled_bias_available() and flashdeberta_compiled_position_bias_available()
         ):
             return False
@@ -1158,7 +1145,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
-            if _is_torch_compiling() and not flashdeberta_compiled_bias_available():
+            if is_torch_compiling() and not flashdeberta_compiled_bias_available():
                 if _RUNTIME_CONFIG.enable_debug_stats:
                     _record_stat("fallback_calls")
                     _record_stat("fallback_docblock_bias_compile")
@@ -1232,7 +1219,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
-            if _is_torch_compiling() and not flashdeberta_compiled_docblock_available():
+            if is_torch_compiling() and not flashdeberta_compiled_docblock_available():
                 if _RUNTIME_CONFIG.enable_debug_stats:
                     _record_stat("fallback_calls")
                     _record_stat("fallback_docblock_compile")

@@ -22,6 +22,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
 from deberta.modeling.flashdeberta_segment_pack import (
     segment_pack_grad_and_delta_from_padded,
     segment_pack_padded_rows,
@@ -91,21 +92,6 @@ def flashdeberta_compiled_docblock_available() -> bool:
     """
 
     return _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP is not None and _FLASHDEBERTA_DOCBLOCK_BWD_CUSTOM_OP is not None
-
-
-def _lookup_registered_op(namespace: str, name: str) -> Any | None:
-    """Return a previously registered custom op overload, if one exists.
-
-    :param str namespace: Operator namespace.
-    :param str name: Operator name.
-    :return Any | None: Registered overload or ``None``.
-    """
-
-    ns = getattr(torch.ops, namespace, None)
-    if ns is None or not hasattr(ns, name):
-        return None
-    op = getattr(ns, name)
-    return getattr(op, "default", op)
 
 
 def _active_docblock_metadata(
@@ -490,7 +476,7 @@ def _docblock_forward_impl(
     ):
         table_config = resolve_flash_kernel_config(
             FlashKernelContext(
-                compute_capability=_varlen_mod._varlen_device_capability(query_layer.device),
+                compute_capability=device_compute_capability(query_layer.device),
                 route="docblock",
                 kind="fwd",
                 seq_len=int(max_seqlen),
@@ -852,8 +838,8 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = _lookup_registered_op(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_FWD_OP_NAME)
-    existing_backward = _lookup_registered_op(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_BWD_OP_NAME)
+    existing_forward = lookup_registered_op(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_FWD_OP_NAME)
+    existing_backward = lookup_registered_op(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_BWD_OP_NAME)
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 

@@ -35,6 +35,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     flash_seq_bucket,
     resolve_flash_kernel_config,
 )
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_padded_rows,
     prefix_pack_padded_rows_pair,
@@ -43,6 +44,7 @@ from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_unpack_padded_rows_pair,
     prefix_unpack_padded_rows_triple,
 )
+from deberta.modeling.mask_utils import is_torch_compiling
 
 
 def _optional_triton_jit(fn: object) -> object:
@@ -176,20 +178,6 @@ def flashdeberta_compiled_varlen_available() -> bool:
     return _FLASHDEBERTA_VARLEN_TRITON_OP is not None and _FLASHDEBERTA_VARLEN_TRITON_BWD_OP is not None
 
 
-def _is_torch_compiling() -> bool:
-    """Return whether execution is happening inside ``torch.compile``.
-
-    :return bool: True when a compiled/traced graph is active.
-    """
-
-    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
-        return False
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
-
-
 def _varlen_use_triton_op() -> bool:
     """Return whether the compile-visible Triton varlen path is available.
 
@@ -208,36 +196,6 @@ def _varlen_use_triton_op() -> bool:
         and hasattr(torch.library, "triton_op")
         and hasattr(torch.library, "wrap_triton")
     )
-
-
-def _lookup_registered_op(namespace: str, name: str) -> Any | None:
-    """Return a previously registered custom op overload, if one exists.
-
-    :param str namespace: Operator namespace.
-    :param str name: Operator name.
-    :return Any | None: Registered overload or ``None``.
-    """
-
-    ns = getattr(torch.ops, namespace, None)
-    if ns is None or not hasattr(ns, name):
-        return None
-    op = getattr(ns, name)
-    return getattr(op, "default", op)
-
-
-def _varlen_device_capability(device: torch.device) -> tuple[int, int]:
-    """Return CUDA device capability for one device.
-
-    :param torch.device device: CUDA device to query.
-    :return tuple[int, int]: ``(major, minor)`` compute capability.
-    """
-
-    if device.type != "cuda":
-        return (0, 0)
-    index = device.index
-    if index is None:
-        return torch.cuda.get_device_capability()
-    return torch.cuda.get_device_capability(index)
 
 
 def _varlen_density_bucket(*, seq_len: int, total_tokens: int, batch_size: int) -> str:
@@ -300,7 +258,7 @@ def _varlen_repo_tuned_bwd_config(
     normalized_kind = str(kind).strip().lower()
     if normalized_kind not in {"kv", "q"}:
         return None
-    capability = _varlen_device_capability(device)
+    capability = device_compute_capability(device)
     return resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=capability,
@@ -346,7 +304,7 @@ def _varlen_repo_tuned_fwd_config(
 
     return resolve_flash_kernel_config(
         FlashKernelContext(
-            compute_capability=_varlen_device_capability(device),
+            compute_capability=device_compute_capability(device),
             route="varlen",
             kind="fwd",
             seq_len=int(seq_len),
@@ -1684,8 +1642,8 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = _lookup_registered_op(_VARLEN_OP_NAMESPACE, _VARLEN_FWD_OP_NAME)
-    existing_backward = _lookup_registered_op(_VARLEN_OP_NAMESPACE, _VARLEN_BWD_OP_NAME)
+    existing_forward = lookup_registered_op(_VARLEN_OP_NAMESPACE, _VARLEN_FWD_OP_NAME)
+    existing_backward = lookup_registered_op(_VARLEN_OP_NAMESPACE, _VARLEN_BWD_OP_NAME)
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 
@@ -2369,8 +2327,8 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
     if not _varlen_use_triton_op():
         return None, None
 
-    existing_forward = _lookup_registered_op(_VARLEN_OP_NAMESPACE, f"{_VARLEN_FWD_OP_NAME}_triton")
-    existing_backward = _lookup_registered_op(_VARLEN_OP_NAMESPACE, f"{_VARLEN_BWD_OP_NAME}_triton")
+    existing_forward = lookup_registered_op(_VARLEN_OP_NAMESPACE, f"{_VARLEN_FWD_OP_NAME}_triton")
+    existing_backward = lookup_registered_op(_VARLEN_OP_NAMESPACE, f"{_VARLEN_BWD_OP_NAME}_triton")
     if existing_forward is not None and existing_backward is not None:
         return existing_forward, existing_backward
 
@@ -2714,7 +2672,7 @@ def flashdeberta_varlen_padded(
     """
 
     if (
-        _is_torch_compiling()
+        is_torch_compiling()
         and _FLASHDEBERTA_VARLEN_TRITON_OP is not None
         and query_layer.device.type == "cuda"
     ):

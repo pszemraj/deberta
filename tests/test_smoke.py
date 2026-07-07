@@ -3203,7 +3203,7 @@ def test_rotary_compile_mode_requires_prefilled_cache(monkeypatch):
     rope = rope_mod.RotaryEmbedding(dim=8, base=10_000.0)
     device = torch.device("cpu")
 
-    monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(rope_mod, "is_torch_compiling", lambda: True)
     with pytest.raises(RuntimeError, match="not prefilled"):
         _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
 
@@ -3218,7 +3218,7 @@ def test_rotary_compile_mode_requires_prefilled_cache(monkeypatch):
     with pytest.raises(RuntimeError, match="too short"):
         _ = rope.get_cos_sin(9, device=device, dtype=torch.float32)
 
-    monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: False)
+    monkeypatch.setattr(rope_mod, "is_torch_compiling", lambda: False)
     _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     assert rope._cache is not None
 
