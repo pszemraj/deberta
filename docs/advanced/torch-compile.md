@@ -64,17 +64,23 @@ custom ops, so it behaves like a normal compiled attention primitive instead of
 tracing through Python-side launcher code.
 
 Packed doc-block batches on `hf_deberta_v2` use a fourth route family. The
-safe default is the segment-aware `docblock` route for all shipped packed
-sequence lengths. In that path, compile metadata keeps the 2D keep mask plus
+JSON route table selects the dense flash-with-bias `docblock_bias` route for
+the shipped packed `1024`/`2048`/`4096` lengths; the segment-aware ragged
+`docblock` route is the fallback for unlisted shapes and non-`sm_120`
+hardware, and can be forced with `model.hf.flash.docblock_bias_seq_len=0`.
+In the ragged path, compile metadata keeps the 2D keep mask plus
 fixed-shape segment descriptors sized to `B*S`, and the opaque doc-block custom
 op slices the active segment prefix, repacks those document spans into a ragged
 batch, runs the existing disentangled varlen flash kernels, and scatters the
 results back into the original packed layout. The fixed-shape metadata contract
 is important: it keeps the compiled `masked_docblock_*` entrypoints from
-recompiling when the number of documents per packed batch changes. The dense
-flash-with-bias `docblock_bias` route is an explicit validation override, not a
-default, because local 1000-step RTD training exposed degenerate convergence on
-that route even though isolated profiles looked competitive.
+recompiling when the number of documents per packed batch changes. An earlier
+1000-step RTD run showed degenerate convergence on the dense route; that was
+traced to a dense output-layout bug (kernel output viewed as `(B,S,H*D)`
+without transposing from `(B,H,S,D)`), which is fixed and guarded by a
+sentinel regression test. The 2026-07-06 validation campaign (see
+`docs/devlog.md`) confirmed dense-route training equivalence with eager at
+`1024` and `2048` on top of the speed gates.
 The dense-bias branch now builds its `(B,H,S,S)` additive bias through a
 repo-local opaque custom op instead of tracing the earlier
 `take_along_dim`/mask-scaling chain in eager Python. That keeps dense-bias
@@ -87,8 +93,8 @@ The builder has its own tuning entry in `flashdeberta_kernel_tuning.json`, so
 retuning that assembly op does not perturb the downstream flash-with-bias
 attention kernels.
 The current measured `sm_120` packed-docblock `1024` builder candidate is
-`64 x 128, stages=2, warps=4`, but it is only used when dense `docblock_bias`
-is explicitly selected.
+`64 x 128, stages=2, warps=4`; it is used whenever the route table selects
+dense `docblock_bias`, which is the shipped packed default.
 That dense flash-with-bias route now has its own repo-local tuning seam too.
 The opaque bias wrapper checks `flashdeberta_kernel_tuning.json` before falling
 back to upstream FlashDeBERTa config selection, so packed-docblock kernel tuning
@@ -96,13 +102,14 @@ stays isolated from the fixed and varlen routes. The repo now launches the raw
 bias backward `KV` and `Q` Triton kernels directly, which makes those two
 backward surfaces independently tunable without forking the whole attention
 wrapper.
-For the experimental packed-docblock `1024` dense path, the wrapper now goes
-one step further: when the run is non-causal, bf16/fp16, `D=64`, and the
-additive bias is a full dense `(B,H,1024,1024)` tensor, a matching
-`bias_docblock_specialized` entry in `flashdeberta_kernel_tuning.json` enables
-the exact-match repo-local `_bwd_kv_kernel_docblock1024` /
-`_bwd_q_kernel_docblock1024` Triton kernels instead of the more generic
-FlashDeBERTa bias backward launcher. That specialization is intentionally
+For the packed-docblock dense path at the measured `1024`/`2048`/`4096`
+lengths, the wrapper now goes one step further: when the run is non-causal,
+bf16/fp16, `D=64`, and the additive bias is a full dense `(B,H,S,S)` tensor, a
+matching `bias_docblock_specialized` entry in
+`flashdeberta_kernel_tuning.json` enables the repo-local
+`_bwd_kv_kernel_docblock1024` / `_bwd_q_kernel_docblock1024` Triton kernels
+(historical names; the table gates all three measured square shapes) instead
+of the more generic FlashDeBERTa bias backward launcher. That specialization is intentionally
 narrow and stays behind the same opaque custom op boundary, so Dynamo still
 sees one stable flash-with-bias primitive. Outside that exact regime or table
 policy, the wrapper falls back to the generic raw bias backward kernels and the
