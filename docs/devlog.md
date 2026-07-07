@@ -555,3 +555,26 @@ contexts beyond `4096`).
 - Ragged `docblock` kernel ownership (bucket LUT, deterministic segmented
   position-gradient backward) - only worth it if a deterministic-gradient or
   non-`sm_120` requirement materializes.
+
+### 2026-07-07 PR Review Follow-Up (both findings confirmed and fixed)
+
+Two unresolved PR #5 review findings were verified and fixed:
+
+- P1 (`rtd.py`): the RTD head gated global CLS conditioning on attention-mask
+  rank alone, so the ragged flash `docblock` route (2D keep mask + segment
+  metadata) added the packed row's first token to every token - cross-document
+  leakage through the head and a silent objective difference versus eager and
+  the dense route. The head now also consults `FlashBatchMeta`; doc-block
+  metadata disables global CLS like a pairwise mask. Note the 2026-07-06
+  equivalence battery used the dense default route and is unaffected.
+- P2 (`flashdeberta_dense_bias_op.py` and `flashdeberta_bias_op.py`): the
+  eager dense-bias fallback gathered p2c with the transposed bucket map,
+  flipping the signed relative bucket (empirically: c2p matched Triton, p2c
+  diverged, corrected gather matches Triton exactly). Investigation widened
+  the finding: both PyTorch `dpos_query` reductions (bias_op scatter reduce,
+  dense_bias_op bucket-range backward) baked in the same reversed convention
+  and are the live CUDA gradient path whenever the specialized direct-dpos
+  kernels do not engage. Both now match analytic ground truth; the dead
+  `_build_dense_flash_bias` duplicate was removed and its self-confirming
+  test replaced with an explicit loop-reference test on an asymmetric bucket
+  map. Full suite (546) and the whole parity matrix re-passed on GPU.
