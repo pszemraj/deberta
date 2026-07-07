@@ -370,6 +370,32 @@ def _pop_flash_active_token_stats(batch: dict[str, Any]) -> None:
     batch.pop("flash_active_tokens_scalar", None)
 
 
+def _pop_flash_doc_segment_tensors(batch: dict[str, Any]) -> None:
+    """Remove doc-segment descriptor tensors from a batch.
+
+    :param dict[str, Any] batch: Batch mapping.
+    """
+
+    batch.pop("flash_doc_segment_offsets", None)
+    batch.pop("flash_doc_segment_lengths", None)
+    batch.pop("flash_doc_cu_seqlens", None)
+
+
+def _clear_flash_batch_metadata(batch: dict[str, Any]) -> None:
+    """Remove every collator-attached flash metadata key from a batch.
+
+    Early-return paths that hand the batch to non-flash consumers must not
+    leave stale flash descriptors behind.
+
+    :param dict[str, Any] batch: Batch mapping.
+    """
+
+    batch.pop("flash_seq_lengths", None)
+    _pop_flash_active_token_stats(batch)
+    _pop_flash_doc_segment_tensors(batch)
+    _pop_flash_doc_segment_host_stats(batch)
+
+
 def prepare_flash_attention_batch_metadata(
     *,
     batch: dict[str, Any],
@@ -390,19 +416,12 @@ def prepare_flash_attention_batch_metadata(
 
     btype = str(backbone_type).strip().lower()
     if btype != "hf_deberta_v2":
-        batch.pop("flash_seq_lengths", None)
-        _pop_flash_active_token_stats(batch)
-        _pop_flash_doc_segment_host_stats(batch)
+        _clear_flash_batch_metadata(batch)
         return batch, None
 
     input_ids = batch.get("input_ids")
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
-        batch.pop("flash_seq_lengths", None)
-        _pop_flash_active_token_stats(batch)
-        batch.pop("flash_doc_segment_offsets", None)
-        batch.pop("flash_doc_segment_lengths", None)
-        batch.pop("flash_doc_cu_seqlens", None)
-        _pop_flash_doc_segment_host_stats(batch)
+        _clear_flash_batch_metadata(batch)
         return batch, None
 
     doc_ids = batch.pop("doc_ids", None)
@@ -437,9 +456,7 @@ def prepare_flash_attention_batch_metadata(
             if not bool(flash_enabled):
                 batch.pop("flash_seq_lengths", None)
                 _pop_flash_active_token_stats(batch)
-            batch.pop("flash_doc_segment_offsets", None)
-            batch.pop("flash_doc_segment_lengths", None)
-            batch.pop("flash_doc_cu_seqlens", None)
+            _pop_flash_doc_segment_tensors(batch)
             _pop_flash_doc_segment_host_stats(batch)
             meta = FlashBatchMeta(
                 seq_lengths=seq_lengths if bool(flash_enabled) else None,
@@ -510,38 +527,18 @@ def prepare_flash_attention_batch_metadata(
     attention_mask = batch.get("attention_mask")
     seq_len = int(input_ids.shape[-1])
     if attention_mask is None:
-        batch.pop("flash_seq_lengths", None)
-        _pop_flash_active_token_stats(batch)
-        batch.pop("flash_doc_segment_offsets", None)
-        batch.pop("flash_doc_segment_lengths", None)
-        batch.pop("flash_doc_cu_seqlens", None)
-        _pop_flash_doc_segment_host_stats(batch)
+        _clear_flash_batch_metadata(batch)
         return batch, FlashBatchMeta(route_hint="dense") if bool(flash_enabled) else None
     if _flash_is_pairwise_mask(attention_mask, seq_len=int(seq_len)):
-        batch.pop("flash_seq_lengths", None)
-        _pop_flash_active_token_stats(batch)
-        batch.pop("flash_doc_segment_offsets", None)
-        batch.pop("flash_doc_segment_lengths", None)
-        batch.pop("flash_doc_cu_seqlens", None)
-        _pop_flash_doc_segment_host_stats(batch)
+        _clear_flash_batch_metadata(batch)
         return batch, None
 
     if not isinstance(attention_mask, torch.Tensor):
-        batch.pop("flash_seq_lengths", None)
-        _pop_flash_active_token_stats(batch)
-        batch.pop("flash_doc_segment_offsets", None)
-        batch.pop("flash_doc_segment_lengths", None)
-        batch.pop("flash_doc_cu_seqlens", None)
-        _pop_flash_doc_segment_host_stats(batch)
+        _clear_flash_batch_metadata(batch)
         return batch, None
 
     if not bool(flash_enabled):
-        batch.pop("flash_seq_lengths", None)
-        _pop_flash_active_token_stats(batch)
-        batch.pop("flash_doc_segment_offsets", None)
-        batch.pop("flash_doc_segment_lengths", None)
-        batch.pop("flash_doc_cu_seqlens", None)
-        _pop_flash_doc_segment_host_stats(batch)
+        _clear_flash_batch_metadata(batch)
         return batch, None
 
     keep_mask = _flash_mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
@@ -574,9 +571,7 @@ def prepare_flash_attention_batch_metadata(
         batch["flash_active_tokens_scalar"] = active_tokens_scalar
     else:
         batch.pop("flash_active_tokens_scalar", None)
-    batch.pop("flash_doc_segment_offsets", None)
-    batch.pop("flash_doc_segment_lengths", None)
-    batch.pop("flash_doc_cu_seqlens", None)
+    _pop_flash_doc_segment_tensors(batch)
     _pop_flash_doc_segment_host_stats(batch)
     return batch, FlashBatchMeta(
         seq_lengths=seq_lengths,

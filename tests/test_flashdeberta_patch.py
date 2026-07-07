@@ -1764,6 +1764,32 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert varlen_meta.active_tokens_host == 3500
 
 
+def test_prepare_flash_attention_batch_metadata_clears_metadata_for_other_backbones() -> None:
+    import deberta.training.compile as compile_mod
+
+    batch = {
+        "input_ids": torch.zeros((2, 8), dtype=torch.long),
+        "flash_seq_lengths": torch.tensor([8, 5], dtype=torch.int32),
+        "flash_active_tokens": 13,
+        "flash_active_tokens_scalar": torch.tensor(13),
+        "flash_doc_segment_offsets": torch.zeros((16,), dtype=torch.int32),
+        "flash_doc_segment_lengths": torch.zeros((16,), dtype=torch.int32),
+        "flash_doc_cu_seqlens": torch.zeros((17,), dtype=torch.int32),
+        "flash_doc_num_segments": 3,
+        "flash_doc_max_seqlen": 5,
+        "flash_doc_num_segments_scalar": torch.tensor(3),
+        "flash_doc_max_seqlen_scalar": torch.tensor(5),
+    }
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="rope",
+        flash_enabled=False,
+    )
+    assert prepared is batch
+    assert meta is None
+    assert not any(key.startswith("flash_") for key in prepared)
+
+
 def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
     import deberta.training.compile as compile_mod
 
