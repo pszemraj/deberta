@@ -35,12 +35,18 @@ class FlashKernelContext:
 def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
     """Set the process-local FlashDeBERTa kernel override table.
 
+    Reapplying the already-active path is a no-op, so hot-path callers such as
+    per-step batch preparation do not invalidate the cached tuning table.
+
     :param str | None path: JSON table path, or None to use only the package default.
     """
 
     global _ACTIVE_OVERRIDES_PATH
     normalized = str(path).strip() if path is not None else ""
-    _ACTIVE_OVERRIDES_PATH = normalized or None
+    resolved = normalized or None
+    if resolved == _ACTIVE_OVERRIDES_PATH:
+        return
+    _ACTIVE_OVERRIDES_PATH = resolved
     _load_tuning_payload.cache_clear()
 
 

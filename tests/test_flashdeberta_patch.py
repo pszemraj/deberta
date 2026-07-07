@@ -307,6 +307,30 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     ) == (16, 32, 1, 4)
 
 
+def test_flashdeberta_kernel_overrides_same_path_reconfigure_keeps_cache(monkeypatch) -> None:
+    from deberta.modeling import flashdeberta_kernel_tuning as tuning
+
+    tuning.configure_flashdeberta_kernel_overrides(None)
+    reads = {"count": 0}
+    real_read = tuning._read_json
+
+    def _counting_read(path):
+        reads["count"] += 1
+        return real_read(path)
+
+    monkeypatch.setattr(tuning, "_read_json", _counting_read)
+    tuning._load_tuning_payload.cache_clear()
+
+    baseline_bucket = tuning.flash_seq_bucket(seq_len=1024)
+    first_reads = reads["count"]
+    assert first_reads >= 1
+
+    for _ in range(5):
+        tuning.configure_flashdeberta_kernel_overrides(None)
+        assert tuning.flash_seq_bucket(seq_len=1024) == baseline_bucket
+    assert reads["count"] == first_reads
+
+
 def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
