@@ -856,6 +856,35 @@ def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest
     assert stats.get("fallback_calls", 0) == 0
 
 
+def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+
+    def _gate(hf_flash: dict[str, object]) -> bool:
+        cfg = _small_deberta_config()
+        cfg.hf_flash = hf_flash
+        attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+        attention.train()
+        pos_term = torch.zeros((1, 1, 1, 1))
+        return attention._should_use_local_bias(
+            attention_mask=None,
+            batch_size=1,
+            seq_len=1024,
+            pos_key=pos_term,
+            pos_query=pos_term,
+        )
+
+    assert _gate({}) is True
+    # The packed doc-block override must not leak into the plain-batch local-bias route.
+    assert _gate({"docblock_bias_seq_len": 0}) is True
+    assert _gate({"docblock_bias_seq_len": 2048}) is True
+    assert _gate({"local_bias_seq_len": 0}) is False
+    assert _gate({"local_bias_seq_len": 1024}) is True
+    assert _gate({"local_bias_seq_len": 2048}) is False
+
+
 def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
     from deberta.modeling.flashdeberta_prefix_pack import (
         prefix_pack_padded_rows_pair,

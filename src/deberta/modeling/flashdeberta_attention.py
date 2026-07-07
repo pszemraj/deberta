@@ -98,6 +98,7 @@ class FlashDebertaRuntimeConfig:
     force_varlen: bool = False
     varlen_min_seq_len: int | None = None
     docblock_bias_seq_len: int | None = None
+    local_bias_seq_len: int | None = None
     local_bias_max_batch_size: int | None = None
     eager_dense_max_seq_len: int = 0
     kernel_overrides_path: str | None = None
@@ -156,6 +157,7 @@ def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
         force_varlen=False,
         varlen_min_seq_len=None,
         docblock_bias_seq_len=None,
+        local_bias_seq_len=None,
         local_bias_max_batch_size=None,
         eager_dense_max_seq_len=0,
         kernel_overrides_path=None,
@@ -208,6 +210,7 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
         docblock_bias_seq_len=_optional_int(
             getter("docblock_bias_seq_len", getattr(config, "flash_docblock_bias_seq_len", None))
         ),
+        local_bias_seq_len=_optional_int(getter("local_bias_seq_len", None)),
         local_bias_max_batch_size=_optional_int(
             getter(
                 "local_bias_max_batch_size",
@@ -758,7 +761,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 local_bias_max_batch_size = 0
         if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
             return False
-        local_bias_seq_len = self._runtime_config.docblock_bias_seq_len
+        local_bias_seq_len = self._runtime_config.local_bias_seq_len
         if local_bias_seq_len is None:
             if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
                 return False

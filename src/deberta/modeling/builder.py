@@ -623,6 +623,7 @@ def _apply_hf_config_normalization(
         "force_varlen": bool(flash_cfg.force_varlen),
         "varlen_min_seq_len": _optional_flash_int(flash_cfg.varlen_min_seq_len),
         "docblock_bias_seq_len": _optional_flash_int(flash_cfg.docblock_bias_seq_len),
+        "local_bias_seq_len": _optional_flash_int(flash_cfg.local_bias_seq_len),
         "local_bias_max_batch_size": _optional_flash_int(flash_cfg.local_bias_max_batch_size),
         "eager_dense_max_seq_len": int(flash_cfg.eager_dense_max_seq_len),
         "kernel_overrides_path": flash_cfg.kernel_overrides_path,

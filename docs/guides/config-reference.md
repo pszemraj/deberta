@@ -89,6 +89,9 @@ model:
       # Guidance: Only used when `model.hf.attention_impl=flash`. Exact-length dense doc-block route override. `null` uses the JSON table, which selects dense `docblock_bias` for measured packed `1024`/`2048`/`4096` buckets and uses ragged `docblock` elsewhere. Set a positive exact sequence length to force dense only at that length; set `0` to force-disable dense doc-block routing and use ragged segment metadata.
       docblock_bias_seq_len: null
       # Type: int | None. Default: null. Required: no.
+      # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route seq-len override for plain (non-packed) batches. `null` uses table policy; `0` disables the local-bias route; a positive value allows it only at that exact sequence length. Independent of `model.hf.flash.docblock_bias_seq_len`.
+      local_bias_seq_len: null
+      # Type: int | None. Default: null. Required: no.
       # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route cap. `null` uses table policy; `0` disables. Dense routes can be memory-heavy and hardware-sensitive.
       local_bias_max_batch_size: null
       # Type: int. Default: 0. Required: no.

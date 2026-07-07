@@ -151,6 +151,7 @@ class ModelHFFlashConfig:
     force_varlen: bool = field(default=False)
     varlen_min_seq_len: int | None = field(default=None)
     docblock_bias_seq_len: int | None = field(default=None)
+    local_bias_seq_len: int | None = field(default=None)
     local_bias_max_batch_size: int | None = field(default=None)
     eager_dense_max_seq_len: int = field(default=0)
     kernel_overrides_path: str | None = field(default=None)
@@ -1367,6 +1368,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
         _cfg_set(cfg.hf.flash, "varlen_min_seq_len", int(cfg.hf.flash.varlen_min_seq_len))
     if cfg.hf.flash.docblock_bias_seq_len is not None:
         _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
+    if cfg.hf.flash.local_bias_seq_len is not None:
+        _cfg_set(cfg.hf.flash, "local_bias_seq_len", int(cfg.hf.flash.local_bias_seq_len))
     if cfg.hf.flash.local_bias_max_batch_size is not None:
         _cfg_set(cfg.hf.flash, "local_bias_max_batch_size", int(cfg.hf.flash.local_bias_max_batch_size))
     _cfg_set(cfg.hf.flash, "eager_dense_max_seq_len", int(cfg.hf.flash.eager_dense_max_seq_len))
@@ -1410,6 +1413,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
         raise ValueError("model.hf.flash.varlen_min_seq_len must be > 0.")
     if cfg.hf.flash.docblock_bias_seq_len is not None and int(cfg.hf.flash.docblock_bias_seq_len) < 0:
         raise ValueError("model.hf.flash.docblock_bias_seq_len must be >= 0.")
+    if cfg.hf.flash.local_bias_seq_len is not None and int(cfg.hf.flash.local_bias_seq_len) < 0:
+        raise ValueError("model.hf.flash.local_bias_seq_len must be >= 0.")
     if cfg.hf.flash.local_bias_max_batch_size is not None and int(cfg.hf.flash.local_bias_max_batch_size) < 0:
         raise ValueError("model.hf.flash.local_bias_max_batch_size must be >= 0.")
     if int(cfg.hf.flash.eager_dense_max_seq_len) < 0:

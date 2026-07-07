@@ -157,11 +157,14 @@ flash-with-bias kernel returned `(B,H,S,D)` but the adapter viewed it directly a
 parity covers `1024`, `2048`, and `4096` forward plus word embedding, relative
 embedding, query-projection, and value-projection gradients.
 
-Leave `model.hf.flash.docblock_bias_seq_len` and
-`model.hf.flash.local_bias_max_batch_size` unset to use the table. Set
+Leave `model.hf.flash.docblock_bias_seq_len`, `model.hf.flash.local_bias_seq_len`,
+and `model.hf.flash.local_bias_max_batch_size` unset to use the table. Set
 `model.hf.flash.docblock_bias_seq_len=<len>` to force the dense-bias doc-block
 route only at that exact sequence length, or set it to `0` to force-disable the
-dense-bias doc-block route while keeping flash enabled. Set
+dense-bias doc-block route while keeping flash enabled; this knob only affects
+packed doc-block batches. The plain-batch dense local-bias route has its own
+independent overrides: set `model.hf.flash.local_bias_seq_len=<len>` to allow it
+only at that exact sequence length (`0` disables it), and set
 `model.hf.flash.local_bias_max_batch_size=0` to disable the small-batch dense
 local-bias route without changing the doc-block route. Route policy is
 config/table-only; the older FlashDeBERTa route environment fallbacks are not

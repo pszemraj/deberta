@@ -118,6 +118,7 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
                 "      force_varlen: true",
                 "      varlen_min_seq_len: 4096",
                 "      docblock_bias_seq_len: 0",
+                "      local_bias_seq_len: 1024",
                 "      local_bias_max_batch_size: 2",
                 "data:",
                 "  source:",
@@ -133,6 +134,7 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     assert cfg.model.hf.flash.force_varlen is True
     assert cfg.model.hf.flash.varlen_min_seq_len == 4096
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
+    assert cfg.model.hf.flash.local_bias_seq_len == 1024
     assert cfg.model.hf.flash.local_bias_max_batch_size == 2
 
 
