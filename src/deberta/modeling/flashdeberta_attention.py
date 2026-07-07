@@ -206,28 +206,13 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
             return getattr(raw, key, default) if raw is not None else default
 
     return FlashDebertaRuntimeConfig(
-        force_varlen=bool(getter("force_varlen", getattr(config, "flash_force_varlen", False))),
-        varlen_min_seq_len=_optional_int(
-            getter("varlen_min_seq_len", getattr(config, "flash_varlen_min_seq_len", None))
-        ),
-        docblock_bias_seq_len=_optional_int(
-            getter("docblock_bias_seq_len", getattr(config, "flash_docblock_bias_seq_len", None))
-        ),
+        force_varlen=bool(getter("force_varlen", False)),
+        varlen_min_seq_len=_optional_int(getter("varlen_min_seq_len", None)),
+        docblock_bias_seq_len=_optional_int(getter("docblock_bias_seq_len", None)),
         local_bias_seq_len=_optional_int(getter("local_bias_seq_len", None)),
-        local_bias_max_batch_size=_optional_int(
-            getter(
-                "local_bias_max_batch_size",
-                getattr(config, "flash_local_bias_max_batch_size", None),
-            )
-        ),
-        eager_dense_max_seq_len=max(
-            0,
-            int(getter("eager_dense_max_seq_len", getattr(config, "flash_eager_dense_max_seq_len", 0))),
-        ),
-        kernel_overrides_path=getter(
-            "kernel_overrides_path",
-            getattr(config, "flash_kernel_overrides_path", None),
-        ),
+        local_bias_max_batch_size=_optional_int(getter("local_bias_max_batch_size", None)),
+        eager_dense_max_seq_len=max(0, int(getter("eager_dense_max_seq_len", 0))),
+        kernel_overrides_path=getter("kernel_overrides_path", None),
         enable_debug_stats=bool(_RUNTIME_CONFIG.enable_debug_stats),
         warn_fallbacks=bool(_RUNTIME_CONFIG.warn_fallbacks),
     )
