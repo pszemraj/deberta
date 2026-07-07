@@ -1456,20 +1456,11 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         output_hidden_states = bool(output_hidden_states)
         return_dict = bool(return_dict)
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time.")
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("You have to specify either input_ids or inputs_embeds.")
-
-        if input_ids is not None:
-            input_shape = input_ids.shape
-            device = input_ids.device
-        else:
-            input_shape = inputs_embeds.shape[:-1]
-            device = inputs_embeds.device
-
-        if token_type_ids is None:
-            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            token_type_ids=token_type_ids,
+        )
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -1545,6 +1536,12 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         return_dict: bool,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run forward on the dense no-mask path with resolved flags.
+
+        This path intentionally has no ``flash_meta`` parameter: a dense batch
+        (``attention_mask is None``) carries no flash metadata content — its
+        route hint is at most ``"dense"``, which every consumer treats exactly
+        like ``None`` — and keeping the compiled dense entrypoints tensor-only
+        avoids Dynamo guards on a semantically empty object.
 
         :param torch.Tensor | None input_ids: Optional input token ids.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
@@ -1623,52 +1620,14 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
-        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            token_type_ids=token_type_ids,
-        )
-        embedding_output = self.embeddings(
+        return self._forward_dense_resolved(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            mask=None,
             inputs_embeds=inputs_embeds,
-        )
-        need_hidden_states_for_z = int(self.z_steps) > 1
-        encoder_outputs = self.encoder(
-            embedding_output,
-            None,
-            output_hidden_states=need_hidden_states_for_z,
             output_attentions=False,
+            output_hidden_states=False,
             return_dict=True,
-        )
-        sequence_output = encoder_outputs.last_hidden_state
-        hidden_states = encoder_outputs.hidden_states
-
-        if int(self.z_steps) > 1:
-            if hidden_states is None or len(hidden_states) < 2:
-                raise RuntimeError("z_steps>1 requires encoder hidden states.")
-            z_base_states = hidden_states[-2]
-            z_query_states = hidden_states[-1]
-            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
-            rel_embeddings = self.encoder.get_rel_embedding()
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
-            for layer in layers[1:]:
-                z_query_states, _ = layer(
-                    z_base_states,
-                    None,
-                    output_attentions=False,
-                    query_states=z_query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                )
-            sequence_output = z_query_states
-
-        return BaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=None,
-            attentions=None,
         )
 
     def _forward_dense_hs1(
@@ -1688,55 +1647,14 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
-        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            token_type_ids=token_type_ids,
-        )
-        embedding_output = self.embeddings(
+        return self._forward_dense_resolved(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            mask=None,
             inputs_embeds=inputs_embeds,
-        )
-        encoder_outputs = self.encoder(
-            embedding_output,
-            None,
-            output_hidden_states=True,
             output_attentions=False,
+            output_hidden_states=True,
             return_dict=True,
-        )
-        sequence_output = encoder_outputs.last_hidden_state
-        hidden_states = encoder_outputs.hidden_states
-
-        if int(self.z_steps) > 1:
-            if hidden_states is None or len(hidden_states) < 2:
-                raise RuntimeError("z_steps>1 requires encoder hidden states.")
-            z_base_states = hidden_states[-2]
-            z_query_states = hidden_states[-1]
-            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
-            rel_embeddings = self.encoder.get_rel_embedding()
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
-            z_extras: list[torch.Tensor] = []
-            for layer in layers[1:]:
-                z_query_states, _ = layer(
-                    z_base_states,
-                    None,
-                    output_attentions=False,
-                    query_states=z_query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                )
-                z_extras.append(z_query_states)
-            sequence_output = z_query_states
-            if z_extras:
-                hidden_states = tuple(hidden_states) + tuple(z_extras)
-
-        return BaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=hidden_states,
-            attentions=None,
         )
 
     def _forward_masked_hs0(
@@ -1760,55 +1678,16 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
-        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+        return self._forward_masked_resolved(
             input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            token_type_ids=token_type_ids,
-        )
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            mask=attention_mask,
             inputs_embeds=inputs_embeds,
-        )
-        need_hidden_states_for_z = int(self.z_steps) > 1
-        encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask,
-            output_hidden_states=need_hidden_states_for_z,
             output_attentions=False,
+            output_hidden_states=False,
             return_dict=True,
             flash_meta=flash_meta,
-        )
-        sequence_output = encoder_outputs.last_hidden_state
-        hidden_states = encoder_outputs.hidden_states
-
-        if int(self.z_steps) > 1:
-            if hidden_states is None or len(hidden_states) < 2:
-                raise RuntimeError("z_steps>1 requires encoder hidden states.")
-            z_base_states = hidden_states[-2]
-            z_query_states = hidden_states[-1]
-            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
-            rel_embeddings = self.encoder.get_rel_embedding()
-            attn_mask = self.encoder.get_attention_mask(attention_mask)
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
-            for layer in layers[1:]:
-                z_query_states, _ = layer(
-                    z_base_states,
-                    attn_mask,
-                    output_attentions=False,
-                    query_states=z_query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
-                )
-            sequence_output = z_query_states
-
-        return BaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=None,
-            attentions=None,
         )
 
     def _forward_masked_hs1(
@@ -1832,58 +1711,16 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
-        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+        return self._forward_masked_resolved(
             input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            token_type_ids=token_type_ids,
-        )
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            mask=attention_mask,
             inputs_embeds=inputs_embeds,
-        )
-        encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask,
-            output_hidden_states=True,
             output_attentions=False,
+            output_hidden_states=True,
             return_dict=True,
             flash_meta=flash_meta,
-        )
-        sequence_output = encoder_outputs.last_hidden_state
-        hidden_states = encoder_outputs.hidden_states
-
-        if int(self.z_steps) > 1:
-            if hidden_states is None or len(hidden_states) < 2:
-                raise RuntimeError("z_steps>1 requires encoder hidden states.")
-            z_base_states = hidden_states[-2]
-            z_query_states = hidden_states[-1]
-            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
-            rel_embeddings = self.encoder.get_rel_embedding()
-            attn_mask = self.encoder.get_attention_mask(attention_mask)
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
-            z_extras: list[torch.Tensor] = []
-            for layer in layers[1:]:
-                z_query_states, _ = layer(
-                    z_base_states,
-                    attn_mask,
-                    output_attentions=False,
-                    query_states=z_query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
-                )
-                z_extras.append(z_query_states)
-            sequence_output = z_query_states
-            if z_extras:
-                hidden_states = tuple(hidden_states) + tuple(z_extras)
-
-        return BaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=hidden_states,
-            attentions=None,
         )
 
     def forward(
