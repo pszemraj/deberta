@@ -538,6 +538,67 @@ class DebertaV3ElectraCollator:
         selected_offsets = starts + offsets
         return maskable_idx.index_select(0, selected_offsets)
 
+    def _resolve_masking_hyperparams(
+        self, *, seq_len: int, mlm_prob: float
+    ) -> tuple[float, float, float, int, int]:
+        """Resolve the shared DeBERTa masking hyperparameters for one batch.
+
+        :param int seq_len: Sequence length of the batch.
+        :param float mlm_prob: Effective MLM probability.
+        :return tuple[float, float, float, int, int]: mask/random/keep
+            probabilities, window size, and per-sequence prediction cap.
+        """
+        mask_prob = float(self.cfg.mask_token_prob)
+        random_prob = float(self.cfg.random_token_prob)
+        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
+        mask_window = max(1, int(1.0 / mlm_prob))
+        max_preds_per_seq = int(math.ceil(float(seq_len) * mlm_prob / 10.0) * 10)
+        return mask_prob, random_prob, keep_prob, mask_window, max_preds_per_seq
+
+    def _apply_mask_replacement_policy(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        row: int,
+        selected: torch.Tensor,
+        *,
+        mask_prob: float,
+        random_prob: float,
+        keep_prob: float,
+        mask_token_id: int,
+    ) -> None:
+        """Apply the mask/random/keep replacement policy to selected positions.
+
+        Mutates ``input_ids`` and ``labels`` for one batch row in place. RNG
+        draw order matches the historical inline implementation exactly (one
+        uniform roll per selection, then one random-word draw when needed).
+
+        :param torch.Tensor input_ids: Mutable input ids of shape (B, S).
+        :param torch.Tensor labels: Mutable MLM labels of shape (B, S).
+        :param int row: Batch row index.
+        :param torch.Tensor selected: Selected position indices for this row.
+        :param float mask_prob: Probability of replacing with the mask token.
+        :param float random_prob: Probability of replacing with a random token.
+        :param float keep_prob: Probability of keeping the original token.
+        :param int mask_token_id: Mask token id.
+        """
+        originals = input_ids[row].index_select(0, selected)
+        labels[row].scatter_(0, selected, originals)
+
+        if mask_prob >= 1.0 and random_prob <= 0.0:
+            input_ids[row, selected] = mask_token_id
+            return
+
+        roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
+        mask_sel = roll < mask_prob
+        rand_sel = roll >= (mask_prob + keep_prob)
+
+        if bool(mask_sel.any().item()):
+            input_ids[row, selected[mask_sel]] = mask_token_id
+        if random_prob > 0.0 and bool(rand_sel.any().item()):
+            rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
+            input_ids[row, selected[rand_sel]] = rand_ids
+
     def _mask_tokens_unigram_windowed(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -559,11 +620,9 @@ class DebertaV3ElectraCollator:
         if mlm_prob <= 0.0:
             return input_ids, labels
 
-        mask_prob = float(self.cfg.mask_token_prob)
-        random_prob = float(self.cfg.random_token_prob)
-        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
-        mask_window = max(1, int(1.0 / mlm_prob))
-        max_preds_per_seq = int(math.ceil(float(seq_len) * mlm_prob / 10.0) * 10)
+        mask_prob, random_prob, keep_prob, mask_window, max_preds_per_seq = self._resolve_masking_hyperparams(
+            seq_len=seq_len, mlm_prob=mlm_prob
+        )
 
         for b in range(batch):
             spec = special_tokens_mask[b].to(dtype=torch.bool)
@@ -581,22 +640,16 @@ class DebertaV3ElectraCollator:
             if int(selected.numel()) > int(num_to_predict):
                 selected = selected[: int(num_to_predict)]
 
-            originals = input_ids[b].index_select(0, selected)
-            labels[b].scatter_(0, selected, originals)
-
-            if mask_prob >= 1.0 and random_prob <= 0.0:
-                input_ids[b, selected] = mask_token_id
-                continue
-
-            roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
-            mask_sel = roll < mask_prob
-            rand_sel = roll >= (mask_prob + keep_prob)
-
-            if bool(mask_sel.any().item()):
-                input_ids[b, selected[mask_sel]] = mask_token_id
-            if random_prob > 0.0 and bool(rand_sel.any().item()):
-                rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
-                input_ids[b, selected[rand_sel]] = rand_ids
+            self._apply_mask_replacement_policy(
+                input_ids,
+                labels,
+                b,
+                selected,
+                mask_prob=mask_prob,
+                random_prob=random_prob,
+                keep_prob=keep_prob,
+                mask_token_id=mask_token_id,
+            )
 
         return input_ids, labels
 
@@ -635,9 +688,9 @@ class DebertaV3ElectraCollator:
         mlm_prob = float(self.cfg.mlm_probability)
         if mlm_prob <= 0.0:
             return input_ids, labels
-        mask_prob = float(self.cfg.mask_token_prob)
-        random_prob = float(self.cfg.random_token_prob)
-        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
+        mask_prob, random_prob, keep_prob, mask_window, max_preds_per_seq = self._resolve_masking_hyperparams(
+            seq_len=S, mlm_prob=mlm_prob
+        )
 
         # n-gram sampling distribution: p(n) ∝ 1/n
         cache_key = (
@@ -653,9 +706,6 @@ class DebertaV3ElectraCollator:
             )
             probs = probs / probs.sum().clamp(min=1e-12)
             self._ngram_prob_cache[cache_key] = probs
-
-        mask_window = max(1, int(1.0 / mlm_prob))
-        max_preds_per_seq = int(math.ceil(float(S) * mlm_prob / 10.0) * 10)
 
         for b in range(B):
             spec = special_tokens_mask[b].to(dtype=torch.bool)
@@ -725,22 +775,16 @@ class DebertaV3ElectraCollator:
                 continue
 
             selected = torch.tensor(selected_positions, device=input_ids.device, dtype=torch.long)
-            originals = input_ids[b].index_select(0, selected)
-            labels[b].scatter_(0, selected, originals)
-
-            if mask_prob >= 1.0 and random_prob <= 0.0:
-                input_ids[b, selected] = mask_token_id
-                continue
-
-            roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
-            mask_sel = roll < mask_prob
-            rand_sel = roll >= (mask_prob + keep_prob)
-
-            if bool(mask_sel.any().item()):
-                input_ids[b, selected[mask_sel]] = mask_token_id
-            if random_prob > 0.0 and bool(rand_sel.any().item()):
-                rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
-                input_ids[b, selected[rand_sel]] = rand_ids
+            self._apply_mask_replacement_policy(
+                input_ids,
+                labels,
+                b,
+                selected,
+                mask_prob=mask_prob,
+                random_prob=random_prob,
+                keep_prob=keep_prob,
+                mask_token_id=mask_token_id,
+            )
 
         return input_ids, labels
 
