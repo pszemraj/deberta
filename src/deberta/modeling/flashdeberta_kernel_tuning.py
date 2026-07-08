@@ -52,15 +52,6 @@ def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
     resolve_flash_kernel_config.cache_clear()
 
 
-def active_flashdeberta_kernel_overrides_path() -> str | None:
-    """Return the active process-local kernel override table path.
-
-    :return str | None: Override path, or None when only package defaults are active.
-    """
-
-    return _ACTIVE_OVERRIDES_PATH
-
-
 def compute_capability_key(capability: tuple[int, int]) -> str:
     """Return the table key for a CUDA compute capability tuple.
 

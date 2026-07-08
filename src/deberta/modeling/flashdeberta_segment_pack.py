@@ -93,15 +93,6 @@ def _tensor_host_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(value) for value in tensor.tolist())
 
 
-def clear_segment_pack_host_cache() -> None:
-    """Compatibility no-op for the removed segment host cache.
-
-    :return None: This exists primarily for tests.
-    """
-
-    return None
-
-
 def _flatten_rows(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int, int]:
     """Flatten a contiguous ``(B, S, ...)`` tensor into row-major ``(B*S, F)`` form.
 
@@ -1157,7 +1148,6 @@ def segment_unpack_padded_rows_triple(
 
 
 __all__ = [
-    "clear_segment_pack_host_cache",
     "flashdeberta_segment_pack_available",
     "flashdeberta_segment_pack_import_error",
     "segment_pack_grad_and_delta_from_padded",

@@ -88,15 +88,6 @@ def flashdeberta_fixed_import_error() -> Exception | None:
     return _FLASH_FIXED_LOWLEVEL_IMPORT_ERROR
 
 
-def flashdeberta_compiled_fixed_available() -> bool:
-    """Return whether the opaque compiled fixed-length CUDA op is available.
-
-    :return bool: True when the custom-op based CUDA path is registered.
-    """
-
-    return _FLASHDEBERTA_FIXED_CUSTOM_OP is not None and _FLASHDEBERTA_FIXED_BWD_CUSTOM_OP is not None
-
-
 def _cdiv(a: int, b: int) -> int:
     """Return ceil-division for positive integers.
 
@@ -414,88 +405,6 @@ def _fixed_eager_forward_impl(
         int(max_relative_distance),
     )
     return output, None
-
-
-def _fixed_eager_backward_impl(
-    *,
-    grad_output: torch.Tensor,
-    query_layer: torch.Tensor,
-    key_layer: torch.Tensor,
-    value_layer: torch.Tensor,
-    seq_lengths: torch.Tensor | None,
-    output: torch.Tensor,
-    lse: torch.Tensor,
-    pos_key: torch.Tensor | None,
-    pos_query: torch.Tensor | None,
-    sm_scale: float,
-    position_buckets: int,
-    max_relative_distance: int,
-    causal: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Run fixed-length FlashDeBERTa backward eagerly.
-
-    :param torch.Tensor grad_output: Gradient of the fixed attention output.
-    :param torch.Tensor query_layer: Forward queries.
-    :param torch.Tensor key_layer: Forward keys.
-    :param torch.Tensor value_layer: Forward values.
-    :param torch.Tensor | None seq_lengths: Optional per-example active lengths.
-    :param torch.Tensor output: Forward output tensor.
-    :param torch.Tensor lse: Forward LSE tensor.
-    :param torch.Tensor | None pos_key: Optional c2p tensor.
-    :param torch.Tensor | None pos_query: Optional p2c tensor.
-    :param float sm_scale: Softmax scale.
-    :param int position_buckets: Relative-position bucket count.
-    :param int max_relative_distance: Maximum relative distance.
-    :param bool causal: Whether causal masking is enabled.
-    :raises RuntimeError: If low-level backward primitives are unavailable.
-    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        Gradients for q/k/v and optional positional tensors.
-    """
-
-    if _flash_attn_v2_bwd_dise_lowlevel is None or _get_bwd_config_lowlevel is None:
-        detail = _FLASH_FIXED_LOWLEVEL_IMPORT_ERROR
-        raise RuntimeError(
-            "Compiled FlashDeBERTa fixed-length backward is unavailable."
-            if detail is None
-            else f"Compiled FlashDeBERTa fixed-length backward is unavailable ({detail})."
-        )
-
-    batch_size, num_heads, query_len, head_dim = query_layer.shape
-    key_len = int(key_layer.shape[-2])
-    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
-    block_m, block_n, num_stages, num_warps = _fixed_backward_config(
-        batch_size=batch_size,
-        num_heads=num_heads,
-        query_len=query_len,
-        key_len=key_len,
-        head_dim=head_dim,
-        causal=bool(causal),
-        position_buckets=position_buckets,
-        max_relative_distance=max_relative_distance,
-        dtype=query_layer.dtype,
-        device=query_layer.device,
-        has_pos=(pos_key is not None or pos_query is not None),
-    )
-    return _flash_attn_v2_bwd_dise_lowlevel(
-        output,
-        grad_output,
-        query_layer,
-        key_layer,
-        value_layer,
-        seq_lengths,
-        pos_key,
-        pos_query,
-        lse,
-        bool(causal),
-        float(sm_scale),
-        block_m,
-        block_n,
-        int(position_buckets),
-        int(max_relative_distance),
-        num_warps,
-        num_stages,
-        att_span,
-    )
 
 
 def _fixed_triton_forward_impl(
@@ -1156,7 +1065,6 @@ def flashdeberta_fixed(
 
 
 __all__ = [
-    "flashdeberta_compiled_fixed_available",
     "flashdeberta_fixed",
     "flashdeberta_fixed_import_error",
     "_fixed_repo_tuned_config",

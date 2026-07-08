@@ -32,7 +32,6 @@ except Exception:  # pragma: no cover - optional Triton dependency
 
 from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
-    flash_seq_bucket,
     resolve_flash_kernel_config,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
@@ -195,22 +194,6 @@ def _varlen_use_triton_op() -> bool:
         and hasattr(torch, "library")
         and hasattr(torch.library, "triton_op")
         and hasattr(torch.library, "wrap_triton")
-    )
-
-
-def _varlen_density_bucket(*, seq_len: int, total_tokens: int, batch_size: int) -> str:
-    """Return the repo-local density bucket for one padded-varlen batch.
-
-    :param int seq_len: Padded sequence length.
-    :param int total_tokens: Total active tokens across the batch.
-    :param int batch_size: Batch size.
-    :return str: Density bucket label used by repo-local heuristics.
-    """
-
-    return flash_seq_bucket(
-        seq_len=int(seq_len),
-        total_tokens=int(total_tokens),
-        batch_size=int(batch_size),
     )
 
 

@@ -389,19 +389,6 @@ def _should_use_varlen(
     )
 
 
-def _normalize_route_hint(route_hint: str | None) -> str | None:
-    """Normalize an optional flash routing hint.
-
-    :param str | None route_hint: Optional routing hint.
-    :return str | None: Normalized hint or ``None`` when unset.
-    """
-
-    if route_hint is None:
-        return None
-    text = str(route_hint).strip().lower()
-    return text if text else None
-
-
 def _seqlens_to_mask_2d(seq_lengths: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     """Build a canonical prefix-padding keep mask from per-example lengths.
 

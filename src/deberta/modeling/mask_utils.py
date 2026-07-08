@@ -144,28 +144,6 @@ def _flash_cfg_bool(
     return bool(_flash_cfg_get(flash_cfg, name, False))
 
 
-def _flash_cfg_int(
-    flash_cfg: Any | None,
-    *,
-    name: str,
-    default: int,
-) -> int:
-    """Resolve one integer flash option from config or a declared default.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Config field name.
-    :param int default: Default integer when config is absent.
-    :return int: Resolved integer value.
-    """
-
-    if flash_cfg is None:
-        return int(default)
-    try:
-        return int(_flash_cfg_get(flash_cfg, name, default))
-    except Exception:
-        return int(default)
-
-
 def _flash_cfg_optional_int(
     flash_cfg: Any | None,
     *,
@@ -377,7 +355,6 @@ __all__ = [
     "FlashBatchMeta",
     "_flash_cfg_bool",
     "_flash_cfg_get",
-    "_flash_cfg_int",
     "_flash_is_pairwise_mask",
     "_flash_mask_to_2d_keep_mask",
     "build_doc_block_mask",
