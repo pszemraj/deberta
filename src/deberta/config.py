@@ -2062,8 +2062,36 @@ def _collect_leaf_paths(value: Any, *, prefix: str = "") -> set[str]:
     return set()
 
 
+# Legacy train-section keys that migrated to *other* sections. Same-section
+# migrations derive from each config class's _LEGACY_MAP instead.
+_TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
+    "project_name": "logging.project_name",
+    "run_name": "logging.run_name",
+    "report_to": "logging.wandb.enabled + logging.backend",
+    "logging_steps": "logging.logging_steps",
+    "wandb_watch": "logging.wandb.watch",
+    "wandb_watch_log_freq": "logging.wandb.watch_log_freq",
+    "debug_metrics": "logging.debug.metrics",
+    "learning_rate": "optim.lr.base",
+    "generator_learning_rate": "optim.lr.generator",
+    "discriminator_learning_rate": "optim.lr.discriminator",
+    "weight_decay": "optim.weight_decay",
+    "adam_beta1": "optim.adam.beta1",
+    "adam_beta2": "optim.adam.beta2",
+    "adam_epsilon": "optim.adam.epsilon",
+    "warmup_steps": "optim.scheduler.warmup_steps",
+    "lr_scheduler_type": "optim.scheduler.type",
+    "max_grad_norm": "optim.max_grad_norm",
+}
+
+
 def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
-    """Return actionable migration suggestion for an unknown key.
+    """Return an actionable migration suggestion for an unknown key.
+
+    Same-section suggestions derive from each config class's ``_LEGACY_MAP``
+    (the executable alias table), so the suggested dotted paths cannot drift
+    from the real ones; only cross-section train migrations need their own
+    table.
 
     :param str section_name: Section path.
     :param str key: Unknown key.
@@ -2071,109 +2099,16 @@ def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
     """
     section = str(section_name)
     k = str(key)
-    model_map = {
-        "tokenizer_name_or_path": "model.tokenizer.name_or_path",
-        "tokenizer_allow_vocab_resize": "model.tokenizer.allow_vocab_resize",
-        "tokenizer_vocab_target": "model.tokenizer.vocab_target",
-        "tokenizer_vocab_multiple": "model.tokenizer.vocab_multiple",
-        "hf_model_size": "model.hf.model_size",
-        "hf_attention_kernel": "model.hf.attention_kernel",
-        "hf_attention_impl": "model.hf.attention_impl",
-        "hf_max_position_embeddings": "model.hf.max_position_embeddings",
-        "pretrained_discriminator_path": "model.pretrained.discriminator_path",
-        "pretrained_generator_path": "model.pretrained.generator_path",
-        "hidden_dropout_prob": "model.dropout.hidden_prob",
-        "attention_probs_dropout_prob": "model.dropout.attention_probs_prob",
-        "generator_num_hidden_layers": "model.generator.num_hidden_layers",
-        "generator_hidden_size": "model.generator.hidden_size",
-        "generator_intermediate_size": "model.generator.intermediate_size",
-        "generator_num_attention_heads": "model.generator.num_attention_heads",
+    section_maps: dict[str, dict[str, str]] = {
+        "model": ModelConfig._LEGACY_MAP,
+        "data": DataConfig._LEGACY_MAP,
+        "train": TrainConfig._LEGACY_MAP,
     }
-    data_map = {
-        "dataset_name": "data.source.dataset_name",
-        "dataset_config_name": "data.source.dataset_config_name",
-        "data_files": "data.source.data_files",
-        "load_from_disk": "data.source.load_from_disk",
-        "train_split": "data.source.train_split",
-        "text_column_name": "data.source.text_column_name",
-        "streaming": "data.source.streaming",
-        "shuffle_buffer_size": "data.source.shuffle_buffer_size",
-        "pack_sequences": "data.packing.enabled",
-        "max_seq_length": "data.packing.max_seq_length",
-        "block_cross_document_attention": "data.packing.block_cross_document_attention",
-    }
-    train_map = {
-        "output_dir": "train.checkpoint.output_dir",
-        "overwrite_output_dir": "train.checkpoint.overwrite_output_dir",
-        "save_steps": "train.checkpoint.save_steps",
-        "save_total_limit": "train.checkpoint.save_total_limit",
-        "resume_from_checkpoint": "train.checkpoint.resume_from_checkpoint",
-        "resume_data_strategy": "train.checkpoint.resume_data_strategy",
-        "resume_replay_max_micro_batches": "train.checkpoint.resume_replay_max_micro_batches",
-        "export_hf_final": "train.checkpoint.export_hf_final",
-        "dataloader_num_workers": "train.dataloader.num_workers",
-        "dataloader_pin_memory": "train.dataloader.pin_memory",
-        "torch_compile": "train.compile.enabled",
-        "torch_compile_mode": "train.compile.mode",
-        "torch_compile_scope": "train.compile.scope",
-        "torch_compile_backend": "train.compile.backend",
-        "mlm_probability": "train.objective.mlm_probability",
-        "mask_token_prob": "train.objective.mask_token_prob",
-        "random_token_prob": "train.objective.random_token_prob",
-        "mlm_max_ngram": "train.objective.mlm_max_ngram",
-        "sampling_temperature": "train.objective.sampling_temperature",
-        "gen_loss_weight": "train.objective.gen_loss_weight",
-        "disc_loss_weight": "train.objective.disc_loss_weight",
-        "project_name": "logging.project_name",
-        "run_name": "logging.run_name",
-        "report_to": "logging.wandb.enabled + logging.backend",
-        "logging_steps": "logging.logging_steps",
-        "wandb_watch": "logging.wandb.watch",
-        "wandb_watch_log_freq": "logging.wandb.watch_log_freq",
-        "debug_metrics": "logging.debug.metrics",
-        "learning_rate": "optim.lr.base",
-        "generator_learning_rate": "optim.lr.generator",
-        "discriminator_learning_rate": "optim.lr.discriminator",
-        "weight_decay": "optim.weight_decay",
-        "adam_beta1": "optim.adam.beta1",
-        "adam_beta2": "optim.adam.beta2",
-        "adam_epsilon": "optim.adam.epsilon",
-        "warmup_steps": "optim.scheduler.warmup_steps",
-        "lr_scheduler_type": "optim.scheduler.type",
-        "max_grad_norm": "optim.max_grad_norm",
-    }
-    if section == "model":
-        if k in model_map:
-            return model_map[k]
-        rope_like = {
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "hidden_act",
-            "rope_theta",
-            "rotary_pct",
-            "use_absolute_position_embeddings",
-            "max_position_embeddings",
-            "type_vocab_size",
-            "norm_arch",
-            "norm_eps",
-            "keel_alpha_init",
-            "keel_alpha_learnable",
-            "attention_implementation",
-            "ffn_type",
-            "use_bias",
-            "swiglu_adjust_intermediate",
-            "initializer_range",
-        }
-        if k in rope_like:
-            return f"model.rope.{k}"
-        if k.startswith("pretrained_"):
-            return "model.rope.pretrained.<field>"
-    if section == "data" and k in data_map:
-        return data_map[k]
-    if section == "train" and k in train_map:
-        return train_map[k]
+    mapped = section_maps.get(section, {}).get(k)
+    if mapped is not None:
+        return f"{section}.{mapped}"
+    if section == "train":
+        return _TRAIN_CROSS_SECTION_SUGGESTIONS.get(k)
     if section == "root":
         if k == "checkpoint":
             return "train.checkpoint"
@@ -2518,29 +2453,29 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
             f"{root!r}; expected one of {', '.join(sorted(f.name for f in fields(Config)))}."
         )
 
-    def _apply_to_obj(obj: Any, remaining: list[str], value_text: str, full_path: str) -> Any:
-        """Recursively apply one override path to a dataclass instance.
+    def _resolve_override_leaf_type(obj: Any, remaining: list[str], full_path: str) -> Any:
+        """Resolve and validate the leaf field type for one override path.
 
-        :param Any obj: Current dataclass object.
-        :param list[str] remaining: Remaining path parts.
-        :param str value_text: Raw override value text.
+        :param Any obj: Root section dataclass.
+        :param list[str] remaining: Path parts under the section.
         :param str full_path: Full dotted path for error reporting.
-        :return Any: Updated dataclass object.
+        :raises ValueError: If any path segment is unknown.
+        :return Any: Leaf field type hint.
         """
-        key = remaining[0]
-        if not hasattr(obj, key):
+        node = obj
+        for key in remaining[:-1]:
+            if not hasattr(node, key):
+                raise ValueError(f"Unknown override field {full_path!r}.")
+            node = getattr(node, key)
+        leaf = remaining[-1]
+        if not hasattr(node, leaf):
             raise ValueError(f"Unknown override field {full_path!r}.")
-        if len(remaining) == 1:
-            type_hints = get_type_hints(type(obj))
-            field_type = type_hints.get(key, Any)
-            coerced = _coerce_override_value(value_text, field_type)
-            return replace(obj, **{key: coerced})
-        child = getattr(obj, key)
-        new_child = _apply_to_obj(child, remaining[1:], value_text, full_path)
-        return replace(obj, **{key: new_child})
+        return get_type_hints(type(node)).get(leaf, Any)
 
     root_obj = getattr(cfg, root)
-    new_root = _apply_to_obj(root_obj, parts[1:], raw_value, path)
+    leaf_type = _resolve_override_leaf_type(root_obj, parts[1:], path)
+    coerced_value = _coerce_override_value(raw_value, leaf_type)
+    new_root = _replace_path(root_obj, parts[1:], coerced_value)
     explicit_leaf_path = ".".join(parts[1:])
     _mark_explicit_fields(new_root, _explicit_fields(root_obj) | {explicit_leaf_path})
     new_cfg = replace(cfg, **{root: new_root})
