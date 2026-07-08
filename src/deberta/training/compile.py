@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import types
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -302,6 +303,35 @@ def _flash_existing_seq_lengths(batch: dict[str, Any]) -> torch.Tensor | None:
     return value if isinstance(value, torch.Tensor) and value.ndim == 1 else None
 
 
+def _resolve_flash_seq_lengths_and_active_tokens(
+    batch: dict[str, Any],
+    keep_mask: torch.Tensor,
+) -> tuple[torch.Tensor, int | None, torch.Tensor | None]:
+    """Resolve per-example lengths and active-token scalars for one flash batch.
+
+    Precomputed batch entries win; otherwise lengths derive from the keep mask
+    and the active-token count falls back through scalar-tensor and host paths.
+
+    :param dict[str, Any] batch: Batch mapping.
+    :param torch.Tensor keep_mask: Boolean keep mask in ``(B,S)`` layout.
+    :return tuple[torch.Tensor, int | None, torch.Tensor | None]: Sequence
+        lengths, host active-token count, and CPU scalar active-token tensor.
+    """
+
+    seq_lengths = _flash_existing_seq_lengths(batch)
+    if seq_lengths is None:
+        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+    active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
+    active_tokens_scalar = _flash_scalar_tensor(batch.get("flash_active_tokens_scalar"))
+    if active_tokens is None and active_tokens_scalar is not None:
+        active_tokens = int(active_tokens_scalar)
+    if active_tokens is None:
+        active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
+    if active_tokens_scalar is None:
+        active_tokens_scalar = _cpu_int_scalar(active_tokens)
+    return seq_lengths, active_tokens, active_tokens_scalar
+
+
 def _flash_doc_segment_host_stats(batch: dict[str, Any]) -> tuple[int | None, int | None]:
     """Return precomputed host doc-segment stats from the batch.
 
@@ -399,17 +429,9 @@ def prepare_flash_attention_batch_metadata(
             flash_cfg=flash_cfg,
         )
         keep_mask = doc_ids.ne(0)
-        seq_lengths = _flash_existing_seq_lengths(batch)
-        if seq_lengths is None:
-            seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
-        active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
-        active_tokens_scalar = _flash_scalar_tensor(batch.get("flash_active_tokens_scalar"))
-        if active_tokens is None and active_tokens_scalar is not None:
-            active_tokens = int(active_tokens_scalar)
-        if active_tokens is None:
-            active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
-        if active_tokens_scalar is None:
-            active_tokens_scalar = _cpu_int_scalar(active_tokens)
+        seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
+            batch, keep_mask
+        )
         batch["flash_seq_lengths"] = seq_lengths
         if active_tokens is not None:
             batch["flash_active_tokens"] = int(active_tokens)
@@ -510,17 +532,9 @@ def prepare_flash_attention_batch_metadata(
         return batch, None
 
     keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-    seq_lengths = _flash_existing_seq_lengths(batch)
-    if seq_lengths is None:
-        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
-    active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
-    active_tokens_scalar = _flash_scalar_tensor(batch.get("flash_active_tokens_scalar"))
-    if active_tokens is None and active_tokens_scalar is not None:
-        active_tokens = int(active_tokens_scalar)
-    if active_tokens is None:
-        active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
-    if active_tokens_scalar is None:
-        active_tokens_scalar = _cpu_int_scalar(active_tokens)
+    seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
+        batch, keep_mask
+    )
     route_active_tokens = (
         int(active_tokens) if active_tokens is not None else int(seq_len) * int(input_ids.shape[0])
     )
@@ -871,237 +885,59 @@ def _install_stable_backbone_compile_dispatch(
         masked_hs0_fn = _masked_hs0_fn
         masked_hs1_fn = _masked_hs1_fn
 
-    def _masked_fixed_hs0_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with fixed-flash routing.
+    def _make_routed_masked_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
+        """Bind a fixed flash route onto one stable masked entrypoint.
 
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Attention mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
+        Each returned closure is a distinct function object, so ``torch.compile``
+        keeps one compiled artifact per (route, hidden-states) combination.
+
+        :param Callable[..., Any] base_fn: Stable masked helper to wrap.
+        :param str route: Flash route literal stamped onto ``flash_meta``.
+        :return Callable[..., Any]: Route-bound masked entrypoint.
         """
 
-        return masked_hs0_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "fixed"),
-        )
+        def _routed_masked_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            attention_mask: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            flash_meta: FlashBatchMeta | None = None,
+        ) -> Any:
+            """Call the masked helper with a fixed flash route.
 
-    def _masked_fixed_hs1_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with fixed-flash routing and hidden states.
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor attention_mask: Attention mask tensor.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+            :return Any: Masked-path backbone outputs.
+            """
 
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Attention mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
+            return base_fn(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                flash_meta=_flash_meta_with_route(flash_meta, route),
+            )
+
+        return _routed_masked_fn
+
+    def _compile_routed_masked_pair(route: str) -> dict[bool, Any]:
+        """Compile the hs0/hs1 masked entrypoints bound to one flash route.
+
+        :param str route: Flash route literal.
+        :return dict[bool, Any]: Compiled entrypoints keyed by ``output_hidden_states``.
         """
 
-        return masked_hs1_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "fixed"),
-        )
-
-    def _masked_varlen_hs0_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with varlen-flash routing.
-
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Attention mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
-        """
-
-        return masked_hs0_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "varlen"),
-        )
-
-    def _masked_varlen_hs1_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with varlen-flash routing and hidden states.
-
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Attention mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
-        """
-
-        return masked_hs1_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "varlen"),
-        )
-
-    def _masked_docblock_hs0_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with doc-block flash routing.
-
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Attention mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
-        """
-
-        return masked_hs0_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "docblock"),
-        )
-
-    def _masked_docblock_hs1_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with doc-block flash routing and hidden states.
-
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Attention mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
-        """
-
-        return masked_hs1_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "docblock"),
-        )
-
-    def _masked_docblock_bias_hs0_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with dense doc-block bias flash routing.
-
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
-        """
-
-        return masked_hs0_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "docblock_bias"),
-        )
-
-    def _masked_docblock_bias_hs1_fn(
-        *,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        flash_meta: FlashBatchMeta | None = None,
-    ) -> Any:
-        """Call the masked helper with dense doc-block bias flash routing and hidden states.
-
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return Any: Masked-path backbone outputs.
-        """
-
-        return masked_hs1_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, "docblock_bias"),
-        )
+        return {
+            False: torch.compile(_make_routed_masked_fn(masked_hs0_fn, route), **compile_kwargs),
+            True: torch.compile(_make_routed_masked_fn(masked_hs1_fn, route), **compile_kwargs),
+        }
 
     compiled_dense = {
         False: torch.compile(dense_hs0_fn, **compile_kwargs),
@@ -1111,22 +947,10 @@ def _install_stable_backbone_compile_dispatch(
         False: torch.compile(masked_hs0_fn, **compile_kwargs),
         True: torch.compile(masked_hs1_fn, **compile_kwargs),
     }
-    compiled_masked_fixed = {
-        False: torch.compile(_masked_fixed_hs0_fn, **compile_kwargs),
-        True: torch.compile(_masked_fixed_hs1_fn, **compile_kwargs),
-    }
-    compiled_masked_varlen = {
-        False: torch.compile(_masked_varlen_hs0_fn, **compile_kwargs),
-        True: torch.compile(_masked_varlen_hs1_fn, **compile_kwargs),
-    }
-    compiled_masked_docblock = {
-        False: torch.compile(_masked_docblock_hs0_fn, **compile_kwargs),
-        True: torch.compile(_masked_docblock_hs1_fn, **compile_kwargs),
-    }
-    compiled_masked_docblock_bias = {
-        False: torch.compile(_masked_docblock_bias_hs0_fn, **compile_kwargs),
-        True: torch.compile(_masked_docblock_bias_hs1_fn, **compile_kwargs),
-    }
+    compiled_masked_fixed = _compile_routed_masked_pair("fixed")
+    compiled_masked_varlen = _compile_routed_masked_pair("varlen")
+    compiled_masked_docblock = _compile_routed_masked_pair("docblock")
+    compiled_masked_docblock_bias = _compile_routed_masked_pair("docblock_bias")
 
     def _dispatch_forward(
         self: torch.nn.Module,
