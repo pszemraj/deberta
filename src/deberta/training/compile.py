@@ -1020,10 +1020,14 @@ def _install_stable_backbone_compile_dispatch(
         False: torch.compile(masked_hs0_fn, **compile_kwargs),
         True: torch.compile(masked_hs1_fn, **compile_kwargs),
     }
-    compiled_masked_fixed = _compile_routed_masked_pair("fixed")
-    compiled_masked_varlen = _compile_routed_masked_pair("varlen")
-    compiled_masked_docblock = _compile_routed_masked_pair("docblock")
-    compiled_masked_docblock_bias = _compile_routed_masked_pair("docblock_bias")
+    # Routes with a dedicated compiled specialization; adding a route family
+    # means adding one entry here. Hints outside this mapping (or None) run the
+    # generic masked entrypoint with the hint re-attached, so the model-side
+    # adapter still resolves them.
+    compiled_masked_routed = {
+        route: _compile_routed_masked_pair(route)
+        for route in ("fixed", "varlen", "docblock", "docblock_bias")
+    }
 
     def _dispatch_forward(
         self: torch.nn.Module,
@@ -1085,35 +1089,9 @@ def _install_stable_backbone_compile_dispatch(
                 inputs_embeds=inputs_embeds,
             )
         normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
-        if normalized_route == "fixed":
-            return compiled_masked_fixed[resolved_output_hidden_states](
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                flash_meta=flash_meta,
-            )
-        if normalized_route == "varlen":
-            return compiled_masked_varlen[resolved_output_hidden_states](
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                flash_meta=flash_meta,
-            )
-        if normalized_route == "docblock":
-            return compiled_masked_docblock[resolved_output_hidden_states](
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                flash_meta=flash_meta,
-            )
-        if normalized_route == "docblock_bias":
-            return compiled_masked_docblock_bias[resolved_output_hidden_states](
+        routed = compiled_masked_routed.get(normalized_route) if normalized_route is not None else None
+        if routed is not None:
+            return routed[resolved_output_hidden_states](
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -1132,10 +1110,7 @@ def _install_stable_backbone_compile_dispatch(
 
     module._compiled_forward_dense = compiled_dense
     module._compiled_forward_masked = compiled_masked
-    module._compiled_forward_masked_fixed = compiled_masked_fixed
-    module._compiled_forward_masked_varlen = compiled_masked_varlen
-    module._compiled_forward_masked_docblock = compiled_masked_docblock
-    module._compiled_forward_masked_docblock_bias = compiled_masked_docblock_bias
+    module._compiled_forward_masked_routed = compiled_masked_routed
     module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]
     compiled_targets.extend(
         [
@@ -1143,14 +1118,11 @@ def _install_stable_backbone_compile_dispatch(
             f"{target}[dense_hs1]",
             f"{target}[masked_hs0]",
             f"{target}[masked_hs1]",
-            f"{target}[masked_fixed_hs0]",
-            f"{target}[masked_fixed_hs1]",
-            f"{target}[masked_varlen_hs0]",
-            f"{target}[masked_varlen_hs1]",
-            f"{target}[masked_docblock_hs0]",
-            f"{target}[masked_docblock_hs1]",
-            f"{target}[masked_docblock_bias_hs0]",
-            f"{target}[masked_docblock_bias_hs1]",
+            *(
+                f"{target}[masked_{route}_hs{int(hs)}]"
+                for route in compiled_masked_routed
+                for hs in (False, True)
+            ),
         ]
     )
     return True
