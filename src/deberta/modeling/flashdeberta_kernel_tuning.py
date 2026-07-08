@@ -80,6 +80,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _load_tuning_payload() -> dict[str, Any]:
     """Load the default table plus optional user override entries.
 
+    Override rows append to the shipped rows rather than replacing them, both
+    for top-level lists (``seq_buckets``, ``kernels``) and per-namespace
+    route-policy lists, so an override table can promote a single row (for
+    example one capability-scoped route choice) without restating the shipped
+    policy. Appended rows outrank shipped rows of the same specificity.
+
     :return dict[str, Any]: Merged tuning payload.
     """
 
@@ -100,7 +106,14 @@ def _load_tuning_payload() -> dict[str, Any]:
             ]
         elif isinstance(base_value, dict) or isinstance(override_value, dict):
             combined = dict(base_value if isinstance(base_value, dict) else {})
-            combined.update(override_value if isinstance(override_value, dict) else {})
+            for namespace, override_rows in (
+                override_value if isinstance(override_value, dict) else {}
+            ).items():
+                base_rows = combined.get(namespace)
+                if isinstance(base_rows, list) and isinstance(override_rows, list):
+                    combined[namespace] = [*base_rows, *override_rows]
+                else:
+                    combined[namespace] = override_rows
             merged[key] = combined
     return merged
 
@@ -159,11 +172,24 @@ def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_siz
 flash_seq_bucket = cache(flash_seq_bucket)
 
 
-def flash_route_policy(*, policy: str, seq_bucket: str) -> dict[str, Any] | None:
+def flash_route_policy(
+    *,
+    policy: str,
+    seq_bucket: str,
+    compute_capability: tuple[int, int] | None = None,
+) -> dict[str, Any] | None:
     """Resolve a route-policy row from the active tuning table.
+
+    Rows may scope themselves to one GPU class with a ``compute_capability``
+    key such as ``"sm_120"``; rows without the key (or with ``"*"``) apply to
+    any hardware. An exact-capability row outranks a wildcard row; within the
+    same specificity, later rows win so appended override-table rows take
+    precedence.
 
     :param str policy: Route policy namespace such as ``"padding"`` or ``"docblock"``.
     :param str seq_bucket: Sequence bucket returned by :func:`flash_seq_bucket`.
+    :param tuple[int, int] | None compute_capability: Device capability, or None
+        to match only hardware-agnostic rows.
     :return dict[str, Any] | None: Matching policy row, or None when the table has no entry.
     """
 
@@ -171,28 +197,69 @@ def flash_route_policy(*, policy: str, seq_bucket: str) -> dict[str, Any] | None
     choices = policies.get(str(policy).strip().lower()) if isinstance(policies, dict) else None
     if not isinstance(choices, list):
         return None
+    cc_key = compute_capability_key(compute_capability) if compute_capability is not None else None
+    wildcard_match: dict[str, Any] | None = None
     for raw in reversed(choices):
         if not isinstance(raw, dict):
             continue
         if str(raw.get("seq_bucket", "")).strip() != str(seq_bucket).strip():
             continue
-        return dict(raw)
-    return None
+        entry_cc = str(raw.get("compute_capability", "*")).strip().lower()
+        if entry_cc == "*":
+            if wildcard_match is None:
+                wildcard_match = dict(raw)
+            continue
+        if cc_key is not None and entry_cc == cc_key:
+            return dict(raw)
+    return wildcard_match
 
 
-def flash_route_choice(*, policy: str, seq_bucket: str) -> str | None:
+def flash_route_choice(
+    *,
+    policy: str,
+    seq_bucket: str,
+    compute_capability: tuple[int, int] | None = None,
+) -> str | None:
     """Resolve a route choice from the active tuning table.
 
     :param str policy: Route policy namespace such as ``"padding"`` or ``"docblock"``.
     :param str seq_bucket: Sequence bucket returned by :func:`flash_seq_bucket`.
+    :param tuple[int, int] | None compute_capability: Device capability, or None
+        to match only hardware-agnostic rows.
     :return str | None: Route choice, or None when the table has no entry.
     """
 
-    raw = flash_route_policy(policy=policy, seq_bucket=seq_bucket)
+    raw = flash_route_policy(policy=policy, seq_bucket=seq_bucket, compute_capability=compute_capability)
     if raw is not None:
         choice = raw.get("choice")
         return str(choice).strip() if choice is not None else None
     return None
+
+
+def tuned_capability_keys() -> frozenset[str]:
+    """Return the explicit compute-capability keys present in the active table.
+
+    :return frozenset[str]: Keys such as ``{"sm_120"}``; wildcard rows are excluded.
+    """
+
+    payload = _load_tuning_payload()
+    rows: list[Any] = []
+    kernels = payload.get("kernels", [])
+    if isinstance(kernels, list):
+        rows.extend(kernels)
+    policies = payload.get("route_policies", {})
+    if isinstance(policies, dict):
+        for choices in policies.values():
+            if isinstance(choices, list):
+                rows.extend(choices)
+    keys: set[str] = set()
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        value = str(raw.get("compute_capability", "*")).strip().lower()
+        if value and value != "*":
+            keys.add(value)
+    return frozenset(keys)
 
 
 def flash_padding_route(
@@ -202,6 +269,7 @@ def flash_padding_route(
     batch_size: int | None = None,
     force_varlen: bool = False,
     varlen_min_seq_len: int | None = None,
+    compute_capability: tuple[int, int] | None = None,
 ) -> str:
     """Resolve the fixed-vs-varlen route for one padded batch shape.
 
@@ -215,6 +283,8 @@ def flash_padding_route(
     :param int | None batch_size: Batch size, when known.
     :param bool force_varlen: Config override that forces the varlen route.
     :param int | None varlen_min_seq_len: Optional config threshold overriding the table.
+    :param tuple[int, int] | None compute_capability: Device capability for
+        capability-scoped table rows; None matches only hardware-agnostic rows.
     :return str: Either ``"fixed"`` or ``"varlen"``.
     """
 
@@ -228,7 +298,11 @@ def flash_padding_route(
         total_tokens=total_tokens,
         batch_size=batch_size,
     )
-    table_route = flash_route_choice(policy="padding", seq_bucket=seq_bucket)
+    table_route = flash_route_choice(
+        policy="padding",
+        seq_bucket=seq_bucket,
+        compute_capability=compute_capability,
+    )
     if table_route in {"fixed", "varlen"}:
         return table_route
     return "fixed"

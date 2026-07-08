@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata as importlib_metadata
+import json
+import logging
 import sys
 import types
 import warnings
@@ -194,6 +196,7 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
         flash_route_choice,
         flash_seq_bucket,
         resolve_flash_kernel_config,
+        tuned_capability_keys,
     )
 
     configure_flashdeberta_kernel_overrides(None)
@@ -201,7 +204,19 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     bucket = flash_seq_bucket(seq_len=2048, total_tokens=3000, batch_size=2)
     assert bucket == "2048_medium"
     assert flash_route_choice(policy="padding", seq_bucket=bucket) == "varlen"
-    assert flash_route_choice(policy="docblock", seq_bucket=flash_seq_bucket(seq_len=1024)) == "docblock_bias"
+    # Dense doc-block is the measured sm_120 default; other hardware and
+    # capability-blind callers get the conservative ragged route.
+    docblock_bucket = flash_seq_bucket(seq_len=1024)
+    assert (
+        flash_route_choice(policy="docblock", seq_bucket=docblock_bucket, compute_capability=(12, 0))
+        == "docblock_bias"
+    )
+    assert (
+        flash_route_choice(policy="docblock", seq_bucket=docblock_bucket, compute_capability=(9, 0))
+        == "docblock"
+    )
+    assert flash_route_choice(policy="docblock", seq_bucket=docblock_bucket) == "docblock"
+    assert tuned_capability_keys() == frozenset({"sm_120"})
     assert resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=(12, 0),
@@ -421,16 +436,22 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
-def test_docblock_bias_route_uses_table_with_ragged_override() -> None:
+def test_docblock_bias_route_uses_table_with_ragged_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.training.compile as compile_mod
     from deberta.training.compile import _flash_route_hint_for_docblock_batch
 
-    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock_bias"
-    assert _flash_route_hint_for_docblock_batch(seq_len=2048) == "docblock_bias"
-    assert _flash_route_hint_for_docblock_batch(seq_len=4096) == "docblock_bias"
+    device = torch.device("cpu")
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024, device=device) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=2048, device=device) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=4096, device=device) == "docblock_bias"
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
             flash_cfg={"docblock_bias_seq_len": 1024},
+            device=device,
         )
         == "docblock_bias"
     )
@@ -438,9 +459,126 @@ def test_docblock_bias_route_uses_table_with_ragged_override() -> None:
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
             flash_cfg={"docblock_bias_seq_len": 0},
+            device=device,
         )
         == "docblock"
     )
+
+    # Hardware without capability-scoped table rows defaults to the ragged
+    # route, and the explicit dense override still works there.
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (9, 0))
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024, device=device) == "docblock"
+    assert _flash_route_hint_for_docblock_batch(seq_len=4096, device=device) == "docblock"
+    assert (
+        _flash_route_hint_for_docblock_batch(
+            seq_len=1024,
+            flash_cfg={"docblock_bias_seq_len": 1024},
+            device=device,
+        )
+        == "docblock_bias"
+    )
+    # Capability-blind callers (no device) also resolve conservatively.
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
+
+
+def test_flash_route_policy_capability_precedence_and_override_append(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        configure_flashdeberta_kernel_overrides,
+        flash_route_choice,
+    )
+
+    # A user override table can promote the dense route for new hardware by
+    # appending a capability-scoped row.
+    promote_path = tmp_path / "flash_routes_sm90.json"
+    promote_path.write_text(
+        json.dumps(
+            {
+                "route_policies": {
+                    "docblock": [
+                        {
+                            "seq_bucket": "1024_exact",
+                            "choice": "docblock_bias",
+                            "compute_capability": "sm_90",
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        configure_flashdeberta_kernel_overrides(str(promote_path))
+        assert (
+            flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(9, 0))
+            == "docblock_bias"
+        )
+        assert (
+            flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(12, 0))
+            == "docblock_bias"
+        )
+        # Hardware without an exact row still resolves the shipped wildcard.
+        assert (
+            flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(8, 0))
+            == "docblock"
+        )
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+    # An appended wildcard row must not outrank the shipped exact sm_120 row.
+    wildcard_path = tmp_path / "flash_routes_wildcard.json"
+    wildcard_path.write_text(
+        json.dumps(
+            {
+                "route_policies": {
+                    "docblock": [{"seq_bucket": "1024_exact", "choice": "docblock"}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        configure_flashdeberta_kernel_overrides(str(wildcard_path))
+        assert (
+            flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(12, 0))
+            == "docblock_bias"
+        )
+        assert flash_route_choice(policy="docblock", seq_bucket="1024_exact") == "docblock"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
+def test_untuned_flash_hardware_notice_logs_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import deberta.training.compile as compile_mod
+
+    def _notices() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if "no measured tuning rows" in r.getMessage()]
+
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(compile_mod, "_UNTUNED_FLASH_HARDWARE_NOTICED", set())
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (9, 0))
+    with caplog.at_level(logging.WARNING, logger="deberta.training.compile"):
+        compile_mod._notice_untuned_flash_hardware_once(device)
+        compile_mod._notice_untuned_flash_hardware_once(device)
+    assert len(_notices()) == 1
+    assert "sm_90" in _notices()[0].getMessage()
+
+    # Hardware with measured rows stays quiet.
+    caplog.clear()
+    monkeypatch.setattr(compile_mod, "_UNTUNED_FLASH_HARDWARE_NOTICED", set())
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
+    with caplog.at_level(logging.WARNING, logger="deberta.training.compile"):
+        compile_mod._notice_untuned_flash_hardware_once(device)
+    assert not _notices()
+
+    # CPU batches (tests, metadata probes) never notice.
+    caplog.clear()
+    monkeypatch.setattr(compile_mod, "_UNTUNED_FLASH_HARDWARE_NOTICED", set())
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (9, 0))
+    with caplog.at_level(logging.WARNING, logger="deberta.training.compile"):
+        compile_mod._notice_untuned_flash_hardware_once(torch.device("cpu"))
+    assert not _notices()
 
 
 def test_dense_bucket_index_reuses_native_log_bucket_math(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -875,6 +1013,8 @@ def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest
     cfg.max_relative_positions = 1024
     cfg.position_buckets = 256
     attention_mod, attention, cfg = _stats_attention_harness(monkeypatch, cfg=cfg)
+    # The shipped local-bias policy row is scoped to sm_120.
+    monkeypatch.setattr(attention_mod, "device_compute_capability", lambda _device: (12, 0))
     attention.train()
     seen: dict[str, object] = {}
 
@@ -932,11 +1072,12 @@ def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
     _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()
 
-    def _gate(hf_flash: dict[str, object]) -> bool:
+    def _gate(hf_flash: dict[str, object], *, capability: tuple[int, int] = (12, 0)) -> bool:
         cfg = _small_deberta_config()
         cfg.hf_flash = hf_flash
         attention = attention_mod.FlashDisentangledSelfAttention(cfg)
         attention.train()
+        monkeypatch.setattr(attention_mod, "device_compute_capability", lambda _device: capability)
         pos_term = torch.zeros((1, 1, 1, 1))
         return attention._should_use_local_bias(
             attention_mask=None,
@@ -944,6 +1085,7 @@ def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
             seq_len=1024,
             pos_key=pos_term,
             pos_query=pos_term,
+            device=torch.device("cpu"),
         )
 
     assert _gate({}) is True
@@ -953,6 +1095,10 @@ def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
     assert _gate({"local_bias_seq_len": 0}) is False
     assert _gate({"local_bias_seq_len": 1024}) is True
     assert _gate({"local_bias_seq_len": 2048}) is False
+    # The shipped policy row is sm_120-scoped: other hardware keeps local-bias
+    # off by default, and the explicit runtime knobs re-enable it there.
+    assert _gate({}, capability=(9, 0)) is False
+    assert _gate({"local_bias_seq_len": 1024, "local_bias_max_batch_size": 4}, capability=(9, 0)) is True
 
 
 def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:

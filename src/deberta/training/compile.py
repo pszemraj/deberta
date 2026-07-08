@@ -11,11 +11,14 @@ import torch
 
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
 from deberta.modeling.flashdeberta_kernel_tuning import (
+    compute_capability_key,
     configure_flashdeberta_kernel_overrides,
     flash_padding_route,
     flash_route_choice,
     flash_seq_bucket,
+    tuned_capability_keys,
 )
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     _flash_cfg_bool,
@@ -135,6 +138,7 @@ def _flash_route_hint_for_padding_batch(
     active_tokens: int,
     batch_size: int,
     flash_cfg: Any | None = None,
+    device: torch.device | None = None,
 ) -> str:
     """Select a fixed-vs-varlen route for one standard padded batch.
 
@@ -142,6 +146,7 @@ def _flash_route_hint_for_padding_batch(
     :param int active_tokens: Total active tokens across the batch.
     :param int batch_size: Batch size.
     :param Any | None flash_cfg: Optional resolved flash config.
+    :param torch.device | None device: Batch device for capability-scoped table rows.
     :return str: Either ``fixed`` or ``varlen``.
     """
 
@@ -151,19 +156,28 @@ def _flash_route_hint_for_padding_batch(
         batch_size=int(batch_size),
         force_varlen=_flash_cfg_bool(flash_cfg, name="force_varlen", default="0"),
         varlen_min_seq_len=_flash_cfg_optional_int(flash_cfg, name="varlen_min_seq_len", default=None),
+        compute_capability=device_compute_capability(device) if device is not None else None,
     )
 
 
-def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None = None) -> str:
+def _flash_route_hint_for_docblock_batch(
+    *,
+    seq_len: int,
+    flash_cfg: Any | None = None,
+    device: torch.device | None = None,
+) -> str:
     """Select the doc-block flash backend for one packed batch.
 
     The default policy comes from the repo-local JSON route table. Measured
-    packed RTD sequence buckets can choose dense ``docblock_bias`` when that
-    route is faster and parity-covered; set ``docblock_bias_seq_len=0`` to
-    force the segment-aware ragged ``docblock`` route for ablations.
+    packed RTD sequence buckets choose dense ``docblock_bias`` on GPUs with
+    matching capability-scoped rows (shipped: ``sm_120``); other hardware
+    defaults to the segment-aware ragged ``docblock`` route. Set
+    ``docblock_bias_seq_len`` to force dense at one exact length on any GPU,
+    or ``0`` to force ragged for ablations.
 
     :param int seq_len: Packed sequence length.
     :param Any | None flash_cfg: Optional resolved flash config.
+    :param torch.device | None device: Batch device for capability-scoped table rows.
     :return str: Either ``docblock_bias`` or ``docblock``.
     """
 
@@ -178,10 +192,39 @@ def _flash_route_hint_for_docblock_batch(*, seq_len: int, flash_cfg: Any | None 
         return "docblock"
 
     seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
-    table_route = flash_route_choice(policy="docblock", seq_bucket=seq_bucket)
+    table_route = flash_route_choice(
+        policy="docblock",
+        seq_bucket=seq_bucket,
+        compute_capability=device_compute_capability(device) if device is not None else None,
+    )
     if table_route in {"docblock", "docblock_bias"}:
         return table_route
     return "docblock"
+
+
+_UNTUNED_FLASH_HARDWARE_NOTICED: set[str] = set()
+
+
+def _notice_untuned_flash_hardware_once(device: torch.device) -> None:
+    """Log once per GPU class when flash runs without measured tuning rows.
+
+    :param torch.device device: Device hosting the flash batch.
+    """
+
+    if device.type != "cuda":
+        return
+    key = compute_capability_key(device_compute_capability(device))
+    if key in _UNTUNED_FLASH_HARDWARE_NOTICED:
+        return
+    _UNTUNED_FLASH_HARDWARE_NOTICED.add(key)
+    if key in tuned_capability_keys():
+        return
+    logger.warning(
+        "FlashDeBERTa has no measured tuning rows for %s; flash stays enabled with "
+        "hardware-agnostic route defaults and generic kernel configs. "
+        "See docs/advanced/gpu-support.md to tune this GPU.",
+        key,
+    )
 
 
 def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
@@ -422,11 +465,15 @@ def prepare_flash_attention_batch_metadata(
         _clear_flash_batch_metadata(batch)
         return batch, None
 
+    if bool(flash_enabled):
+        _notice_untuned_flash_hardware_once(input_ids.device)
+
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
         route_hint = _flash_route_hint_for_docblock_batch(
             seq_len=int(input_ids.shape[-1]),
             flash_cfg=flash_cfg,
+            device=input_ids.device,
         )
         keep_mask = doc_ids.ne(0)
         seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
@@ -543,6 +590,7 @@ def prepare_flash_attention_batch_metadata(
         active_tokens=route_active_tokens,
         batch_size=int(input_ids.shape[0]),
         flash_cfg=flash_cfg,
+        device=input_ids.device,
     )
     batch["flash_seq_lengths"] = seq_lengths
     if active_tokens is not None:

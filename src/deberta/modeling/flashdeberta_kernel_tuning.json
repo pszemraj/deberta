@@ -62,7 +62,7 @@
     "docblock": [
       {
         "seq_bucket": "1024_exact",
-        "choice": "docblock_bias"
+        "choice": "docblock"
       },
       {
         "seq_bucket": "under_2048",
@@ -70,26 +70,52 @@
       },
       {
         "seq_bucket": "2048_plus",
-        "choice": "docblock_bias"
+        "choice": "docblock"
       },
       {
         "seq_bucket": "2048_medium",
-        "choice": "docblock_bias"
+        "choice": "docblock"
       },
       {
         "seq_bucket": "2048_sparse",
-        "choice": "docblock_bias"
+        "choice": "docblock"
       },
       {
         "seq_bucket": "4096_plus",
-        "choice": "docblock_bias"
+        "choice": "docblock"
+      },
+      {
+        "seq_bucket": "1024_exact",
+        "choice": "docblock_bias",
+        "compute_capability": "sm_120"
+      },
+      {
+        "seq_bucket": "2048_plus",
+        "choice": "docblock_bias",
+        "compute_capability": "sm_120"
+      },
+      {
+        "seq_bucket": "2048_medium",
+        "choice": "docblock_bias",
+        "compute_capability": "sm_120"
+      },
+      {
+        "seq_bucket": "2048_sparse",
+        "choice": "docblock_bias",
+        "compute_capability": "sm_120"
+      },
+      {
+        "seq_bucket": "4096_plus",
+        "choice": "docblock_bias",
+        "compute_capability": "sm_120"
       }
     ],
     "local_bias": [
       {
         "seq_bucket": "1024_exact",
         "choice": "local_bias",
-        "max_batch_size": 4
+        "max_batch_size": 4,
+        "compute_capability": "sm_120"
       }
     ]
   },
