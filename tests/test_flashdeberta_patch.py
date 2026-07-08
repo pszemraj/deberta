@@ -2719,11 +2719,14 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     assert probs is None
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
     head_dim = cfg.hidden_size // cfg.num_attention_heads
-    for seq_idx in range(4):
+    # Rows 0-2 are active (diagonal True) and pass through; row 3 is an
+    # inactive query (diagonal False) and must be zeroed to match eager.
+    for seq_idx in range(3):
         for head_idx in range(cfg.num_attention_heads):
             start = head_idx * head_dim
             end = start + head_dim
             assert torch.all(output[0, seq_idx, start:end].eq(float(head_idx * 100 + seq_idx)))
+    assert torch.all(output[0, 3].eq(0.0))
     assert seen["keep_mask"] is not None
     assert tuple(seen["keep_mask"].shape) == (1, 1, 4, 4)
     _assert_single_flash_route_stat(attention_mod, "flash_docblock_bias_calls")
@@ -3249,6 +3252,111 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
     )
     doc1_grad = hidden_states.grad[0, :boundary]
     assert float(doc1_grad.abs().max()) > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for dense doc-block parity.")
+def test_docblock_bias_dense_route_matches_eager_on_padded_batch() -> None:
+    """Full-output parity for the dense docblock_bias route on a padded batch.
+
+    Eager attention zeroes inactive query rows after softmax; the dense
+    flash-with-bias route must not emit a real CLS value mixture at padding
+    positions. Compares the whole output tensor, padding rows included.
+    """
+
+    import dataclasses
+
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
+        sys.modules.pop(name, None)
+    try:
+        attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
+        if attention_mod.flashdeberta_fixed_import_error() is not None:
+            pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
+        attention_mod._RUNTIME_CONFIG = dataclasses.replace(
+            attention_mod._RUNTIME_CONFIG, enable_debug_stats=True
+        )
+        _run_docblock_bias_padded_parity_check(attention_mod=attention_mod)
+    finally:
+        _restore_saved_flash_modules(saved, affected_prefixes)
+
+
+def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Config
+    from deberta.modeling.mask_utils import build_doc_block_mask
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    seq_len = 1024
+    active_len = 800
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=seq_len,
+        type_vocab_size=0,
+        relative_attention=True,
+        position_buckets=32,
+        max_relative_positions=seq_len,
+        pos_att_type=["c2p", "p2c"],
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        position_biased_input=False,
+    )
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
+    reference = attention_mod._EagerDisentangledSelfAttention(cfg)
+    reference.load_state_dict(attention.state_dict())
+    reference = reference.to(device=device, dtype=dtype).eval()
+
+    doc_ids = torch.cat(
+        (
+            torch.ones((1, active_len // 2), dtype=torch.long),
+            torch.full((1, active_len - active_len // 2), 2, dtype=torch.long),
+            torch.zeros((1, seq_len - active_len), dtype=torch.long),
+        ),
+        dim=1,
+    ).to(device=device)
+    attention_mask = build_doc_block_mask(doc_ids)
+    flash_meta = FlashBatchMeta(
+        seq_lengths=doc_ids.ne(0).sum(-1, dtype=torch.int32),
+        active_tokens_host=active_len,
+        route_hint="docblock_bias",
+    )
+
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), device=device, dtype=dtype)
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), device=device, dtype=dtype)
+
+    attention_mod.reset_flashdeberta_stats()
+    with torch.no_grad():
+        flash_out, _ = attention(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
+        )
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats.get("flash_docblock_bias_calls", 0) >= 1, f"dense doc-block route did not run: {stats}"
+    assert stats.get("fallback_calls", 0) == 0, f"unexpected eager fallback: {stats}"
+
+    with torch.no_grad():
+        eager_out, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask.unsqueeze(1),
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+
+    # Eager zeroes inactive query rows exactly; the flash route must match.
+    padding_rows = flash_out[0, active_len:]
+    assert torch.all(padding_rows == 0), (
+        f"padding query rows carry real values: max abs {float(padding_rows.abs().max()):.3e}"
+    )
+    torch.testing.assert_close(flash_out, eager_out, atol=2e-2, rtol=2e-2)
 
 
 def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:

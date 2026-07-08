@@ -31,7 +31,7 @@ The adapter picks one of five routes per batch:
 | `fixed` | dense (unpadded) batches, and padded `1024` with per-example `seq_lengths` | fixed-length disentangled flash kernels |
 | `varlen` | longer padded batches (`2048+` in the shipped table) | variable-length kernels over prefix-packed active tokens |
 | `local_bias` | plain dense `1024` batches at small batch size (`<= 4`, `sm_120` only in the shipped table) | materializes the dense relative bias and runs flash-with-bias kernels |
-| `docblock_bias` | packed doc-block batches at the measured `1024`/`2048`/`4096` lengths on `sm_120` (or wherever a capability row/knob enables it) | dense flash-with-bias with the pairwise document keep-mask folded into the bias |
+| `docblock_bias` | packed doc-block batches at the measured `1024`/`2048`/`4096` lengths on `sm_120` (or wherever a capability row/knob enables it) | dense flash-with-bias with the pairwise document keep-mask folded into the bias; padding query rows are zeroed afterwards to match eager outputs exactly |
 | `docblock` | packed doc-block batches elsewhere: other hardware, unlisted shapes, or forced for ablations | segment-aware ragged route: repacks document spans and runs the varlen kernels per document |
 
 Route selection is config/table-only: it reads `route_policies` from the JSON tuning table, and

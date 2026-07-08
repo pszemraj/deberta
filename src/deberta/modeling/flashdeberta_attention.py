@@ -907,7 +907,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None pos_key: Optional c2p term in ``(B, H, S, P)`` layout.
         :param torch.Tensor | None pos_query: Optional p2c term in ``(B, H, S, P)`` layout.
         :param float sm_scale: Softmax scale.
-        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout with
+            inactive query rows zeroed to match eager attention.
         """
 
         batch_size, num_heads, seq_len, _ = query_layer.shape
@@ -925,7 +926,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        return flashdeberta_bias_from_positions(
+        output = flashdeberta_bias_from_positions(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
@@ -937,6 +938,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             sm_scale=sm_scale,
             causal=False,
         )
+        # The pairwise-mask diagonal encodes query activity; inactive (padding)
+        # queries only keep a CLS fallback edge so their softmax rows stay
+        # finite inside the kernel. Eager attention zeroes those rows after
+        # softmax - mirror that here so padding positions match eager outputs
+        # (and gradients through them) exactly.
+        query_live = torch.diagonal(keep_mask, dim1=-2, dim2=-1).unsqueeze(-1)
+        return output * query_live.to(dtype=output.dtype)
 
     def _eager_fallback_attention_mask(
         self,
