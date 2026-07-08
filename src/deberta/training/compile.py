@@ -453,8 +453,6 @@ def prepare_flash_attention_batch_metadata(
     :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
     """
 
-    _configure_flash_kernel_overrides_from_cfg(flash_cfg)
-
     btype = str(backbone_type).strip().lower()
     if btype != "hf_deberta_v2":
         _clear_flash_batch_metadata(batch)
@@ -465,11 +463,17 @@ def prepare_flash_attention_batch_metadata(
         _clear_flash_batch_metadata(batch)
         return batch, None
 
-    if bool(flash_enabled):
+    flash_enabled = bool(flash_enabled)
+    if flash_enabled:
+        _configure_flash_kernel_overrides_from_cfg(flash_cfg)
         _notice_untuned_flash_hardware_once(input_ids.device)
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
+        if not flash_enabled:
+            batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+            _clear_flash_batch_metadata(batch)
+            return batch, None
         route_hint = _flash_route_hint_for_docblock_batch(
             seq_len=int(input_ids.shape[-1]),
             flash_cfg=flash_cfg,
@@ -488,20 +492,17 @@ def prepare_flash_attention_batch_metadata(
             batch["flash_active_tokens_scalar"] = active_tokens_scalar
         else:
             batch.pop("flash_active_tokens_scalar", None)
-        if (not bool(flash_enabled)) or route_hint == "docblock_bias":
+        if route_hint == "docblock_bias":
             batch["attention_mask"] = _build_doc_block_mask(doc_ids)
-            if not bool(flash_enabled):
-                batch.pop("flash_seq_lengths", None)
-                _pop_flash_active_token_stats(batch)
             _pop_flash_doc_segment_tensors(batch)
             _pop_flash_doc_segment_host_stats(batch)
             meta = FlashBatchMeta(
-                seq_lengths=seq_lengths if bool(flash_enabled) else None,
+                seq_lengths=seq_lengths,
                 active_tokens_host=active_tokens,
-                active_tokens_scalar=active_tokens_scalar if bool(flash_enabled) else None,
-                route_hint=route_hint if bool(flash_enabled) else "pairwise",
+                active_tokens_scalar=active_tokens_scalar,
+                route_hint=route_hint,
             )
-            return batch, meta if bool(flash_enabled) else None
+            return batch, meta
         batch["attention_mask"] = keep_mask
         segment_offsets = batch.get("flash_doc_segment_offsets")
         segment_lengths = batch.get("flash_doc_segment_lengths")
@@ -565,7 +566,7 @@ def prepare_flash_attention_batch_metadata(
     seq_len = int(input_ids.shape[-1])
     if attention_mask is None:
         _clear_flash_batch_metadata(batch)
-        return batch, FlashBatchMeta(route_hint="dense") if bool(flash_enabled) else None
+        return batch, FlashBatchMeta(route_hint="dense") if flash_enabled else None
     if is_pairwise_mask(attention_mask, query_len=int(seq_len), key_len=int(seq_len)):
         _clear_flash_batch_metadata(batch)
         return batch, None
@@ -574,7 +575,7 @@ def prepare_flash_attention_batch_metadata(
         _clear_flash_batch_metadata(batch)
         return batch, None
 
-    if not bool(flash_enabled):
+    if not flash_enabled:
         _clear_flash_batch_metadata(batch)
         return batch, None
 

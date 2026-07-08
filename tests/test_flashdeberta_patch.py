@@ -2079,6 +2079,33 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_pairwise_mas
     assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
 
 
+def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_overrides(
+    tmp_path,
+) -> None:
+    import deberta.training.compile as compile_mod
+    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+
+    configure_flashdeberta_kernel_overrides(None)
+    doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
+    batch = {"input_ids": torch.zeros((1, 4), dtype=torch.long), "doc_ids": doc_ids}
+    missing_override_path = tmp_path / "missing-flash-routes.json"
+
+    try:
+        prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+            batch=batch,
+            backbone_type="hf_deberta_v2",
+            flash_enabled=False,
+            flash_cfg={"kernel_overrides_path": str(missing_override_path)},
+        )
+
+        assert meta is None
+        assert "flash_seq_lengths" not in prepared
+        assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
+        assert compile_mod._flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 @pytest.mark.parametrize("seq_len", [2048, 4096])
 def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_large_pairwise_mask(seq_len: int) -> None:
     import deberta.training.compile as compile_mod
