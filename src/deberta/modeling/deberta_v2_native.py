@@ -822,59 +822,6 @@ class DebertaV2Layer(nn.Module):
         return layer_output, None
 
 
-class ConvLayer(nn.Module):
-    """Optional convolutional refinement layer used by some DeBERTa variants."""
-
-    def __init__(self, config: DebertaV2Config) -> None:
-        """Create optional 1D convolution block.
-
-        :param DebertaV2Config config: Backbone configuration.
-        """
-        super().__init__()
-        hidden_size = int(config.hidden_size)
-        kernel_size = int(getattr(config, "conv_kernel_size", 3))
-        groups = int(getattr(config, "conv_groups", 1))
-        self.conv_act = str(getattr(config, "conv_act", "tanh"))
-
-        self.conv = nn.Conv1d(
-            hidden_size,
-            hidden_size,
-            kernel_size,
-            padding=(kernel_size - 1) // 2,
-            groups=groups,
-        )
-        self.LayerNorm = nn.LayerNorm(hidden_size, eps=float(config.layer_norm_eps))
-        self.dropout = nn.Dropout(float(config.hidden_dropout_prob))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual_states: torch.Tensor,
-        input_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Run convolutional refinement over hidden states.
-
-        :param torch.Tensor hidden_states: Conv input states.
-        :param torch.Tensor residual_states: Residual tensor to combine with conv output.
-        :param torch.Tensor | None input_mask: Optional token keep mask.
-        :return torch.Tensor: Updated hidden states.
-        """
-
-        out = self.conv(hidden_states.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
-
-        if input_mask is not None:
-            keep = normalize_keep_mask(input_mask, name="input_mask")
-            out = out.masked_fill(~keep.unsqueeze(-1), 0)
-
-        out = ACT2FN[self.conv_act](self.dropout(out))
-        layer_norm_input = residual_states + out
-        output = self.LayerNorm(layer_norm_input)
-
-        if input_mask is None:
-            return output
-        return output * input_mask.to(dtype=output.dtype).unsqueeze(-1)
-
-
 class DebertaV2Embeddings(nn.Module):
     """Token/position/type embedding stack for DeBERTa-v2."""
 
@@ -1043,8 +990,12 @@ class DebertaV2Encoder(nn.Module):
         else:
             self.LayerNorm = None
 
-        conv_kernel_size = getattr(config, "conv_kernel_size", 0)
-        self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
+        conv_kernel_size = int(getattr(config, "conv_kernel_size", 0) or 0)
+        if conv_kernel_size > 0:
+            raise ValueError(
+                "conv_kernel_size > 0 is not supported by the native DeBERTa-v2 backbone; "
+                "DeBERTa-v2 conv-refinement checkpoints (e.g. v2-xlarge/xxlarge) are out of scope."
+            )
         self.gradient_checkpointing = False
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
         self.flash_attention_enabled = (
@@ -1083,25 +1034,6 @@ class DebertaV2Encoder(nn.Module):
             if mask.shape[1] == 1:
                 return mask
             return mask.any(dim=1, keepdim=True)
-        raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
-
-    def _input_mask_for_conv(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Extract a 2D token keep mask for optional convolution.
-
-        :param torch.Tensor attention_mask: Raw attention mask.
-        :return torch.Tensor: Token keep mask with shape ``(B,S)``.
-        """
-        mask = normalize_keep_mask(attention_mask)
-        if mask.ndim <= 2:
-            return mask
-        if mask.ndim == 3:
-            return torch.diagonal(mask, dim1=-2, dim2=-1)
-        if mask.ndim == 4:
-            m = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-            # Broadcast padding masks have shape (B,1,1,S) → (B,1,S) after head squeeze.
-            if m.shape[-2] == 1:
-                return m[:, 0, :]
-            return torch.diagonal(m, dim1=-2, dim2=-1)
         raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
 
     def get_rel_pos(
@@ -1161,12 +1093,7 @@ class DebertaV2Encoder(nn.Module):
         :return BaseModelOutput | tuple: Encoder outputs.
         """
 
-        if attention_mask is not None:
-            input_mask = self._input_mask_for_conv(attention_mask)
-            attn_mask = self.get_attention_mask(attention_mask)
-        else:
-            input_mask = None
-            attn_mask = None
+        attn_mask = self.get_attention_mask(attention_mask) if attention_mask is not None else None
         rel_pos = self.get_rel_pos(hidden_states, query_states=query_states, relative_pos=relative_pos)
         rel_embeddings = self.get_rel_embedding()
 
@@ -1181,7 +1108,7 @@ class DebertaV2Encoder(nn.Module):
         next_kv = hidden_states
         output_states = hidden_states
 
-        for idx, layer_module in enumerate(self.layer):
+        for layer_module in self.layer:
             if self.gradient_checkpointing and self.training and query_states is None:
 
                 def _custom_forward(
@@ -1233,9 +1160,6 @@ class DebertaV2Encoder(nn.Module):
                 if attn_weights is None:
                     attn_weights = torch.empty(0, device=output_states.device)
                 all_attentions = all_attentions + (attn_weights,)
-
-            if idx == 0 and self.conv is not None:
-                output_states = self.conv(hidden_states, output_states, input_mask)
 
             if capture_hidden_states and all_hidden_states is not None:
                 hidden_state_snapshot = (

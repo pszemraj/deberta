@@ -2787,12 +2787,6 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
     attn_mask_4d = model.encoder.get_attention_mask(mask_2d)
     assert attn_mask_4d.shape == (1, 1, 1, 8), f"Expected (1,1,1,8), got {attn_mask_4d.shape}"
 
-    # Conv mask extraction should still work.
-    conv_mask = model.encoder._input_mask_for_conv(attn_mask_4d)
-    assert conv_mask.shape == (1, 8)
-    assert conv_mask[0, 0].item() is True
-    assert conv_mask[0, 7].item() is False
-
     # Full forward with padding: padded positions must be zeroed, active positions finite.
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(1, 8), dtype=torch.long)
     with torch.no_grad():
@@ -2807,6 +2801,29 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
     with torch.no_grad():
         out_dense = model(input_ids=input_ids, attention_mask=mask_dense).last_hidden_state
     torch.testing.assert_close(out, out_dense, rtol=0.0, atol=0.0)
+
+
+def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
+    import pytest
+
+    pytest.importorskip("transformers")
+
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        type_vocab_size=0,
+        conv_kernel_size=3,
+    )
+    with pytest.raises(ValueError, match="conv_kernel_size"):
+        DebertaV2Model(cfg)
 
 
 def test_native_hf_deberta_v2_none_mask_matches_all_ones_with_relative_attention():
