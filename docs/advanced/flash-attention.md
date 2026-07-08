@@ -24,6 +24,12 @@ Constraints:
 - Doc-block eager fallbacks fail closed: they reuse an explicit pairwise mask or rebuild one from
   complete segment metadata, and raise otherwise. A doc-block batch is never downgraded to a
   compact 2D padding mask, which would silently allow cross-document attention.
+- The `fixed`/`varlen` padding routes compress key-padding masks into per-example right-padded
+  prefix lengths, so they only accept exact-shape `(B,S)`/`(B,1,1,S)` contiguous-prefix masks.
+  Legal non-prefix masks (holes, left padding) use eager attention for that call, and
+  length-mismatched masks raise instead of being silently sliced. `FlashBatchMeta.seq_lengths`
+  carries the same right-padding contract; the training metadata prep verifies it before
+  publishing lengths and leaves non-prefix batches on eager.
 
 ## Route families
 

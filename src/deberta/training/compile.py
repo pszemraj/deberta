@@ -29,6 +29,7 @@ from deberta.modeling.mask_utils import (
     build_doc_segment_metadata,
     doc_segment_metadata_host_stats,
     is_pairwise_mask,
+    is_prefix_padding_keep_mask,
     mask_to_2d_keep_mask,
 )
 
@@ -577,6 +578,12 @@ def prepare_flash_attention_batch_metadata(
         return batch, None
 
     keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+    if not is_prefix_padding_keep_mask(keep_mask, seq_len=seq_len):
+        # Fixed/varlen flash routes interpret seq_lengths as right-padded
+        # prefixes; publishing lengths for a mask with holes or left padding
+        # would bake in wrong attention semantics. Leave the batch on eager.
+        _clear_flash_batch_metadata(batch)
+        return batch, None
     seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
         batch, keep_mask
     )

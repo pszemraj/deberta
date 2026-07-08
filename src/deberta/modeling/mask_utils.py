@@ -28,7 +28,10 @@ def is_torch_compiling() -> bool:
 class FlashBatchMeta:
     """Batch-scoped FlashDeBERTa metadata.
 
-    :param torch.Tensor | None seq_lengths: Optional per-example active lengths.
+    :param torch.Tensor | None seq_lengths: Optional per-example active prefix lengths.
+        Right-padding contract: position ``i`` is active iff ``i < length``, so
+        producers must prove the batch mask is a contiguous-prefix mask (see
+        :func:`is_prefix_padding_keep_mask`) before publishing lengths here.
     :param torch.Tensor | None doc_segment_offsets: Optional flat padded row offsets per doc segment.
     :param torch.Tensor | None doc_segment_lengths: Optional per-segment doc lengths.
     :param torch.Tensor | None doc_cu_seqlens: Optional cumulative packed doc offsets.
@@ -171,23 +174,59 @@ def mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch
     """Extract a canonical ``(B,S)`` keep mask from rank-2/4 padding masks.
 
     Pairwise masks are rejected on purpose: callers that support per-query
-    structure must branch on :func:`is_pairwise_mask` first.
+    structure must branch on :func:`is_pairwise_mask` first. Length mismatches
+    raise instead of slicing: the flash routes reinterpret this mask against
+    the full sequence, so silent truncation or a too-short mask would change
+    which positions count as active.
 
     :param torch.Tensor attention_mask: Padding-style keep mask.
     :param int seq_len: Expected sequence length.
-    :raises ValueError: If the mask is not 2D or broadcast 4D.
+    :raises ValueError: If the mask is not an exact-length 2D or broadcast 4D mask.
     :return torch.Tensor: Boolean keep mask in ``(B,S)`` layout.
     """
 
     mask = normalize_keep_mask(attention_mask)
+    expected = int(seq_len)
     if mask.ndim == 2:
-        return mask[:, : int(seq_len)]
-    if mask.ndim == 4 and int(mask.shape[-2]) == 1:
-        return mask[:, 0, 0, : int(seq_len)]
+        if int(mask.shape[-1]) != expected:
+            raise ValueError(
+                f"Padding mask key length must exactly match seq_len={expected}; "
+                f"got shape={tuple(mask.shape)}"
+            )
+        return mask
+    if mask.ndim == 4 and int(mask.shape[1]) == 1 and int(mask.shape[-2]) == 1:
+        if int(mask.shape[-1]) != expected:
+            raise ValueError(
+                f"Broadcast padding mask key length must exactly match seq_len={expected}; "
+                f"got shape={tuple(mask.shape)}"
+            )
+        return mask[:, 0, 0, :]
     raise ValueError(
         f"Padding masks must be shaped (B,S) or (B,1,1,S) for 2D keep-mask extraction; "
         f"got shape={tuple(mask.shape)}"
     )
+
+
+def is_prefix_padding_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> bool:
+    """Return whether a padding keep mask is a right-padded contiguous prefix.
+
+    The flash fixed/varlen routes compress padding masks into per-example
+    prefix lengths, which only preserves eager semantics when every row keeps
+    a contiguous prefix (right padding). Masks with holes or left padding must
+    stay on eager attention, which honors arbitrary key-padding masks.
+
+    :param torch.Tensor attention_mask: Padding-style keep mask ``(B,S)`` or ``(B,1,1,S)``.
+    :param int seq_len: Expected sequence length.
+    :raises ValueError: If the mask is not an exact-length padding mask.
+    :return bool: True when each row's kept positions form a contiguous prefix.
+    """
+
+    keep = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+    if int(keep.shape[-1]) <= 1:
+        return True
+    # A prefix mask never rises from False back to True along the key axis.
+    rises = ~keep[:, :-1] & keep[:, 1:]
+    return not bool(rises.any())
 
 
 def is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
@@ -446,6 +485,7 @@ __all__ = [
     "doc_ids_from_segments",
     "expand_keep_mask_to_4d",
     "is_pairwise_mask",
+    "is_prefix_padding_keep_mask",
     "mask_to_2d_keep_mask",
     "normalize_keep_mask",
     "reduce_keep_mask_to_2d",

@@ -1122,6 +1122,88 @@ def test_flash_attention_explicit_relative_pos_falls_back_and_preserves_tensor(
     assert not torch.allclose(output, default_out)
 
 
+def test_non_prefix_padding_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-prefix padding masks must use eager, not collapse to prefix lengths.
+
+    The fixed/varlen routes compress padding masks into per-example prefix
+    lengths, which reinterprets masks with holes or left padding as right
+    padding. Such masks are legal eager inputs and must fall back.
+    """
+
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+
+    cfg = _small_deberta_config()
+    cfg.hf_flash = {"eager_dense_max_seq_len": 0}
+    torch.manual_seed(0)
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    reference = attention_mod._EagerDisentangledSelfAttention(cfg).eval()
+    reference.load_state_dict(attention.state_dict())
+
+    seq_len = 4
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    # Canonical encoder-expanded (B,1,1,S) broadcast layout with a hole.
+    holey_mask = torch.tensor([True, False, True, False]).view(1, 1, 1, seq_len)
+
+    attention_mod.reset_flashdeberta_stats()
+    output, _ = attention(
+        hidden_states=hidden_states,
+        attention_mask=holey_mask,
+        output_attentions=False,
+        rel_embeddings=rel_embeddings,
+    )
+
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats.get("fallback_non_prefix_padding_mask", 0) == 1
+    with torch.no_grad():
+        expected, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=holey_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+    torch.testing.assert_close(output, expected)
+
+    # A length-mismatched mask is a shape error, not a reinterpretable input:
+    # flash refuses to derive prefix lengths from it (padding_mask_shape
+    # fallback) and eager then rejects the non-broadcastable mask itself.
+    attention_mod.reset_flashdeberta_stats()
+    with pytest.raises((RuntimeError, ValueError)):
+        attention(
+            hidden_states=hidden_states,
+            attention_mask=torch.ones((1, 1, 1, seq_len + 1), dtype=torch.bool),
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats.get("fallback_padding_mask_shape", 0) == 1
+
+
+def test_mask_to_2d_keep_mask_rejects_length_mismatch() -> None:
+    """Length-mismatched padding masks must raise instead of silently slicing."""
+
+    from deberta.modeling.mask_utils import is_prefix_padding_keep_mask, mask_to_2d_keep_mask
+
+    too_long = torch.ones((1, 5), dtype=torch.bool)
+    too_short = torch.ones((1, 3), dtype=torch.bool)
+    broadcast_too_long = torch.ones((1, 1, 1, 5), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="exactly match seq_len=4"):
+        mask_to_2d_keep_mask(too_long, seq_len=4)
+    with pytest.raises(ValueError, match="exactly match seq_len=4"):
+        mask_to_2d_keep_mask(too_short, seq_len=4)
+    with pytest.raises(ValueError, match="exactly match seq_len=4"):
+        mask_to_2d_keep_mask(broadcast_too_long, seq_len=4)
+
+    assert is_prefix_padding_keep_mask(torch.tensor([[True, True, False, False]]), seq_len=4)
+    assert not is_prefix_padding_keep_mask(torch.tensor([[True, False, True, False]]), seq_len=4)
+    assert not is_prefix_padding_keep_mask(torch.tensor([[False, False, True, True]]), seq_len=4)
+
+
 def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()
@@ -2620,7 +2702,7 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
     import deberta.training.compile as compile_mod
 
     batch = {
-        "input_ids": torch.zeros((2, 1024), dtype=torch.long),
+        "input_ids": torch.zeros((2, 4), dtype=torch.long),
         "attention_mask": torch.tensor(
             [
                 [True, True, False, False],
@@ -2644,6 +2726,28 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
     assert meta.active_tokens_scalar.device.type == "cpu"
     assert meta.active_tokens_scalar.ndim == 0
     assert int(meta.active_tokens_scalar) == 5
+
+
+def test_prepare_flash_metadata_does_not_route_non_prefix_padding_mask_to_flash() -> None:
+    """Metadata prep must not bake prefix seq_lengths from a mask with holes."""
+
+    import deberta.training.compile as compile_mod
+
+    batch = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "attention_mask": torch.tensor([[True, False, True, False]]),
+    }
+
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+    )
+
+    assert prepared is batch
+    assert meta is None
+    assert "flash_seq_lengths" not in prepared
+    assert "flash_active_tokens" not in prepared
 
 
 def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3616,6 +3720,93 @@ def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
         f"padding query rows carry real values: max abs {float(padding_rows.abs().max()):.3e}"
     )
     torch.testing.assert_close(flash_out, eager_out, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for padding-mask parity.")
+def test_non_prefix_padding_mask_matches_eager_on_cuda() -> None:
+    """A holey padding mask must produce eager outputs, not prefix-length flash outputs.
+
+    Pre-fix, the fixed/varlen routes collapsed any padding mask to per-example
+    lengths, silently attending the wrong key positions for masks with holes.
+    """
+
+    import dataclasses
+
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
+        sys.modules.pop(name, None)
+    try:
+        attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
+        if attention_mod.flashdeberta_fixed_import_error() is not None:
+            pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
+        attention_mod._RUNTIME_CONFIG = dataclasses.replace(
+            attention_mod._RUNTIME_CONFIG, enable_debug_stats=True
+        )
+        _run_non_prefix_padding_parity_check(attention_mod=attention_mod)
+    finally:
+        _restore_saved_flash_modules(saved, affected_prefixes)
+
+
+def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Config
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    seq_len = 1024
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=seq_len,
+        type_vocab_size=0,
+        relative_attention=True,
+        position_buckets=32,
+        max_relative_positions=seq_len,
+        pos_att_type=["c2p", "p2c"],
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        position_biased_input=False,
+    )
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
+    reference = attention_mod._EagerDisentangledSelfAttention(cfg)
+    reference.load_state_dict(attention.state_dict())
+    reference = reference.to(device=device, dtype=dtype).eval()
+
+    # A hole in the middle plus tail padding: same active-token count as a
+    # prefix mask of length 824, but different key positions - collapsing it
+    # to seq_lengths silently attends the wrong keys.
+    keep = torch.ones((1, seq_len), dtype=torch.bool, device=device)
+    keep[:, 100:300] = False
+    keep[:, 900:] = False
+    broadcast_mask = keep.view(1, 1, 1, seq_len)
+
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), device=device, dtype=dtype)
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), device=device, dtype=dtype)
+
+    attention_mod.reset_flashdeberta_stats()
+    with torch.no_grad():
+        flash_out, _ = attention(
+            hidden_states=hidden_states,
+            attention_mask=broadcast_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats.get("fallback_non_prefix_padding_mask", 0) >= 1, f"expected eager fallback: {stats}"
+
+    with torch.no_grad():
+        eager_out, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=broadcast_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+    torch.testing.assert_close(flash_out, eager_out)
 
 
 def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:

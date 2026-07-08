@@ -83,6 +83,7 @@ from deberta.modeling.mask_utils import (
     build_doc_block_mask,
     doc_ids_from_segments,
     is_pairwise_mask,
+    is_prefix_padding_keep_mask,
     is_torch_compiling,
     mask_to_2d_keep_mask,
     normalize_keep_mask,
@@ -546,6 +547,32 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "pairwise_mask",
                 "FlashDeBERTa attention does not support pairwise (B,S,S)/(B,1,S,S) masks; using eager attention.",
             )
+        if (
+            attention_mask is not None
+            and (flash_meta is None or flash_meta.seq_lengths is None)
+            and not (flash_meta is not None and flash_meta.is_cross_document())
+            and not is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
+        ):
+            # Without metadata lengths, the fixed/varlen routes would derive
+            # per-example prefix lengths from this mask, which is only faithful
+            # to eager semantics for exact-shape right-padded prefix masks.
+            # When flash_meta.seq_lengths is present the mask is not consulted;
+            # the metadata producer owns the prefix contract instead.
+            try:
+                prefix_ok = is_prefix_padding_keep_mask(attention_mask, seq_len=key_len)
+            except ValueError as exc:
+                return (
+                    "padding_mask_shape",
+                    f"FlashDeBERTa padding routes require an exact (B,S) or (B,1,1,S) keep mask ({exc}); "
+                    "using eager attention.",
+                )
+            if not prefix_ok:
+                return (
+                    "non_prefix_padding_mask",
+                    "FlashDeBERTa fixed/varlen padding routes compress masks into right-padded prefix "
+                    "lengths; the supplied mask has holes or left padding, so eager attention is used "
+                    "to preserve native DeBERTa mask semantics.",
+                )
         if "p2p" in self.pos_att_type:
             return (
                 "p2p",
