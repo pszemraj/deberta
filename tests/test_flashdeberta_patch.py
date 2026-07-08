@@ -2476,6 +2476,73 @@ def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cp
     assert float(probs[0, 0, seq_len // 2, : seq_len // 2].detach().abs().max()) == pytest.approx(0.0)
 
 
+def test_docblock_missing_metadata_does_not_fallback_to_padding_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doc-block eager fallback must fail closed without segment metadata.
+
+    A compact 2D keep mask only preserves padding; running eager with it
+    would silently allow cross-document attention. With neither a pairwise
+    mask nor complete segment metadata, the fallback must raise.
+    """
+
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+
+    seq_len = 8
+    cfg = _docblock_attention_config(seq_len=seq_len)
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    compact_keep_mask = torch.ones((1, seq_len), dtype=torch.bool)
+
+    with pytest.raises(RuntimeError, match="Refusing to fall back to a compact 2D padding mask"):
+        attention(
+            hidden_states=hidden_states,
+            attention_mask=compact_keep_mask,
+            output_attentions=True,
+            rel_embeddings=rel_embeddings,
+            flash_meta=FlashBatchMeta(route_hint="docblock"),
+        )
+
+
+def test_docblock_missing_metadata_can_fallback_with_explicit_pairwise_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit pairwise mask keeps eager fallback usable without metadata."""
+
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    from deberta.modeling.mask_utils import build_doc_block_mask
+
+    seq_len = 8
+    boundary = seq_len // 2
+    cfg = _docblock_attention_config(seq_len=seq_len)
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    doc_ids = torch.cat(
+        (
+            torch.ones((1, boundary), dtype=torch.long),
+            torch.full((1, seq_len - boundary), 2, dtype=torch.long),
+        ),
+        dim=1,
+    )
+    pairwise_mask = build_doc_block_mask(doc_ids).unsqueeze(1)
+
+    _, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=pairwise_mask,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+        flash_meta=FlashBatchMeta(route_hint="docblock"),
+    )
+
+    assert probs is not None
+    assert float(probs[0, 0, 0, boundary:].detach().abs().max()) == pytest.approx(0.0)
+    assert float(probs[0, 0, boundary, :boundary].detach().abs().max()) == pytest.approx(0.0)
+
+
 def test_prepare_flash_attention_batch_metadata_routes_docblock_bias() -> None:
     import deberta.training.compile as compile_mod
 

@@ -21,6 +21,9 @@ Constraints:
   `(B,H,S,S)` attention-probability outputs instead of returning flash-only placeholders.
 - Calls with an explicit `relative_pos` tensor use eager attention for that call with the tensor
   preserved; the flash kernels only compute the default relative-position map on device.
+- Doc-block eager fallbacks fail closed: they reuse an explicit pairwise mask or rebuild one from
+  complete segment metadata, and raise otherwise. A doc-block batch is never downgraded to a
+  compact 2D padding mask, which would silently allow cross-document attention.
 
 ## Route families
 

@@ -955,23 +955,48 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_states: torch.Tensor,
         flash_meta: FlashBatchMeta | None,
     ) -> torch.Tensor | None:
-        """Rebuild pairwise doc-block masks for eager fallback when needed.
+        """Return an eager-safe attention mask, rebuilding doc-block masks on demand.
+
+        Doc-block batches carry their cross-document blocking in ``flash_meta``
+        (the flash kernels consume segment metadata), so the mask tensor alone
+        may be a compact 2D padding mask. Eager attention only sees the mask
+        tensor; falling back with the compact mask would silently allow
+        cross-document attention. This helper therefore fails closed for
+        doc-block batches: reuse an explicit pairwise mask, rebuild one from
+        complete segment metadata, or raise - never downgrade to a padding mask.
 
         :param torch.Tensor | None attention_mask: Original attention mask.
         :param torch.Tensor hidden_states: Key/value hidden states.
         :param torch.Tensor query_states: Query hidden states.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :raises RuntimeError: For a doc-block fallback whose pairwise mask can
+            be neither reused nor rebuilt from segment metadata.
         :return torch.Tensor | None: Eager-compatible attention mask.
         """
 
-        if flash_meta is None or flash_meta.normalized_route_hint() != "docblock":
-            return attention_mask
-        if flash_meta.doc_segment_offsets is None or flash_meta.doc_segment_lengths is None:
+        if flash_meta is None or not flash_meta.is_cross_document():
             return attention_mask
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2])
-        if query_len != key_len:
+        if attention_mask is not None and is_pairwise_mask(
+            attention_mask,
+            query_len=query_len,
+            key_len=key_len,
+        ):
             return attention_mask
+        if query_len != key_len:
+            raise RuntimeError(
+                "FlashDeBERTa doc-block eager fallback cannot rebuild a pairwise mask for "
+                f"query_len={query_len} != key_len={key_len}; provide an explicit pairwise "
+                "attention_mask."
+            )
+        if flash_meta.doc_segment_offsets is None or flash_meta.doc_segment_lengths is None:
+            raise RuntimeError(
+                "FlashDeBERTa doc-block eager fallback requires complete doc_segment_offsets/"
+                "doc_segment_lengths metadata or an explicit pairwise doc-block attention_mask. "
+                "Refusing to fall back to a compact 2D padding mask because that would allow "
+                "cross-document attention."
+            )
         doc_ids = doc_ids_from_segments(
             offsets=flash_meta.doc_segment_offsets,
             lengths=flash_meta.doc_segment_lengths,
@@ -1185,7 +1210,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     reason="docblock_bias_mask",
                     message=(
                         "FlashDeBERTa dense doc-block bias routing requires a pairwise keep mask; "
-                        "using eager attention."
+                        "attempting eager attention, which runs only if a safe pairwise doc-block mask "
+                        "can be reused or reconstructed."
                     ),
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -1241,7 +1267,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     reason="docblock_metadata_missing",
                     message=(
                         "FlashDeBERTa doc-block routing requires precomputed segment metadata and host stats; "
-                        "using eager attention."
+                        "attempting eager attention, which runs only if a safe pairwise doc-block mask "
+                        "can be reused or reconstructed."
                     ),
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
