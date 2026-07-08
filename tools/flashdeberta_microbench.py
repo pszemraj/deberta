@@ -25,12 +25,14 @@ import os
 import statistics
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
 
+from deberta.config import ModelHFFlashConfig  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 
 try:  # noqa: E402
@@ -83,14 +85,9 @@ def _build_config(args: argparse.Namespace) -> DebertaV2Config:
         position_biased_input=False,
     )
     cfg.hf_attention_impl = str(args.mode)
-    cfg.hf_flash = {
-        "force_varlen": False,
-        "varlen_min_seq_len": None,
-        "docblock_bias_seq_len": None,
-        "local_bias_max_batch_size": None,
-        "eager_dense_max_seq_len": 0,
-        "kernel_overrides_path": None,
-    }
+    # Derive the flash dict from the canonical config schema so the benchmark
+    # cannot drift from the keys the training builder materializes.
+    cfg.hf_flash = asdict(ModelHFFlashConfig())
     return cfg
 
 

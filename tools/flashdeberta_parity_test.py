@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
 
+from deberta.config import ModelHFFlashConfig  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.modeling.mask_utils import (  # noqa: E402
     FlashBatchMeta,
@@ -55,12 +56,9 @@ def _build_tiny_config(*, seq_len: int, flash: bool) -> DebertaV2Config:
         position_biased_input=False,
     )
     cfg.hf_attention_impl = "flash" if bool(flash) else "eager"
-    cfg.hf_flash = {
-        "force_varlen": False,
-        "varlen_min_seq_len": None,
-        "docblock_bias_seq_len": None,
-        "eager_dense_max_seq_len": 0,
-    }
+    # Derive the flash dict from the canonical config schema so the parity
+    # harness cannot drift from the keys the training builder materializes.
+    cfg.hf_flash = asdict(ModelHFFlashConfig())
     return cfg
 
 
