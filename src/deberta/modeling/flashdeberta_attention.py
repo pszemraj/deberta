@@ -1007,6 +1007,48 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             rel_embeddings=rel_embeddings,
         )
 
+    def _fallback_to_eager(
+        self,
+        *,
+        reason: str,
+        message: str,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        output_attentions: bool,
+        query_states: torch.Tensor,
+        rel_embeddings: torch.Tensor | None,
+        flash_meta: FlashBatchMeta | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Record fallback stats, warn once, and run the eager attention path.
+
+        Every fallback site in :meth:`forward` shares this contract; keep the
+        stats naming (``fallback_calls`` plus ``fallback_<reason>``) and the
+        eager call in one place so a contract change cannot miss a site.
+
+        :param str reason: Stable fallback reason key used for stats and warn dedup.
+        :param str message: Human-readable fallback explanation.
+        :param torch.Tensor hidden_states: Key/value hidden states.
+        :param torch.Tensor | None attention_mask: Original attention mask.
+        :param bool output_attentions: Whether to return attention probabilities.
+        :param torch.Tensor query_states: Query hidden states.
+        :param torch.Tensor | None rel_embeddings: Relative embedding table.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return tuple[torch.Tensor, torch.Tensor | None]: Eager attention output and optional probs.
+        """
+
+        if _RUNTIME_CONFIG.enable_debug_stats:
+            _record_stat("fallback_calls")
+            _record_stat(f"fallback_{reason}")
+        self._warn_once(reason=reason, message=message)
+        return self._eager_forward_fallback(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            query_states=query_states,
+            rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1038,17 +1080,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             _record_stat("forward_calls")
 
         if output_attentions:
-            if _RUNTIME_CONFIG.enable_debug_stats:
-                _record_stat("fallback_calls")
-                _record_stat("fallback_output_attentions")
-            self._warn_once(
+            return self._fallback_to_eager(
                 reason="output_attentions",
                 message=(
                     "FlashDeBERTa kernels do not materialize attention probabilities; "
                     "using eager attention for output_attentions=True."
                 ),
-            )
-            return self._eager_forward_fallback(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 output_attentions=True,
@@ -1066,14 +1103,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         )
         if reason is not None:
             key, message = reason
-            if _RUNTIME_CONFIG.enable_debug_stats:
-                _record_stat("fallback_calls")
-                _record_stat(f"fallback_{key}")
-            self._warn_once(reason=key, message=message)
             # The encoder-level get_rel_pos patch suppresses the shared (S,S)
             # allocation globally. Unsupported correctness fallbacks rebuild
             # relative-position bias inside eager attention instead.
-            return self._eager_forward_fallback(
+            return self._fallback_to_eager(
+                reason=key,
+                message=message,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 output_attentions=output_attentions,
@@ -1111,17 +1146,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 query_len=query_len,
                 key_len=int(hidden_states.shape[-2]),
             ):
-                if _RUNTIME_CONFIG.enable_debug_stats:
-                    _record_stat("fallback_calls")
-                    _record_stat("fallback_docblock_bias_mask")
-                self._warn_once(
+                return self._fallback_to_eager(
                     reason="docblock_bias_mask",
                     message=(
                         "FlashDeBERTa dense doc-block bias routing requires a pairwise keep mask; "
                         "using eager attention."
                     ),
-                )
-                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
@@ -1131,14 +1161,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
             bias_import_error = flashdeberta_bias_import_error()
             if bias_import_error is not None:
-                if _RUNTIME_CONFIG.enable_debug_stats:
-                    _record_stat("fallback_calls")
-                    _record_stat("fallback_docblock_bias_missing")
-                self._warn_once(
+                return self._fallback_to_eager(
                     reason="docblock_bias_missing",
-                    message=("FlashDeBERTa dense doc-block bias path is unavailable; using eager attention."),
-                )
-                return self._eager_forward_fallback(
+                    message="FlashDeBERTa dense doc-block bias path is unavailable; using eager attention.",
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
@@ -1147,17 +1172,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     flash_meta=flash_meta,
                 )
             if is_torch_compiling() and not flashdeberta_compiled_bias_available():
-                if _RUNTIME_CONFIG.enable_debug_stats:
-                    _record_stat("fallback_calls")
-                    _record_stat("fallback_docblock_bias_compile")
-                self._warn_once(
+                return self._fallback_to_eager(
                     reason="docblock_bias_compile",
                     message=(
                         "FlashDeBERTa dense doc-block bias path is not compile-visible on this build; "
                         "using eager attention."
                     ),
-                )
-                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
@@ -1179,17 +1199,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 or docblock_num_segments is None
                 or docblock_max_segment is None
             ):
-                if _RUNTIME_CONFIG.enable_debug_stats:
-                    _record_stat("fallback_calls")
-                    _record_stat("fallback_docblock_metadata_missing")
-                self._warn_once(
+                return self._fallback_to_eager(
                     reason="docblock_metadata_missing",
                     message=(
                         "FlashDeBERTa doc-block routing requires precomputed segment metadata and host stats; "
                         "using eager attention."
                     ),
-                )
-                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
@@ -1199,14 +1214,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
             docblock_import_error = flashdeberta_docblock_import_error()
             if docblock_import_error is not None:
-                if _RUNTIME_CONFIG.enable_debug_stats:
-                    _record_stat("fallback_calls")
-                    _record_stat("fallback_docblock_missing")
-                self._warn_once(
+                return self._fallback_to_eager(
                     reason="docblock_missing",
-                    message=("FlashDeBERTa doc-block flash path is unavailable; using eager attention."),
-                )
-                return self._eager_forward_fallback(
+                    message="FlashDeBERTa doc-block flash path is unavailable; using eager attention.",
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
@@ -1215,17 +1225,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     flash_meta=flash_meta,
                 )
             if is_torch_compiling() and not flashdeberta_compiled_docblock_available():
-                if _RUNTIME_CONFIG.enable_debug_stats:
-                    _record_stat("fallback_calls")
-                    _record_stat("fallback_docblock_compile")
-                self._warn_once(
+                return self._fallback_to_eager(
                     reason="docblock_compile",
                     message=(
                         "FlashDeBERTa doc-block flash path is not compile-visible on this build; "
                         "using eager attention."
                     ),
-                )
-                return self._eager_forward_fallback(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
@@ -1250,13 +1255,11 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         )
         if projected_reason is not None:
             key, message = projected_reason
-            if _RUNTIME_CONFIG.enable_debug_stats:
-                _record_stat("fallback_calls")
-                _record_stat(f"fallback_{key}")
-            self._warn_once(reason=key, message=message)
             # Keep the same eager fallback contract here for dtype/layout
             # mismatches instead of reviving the encoder-wide relative_pos tensor.
-            return self._eager_forward_fallback(
+            return self._fallback_to_eager(
+                reason=key,
+                message=message,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 output_attentions=output_attentions,
@@ -1359,9 +1362,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
             output = output.transpose(1, 2).contiguous().view(bsz, query_len, self.all_head_size)
         output = output.to(dtype=model_dtype)
-
-        if output_attentions:
-            return output, None
+        # output_attentions=True returned via the eager fallback above; flash
+        # routes never materialize attention probabilities.
         return output, None
 
 
