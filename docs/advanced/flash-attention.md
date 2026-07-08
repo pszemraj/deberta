@@ -47,8 +47,12 @@ Route selection is config/table-only: it reads `route_policies` from the JSON tu
 the upstream FlashDeBERTa environment-variable route fallbacks are never consulted. Policy rows
 may be scoped to one GPU class with a `compute_capability` key; an exact `sm_XX` row outranks the
 wildcard rows, and the shipped table scopes its aggressive defaults (`docblock_bias`,
-`local_bias`) to `sm_120` while the padded `fixed`/`varlen` split applies everywhere. See
-[GPU support](gpu-support.md) for the per-hardware picture.
+`local_bias`) to `sm_120` while the padded `fixed`/`varlen` split applies everywhere. Rows may
+also carry `min_seq_len`/`max_seq_len` bounds tighter than their bucket: the `4096_plus` bucket
+is open-ended, so the shipped dense doc-block row is bounded at `max_seq_len: 4096` and packed
+contexts longer than the measured lengths fall back to the ragged `docblock` route instead of
+materializing the quadratic dense bias. See [GPU support](gpu-support.md) for the per-hardware
+picture.
 
 The padded fixed/varlen split at `2048` is deliberate: on the measured unpacked `1024` RTD regime
 the compile-clean fixed path beats the varlen backward kernels, while varlen pulls back ahead for

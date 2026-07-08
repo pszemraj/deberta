@@ -198,6 +198,7 @@ def _flash_route_hint_for_docblock_batch(
         policy="docblock",
         seq_bucket=seq_bucket,
         compute_capability=device_compute_capability(device) if device is not None else None,
+        seq_len=int(seq_len),
     )
     if table_route in {"docblock", "docblock_bias"}:
         return table_route

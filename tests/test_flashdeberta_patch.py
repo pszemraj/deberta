@@ -548,6 +548,19 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
     assert _flash_route_hint_for_docblock_batch(seq_len=1024, device=device) == "docblock_bias"
     assert _flash_route_hint_for_docblock_batch(seq_len=2048, device=device) == "docblock_bias"
     assert _flash_route_hint_for_docblock_batch(seq_len=4096, device=device) == "docblock_bias"
+    # The dense row is bounded at the largest measured length: the 4096_plus
+    # bucket is open-ended, and dense docblock_bias saves a quadratic
+    # (B,H,S,S) bias, so unmeasured longer contexts fall back to the ragged
+    # route. The docblock_bias_seq_len knob stays the explicit opt-in.
+    assert _flash_route_hint_for_docblock_batch(seq_len=8192, device=device) == "docblock"
+    assert (
+        _flash_route_hint_for_docblock_batch(
+            seq_len=8192,
+            flash_cfg={"docblock_bias_seq_len": 8192},
+            device=device,
+        )
+        == "docblock_bias"
+    )
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,

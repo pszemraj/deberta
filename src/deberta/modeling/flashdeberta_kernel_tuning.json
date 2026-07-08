@@ -107,7 +107,8 @@
       {
         "seq_bucket": "4096_plus",
         "choice": "docblock_bias",
-        "compute_capability": "sm_120"
+        "compute_capability": "sm_120",
+        "max_seq_len": 4096
       }
     ],
     "local_bias": [

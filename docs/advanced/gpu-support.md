@@ -72,14 +72,18 @@ model:
 
 Or a capability-scoped override table, selected with `model.hf.flash.kernel_overrides_path`.
 Override rows append to the shipped table, and an exact-capability row outranks the wildcard
-defaults, so promoting one route for your GPU takes one row per bucket:
+defaults, so promoting one route for your GPU takes one row per bucket. Buckets like
+`4096_plus` are open-ended, so bound dense rows with `max_seq_len` at the longest length you
+actually measured — the dense route's saved `(B,H,S,S)` bias grows quadratically, and a row
+whose bounds exclude the batch length resolves to the ragged fallback instead:
 
 ```json
 {
   "route_policies": {
     "docblock": [
       {"seq_bucket": "1024_exact", "choice": "docblock_bias", "compute_capability": "sm_90"},
-      {"seq_bucket": "4096_plus", "choice": "docblock_bias", "compute_capability": "sm_90"}
+      {"seq_bucket": "4096_plus", "choice": "docblock_bias", "compute_capability": "sm_90",
+       "max_seq_len": 4096}
     ]
   },
   "kernels": [

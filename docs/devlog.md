@@ -905,3 +905,20 @@ summary-only). Environment unchanged: RTX 5090, driver `580.159.04`, torch
   battery remains the evidence of record (flash-vs-eager <=0.94% on every
   metric, inside flash's own ~1.7% atomics-noise floor), and no commit since
   touched numerics on the non-fallback paths.
+
+### PR #5 P2: Dense Doc-Block Route Bounded To Measured Lengths
+
+Reviewer finding (confirmed live at `610148e`): the `4096_plus` bucket has no
+upper bound, and the `sm_120` docblock policy row mapped it to dense
+`docblock_bias` - so a packed doc-block batch at any `S > 4096` would route
+dense and save the quadratic `(B,H,S,S)` bias (about 1.6 GiB per layer at
+`8192`, B=1, H=12), an OOM instead of the ragged fallback the docs promise
+for unlisted shapes. Fix keeps policy table-owned: route-policy rows now
+accept optional `min_seq_len`/`max_seq_len` bounds (checked in
+`flash_route_choice` when the caller supplies `seq_len`; a bounded-out row
+resolves as if the namespace had no entry, so the consumer's conservative
+default applies), and the shipped `sm_120` `4096_plus` dense row carries
+`max_seq_len: 4096`. The `docblock_bias_seq_len` knob remains the explicit
+exact-length opt-in for unmeasured lengths. Regression assertions added to
+the existing route test (verified failing pre-fix); gpu-support override
+example updated to model the bounded row.
