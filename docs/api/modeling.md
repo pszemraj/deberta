@@ -49,6 +49,7 @@ forward_generator_phase(
     labels: 'torch.Tensor',
     token_type_ids: 'torch.Tensor | None' = None,
     sampling_temperature: 'float' = 1.0,
+    flash_meta: 'FlashBatchMeta | None' = None,
 ) -> 'RTDGeneratorPhaseOutput'
 ```
 
@@ -63,6 +64,7 @@ Run generator forward/corruption only, returning discriminator targets.
 - `labels` (`torch.Tensor`): MLM labels with ``-100`` ignore index.
 - `token_type_ids` (`torch.Tensor | None`): Optional token type ids.
 - `sampling_temperature` (`float`): Generator sampling temperature.
+- `flash_meta` (`FlashBatchMeta | None`): Optional FlashDeBERTa metadata bundle.
 
 ### Returns
 
@@ -79,6 +81,7 @@ forward_discriminator_phase(
     disc_labels: 'torch.Tensor',
     attention_mask: 'torch.Tensor | None' = None,
     token_type_ids: 'torch.Tensor | None' = None,
+    flash_meta: 'FlashBatchMeta | None' = None,
 ) -> 'RTDDiscriminatorPhaseOutput'
 ```
 
@@ -93,6 +96,7 @@ Run discriminator scoring only, given prebuilt corrupted ids/labels.
 - `disc_labels` (`torch.Tensor`): Binary RTD labels.
 - `attention_mask` (`torch.Tensor | None`): Optional attention mask.
 - `token_type_ids` (`torch.Tensor | None`): Optional token type ids.
+- `flash_meta` (`FlashBatchMeta | None`): Optional FlashDeBERTa metadata bundle.
 
 ### Returns
 
@@ -114,6 +118,7 @@ forward(
     phase: 'str' = 'both',
     corrupted_input_ids: 'torch.Tensor | None' = None,
     disc_labels: 'torch.Tensor | None' = None,
+    flash_meta: 'FlashBatchMeta | None' = None,
 ) -> 'RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput'
 ```
 
@@ -133,6 +138,7 @@ Run RTD forward in combined or phase-specific mode.
 - `phase` (`str`): One of ``both|generator|discriminator``.
 - `corrupted_input_ids` (`torch.Tensor | None`): Precomputed corrupted ids for ``phase='discriminator'``.
 - `disc_labels` (`torch.Tensor | None`): Precomputed RTD labels for ``phase='discriminator'``.
+- `flash_meta` (`FlashBatchMeta | None`): Optional FlashDeBERTa metadata bundle.
 
 ### Returns
 
@@ -319,6 +325,7 @@ forward(
     output_attentions: 'bool | None' = None,
     output_hidden_states: 'bool | None' = None,
     return_dict: 'bool | None' = None,
+    flash_meta: 'FlashBatchMeta | None' = None,
 ) -> 'BaseModelOutput | tuple[torch.Tensor, ...]'
 ```
 
@@ -336,6 +343,7 @@ Run DeBERTa-v2 encoder forward pass.
 - `output_attentions` (`bool | None`): Optional attention-output flag.
 - `output_hidden_states` (`bool | None`): Optional hidden-state-output flag.
 - `return_dict` (`bool | None`): Optional return-format flag.
+- `flash_meta` (`FlashBatchMeta | None`): Optional FlashDeBERTa metadata bundle.
 
 ### Raises
 
@@ -344,6 +352,30 @@ Run DeBERTa-v2 encoder forward pass.
 ### Returns
 
 - `BaseModelOutput | tuple[torch.Tensor, ...]`: Model outputs.
+
+## `disable_flashdeberta_attention`
+
+```python
+disable_flashdeberta_attention() -> 'None'
+```
+
+Compatibility no-op for the removed runtime patch path.
+
+## `enable_flashdeberta_attention`
+
+```python
+enable_flashdeberta_attention(*, strict: 'bool' = True) -> 'None'
+```
+
+Validate that FlashDeBERTa can be constructed by config.
+
+### Parameters
+
+- `strict` (`bool`): Whether missing FlashDeBERTa support should raise.
+
+### Raises
+
+- `RuntimeError`: If strict mode is enabled and FlashDeBERTa cannot be imported.
 
 ## `DebertaRoPEConfig`
 

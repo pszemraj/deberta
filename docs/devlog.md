@@ -660,3 +660,129 @@ infrastructure helpers`).
   inert (doc-block batches always carry a real mask and cannot reach the
   dense branch); resolved by documenting the tensor-only dense contract
   rather than threading a semantically empty object through Dynamo guards.
+
+## 2026-07-07 - Redundancy/Dead-Code Consolidation Campaign
+
+Read-only audit (7 parallel scope reviews + mechanical zero-consumer and
+AST-clone scans over all 53k tracked Python lines) followed by a fix
+campaign. All findings either resolved or explicitly deferred below.
+
+### Dead code removed
+
+- Flash op modules: `_select_rows_or_none` / `_docblock_fixed_forward_impl` /
+  `_docblock_fixed_backward_impl` (git-confirmed debris from `bf0d6e7`'s
+  row-partitioning removal), chained `_fixed_eager_backward_impl`,
+  `flashdeberta_compiled_fixed_available`, `_varlen_density_bucket`,
+  `active_flashdeberta_kernel_overrides_path`, `_normalize_route_hint`,
+  `_flash_cfg_int`, `clear_segment_pack_host_cache` (~280 lines, all
+  verified zero-consumer repo-wide including string/monkeypatch refs).
+- `ConvLayer` + `_input_mask_for_conv` removed from the native backbone.
+  The repo never sets `conv_kernel_size`; the only reach was loading an
+  external DeBERTa-v2 xlarge/xxlarge checkpoint config, which is out of
+  scope for this v3-focused repo. A conv-bearing config now fails with an
+  explicit `ValueError` (new rejection test) instead of silently loading
+  without conv weights. This also removes the unconditional
+  `_input_mask_for_conv` computation that ran on every masked forward.
+
+### Consolidations (production)
+
+- Mask-shape zoo: `mask_utils` now owns `mask_to_2d_keep_mask`,
+  `is_pairwise_mask`, `expand_keep_mask_to_4d`, `reduce_keep_mask_to_2d`.
+  Six drifting copies across attention/native/rtd collapsed onto them;
+  the rank-3 `(B,1,S)` broadcast divergence between the old copies is
+  fixed (unreachable today, pinned by a new rank-matrix test).
+- `training/compile.py`: 8 byte-identical routed masked entrypoints ->
+  `_make_routed_masked_fn` factory (distinct function objects preserved
+  for Dynamo; verified bitwise via an aot_eager dispatcher probe over
+  dense + all 5 masked routes, hs0+hs1). Shared
+  `_resolve_flash_seq_lengths_and_active_tokens` for the doc-block and
+  padded branches.
+- `cli.py` now calls `runtime._apply_profile_and_validate_training_configs`
+  instead of hand-copying the validator sequence (the CLI copy had already
+  drifted: it skipped `_sync_legacy_train_aliases`).
+- `data/collator.py`: unigram/ngram masking share
+  `_resolve_masking_hyperparams` + `_apply_mask_replacement_policy`;
+  verified bit-identical on a 6-case seeded golden (RNG draw order
+  preserved).
+- `entrypoint.py`: checkpoint-save (4 sites, 9 kwargs) and non-finite
+  debug-artifact (5 sites, 14 kwargs) calls folded into closures;
+  compile-scope resolution shared between dry-run and full run.
+- Flash op/pack plumbing into `flashdeberta_op_utils`: `kernel_dtype_name`
+  (5 copies), `lookup_existing_op_pair` (6 sites), `optional_triton_jit`
+  (3 verbatim copies), `traceable_triton_kernel`, `flatten_padded_rows`,
+  `can_use_triton_pack`. Optional pos-pair pack/unpack helpers added to
+  both pack modules (6 plain sites); the 3 cache-aware/both-or-none inline
+  variants intentionally kept (different semantics).
+- `bias_op` backward: generic positional fallback now uses
+  `dense_bias_op._dense_bucket_reduce` (cached contiguous-range reduction,
+  same p2c transpose convention) instead of its own scatter-add; the two
+  docblock1024 backward launchers share `_launch_docblock1024_backward`
+  (owns the strictly-positional Triton argument order once). Gated on the
+  full CUDA parity matrix (OK) plus the autograd-differential reduction test.
+- `flashdeberta_attention`: doc-block scalars resolved once in `forward()`
+  and threaded into `_flash_docblock` (was recomputed per call);
+  `mask_utils` doc-block eye/CLS caches now bounded (8 entries, evict-half)
+  matching the attention bucket-index cache policy.
+- Native model: dynamic vs cached_bmm disentangled-bias variants (~90%
+  identical) merged into one core with a per-term `use_bmm` branch;
+  verified bitwise on a 12-case golden (3 kernels x 4 pos_att_type).
+  `DebertaV2Intermediate` uses `activations.get_act_fn`.
+- `config.py`: `_legacy_key_suggestion` derives from the executable
+  `_LEGACY_MAP`s (the hand-copied table had drifted on `pretrained_*` rope
+  paths); `apply_dotted_override` reuses `_replace_path`.
+- `builder.py`: shared `_load_pretrained_backbone_or_raise` for the 4
+  copy-pasted from_pretrained blocks.
+- `tools/_bench_common.py`: sys.path bootstrap (6 copies), autocast (2),
+  candidate parsing/env (2 each), real-loader chain (4), RTD model build
+  (2), tuner sampling/timing loops extracted. The tune-script twins are
+  now thin CLIs; two audited drifts fixed deliberately (bias_tune builds
+  the model once per run, peak memory read per-device).
+  `generate_config_reference.py` keeps its own tiny bootstrap so the docs
+  generator does not import torch.
+- `tools/audit_contracts.py`: the AST-exec machinery (hand-maintained
+  globals dicts, itself the shadow-copy failure mode) replaced with plain
+  imports; sibling checks already imported from the same modules.
+- Tests: shared `capture_run_pretraining_kwargs` (was 10 byte-identical
+  copies), `fake_torch_compile` (3), `checkpoint_saving_accelerator`
+  (removes the only cross-test-module private import), resume suite
+  adopts the `mock_checkpoint` fixture (6 hand-rolled scaffolds), the
+  redundant `_has_nonfinite_grad_norm_any_rank` reduce-mocking trio
+  collapsed to one parametrized translation test, two misplaced
+  `build_backbone_configs` tests moved to `test_builder.py`, flash
+  stats-test harness + strengthened single-route assertion, two smoke
+  near-duplicate pairs parametrized, EMD trio scaffolding factored.
+
+### Deferred (intentional, do not "fix" casually)
+
+- `entrypoint.py` decoupled vs joint training loops: genuinely different
+  one- vs two-optimizer semantics, heavily tested; only the call
+  boilerplate around them was deduplicated.
+- `varlen_op` eager vs Triton-op path duplication: perf-motivated
+  (identity-keyed mask-metadata cache is unsafe under compile), documented
+  in the wrapper docstring; a merge needs dedicated parity work.
+- Pack-kernel unification (prefix as segment-with-computed-offsets):
+  correct in principle but hot-path; needs its own benchmarked change.
+- `prefix_pack` rank4-strided kernels (~150 lines): suspected unreachable
+  in production (all producers are contiguous); needs GPU instrumentation
+  during a real run before deletion. Not asserted dead.
+- `rtd_profile` decoupled/coupled windows mirror `entrypoint.py` step
+  logic by hand; anyone changing the real step must mirror it or profiler
+  numbers stop representing training.
+- `norm.py` RMSNorm (stable FSDP2 param names), `get/set_input_embeddings`
+  duplicated native/rope (HF API convention), builder pooler kwargs
+  (export interop), config `__init__` kwargs-partition pattern and the
+  table-drivable profile-default/inert-warning blocks (dedicated change),
+  audit_contracts-vs-pytest assertion overlap (intentional dual gate),
+  `_config_and_training_shared_imports` grab-bag (documented tradeoff).
+
+### Validation
+
+- Full suite with CUDA: 555 passed, 4 skipped (552/4 pre-campaign; net
+  +3 from the conv-rejection, mask rank-matrix, and parametrized folds).
+- `tools/flashdeberta_parity_test.py`: full matrix OK after the pack
+  optional-pair change and again after the bias_op backward merges.
+- Bitwise goldens: collator masking (6 cases), native disentangled bias
+  (12 cases), compiled dispatcher probe (12 entrypoints, aot_eager).
+- `tools/audit_contracts.py --strict`: 14 PASS, 0 WARN/SKIP/FAIL.
+- API docs regenerated (`tools/generate_api_docs.py`); the diff was
+  stale-doc catch-up for `flash_meta` parameters, not campaign changes.
