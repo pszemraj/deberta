@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import types
 from collections.abc import Callable
@@ -308,19 +309,7 @@ def _flash_meta_with_route(
         return FlashBatchMeta(route_hint=route) if route is not None else None
     if flash_meta.normalized_route_hint() == route:
         return flash_meta
-    return FlashBatchMeta(
-        seq_lengths=flash_meta.seq_lengths,
-        doc_segment_offsets=flash_meta.doc_segment_offsets,
-        doc_segment_lengths=flash_meta.doc_segment_lengths,
-        doc_cu_seqlens=flash_meta.doc_cu_seqlens,
-        active_tokens_host=flash_meta.active_tokens_host,
-        doc_num_segments_host=flash_meta.doc_num_segments_host,
-        doc_max_segment_length_host=flash_meta.doc_max_segment_length_host,
-        active_tokens_scalar=flash_meta.active_tokens_scalar,
-        doc_num_segments_scalar=flash_meta.doc_num_segments_scalar,
-        doc_max_segment_length_scalar=flash_meta.doc_max_segment_length_scalar,
-        route_hint=route,
-    )
+    return dataclasses.replace(flash_meta, route_hint=route)
 
 
 def _flash_active_tokens_from_seq_lengths(seq_lengths: torch.Tensor) -> int | None:
