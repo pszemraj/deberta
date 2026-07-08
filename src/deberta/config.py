@@ -2369,6 +2369,12 @@ def _coerce_config_mapping_scalar_value(*, raw_value: Any, field_type: Any, fiel
         raise ValueError(f"Config field {path} must be a number, got {type(value).__name__}: {value!r}.")
 
     if target_t is str:
+        if isinstance(value, bool):
+            raise ValueError(
+                f"Config field {path} must be a string, got bool: {value!r}. "
+                "YAML parses unquoted yes/no/true/false as booleans; quote the value "
+                f'(e.g. {path}: "no").'
+            )
         if not isinstance(value, str):
             raise ValueError(f"Config field {path} must be a string, got {type(value).__name__}: {value!r}.")
         return str(value)

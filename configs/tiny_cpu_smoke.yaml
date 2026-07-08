@@ -39,7 +39,8 @@ train:
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
   token_weighted_gradient_accumulation: true
-  mixed_precision: no
+  # Quoted: YAML would otherwise parse a bare `no` as boolean false.
+  mixed_precision: "no"
   tf32: false
   sdpa_kernel: auto
   decoupled_training: true
