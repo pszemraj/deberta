@@ -17,6 +17,8 @@ Constraints:
   set to `0.0` or null)
 - CUDA only. Measured route/kernel defaults ship for `sm_120` (RTX 5090); other GPUs run flash
   with conservative capability-scoped defaults - see [GPU support](gpu-support.md)
+- Calls with `output_attentions=true` use eager attention for that call, preserving the HF-style
+  `(B,H,S,S)` attention-probability outputs instead of returning flash-only placeholders.
 
 ## Route families
 

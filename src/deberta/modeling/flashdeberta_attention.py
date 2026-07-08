@@ -1034,6 +1034,26 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("forward_calls")
 
+        if output_attentions:
+            if _RUNTIME_CONFIG.enable_debug_stats:
+                _record_stat("fallback_calls")
+                _record_stat("fallback_output_attentions")
+            self._warn_once(
+                reason="output_attentions",
+                message=(
+                    "FlashDeBERTa kernels do not materialize attention probabilities; "
+                    "using eager attention for output_attentions=True."
+                ),
+            )
+            return self._eager_forward_fallback(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                query_states=query_states,
+                rel_embeddings=rel_embeddings,
+                flash_meta=flash_meta,
+            )
+
         reason = self._fallback_reason(
             hidden_states=hidden_states,
             attention_mask=attention_mask,

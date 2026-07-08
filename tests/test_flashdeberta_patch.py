@@ -801,6 +801,37 @@ def test_native_attention_selects_flash_from_config(monkeypatch: pytest.MonkeyPa
     assert isinstance(attention.self, attention_mod.FlashDisentangledSelfAttention)
 
 
+def test_native_model_flash_output_attentions_returns_prob_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    _reload_flash_modules()
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    cfg = _small_deberta_config()
+    cfg.hf_attention_impl = "flash"
+    model = DebertaV2Model(cfg).eval()
+    input_ids = torch.tensor([[1, 7, 8, 0]], dtype=torch.long)
+    attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_attentions=True,
+        return_dict=True,
+    )
+
+    assert outputs.attentions is not None
+    assert len(outputs.attentions) == int(cfg.num_hidden_layers)
+    assert tuple(outputs.attentions[0].shape) == (
+        1,
+        cfg.num_attention_heads,
+        4,
+        4,
+    )
+    assert outputs.attentions[0].numel() > 0
+
+
 def test_enable_flashdeberta_attention_strict_false_is_noop_when_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -861,7 +892,7 @@ def test_flash_attention_pairwise_mask_falls_back_to_eager(monkeypatch: pytest.M
     output, probs = attention(
         hidden_states=hidden_states,
         attention_mask=pairwise_mask,
-        output_attentions=True,
+        output_attentions=False,
         rel_embeddings=rel_embeddings,
     )
 
@@ -869,6 +900,51 @@ def test_flash_attention_pairwise_mask_falls_back_to_eager(monkeypatch: pytest.M
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
     assert "kwargs" in seen
     assert seen["kwargs"]["attention_mask"] is pairwise_mask
+
+
+def test_flash_attention_output_attentions_falls_back_to_eager_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+
+    cfg = _small_deberta_config()
+    cfg.hf_flash = {"eager_dense_max_seq_len": 0}
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+
+    monkeypatch.setattr(
+        attention,
+        "_fallback_reason",
+        lambda **kwargs: pytest.fail("output_attentions=True should bypass flash eligibility checks"),
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "flashdeberta_fixed",
+        lambda **kwargs: pytest.fail("output_attentions=True should use eager attention"),
+    )
+
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        output_attentions=True,
+        rel_embeddings=rel_embeddings,
+    )
+
+    assert tuple(output.shape) == (1, 4, cfg.hidden_size)
+    assert probs is not None
+    assert tuple(probs.shape) == (1, cfg.num_attention_heads, 4, 4)
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["forward_calls"] == 1
+    assert stats["fallback_calls"] == 1
+    assert stats["fallback_output_attentions"] == 1
+    assert stats.get("flash_eligible_calls", 0) == 0
 
 
 def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -942,7 +1018,7 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     output, probs = attention(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
-        output_attentions=True,
+        output_attentions=False,
         rel_embeddings=rel_embeddings,
     )
 
@@ -996,7 +1072,7 @@ def test_flash_attention_fixed_path_records_stats(monkeypatch: pytest.MonkeyPatc
     output, probs = attention(
         hidden_states=hidden_states,
         attention_mask=None,
-        output_attentions=True,
+        output_attentions=False,
         rel_embeddings=rel_embeddings,
     )
 
@@ -1048,7 +1124,7 @@ def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest
     output, probs = attention(
         hidden_states=hidden_states,
         attention_mask=None,
-        output_attentions=True,
+        output_attentions=False,
         rel_embeddings=rel_embeddings,
     )
 
@@ -2366,7 +2442,7 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
     output, probs = attention(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
-        output_attentions=True,
+        output_attentions=False,
         rel_embeddings=rel_embeddings,
         flash_meta=FlashBatchMeta(
             doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32),
@@ -2441,7 +2517,7 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     output, probs = attention(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
-        output_attentions=True,
+        output_attentions=False,
         rel_embeddings=rel_embeddings,
         flash_meta=FlashBatchMeta(route_hint="docblock_bias"),
     )
