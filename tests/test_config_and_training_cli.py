@@ -158,7 +158,9 @@ def test_main_cli_train_reports_when_runtime_mutation_changes_loaded_value(
         seen["logging_cfg"] = logging_cfg
         seen["config_path"] = config_path
 
-    monkeypatch.setattr(cli_mod, "apply_profile_defaults", _fake_apply_profile_defaults)
+    import deberta.training.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "apply_profile_defaults", _fake_apply_profile_defaults)
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
     cli_mod.main(["train", str(cfg_path)])
 

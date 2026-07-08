@@ -35,16 +35,9 @@ from deberta.config import (
     _WANDB_WATCH_CHOICES,
     Config,
     apply_dotted_override,
-    apply_profile_defaults,
     asdict_without_private,
     iter_leaf_paths_for_dataclass,
     load_config,
-    validate_data_config,
-    validate_logging_config,
-    validate_model_config,
-    validate_optim_config,
-    validate_train_config,
-    validate_training_workflow_options,
 )
 from deberta.export_cli import (
     ExportArgumentDefaultsHelpFormatter,
@@ -53,6 +46,7 @@ from deberta.export_cli import (
     run_export,
 )
 from deberta.training import run_pretraining, run_pretraining_dry_run
+from deberta.training.runtime import _apply_profile_and_validate_training_configs
 from deberta.utils.mapping import flatten_mapping
 from deberta.utils.types import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap_optional_type
 
@@ -467,17 +461,12 @@ def _run_train(
     cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns, dotflag_map=dotflag_map)
     reason_overrides.update(cli_reasons)
 
-    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
-
-    validate_model_config(cfg.model)
-    validate_data_config(cfg.data)
-    validate_train_config(cfg.train)
-    validate_optim_config(cfg.optim)
-    validate_logging_config(cfg.logging)
-    validate_training_workflow_options(
+    # Fail fast at the CLI boundary with the same profile/alias/validator
+    # sequence the training entrypoint applies, so the two can never drift.
+    _apply_profile_and_validate_training_configs(
+        model_cfg=cfg.model,
         data_cfg=cfg.data,
         train_cfg=cfg.train,
-        model_cfg=cfg.model,
         optim_cfg=cfg.optim,
         logging_cfg=cfg.logging,
     )
