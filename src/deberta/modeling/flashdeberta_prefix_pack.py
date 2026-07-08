@@ -1438,12 +1438,104 @@ def prefix_unpack_padded_rows_triple(
     )
 
 
+def prefix_pack_optional_pair(
+    tensor_a: torch.Tensor | None,
+    tensor_b: torch.Tensor | None,
+    *,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    total_tokens: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Pack an optional tensor pair, sharing one launch when both are present.
+
+    :param torch.Tensor | None tensor_a: Optional first padded tensor.
+    :param torch.Tensor | None tensor_b: Optional second padded tensor.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
+    :param int max_seqlen: Maximum active length.
+    :param int total_tokens: Total packed token count.
+    :return tuple[torch.Tensor | None, torch.Tensor | None]: Packed tensors, or
+        ``None`` for absent inputs.
+    """
+
+    if tensor_a is not None and tensor_b is not None:
+        return prefix_pack_padded_rows_pair(
+            tensor_a,
+            tensor_b,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+    packed = [
+        prefix_pack_padded_rows(
+            tensor,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+        if tensor is not None
+        else None
+        for tensor in (tensor_a, tensor_b)
+    ]
+    return packed[0], packed[1]
+
+
+def prefix_unpack_optional_pair(
+    tensor_a: torch.Tensor | None,
+    tensor_b: torch.Tensor | None,
+    *,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Unpack an optional tensor pair, sharing one launch when both are present.
+
+    :param torch.Tensor | None tensor_a: Optional first packed tensor.
+    :param torch.Tensor | None tensor_b: Optional second packed tensor.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
+    :param int batch_size: Padded batch size.
+    :param int seq_len: Padded sequence length.
+    :return tuple[torch.Tensor | None, torch.Tensor | None]: Padded tensors, or
+        ``None`` for absent inputs.
+    """
+
+    if tensor_a is not None and tensor_b is not None:
+        return prefix_unpack_padded_rows_pair(
+            tensor_a,
+            tensor_b,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+    unpacked = [
+        prefix_unpack_padded_rows(
+            tensor,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+        if tensor is not None
+        else None
+        for tensor in (tensor_a, tensor_b)
+    ]
+    return unpacked[0], unpacked[1]
+
+
 __all__ = [
     "flashdeberta_prefix_pack_available",
     "flashdeberta_prefix_pack_import_error",
+    "prefix_pack_optional_pair",
     "prefix_pack_padded_rows",
     "prefix_pack_padded_rows_pair",
     "prefix_pack_padded_rows_triple",
+    "prefix_unpack_optional_pair",
     "prefix_unpack_padded_rows",
     "prefix_unpack_padded_rows_pair",
     "prefix_unpack_padded_rows_triple",

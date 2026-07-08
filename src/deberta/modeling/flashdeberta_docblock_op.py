@@ -30,11 +30,12 @@ from deberta.modeling.flashdeberta_op_utils import (
 )
 from deberta.modeling.flashdeberta_segment_pack import (
     segment_pack_grad_and_delta_from_padded,
+    segment_pack_optional_pair,
     segment_pack_padded_rows,
     segment_pack_padded_rows_pair,
     segment_pack_padded_rows_triple,
+    segment_unpack_optional_pair,
     segment_unpack_padded_rows,
-    segment_unpack_padded_rows_pair,
     segment_unpack_padded_rows_triple,
 )
 
@@ -306,41 +307,15 @@ def _docblock_forward_impl(
         total_tokens=total_tokens,
         max_segment_length=max_seqlen,
     )
-    if pos_key is not None and pos_query is not None:
-        pos_key_unpad, pos_query_unpad = segment_pack_padded_rows_pair(
-            pos_key,
-            pos_query,
-            segment_offsets=active_segment_offsets,
-            segment_lengths=active_segment_lengths,
-            cu_seqlens=active_cu_seqlens,
-            total_tokens=total_tokens,
-            max_segment_length=max_seqlen,
-        )
-    else:
-        pos_key_unpad = (
-            segment_pack_padded_rows(
-                pos_key,
-                segment_offsets=active_segment_offsets,
-                segment_lengths=active_segment_lengths,
-                cu_seqlens=active_cu_seqlens,
-                total_tokens=total_tokens,
-                max_segment_length=max_seqlen,
-            )
-            if pos_key is not None
-            else None
-        )
-        pos_query_unpad = (
-            segment_pack_padded_rows(
-                pos_query,
-                segment_offsets=active_segment_offsets,
-                segment_lengths=active_segment_lengths,
-                cu_seqlens=active_cu_seqlens,
-                total_tokens=total_tokens,
-                max_segment_length=max_seqlen,
-            )
-            if pos_query is not None
-            else None
-        )
+    pos_key_unpad, pos_query_unpad = segment_pack_optional_pair(
+        pos_key,
+        pos_query,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
+        total_tokens=total_tokens,
+        max_segment_length=max_seqlen,
+    )
 
     if (
         _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is not None
@@ -657,44 +632,16 @@ def _docblock_backward_impl(
         seq_len=seq_len,
         max_segment_length=max_seqlen,
     )
-    if dpos_key_unpad is not None and dpos_query_unpad is not None:
-        dpos_key, dpos_query = segment_unpack_padded_rows_pair(
-            dpos_key_unpad,
-            dpos_query_unpad,
-            segment_offsets=active_segment_offsets,
-            segment_lengths=active_segment_lengths,
-            cu_seqlens=active_cu_seqlens,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            max_segment_length=max_seqlen,
-        )
-    else:
-        dpos_key = (
-            segment_unpack_padded_rows(
-                dpos_key_unpad,
-                segment_offsets=active_segment_offsets,
-                segment_lengths=active_segment_lengths,
-                cu_seqlens=active_cu_seqlens,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                max_segment_length=max_seqlen,
-            )
-            if dpos_key_unpad is not None
-            else None
-        )
-        dpos_query = (
-            segment_unpack_padded_rows(
-                dpos_query_unpad,
-                segment_offsets=active_segment_offsets,
-                segment_lengths=active_segment_lengths,
-                cu_seqlens=active_cu_seqlens,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                max_segment_length=max_seqlen,
-            )
-            if dpos_query_unpad is not None
-            else None
-        )
+    dpos_key, dpos_query = segment_unpack_optional_pair(
+        dpos_key_unpad,
+        dpos_query_unpad,
+        segment_offsets=active_segment_offsets,
+        segment_lengths=active_segment_lengths,
+        cu_seqlens=active_cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        max_segment_length=max_seqlen,
+    )
     return (
         dq.contiguous(),
         dk.contiguous(),

@@ -45,9 +45,11 @@ from deberta.modeling.flashdeberta_op_utils import (
     optional_triton_jit as _optional_triton_jit,
 )
 from deberta.modeling.flashdeberta_prefix_pack import (
+    prefix_pack_optional_pair,
     prefix_pack_padded_rows,
     prefix_pack_padded_rows_pair,
     prefix_pack_padded_rows_triple,
+    prefix_unpack_optional_pair,
     prefix_unpack_padded_rows,
     prefix_unpack_padded_rows_pair,
     prefix_unpack_padded_rows_triple,
@@ -1220,38 +1222,14 @@ def _varlen_eager_forward_impl(
         max_seqlen=max_seqlen,
         total_tokens=total_tokens,
     )
-    if pos_key is not None and pos_query is not None:
-        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
-            pos_key,
-            pos_query,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-    else:
-        pos_key_unpad = (
-            prefix_pack_padded_rows(
-                pos_key,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                total_tokens=total_tokens,
-            )
-            if pos_key is not None
-            else None
-        )
-        pos_query_unpad = (
-            prefix_pack_padded_rows(
-                pos_query,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                total_tokens=total_tokens,
-            )
-            if pos_query is not None
-            else None
-        )
+    pos_key_unpad, pos_query_unpad = prefix_pack_optional_pair(
+        pos_key,
+        pos_query,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
+    )
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
         table_config = _varlen_repo_tuned_fwd_config(
@@ -1570,38 +1548,14 @@ def _varlen_eager_backward_cached_impl(
         batch_size=batch_size,
         seq_len=seq_len,
     )
-    if dpos_key_unpad is not None and dpos_query_unpad is not None:
-        dpos_key, dpos_query = prefix_unpack_padded_rows_pair(
-            dpos_key_unpad,
-            dpos_query_unpad,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            batch_size=batch_size,
-            seq_len=seq_len,
-        )
-    else:
-        dpos_key = (
-            prefix_unpack_padded_rows(
-                dpos_key_unpad,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                batch_size=batch_size,
-                seq_len=seq_len,
-            )
-            if dpos_key_unpad is not None
-            else None
-        )
-        dpos_query = (
-            prefix_unpack_padded_rows(
-                dpos_query_unpad,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                batch_size=batch_size,
-                seq_len=seq_len,
-            )
-            if dpos_query_unpad is not None
-            else None
-        )
+    dpos_key, dpos_query = prefix_unpack_optional_pair(
+        dpos_key_unpad,
+        dpos_query_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
     return dq, dk, dv, dpos_key, dpos_query
 
 
@@ -1960,38 +1914,14 @@ def _varlen_triton_forward_impl(
         max_seqlen=seq_len,
         total_tokens=capacity_tokens,
     )
-    if pos_key is not None and pos_query is not None:
-        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
-            pos_key,
-            pos_query,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    else:
-        pos_key_unpad = (
-            prefix_pack_padded_rows(
-                pos_key,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=seq_len,
-                total_tokens=capacity_tokens,
-            )
-            if pos_key is not None
-            else None
-        )
-        pos_query_unpad = (
-            prefix_pack_padded_rows(
-                pos_query,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=seq_len,
-                total_tokens=capacity_tokens,
-            )
-            if pos_query is not None
-            else None
-        )
+    pos_key_unpad, pos_query_unpad = prefix_pack_optional_pair(
+        pos_key,
+        pos_query,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=seq_len,
+        total_tokens=capacity_tokens,
+    )
 
     table_config = _varlen_repo_tuned_fwd_config(
         seq_len=seq_len,

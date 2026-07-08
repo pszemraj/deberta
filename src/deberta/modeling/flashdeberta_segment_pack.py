@@ -1108,13 +1108,117 @@ def segment_unpack_padded_rows_triple(
     return output_a, output_b, output_c
 
 
+def segment_pack_optional_pair(
+    tensor_a: torch.Tensor | None,
+    tensor_b: torch.Tensor | None,
+    *,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    max_segment_length: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Pack an optional tensor pair, sharing one launch when both are present.
+
+    :param torch.Tensor | None tensor_a: Optional first padded tensor.
+    :param torch.Tensor | None tensor_b: Optional second padded tensor.
+    :param torch.Tensor segment_offsets: Flat row offsets per segment.
+    :param torch.Tensor segment_lengths: Segment lengths.
+    :param torch.Tensor cu_seqlens: Packed cumulative sequence lengths.
+    :param int total_tokens: Total packed token count.
+    :param int max_segment_length: Maximum segment length.
+    :return tuple[torch.Tensor | None, torch.Tensor | None]: Packed tensors, or
+        ``None`` for absent inputs.
+    """
+
+    if tensor_a is not None and tensor_b is not None:
+        return segment_pack_padded_rows_pair(
+            tensor_a,
+            tensor_b,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            total_tokens=total_tokens,
+            max_segment_length=max_segment_length,
+        )
+    packed = [
+        segment_pack_padded_rows(
+            tensor,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            total_tokens=total_tokens,
+            max_segment_length=max_segment_length,
+        )
+        if tensor is not None
+        else None
+        for tensor in (tensor_a, tensor_b)
+    ]
+    return packed[0], packed[1]
+
+
+def segment_unpack_optional_pair(
+    tensor_a: torch.Tensor | None,
+    tensor_b: torch.Tensor | None,
+    *,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    max_segment_length: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Unpack an optional tensor pair, sharing one launch when both are present.
+
+    :param torch.Tensor | None tensor_a: Optional first packed tensor.
+    :param torch.Tensor | None tensor_b: Optional second packed tensor.
+    :param torch.Tensor segment_offsets: Flat row offsets per segment.
+    :param torch.Tensor segment_lengths: Segment lengths.
+    :param torch.Tensor cu_seqlens: Packed cumulative sequence lengths.
+    :param int batch_size: Padded batch size.
+    :param int seq_len: Padded sequence length.
+    :param int max_segment_length: Maximum segment length.
+    :return tuple[torch.Tensor | None, torch.Tensor | None]: Padded tensors, or
+        ``None`` for absent inputs.
+    """
+
+    if tensor_a is not None and tensor_b is not None:
+        return segment_unpack_padded_rows_pair(
+            tensor_a,
+            tensor_b,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            max_segment_length=max_segment_length,
+        )
+    unpacked = [
+        segment_unpack_padded_rows(
+            tensor,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            max_segment_length=max_segment_length,
+        )
+        if tensor is not None
+        else None
+        for tensor in (tensor_a, tensor_b)
+    ]
+    return unpacked[0], unpacked[1]
+
+
 __all__ = [
     "flashdeberta_segment_pack_available",
     "flashdeberta_segment_pack_import_error",
     "segment_pack_grad_and_delta_from_padded",
+    "segment_pack_optional_pair",
     "segment_pack_padded_rows",
     "segment_pack_padded_rows_pair",
     "segment_pack_padded_rows_triple",
+    "segment_unpack_optional_pair",
     "segment_unpack_padded_rows",
     "segment_unpack_padded_rows_pair",
     "segment_unpack_padded_rows_triple",
