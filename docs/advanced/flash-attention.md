@@ -19,6 +19,8 @@ Constraints:
   with conservative capability-scoped defaults - see [GPU support](gpu-support.md)
 - Calls with `output_attentions=true` use eager attention for that call, preserving the HF-style
   `(B,H,S,S)` attention-probability outputs instead of returning flash-only placeholders.
+- Calls with an explicit `relative_pos` tensor use eager attention for that call with the tensor
+  preserved; the flash kernels only compute the default relative-position map on device.
 
 ## Route families
 

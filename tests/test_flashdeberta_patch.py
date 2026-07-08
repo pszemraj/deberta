@@ -1048,6 +1048,80 @@ def test_flash_attention_output_attentions_falls_back_to_eager_contract(
     assert stats.get("flash_eligible_calls", 0) == 0
 
 
+def test_flash_attention_explicit_relative_pos_falls_back_and_preserves_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit relative_pos must route to eager with the exact tensor preserved."""
+
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+
+    from deberta.modeling.deberta_v2_native import build_relative_position
+
+    cfg = _small_deberta_config()
+    cfg.hf_flash = {"eager_dense_max_seq_len": 0}
+    torch.manual_seed(0)
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    reference = attention_mod._EagerDisentangledSelfAttention(cfg).eval()
+    reference.load_state_dict(attention.state_dict())
+
+    monkeypatch.setattr(
+        attention,
+        "_fallback_reason",
+        lambda **kwargs: pytest.fail("explicit relative_pos should bypass flash eligibility checks"),
+    )
+
+    seq_len = 4
+    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    default_pos = build_relative_position(
+        seq_len,
+        seq_len,
+        bucket_size=cfg.position_buckets,
+        max_position=cfg.max_relative_positions,
+        device=hidden_states.device,
+    )
+    # Deliberately non-default map so dropping the tensor would change outputs.
+    shifted_pos = default_pos.roll(shifts=1, dims=-1)
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        output_attentions=False,
+        relative_pos=shifted_pos,
+        rel_embeddings=rel_embeddings,
+    )
+
+    assert probs is None
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["fallback_calls"] == 1
+    assert stats["fallback_explicit_relative_pos"] == 1
+    assert stats.get("flash_eligible_calls", 0) == 0
+
+    with torch.no_grad():
+        expected, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            output_attentions=False,
+            relative_pos=shifted_pos,
+            rel_embeddings=rel_embeddings,
+        )
+        default_out, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            output_attentions=False,
+            relative_pos=None,
+            rel_embeddings=rel_embeddings,
+        )
+    torch.testing.assert_close(output, expected)
+    # Guard against silently reverting to the default relative-position map.
+    assert not torch.allclose(output, default_out)
+
+
 def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod, _ = _reload_flash_modules()

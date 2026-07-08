@@ -978,6 +978,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         attention_mask: torch.Tensor | None,
         output_attentions: bool,
         query_states: torch.Tensor,
+        relative_pos: torch.Tensor | None,
         rel_embeddings: torch.Tensor | None,
         flash_meta: FlashBatchMeta | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -987,6 +988,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None attention_mask: Original attention mask.
         :param bool output_attentions: Whether to return attention probabilities.
         :param torch.Tensor query_states: Query hidden states.
+        :param torch.Tensor | None relative_pos: Caller-provided relative-position ids, if any.
         :param torch.Tensor | None rel_embeddings: Relative embedding table.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Eager attention output and optional probs.
@@ -1003,7 +1005,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             attention_mask=eager_attention_mask,
             output_attentions=output_attentions,
             query_states=query_states,
-            relative_pos=None,
+            relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
         )
 
@@ -1016,6 +1018,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         attention_mask: torch.Tensor | None,
         output_attentions: bool,
         query_states: torch.Tensor,
+        relative_pos: torch.Tensor | None,
         rel_embeddings: torch.Tensor | None,
         flash_meta: FlashBatchMeta | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1031,6 +1034,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None attention_mask: Original attention mask.
         :param bool output_attentions: Whether to return attention probabilities.
         :param torch.Tensor query_states: Query hidden states.
+        :param torch.Tensor | None relative_pos: Caller-provided relative-position ids, if any.
         :param torch.Tensor | None rel_embeddings: Relative embedding table.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Eager attention output and optional probs.
@@ -1045,6 +1049,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             query_states=query_states,
+            relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
             flash_meta=flash_meta,
         )
@@ -1065,19 +1070,38 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param bool output_attentions: Whether to return attention probabilities.
         :param torch.Tensor | None query_states: Optional query states.
-        :param torch.Tensor | None relative_pos: Optional relative-position ids.
+        :param torch.Tensor | None relative_pos: Optional relative-position ids; a
+            non-``None`` value always routes to eager attention with the tensor
+            preserved, because the flash kernels only compute the default map.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
         """
-
-        del relative_pos  # The flash kernels compute relative positions on device.
 
         if query_states is None:
             query_states = hidden_states
 
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("forward_calls")
+
+        if relative_pos is not None:
+            # The flash kernels compute default relative positions on device and
+            # cannot honor an arbitrary caller-provided tensor; only eager
+            # attention preserves the native relative_pos contract.
+            return self._fallback_to_eager(
+                reason="explicit_relative_pos",
+                message=(
+                    "FlashDeBERTa kernels compute default relative positions internally; "
+                    "using eager attention because an explicit relative_pos tensor was supplied."
+                ),
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+                flash_meta=flash_meta,
+            )
 
         if output_attentions:
             return self._fallback_to_eager(
@@ -1090,6 +1114,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 attention_mask=attention_mask,
                 output_attentions=True,
                 query_states=query_states,
+                relative_pos=relative_pos,
                 rel_embeddings=rel_embeddings,
                 flash_meta=flash_meta,
             )
@@ -1113,6 +1138,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 attention_mask=attention_mask,
                 output_attentions=output_attentions,
                 query_states=query_states,
+                relative_pos=relative_pos,
                 rel_embeddings=rel_embeddings,
                 flash_meta=flash_meta,
             )
@@ -1156,6 +1182,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
+                    relative_pos=relative_pos,
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
@@ -1168,6 +1195,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
+                    relative_pos=relative_pos,
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
@@ -1182,6 +1210,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
+                    relative_pos=relative_pos,
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
@@ -1209,6 +1238,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
+                    relative_pos=relative_pos,
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
@@ -1221,6 +1251,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
+                    relative_pos=relative_pos,
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
@@ -1235,6 +1266,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     query_states=query_states,
+                    relative_pos=relative_pos,
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
@@ -1264,6 +1296,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 attention_mask=attention_mask,
                 output_attentions=output_attentions,
                 query_states=query_states,
+                relative_pos=relative_pos,
                 rel_embeddings=rel_embeddings,
                 flash_meta=flash_meta,
             )
