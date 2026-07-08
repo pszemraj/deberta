@@ -1305,11 +1305,12 @@ def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_act
     assert int(out.gen_token_count.item()) == 1
 
 
-def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition():
-    import pytest
+def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Module | None = None):
+    """Build an EnhancedMaskDecoder harness around one instrumented last layer.
 
-    pytest.importorskip("transformers")
-
+    The three EMD contract tests share this scaffolding and differ only in the
+    last layer's recording behavior plus their assertions.
+    """
     from deberta.modeling.rtd import EnhancedMaskDecoder
 
     class _Cfg:
@@ -1320,6 +1321,31 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
             bsz, seq_len = position_ids.shape
             return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
 
+    class _Embeddings(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.position_embeddings = _PositionEmbeddings()
+            self.LayerNorm = layer_norm if layer_norm is not None else torch.nn.Identity()
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self, layer: torch.nn.Module) -> None:
+            super().__init__()
+            self.layer = torch.nn.ModuleList([layer])
+
+    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
+    encoder = _Encoder(last_layer)
+    embeddings = _Embeddings()
+    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
+    encoder_hidden_states = [kv_states, kv_states + 1.0]
+    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    return decoder, encoder, embeddings, kv_states, encoder_hidden_states, masked_positions
+
+
+def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition():
+    import pytest
+
+    pytest.importorskip("transformers")
+
     class _ShiftNorm(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -1328,12 +1354,6 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             self.calls += 1
             return x + 5.0
-
-    class _Embeddings(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.position_embeddings = _PositionEmbeddings()
-            self.LayerNorm = _ShiftNorm()
 
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
@@ -1355,19 +1375,11 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
             self.query_states_seen = query_states.detach().clone()
             return query_states, None
 
-    class _Encoder(torch.nn.Module):
-        def __init__(self, layer: torch.nn.Module) -> None:
-            super().__init__()
-            self.layer = torch.nn.ModuleList([layer])
-
-    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
     last_layer = _LastLayer()
-    encoder = _Encoder(last_layer)
-    embeddings = _Embeddings()
-
-    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
-    encoder_hidden_states = [kv_states, kv_states + 1.0]
-    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    shift_norm = _ShiftNorm()
+    decoder, encoder, embeddings, kv_states, encoder_hidden_states, masked_positions = _make_emd_harness(
+        last_layer, layer_norm=shift_norm
+    )
     attention_mask = torch.ones((1, 3), dtype=torch.bool)
 
     masked = decoder(
@@ -1379,7 +1391,7 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
     )
 
     expected_query = kv_states + 5.0
-    assert embeddings.LayerNorm.calls == 1
+    assert shift_norm.calls == 1
     assert last_layer.query_states_seen is not None
     torch.testing.assert_close(last_layer.query_states_seen, expected_query, rtol=0.0, atol=0.0)
     torch.testing.assert_close(masked, expected_query[:, 1:2, :].reshape(1, 4), rtol=0.0, atol=0.0)
@@ -1389,22 +1401,6 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
     import pytest
 
     pytest.importorskip("transformers")
-
-    from deberta.modeling.rtd import EnhancedMaskDecoder
-
-    class _Cfg:
-        position_biased_input = False
-
-    class _PositionEmbeddings(torch.nn.Module):
-        def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-            bsz, seq_len = position_ids.shape
-            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
-
-    class _Embeddings(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.position_embeddings = _PositionEmbeddings()
-            self.LayerNorm = torch.nn.Identity()
 
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
@@ -1426,19 +1422,8 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
             assert query_states is not None
             return query_states, None
 
-    class _Encoder(torch.nn.Module):
-        def __init__(self, layer: torch.nn.Module) -> None:
-            super().__init__()
-            self.layer = torch.nn.ModuleList([layer])
-
-    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
     last_layer = _LastLayer()
-    encoder = _Encoder(last_layer)
-    embeddings = _Embeddings()
-
-    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
-    encoder_hidden_states = [kv_states, kv_states + 1.0]
-    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    decoder, encoder, embeddings, _, encoder_hidden_states, masked_positions = _make_emd_harness(last_layer)
 
     masked = decoder(
         encoder_hidden_states=encoder_hidden_states,
@@ -1458,21 +1443,6 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
     pytest.importorskip("transformers")
 
     from deberta.modeling.mask_utils import FlashBatchMeta
-    from deberta.modeling.rtd import EnhancedMaskDecoder
-
-    class _Cfg:
-        position_biased_input = False
-
-    class _PositionEmbeddings(torch.nn.Module):
-        def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-            bsz, seq_len = position_ids.shape
-            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
-
-    class _Embeddings(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.position_embeddings = _PositionEmbeddings()
-            self.LayerNorm = torch.nn.Identity()
 
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
@@ -1495,19 +1465,8 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
             self.seen = {"flash_meta": flash_meta}
             return query_states, None
 
-    class _Encoder(torch.nn.Module):
-        def __init__(self, layer: torch.nn.Module) -> None:
-            super().__init__()
-            self.layer = torch.nn.ModuleList([layer])
-
-    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
     last_layer = _LastLayer()
-    encoder = _Encoder(last_layer)
-    embeddings = _Embeddings()
-
-    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
-    encoder_hidden_states = [kv_states, kv_states + 1.0]
-    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    decoder, encoder, embeddings, _, encoder_hidden_states, masked_positions = _make_emd_harness(last_layer)
     attention_mask = torch.tensor(
         [[[True, True, False], [True, True, False], [False, False, True]]],
         dtype=torch.bool,
@@ -2140,7 +2099,12 @@ def test_native_hf_deberta_v2_forward_smoke():
     torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
 
 
-def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
+@pytest.mark.parametrize(
+    ("pos_att_type", "seed"),
+    [("c2p|p2c", 123), ("c2p|p2c|p2p", 321)],
+    ids=["c2p_p2c", "with_p2p"],
+)
+def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_type: str, seed: int):
     import pytest
 
     pytest.importorskip("transformers")
@@ -2157,7 +2121,7 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
         intermediate_size=64,
         max_position_embeddings=32,
         relative_attention=True,
-        pos_att_type="c2p|p2c",
+        pos_att_type=pos_att_type,
         type_vocab_size=0,
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
@@ -2165,7 +2129,7 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-    torch.manual_seed(123)
+    torch.manual_seed(seed)
     cfg.hf_attention_kernel = "dynamic"
     dynamic_model = DebertaV2Model(cfg).eval()
     snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
@@ -2512,53 +2476,6 @@ def test_native_hf_deberta_v2_c2p_p2c_bias_respects_scale_factor(kernel: str):
     assert ratio == pytest.approx(math.sqrt(12.0 / 3.0), rel=1e-4, abs=1e-4)
 
 
-def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic_with_p2p():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DebertaV2Model
-
-    cfg = DebertaV2Config(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="c2p|p2c|p2p",
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-
-    torch.manual_seed(321)
-    cfg.hf_attention_kernel = "dynamic"
-    dynamic_model = DebertaV2Model(cfg).eval()
-    snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
-
-    cfg.hf_attention_kernel = "cached_bmm"
-    cached_model = DebertaV2Model(cfg).eval()
-    cached_model.load_state_dict(snapshot, strict=True)
-
-    cfg.hf_attention_kernel = "stable"
-    stable_model = DebertaV2Model(cfg).eval()
-    stable_model.load_state_dict(snapshot, strict=True)
-
-    with torch.no_grad():
-        out_dynamic = dynamic_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        out_cached = cached_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        out_stable = stable_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-    torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
-
-
 def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
     from deberta.modeling.deberta_v2_native import _make_log_bucket_position
 
@@ -2756,7 +2673,8 @@ def test_native_hf_deberta_v2_stable_compile_step_is_finite():
         assert all(torch.isfinite(g).all().item() for g in grads)
 
 
-def test_native_hf_deberta_v2_forward_with_none_mask():
+@pytest.mark.parametrize("relative_attention", [False, True], ids=["plain", "disentangled"])
+def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_attention: bool):
     import pytest
 
     pytest.importorskip("transformers")
@@ -2765,6 +2683,7 @@ def test_native_hf_deberta_v2_forward_with_none_mask():
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
+    extra = {"relative_attention": True, "pos_att_type": "c2p|p2c"} if relative_attention else {}
     cfg = DebertaV2Config(
         vocab_size=64,
         hidden_size=32,
@@ -2775,6 +2694,7 @@ def test_native_hf_deberta_v2_forward_with_none_mask():
         type_vocab_size=0,
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
+        **extra,
     )
     model = DebertaV2Model(cfg).eval()
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
@@ -2853,41 +2773,6 @@ def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
     )
     with pytest.raises(ValueError, match="conv_kernel_size"):
         DebertaV2Model(cfg)
-
-
-def test_native_hf_deberta_v2_none_mask_matches_all_ones_with_relative_attention():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DebertaV2Model
-
-    cfg = DebertaV2Config(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="c2p|p2c",
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    model = DebertaV2Model(cfg).eval()
-    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    all_ones = torch.ones_like(input_ids, dtype=torch.bool)
-
-    with torch.no_grad():
-        out_none = model(input_ids=input_ids, attention_mask=None).last_hidden_state
-        out_ones = model(input_ids=input_ids, attention_mask=all_ones).last_hidden_state
-
-    assert out_none.shape == (2, 8, 32)
-    assert torch.isfinite(out_none).all()
-    torch.testing.assert_close(out_none, out_ones, rtol=0.0, atol=0.0)
 
 
 def test_rope_model_accepts_positional_input_ids_call():

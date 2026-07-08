@@ -7,6 +7,7 @@ import importlib.metadata as importlib_metadata
 import sys
 import types
 import warnings
+from typing import Any
 
 import pytest
 import torch
@@ -557,6 +558,48 @@ def _docblock_attention_config(*, seq_len: int):
     )
 
 
+def _stats_attention_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cfg: Any | None = None,
+) -> tuple[types.ModuleType, Any, Any]:
+    """Build a debug-stats FlashDisentangledSelfAttention with fallbacks stubbed.
+
+    Installs the fake flashdeberta package, reloads the flash modules, enables
+    debug stats, and stubs both fallback-reason probes so the route under test
+    is taken. Returns ``(attention_mod, attention, cfg)``.
+    """
+
+    _install_fake_flashdeberta(monkeypatch)
+    attention_mod, _ = _reload_flash_modules()
+    cfg = cfg if cfg is not None else _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
+    attention_mod.refresh_flashdeberta_runtime_config_from_env()
+    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
+    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    return attention_mod, attention, cfg
+
+
+def _assert_single_flash_route_stat(attention_mod: types.ModuleType, route_counter: str) -> None:
+    """Assert exactly one flash route counter incremented and no fallbacks."""
+
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    assert stats["forward_calls"] == 1
+    assert stats["flash_eligible_calls"] == 1
+    assert stats[route_counter] == 1
+    for counter in (
+        "flash_fixed_calls",
+        "flash_varlen_calls",
+        "flash_bias_calls",
+        "flash_docblock_calls",
+        "flash_docblock_bias_calls",
+    ):
+        if counter != route_counter:
+            assert stats.get(counter, 0) == 0
+    assert stats.get("fallback_calls", 0) == 0
+
+
 def test_enable_flashdeberta_attention_validates_without_global_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -718,16 +761,9 @@ def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatc
 
 
 def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
     cfg = _small_deberta_config()
     cfg.hf_flash = {"force_varlen": True, "varlen_min_seq_len": 2048, "eager_dense_max_seq_len": 0}
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
-    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
-    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    attention_mod, attention, cfg = _stats_attention_harness(monkeypatch, cfg=cfg)
     seen: dict[str, torch.Tensor] = {}
 
     def _fake_varlen_wrapper(
@@ -778,24 +814,11 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     assert seen["mask"].dtype == torch.bool
     assert torch.equal(seen["mask"], attention_mask)
 
-    stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats["forward_calls"] == 1
-    assert stats["flash_eligible_calls"] == 1
-    assert stats["flash_varlen_calls"] == 1
-    assert stats.get("flash_fixed_calls", 0) == 0
-    assert stats.get("fallback_calls", 0) == 0
+    _assert_single_flash_route_stat(attention_mod, "flash_varlen_calls")
 
 
 def test_flash_attention_fixed_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
-    cfg = _small_deberta_config()
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
-    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
-    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    attention_mod, attention, cfg = _stats_attention_harness(monkeypatch)
     seen: dict[str, object] = {}
 
     def _fake_fixed_wrapper(
@@ -843,28 +866,16 @@ def test_flash_attention_fixed_path_records_stats(monkeypatch: pytest.MonkeyPatc
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
     assert seen["seq_lengths"] is None
 
-    stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats["forward_calls"] == 1
-    assert stats["flash_eligible_calls"] == 1
-    assert stats["flash_fixed_calls"] == 1
-    assert stats.get("flash_varlen_calls", 0) == 0
-    assert stats.get("fallback_calls", 0) == 0
+    _assert_single_flash_route_stat(attention_mod, "flash_fixed_calls")
 
 
 def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
     cfg = _small_deberta_config()
     cfg.max_position_embeddings = 1024
     cfg.max_relative_positions = 1024
     cfg.position_buckets = 256
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+    attention_mod, attention, cfg = _stats_attention_harness(monkeypatch, cfg=cfg)
     attention.train()
-
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
-    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
-    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
     seen: dict[str, object] = {}
 
     def _fake_bias_wrapper(
@@ -912,13 +923,7 @@ def test_flash_attention_dense_local_bias_path_records_stats(monkeypatch: pytest
     assert seen["bucket_shape"] == (1024, 1024)
     assert seen["keep_mask"] is None
 
-    stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats["forward_calls"] == 1
-    assert stats["flash_eligible_calls"] == 1
-    assert stats["flash_bias_calls"] == 1
-    assert stats.get("flash_fixed_calls", 0) == 0
-    assert stats.get("flash_varlen_calls", 0) == 0
-    assert stats.get("fallback_calls", 0) == 0
+    _assert_single_flash_route_stat(attention_mod, "flash_bias_calls")
 
 
 def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
@@ -2132,15 +2137,7 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
 
 
 def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
-    cfg = _small_deberta_config()
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
-    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
-    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    attention_mod, attention, cfg = _stats_attention_harness(monkeypatch)
     monkeypatch.setattr(
         attention,
         "_eager_fallback_attention_mask",
@@ -2221,25 +2218,11 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
     assert seen["max_seqlen"].item() == 2
     assert seen["total_tokens"].item() == 3
 
-    stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats["forward_calls"] == 1
-    assert stats["flash_eligible_calls"] == 1
-    assert stats["flash_docblock_calls"] == 1
-    assert stats.get("flash_varlen_calls", 0) == 0
-    assert stats.get("flash_fixed_calls", 0) == 0
-    assert stats.get("fallback_calls", 0) == 0
+    _assert_single_flash_route_stat(attention_mod, "flash_docblock_calls")
 
 
 def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
-    cfg = _small_deberta_config()
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
-    monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
-    monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
+    attention_mod, attention, cfg = _stats_attention_harness(monkeypatch)
     monkeypatch.setattr(attention_mod, "flashdeberta_bias_import_error", lambda: None)
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_bias_available", lambda: True)
     seen: dict[str, torch.Tensor] = {}
@@ -2300,12 +2283,7 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
             assert torch.all(output[0, seq_idx, start:end].eq(float(head_idx * 100 + seq_idx)))
     assert seen["keep_mask"] is not None
     assert tuple(seen["keep_mask"].shape) == (1, 1, 4, 4)
-    stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats["forward_calls"] == 1
-    assert stats["flash_eligible_calls"] == 1
-    assert stats["flash_docblock_bias_calls"] == 1
-    assert stats.get("flash_docblock_calls", 0) == 0
-    assert stats.get("fallback_calls", 0) == 0
+    _assert_single_flash_route_stat(attention_mod, "flash_docblock_bias_calls")
 
 
 def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
