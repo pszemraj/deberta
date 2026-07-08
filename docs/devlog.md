@@ -870,3 +870,38 @@ sm_120-gated backward specializations, and which saves the dense
 - Validation: flash file 68 passed / 4 skipped with CUDA, full suite
   557/4, audit_contracts 14 PASS, full parity matrix OK, compiled smokes
   clean, doc links resolve (17 files).
+
+## 2026-07-08 - Speed/Quality Gate Re-Validation At PR-Review HEAD
+
+Question: does flash still beat eager after the 31 commits that landed on top
+of the validated `486174a` base (capability-aware routing, the fail-closed
+mask/fallback gates from PR #5 review rounds, and the consolidation
+refactors)? Re-ran the formal phase-1 speed gate and the full parity matrix at
+HEAD `610148e`. Artifacts:
+`local-scratch/benchmarks/flashdeberta/headcheck_20260708/` (same
+methodology: 10 warmup / 50 profiled steps, GA=8, packed doc-block arms,
+summary-only). Environment unchanged: RTX 5090, driver `580.159.04`, torch
+`2.9.1+cu128`, triton `3.5.1`, flashdeberta `0.0.7`.
+
+| S | eager tok/s | flash tok/s | ratio | peak mem eager -> flash |
+|---|---|---|---|---|
+| 1024 | 33913 | 43232 | 1.27x | 7.71 -> 6.78 GiB |
+| 2048 | 18147 | 24545 | 1.35x | 11.36 -> 7.90 GiB |
+| 4096 | 11381 | 15109 | 1.33x | 18.44 -> 10.32 GiB |
+
+- Every arm reproduces the 2026-07-06 campaign gate within 3% (eager and
+  flash alike); ratios match to the second decimal. The review-round
+  fail-closed gates cost nothing on the training hot path, as designed: the
+  packed doc-block branch in `prepare_flash_attention_batch_metadata` returns
+  before the new prefix-mask check, and the per-layer check is skipped
+  whenever metadata `seq_lengths` are published.
+- Step-metric means are identical between arms at all three lengths
+  (`gen_loss` 9.4640/9.4378/9.4279, `disc_acc` 0.8503/0.8506/0.8506 to
+  displayed precision) - same data, same learning signal.
+- Full parity matrix OK at HEAD: dense, fixed_padded, varlen, local_bias,
+  docblock and docbias at `1024`/`2048`/`4096` (plus the `b4` batch case),
+  outputs and selected gradients all inside limits.
+- Training equivalence itself was not re-run; the 2026-07-06 1000-step
+  battery remains the evidence of record (flash-vs-eager <=0.94% on every
+  metric, inside flash's own ~1.7% atomics-noise floor), and no commit since
+  touched numerics on the non-fallback paths.
