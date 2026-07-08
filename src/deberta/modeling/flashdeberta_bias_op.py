@@ -354,7 +354,10 @@ def _should_use_specialized_docblock_bias_backward(
     This path is intentionally narrow: it targets measured packed doc-block
     RTD hot paths where the dense-bias route is viable but the generic
     local-bias backward still spends significant time in dense positional
-    gradient reduction.
+    gradient reduction. The tuning table is the single source of truth for
+    which shapes are enabled (``bias_docblock_specialized`` rows exact-match
+    the measured lengths); kernel shape constraints are enforced separately by
+    the launch-config divisibility checks, which fall back to the generic path.
 
     :param torch.Tensor q: Forward query tensor in ``(B,H,S,D)`` layout.
     :param torch.Tensor k: Forward key tensor in ``(B,H,S,D)`` layout.
@@ -397,8 +400,6 @@ def _should_use_specialized_docblock_bias_backward(
     query_len = int(q.shape[-2])
     key_len = int(k.shape[-2])
     if query_len != key_len or int(v.shape[-2]) != key_len:
-        return False
-    if query_len not in {1024, 2048, 4096}:
         return False
     if tuple(q.shape[:2]) != tuple(k.shape[:2]) or tuple(q.shape[:2]) != tuple(v.shape[:2]):
         return False

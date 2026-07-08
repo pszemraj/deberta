@@ -3489,6 +3489,59 @@ def test_specialized_docblock_bias_policy_is_table_gated() -> None:
     assert resolve_flash_kernel_config(FlashKernelContext(batch_size=5, **base)) is None
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for the specialized-backward gate."
+)
+def test_specialized_docblock_bias_backward_enables_new_seq_len_from_table(tmp_path) -> None:
+    import deberta.modeling.flashdeberta_bias_op as bias_mod
+    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+
+    if bias_mod.triton is None:
+        pytest.skip("Triton is required for the specialized-backward gate.")
+
+    def _gate(seq_len: int) -> bool:
+        q = torch.zeros((1, 2, seq_len, 64), dtype=torch.bfloat16, device="cuda")
+        bias = torch.zeros((1, 2, seq_len, seq_len), dtype=torch.bfloat16, device="cuda")
+        return bias_mod._should_use_specialized_docblock_bias_backward(q=q, k=q, v=q, bias=bias, causal=False)
+
+    override_path = tmp_path / "flash_specialized_512.json"
+    override_path.write_text(
+        json.dumps(
+            {
+                "kernels": [
+                    {
+                        "route": "bias_docblock_specialized",
+                        "kind": "bwd",
+                        "seq_bucket": "under_2048",
+                        "query_len": 512,
+                        "key_len": 512,
+                        "head_dim": 64,
+                        "dtype": "bfloat16",
+                        "causal": False,
+                        "has_mask": True,
+                        "block_m": 32,
+                        "block_n": 32,
+                        "num_stages": 1,
+                        "num_warps": 2,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    configure_flashdeberta_kernel_overrides(None)
+    try:
+        # The shipped table has no 512 row, so the gate stays closed.
+        assert not _gate(512)
+        # Adding a tuning-table row is sufficient to open the gate: shape
+        # enablement must live in data, not in a hardcoded seq-len set in src.
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        assert _gate(512)
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
