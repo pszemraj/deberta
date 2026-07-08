@@ -100,20 +100,6 @@ def _parse_ast(path: Path) -> ast.AST:
     return ast.parse(_read_text(path), filename=str(path))
 
 
-def _extract_function_source(path: Path, func_name: str) -> str:
-    src = _read_text(path)
-    tree = ast.parse(src, filename=str(path))
-    lines = src.splitlines()
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == func_name:
-            if not hasattr(node, "lineno") or not hasattr(node, "end_lineno"):
-                raise RuntimeError("Python AST nodes missing lineno/end_lineno; need Python 3.8+.")
-            start = int(node.lineno) - 1
-            end = int(node.end_lineno)
-            return "\n".join(lines[start:end])
-    raise KeyError(f"Function {func_name!r} not found in {path}")
-
-
 # -----------------------------
 # Minimal tokenizer stub (no internet / no HF download required)
 # -----------------------------
@@ -351,34 +337,13 @@ def check_optimizer_state_ordering_risk(repo_root: Path) -> CheckResult:
     return _pass("optimizer_resume_param_order_risk")
 
 
-def _exec_extracted_function(path: Path, func_name: str, globals_dict: dict[str, Any]) -> Callable[..., Any]:
-    src = _extract_function_source(path, func_name)
-    # Compile in an isolated module-like dict.
-    loc: dict[str, Any] = {}
-    g = dict(globals_dict)
-    exec(compile(src, filename=str(path), mode="exec"), g, loc)
-    fn = loc.get(func_name) or g.get(func_name)
-    if not callable(fn):
-        raise RuntimeError(f"Failed to exec function {func_name} from {path}")
-    return fn  # type: ignore[return-value]
-
-
 def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
-    path = repo_root / "src" / "deberta" / "training" / "compile.py"
-    from deberta.modeling.mask_utils import build_doc_block_mask
-
-    g = {
-        "torch": torch,
-        "_DOC_BLOCK_EYE_CACHE": {},
-        "_DOC_BLOCK_CLS_KEY_CACHE": {},
-        "build_doc_block_mask": build_doc_block_mask,
-    }
     try:
-        build_mask = _exec_extracted_function(path, "_build_doc_block_mask", g)
+        from deberta.training.compile import _build_doc_block_mask as build_mask
     except Exception as e:
         return _fail(
             "doc_block_mask_contract",
-            f"Failed to load _build_doc_block_mask via AST exec: {type(e).__name__}: {e}",
+            f"Failed to import _build_doc_block_mask: {type(e).__name__}: {e}",
             hint="This harness expects src/deberta/training/compile.py to define _build_doc_block_mask(doc_ids).",
         )
 
@@ -546,20 +511,12 @@ def check_flash_batch_metadata_contract(repo_root: Path) -> CheckResult:
 
 
 def check_attention_mask_to_active_tokens_contract(repo_root: Path) -> CheckResult:
-    path = repo_root / "src" / "deberta" / "modeling" / "rtd.py"
     try:
-        from deberta.modeling.mask_utils import normalize_keep_mask
-    except ImportError:
-        normalize_keep_mask = None  # type: ignore[assignment]
-    g: dict[str, Any] = {"torch": torch}
-    if normalize_keep_mask is not None:
-        g["normalize_keep_mask"] = normalize_keep_mask
-    try:
-        fn = _exec_extracted_function(path, "attention_mask_to_active_tokens", g)
+        from deberta.modeling.rtd import attention_mask_to_active_tokens as fn
     except Exception as e:
         return _fail(
             "attention_mask_to_active_tokens_contract",
-            f"Failed to load attention_mask_to_active_tokens via AST exec: {type(e).__name__}: {e}",
+            f"Failed to import attention_mask_to_active_tokens: {type(e).__name__}: {e}",
         )
 
     B, S = 2, 5
@@ -756,21 +713,9 @@ def check_rope_attention_mask_leak(repo_root: Path) -> CheckResult:
             f"Failed to import DebertaRoPESelfAttention: {type(e).__name__}: {e}",
         )
 
-    # Prefer testing the *repo's* packed/doc-block mask builder, without importing the whole training module.
-    build_mask = None
+    # Prefer testing the *repo's* packed/doc-block mask builder.
     try:
-        from deberta.modeling.mask_utils import build_doc_block_mask
-
-        build_mask = _exec_extracted_function(
-            repo_root / "src" / "deberta" / "training" / "compile.py",
-            "_build_doc_block_mask",
-            {
-                "torch": torch,
-                "_DOC_BLOCK_EYE_CACHE": {},
-                "_DOC_BLOCK_CLS_KEY_CACHE": {},
-                "build_doc_block_mask": build_doc_block_mask,
-            },
-        )
+        from deberta.training.compile import _build_doc_block_mask as build_mask
     except Exception:
         build_mask = None  # We'll fall back to a minimal within-doc mask (no padding edge cases).
 
