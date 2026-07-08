@@ -347,6 +347,40 @@ def _should_use_varlen(
     )
 
 
+def _resolve_docblock_scalars(
+    flash_meta: FlashBatchMeta | None,
+) -> tuple[torch.Tensor | int | None, torch.Tensor | int | None, torch.Tensor | int | None]:
+    """Resolve doc-block active-token/segment scalars from flash metadata.
+
+    Compiled routes prefer the CPU scalar tensors; eager metadata falls back
+    to host integers.
+
+    :param FlashBatchMeta | None flash_meta: Optional flash metadata bundle.
+    :return tuple[torch.Tensor | int | None, torch.Tensor | int | None, torch.Tensor | int | None]:
+        ``(active_tokens, num_segments, max_segment_length)`` as scalar
+        tensors, host ints, or ``None`` per missing field.
+    """
+
+    if flash_meta is None:
+        return None, None, None
+    active_tokens = (
+        flash_meta.active_tokens_scalar
+        if flash_meta.active_tokens_scalar is not None
+        else flash_meta.active_tokens_host
+    )
+    num_segments = (
+        flash_meta.doc_num_segments_scalar
+        if flash_meta.doc_num_segments_scalar is not None
+        else flash_meta.doc_num_segments_host
+    )
+    max_segment_length = (
+        flash_meta.doc_max_segment_length_scalar
+        if flash_meta.doc_max_segment_length_scalar is not None
+        else flash_meta.doc_max_segment_length_host
+    )
+    return active_tokens, num_segments, max_segment_length
+
+
 def _seqlens_to_mask_2d(seq_lengths: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     """Build a canonical prefix-padding keep mask from per-example lengths.
 
@@ -790,6 +824,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         flash_meta: FlashBatchMeta,
+        active_tokens: torch.Tensor | int | None,
+        doc_num_segments: torch.Tensor | int | None,
+        doc_max_segment_length: torch.Tensor | int | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -800,27 +837,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param FlashBatchMeta flash_meta: FlashDeBERTa doc-block metadata bundle.
+        :param torch.Tensor | int | None active_tokens: Resolved active-token scalar.
+        :param torch.Tensor | int | None doc_num_segments: Resolved segment-count scalar.
+        :param torch.Tensor | int | None doc_max_segment_length: Resolved max-segment scalar.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
         :return torch.Tensor: Flash output in ``(B, S, H, D)`` layout.
         """
 
-        active_tokens = (
-            flash_meta.active_tokens_scalar
-            if flash_meta.active_tokens_scalar is not None
-            else flash_meta.active_tokens_host
-        )
-        doc_num_segments = (
-            flash_meta.doc_num_segments_scalar
-            if flash_meta.doc_num_segments_scalar is not None
-            else flash_meta.doc_num_segments_host
-        )
-        doc_max_segment_length = (
-            flash_meta.doc_max_segment_length_scalar
-            if flash_meta.doc_max_segment_length_scalar is not None
-            else flash_meta.doc_max_segment_length_host
-        )
         if (
             flash_meta.doc_segment_offsets is None
             or flash_meta.doc_segment_lengths is None
@@ -1111,15 +1136,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 )
 
         if use_docblock:
-            docblock_active_tokens = None if flash_meta is None else flash_meta.active_tokens_scalar
-            if docblock_active_tokens is None and flash_meta is not None:
-                docblock_active_tokens = flash_meta.active_tokens_host
-            docblock_num_segments = None if flash_meta is None else flash_meta.doc_num_segments_scalar
-            if docblock_num_segments is None and flash_meta is not None:
-                docblock_num_segments = flash_meta.doc_num_segments_host
-            docblock_max_segment = None if flash_meta is None else flash_meta.doc_max_segment_length_scalar
-            if docblock_max_segment is None and flash_meta is not None:
-                docblock_max_segment = flash_meta.doc_max_segment_length_host
+            docblock_active_tokens, docblock_num_segments, docblock_max_segment = _resolve_docblock_scalars(
+                flash_meta
+            )
             if (
                 flash_meta is None
                 or flash_meta.doc_segment_offsets is None
@@ -1259,6 +1278,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 key_layer=key_layer,
                 value_layer=value_layer,
                 flash_meta=flash_meta,
+                active_tokens=docblock_active_tokens,
+                doc_num_segments=docblock_num_segments,
+                doc_max_segment_length=docblock_max_segment,
                 pos_key=pos_key,
                 pos_query=pos_query,
                 sm_scale=sm_scale,

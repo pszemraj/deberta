@@ -265,6 +265,28 @@ def reduce_keep_mask_to_2d(attention_mask: torch.Tensor, *, seq_len: int | None 
 
 _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 _DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
+_DOC_BLOCK_CACHE_MAX_ENTRIES = 8
+
+
+def _doc_block_cache_put(
+    cache: dict[tuple[int, str, int | None], torch.Tensor],
+    key: tuple[int, str, int | None],
+    value: torch.Tensor,
+) -> None:
+    """Insert into a doc-block mask cache, evicting oldest entries past the cap.
+
+    Cached entries scale with ``seq_len**2`` bytes, so variable-seq-len
+    training must not grow these dicts without bound.
+
+    :param dict[tuple[int, str, int | None], torch.Tensor] cache: Target cache.
+    :param tuple[int, str, int | None] key: Cache key.
+    :param torch.Tensor value: Tensor to cache.
+    """
+
+    cache[key] = value
+    if len(cache) > _DOC_BLOCK_CACHE_MAX_ENTRIES:
+        for stale_key in list(cache.keys())[: _DOC_BLOCK_CACHE_MAX_ENTRIES // 2]:
+            cache.pop(stale_key, None)
 
 
 def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
@@ -289,7 +311,7 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     eye = _DOC_BLOCK_EYE_CACHE.get(cache_key)
     if eye is None:
         eye = torch.eye(seq_len, dtype=torch.bool, device=ids.device)
-        _DOC_BLOCK_EYE_CACHE[cache_key] = eye
+        _doc_block_cache_put(_DOC_BLOCK_EYE_CACHE, cache_key, eye)
 
     keep = (keep & ~eye[None, :, :]) | (eye[None, :, :] & active[:, :, None])
 
@@ -298,7 +320,7 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
         cls_key = torch.zeros((seq_len,), dtype=torch.bool, device=ids.device)
         if seq_len > 0:
             cls_key[0] = True
-        _DOC_BLOCK_CLS_KEY_CACHE[cache_key] = cls_key
+        _doc_block_cache_put(_DOC_BLOCK_CLS_KEY_CACHE, cache_key, cls_key)
     keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
 
     return keep
