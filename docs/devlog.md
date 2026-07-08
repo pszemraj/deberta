@@ -786,3 +786,56 @@ campaign. All findings either resolved or explicitly deferred below.
 - `tools/audit_contracts.py --strict`: 14 PASS, 0 WARN/SKIP/FAIL.
 - API docs regenerated (`tools/generate_api_docs.py`); the diff was
   stale-doc catch-up for `flash_meta` parameters, not campaign changes.
+
+## 2026-07-07 - Documentation Pass (dedupe, verify, consolidate)
+
+Full read of all 15 tracked markdown files, then three parallel code-vs-doc
+verification agents (getting-started/README, guides, advanced/flash) with
+every claim checked to file:line.
+
+### Structure
+
+- New `docs/advanced/flash-attention.md` owns FlashDeBERTa routing, the
+  tuning-table schema, override knobs, retuning workflow, tool inventory,
+  and accepted caveats. The same material was previously restated with
+  drift across quickstart.md, architectures.md (the follow-ups wall), and
+  torch-compile.md; those now carry pointers plus their own concerns
+  (torch-compile keeps only the opaque-op and fixed-shape-metadata compile
+  contracts). Net: -190 lines of triplicated prose, +151-line consolidated
+  guide.
+
+### Verified errors fixed
+
+- quickstart's flash `accelerate launch` example omitted `--no_python` and
+  failed as written (reproduced; `deberta` is a console script).
+- The 1024 packed v2 configs (base + docblock) were gitignored while being
+  the defaults of tracked `tools/run_flashdeberta_benchmarks.sh` and
+  described as shipped; both force-added.
+- configuration.md's load pipeline was wrong: `load_config` fully
+  validates the file (with profile defaults) before preset/CLI overrides
+  apply, then validation re-runs on the merged result - a broken base
+  file cannot be repaired by CLI flags (reproduced).
+- `metrics.jsonl.gz` is gated by `logging.debug.metrics`, not the removed
+  `train.debug_metrics`; crash rows write unconditionally.
+- The documented "non-sm_120 hardware falls back to ragged docblock" route
+  rule does not exist: route policies are seq-bucket-only, compute
+  capability only gates kernel tile tuning within a route.
+- `disc_loss_weight` 10.0 described as the effective `hf_deberta_v2`
+  default (raw dataclass default is 50.0).
+- data-pipeline.md now states the real `doc_ids` contract (dense
+  `(B,S,S)` for eager/docblock_bias; 2D keep-mask plus fixed-shape
+  segment descriptors for ragged flash) and names the unigram path as
+  DeBERTa windowed selection.
+- torch-compile.md no longer points at untracked `local-scratch/` helper
+  scripts; the drift-probe description matches its synthetic-batch design.
+- installation.md documents the existing `tensorboard` extra.
+
+### Validation
+
+- Generated docs fresh: `generate_config_reference.py --check` passes and
+  regenerating API docs produced no diff; `tests/test_config_reference_docs.py`
+  passes.
+- All internal doc links resolve relatively (scripted check over all 16
+  files); no absolute self-repo URLs.
+- `rehuman` normalization was a no-op: hand-written docs are already pure
+  ASCII.
