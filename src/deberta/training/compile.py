@@ -446,6 +446,11 @@ def prepare_flash_attention_batch_metadata(
 ) -> tuple[dict[str, Any], FlashBatchMeta | None]:
     """Attach precomputed flash metadata and return an out-of-graph metadata bundle.
 
+    This owns ``doc_ids`` consumption for every backbone: non-``hf_deberta_v2``
+    backbones get the dense pairwise doc-block mask built here, so callers must
+    not pre-convert (a forgotten preamble would otherwise silently drop
+    cross-document blocking).
+
     :param dict[str, Any] batch: Device-local batch mapping.
     :param str backbone_type: Backbone type string.
     :param bool flash_enabled: Whether the active backend can consume flash metadata.
@@ -455,6 +460,9 @@ def prepare_flash_attention_batch_metadata(
 
     btype = str(backbone_type).strip().lower()
     if btype != "hf_deberta_v2":
+        doc_ids = batch.pop("doc_ids", None)
+        if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
+            batch["attention_mask"] = _build_doc_block_mask(doc_ids)
         _clear_flash_batch_metadata(batch)
         return batch, None
 

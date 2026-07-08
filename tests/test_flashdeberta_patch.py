@@ -2152,6 +2152,27 @@ def test_prepare_flash_attention_batch_metadata_clears_metadata_for_other_backbo
     assert not any(key.startswith("flash_") for key in prepared)
 
 
+def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbones() -> None:
+    import deberta.training.compile as compile_mod
+
+    # Cross-document blocking must not depend on caller-side preambles: a
+    # non-hf_deberta_v2 batch carrying doc_ids gets the dense pairwise mask
+    # built here, or packed documents silently attend across boundaries.
+    doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
+    batch = {"input_ids": torch.zeros((1, 4), dtype=torch.long), "doc_ids": doc_ids}
+
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="rope",
+        flash_enabled=False,
+    )
+
+    assert meta is None
+    assert "doc_ids" not in prepared
+    assert tuple(prepared["attention_mask"].shape) == (1, 4, 4)
+    assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
+
+
 def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
     import deberta.training.compile as compile_mod
 

@@ -32,7 +32,6 @@ from deberta.training.checkpointing import (
 )
 from deberta.training.compile import (
     _bf16_runtime_sanity_check,
-    _build_doc_block_mask,
     _compile_backbones_for_scope,
     _dtype_for_mixed_precision,
     _maybe_configure_sdpa_kernels,
@@ -1190,14 +1189,6 @@ def run_pretraining(
                 gen_first_nonfinite_micro_step: int | None = None
                 for step_idx, (batch, gen_count, disc_count, has_gen_targets) in enumerate(window):
                     batch = _move_batch_to_device(batch, accelerator.device)
-                    doc_ids = batch.pop("doc_ids", None)
-                    if (
-                        doc_ids is not None
-                        and str(model_cfg.backbone_type).strip().lower() != "hf_deberta_v2"
-                    ):
-                        batch["attention_mask"] = _build_doc_block_mask(doc_ids)
-                    elif doc_ids is not None:
-                        batch["doc_ids"] = doc_ids
                     batch = _stabilize_compile_attention_mask(
                         batch=batch,
                         compile_enabled=compile_enabled,
@@ -1638,11 +1629,6 @@ def run_pretraining(
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch = _move_batch_to_device(batch, accelerator.device)
-                doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None and str(model_cfg.backbone_type).strip().lower() != "hf_deberta_v2":
-                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
-                elif doc_ids is not None:
-                    batch["doc_ids"] = doc_ids
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,

@@ -23,7 +23,6 @@ from deberta.config import load_config  # noqa: E402
 from deberta.modeling import DebertaV3RTDPretrainer  # noqa: E402
 from deberta.modeling.rtd import attention_mask_to_active_tokens  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
-    _build_doc_block_mask,
     _stabilize_compile_attention_mask,
     prepare_flash_attention_batch_metadata,
 )
@@ -106,12 +105,7 @@ def _prepare_batch(
     flash_enabled: bool,
 ) -> tuple[dict[str, Any], Any | None]:
     batch = _move_batch_to_device(_tensor_batch_clone(batch_cpu), device)
-    doc_ids = batch.pop("doc_ids", None)
     backbone_type = str(cfg.model.backbone_type)
-    if doc_ids is not None and str(backbone_type).strip().lower() != "hf_deberta_v2":
-        batch["attention_mask"] = _build_doc_block_mask(doc_ids)
-    elif doc_ids is not None:
-        batch["doc_ids"] = doc_ids
     batch = _stabilize_compile_attention_mask(
         batch=batch,
         compile_enabled=False,

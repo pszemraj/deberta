@@ -32,7 +32,6 @@ from torch.profiler import ProfilerActivity
 
 from deberta.modeling import DebertaV3RTDPretrainer  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
-    _build_doc_block_mask,
     _compile_backbones_for_scope,
     _dtype_for_mixed_precision,
     _maybe_cudagraph_mark_step_begin,
@@ -352,11 +351,6 @@ def _run_decoupled_window(
         for batch, gen_count, disc_count, has_gen_targets in window:
             with _TimedPhase("batch_to_device", phase_times_ms):
                 batch = _move_batch_to_device(batch, device)
-                doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None and str(backbone_type).strip().lower() != "hf_deberta_v2":
-                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
-                elif doc_ids is not None:
-                    batch["doc_ids"] = doc_ids
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
@@ -547,11 +541,6 @@ def _run_coupled_window(
         for batch, gen_count, disc_count in window:
             with _TimedPhase("batch_to_device", phase_times_ms):
                 batch = _move_batch_to_device(batch, device)
-                doc_ids = batch.pop("doc_ids", None)
-                if doc_ids is not None and str(backbone_type).strip().lower() != "hf_deberta_v2":
-                    batch["attention_mask"] = _build_doc_block_mask(doc_ids)
-                elif doc_ids is not None:
-                    batch["doc_ids"] = doc_ids
                 batch = _stabilize_compile_attention_mask(
                     batch=batch,
                     compile_enabled=compile_enabled,
