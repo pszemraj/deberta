@@ -18,7 +18,7 @@ For `hf_deberta_v2`, scratch runs synthesize backbone configs in-repo from `mode
 
 `model.hf.model_size` supports `xsmall`, `small`, `base`, `large`.
 
-Generator defaults are derived from discriminator width/heads/ffn and half depth on `hf_deberta_v2`.
+Generator defaults are derived from discriminator width/heads/ffn and half depth on `hf_deberta_v2` (`rope` derives one-third depth).
 
 ## RTD architecture notes
 
@@ -31,7 +31,8 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 Intentional repo defaults:
 
 - dropout defaults are `0.0` (`model.dropout.hidden_prob`, `model.dropout.attention_probs_prob`)
-- RTD parity++ default `train.objective.disc_loss_weight` is `10.0`
+- `train.objective.disc_loss_weight` has an effective default of `10.0` for `hf_deberta_v2` when
+  left unset (the raw dataclass default is `50.0`)
 - default `optim.adam.beta2` is `0.999`
 
 Use explicit config values when you want different behavior.
@@ -42,28 +43,11 @@ Use explicit config values when you want different behavior.
 - TODO (strict parity follow-up): evaluate narrowing discriminator embedding sharing to only word+position embeddings; current sharing also includes `token_type_embeddings`.
 - TODO (architecture follow-up): evaluate defaulting `generator_intermediate_size` from `generator_hidden_size` when only width is overridden; current behavior inherits discriminator FFN width unless explicitly set.
 
-## FlashDeBERTa follow-ups
+## FlashDeBERTa
 
-- Dense packed `1024` now uses a repo-local local-bias flash path for the common small-batch training regime. Instead of retuning the original fixed disentangled backward kernel directly, the adapter materializes dense DeBERTa relative bias and dispatches through FlashDeBERTa's flash-with-bias kernels when that route is faster on current GPUs.
-- Padded varlen now uses dedicated repo-local prefix-pack Triton kernels, including shared pair/triple pack and unpack paths, and the padded backward path now builds packed `grad_out` plus `delta` in one fused step instead of a standalone prefix-pack followed by a separate preprocess kernel.
-- Unpacked `1024` now defaults masked batches to the fixed flash path with per-example `seq_lengths`. Sequential microbench and RTD benchmarking showed that route beats the varlen backward kernels at `1024`, while the varlen path regains the advantage at `2048+`.
-- Longer padded runs now load measured split backward heuristics from `src/deberta/modeling/flashdeberta_kernel_tuning.json` instead of one shared upstream config. On the current `sm_120` machine bucket, the table records `2048` as `KV=(64,32,2,4)` with `Q=(32,64,2,4)`, and `4096+` as `KV=(32,64,2,4)` with the upstream-style `Q=(64,64,3,8)`.
-- With those tuned buckets, unpacked FlashDeBERTa now beats eager end to end on the repo's `2048` and `4096` HF DeBERTa RTD configs, not just in the synthetic microbench.
-- Current profiling result for the tuned longer padded runs: the dominant remaining CUDA cost is still the varlen backward kernels themselves, especially `_bwd_kv_dise_kernel_varlen`, with the repo-local prefix pack/unpack kernels reduced to secondary overhead.
-- Packed doc-block batches are now supported for `hf_deberta_v2` with a JSON-table route policy. The measured table default uses dense flash-with-bias `docblock_bias` at the shipped packed `1024`/`2048`/`4096` lengths because the direct positional-gradient backward is parity-covered and faster than ragged `docblock` on the local `sm_120` GPU. Set `model.hf.flash.docblock_bias_seq_len=0` to force the segment-aware ragged route for ablations or hardware retuning. The collator stores compact `doc_ids`; compile metadata expands them either into fixed-shape segment descriptors for the ragged route or into a dense pairwise keep mask for `docblock_bias`.
-- The dense flash-with-bias wrapper now has its own repo-local tuning seam. `src/deberta/modeling/flashdeberta_bias_op.py` checks the shared JSON tuning table before upstream FlashDeBERTa config selection. The wrapper now launches the raw bias backward `KV` and `Q` Triton kernels directly, so those two backward surfaces can be tuned independently without forking the whole flash-with-bias wrapper. `tools/flashdeberta_bias_tune.py` samples real packed doc-block batches from the repo dataloader so those overrides can be promoted from measured RTD evidence rather than synthetic shapes.
-- The packed-docblock dense-bias path has repo-local backward specializations on top of that tuning seam. For non-causal bf16/fp16 `D=64` runs with a full dense `(B,H,S,S)` additive bias tensor at the measured packed lengths, matching `bias_docblock_specialized` entries in `src/deberta/modeling/flashdeberta_kernel_tuning.json` let `src/deberta/modeling/flashdeberta_bias_op.py` dispatch dedicated `_bwd_kv_kernel_docblock1024` and `_bwd_q_kernel_docblock1024` Triton kernels instead of the generic FlashDeBERTa local-bias backward launcher. Despite the historical kernel names, the table gates measured `1024`, `2048`, and `4096` square shapes. Outside that table policy, the wrapper still falls back to the generic raw bias backward kernels and their normal tuning path.
-- The position-bias attention backward can accumulate positional-score gradients directly inside the specialized KV/Q Triton tiles. This removes the old dense `d_bias -> scatter_add_` PyTorch reduction hotspot while keeping accumulation in fp32.
-- Two dense-route caveats are accepted trade-offs, not bugs. First, the specialized backward accumulates `dpos_key`/`dpos_query` with `tl.atomic_add`, so flash-route gradients are not bitwise reproducible: same-seed flash runs diverge at bf16 noise scale (measured final-loss spread about `1.7%` relative over 1000 RTD steps at packed `1024`, with same-seed eager-vs-flash deltas inside that spread), and resume/drift tooling must not assert bit-exact replay through flash attention. Second, the flash-with-bias op saves the dense `(B,H,S,S)` bias for backward, trading memory for recompute; end-to-end peak memory still measures well below eager at the shipped packed configs, but a recompute-in-backward knob becomes a prerequisite before any config longer than `4096` or with a larger batch-times-length product.
-- The fused dense-bias builder itself now uses the shared tuning table too. `src/deberta/modeling/flashdeberta_dense_bias_op.py` resolves the repo-local `(B,H,S,S)` bias assembly kernel from that table, so tuning the builder no longer needs to perturb the downstream flash-with-bias attention kernels. Its backward rule now saves per-row bucket ranges and reduces dense bias gradients with contiguous segment reductions, which removed the old scatter-heavy backward hotspot from the packed-docblock `1024` profile. On the current measured `sm_120` packed-docblock `1024` hot path, the promoted builder tile is recorded as `BLOCK_M=64`, `BLOCK_N=128`, `stages=2`, `warps=4`.
-- `tools/flashdeberta_varlen_tune.py` is the supported path for refreshing these heuristics on another GPU or after larger kernel changes. It samples the real unpacked loader and persists route/kernel summaries under `local-scratch/benchmarks/flashdeberta/...`; promote durable results into a JSON table passed by `model.hf.flash.kernel_overrides_path`.
-- TODO (flash optimization follow-up): benchmark and, only if warranted, add the upstream small-batch local-bias path for `512 < seq_len < 1024` with very small training batches.
-- TODO (F9 route tuning follow-up): extend the measured JSON policy artifact with more hardware buckets and route cases before deleting less-used specialized kernel branches.
-- TODO (F12 residual dense-bias kernel follow-up): replace the remaining transient dense bias / `d_bias` allocations with tile-local position-bias kernels once the upstream FlashDeBERTa kernel signatures are owned locally.
-- TODO (F13 recompute follow-up): evaluate recomputing position/bucket tensors in backward versus saving them, especially for longer contexts where saved tensors pressure memory.
-- TODO (F14 deterministic kernel follow-up): add a bucket-LUT path and deterministic position-gradient Triton kernels before treating the dense-bias builder as kernel-owned infrastructure.
-- TODO (docblock segment-route performance): continue reducing the segment-aware `docblock` route's varlen backward overhead. It remains the correctness-preserving ragged ablation path and can be forced with `model.hf.flash.docblock_bias_seq_len=0`, but current local evidence shows generic varlen backward still trails the dense route at the shipped packed lengths.
-- TODO (flash dependency ownership): vendor or replace the upstream FlashDeBERTa kernels if this integration becomes a long-lived training dependency; the current branch pins `flashdeberta==0.0.7`.
+The native backbone can run disentangled attention through Triton FlashDeBERTa kernels
+(`model.hf.attention_impl=flash`), including packed doc-block routing. Routes, kernel tuning,
+tooling, caveats, and open follow-ups: [Advanced / FlashDeBERTa attention](flash-attention.md).
 
 ## RoPE-specific controls
 

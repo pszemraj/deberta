@@ -28,18 +28,28 @@ Outputs:
 
 ## Cross-document attention blocking
 
-`data.packing.block_cross_document_attention` controls pairwise document masking for packed samples.
+`data.packing.block_cross_document_attention` controls attention masking across packed document
+boundaries. It is only valid with `data.packing.enabled=true`.
 
-- `false`: no 3D pairwise mask path
-- `true`: collator emits `doc_ids (B,S)` and training materializes a `(B,S,S)` keep-mask
+- `false`: packed samples attend across document boundaries; no document mask is built
+- `true`: the collator emits compact `doc_ids (B,S)` alongside the batch
 
-This mode is only valid with `data.packing.enabled=true`.
+What consumes `doc_ids` depends on the attention path:
+
+- eager attention (both backbones) and the dense flash `docblock_bias` route materialize a
+  boolean `(B,S,S)` pairwise keep-mask
+- the flash ragged `docblock` route keeps the 2D `(B,S)` keep-mask and expands `doc_ids` into
+  fixed-shape segment descriptors instead of a dense mask
+
+Flash route selection for packed doc-block batches is described in
+[Advanced / FlashDeBERTa attention](../advanced/flash-attention.md).
 
 ## Collator masking behavior
 
 `DebertaV3ElectraCollator` applies dynamic MLM masking:
 
-- `train.objective.mlm_max_ngram=1`: token-level masking (parity path)
+- `train.objective.mlm_max_ngram=1`: windowed unigram masking (DeBERTa's windowed selection, the
+  parity path - not BERT-style iid masking)
 - `train.objective.mlm_max_ngram>1`: whole-word n-gram masking
 
 Mask replacement controls:
