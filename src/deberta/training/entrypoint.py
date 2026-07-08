@@ -40,7 +40,7 @@ from deberta.training.compile import (
     _maybe_enable_tf32,
     _prefill_rotary_caches_for_compile,
     _resolve_compile_enabled_or_raise,
-    _resolve_compile_scope,
+    _resolve_effective_compile_scope,
     _stabilize_compile_attention_mask,
     prepare_flash_attention_batch_metadata,
 )
@@ -196,15 +196,12 @@ def run_pretraining_dry_run(
         bf16_sanity_check=_bf16_runtime_sanity_check,
     )
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
-    compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
-    compile_scope = compile_scope_requested
-    compile_scope_reason: str | None = None
-    if compile_enabled:
-        compile_scope, compile_scope_reason = _resolve_compile_scope(
-            requested_scope=compile_scope_requested,
-            model_cfg=model_cfg,
-            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
-        )
+    _, compile_scope, compile_scope_reason = _resolve_effective_compile_scope(
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        compile_enabled=compile_enabled,
+    )
 
     _persist_or_validate_run_configs(
         output_dir=checkpoint_output_dir,
@@ -378,16 +375,13 @@ def run_pretraining(
         optim_cfg=resolved_optim_cfg,
         logging_cfg=resolved_logging_cfg,
     )
-    compile_scope_requested = str(train_cfg.torch_compile_scope).strip().lower()
     compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
-    compile_scope = compile_scope_requested
-    compile_scope_reason: str | None = None
-    if compile_enabled:
-        compile_scope, compile_scope_reason = _resolve_compile_scope(
-            requested_scope=compile_scope_requested,
-            model_cfg=model_cfg,
-            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
-        )
+    compile_scope_requested, compile_scope, compile_scope_reason = _resolve_effective_compile_scope(
+        train_cfg=train_cfg,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        compile_enabled=compile_enabled,
+    )
     _maybe_enable_tf32(train_cfg.tf32)
     _maybe_configure_sdpa_kernels(str(train_cfg.sdpa_kernel), is_main=accelerator.is_main_process)
 
@@ -680,6 +674,75 @@ def run_pretraining(
             max_tracker_step_logged = int(effective_step)
         accelerator.log(row, step=effective_step)
         return int(effective_step)
+
+    def _save_checkpoint_if_due(
+        *,
+        global_step: int,
+        consumed_micro_batches_committed: int,
+        lr_mult: float,
+        last_saved_step: int,
+    ) -> int:
+        """Save a periodic checkpoint when due, stamping run-invariant kwargs.
+
+        :param int global_step: Committed global step.
+        :param int consumed_micro_batches_committed: Committed micro-batch count.
+        :param float lr_mult: Current LR multiplier.
+        :param int last_saved_step: Step of the last saved checkpoint.
+        :return int: Updated last-saved step.
+        """
+        return _save_periodic_checkpoint_if_due(
+            accelerator=accelerator,
+            train_cfg=train_cfg,
+            output_dir=output_dir,
+            global_step=int(global_step),
+            consumed_micro_batches_committed=int(consumed_micro_batches_committed),
+            lr_mult=float(lr_mult),
+            optimizer_param_digest=param_digest,
+            gradient_accumulation_steps=int(ga_steps),
+            last_saved_step=int(last_saved_step),
+        )
+
+    def _write_nonfinite_artifact(
+        *,
+        micro_step_idx: int,
+        offending: str,
+        gen_loss_raw: torch.Tensor | None,
+        disc_loss_raw: torch.Tensor | None,
+        forward_loss: torch.Tensor | None,
+        backward_loss: torch.Tensor | None,
+        grad_norm: float | None,
+        lr: float | None,
+    ) -> Path:
+        """Write a non-finite debug artifact, stamping run-invariant fields.
+
+        The step is stamped as ``global_step + 1``: every skip path reports the
+        in-flight step being attempted, not the last committed one.
+
+        :param int micro_step_idx: Micro-step index within the window.
+        :param str offending: Name of the first offending tensor/stat.
+        :param torch.Tensor | None gen_loss_raw: Generator raw loss.
+        :param torch.Tensor | None disc_loss_raw: Discriminator raw loss.
+        :param torch.Tensor | None forward_loss: Forward scalar objective.
+        :param torch.Tensor | None backward_loss: Backward scalar objective.
+        :param float | None grad_norm: Global gradient norm.
+        :param float | None lr: Scheduler LR snapshot.
+        :return Path: Written artifact path.
+        """
+        return _write_nonfinite_debug_artifact(
+            output_dir=logging_output_dir,
+            step=int(global_step + 1),
+            micro_step_idx=int(micro_step_idx),
+            offending=str(offending),
+            gen_loss_raw=gen_loss_raw,
+            disc_loss_raw=disc_loss_raw,
+            forward_loss=forward_loss,
+            backward_loss=backward_loss,
+            grad_norm=grad_norm,
+            lr=lr,
+            compile_enabled=compile_enabled,
+            compile_mode=compile_mode,
+            embedding_sharing=str(model_cfg.embedding_sharing),
+        )
 
     try:
         # Trackers
@@ -1213,9 +1276,7 @@ def run_pretraining(
                             nonfinite_skip_streak += 1
                             nonfinite_reason = str(offending_effective)
                             lr_now = _scheduler_current_lr(gen_lr_scheduler)
-                            nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=logging_output_dir,
-                                step=int(global_step + 1),
+                            nonfinite_debug_path = _write_nonfinite_artifact(
                                 micro_step_idx=int(offending_micro_step),
                                 offending=str(offending_effective),
                                 gen_loss_raw=gen_phase_out.gen_loss_raw,
@@ -1224,9 +1285,6 @@ def run_pretraining(
                                 backward_loss=backward_loss,
                                 grad_norm=None,
                                 lr=lr_now,
-                                compile_enabled=compile_enabled,
-                                compile_mode=compile_mode,
-                                embedding_sharing=str(model_cfg.embedding_sharing),
                             )
                             gen_optimizer.zero_grad(set_to_none=True)
                             disc_optimizer.zero_grad(set_to_none=True)
@@ -1385,9 +1443,7 @@ def run_pretraining(
                                 nonfinite_skip_streak += 1
                                 nonfinite_reason = str(offending_effective)
                                 lr_now = _scheduler_current_lr(disc_lr_scheduler)
-                                nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                    output_dir=logging_output_dir,
-                                    step=int(global_step + 1),
+                                nonfinite_debug_path = _write_nonfinite_artifact(
                                     micro_step_idx=int(offending_micro_step),
                                     offending=str(offending_effective),
                                     gen_loss_raw=gen_phase_out.gen_loss_raw
@@ -1398,9 +1454,6 @@ def run_pretraining(
                                     backward_loss=backward_loss,
                                     grad_norm=None,
                                     lr=lr_now,
-                                    compile_enabled=compile_enabled,
-                                    compile_mode=compile_mode,
-                                    embedding_sharing=str(model_cfg.embedding_sharing),
                                 )
                                 gen_optimizer.zero_grad(set_to_none=True)
                                 disc_optimizer.zero_grad(set_to_none=True)
@@ -1491,16 +1544,11 @@ def run_pretraining(
                         consumed_micro_batches_committed = int(consumed_micro_batches)
                         if train_progress is not None:
                             train_progress.update(1)
-                        last_saved_step = _save_periodic_checkpoint_if_due(
-                            accelerator=accelerator,
-                            train_cfg=train_cfg,
-                            output_dir=output_dir,
-                            global_step=int(global_step),
-                            consumed_micro_batches_committed=int(consumed_micro_batches_committed),
-                            lr_mult=float(lr_mult),
-                            optimizer_param_digest=param_digest,
-                            gradient_accumulation_steps=int(ga_steps),
-                            last_saved_step=int(last_saved_step),
+                        last_saved_step = _save_checkpoint_if_due(
+                            global_step=global_step,
+                            consumed_micro_batches_committed=consumed_micro_batches_committed,
+                            lr_mult=lr_mult,
+                            last_saved_step=last_saved_step,
                         )
                         continue
                     raise RuntimeError(
@@ -1526,16 +1574,11 @@ def run_pretraining(
                     disc_positive_count_window=disc_positive_count_window,
                 )
 
-                last_saved_step = _save_periodic_checkpoint_if_due(
-                    accelerator=accelerator,
-                    train_cfg=train_cfg,
-                    output_dir=output_dir,
-                    global_step=int(global_step),
-                    consumed_micro_batches_committed=int(consumed_micro_batches_committed),
-                    lr_mult=float(lr_mult),
-                    optimizer_param_digest=param_digest,
-                    gradient_accumulation_steps=int(ga_steps),
-                    last_saved_step=int(last_saved_step),
+                last_saved_step = _save_checkpoint_if_due(
+                    global_step=global_step,
+                    consumed_micro_batches_committed=consumed_micro_batches_committed,
+                    lr_mult=lr_mult,
+                    last_saved_step=last_saved_step,
                 )
 
         while global_step < int(train_cfg.max_steps):
@@ -1689,9 +1732,7 @@ def run_pretraining(
                         nonfinite_skip_streak += 1
                         nonfinite_reason = str(offending_effective)
                         lr_now = _scheduler_current_lr(lr_scheduler)
-                        nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=logging_output_dir,
-                            step=int(global_step + 1),
+                        nonfinite_debug_path = _write_nonfinite_artifact(
                             micro_step_idx=int(offending_micro_step),
                             offending=str(offending_effective),
                             gen_loss_raw=out.gen_loss_raw,
@@ -1700,9 +1741,6 @@ def run_pretraining(
                             backward_loss=backward_loss,
                             grad_norm=None,
                             lr=lr_now,
-                            compile_enabled=compile_enabled,
-                            compile_mode=compile_mode,
-                            embedding_sharing=str(model_cfg.embedding_sharing),
                         )
                         logger.warning(
                             "Skipping accumulation window due non-finite %s "
@@ -1741,9 +1779,7 @@ def run_pretraining(
                         nonfinite_skip_streak += 1
                         nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
                         lr_now = _scheduler_current_lr(lr_scheduler)
-                        nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                            output_dir=logging_output_dir,
-                            step=int(global_step + 1),
+                        nonfinite_debug_path = _write_nonfinite_artifact(
                             micro_step_idx=int(step_idx),
                             offending=str(nonfinite_reason),
                             gen_loss_raw=out.gen_loss_raw if out is not None else None,
@@ -1752,9 +1788,6 @@ def run_pretraining(
                             backward_loss=None,
                             grad_norm=float(grad_norm_for_check),
                             lr=lr_now,
-                            compile_enabled=compile_enabled,
-                            compile_mode=compile_mode,
-                            embedding_sharing=str(model_cfg.embedding_sharing),
                         )
                         logger.warning(
                             "Skipping optimizer step due non-finite gradient norm "
@@ -1782,9 +1815,7 @@ def run_pretraining(
                             nonfinite_skip_streak += 1
                             nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
                             lr_now = _scheduler_current_lr(lr_scheduler)
-                            nonfinite_debug_path = _write_nonfinite_debug_artifact(
-                                output_dir=logging_output_dir,
-                                step=int(global_step + 1),
+                            nonfinite_debug_path = _write_nonfinite_artifact(
                                 micro_step_idx=int(step_idx),
                                 offending=str(nonfinite_reason),
                                 gen_loss_raw=out.gen_loss_raw if out is not None else None,
@@ -1793,9 +1824,6 @@ def run_pretraining(
                                 backward_loss=None,
                                 grad_norm=float(post_clip_grad_norm),
                                 lr=lr_now,
-                                compile_enabled=compile_enabled,
-                                compile_mode=compile_mode,
-                                embedding_sharing=str(model_cfg.embedding_sharing),
                             )
                             logger.warning(
                                 "Skipping optimizer step due non-finite post-clip gradient norm "
@@ -1864,16 +1892,11 @@ def run_pretraining(
                             str(nonfinite_debug_path) if nonfinite_debug_path is not None else "n/a",
                         )
 
-                    last_saved_step = _save_periodic_checkpoint_if_due(
-                        accelerator=accelerator,
-                        train_cfg=train_cfg,
-                        output_dir=output_dir,
-                        global_step=int(global_step),
-                        consumed_micro_batches_committed=int(consumed_micro_batches_committed),
-                        lr_mult=float(lr_mult),
-                        optimizer_param_digest=param_digest,
-                        gradient_accumulation_steps=int(ga_steps),
-                        last_saved_step=int(last_saved_step),
+                    last_saved_step = _save_checkpoint_if_due(
+                        global_step=global_step,
+                        consumed_micro_batches_committed=consumed_micro_batches_committed,
+                        lr_mult=lr_mult,
+                        last_saved_step=last_saved_step,
                     )
                     continue
                 raise RuntimeError("Accumulation window produced no synchronized optimization step.")
@@ -1905,16 +1928,11 @@ def run_pretraining(
                     ),
                 )
 
-                last_saved_step = _save_periodic_checkpoint_if_due(
-                    accelerator=accelerator,
-                    train_cfg=train_cfg,
-                    output_dir=output_dir,
-                    global_step=int(global_step),
-                    consumed_micro_batches_committed=int(consumed_micro_batches_committed),
-                    lr_mult=float(lr_mult),
-                    optimizer_param_digest=param_digest,
-                    gradient_accumulation_steps=int(ga_steps),
-                    last_saved_step=int(last_saved_step),
+                last_saved_step = _save_checkpoint_if_due(
+                    global_step=global_step,
+                    consumed_micro_batches_committed=consumed_micro_batches_committed,
+                    lr_mult=lr_mult,
+                    last_saved_step=last_saved_step,
                 )
 
     except KeyboardInterrupt as exc:

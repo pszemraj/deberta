@@ -602,6 +602,33 @@ def _resolve_compile_scope(
     return "backbones", None
 
 
+def _resolve_effective_compile_scope(
+    *,
+    train_cfg: Any,
+    model_cfg: ModelConfig,
+    data_cfg: Any,
+    compile_enabled: bool,
+) -> tuple[str, str, str | None]:
+    """Resolve requested and effective compile scope for one training run.
+
+    :param Any train_cfg: Train config carrying ``torch_compile_scope``.
+    :param ModelConfig model_cfg: Model configuration.
+    :param Any data_cfg: Data config carrying ``block_cross_document_attention``.
+    :param bool compile_enabled: Whether torch.compile is enabled.
+    :return tuple[str, str, str | None]: Requested scope, effective scope, and
+        optional downgrade reason (effective == requested when compile is off).
+    """
+    requested_scope = str(train_cfg.torch_compile_scope).strip().lower()
+    if not compile_enabled:
+        return requested_scope, requested_scope, None
+    scope, reason = _resolve_compile_scope(
+        requested_scope=requested_scope,
+        model_cfg=model_cfg,
+        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+    )
+    return requested_scope, scope, reason
+
+
 def _compile_backbones_for_scope(
     *,
     unwrapped_model: torch.nn.Module,
