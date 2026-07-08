@@ -178,6 +178,37 @@ def _reload_flash_modules() -> tuple[types.ModuleType, types.ModuleType]:
     return importlib.reload(attention_mod), importlib.reload(patch_mod)
 
 
+def _restore_saved_flash_modules(
+    saved: dict[str, types.ModuleType], affected_prefixes: tuple[str, ...]
+) -> None:
+    """Restore a snapshotted flash module tree in sys.modules and parent packages.
+
+    Re-importing the flash tree rebinds each parent-package attribute (e.g.
+    ``deberta.modeling.flashdeberta_bias_op``) to the fresh twin. Restoring
+    sys.modules alone leaves ``from X.Y import name`` (parent-attribute lookup)
+    and ``import X.Y`` (sys.modules lookup) resolving to different module
+    objects in later tests, so configure-style module globals silently diverge.
+
+    :param dict[str, types.ModuleType] saved: Snapshot taken before the swap.
+    :param tuple[str, ...] affected_prefixes: Module-name prefixes that were swapped.
+    """
+
+    for name in [n for n in sys.modules if n.startswith(affected_prefixes)]:
+        fresh = sys.modules.pop(name)
+        if name not in saved:
+            parent_name, _, child = name.rpartition(".")
+            parent = sys.modules.get(parent_name) if parent_name else None
+            if parent is not None and getattr(parent, child, None) is fresh:
+                delattr(parent, child)
+    sys.modules.update(saved)
+    for name, mod in saved.items():
+        parent_name, _, child = name.rpartition(".")
+        if parent_name:
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, child, mod)
+
+
 def test_flashdeberta_version_guard_accepts_pinned_version(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
 
@@ -2031,9 +2062,7 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         assert isinstance(bias_mod.flashdeberta_compiled_position_bias_available(), bool)
         assert isinstance(dense_bias_mod.flashdeberta_compiled_dense_bias_available(), bool)
     finally:
-        for name in [n for n in sys.modules if n.startswith(affected_prefixes)]:
-            sys.modules.pop(name, None)
-        sys.modules.update(saved)
+        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded() -> None:
@@ -3054,9 +3083,7 @@ def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str
         )
         _run_docblock_real_kernel_leak_check(attention_mod=attention_mod, route=route)
     finally:
-        for name in [n for n in sys.modules if n.startswith(affected_prefixes)]:
-            sys.modules.pop(name, None)
-        sys.modules.update(saved)
+        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
@@ -3228,7 +3255,11 @@ def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
 
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    if varlen_mod._FLASHDEBERTA_VARLEN_BWD_CUSTOM_OP is None:
+    # Recover the op from the process-global torch.library registry instead of
+    # the module global: earlier fake-package tests can leave the canonical
+    # module imported without ops even though the registered op is live.
+    _, varlen_bwd_op = varlen_mod._build_varlen_custom_ops()
+    if varlen_bwd_op is None:
         pytest.skip("Compiled varlen custom op is unavailable in this environment.")
 
     with fake_tensor_mod.FakeTensorMode():
@@ -3242,7 +3273,7 @@ def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
         pos_key = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
         pos_query = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
 
-        _, _, _, dpos_key, dpos_query = varlen_mod._FLASHDEBERTA_VARLEN_BWD_CUSTOM_OP(
+        _, _, _, dpos_key, dpos_query = varlen_bwd_op(
             grad_out,
             q,
             k,
