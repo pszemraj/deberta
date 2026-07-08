@@ -25,6 +25,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
+    keep_mask_head_stride,
     lookup_registered_op,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -156,7 +157,7 @@ def _dense_bias_forward_fallback(
     :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
     :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the final additive bias.
     :raises RuntimeError: If both positional terms are missing.
     :return torch.Tensor: Scaled dense additive bias in ``(B,H,S,S)`` layout.
@@ -477,9 +478,12 @@ if triton is not None:
 
         acc *= scale
         if HAS_MASK:
+            # stride_mask_h is normalized at launch: 0 for broadcast (B,1,S,S)
+            # masks, the real head stride for per-head (B,H,S,S) masks.
             keep = tl.load(
                 keep_mask_ptr
                 + off_b * stride_mask_b
+                + off_h * stride_mask_h
                 + offs_m[:, None] * stride_mask_s
                 + offs_n[None, :] * stride_mask_n,
                 mask=valid,
@@ -510,7 +514,7 @@ def _dense_bias_forward_cuda(
     :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
     :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the final additive bias.
     :raises RuntimeError: If both positional terms are missing.
     :return torch.Tensor: Scaled dense additive bias in ``(B,H,S,S)`` layout.
@@ -566,7 +570,7 @@ def _dense_bias_forward_cuda(
             bucket_index.stride(0),
             bucket_index.stride(1),
             keep_mask_tensor.stride(0) if keep_mask is not None else 0,
-            keep_mask_tensor.stride(1) if keep_mask is not None else 0,
+            keep_mask_head_stride(keep_mask, num_heads=num_heads),
             keep_mask_tensor.stride(2) if keep_mask is not None else 0,
             keep_mask_tensor.stride(3) if keep_mask is not None else 0,
             output.stride(0),
@@ -762,7 +766,7 @@ def flashdeberta_dense_bias(
     :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
     :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the final additive bias.
     :return torch.Tensor: Scaled dense bias tensor in ``(B,H,S,S)`` layout.
     """

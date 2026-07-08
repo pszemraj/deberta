@@ -24,6 +24,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
+    keep_mask_head_stride,
     lookup_existing_op_pair,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -687,9 +688,12 @@ if triton is not None:
                 )
                 dpos_mask = bucket < P
                 if HAS_KEEP_MASK:
+                    # stride_mask_h is normalized at launch: 0 for broadcast
+                    # (B,1,S,S) masks, the real stride for per-head masks.
                     keep = tl.load(
                         KEEP_MASK
                         + off_z * stride_mask_b
+                        + off_h * stride_mask_h
                         + offs_m[:, None] * stride_mask_m
                         + offs_n[None, :] * stride_mask_n
                     )
@@ -884,9 +888,12 @@ if triton is not None:
                 )
                 dpos_mask = bucket < P
                 if HAS_KEEP_MASK:
+                    # stride_mask_h is normalized at launch: 0 for broadcast
+                    # (B,1,S,S) masks, the real stride for per-head masks.
                     keep = tl.load(
                         KEEP_MASK
                         + off_z * stride_mask_b
+                        + off_h * stride_mask_h
                         + offs_m[:, None] * stride_mask_m
                         + offs_n[None, :] * stride_mask_n
                     )
@@ -1071,6 +1078,13 @@ def _launch_docblock1024_backward(
     dpos_query_tensor = dpos_query_accum if dpos_query_accum is not None else empty_float
     bucket_tensor = bucket_index if bucket_index is not None else empty_int
     keep_mask_tensor = keep_mask if keep_mask is not None else empty_bool
+    raw_mask_strides = _strides_or_zeros(keep_mask, 4)
+    keep_mask_strides = (
+        raw_mask_strides[0],
+        keep_mask_head_stride(keep_mask, num_heads=int(num_heads)),
+        raw_mask_strides[2],
+        raw_mask_strides[3],
+    )
 
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
@@ -1125,7 +1139,7 @@ def _launch_docblock1024_backward(
             dv.stride(3),
             *_strides_or_zeros(dpos_key_accum, 4),
             *_strides_or_zeros(bucket_index, 2),
-            *_strides_or_zeros(keep_mask, 4),
+            *keep_mask_strides,
             int(num_heads),
             int(query_len),
             int(key_len),
@@ -1187,7 +1201,7 @@ def _launch_docblock1024_backward(
             dq.stride(3),
             *_strides_or_zeros(dpos_query_accum, 4),
             *_strides_or_zeros(bucket_index, 2),
-            *_strides_or_zeros(keep_mask, 4),
+            *keep_mask_strides,
             int(num_heads),
             int(query_len),
             int(key_len),
@@ -1816,7 +1830,7 @@ def _position_bias_forward_impl(
     :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
     :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the additive position bias.
     :return torch.Tensor: Dense additive bias in ``(B,H,S,S)`` layout.
     """
@@ -2552,7 +2566,7 @@ def flashdeberta_bias_from_positions(
     :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
     :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` layout.
+    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float bias_scale: Scale applied to the additive position bias.
     :param float sm_scale: Softmax scale applied to content scores.
     :param bool causal: Whether causal masking is enabled.

@@ -279,13 +279,14 @@ def _pairwise_mask_to_4d_keep_mask(
     query_len: int,
     key_len: int,
 ) -> torch.Tensor:
-    """Extract a canonical pairwise keep mask ``(B,1,Q,K)``.
+    """Extract a canonical pairwise keep mask ``(B,1,Q,K)`` or ``(B,H,Q,K)``.
 
     :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
     :param int query_len: Expected query length.
     :param int key_len: Expected key length.
     :raises ValueError: If the mask is not pairwise.
-    :return torch.Tensor: Boolean keep mask with shape ``(B, 1, Q, K)``.
+    :return torch.Tensor: Boolean keep mask with shape ``(B, 1, Q, K)``, or
+        ``(B, H, Q, K)`` when a per-head mask is supplied.
     """
 
     mask = normalize_keep_mask(attention_mask)

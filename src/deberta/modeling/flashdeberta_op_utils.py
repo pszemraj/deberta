@@ -129,6 +129,32 @@ def can_use_triton_pack(
     return all(meta.device == tensor.device for meta in metadata_tensors)
 
 
+def keep_mask_head_stride(keep_mask: torch.Tensor | None, *, num_heads: int) -> int:
+    """Return the Triton head stride for an optional rank-4 keep mask.
+
+    Broadcast masks ``(B,1,Q,K)`` must use stride 0 so every head reads the
+    shared plane (their ``stride(1)`` is nonzero even though the dim is size
+    1); per-head masks ``(B,H,Q,K)`` use their real head stride.
+
+    :param torch.Tensor | None keep_mask: Optional rank-4 keep mask.
+    :param int num_heads: Attention head count for the launch.
+    :raises ValueError: If the mask head dimension is neither 1 nor ``num_heads``.
+    :return int: Head stride to pass to Triton mask loads.
+    """
+
+    if keep_mask is None:
+        return 0
+    mask_heads = int(keep_mask.shape[1])
+    if mask_heads == 1:
+        return 0
+    if mask_heads == int(num_heads):
+        return int(keep_mask.stride(1))
+    raise ValueError(
+        f"keep_mask head dimension must be 1 or num_heads={int(num_heads)}; "
+        f"got shape={tuple(keep_mask.shape)}"
+    )
+
+
 @cache
 def _cuda_device_capability(index: int) -> tuple[int, int]:
     """Return the cached CUDA compute capability for one device index.

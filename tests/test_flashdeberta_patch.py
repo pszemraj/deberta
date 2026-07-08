@@ -3128,6 +3128,198 @@ def test_position_bias_attention_cuda_saves_dense_bias_aux_tensor() -> None:
     assert (batch_size, num_heads, seq_len, seq_len) in saved_shapes
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for dense-bias kernel checks.")
+def test_dense_bias_triton_builder_honors_per_head_keep_mask() -> None:
+    """The fused dense-bias builder must read each head's own keep-mask plane.
+
+    A per-head ``(B,H,S,S)`` mask exercised head 0's plane for every head
+    before the head stride was applied; the eager fallback (plain broadcast
+    ops) is the shape-agnostic reference. Head dims other than 1 or H must be
+    rejected instead of silently misread.
+    """
+
+    import deberta.modeling.flashdeberta_attention as attention_mod
+    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+    if dense_bias_mod.flashdeberta_dense_bias_import_error() is not None:
+        pytest.skip("Fused dense-bias builder is unavailable in this environment.")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, num_heads, seq_len, num_buckets = 2, 3, 32, 16
+    scale = 0.125
+    bucket_index = attention_mod._dense_bucket_index_tensor(
+        seq_len=seq_len,
+        position_buckets=num_buckets // 2,
+        max_relative_distance=seq_len,
+        device=device,
+    )
+    pos_key = torch.randn((batch_size, num_heads, seq_len, num_buckets), device=device, dtype=dtype)
+    pos_query = torch.randn((batch_size, num_heads, seq_len, num_buckets), device=device, dtype=dtype)
+    per_head_mask = torch.rand((batch_size, num_heads, seq_len, seq_len), device=device) > 0.4
+    # Make head planes provably different so a head-0 fallback cannot pass.
+    per_head_mask[:, 1] = ~per_head_mask[:, 0]
+
+    triton_bias = dense_bias_mod._dense_bias_forward_cuda(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=per_head_mask,
+        scale=scale,
+    )
+    eager_bias = dense_bias_mod._dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=per_head_mask,
+        scale=scale,
+    )
+    torch.testing.assert_close(triton_bias, eager_bias, atol=2e-2, rtol=2e-2)
+
+    with pytest.raises(ValueError, match="head dimension"):
+        dense_bias_mod._dense_bias_forward_cuda(
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=per_head_mask[:, :2],
+            scale=scale,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for specialized backward checks.")
+def test_specialized_docblock_backward_honors_per_head_keep_mask() -> None:
+    """Specialized docblock backward must read each head's own keep-mask plane.
+
+    The positional-gradient accumulation (dpos_key/dpos_query) gates its
+    atomic adds on the keep mask; with a per-head ``(B,H,S,S)`` mask, head h
+    must use plane h, not head 0's plane. The reference is the same impl run
+    one head at a time with ``(B,1,S,S)`` masks - a regime that never depended
+    on the mask head stride.
+
+    Other tests in this file reload the flash module tree against fake
+    flashdeberta packages, so this test re-imports a clean real-kernel tree
+    and restores the prior modules after.
+    """
+
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
+        sys.modules.pop(name, None)
+    try:
+        attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
+        bias_mod = importlib.import_module("deberta.modeling.flashdeberta_bias_op")
+        dense_bias_mod = importlib.import_module("deberta.modeling.flashdeberta_dense_bias_op")
+        if bias_mod.triton is None or bias_mod._bwd_kv_kernel_docblock1024 is None:
+            pytest.skip("Specialized docblock backward kernels are unavailable.")
+        _run_specialized_docblock_backward_per_head_check(
+            attention_mod=attention_mod,
+            bias_mod=bias_mod,
+            dense_bias_mod=dense_bias_mod,
+        )
+    finally:
+        _restore_saved_flash_modules(saved, affected_prefixes)
+
+
+def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod, dense_bias_mod) -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, num_heads, seq_len, head_dim, num_buckets = 1, 2, 512, 64, 32
+    sm_scale = float(head_dim) ** -0.5
+    bias_scale = sm_scale
+
+    configs = bias_mod._resolve_docblock1024_bwd_configs(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=seq_len,
+        key_len=seq_len,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    assert configs is not None, "specialized kernels must be launchable for this shape"
+
+    bucket_index = attention_mod._dense_bucket_index_tensor(
+        seq_len=seq_len,
+        position_buckets=num_buckets // 2,
+        max_relative_distance=seq_len,
+        device=device,
+    )
+
+    def _doc_pairwise(boundary: int) -> torch.Tensor:
+        doc_ids = torch.cat(
+            (
+                torch.ones((1, boundary), dtype=torch.long, device=device),
+                torch.full((1, seq_len - boundary), 2, dtype=torch.long, device=device),
+            ),
+            dim=1,
+        )
+        return doc_ids[:, :, None].eq(doc_ids[:, None, :]).unsqueeze(1)
+
+    per_head_mask = torch.cat((_doc_pairwise(seq_len // 2), _doc_pairwise(seq_len // 4)), dim=1)
+    assert not torch.equal(per_head_mask[:, 0], per_head_mask[:, 1])
+
+    q = torch.randn((batch_size, num_heads, seq_len, head_dim), device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    pos_key = torch.randn((batch_size, num_heads, seq_len, num_buckets), device=device, dtype=dtype)
+    pos_query = torch.randn((batch_size, num_heads, seq_len, num_buckets), device=device, dtype=dtype)
+    bias = dense_bias_mod._dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=per_head_mask,
+        scale=bias_scale,
+    )
+    out, lse = bias_mod._bias_eager_forward_impl(
+        q=q, k=k, v=v, bias=bias, sm_scale=sm_scale, causal=False, require_lse=True
+    )
+    if lse is None:
+        pytest.skip("Low-level bias forward with LSE is unavailable.")
+    grad_out = torch.randn_like(out)
+
+    dq, dk, dv, dpos_key, dpos_query = bias_mod._position_bias_specialized_docblock_backward_impl(
+        grad_out=grad_out,
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        out=out,
+        lse=lse,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=per_head_mask,
+        bias_scale=bias_scale,
+        sm_scale=sm_scale,
+    )
+
+    for head in range(num_heads):
+        sl = slice(head, head + 1)
+        ref = bias_mod._position_bias_specialized_docblock_backward_impl(
+            grad_out=grad_out[:, sl].contiguous(),
+            q=q[:, sl].contiguous(),
+            k=k[:, sl].contiguous(),
+            v=v[:, sl].contiguous(),
+            bias=bias[:, sl].contiguous(),
+            out=out[:, sl].contiguous(),
+            lse=lse[:, sl].contiguous(),
+            pos_key=pos_key[:, sl].contiguous(),
+            pos_query=pos_query[:, sl].contiguous(),
+            bucket_index=bucket_index,
+            keep_mask=per_head_mask[:, sl].contiguous(),
+            bias_scale=bias_scale,
+            sm_scale=sm_scale,
+        )
+        dq_h, dk_h, dv_h, dpos_key_h, dpos_query_h = ref
+        torch.testing.assert_close(dq[:, sl], dq_h, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk[:, sl], dk_h, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dv[:, sl], dv_h, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dpos_key[:, sl], dpos_key_h, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dpos_query[:, sl], dpos_query_h, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for real-kernel leakage checks.")
 @pytest.mark.parametrize("route", ["docblock", "docblock_bias"])
 def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str) -> None:
