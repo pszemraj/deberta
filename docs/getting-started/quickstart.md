@@ -32,7 +32,7 @@ accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml -
 Optional FlashDeBERTa trial run:
 
 ```bash
-accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml \
+accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
   deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
   --model.hf.attention_impl flash
 ```

@@ -26,6 +26,7 @@ Optional extras:
 ```bash
 pip install -e '.[dev]'
 pip install -e '.[wandb]'
+pip install -e '.[tensorboard]'
 pip install -e '.[flash]'
 ```
 

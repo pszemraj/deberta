@@ -21,13 +21,17 @@ There is no flat/legacy mode and no extra top-level sections.
 
 1. parse YAML/JSON
 2. resolve variables (`$variables.*`, `{$variables.*}`, `${variables.*}`)
-3. build nested frozen dataclasses
+3. build nested frozen dataclasses, apply profile/backbone effective defaults, and run full
+   validation on the file itself
 4. apply preset defaults (`--preset`, if provided)
 5. apply direct dotted CLI flags (`--train.max_steps 2000`, `--optim.scheduler.warmup_steps 500`, ...)
-6. apply profile/backbone effective defaults (`apply_profile_defaults`)
-7. run validation (`validate_model_config`, `validate_data_config`, `validate_train_config`, `validate_optim_config`, `validate_logging_config`, workflow checks)
+6. re-apply profile/backbone effective defaults, sync legacy train aliases, and re-run validation
+   (`validate_model_config`, `validate_data_config`, `validate_train_config`,
+   `validate_optim_config`, `validate_logging_config`, workflow checks) on the merged result
 
-Invalid keys, bad types, and incompatible combinations raise immediately.
+Invalid keys, bad types, and incompatible combinations raise immediately. Because step 3 validates
+the file before any preset or CLI override is applied, the config file must be valid on its own; a
+broken base file cannot be repaired by CLI flags.
 
 ## Precedence
 
