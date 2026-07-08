@@ -76,7 +76,7 @@ model:
     # Guidance: Native eager DeBERTa attention implementation choice. Applies only to `hf_deberta_v2`; ignored for `rope`.
     attention_kernel: "dynamic"
     # Type: str. Default: "eager". Required: no. Valid values: `eager` | `flash`.
-    # Guidance: `eager` is the portability default. `flash` is valid only with `model.backbone_type=hf_deberta_v2`, requires dropout disabled, and uses the JSON route/kernel policy under `model.hf.flash.*`; validate throughput on new GPU types before treating measured table defaults as portable.
+    # Guidance: `eager` is the portability default. `flash` is valid only with `model.backbone_type=hf_deberta_v2`, requires dropout disabled, and uses the JSON route/kernel policy under `model.hf.flash.*`. Route/kernel defaults are capability-scoped (measured rows ship for `sm_120`); other GPUs run flash with conservative defaults - see `docs/advanced/gpu-support.md`.
     attention_impl: "eager"
     flash:
       # Type: bool. Default: false. Required: no.
@@ -86,13 +86,13 @@ model:
       # Guidance: Only used when `model.hf.attention_impl=flash`. Optional varlen threshold. `null` uses the JSON route table; if set, must be > 0.
       varlen_min_seq_len: null
       # Type: int | None. Default: null. Required: no.
-      # Guidance: Only used when `model.hf.attention_impl=flash`. Exact-length dense doc-block route override. `null` uses the JSON table, which selects dense `docblock_bias` for measured packed `1024`/`2048`/`4096` buckets and uses ragged `docblock` elsewhere. Set a positive exact sequence length to force dense only at that length; set `0` to force-disable dense doc-block routing and use ragged segment metadata.
+      # Guidance: Only used when `model.hf.attention_impl=flash`. Exact-length dense doc-block route override. `null` uses the JSON table, which selects dense `docblock_bias` for measured packed `1024`/`2048`/`4096` buckets on `sm_120` and ragged `docblock` elsewhere (other hardware and unlisted shapes). Set a positive exact sequence length to force dense only at that length on any GPU; set `0` to force-disable dense doc-block routing and use ragged segment metadata.
       docblock_bias_seq_len: null
       # Type: int | None. Default: null. Required: no.
-      # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route seq-len override for plain (non-packed) batches. `null` uses table policy; `0` disables the local-bias route; a positive value allows it only at that exact sequence length. Independent of `model.hf.flash.docblock_bias_seq_len`.
+      # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route seq-len override for plain (non-packed) batches. `null` uses table policy (shipped rows are `sm_120`-scoped, so the route stays off on other GPUs); `0` disables the local-bias route; a positive value allows it only at that exact sequence length. On hardware without table rows, set this together with `local_bias_max_batch_size`. Independent of `model.hf.flash.docblock_bias_seq_len`.
       local_bias_seq_len: null
       # Type: int | None. Default: null. Required: no.
-      # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route cap. `null` uses table policy; `0` disables. Dense routes can be memory-heavy and hardware-sensitive.
+      # Guidance: Only used when `model.hf.attention_impl=flash`. Dense local-bias route cap. `null` uses table policy; `0` disables. On hardware without table rows, set this together with `local_bias_seq_len` to opt in. Dense routes can be memory-heavy and hardware-sensitive.
       local_bias_max_batch_size: null
       # Type: int. Default: 0. Required: no.
       # Guidance: Only used when `model.hf.attention_impl=flash`. Debugging fallback threshold. Must be >= 0. Leave `0` unless explicitly comparing eager dense attention inside flash experiments.

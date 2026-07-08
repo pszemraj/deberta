@@ -839,3 +839,34 @@ every claim checked to file:line.
   files); no absolute self-repo URLs.
 - `rehuman` normalization was a no-op: hand-written docs are already pure
   ASCII.
+
+## 2026-07-07 - Hardware Portability Hardening (capability-scoped routing)
+
+The sm_120-only risk assessment concluded kernel tuning was self-gating but
+route policies shipped sm_120-derived defaults globally: non-sm_120 GPUs
+silently inherited dense `docblock_bias` (whose speed depends on
+sm_120-gated backward specializations, and which saves the dense
+`(B,H,S,S)` bias for backward) and the small-batch `local_bias` route.
+
+- Route-policy rows now accept `compute_capability` (exact `sm_XX` beats
+  wildcard `*`; later rows win within a tier). Shipped table: dense
+  doc-block and local-bias defaults scoped to `sm_120`; wildcard packed
+  doc-block default is ragged `docblock`; padded `fixed`/`varlen` split
+  stays hardware-agnostic. sm_120 behavior is bit-for-bit the same policy.
+- Route hints and the local-bias/varlen gates thread the batch device
+  capability. Verified Dynamo-safe via 2-step compiled (aot_eager) flash
+  smokes on the dense and packed-docblock configs.
+- Override-table merge fix: route-policy namespaces append per row instead
+  of replacing wholesale, so promoting one capability-scoped row for a new
+  GPU cannot silently delete the shipped policy (the old semantics were a
+  footgun for exactly that workflow).
+- One-time logger warning on the first flash batch on a GPU with no
+  measured rows, pointing at the new doc.
+- New `docs/advanced/gpu-support.md`: capability table (sm_120/100/90/89/
+  86/80), the no-eager-fallback-by-GPU guarantee, per-class expectations,
+  knob and override-table recipes for promoting dense routes off sm_120,
+  and why kernel tiles are capability-scoped. Config-reference guidance
+  regenerated; flash-attention.md updated to the capability-scoped story.
+- Validation: flash file 68 passed / 4 skipped with CUDA, full suite
+  557/4, audit_contracts 14 PASS, full parity matrix OK, compiled smokes
+  clean, doc links resolve (17 files).

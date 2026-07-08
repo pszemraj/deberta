@@ -15,8 +15,8 @@ Constraints:
 - valid only with `model.backbone_type=hf_deberta_v2`
 - dropout must be disabled (`model.dropout.hidden_prob` and `model.dropout.attention_probs_prob`
   set to `0.0` or null)
-- CUDA only; shipped route and kernel defaults are measured on a single GPU class (`sm_120`,
-  RTX 5090) - validate throughput on other hardware before trusting them
+- CUDA only. Measured route/kernel defaults ship for `sm_120` (RTX 5090); other GPUs run flash
+  with conservative capability-scoped defaults - see [GPU support](gpu-support.md)
 
 ## Route families
 
@@ -26,14 +26,16 @@ The adapter picks one of five routes per batch:
 |---|---|---|
 | `fixed` | dense (unpadded) batches, and padded `1024` with per-example `seq_lengths` | fixed-length disentangled flash kernels |
 | `varlen` | longer padded batches (`2048+` in the shipped table) | variable-length kernels over prefix-packed active tokens |
-| `local_bias` | plain dense `1024` batches at small batch size (`<= 4` in the shipped table) | materializes the dense relative bias and runs flash-with-bias kernels |
-| `docblock_bias` | packed doc-block batches at the measured `1024`/`2048`/`4096` lengths | dense flash-with-bias with the pairwise document keep-mask folded into the bias |
-| `docblock` | packed doc-block batches at unlisted shapes, or forced for ablations | segment-aware ragged route: repacks document spans and runs the varlen kernels per document |
+| `local_bias` | plain dense `1024` batches at small batch size (`<= 4`, `sm_120` only in the shipped table) | materializes the dense relative bias and runs flash-with-bias kernels |
+| `docblock_bias` | packed doc-block batches at the measured `1024`/`2048`/`4096` lengths on `sm_120` (or wherever a capability row/knob enables it) | dense flash-with-bias with the pairwise document keep-mask folded into the bias |
+| `docblock` | packed doc-block batches elsewhere: other hardware, unlisted shapes, or forced for ablations | segment-aware ragged route: repacks document spans and runs the varlen kernels per document |
 
 Route selection is config/table-only: it reads `route_policies` from the JSON tuning table, and
-the upstream FlashDeBERTa environment-variable route fallbacks are never consulted. Selection is
-also hardware-independent - compute capability gates kernel tile tuning within a route (see
-below), never which route is chosen.
+the upstream FlashDeBERTa environment-variable route fallbacks are never consulted. Policy rows
+may be scoped to one GPU class with a `compute_capability` key; an exact `sm_XX` row outranks the
+wildcard rows, and the shipped table scopes its aggressive defaults (`docblock_bias`,
+`local_bias`) to `sm_120` while the padded `fixed`/`varlen` split applies everywhere. See
+[GPU support](gpu-support.md) for the per-hardware picture.
 
 The padded fixed/varlen split at `2048` is deliberate: on the measured unpacked `1024` RTD regime
 the compile-clean fixed path beats the varlen backward kernels, while varlen pulls back ahead for
@@ -42,9 +44,11 @@ resolves a route itself (no hint), it also rechecks that the installed `flashdeb
 exposes the required varlen primitives.
 
 For packed doc-block batches, dense `docblock_bias` is the shipped default at the three measured
-lengths because its direct positional-gradient backward is parity-covered and faster than the
-ragged route on the benchmark GPU. Ragged `docblock` remains the correctness-preserving ablation
-path and the automatic choice for unlisted packed shapes.
+lengths on `sm_120` because its direct positional-gradient backward is parity-covered and faster
+than the ragged route on the benchmark GPU. Ragged `docblock` remains the correctness-preserving
+ablation path and the automatic choice for unlisted packed shapes and other hardware, where the
+dense route's speed edge (which depends on the `sm_120`-gated backward specializations) is
+unproven and its saved dense bias costs more memory.
 
 ## Routing overrides
 
@@ -55,7 +59,8 @@ All flash knobs live under `model.hf.flash.*`; per-key details are in
   route only at that exact sequence length; `0` forces the ragged `docblock` route. Only affects
   packed doc-block batches.
 - `local_bias_seq_len` / `local_bias_max_batch_size`: the same null/`0`/exact-length semantics
-  for the plain-batch dense local-bias route, independent of the doc-block knobs.
+  for the plain-batch dense local-bias route, independent of the doc-block knobs. On hardware
+  without a matching table row, set both to opt in.
 - `varlen_min_seq_len`: set to `1024` to force the older "all padded batches go varlen" policy
   for debugging or cross-machine comparison.
 - `kernel_overrides_path`: path to a JSON table consulted before the shipped one. Keep override
@@ -76,7 +81,8 @@ local-bias kernels; note the naming split versus the `local_bias` route-policy n
 `dense_bias` (the dense bias-assembly builder op), and `bias_docblock_specialized` (the dedicated
 dense doc-block backward, gated to non-causal bf16/fp16 `head_dim=64` full-bias shapes). On
 hardware without matching kernel entries, routes still apply and kernels fall back to upstream
-FlashDeBERTa config selection.
+FlashDeBERTa config selection; see [GPU support](gpu-support.md) for what that means per GPU
+class.
 
 Measured `sm_120` highlights: varlen backward runs `KV=(64,32,2,4)` / `Q=(32,64,2,4)` at
 `2048_medium`/`2048_sparse` and `KV=(32,64,2,4)` / `Q=(64,64,3,8)` at `4096_plus`; the dense-bias
@@ -91,7 +97,9 @@ builder tile is `64 x 128, stages=2, warps=4` at the packed doc-block lengths.
    - `tools/flashdeberta_bias_tune.py` does the same for the dense-bias kernels against sampled
      packed doc-block batches.
 2. Promote durable winners into a JSON table and select it with
-   `model.hf.flash.kernel_overrides_path`.
+   `model.hf.flash.kernel_overrides_path`. Scope rows to your GPU with a `compute_capability`
+   key; override rows append to the shipped table and exact-capability rows outrank wildcards,
+   so one row per bucket is enough.
 3. Once results hold up across runs, fold them into the shipped table.
 
 ## Benchmarking and profiling tools
