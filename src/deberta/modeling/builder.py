@@ -910,6 +910,35 @@ def build_backbone_configs(
     return disc_cfg, gen_cfg
 
 
+def _load_pretrained_backbone_or_raise(
+    model_cls: type,
+    source: str,
+    *,
+    config: Any,
+    component: str,
+    kind: str,
+    origin: str,
+) -> Any:
+    """Load one pretrained backbone, raising a descriptive error on failure.
+
+    :param type model_cls: Backbone model class exposing ``from_pretrained``.
+    :param str source: Resolved weight source (local path or model id).
+    :param Any config: Backbone config instance.
+    :param str component: Component name for error text (discriminator/generator).
+    :param str kind: Backbone kind for error text (HF backbone/RoPE checkpoint).
+    :param str origin: Human-readable weight-origin description.
+    :raises RuntimeError: If loading fails.
+    :return Any: Loaded backbone model.
+    """
+
+    try:
+        return model_cls.from_pretrained(source, config=config)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load {component} {kind} from source '{source}' (resolved from {origin})."
+        ) from e
+
+
 def build_backbones(
     *,
     model_cfg: ModelConfig,
@@ -942,22 +971,22 @@ def build_backbones(
         if disc_src is None or gen_src is None:
             raise RuntimeError("Resolved pretrained HF weight source is missing.")
 
-        try:
-            disc = DebertaV2Model.from_pretrained(disc_src, config=disc_config)
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load discriminator HF backbone from "
-                f"source '{disc_src}' (resolved from {resolved.discriminator.weight_origin})."
-            ) from e
-
-        try:
-            gen = DebertaV2Model.from_pretrained(gen_src, config=gen_config)
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load generator HF backbone from "
-                f"source '{gen_src}' (resolved from {resolved.generator.weight_origin})."
-            ) from e
-
+        disc = _load_pretrained_backbone_or_raise(
+            DebertaV2Model,
+            disc_src,
+            config=disc_config,
+            component="discriminator",
+            kind="HF backbone",
+            origin=resolved.discriminator.weight_origin,
+        )
+        gen = _load_pretrained_backbone_or_raise(
+            DebertaV2Model,
+            gen_src,
+            config=gen_config,
+            component="generator",
+            kind="HF backbone",
+            origin=resolved.generator.weight_origin,
+        )
         return disc, gen
 
     # RoPE backbone
@@ -971,20 +1000,20 @@ def build_backbones(
     if disc_src is None or gen_src is None:
         raise RuntimeError("Resolved pretrained RoPE weight source is missing.")
 
-    try:
-        disc = DebertaRoPEModel.from_pretrained(disc_src, config=disc_config)
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load discriminator RoPE checkpoint with model.from_scratch=false. "
-            f"Resolved source: '{disc_src}' ({resolved.discriminator.weight_origin})."
-        ) from e
-
-    try:
-        gen = DebertaRoPEModel.from_pretrained(gen_src, config=gen_config)
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load generator RoPE checkpoint with model.from_scratch=false. "
-            f"Resolved source: '{gen_src}' ({resolved.generator.weight_origin})."
-        ) from e
-
+    disc = _load_pretrained_backbone_or_raise(
+        DebertaRoPEModel,
+        disc_src,
+        config=disc_config,
+        component="discriminator",
+        kind="RoPE checkpoint",
+        origin=resolved.discriminator.weight_origin,
+    )
+    gen = _load_pretrained_backbone_or_raise(
+        DebertaRoPEModel,
+        gen_src,
+        config=gen_config,
+        component="generator",
+        kind="RoPE checkpoint",
+        origin=resolved.generator.weight_origin,
+    )
     return disc, gen
