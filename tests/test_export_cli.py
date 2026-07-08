@@ -531,6 +531,8 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
                     "model_type": "deberta-v2",
                     "hidden_size": 768,
                     "hf_attention_kernel": "stable",
+                    "hf_attention_impl": "flash",
+                    "hf_flash": {"force_varlen": True},
                     "use_rmsnorm_heads": False,
                     "legacy": True,
                     "cls_token_id": 1,
@@ -553,6 +555,8 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     config_path = out_dir / "config.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert "hf_attention_kernel" not in data
+    assert "hf_attention_impl" not in data
+    assert "hf_flash" not in data
     assert "use_rmsnorm_heads" not in data
     assert "cls_token_id" not in data
     assert data["model_type"] == "deberta-v2"

@@ -12,6 +12,8 @@ from deberta.utils.io import dump_json, load_json_mapping
 EXPORT_CONFIG_STRIP_KEYS = frozenset(
     {
         "hf_attention_kernel",
+        "hf_attention_impl",
+        "hf_flash",
         "use_rmsnorm_heads",
         "cls_token_id",
         "mask_token_id",
