@@ -81,7 +81,9 @@ from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     build_doc_block_mask,
     doc_ids_from_segments,
+    is_pairwise_mask,
     is_torch_compiling,
+    mask_to_2d_keep_mask,
     normalize_keep_mask,
 )
 
@@ -266,35 +268,8 @@ def _mask4d_to_seqlens(attention_mask: torch.Tensor, *, seq_len: int) -> torch.T
     :return torch.Tensor: Per-example sequence lengths with dtype ``int32``.
     """
 
-    key_mask = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+    key_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
     return key_mask.sum(dim=-1, dtype=torch.int32)
-
-
-def _mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
-    """Extract a canonical 2D key-padding mask ``(B,S)`` from a broadcast mask.
-
-    This function intentionally rejects pairwise masks because the varlen path in
-    this adapter is for standard padding masks only.
-
-    :param torch.Tensor attention_mask: Broadcast or 2D keep mask.
-    :param int seq_len: Expected sequence length.
-    :raises ValueError: If the mask is not 2D or broadcast 4D.
-    :return torch.Tensor: Boolean mask with shape ``(B, S)``.
-    """
-
-    mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 2:
-        key_mask = mask
-    elif mask.ndim == 4 and int(mask.shape[-2]) == 1:
-        key_mask = mask[:, 0, 0, :]
-    else:
-        raise ValueError(
-            "FlashDeBERTa padding masks must be shaped (B,S) or (B,1,1,S) for sequence-length extraction."
-        )
-
-    if int(key_mask.shape[-1]) != int(seq_len):
-        key_mask = key_mask[..., :seq_len]
-    return key_mask.to(dtype=torch.bool)
 
 
 def _pairwise_mask_to_4d_keep_mask(
@@ -325,23 +300,6 @@ def _pairwise_mask_to_4d_keep_mask(
             f"got mask={tuple(pairwise.shape)} expected=(*,{int(query_len)},{int(key_len)})."
         )
     return pairwise.to(dtype=torch.bool)
-
-
-def _is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
-    """Return whether a mask encodes per-query pairwise constraints.
-
-    :param torch.Tensor attention_mask: Candidate attention mask.
-    :param int query_len: Expected query length.
-    :param int key_len: Expected key length.
-    :return bool: True when the mask has per-query pairwise structure.
-    """
-
-    mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 3:
-        return tuple(mask.shape[-2:]) == (int(query_len), int(key_len))
-    if mask.ndim == 4:
-        return tuple(mask.shape[-2:]) == (int(query_len), int(key_len))
-    return False
 
 
 def _should_use_varlen(
@@ -544,7 +502,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             )
         if (
             attention_mask is not None
-            and _is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
+            and is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
             and normalized_route != "docblock_bias"
         ):
             return (
@@ -808,7 +766,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         if seq_lengths is not None:
             mask_2d = _seqlens_to_mask_2d(seq_lengths, seq_len=seq_len)
         else:
-            mask_2d = _mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+            mask_2d = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
         out = flashdeberta_varlen_padded(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -1092,7 +1050,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             )
 
         if use_docblock_bias:
-            if attention_mask is None or not _is_pairwise_mask(
+            if attention_mask is None or not is_pairwise_mask(
                 attention_mask,
                 query_len=query_len,
                 key_len=int(hidden_states.shape[-2]),
@@ -1355,9 +1313,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
 __all__ = [
     "FlashDisentangledSelfAttention",
-    "_is_pairwise_mask",
     "_mask4d_to_seqlens",
-    "_mask_to_2d_keep_mask",
     "flashdeberta_import_error",
     "flashdeberta_stats_snapshot",
     "refresh_flashdeberta_runtime_config_from_env",

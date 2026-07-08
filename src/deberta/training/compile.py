@@ -20,11 +20,11 @@ from deberta.modeling.mask_utils import (
     _flash_cfg_bool,
     _flash_cfg_get,
     _flash_cfg_optional_int,
-    _flash_is_pairwise_mask,
-    _flash_mask_to_2d_keep_mask,
     build_doc_block_mask,
     build_doc_segment_metadata,
     doc_segment_metadata_host_stats,
+    is_pairwise_mask,
+    mask_to_2d_keep_mask,
 )
 
 logger = logging.getLogger(__name__)
@@ -497,7 +497,7 @@ def prepare_flash_attention_batch_metadata(
     if attention_mask is None:
         _clear_flash_batch_metadata(batch)
         return batch, FlashBatchMeta(route_hint="dense") if bool(flash_enabled) else None
-    if _flash_is_pairwise_mask(attention_mask, seq_len=int(seq_len)):
+    if is_pairwise_mask(attention_mask, query_len=int(seq_len), key_len=int(seq_len)):
         _clear_flash_batch_metadata(batch)
         return batch, None
 
@@ -509,7 +509,7 @@ def prepare_flash_attention_batch_metadata(
         _clear_flash_batch_metadata(batch)
         return batch, None
 
-    keep_mask = _flash_mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+    keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
     seq_lengths = _flash_existing_seq_lengths(batch)
     if seq_lengths is None:
         seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)

@@ -15,7 +15,13 @@ import torch
 import torch.nn as nn
 
 from deberta.config import _normalize_hf_attention_kernel
-from deberta.modeling.mask_utils import FlashBatchMeta, is_torch_compiling, normalize_keep_mask
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    expand_keep_mask_to_4d,
+    is_torch_compiling,
+    normalize_keep_mask,
+    reduce_keep_mask_to_2d,
+)
 
 try:
     from transformers import DebertaV2Config, PreTrainedModel
@@ -869,32 +875,6 @@ class DebertaV2Embeddings(nn.Module):
             persistent=False,
         )
 
-    def _extract_token_mask(self, mask: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Extract a 2D token keep mask from attention-mask variants.
-
-        :param torch.Tensor mask: Mask in rank-2/3/4 layout.
-        :param int seq_len: Current sequence length.
-        :return torch.Tensor: Token keep mask with shape ``(B,S)``.
-        """
-
-        m = mask
-        if m.ndim == 4:
-            if m.shape[1] != 1:
-                m = m.any(dim=1)
-            else:
-                m = m[:, 0]
-        if m.ndim == 3:
-            if m.shape[-2] == 1:
-                # Broadcast padding mask path: (B,1,1,S) -> (B,1,S), keep full sequence axis.
-                m = m[:, 0, :]
-            else:
-                m = torch.diagonal(m, dim1=-2, dim2=-1)
-        if m.ndim != 2:
-            raise ValueError(f"mask must be rank-2/3/4 for embeddings; got rank={m.ndim}")
-        if m.shape[-1] != seq_len:
-            m = m[:, :seq_len]
-        return normalize_keep_mask(m)
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -950,7 +930,7 @@ class DebertaV2Embeddings(nn.Module):
         embeddings = self.LayerNorm(embeddings)
 
         if mask is not None:
-            keep = self._extract_token_mask(mask, seq_len).to(dtype=embeddings.dtype)
+            keep = reduce_keep_mask_to_2d(mask, seq_len=seq_len).to(dtype=embeddings.dtype)
             embeddings = embeddings * keep.unsqueeze(-1)
 
         embeddings = self.dropout(embeddings)
@@ -1025,16 +1005,7 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor attention_mask: Input mask tensor.
         :return torch.Tensor: Keep mask ``(B, 1, 1, S)`` or ``(B, 1, S, S)``.
         """
-        mask = normalize_keep_mask(attention_mask)
-        if mask.ndim <= 2:
-            return mask[:, None, None, :]  # (B,1,1,S) — broadcast across queries
-        if mask.ndim == 3:
-            return mask.unsqueeze(1)
-        if mask.ndim == 4:
-            if mask.shape[1] == 1:
-                return mask
-            return mask.any(dim=1, keepdim=True)
-        raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
+        return expand_keep_mask_to_4d(attention_mask)
 
     def get_rel_pos(
         self,

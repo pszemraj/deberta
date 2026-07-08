@@ -353,6 +353,35 @@ def test_build_doc_block_mask_matches_expected_structure():
     assert int(mask[0, 5].sum().item()) == 1
 
 
+def test_mask_utils_reduce_and_expand_helpers_cover_all_ranks():
+    from deberta.modeling.mask_utils import expand_keep_mask_to_4d, reduce_keep_mask_to_2d
+
+    mask_2d = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.long)
+    expected = mask_2d.bool()
+
+    # 2D passthrough plus optional key-axis slicing.
+    assert torch.equal(reduce_keep_mask_to_2d(mask_2d), expected)
+    assert torch.equal(reduce_keep_mask_to_2d(mask_2d, seq_len=3), expected[:, :3])
+
+    # Pairwise (B,S,S): diagonal encodes per-query activity.
+    pairwise = expected[:, :, None] & expected[:, None, :]
+    assert torch.equal(reduce_keep_mask_to_2d(pairwise), expected)
+
+    # 4D broadcast (B,1,1,S) and head-specific (B,H,S,S) layouts.
+    assert torch.equal(reduce_keep_mask_to_2d(expected[:, None, None, :]), expected)
+    assert torch.equal(reduce_keep_mask_to_2d(pairwise[:, None].expand(-1, 3, -1, -1)), expected)
+
+    # Rank-3 broadcast (B,1,S) keeps the sequence axis instead of truncating
+    # to a bogus (B,1) diagonal -- this was the latent drift between the old
+    # per-module copies of this reduction.
+    assert torch.equal(reduce_keep_mask_to_2d(expected[:, None, :]), expected)
+
+    # Expansion: broadcast by default, EMD outer product on request.
+    assert torch.equal(expand_keep_mask_to_4d(mask_2d), expected[:, None, None, :])
+    assert torch.equal(expand_keep_mask_to_4d(mask_2d, pairwise_2d=True), pairwise[:, None])
+    assert torch.equal(expand_keep_mask_to_4d(pairwise), pairwise[:, None])
+
+
 def test_collator_build_drops_document_mask_when_not_packed():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))

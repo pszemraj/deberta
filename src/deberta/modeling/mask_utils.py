@@ -167,8 +167,11 @@ def _flash_cfg_optional_int(
         return default
 
 
-def _flash_mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
+def mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     """Extract a canonical ``(B,S)`` keep mask from rank-2/4 padding masks.
+
+    Pairwise masks are rejected on purpose: callers that support per-query
+    structure must branch on :func:`is_pairwise_mask` first.
 
     :param torch.Tensor attention_mask: Padding-style keep mask.
     :param int seq_len: Expected sequence length.
@@ -178,26 +181,86 @@ def _flash_mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -
 
     mask = normalize_keep_mask(attention_mask)
     if mask.ndim == 2:
-        return mask[:, :seq_len]
+        return mask[:, : int(seq_len)]
     if mask.ndim == 4 and int(mask.shape[-2]) == 1:
-        return mask[:, 0, 0, :seq_len]
-    raise ValueError(f"Unsupported padding-mask shape for flash metadata: {tuple(mask.shape)}")
+        return mask[:, 0, 0, : int(seq_len)]
+    raise ValueError(
+        f"Padding masks must be shaped (B,S) or (B,1,1,S) for 2D keep-mask extraction; "
+        f"got shape={tuple(mask.shape)}"
+    )
 
 
-def _flash_is_pairwise_mask(attention_mask: torch.Tensor, *, seq_len: int) -> bool:
-    """Return whether a mask carries per-query pairwise structure.
+def is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
+    """Return whether a mask encodes per-query pairwise constraints.
 
     :param torch.Tensor attention_mask: Candidate mask tensor.
-    :param int seq_len: Expected query/key length.
-    :return bool: True for ``(B,S,S)`` or ``(B,1,S,S)`` style masks.
+    :param int query_len: Expected query length.
+    :param int key_len: Expected key length.
+    :return bool: True for ``(B,Q,K)`` or ``(B,*,Q,K)`` style masks.
     """
 
     mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 3:
-        return tuple(mask.shape[-2:]) == (int(seq_len), int(seq_len))
-    if mask.ndim == 4:
-        return tuple(mask.shape[-2:]) == (int(seq_len), int(seq_len))
+    if mask.ndim in (3, 4):
+        return tuple(mask.shape[-2:]) == (int(query_len), int(key_len))
     return False
+
+
+def expand_keep_mask_to_4d(attention_mask: torch.Tensor, *, pairwise_2d: bool = False) -> torch.Tensor:
+    """Expand a rank-2/3/4 keep mask to the canonical 4D attention layout.
+
+    2D key-padding masks become broadcast ``(B,1,1,S)`` by default, or a full
+    outer-product ``(B,1,S,S)`` pairwise mask when ``pairwise_2d`` is set (the
+    original DeBERTa EMD convention). 3D pairwise masks gain a head axis and 4D
+    masks are head-reduced to ``(B,1,*,S)``.
+
+    :param torch.Tensor attention_mask: Keep mask in rank-2/3/4 layout.
+    :param bool pairwise_2d: Whether 2D masks expand via outer product.
+    :raises ValueError: If the mask rank is unsupported.
+    :return torch.Tensor: Boolean keep mask in ``(B,1,1,S)`` or ``(B,1,S,S)`` layout.
+    """
+
+    mask = normalize_keep_mask(attention_mask)
+    if mask.ndim == 2:
+        ext = mask[:, None, None, :]
+        if pairwise_2d:
+            return ext & ext.transpose(-1, -2)
+        return ext
+    if mask.ndim == 3:
+        return mask[:, None, :, :]
+    if mask.ndim == 4:
+        if mask.shape[1] == 1:
+            return mask
+        return mask.any(dim=1, keepdim=True)
+    raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
+
+
+def reduce_keep_mask_to_2d(attention_mask: torch.Tensor, *, seq_len: int | None = None) -> torch.Tensor:
+    """Reduce a rank-2/3/4 keep mask to per-token ``(B,S)`` activity.
+
+    Pairwise masks contribute their diagonal (the diagonal encodes per-query
+    activity); broadcast key-padding rows keep the full sequence axis; 4D masks
+    are head-reduced first.
+
+    :param torch.Tensor attention_mask: Keep mask in rank-2/3/4 layout.
+    :param int | None seq_len: Optional sequence length to slice the key axis to.
+    :raises ValueError: If the mask rank is unsupported.
+    :return torch.Tensor: Boolean keep mask in ``(B,S)`` layout.
+    """
+
+    mask = normalize_keep_mask(attention_mask)
+    if mask.ndim == 4:
+        mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
+    if mask.ndim == 3:
+        if mask.shape[-2] == 1:
+            # Broadcast padding path: (B,1,S) keeps the full sequence axis.
+            mask = mask[:, 0, :]
+        else:
+            mask = torch.diagonal(mask, dim1=-2, dim2=-1)
+    if mask.ndim != 2:
+        raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
+    if seq_len is not None and int(mask.shape[-1]) != int(seq_len):
+        mask = mask[:, : int(seq_len)]
+    return mask
 
 
 _DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
@@ -355,11 +418,13 @@ __all__ = [
     "FlashBatchMeta",
     "_flash_cfg_bool",
     "_flash_cfg_get",
-    "_flash_is_pairwise_mask",
-    "_flash_mask_to_2d_keep_mask",
     "build_doc_block_mask",
     "build_doc_segment_metadata",
     "doc_segment_metadata_host_stats",
     "doc_ids_from_segments",
+    "expand_keep_mask_to_4d",
+    "is_pairwise_mask",
+    "mask_to_2d_keep_mask",
     "normalize_keep_mask",
+    "reduce_keep_mask_to_2d",
 ]

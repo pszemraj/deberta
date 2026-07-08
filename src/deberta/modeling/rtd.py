@@ -39,7 +39,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deberta.modeling.activations import get_act_fn
-from deberta.modeling.mask_utils import FlashBatchMeta, normalize_keep_mask
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    expand_keep_mask_to_4d,
+    normalize_keep_mask,
+    reduce_keep_mask_to_2d,
+)
 from deberta.modeling.norm import RMSNorm
 
 try:
@@ -97,29 +102,12 @@ def attention_mask_to_active_tokens(
         return input_ids.ne(int(pad_token_id))
 
     mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 2:
-        return mask
-
-    if mask.ndim == 3:
-        # Diagonal encodes per-token query activity.
-        active = torch.diagonal(mask, dim1=-2, dim2=-1)
-        if pad_token_id is not None:
-            active = active & input_ids.ne(int(pad_token_id))
-        return active
-
-    if mask.ndim == 4:
-        # Reduce head dimension if present.
-        squeezed = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if squeezed.shape[-2] == 1:
-            # Broadcast path: (B,1,1,S) -> (B,S)
-            active = squeezed[:, 0, :]
-        else:
-            active = torch.diagonal(squeezed, dim1=-2, dim2=-1)
-        if pad_token_id is not None:
-            active = active & input_ids.ne(int(pad_token_id))
-        return active
-
-    raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
+    active = reduce_keep_mask_to_2d(mask)
+    if mask.ndim > 2 and pad_token_id is not None:
+        # Pairwise/broadcast masks encode attention structure, not padding;
+        # re-intersect with padding activity derived from the token ids.
+        active = active & input_ids.ne(int(pad_token_id))
+    return active
 
 
 def _ensure_emd_pairwise_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -134,27 +122,7 @@ def _ensure_emd_pairwise_attention_mask(attention_mask: torch.Tensor) -> torch.T
     :return torch.Tensor: Pairwise keep mask with shape ``(B,1,S,S)``.
     """
 
-    m = normalize_keep_mask(attention_mask)
-
-    # 2D: (B,S) -> (B,1,S,S) using outer product.
-    if m.ndim == 2:
-        # (B,1,1,S)
-        ext = m[:, None, None, :]
-        # Outer product: key mask * query mask.
-        # (B,1,1,S) * (B,1,S,1) -> (B,1,S,S)
-        return ext & ext.transpose(-1, -2)
-
-    # 3D: (B,S,S) -> (B,1,S,S)
-    if m.ndim == 3:
-        return m[:, None, :, :]
-
-    # 4D: (B,H,S,S) -> (B,1,S,S)
-    if m.ndim == 4:
-        if m.shape[1] == 1:
-            return m
-        return m.any(dim=1, keepdim=True)
-
-    raise ValueError(f"Unsupported attention_mask rank for EMD: {m.ndim}")
+    return expand_keep_mask_to_4d(attention_mask, pairwise_2d=True)
 
 
 def _ensure_emd_flash_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -164,16 +132,7 @@ def _ensure_emd_flash_attention_mask(attention_mask: torch.Tensor) -> torch.Tens
     :return torch.Tensor: Broadcast or pairwise keep mask.
     """
 
-    m = normalize_keep_mask(attention_mask)
-    if m.ndim == 2:
-        return m[:, None, None, :]
-    if m.ndim == 3:
-        return m[:, None, :, :]
-    if m.ndim == 4:
-        if m.shape[1] == 1:
-            return m
-        return m.any(dim=1, keepdim=True)
-    raise ValueError(f"Unsupported attention_mask rank for EMD: {m.ndim}")
+    return expand_keep_mask_to_4d(attention_mask)
 
 
 def _is_sharded_dtensor(tensor: torch.Tensor) -> bool:
