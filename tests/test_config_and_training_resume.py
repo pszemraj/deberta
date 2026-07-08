@@ -38,17 +38,10 @@ def _write_resume_source_snapshots(run_dir: Path) -> None:
 
 
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
-    checkpoint_dir = tmp_path / "run" / "checkpoint-2"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = mock_checkpoint(root=tmp_path / "run", name="checkpoint-2", consumed_micro_batches=50)
     _write_resume_source_snapshots(checkpoint_dir.parent)
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
-    (checkpoint_dir / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 50}),
-        encoding="utf-8",
-    )
-    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
 
     replay_calls = {"next": 0}
 
@@ -89,17 +82,10 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
 
 
 def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
-    checkpoint_dir = tmp_path / "run" / "checkpoint-1"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = mock_checkpoint(root=tmp_path / "run", name="checkpoint-1", consumed_micro_batches=3)
     _write_resume_source_snapshots(checkpoint_dir.parent)
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
-    (checkpoint_dir / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 3}),
-        encoding="utf-8",
-    )
-    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
 
     captured: dict[str, int] = {}
 
@@ -142,23 +128,15 @@ def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
 
 
 def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
-    checkpoint_dir = tmp_path / "run" / "checkpoint-1"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    _write_resume_source_snapshots(checkpoint_dir.parent)
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
-    (checkpoint_dir / "data_state.json").write_text(
-        json.dumps(
-            {
-                "consumed_micro_batches": 3,
-                "global_step": 1,
-                "gradient_accumulation_steps": 3,
-            }
-        ),
-        encoding="utf-8",
+    checkpoint_dir = mock_checkpoint(
+        root=tmp_path / "run",
+        name="checkpoint-1",
+        consumed_micro_batches=3,
+        data_state_extra={"global_step": 1, "gradient_accumulation_steps": 3},
     )
-    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
+    _write_resume_source_snapshots(checkpoint_dir.parent)
 
     captured: dict[str, int] = {}
 
@@ -202,13 +180,10 @@ def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
 
 
 def test_run_pretraining_resume_requires_data_state_json(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
-    checkpoint_dir = tmp_path / "run" / "checkpoint-2"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = mock_checkpoint(root=tmp_path / "run", name="checkpoint-2", with_data_state=False)
     _write_resume_source_snapshots(checkpoint_dir.parent)
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
-    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
     train_cfg = TrainConfig(
@@ -236,17 +211,15 @@ def test_run_pretraining_resume_requires_data_state_json(
 
 
 def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
-    checkpoint_dir = tmp_path / "run" / "checkpoint-2"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    _write_resume_source_snapshots(checkpoint_dir.parent)
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
-    (checkpoint_dir / "data_state.json").write_text(
-        json.dumps({"consumed_micro_batches": 2, "global_step": 1}),
-        encoding="utf-8",
+    checkpoint_dir = mock_checkpoint(
+        root=tmp_path / "run",
+        name="checkpoint-2",
+        consumed_micro_batches=2,
+        data_state_extra={"global_step": 1},
     )
-    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
+    _write_resume_source_snapshots(checkpoint_dir.parent)
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
     train_cfg = TrainConfig(
@@ -277,27 +250,20 @@ def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    mock_checkpoint,
 ) -> None:
-    checkpoint_dir = tmp_path / "run" / "checkpoint-0"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = mock_checkpoint(
+        root=tmp_path / "run",
+        name="checkpoint-0",
+        consumed_micro_batches=0,
+        data_state_extra={"global_step": 0, "optimizer_param_digest": "legacydeadbeef000"},
+    )
     _write_resume_source_snapshots(checkpoint_dir.parent)
     (checkpoint_dir.parent / "model_config.json").write_text(
         json.dumps(asdict(ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes")), indent=2)
         + "\n",
         encoding="utf-8",
     )
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
-    (checkpoint_dir / "data_state.json").write_text(
-        json.dumps(
-            {
-                "consumed_micro_batches": 0,
-                "global_step": 0,
-                "optimizer_param_digest": "legacydeadbeef000",
-            }
-        ),
-        encoding="utf-8",
-    )
-    (checkpoint_dir / ".complete").write_text("ok\n", encoding="utf-8")
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
@@ -1033,13 +999,7 @@ def test_run_pretraining_decoupled_debug_metrics_writes_local_rows(
 def test_run_pretraining_compiles_generator_and_discriminator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    compile_calls: list[tuple[Any, dict[str, Any]]] = []
-
-    def _fake_compile(
-        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
-    ) -> Any:
-        compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
-        return target
+    _fake_compile, compile_calls = fake_torch_compile()
 
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
@@ -1171,13 +1131,7 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
             self.encoder = torch.nn.Module()
             self.encoder.layer = torch.nn.ModuleList([_FakeLayer()])
 
-    compile_calls: list[tuple[Any, dict[str, Any]]] = []
-
-    def _fake_compile(
-        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
-    ) -> Any:
-        compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
-        return target
+    _fake_compile, compile_calls = fake_torch_compile()
 
     created_models: list[SimpleRTD] = []
 
@@ -1720,36 +1674,13 @@ def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(tmp
         )
 
 
-def _checkpoint_saving_accelerator(
-    *,
-    is_main_process: bool,
-    write_weights: bool = True,
-) -> FakeAccelerator:
-    """Build a fake accelerator whose ``save_state`` writes checkpoint-like files."""
-
-    accel = FakeAccelerator(is_main_process=bool(is_main_process))
-
-    def _save_state(output_dir: str | None) -> None:
-        if output_dir is None:
-            return
-        p = Path(output_dir)
-        p.mkdir(parents=True, exist_ok=True)
-        if write_weights:
-            (p / "model.safetensors").write_bytes(b"weights")
-        marker = "main" if accel.is_main_process else "worker"
-        (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
-
-    accel.save_state_hook = _save_state
-    return accel
-
-
 def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-1"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    accel = _checkpoint_saving_accelerator(is_main_process=False)
+    accel = checkpoint_saving_accelerator(is_main_process=False)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -1772,7 +1703,7 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-3"
 
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    accel = checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -1800,7 +1731,7 @@ def test_save_training_checkpoint_rejects_overwrite_of_nonempty_checkpoint_dir(t
     ckpt.mkdir(parents=True, exist_ok=True)
     (ckpt / "stale.bin").write_bytes(b"stale")
 
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    accel = checkpoint_saving_accelerator(is_main_process=True)
     with pytest.raises(RuntimeError, match="Refusing to overwrite non-empty checkpoint directory"):
         _save_training_checkpoint(
             accelerator=accel,
@@ -1825,7 +1756,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
     (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    accel = checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=new_ckpt,
@@ -1853,7 +1784,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
     (old_ckpt / ".complete").write_text("ok\n", encoding="utf-8")
     new_ckpt = out / "checkpoint-2"
 
-    accel = _checkpoint_saving_accelerator(is_main_process=True, write_weights=False)
+    accel = checkpoint_saving_accelerator(is_main_process=True, write_weights=False)
     with pytest.raises(RuntimeError, match="Post-save structural validation failed"):
         _save_training_checkpoint(
             accelerator=accel,

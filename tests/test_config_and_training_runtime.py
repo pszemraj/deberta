@@ -553,40 +553,17 @@ def test_should_clip_gradients_on_sync_steps():
     assert _should_clip_gradients(sync_gradients=True, max_grad_norm=1.0) is True
 
 
-def test_has_nonfinite_grad_norm_any_rank_uses_reduced_flag():
-    accel = FakeAccelerator(num_processes=2)
-
-    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-        assert reduction == "sum"
-        return tensor + 1
-
-    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
-    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is True
-    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
-
-
-def test_has_nonfinite_grad_norm_any_rank_single_process_uses_local_flag():
+@pytest.mark.parametrize(
+    ("grad_norm", "expected"),
+    [(1.0, False), (float("inf"), True), (float("nan"), True), (-float("inf"), True)],
+)
+def test_has_nonfinite_grad_norm_any_rank_translates_finiteness(grad_norm: float, expected: bool):
+    # The multi-process reduce/single-process/error-propagation semantics are
+    # pinned by _any_rank_flag_true's own tests below; this function is a
+    # two-line delegation, so only the isfinite -> flag translation needs
+    # independent coverage.
     accel = FakeAccelerator(num_processes=1)
-
-    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-        del tensor, reduction
-        raise AssertionError("reduce() should not be called in single-process mode")
-
-    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
-    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0) is False
-    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=float("inf")) is True
-
-
-def test_has_nonfinite_grad_norm_any_rank_propagates_reduce_errors_on_multi_process():
-    accel = FakeAccelerator(num_processes=2)
-
-    def _reduce(_self: FakeAccelerator, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-        del tensor, reduction
-        raise RuntimeError("collective failed")
-
-    accel.reduce = types.MethodType(_reduce, accel)  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError, match="collective failed"):
-        _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=1.0)
+    assert _has_nonfinite_grad_norm_any_rank(accelerator=accel, grad_norm=grad_norm) is expected
 
 
 def test_any_rank_flag_true_uses_reduced_flag():
@@ -1176,13 +1153,7 @@ def test_stabilize_compile_attention_mask_hf_deberta_v2():
 def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_supported_backbones(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    compile_calls: list[tuple[Any, dict[str, Any]]] = []
-
-    def _fake_compile(
-        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
-    ) -> Any:
-        compile_calls.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
-        return target
+    _fake_compile, compile_calls = fake_torch_compile()
 
     class _StableBackbone(torch.nn.Module):
         def __init__(self, label: str) -> None:

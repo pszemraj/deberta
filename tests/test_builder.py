@@ -1306,3 +1306,84 @@ def test_build_backbone_configs_rejects_hf_deberta_sources_for_pretrained_rope()
             tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
         )
+
+
+def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs():
+    pytest.importorskip("transformers")
+    tokenizer = DummyTokenizer(vocab_size=128)
+
+    model_cfg = ModelConfig(backbone_type="hf_deberta_v2", from_scratch=True)
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=128,
+    )
+
+    for cfg in (disc_cfg, gen_cfg):
+        assert getattr(cfg, "pad_token_id", None) == 0
+        assert getattr(cfg, "cls_token_id", None) == 1
+        assert getattr(cfg, "sep_token_id", None) == 2
+        assert getattr(cfg, "mask_token_id", None) == 3
+        assert getattr(cfg, "bos_token_id", None) == 4
+        assert getattr(cfg, "eos_token_id", None) == 5
+        assert getattr(cfg, "use_rmsnorm_heads", None) is False
+
+
+def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+
+    checkpoint_cfg = DebertaRoPEConfig(
+        vocab_size=32000,
+        hidden_size=64,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        intermediate_size=128,
+        hidden_act="gelu",
+        rope_theta=50000.0,
+        rotary_pct=0.5,
+        use_absolute_position_embeddings=True,
+        type_vocab_size=3,
+        norm_arch="keel",
+        norm_eps=1.0e-5,
+        keel_alpha_init=9.0,
+        keel_alpha_learnable=True,
+        ffn_type="mlp",
+        use_bias=True,
+        hidden_dropout_prob=0.3,
+        attention_probs_dropout_prob=0.4,
+    )
+
+    monkeypatch.setattr(
+        "deberta.modeling.builder.DebertaRoPEConfig.from_pretrained",
+        lambda _src: checkpoint_cfg,
+    )
+    tokenizer = DummyTokenizer(vocab_size=32000)
+
+    model_cfg = ModelConfig(
+        backbone_type="rope",
+        from_scratch=False,
+        pretrained_discriminator_path="local-rope-disc",
+        hidden_dropout_prob=None,
+        attention_probs_dropout_prob=None,
+    )
+
+    disc_cfg, _ = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=512,
+    )
+
+    assert disc_cfg.rope_theta == pytest.approx(50000.0)
+    assert disc_cfg.rotary_pct == pytest.approx(0.5)
+    assert disc_cfg.use_absolute_position_embeddings is True
+    assert disc_cfg.type_vocab_size == 3
+    assert disc_cfg.norm_arch == "keel"
+    assert disc_cfg.norm_eps == pytest.approx(1.0e-5)
+    assert disc_cfg.keel_alpha_init == pytest.approx(9.0)
+    assert disc_cfg.keel_alpha_learnable is True
+    assert disc_cfg.ffn_type == "mlp"
+    assert disc_cfg.use_bias is True
+    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.3)
+    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.4)

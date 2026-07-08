@@ -1,6 +1,6 @@
 # ruff: noqa: F403,F405
 from _config_and_training_shared_imports import *
-from test_config_and_training_resume import _checkpoint_saving_accelerator
+from _fakes import checkpoint_saving_accelerator
 
 
 def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -691,7 +691,7 @@ def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-5"
 
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    accel = checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
@@ -711,7 +711,7 @@ def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path)
     ckpt = out / "checkpoint-6"
 
     dual_digest = {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"}
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    accel = checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,

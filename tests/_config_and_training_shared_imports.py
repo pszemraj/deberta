@@ -22,6 +22,9 @@ from _fakes import (
     FakeWandbRun,
     SimpleRTD,
     TinyRTDLikeModel,
+    capture_run_pretraining_kwargs,
+    checkpoint_saving_accelerator,
+    fake_torch_compile,
     setup_pretraining_mocks,
 )
 

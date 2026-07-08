@@ -570,3 +570,71 @@ def setup_pretraining_mocks(
             monkeypatch.setattr(entrypoint_mod, attr, val)
 
     return entrypoint_mod
+
+
+def checkpoint_saving_accelerator(
+    *,
+    is_main_process: bool,
+    write_weights: bool = True,
+) -> FakeAccelerator:
+    """Build a fake accelerator whose ``save_state`` writes checkpoint-like files.
+
+    :param bool is_main_process: Whether the fake rank is the main process.
+    :param bool write_weights: Whether ``save_state`` writes a weights file.
+    :return FakeAccelerator: Accelerator with a checkpoint-writing save hook.
+    """
+
+    accel = FakeAccelerator(is_main_process=bool(is_main_process))
+
+    def _save_state(output_dir: str | None) -> None:
+        if output_dir is None:
+            return
+        p = Path(output_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        if write_weights:
+            (p / "model.safetensors").write_bytes(b"weights")
+        marker = "main" if accel.is_main_process else "worker"
+        (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
+
+    accel.save_state_hook = _save_state
+    return accel
+
+
+def capture_run_pretraining_kwargs(monkeypatch: Any, cli_module: Any) -> dict[str, Any]:
+    """Monkeypatch the CLI's run_pretraining with a kwargs recorder.
+
+    :param Any monkeypatch: Pytest monkeypatch fixture.
+    :param Any cli_module: The ``deberta.cli`` module object.
+    :return dict[str, Any]: Dict populated with the captured kwargs on call.
+    """
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_module, "run_pretraining", _fake_run_pretraining)
+    return seen
+
+
+def fake_torch_compile() -> tuple[Any, list[tuple[Any, dict[str, Any]]]]:
+    """Return an identity torch.compile stub plus its recorded call list.
+
+    :return tuple[Any, list[tuple[Any, dict[str, Any]]]]: The stub callable and
+        the list it appends ``(target, {mode, backend, dynamic})`` entries to.
+    """
+
+    compiled: list[tuple[Any, dict[str, Any]]] = []
+
+    def _fake_compile(
+        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
+    ) -> Any:
+        compiled.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
+        return target
+
+    return _fake_compile, compiled

@@ -23,17 +23,7 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
 
     assert "train_cfg" in seen
@@ -67,17 +57,7 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(["train", str(cfg_path)])
 
     assert "train_cfg" in seen
@@ -106,17 +86,7 @@ def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
 
     assert "train_cfg" in seen
@@ -144,24 +114,14 @@ def test_main_cli_train_reports_when_runtime_mutation_changes_loaded_value(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
     def _fake_apply_profile_defaults(*, model_cfg, train_cfg, optim_cfg):
         del model_cfg, optim_cfg
         object.__setattr__(train_cfg, "max_steps", int(train_cfg.max_steps) + 1)
 
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
     import deberta.training.runtime as runtime_mod
 
     monkeypatch.setattr(runtime_mod, "apply_profile_defaults", _fake_apply_profile_defaults)
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(["train", str(cfg_path)])
 
     assert int(seen["train_cfg"].max_steps) == 6
@@ -191,17 +151,7 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(
         [
             "train",
@@ -244,17 +194,7 @@ def test_main_cli_train_supports_null_for_optional_numeric_dotted_override(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(
         [
             "train",
@@ -298,17 +238,7 @@ def test_main_cli_train_supports_null_for_optional_constrained_dotted_override(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(
         [
             "train",
@@ -345,17 +275,7 @@ def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(
         [
             "train",
@@ -405,17 +325,7 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
         encoding="utf-8",
     )
 
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(["train", str(cfg_path), "--preset", "deberta-v3-base"])
 
     assert "train_cfg" in seen
@@ -431,17 +341,7 @@ def test_main_cli_train_with_config_and_preset_applies_model_only(
 def test_main_cli_train_preset_without_config_applies_defaults_and_cli_overrides(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    seen: dict[str, Any] = {}
-
-    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
-        seen["model_cfg"] = model_cfg
-        seen["data_cfg"] = data_cfg
-        seen["train_cfg"] = train_cfg
-        seen["optim_cfg"] = optim_cfg
-        seen["logging_cfg"] = logging_cfg
-        seen["config_path"] = config_path
-
-    monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
+    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
     cli_mod.main(["train", "--preset", "deberta-v3-base", "--train.max_steps", "123"])
 
     assert seen["config_path"] is None
@@ -1111,87 +1011,6 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
     )
     with pytest.raises(ValueError, match="apply only when model.from_scratch=false"):
         validate_model_config(cfg)
-
-
-def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs():
-    pytest.importorskip("transformers")
-    tokenizer = DummyTokenizer(vocab_size=128)
-
-    model_cfg = ModelConfig(backbone_type="hf_deberta_v2", from_scratch=True)
-    disc_cfg, gen_cfg = build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=tokenizer,
-        max_position_embeddings=128,
-    )
-
-    for cfg in (disc_cfg, gen_cfg):
-        assert getattr(cfg, "pad_token_id", None) == 0
-        assert getattr(cfg, "cls_token_id", None) == 1
-        assert getattr(cfg, "sep_token_id", None) == 2
-        assert getattr(cfg, "mask_token_id", None) == 3
-        assert getattr(cfg, "bos_token_id", None) == 4
-        assert getattr(cfg, "eos_token_id", None) == 5
-        assert getattr(cfg, "use_rmsnorm_heads", None) is False
-
-
-def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig
-
-    checkpoint_cfg = DebertaRoPEConfig(
-        vocab_size=32000,
-        hidden_size=64,
-        num_hidden_layers=3,
-        num_attention_heads=4,
-        intermediate_size=128,
-        hidden_act="gelu",
-        rope_theta=50000.0,
-        rotary_pct=0.5,
-        use_absolute_position_embeddings=True,
-        type_vocab_size=3,
-        norm_arch="keel",
-        norm_eps=1.0e-5,
-        keel_alpha_init=9.0,
-        keel_alpha_learnable=True,
-        ffn_type="mlp",
-        use_bias=True,
-        hidden_dropout_prob=0.3,
-        attention_probs_dropout_prob=0.4,
-    )
-
-    monkeypatch.setattr(
-        "deberta.modeling.builder.DebertaRoPEConfig.from_pretrained",
-        lambda _src: checkpoint_cfg,
-    )
-    tokenizer = DummyTokenizer(vocab_size=32000)
-
-    model_cfg = ModelConfig(
-        backbone_type="rope",
-        from_scratch=False,
-        pretrained_discriminator_path="local-rope-disc",
-        hidden_dropout_prob=None,
-        attention_probs_dropout_prob=None,
-    )
-
-    disc_cfg, _ = build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=tokenizer,
-        max_position_embeddings=512,
-    )
-
-    assert disc_cfg.rope_theta == pytest.approx(50000.0)
-    assert disc_cfg.rotary_pct == pytest.approx(0.5)
-    assert disc_cfg.use_absolute_position_embeddings is True
-    assert disc_cfg.type_vocab_size == 3
-    assert disc_cfg.norm_arch == "keel"
-    assert disc_cfg.norm_eps == pytest.approx(1.0e-5)
-    assert disc_cfg.keel_alpha_init == pytest.approx(9.0)
-    assert disc_cfg.keel_alpha_learnable is True
-    assert disc_cfg.ffn_type == "mlp"
-    assert disc_cfg.use_bias is True
-    assert disc_cfg.hidden_dropout_prob == pytest.approx(0.3)
-    assert disc_cfg.attention_probs_dropout_prob == pytest.approx(0.4)
 
 
 def test_readme_cli_examples_are_parseable():
