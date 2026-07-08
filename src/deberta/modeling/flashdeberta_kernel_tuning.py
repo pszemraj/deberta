@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any
 
 _DEFAULT_TUNING_PATH = Path(__file__).with_name("flashdeberta_kernel_tuning.json")
 _ACTIVE_OVERRIDES_PATH: str | None = None
+
+# Shape-keyed lookups take per-batch values (total_tokens, batch_size) in their
+# cache keys, so those caches must be bounded LRUs: a long variably-packed run
+# otherwise accretes one permanent entry per distinct batch shape.
+_SHAPE_KEYED_CACHE_MAXSIZE = 4096
 
 
 @dataclass(frozen=True)
@@ -118,20 +124,14 @@ def _load_tuning_payload() -> dict[str, Any]:
     return merged
 
 
-try:
-    from functools import cache
-except ImportError:  # pragma: no cover - Python 3.8 fallback kept harmless for tooling.
-    from functools import lru_cache as cache
-
-
 _load_tuning_payload = cache(_load_tuning_payload)
 
 
 def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_size: int | None = None) -> str:
     """Resolve the measured-policy sequence bucket for one batch shape.
 
-    Results are cached per argument tuple until
-    :func:`configure_flashdeberta_kernel_overrides` changes the active table.
+    Results are cached in a bounded LRU (keys include per-batch token counts)
+    until :func:`configure_flashdeberta_kernel_overrides` changes the active table.
 
     :param int seq_len: Padded sequence length.
     :param int | None total_tokens: Active token count, when known.
@@ -169,7 +169,7 @@ def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_siz
     return "default"
 
 
-flash_seq_bucket = cache(flash_seq_bucket)
+flash_seq_bucket = lru_cache(maxsize=_SHAPE_KEYED_CACHE_MAXSIZE)(flash_seq_bucket)
 
 
 def flash_route_policy(
@@ -382,8 +382,8 @@ def _entry_matches(context: FlashKernelContext, entry: dict[str, Any]) -> bool:
 def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, int, int] | None:
     """Resolve a measured kernel launch tuple from the active tuning table.
 
-    Results are cached per context until
-    :func:`configure_flashdeberta_kernel_overrides` changes the active table,
+    Results are cached in a bounded LRU (contexts carry per-batch token counts)
+    until :func:`configure_flashdeberta_kernel_overrides` changes the active table,
     keeping the per-layer forward/backward table scans off the hot path.
 
     :param FlashKernelContext context: Runtime kernel context.
@@ -408,4 +408,4 @@ def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, 
     return None
 
 
-resolve_flash_kernel_config = cache(resolve_flash_kernel_config)
+resolve_flash_kernel_config = lru_cache(maxsize=_SHAPE_KEYED_CACHE_MAXSIZE)(resolve_flash_kernel_config)

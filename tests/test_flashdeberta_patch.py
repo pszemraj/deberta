@@ -349,6 +349,25 @@ def test_flashdeberta_kernel_overrides_same_path_reconfigure_keeps_cache(monkeyp
     assert reads["count"] == first_reads
 
 
+def test_flashdeberta_shape_keyed_tuning_caches_are_bounded() -> None:
+    from deberta.modeling import flashdeberta_kernel_tuning as tuning
+
+    tuning.configure_flashdeberta_kernel_overrides(None)
+    tuning.flash_seq_bucket.cache_clear()
+    tuning.resolve_flash_kernel_config.cache_clear()
+
+    # Cache keys carry raw per-batch token counts, so both lookups must stay
+    # bounded LRUs; a plain functools.cache grows monotonically over a long
+    # variably-packed training run.
+    maxsize = tuning.flash_seq_bucket.cache_info().maxsize
+    assert maxsize is not None
+    assert tuning.resolve_flash_kernel_config.cache_info().maxsize is not None
+
+    for total_tokens in range(1, maxsize + 129):
+        tuning.flash_seq_bucket(seq_len=2048, total_tokens=total_tokens, batch_size=2)
+    assert tuning.flash_seq_bucket.cache_info().currsize <= maxsize
+
+
 def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
