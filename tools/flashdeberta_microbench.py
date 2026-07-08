@@ -51,7 +51,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--pad-ratio", type=float, default=0.0)
-    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--vocab-size", type=int, default=128_100)
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--num-layers", type=int, default=6)
@@ -93,10 +92,6 @@ def _build_config(args: argparse.Namespace) -> DebertaV2Config:
         "kernel_overrides_path": None,
     }
     return cfg
-
-
-def _dtype_from_arg(name: str) -> torch.dtype:
-    return torch.bfloat16 if str(name) == "bf16" else torch.float16
 
 
 def _build_batch(args: argparse.Namespace, *, device: torch.device, pad_token_id: int) -> dict[str, Any]:
@@ -158,7 +153,8 @@ def main() -> None:
         raise RuntimeError("CUDA is required for flashdeberta_microbench.py")
 
     device = torch.device("cuda")
-    dtype = _dtype_from_arg(str(args.dtype))
+    # bf16 only: the repo's precision contract excludes fp16.
+    dtype = torch.bfloat16
     torch.manual_seed(0)
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -232,9 +228,7 @@ def main() -> None:
     stats = flashdeberta_stats_snapshot() if callable(flashdeberta_stats_snapshot) else None
 
     print(f"mode={args.mode}")
-    print(
-        f"seq_len={args.seq_len} batch_size={args.batch_size} pad_ratio={args.pad_ratio:.3f} dtype={args.dtype}"
-    )
+    print(f"seq_len={args.seq_len} batch_size={args.batch_size} pad_ratio={args.pad_ratio:.3f} dtype=bf16")
     print(f"mean_ms={mean_ms:.2f} p50_ms={p50_ms:.2f} p90_ms={p90_ms:.2f}")
     print(f"active_tok_per_s={active_tok_s:.2f}")
     print(f"slot_tok_per_s={slot_tok_s:.2f}")

@@ -66,6 +66,9 @@ from deberta.training.steps import (  # noqa: E402
 def autocast_context(mixed_precision: str) -> Any:
     """Return the autocast context matching a mixed-precision mode.
 
+    Mixed precision in this repo is ``bf16`` or ``no``; fp16 is deliberately
+    unsupported, matching the training config contract.
+
     :param str mixed_precision: Effective mixed-precision mode.
     :return Any: Autocast context manager (or nullcontext for full precision).
     """
@@ -73,8 +76,6 @@ def autocast_context(mixed_precision: str) -> Any:
     normalized = str(mixed_precision).strip().lower()
     if normalized == "bf16":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    if normalized in {"fp16", "float16"}:
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
 
 
