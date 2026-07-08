@@ -702,13 +702,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if not self.training:
             return False
-        seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
-        local_bias_policy = flash_route_policy(
-            policy="local_bias",
-            seq_bucket=seq_bucket,
-            compute_capability=device_compute_capability(device) if device is not None else None,
-        )
         local_bias_max_batch_size = self._runtime_config.local_bias_max_batch_size
+        local_bias_seq_len = self._runtime_config.local_bias_seq_len
+        local_bias_policy = None
+        if local_bias_max_batch_size is None or local_bias_seq_len is None:
+            # Consult the tuning table only when a config override leaves a
+            # decision open; fully configured runtimes skip the lookup.
+            local_bias_policy = flash_route_policy(
+                policy="local_bias",
+                seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
+                compute_capability=device_compute_capability(device) if device is not None else None,
+            )
         if local_bias_max_batch_size is None:
             if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
                 return False
@@ -718,7 +722,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 local_bias_max_batch_size = 0
         if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
             return False
-        local_bias_seq_len = self._runtime_config.local_bias_seq_len
         if local_bias_seq_len is None:
             if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
                 return False

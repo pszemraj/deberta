@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Any
 
 import torch
@@ -128,8 +129,22 @@ def can_use_triton_pack(
     return all(meta.device == tensor.device for meta in metadata_tensors)
 
 
+@cache
+def _cuda_device_capability(index: int) -> tuple[int, int]:
+    """Return the cached CUDA compute capability for one device index.
+
+    :param int index: CUDA device index.
+    :return tuple[int, int]: ``(major, minor)`` capability.
+    """
+
+    return torch.cuda.get_device_capability(index)
+
+
 def device_compute_capability(device: torch.device) -> tuple[int, int]:
     """Return CUDA compute capability for one device.
+
+    The capability is constant per device for the process lifetime and this
+    helper runs per layer per forward/backward, so it caches per device index.
 
     :param torch.device device: Device to query.
     :return tuple[int, int]: ``(major, minor)`` capability, or ``(0, 0)`` off CUDA.
@@ -139,5 +154,5 @@ def device_compute_capability(device: torch.device) -> tuple[int, int]:
         return (0, 0)
     index = device.index
     if index is None:
-        return torch.cuda.get_device_capability()
-    return torch.cuda.get_device_capability(index)
+        index = torch.cuda.current_device()
+    return _cuda_device_capability(int(index))

@@ -55,6 +55,7 @@ def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
     _ACTIVE_OVERRIDES_PATH = resolved
     _load_tuning_payload.cache_clear()
     flash_seq_bucket.cache_clear()
+    flash_route_policy.cache_clear()
     resolve_flash_kernel_config.cache_clear()
 
 
@@ -186,6 +187,10 @@ def flash_route_policy(
     same specificity, later rows win so appended override-table rows take
     precedence.
 
+    Results are cached until :func:`configure_flashdeberta_kernel_overrides`
+    changes the active table, so callers must treat the returned row as
+    read-only.
+
     :param str policy: Route policy namespace such as ``"padding"`` or ``"docblock"``.
     :param str seq_bucket: Sequence bucket returned by :func:`flash_seq_bucket`.
     :param tuple[int, int] | None compute_capability: Device capability, or None
@@ -212,6 +217,9 @@ def flash_route_policy(
         if cc_key is not None and entry_cc == cc_key:
             return dict(raw)
     return wildcard_match
+
+
+flash_route_policy = cache(flash_route_policy)
 
 
 def flash_route_choice(
