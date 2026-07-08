@@ -21,7 +21,13 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    lookup_existing_op_pair,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    kernel_dtype_name as _kernel_dtype_name,
+)
 
 try:
     import triton
@@ -115,16 +121,6 @@ def flashdeberta_compiled_position_bias_available() -> bool:
         _FLASHDEBERTA_POSITION_BIAS_CUSTOM_OP is not None
         and _FLASHDEBERTA_POSITION_BIAS_BWD_CUSTOM_OP is not None
     )
-
-
-def _kernel_dtype_name(dtype: torch.dtype) -> str:
-    """Return a compact dtype name for tuning-table matching.
-
-    :param torch.dtype dtype: Torch dtype.
-    :return str: Dtype name without the ``torch.`` prefix.
-    """
-
-    return str(dtype).removeprefix("torch.")
 
 
 def _bias_repo_tuned_config(
@@ -1994,10 +1990,9 @@ def _build_bias_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = lookup_registered_op(_BIAS_OP_NAMESPACE, _BIAS_FWD_OP_NAME)
-    existing_backward = lookup_registered_op(_BIAS_OP_NAMESPACE, _BIAS_BWD_OP_NAME)
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
+    existing = lookup_existing_op_pair(_BIAS_OP_NAMESPACE, _BIAS_FWD_OP_NAME, _BIAS_BWD_OP_NAME)
+    if existing is not None:
+        return existing
 
     if (
         _flash_attn_v2_fwd_bias_lowlevel is None
@@ -2205,10 +2200,11 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_FWD_OP_NAME)
-    existing_backward = lookup_registered_op(_BIAS_OP_NAMESPACE, _POSITION_BIAS_BWD_OP_NAME)
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
+    existing = lookup_existing_op_pair(
+        _BIAS_OP_NAMESPACE, _POSITION_BIAS_FWD_OP_NAME, _POSITION_BIAS_BWD_OP_NAME
+    )
+    if existing is not None:
+        return existing
 
     if (
         triton is None

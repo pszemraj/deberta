@@ -12,7 +12,20 @@ scattering packed outputs/gradients back to the original padded layout.
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
+
+from deberta.modeling.flashdeberta_op_utils import (
+    can_use_triton_pack,
+    flatten_padded_rows,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    optional_triton_jit as _optional_triton_jit,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    traceable_triton_kernel as _traceable_triton_kernel,
+)
 
 try:  # pragma: no cover - optional Triton dependency
     import triton
@@ -51,33 +64,6 @@ def flashdeberta_segment_pack_available() -> bool:
     return _TRITON_AVAILABLE
 
 
-def _traceable_triton_kernel(kernel: object) -> object:
-    """Return a traceable Triton kernel wrapper when PyTorch exposes one.
-
-    :param object kernel: Raw Triton kernel or autotuned wrapper.
-    :return object: Traceable wrapper when available, otherwise ``kernel``.
-    """
-
-    if not hasattr(torch, "library") or not hasattr(torch.library, "wrap_triton"):
-        return kernel
-    try:
-        return torch.library.wrap_triton(kernel)
-    except Exception:
-        return kernel
-
-
-def _optional_triton_jit(fn: object) -> object:
-    """Apply ``triton.jit`` only when Triton imported successfully.
-
-    :param object fn: Kernel function.
-    :return object: JIT kernel or unchanged function in no-Triton environments.
-    """
-
-    if triton is None or tl is None:
-        return fn
-    return triton.jit(fn)
-
-
 def _tensor_host_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     """Return a host tuple for one CPU metadata tensor.
 
@@ -93,24 +79,7 @@ def _tensor_host_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(value) for value in tensor.tolist())
 
 
-def _flatten_rows(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int, int]:
-    """Flatten a contiguous ``(B, S, ...)`` tensor into row-major ``(B*S, F)`` form.
-
-    :param torch.Tensor tensor: Tensor with at least two leading dims ``(B, S)``.
-    :raises ValueError: If the tensor rank is less than two.
-    :return tuple[torch.Tensor, tuple[int, ...], int, int]:
-        Flattened tensor, trailing shape, batch size, and padded sequence length.
-    """
-
-    if tensor.ndim < 2:
-        raise ValueError(f"Expected tensor with leading (B,S) dims; got shape={tuple(tensor.shape)}")
-    if not tensor.is_contiguous():
-        raise ValueError("Segment-pack Triton path requires contiguous tensors.")
-    batch_size = int(tensor.shape[0])
-    seq_len = int(tensor.shape[1])
-    trailing_shape = tuple(int(dim) for dim in tensor.shape[2:])
-    flat = tensor.view(batch_size * seq_len, -1)
-    return flat, trailing_shape, batch_size, seq_len
+_flatten_rows = partial(flatten_padded_rows, context="Segment-pack")
 
 
 def _can_use_triton_segment_pack(
@@ -129,19 +98,11 @@ def _can_use_triton_segment_pack(
     :return bool: True when the Triton path is usable.
     """
 
-    if not flashdeberta_segment_pack_available():
-        return False
-    if tensor.device.type != "cuda":
-        return False
-    if not tensor.is_contiguous():
-        return False
-    if (
-        segment_offsets.device != tensor.device
-        or segment_lengths.device != tensor.device
-        or cu_seqlens.device != tensor.device
-    ):
-        return False
-    return True
+    return can_use_triton_pack(
+        available=flashdeberta_segment_pack_available(),
+        tensor=tensor,
+        metadata_tensors=(segment_offsets, segment_lengths, cu_seqlens),
+    )
 
 
 @_optional_triton_jit

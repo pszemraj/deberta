@@ -23,7 +23,13 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    lookup_registered_op,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    kernel_dtype_name as _kernel_dtype_name,
+)
 from deberta.modeling.mask_utils import is_torch_compiling
 
 try:
@@ -98,7 +104,7 @@ def _dense_bias_repo_tuned_config(
             batch_size=int(batch_size),
             num_heads=int(num_heads),
             head_dim=0,
-            dtype=str(dtype).removeprefix("torch."),
+            dtype=_kernel_dtype_name(dtype),
             has_mask=bool(has_mask),
         )
     )

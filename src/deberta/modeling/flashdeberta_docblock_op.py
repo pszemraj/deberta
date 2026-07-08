@@ -21,7 +21,13 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    lookup_existing_op_pair,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    kernel_dtype_name as _kernel_dtype_name,
+)
 from deberta.modeling.flashdeberta_segment_pack import (
     segment_pack_grad_and_delta_from_padded,
     segment_pack_padded_rows,
@@ -349,7 +355,7 @@ def _docblock_forward_impl(
                 total_tokens=int(q_unpad.shape[0]),
                 batch_size=int(num_segments),
                 head_dim=int(query_layer.shape[-1]),
-                dtype=str(query_layer.dtype).removeprefix("torch."),
+                dtype=_kernel_dtype_name(query_layer.dtype),
                 causal=bool(causal),
                 disentangled=True,
                 att_span=int(att_span),
@@ -704,10 +710,9 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = lookup_registered_op(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_FWD_OP_NAME)
-    existing_backward = lookup_registered_op(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_BWD_OP_NAME)
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
+    existing = lookup_existing_op_pair(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_FWD_OP_NAME, _DOCBLOCK_BWD_OP_NAME)
+    if existing is not None:
+        return existing
 
     if (
         _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is None

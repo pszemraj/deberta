@@ -34,7 +34,16 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    lookup_existing_op_pair,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    kernel_dtype_name as _kernel_dtype_name,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    optional_triton_jit as _optional_triton_jit,
+)
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_padded_rows,
     prefix_pack_padded_rows_pair,
@@ -44,19 +53,6 @@ from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_unpack_padded_rows_triple,
 )
 from deberta.modeling.mask_utils import is_torch_compiling
-
-
-def _optional_triton_jit(fn: object) -> object:
-    """Apply ``triton.jit`` only when Triton imported successfully.
-
-    :param object fn: Kernel function.
-    :return object: JIT kernel or unchanged function in no-Triton environments.
-    """
-
-    if triton is None or tl is None:
-        return fn
-    return triton.jit(fn)
-
 
 try:
     from flashdeberta.ops.flash_attention_varlen import (
@@ -195,16 +191,6 @@ def _varlen_use_triton_op() -> bool:
         and hasattr(torch.library, "triton_op")
         and hasattr(torch.library, "wrap_triton")
     )
-
-
-def _kernel_dtype_name(dtype: torch.dtype) -> str:
-    """Return a compact dtype name for tuning-table matching.
-
-    :param torch.dtype dtype: Torch dtype.
-    :return str: Dtype name without the ``torch.`` prefix.
-    """
-
-    return str(dtype).removeprefix("torch.")
 
 
 def _varlen_repo_tuned_bwd_config(
@@ -1625,10 +1611,9 @@ def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = lookup_registered_op(_VARLEN_OP_NAMESPACE, _VARLEN_FWD_OP_NAME)
-    existing_backward = lookup_registered_op(_VARLEN_OP_NAMESPACE, _VARLEN_BWD_OP_NAME)
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
+    existing = lookup_existing_op_pair(_VARLEN_OP_NAMESPACE, _VARLEN_FWD_OP_NAME, _VARLEN_BWD_OP_NAME)
+    if existing is not None:
+        return existing
 
     if (
         _flash_attn_v2_fwd_dise_lowlevel is None
@@ -2310,10 +2295,11 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
     if not _varlen_use_triton_op():
         return None, None
 
-    existing_forward = lookup_registered_op(_VARLEN_OP_NAMESPACE, f"{_VARLEN_FWD_OP_NAME}_triton")
-    existing_backward = lookup_registered_op(_VARLEN_OP_NAMESPACE, f"{_VARLEN_BWD_OP_NAME}_triton")
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
+    existing = lookup_existing_op_pair(
+        _VARLEN_OP_NAMESPACE, f"{_VARLEN_FWD_OP_NAME}_triton", f"{_VARLEN_BWD_OP_NAME}_triton"
+    )
+    if existing is not None:
+        return existing
 
     @torch.library.triton_op(
         f"{_VARLEN_OP_NAMESPACE}::{_VARLEN_FWD_OP_NAME}_triton",

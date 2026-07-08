@@ -18,7 +18,13 @@ from typing import Any
 import torch
 
 from deberta.modeling.flashdeberta_kernel_tuning import FlashKernelContext, resolve_flash_kernel_config
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability, lookup_registered_op
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    lookup_existing_op_pair,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    kernel_dtype_name as _kernel_dtype_name,
+)
 
 try:
     from flashdeberta.ops.flash_attention import (
@@ -149,7 +155,7 @@ def _fixed_repo_tuned_config(
             query_len=int(query_len),
             key_len=int(key_len),
             head_dim=int(head_dim),
-            dtype=str(dtype).removeprefix("torch."),
+            dtype=_kernel_dtype_name(dtype),
             causal=bool(causal),
             disentangled=bool(disentangled),
             att_span=int(att_span),
@@ -785,10 +791,9 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing_forward = lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME)
-    existing_backward = lookup_registered_op(_FIXED_OP_NAMESPACE, _FIXED_BWD_OP_NAME)
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
+    existing = lookup_existing_op_pair(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME, _FIXED_BWD_OP_NAME)
+    if existing is not None:
+        return existing
 
     if not _fixed_use_triton_op():
         return None, None
