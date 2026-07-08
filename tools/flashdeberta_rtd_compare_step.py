@@ -12,38 +12,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+import _bench_common as bench  # noqa: E402  (inserts src/ on sys.path at import)
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
-
-def _ensure_src_on_path() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    src_path = str(repo_root / "src")
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
-
-
-_ensure_src_on_path()
-
-from deberta.config import load_config, resolve_effective_mixed_precision  # noqa: E402
-from deberta.data.loading import load_hf_dataset  # noqa: E402
-from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones  # noqa: E402
+from deberta.config import load_config  # noqa: E402
+from deberta.modeling import DebertaV3RTDPretrainer  # noqa: E402
 from deberta.modeling.rtd import attention_mask_to_active_tokens  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
-    _bf16_runtime_sanity_check,
     _build_doc_block_mask,
-    _maybe_enable_tf32,
     _stabilize_compile_attention_mask,
     prepare_flash_attention_batch_metadata,
 )
-from deberta.training.runtime import _build_train_dataset_and_collator  # noqa: E402
 from deberta.training.steps import (  # noqa: E402
     _move_batch_to_device,
     _sync_discriminator_embeddings_if_available,
@@ -82,13 +65,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _autocast_context(mixed_precision: str):
-    normalized = str(mixed_precision).strip().lower()
-    if normalized == "bf16":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    if normalized in {"fp16", "float16"}:
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
-    return nullcontext()
+_autocast_context = bench.autocast_context
 
 
 def _tensor_batch_clone(batch: dict[str, Any]) -> dict[str, Any]:
@@ -118,29 +95,7 @@ def _build_model(
     tokenizer: Any,
     device: torch.device,
 ) -> DebertaV3RTDPretrainer:
-    disc_config, gen_config = build_backbone_configs(
-        model_cfg=cfg.model,
-        tokenizer=tokenizer,
-        max_position_embeddings=int(cfg.data.max_seq_length),
-    )
-    disc_backbone, gen_backbone = build_backbones(
-        model_cfg=cfg.model,
-        disc_config=disc_config,
-        gen_config=gen_config,
-        load_pretrained_weights=True,
-    )
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=disc_backbone,
-        generator_backbone=gen_backbone,
-        disc_config=disc_config,
-        gen_config=gen_config,
-        embedding_sharing=cfg.model.embedding_sharing,
-        tie_generator_word_embeddings=True,
-        additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
-    ).to(device=device)
-    _sync_discriminator_embeddings_if_available(model)
-    model.train()
-    return model
+    return bench.build_rtd_pretrainer(cfg=cfg, tokenizer=tokenizer, device=device, train_mode=True)
 
 
 def _prepare_batch(
@@ -348,25 +303,7 @@ def _metadata_summary(meta: Any | None) -> dict[str, Any]:
     }
 
 
-def _first_batch(cfg: Any, tokenizer: Any, *, batch_index: int) -> dict[str, Any]:
-    raw_train = load_hf_dataset(cfg=cfg.data, split=cfg.data.train_split, streaming=cfg.data.streaming)
-    train_dataset, collator = _build_train_dataset_and_collator(
-        raw_train=raw_train,
-        tokenizer=tokenizer,
-        data_cfg=cfg.data,
-        train_cfg=cfg.train,
-        process_index=0,
-        num_processes=1,
-    )
-    loader = DataLoader(
-        train_dataset,
-        batch_size=int(cfg.train.per_device_train_batch_size),
-        collate_fn=collator,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=True,
-        persistent_workers=False,
-    )
+def _first_batch(loader: Any, *, batch_index: int) -> dict[str, Any]:
     iterator = iter(loader)
     batch: dict[str, Any] | None = None
     for _ in range(int(batch_index) + 1):
@@ -402,11 +339,11 @@ def main() -> None:
     torch.manual_seed(int(args.seed))
     torch.cuda.manual_seed_all(int(args.seed))
 
-    eager_cfg = load_config(
-        args.config,
-        overrides=_model_overrides(
-            attention_impl="eager", docblock_bias_seq_len=int(args.docblock_bias_seq_len)
-        ),
+    eager_cfg, mixed_precision, tokenizer, loader = bench.load_tool_config_and_loader(
+        str(args.config),
+        _model_overrides(attention_impl="eager", docblock_bias_seq_len=int(args.docblock_bias_seq_len)),
+        tool_name="flashdeberta_rtd_compare_step.py",
+        deterministic_loader=True,
     )
     flash_cfg = load_config(
         args.config,
@@ -414,14 +351,7 @@ def main() -> None:
             attention_impl="flash", docblock_bias_seq_len=int(args.docblock_bias_seq_len)
         ),
     )
-    mixed_precision = resolve_effective_mixed_precision(
-        eager_cfg.train.mixed_precision,
-        bf16_sanity_check=_bf16_runtime_sanity_check,
-    )
-    _maybe_enable_tf32(bool(eager_cfg.train.tf32))
-
-    tokenizer = AutoTokenizer.from_pretrained(eager_cfg.model.tokenizer_name_or_path, use_fast=True)
-    batch_cpu = _first_batch(eager_cfg, tokenizer, batch_index=int(args.batch_index))
+    batch_cpu = _first_batch(loader, batch_index=int(args.batch_index))
 
     eager_model = _build_model(cfg=eager_cfg, tokenizer=tokenizer, device=device)
     flash_model = _build_model(cfg=flash_cfg, tokenizer=tokenizer, device=device)

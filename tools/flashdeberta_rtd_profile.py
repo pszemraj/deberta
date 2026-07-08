@@ -21,42 +21,21 @@ import json
 import os
 import statistics
 import subprocess
-import sys
 import time
 from collections import defaultdict
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+import _bench_common as bench  # noqa: E402  (inserts src/ on sys.path at import)
 import torch
 from torch.profiler import ProfilerActivity
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
-
-def _ensure_src_on_path() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    src_path = str(repo_root / "src")
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
-
-
-_ensure_src_on_path()
-
-from deberta.config import load_config, resolve_effective_mixed_precision  # noqa: E402
-from deberta.data.loading import load_hf_dataset  # noqa: E402
-from deberta.modeling import (  # noqa: E402
-    DebertaV3RTDPretrainer,
-    build_backbone_configs,
-    build_backbones,
-)
+from deberta.modeling import DebertaV3RTDPretrainer  # noqa: E402
 from deberta.training.compile import (  # noqa: E402
-    _bf16_runtime_sanity_check,
     _build_doc_block_mask,
     _compile_backbones_for_scope,
     _dtype_for_mixed_precision,
     _maybe_cudagraph_mark_step_begin,
-    _maybe_enable_tf32,
     _prefill_rotary_caches_for_compile,
     _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
@@ -68,7 +47,6 @@ from deberta.training.runtime import (  # noqa: E402
     _build_decoupled_optimizers,
     _build_optimizer,
     _build_scheduler,
-    _build_train_dataset_and_collator,
 )
 from deberta.training.steps import (  # noqa: E402
     _collect_ga_window,
@@ -139,13 +117,7 @@ def _bool_text(value: str) -> bool:
     raise ValueError(f"Expected true/false, got: {value}")
 
 
-def _autocast_context(mixed_precision: str):
-    normalized = str(mixed_precision).strip().lower()
-    if normalized == "bf16":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    if normalized in {"fp16", "float16"}:
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
-    return nullcontext()
+_autocast_context = bench.autocast_context
 
 
 def _write_profiler_outputs(profile_dir: Path, profiler: torch.profiler.profile) -> None:
@@ -670,56 +642,15 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats(device)
 
     overrides = _maybe_override_config(args)
-    cfg = load_config(args.config, overrides=overrides)
+    cfg, mixed_precision, tokenizer, loader = bench.load_tool_config_and_loader(
+        str(args.config),
+        overrides,
+        tool_name="flashdeberta_rtd_profile.py",
+    )
     model_cfg, data_cfg, train_cfg = cfg.model, cfg.data, cfg.train
-
-    mixed_precision = resolve_effective_mixed_precision(
-        train_cfg.mixed_precision,
-        bf16_sanity_check=_bf16_runtime_sanity_check,
-    )
-    _maybe_enable_tf32(bool(train_cfg.tf32))
-
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
-    raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
-    train_dataset, collator = _build_train_dataset_and_collator(
-        raw_train=raw_train,
-        tokenizer=tokenizer,
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        process_index=0,
-        num_processes=1,
-    )
-    loader = DataLoader(
-        train_dataset,
-        batch_size=int(train_cfg.per_device_train_batch_size),
-        collate_fn=collator,
-        num_workers=int(train_cfg.dataloader_num_workers),
-        pin_memory=bool(train_cfg.dataloader_pin_memory),
-        drop_last=True,
-        persistent_workers=int(train_cfg.dataloader_num_workers) > 0,
-    )
     train_iter = iter(loader)
 
-    disc_config, gen_config = build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=tokenizer,
-        max_position_embeddings=int(data_cfg.max_seq_length),
-    )
-    disc_backbone, gen_backbone = build_backbones(
-        model_cfg=model_cfg,
-        disc_config=disc_config,
-        gen_config=gen_config,
-        load_pretrained_weights=True,
-    )
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=disc_backbone,
-        generator_backbone=gen_backbone,
-        disc_config=disc_config,
-        gen_config=gen_config,
-        embedding_sharing=model_cfg.embedding_sharing,
-        tie_generator_word_embeddings=True,
-        additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
-    ).to(device=device)
+    model = bench.build_rtd_pretrainer(cfg=cfg, tokenizer=tokenizer, device=device, train_mode=False)
 
     effective_decoupled_training = bool(train_cfg.decoupled_training)
     if effective_decoupled_training:
@@ -733,8 +664,6 @@ def main() -> None:
     else:
         optimizer = _build_optimizer(model, train_cfg, mixed_precision=mixed_precision)
         lr_scheduler = _build_scheduler(optimizer, train_cfg)
-
-    _sync_discriminator_embeddings_if_available(model)
 
     compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
     compile_scope = _compile_model_if_enabled(

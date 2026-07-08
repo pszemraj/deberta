@@ -4,24 +4,11 @@
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
+import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
-
-
-def _ensure_src_on_path() -> None:
-    """Add the repository ``src/`` directory to ``sys.path`` for direct script execution."""
-
-    repo_root = Path(__file__).resolve().parents[1]
-    src_path = str(repo_root / "src")
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
-
-
-_ensure_src_on_path()
 
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.modeling.mask_utils import (  # noqa: E402

@@ -23,23 +23,13 @@ from __future__ import annotations
 import argparse
 import os
 import statistics
-import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
-
-
-def _ensure_src_on_path() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    src_path = str(repo_root / "src")
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
-
-
-_ensure_src_on_path()
 
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 
