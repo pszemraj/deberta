@@ -1035,10 +1035,12 @@ def test_run_pretraining_compiles_generator_and_discriminator(
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
-def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
+def test_run_pretraining_builds_doc_block_mask_in_flash_batch_preparation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
+
+    from deberta.training.compile import _build_doc_block_mask
 
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
@@ -1046,7 +1048,7 @@ def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
         k: v.clone() for k, v in _PRETRAINING_BATCH.items() if isinstance(v, torch.Tensor)
     }
     batch_with_doc_ids["doc_ids"] = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
-    expected_mask = pretrain_mod._build_doc_block_mask(batch_with_doc_ids["doc_ids"])
+    expected_mask = _build_doc_block_mask(batch_with_doc_ids["doc_ids"])
 
     def _cycle_with_doc_ids(_loader: Any, *, start_epoch: int = 0):
         del _loader, start_epoch
@@ -1060,27 +1062,21 @@ def test_run_pretraining_builds_doc_block_mask_before_compile_stabilizer(
         lambda target, *, mode="default", backend="inductor", dynamic=None: target,
     )
 
+    # prepare_flash_attention_batch_metadata owns doc_ids consumption for every
+    # backbone: the model-facing batch must carry the dense pairwise doc-block
+    # mask with the compact doc_ids key consumed.
     seen_masks: list[torch.Tensor] = []
-    original_stabilize = pretrain_mod._stabilize_compile_attention_mask
+    original_prepare = pretrain_mod.prepare_flash_attention_batch_metadata
 
-    def _stabilize_spy(
-        *,
-        batch: dict[str, Any],
-        compile_enabled: bool,
-        compile_scope: str,
-        backbone_type: str,
-    ) -> dict[str, Any]:
-        mask = batch.get("attention_mask")
+    def _prepare_spy(**kwargs: Any) -> Any:
+        prepared, flash_meta = original_prepare(**kwargs)
+        assert "doc_ids" not in prepared
+        mask = prepared.get("attention_mask")
         if isinstance(mask, torch.Tensor):
             seen_masks.append(mask.detach().clone())
-        return original_stabilize(
-            batch=batch,
-            compile_enabled=compile_enabled,
-            compile_scope=compile_scope,
-            backbone_type=backbone_type,
-        )
+        return prepared, flash_meta
 
-    monkeypatch.setattr(pretrain_mod, "_stabilize_compile_attention_mask", _stabilize_spy)
+    monkeypatch.setattr(pretrain_mod, "prepare_flash_attention_batch_metadata", _prepare_spy)
 
     train_cfg = TrainConfig(
         output_dir=str(tmp_path / "run"),
