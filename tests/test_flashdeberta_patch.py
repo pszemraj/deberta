@@ -417,6 +417,57 @@ def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
     assert resolve_flash_kernel_config(context) == shipped
 
 
+def test_flash_kernel_config_capability_precedence_and_override_append(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        FlashKernelContext,
+        configure_flashdeberta_kernel_overrides,
+        resolve_flash_kernel_config,
+    )
+
+    # An appended hardware-agnostic kernels row (the documented override
+    # workflow for giving several untuned GPUs a conservative tile) must not
+    # outrank the shipped exact sm_120 row on sm_120 itself.
+    wildcard_path = tmp_path / "flash_kernels_wildcard.json"
+    wildcard_path.write_text(
+        json.dumps(
+            {
+                "kernels": [
+                    {
+                        "route": "varlen",
+                        "kind": "bwd_kv",
+                        "seq_bucket": "2048_medium",
+                        "head_dim": "*",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 2,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _context(capability: tuple[int, int]) -> FlashKernelContext:
+        return FlashKernelContext(
+            compute_capability=capability,
+            route="varlen",
+            kind="bwd_kv",
+            seq_len=2048,
+            total_tokens=3000,
+            batch_size=2,
+            head_dim=64,
+        )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(wildcard_path))
+        assert resolve_flash_kernel_config(_context((12, 0))) == (64, 32, 2, 4)
+        # Untuned hardware picks up the appended wildcard row.
+        assert resolve_flash_kernel_config(_context((9, 0))) == (16, 16, 1, 2)
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
     from deberta.training.compile import (

@@ -379,8 +379,32 @@ def _entry_matches(context: FlashKernelContext, entry: dict[str, Any]) -> bool:
     return True
 
 
+def _kernel_launch_tuple(entry: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    """Parse the launch tuple from one kernel table entry.
+
+    :param dict[str, Any] entry: Matching JSON entry.
+    :return tuple[int, int, int, int] | None: ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or None when the entry is malformed.
+    """
+
+    try:
+        return (
+            int(entry["block_m"]),
+            int(entry["block_n"]),
+            int(entry["num_stages"]),
+            int(entry["num_warps"]),
+        )
+    except Exception:
+        return None
+
+
 def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, int, int] | None:
     """Resolve a measured kernel launch tuple from the active tuning table.
+
+    An exact-capability row outranks a wildcard row; within the same
+    specificity, later rows win so appended override-table rows take
+    precedence, matching :func:`flash_route_policy` and the documented
+    override workflow.
 
     Results are cached in a bounded LRU (contexts carry per-batch token counts)
     until :func:`configure_flashdeberta_kernel_overrides` changes the active table,
@@ -393,18 +417,19 @@ def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, 
     kernels = _load_tuning_payload().get("kernels", [])
     if not isinstance(kernels, list):
         return None
+    wildcard_match: dict[str, Any] | None = None
     for raw in reversed(kernels):
         if not isinstance(raw, dict) or not _entry_matches(context, raw):
             continue
-        try:
-            return (
-                int(raw["block_m"]),
-                int(raw["block_n"]),
-                int(raw["num_stages"]),
-                int(raw["num_warps"]),
-            )
-        except Exception:
-            return None
+        if str(raw.get("compute_capability", "*")).strip().lower() == "*":
+            if wildcard_match is None:
+                wildcard_match = raw
+            continue
+        # _entry_matches already rejected rows scoped to other GPU classes, so
+        # any non-wildcard match here is exact for this capability.
+        return _kernel_launch_tuple(raw)
+    if wildcard_match is not None:
+        return _kernel_launch_tuple(wildcard_match)
     return None
 
 
