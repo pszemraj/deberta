@@ -2828,21 +2828,36 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
     assert int(meta.active_tokens_scalar) == 5
 
 
-def test_prepare_flash_metadata_does_not_route_non_prefix_padding_mask_to_flash() -> None:
+def test_prepare_flash_metadata_does_not_route_non_prefix_padding_mask_to_flash(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Metadata prep must not bake prefix seq_lengths from a mask with holes."""
 
     import deberta.training.compile as compile_mod
 
+    monkeypatch.setattr(compile_mod, "_NON_PREFIX_PADDING_FALLBACK_NOTICED", False)
     batch = {
         "input_ids": torch.zeros((1, 4), dtype=torch.long),
         "attention_mask": torch.tensor([[True, False, True, False]]),
     }
 
-    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
-        batch=batch,
-        backbone_type="hf_deberta_v2",
-        flash_enabled=True,
-    )
+    with caplog.at_level(logging.WARNING, logger=compile_mod.logger.name):
+        prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+            batch=batch,
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+        )
+        # Batch prep is the one fallback signal that survives compiled
+        # training, so this eager downgrade must be visible by default.
+        assert any("holes or left padding" in record.message for record in caplog.records)
+        caplog.clear()
+        compile_mod.prepare_flash_attention_batch_metadata(
+            batch=dict(batch),
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+        )
+        assert not caplog.records
 
     assert prepared is batch
     assert meta is None

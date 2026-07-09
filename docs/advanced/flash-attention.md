@@ -155,10 +155,12 @@ Tracked packed doc-block configs for benchmarking and training live at
   for recompute. Peak memory still measures well below eager at the shipped packed configs, but
   a recompute-in-backward knob is a prerequisite before running contexts longer than `4096` or a
   larger batch-times-length product.
-- Route counters and fallback warnings are debug-only and off by default; set
-  `FLASHDEBERTA_DEBUG_STATS=1` / `FLASHDEBERTA_WARN_FALLBACKS=1` when diagnosing routing in
-  eager runs. Compiled training never mutates the Python-side stats (see
-  [Advanced / torch.compile](torch-compile.md)).
+- Route counters are debug-only and off by default (`FLASHDEBERTA_DEBUG_STATS=1` to enable);
+  per-call fallback warnings are on by default (`FLASHDEBERTA_WARN_FALLBACKS=0` to silence) but
+  are skipped inside compiled forwards, and compiled training never mutates the Python-side
+  stats (see [Advanced / torch.compile](torch-compile.md)). The one fallback signal that
+  survives compiled training is host-side batch preparation, which warns once per process when
+  non-prefix padding masks start keeping batches on eager attention.
 
 ## Known follow-ups
 

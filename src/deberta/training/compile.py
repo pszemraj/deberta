@@ -230,6 +230,29 @@ def _notice_untuned_flash_hardware_once(device: torch.device) -> None:
     )
 
 
+_NON_PREFIX_PADDING_FALLBACK_NOTICED = False
+
+
+def _notice_non_prefix_padding_fallback_once() -> None:
+    """Warn once per process when non-prefix padding masks keep batches on eager.
+
+    Batch preparation runs host-side outside compiled graphs, so this is the
+    one fallback signal that survives compiled training; the per-layer
+    fallback warnings are skipped inside compiled forwards by design.
+    """
+
+    global _NON_PREFIX_PADDING_FALLBACK_NOTICED
+    if _NON_PREFIX_PADDING_FALLBACK_NOTICED:
+        return
+    _NON_PREFIX_PADDING_FALLBACK_NOTICED = True
+    logger.warning(
+        "FlashDeBERTa batch preparation saw a padding mask with holes or left "
+        "padding; such batches run eager attention (throughput drops for them). "
+        "This is logged once per process - set FLASHDEBERTA_DEBUG_STATS=1 in an "
+        "uncompiled run to count occurrences."
+    )
+
+
 def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
     """Apply config-driven FlashDeBERTa kernel override tables for route helpers.
 
@@ -583,6 +606,7 @@ def prepare_flash_attention_batch_metadata(
         # Fixed/varlen flash routes interpret seq_lengths as right-padded
         # prefixes; publishing lengths for a mask with holes or left padding
         # would bake in wrong attention semantics. Leave the batch on eager.
+        _notice_non_prefix_padding_fallback_once()
         _clear_flash_batch_metadata(batch)
         return batch, None
     seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
