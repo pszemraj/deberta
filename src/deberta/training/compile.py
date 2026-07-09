@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import types
 from collections.abc import Callable
 from typing import Any
@@ -210,6 +211,19 @@ def _flash_route_hint_for_docblock_batch(
     return "docblock"
 
 
+def _is_main_process() -> bool:
+    """Check whether this process should emit once-per-process flash notices.
+
+    Launchers (accelerate, torchrun) export ``RANK``; a single-process run has
+    no ``RANK`` and counts as main. This keeps host-side flash warnings from
+    repeating once per rank in distributed training.
+
+    :return bool: True for rank 0 or unlaunched processes.
+    """
+
+    return os.environ.get("RANK", "0").strip() in {"", "0"}
+
+
 _UNTUNED_FLASH_HARDWARE_NOTICED: set[str] = set()
 
 
@@ -219,7 +233,7 @@ def _notice_untuned_flash_hardware_once(device: torch.device) -> None:
     :param torch.device device: Device hosting the flash batch.
     """
 
-    if device.type != "cuda":
+    if device.type != "cuda" or not _is_main_process():
         return
     key = compute_capability_key(device_compute_capability(device))
     if key in _UNTUNED_FLASH_HARDWARE_NOTICED:
@@ -247,7 +261,7 @@ def _notice_non_prefix_padding_fallback_once() -> None:
     """
 
     global _NON_PREFIX_PADDING_FALLBACK_NOTICED
-    if _NON_PREFIX_PADDING_FALLBACK_NOTICED:
+    if _NON_PREFIX_PADDING_FALLBACK_NOTICED or not _is_main_process():
         return
     _NON_PREFIX_PADDING_FALLBACK_NOTICED = True
     logger.warning(
@@ -255,6 +269,63 @@ def _notice_non_prefix_padding_fallback_once() -> None:
         "padding; such batches run eager attention (throughput drops for them). "
         "This is logged once per process - set FLASHDEBERTA_DEBUG_STATS=1 in an "
         "uncompiled run to count occurrences."
+    )
+
+
+_DOCBLOCK_ROUTE_NOTICED: set[tuple[str, int, int]] = set()
+
+
+def _notice_docblock_route_once(
+    *,
+    route_hint: str,
+    seq_len: int,
+    batch_size: int,
+    device: torch.device | None,
+) -> None:
+    """Log the doc-block route decision once per batch shape.
+
+    Route selection depends on batch shape, so a config change (batch size,
+    sequence length) can silently flip dense ``docblock_bias`` to ragged
+    ``docblock`` and cost the measured speedup. Batch preparation runs
+    host-side outside compiled graphs, so this signal survives compiled
+    training where the per-layer ``FLASHDEBERTA_DEBUG_STATS`` counters are
+    no-ops.
+
+    :param str route_hint: Selected doc-block route for this shape.
+    :param int seq_len: Packed sequence length.
+    :param int batch_size: Packed batch size.
+    :param torch.device | None device: Batch device for capability lookup.
+    """
+
+    if not _is_main_process():
+        return
+    key = (str(route_hint), int(seq_len), int(batch_size))
+    if key in _DOCBLOCK_ROUTE_NOTICED:
+        return
+    _DOCBLOCK_ROUTE_NOTICED.add(key)
+    if route_hint != "docblock_bias":
+        unbounded_route = flash_route_choice(
+            policy="docblock",
+            seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
+            compute_capability=device_compute_capability(device) if device is not None else None,
+        )
+        if unbounded_route == "docblock_bias":
+            logger.warning(
+                "FlashDeBERTa keeps packed doc-block batches (B=%d, S=%d) on the ragged "
+                "'docblock' route: the tuning table's dense row exists for this shape but "
+                "its max_batch_size/max_seq_len bounds exclude the batch (the dense route "
+                "saves a (B,H,S,S) bias for backward). If this GPU has memory headroom, "
+                "raise the row bounds via model.hf.flash.kernel_overrides_path; see "
+                "docs/advanced/gpu-support.md.",
+                batch_size,
+                seq_len,
+            )
+            return
+    logger.info(
+        "FlashDeBERTa doc-block route for packed batches (B=%d, S=%d): %s (logged once per shape).",
+        batch_size,
+        seq_len,
+        route_hint,
     )
 
 
@@ -505,6 +576,12 @@ def prepare_flash_attention_batch_metadata(
             seq_len=int(input_ids.shape[-1]),
             batch_size=int(input_ids.shape[0]),
             flash_cfg=flash_cfg,
+            device=input_ids.device,
+        )
+        _notice_docblock_route_once(
+            route_hint=route_hint,
+            seq_len=int(input_ids.shape[-1]),
+            batch_size=int(input_ids.shape[0]),
             device=input_ids.device,
         )
         keep_mask = doc_ids.ne(0)
