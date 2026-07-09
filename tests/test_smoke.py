@@ -324,6 +324,57 @@ def test_collator_skips_document_ids_for_single_doc_packed_chunk():
     assert "attention_mask" not in batch
 
 
+def test_active_token_definitions_agree_for_packed_docblock_batches():
+    """GA weighting, tokens/sec logging, RTD loss, and flash prep must count the same tokens.
+
+    Three call sites independently derive "active tokens" from a raw collator
+    batch; a drift between any two silently skews per-token effective LR or
+    logged throughput, so this pins them to each other and to doc_ids.ne(0).
+    """
+
+    from deberta.modeling.rtd import attention_mask_to_active_tokens
+    from deberta.training.loop_utils import _count_input_tokens_for_batch, _count_rtd_tokens_for_batch
+
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+    )
+
+    # Rows of different lengths force a padded tail on the shorter row.
+    features = [
+        {
+            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+        },
+        {
+            "input_ids": [tok.cls_token_id, 21, 22, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 0, 1],
+        },
+    ]
+    batch = coll(features)
+    assert "doc_ids" in batch
+
+    expected_active = int(batch["doc_ids"].ne(0).sum().item())
+    assert expected_active == 10
+
+    tokens_per_sec_count = _count_input_tokens_for_batch(batch)
+    assert int(tokens_per_sec_count) == expected_active
+
+    _, disc_ga_count = _count_rtd_tokens_for_batch(batch, pad_token_id=tok.pad_token_id)
+    assert int(disc_ga_count) == expected_active
+
+    rtd_loss_active = attention_mask_to_active_tokens(
+        input_ids=batch["input_ids"],
+        attention_mask=batch.get("attention_mask"),
+        pad_token_id=tok.pad_token_id,
+    )
+    assert int(rtd_loss_active.sum().item()) == expected_active
+    assert torch.equal(rtd_loss_active, batch["doc_ids"].ne(0))
+
+
 def test_build_doc_block_mask_matches_expected_structure():
     # doc_ids: doc1=[1,1,1], doc2=[2,2], pad=[0]
     doc_ids = torch.tensor([[1, 1, 1, 2, 2, 0]], dtype=torch.long)
