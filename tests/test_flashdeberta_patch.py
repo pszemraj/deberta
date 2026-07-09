@@ -537,6 +537,31 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
+def test_flash_padding_route_honors_policy_row_seq_len_bounds(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        configure_flashdeberta_kernel_overrides,
+        flash_padding_route,
+    )
+
+    override_path = tmp_path / "flash_routes.json"
+    override_path.write_text(
+        '{"route_policies": {"padding": '
+        '[{"seq_bucket": "under_2048", "choice": "varlen", "max_seq_len": 1024}]}}',
+        encoding="utf-8",
+    )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        # Both lengths resolve to the under_2048 bucket (1024 itself would
+        # match 1024_exact); only the in-bound length may take the row.
+        assert flash_padding_route(seq_len=512, total_tokens=512, batch_size=1) == "varlen"
+        # Beyond the row's own bound the row must not apply; the resolver
+        # falls back to the conservative default instead.
+        assert flash_padding_route(seq_len=1500, total_tokens=1500, batch_size=1) == "fixed"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def test_flashdeberta_kernel_overrides_reload_when_same_path_content_changes(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         configure_flashdeberta_kernel_overrides,

@@ -360,6 +360,7 @@ def flash_padding_route(
         policy="padding",
         seq_bucket=seq_bucket,
         compute_capability=compute_capability,
+        seq_len=int(seq_len),
     )
     if table_route in {"fixed", "varlen"}:
         return table_route
