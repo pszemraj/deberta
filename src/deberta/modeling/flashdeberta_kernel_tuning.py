@@ -378,6 +378,7 @@ def flash_padding_route(
         seq_bucket=seq_bucket,
         compute_capability=compute_capability,
         seq_len=int(seq_len),
+        batch_size=int(batch_size) if batch_size is not None else None,
     )
     if table_route in {"fixed", "varlen"}:
         return table_route
