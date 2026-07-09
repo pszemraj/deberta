@@ -15,6 +15,10 @@ Constraints:
 - valid only with `model.backbone_type=hf_deberta_v2`
 - dropout must be disabled (`model.dropout.hidden_prob` and `model.dropout.attention_probs_prob`
   set to `0.0` or null)
+- `max_relative_positions` must cover `max_position_embeddings` (the repo default `-1` does).
+  Eager attention clamps relative positions to the span before log-bucketing while the flash
+  kernels bucket unclamped positions, so an external checkpoint pinning a shorter explicit span
+  is rejected at build time instead of silently training against different position biases.
 - CUDA only. Measured route/kernel defaults ship for `sm_120` (RTX 5090); other GPUs run flash
   with conservative capability-scoped defaults - see [GPU support](gpu-support.md)
 - Calls with `output_attentions=true` use eager attention for that call, preserving the HF-style

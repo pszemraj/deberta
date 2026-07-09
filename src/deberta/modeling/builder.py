@@ -652,6 +652,18 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
         raise ValueError(f"{component} flash attention requires relative_attention=true.")
     if int(getattr(cfg, "position_buckets", 0)) <= 0:
         raise ValueError(f"{component} flash attention requires position_buckets > 0.")
+    max_relative_positions = int(getattr(cfg, "max_relative_positions", -1))
+    max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 0))
+    if 0 < max_relative_positions < max_position_embeddings:
+        # Eager attention clamps relative positions to the span before
+        # log-bucketing; the FlashDeBERTa kernels bucket unclamped positions,
+        # so the two silently disagree once seq_len exceeds the span.
+        raise ValueError(
+            f"{component} flash attention requires max_relative_positions to cover "
+            f"max_position_embeddings; got max_relative_positions={max_relative_positions} < "
+            f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
+            "to -1 (span follows max_position_embeddings) or use attention_impl=eager."
+        )
     pos_att_type = getattr(cfg, "pos_att_type", "")
     if isinstance(pos_att_type, str):
         pos_parts = {part.strip().lower() for part in pos_att_type.split("|") if part.strip()}

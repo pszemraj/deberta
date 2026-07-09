@@ -498,6 +498,10 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         ({"relative_attention": False}, "relative_attention=true"),
         ({"position_buckets": 0}, "position_buckets > 0"),
         ({"pos_att_type": "p2c|p2p"}, "does not support pos_att_type"),
+        # External checkpoints may pin a short explicit span; eager clamps
+        # relative positions to it before bucketing while the flash kernels
+        # do not, so flash must refuse rather than silently diverge.
+        ({"max_relative_positions": 128}, "max_relative_positions to cover"),
     ],
 )
 def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
