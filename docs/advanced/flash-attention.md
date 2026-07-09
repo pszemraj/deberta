@@ -116,7 +116,8 @@ builder tile is `64 x 128, stages=2, warps=4` at the packed doc-block lengths.
 2. Promote durable winners into a JSON table and select it with
    `model.hf.flash.kernel_overrides_path`. Scope rows to your GPU with a `compute_capability`
    key; override rows append to the shipped table and exact-capability rows outrank wildcards,
-   so one row per bucket is enough.
+   so one row per bucket is enough. Custom `seq_buckets` rows are matched before the shipped
+   buckets (the shipped set already covers every length, so they could never win otherwise).
 3. Once results hold up across runs, fold them into the shipped table.
 
 ## Benchmarking and profiling tools

@@ -537,6 +537,41 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
+def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        configure_flashdeberta_kernel_overrides,
+        flash_seq_bucket,
+    )
+
+    override_path = tmp_path / "flash_buckets.json"
+    override_path.write_text(
+        """
+{
+  "seq_buckets": [
+    {
+      "name": "exact_3000",
+      "min_seq_len": 3000,
+      "max_seq_len": 3000
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        # The shipped buckets cover every length, so the override bucket is
+        # only reachable if override rows are consulted first.
+        assert flash_seq_bucket(seq_len=3000) == "exact_3000"
+        # Shipped resolution order is untouched for lengths the override
+        # does not claim: 1024 must keep matching 1024_exact, not under_2048.
+        assert flash_seq_bucket(seq_len=1024) == "1024_exact"
+        assert flash_seq_bucket(seq_len=4096) == "4096_plus"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def test_docblock_bias_route_uses_table_with_ragged_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

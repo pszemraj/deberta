@@ -107,10 +107,16 @@ def _load_tuning_payload() -> dict[str, Any]:
         base_value = payload.get(key)
         override_value = overrides.get(key)
         if isinstance(base_value, list) or isinstance(override_value, list):
-            merged[key] = [
-                *(base_value if isinstance(base_value, list) else []),
-                *(override_value if isinstance(override_value, list) else []),
-            ]
+            base_rows = base_value if isinstance(base_value, list) else []
+            override_rows = override_value if isinstance(override_value, list) else []
+            if key == "seq_buckets":
+                # Buckets resolve first-match in list order and the shipped
+                # set covers every length, so appended override buckets would
+                # be unreachable; prepend them instead. route_policies/kernels
+                # iterate reversed, so appending keeps "later rows win" there.
+                merged[key] = [*override_rows, *base_rows]
+            else:
+                merged[key] = [*base_rows, *override_rows]
         elif isinstance(base_value, dict) or isinstance(override_value, dict):
             combined = dict(base_value if isinstance(base_value, dict) else {})
             for namespace, override_rows in (
