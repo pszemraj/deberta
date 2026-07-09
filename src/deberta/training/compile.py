@@ -165,6 +165,7 @@ def _flash_route_hint_for_padding_batch(
 def _flash_route_hint_for_docblock_batch(
     *,
     seq_len: int,
+    batch_size: int | None = None,
     flash_cfg: Any | None = None,
     device: torch.device | None = None,
 ) -> str:
@@ -173,11 +174,14 @@ def _flash_route_hint_for_docblock_batch(
     The default policy comes from the repo-local JSON route table. Measured
     packed RTD sequence buckets choose dense ``docblock_bias`` on GPUs with
     matching capability-scoped rows (shipped: ``sm_120``); other hardware
-    defaults to the segment-aware ragged ``docblock`` route. Set
-    ``docblock_bias_seq_len`` to force dense at one exact length on any GPU,
-    or ``0`` to force ragged for ablations.
+    defaults to the segment-aware ragged ``docblock`` route. The dense rows
+    carry ``max_seq_len``/``max_batch_size`` bounds because the route saves a
+    ``(B,H,S,S)`` bias for backward; out-of-bounds batches stay ragged. Set
+    ``docblock_bias_seq_len`` to force dense at one exact length on any GPU
+    regardless of bounds, or ``0`` to force ragged for ablations.
 
     :param int seq_len: Packed sequence length.
+    :param int | None batch_size: Packed batch size, when known.
     :param Any | None flash_cfg: Optional resolved flash config.
     :param torch.device | None device: Batch device for capability-scoped table rows.
     :return str: Either ``docblock_bias`` or ``docblock``.
@@ -199,6 +203,7 @@ def _flash_route_hint_for_docblock_batch(
         seq_bucket=seq_bucket,
         compute_capability=device_compute_capability(device) if device is not None else None,
         seq_len=int(seq_len),
+        batch_size=int(batch_size) if batch_size is not None else None,
     )
     if table_route in {"docblock", "docblock_bias"}:
         return table_route
@@ -498,6 +503,7 @@ def prepare_flash_attention_batch_metadata(
             return batch, None
         route_hint = _flash_route_hint_for_docblock_batch(
             seq_len=int(input_ids.shape[-1]),
+            batch_size=int(input_ids.shape[0]),
             flash_cfg=flash_cfg,
             device=input_ids.device,
         )

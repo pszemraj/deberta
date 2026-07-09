@@ -87,28 +87,33 @@
       {
         "seq_bucket": "1024_exact",
         "choice": "docblock_bias",
-        "compute_capability": "sm_120"
+        "compute_capability": "sm_120",
+        "max_batch_size": 8
       },
       {
         "seq_bucket": "2048_plus",
         "choice": "docblock_bias",
-        "compute_capability": "sm_120"
+        "compute_capability": "sm_120",
+        "max_batch_size": 2
       },
       {
         "seq_bucket": "2048_medium",
         "choice": "docblock_bias",
-        "compute_capability": "sm_120"
+        "compute_capability": "sm_120",
+        "max_batch_size": 2
       },
       {
         "seq_bucket": "2048_sparse",
         "choice": "docblock_bias",
-        "compute_capability": "sm_120"
+        "compute_capability": "sm_120",
+        "max_batch_size": 2
       },
       {
         "seq_bucket": "4096_plus",
         "choice": "docblock_bias",
         "compute_capability": "sm_120",
-        "max_seq_len": 4096
+        "max_seq_len": 4096,
+        "max_batch_size": 2
       }
     ],
     "local_bias": [

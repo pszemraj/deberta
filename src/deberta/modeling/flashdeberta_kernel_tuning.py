@@ -247,20 +247,34 @@ def flash_route_policy(
 flash_route_policy = cache(flash_route_policy)
 
 
-def _route_policy_row_allows_seq_len(row: dict[str, Any], *, seq_len: int) -> bool:
-    """Check a policy row's optional ``min_seq_len``/``max_seq_len`` bounds.
+def _route_policy_row_allows(
+    row: dict[str, Any],
+    *,
+    seq_len: int | None = None,
+    batch_size: int | None = None,
+) -> bool:
+    """Check a policy row's optional shape bounds against known batch facts.
+
+    Rows may carry ``min_seq_len``/``max_seq_len``/``max_batch_size`` keys;
+    each bound is only enforced when the caller supplies the matching fact.
 
     :param dict[str, Any] row: Route-policy row from the tuning table.
-    :param int seq_len: Padded sequence length of the batch under routing.
-    :return bool: False when the row carries a bound that excludes ``seq_len``.
+    :param int | None seq_len: Padded sequence length, when known.
+    :param int | None batch_size: Batch size, when known.
+    :return bool: False when a row bound excludes the supplied facts.
     """
 
-    min_seq = row.get("min_seq_len")
-    if min_seq is not None and seq_len < int(min_seq):
-        return False
-    max_seq = row.get("max_seq_len")
-    if max_seq is not None and seq_len > int(max_seq):
-        return False
+    if seq_len is not None:
+        min_seq = row.get("min_seq_len")
+        if min_seq is not None and seq_len < int(min_seq):
+            return False
+        max_seq = row.get("max_seq_len")
+        if max_seq is not None and seq_len > int(max_seq):
+            return False
+    if batch_size is not None:
+        max_batch = row.get("max_batch_size")
+        if max_batch is not None and batch_size > int(max_batch):
+            return False
     return True
 
 
@@ -270,6 +284,7 @@ def flash_route_choice(
     seq_bucket: str,
     compute_capability: tuple[int, int] | None = None,
     seq_len: int | None = None,
+    batch_size: int | None = None,
 ) -> str | None:
     """Resolve a route choice from the active tuning table.
 
@@ -282,12 +297,14 @@ def flash_route_choice(
         bucket (buckets like ``4096_plus`` are open-ended); a row whose bounds
         exclude this length resolves as if the namespace had no entry, so the
         consumer's conservative default applies.
+    :param int | None batch_size: Batch size, when known. Rows may carry a
+        ``max_batch_size`` bound with the same excluded-row semantics.
     :return str | None: Route choice, or None when the table has no entry.
     """
 
     raw = flash_route_policy(policy=policy, seq_bucket=seq_bucket, compute_capability=compute_capability)
     if raw is not None:
-        if seq_len is not None and not _route_policy_row_allows_seq_len(raw, seq_len=int(seq_len)):
+        if not _route_policy_row_allows(raw, seq_len=seq_len, batch_size=batch_size):
             return None
         choice = raw.get("choice")
         return str(choice).strip() if choice is not None else None

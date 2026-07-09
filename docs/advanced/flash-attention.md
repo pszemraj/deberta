@@ -52,11 +52,14 @@ the upstream FlashDeBERTa environment-variable route fallbacks are never consult
 may be scoped to one GPU class with a `compute_capability` key; an exact `sm_XX` row outranks the
 wildcard rows, and the shipped table scopes its aggressive defaults (`docblock_bias`,
 `local_bias`) to `sm_120` while the padded `fixed`/`varlen` split applies everywhere. Rows may
-also carry `min_seq_len`/`max_seq_len` bounds tighter than their bucket: the `4096_plus` bucket
-is open-ended, so the shipped dense doc-block row is bounded at `max_seq_len: 4096` and packed
-contexts longer than the measured lengths fall back to the ragged `docblock` route instead of
-materializing the quadratic dense bias. See [GPU support](gpu-support.md) for the per-hardware
-picture.
+also carry `min_seq_len`/`max_seq_len`/`max_batch_size` bounds tighter than their bucket: the
+`4096_plus` bucket is open-ended, so the shipped dense doc-block row is bounded at
+`max_seq_len: 4096`, and every dense doc-block row carries a `max_batch_size` sized to its
+bucket's worst case (`8`/`2`/`2` at `1024`/`2048`-family/`4096` - the saved bias costs about
+`4.8 GiB` per batch element at `4096`). Out-of-bounds packed batches fall back to the ragged
+`docblock` route instead of materializing a quadratic dense bias that OOMs at step 1; the
+`docblock_bias_seq_len` knob bypasses row bounds as the explicit opt-in. See
+[GPU support](gpu-support.md) for the per-hardware picture.
 
 The padded fixed/varlen split at `2048` is deliberate: on the measured unpacked `1024` RTD regime
 the compile-clean fixed path beats the varlen backward kernels, while varlen pulls back ahead for
@@ -152,9 +155,11 @@ Tracked packed doc-block configs for benchmarking and training live at
   packed `1024`, with same-seed eager-vs-flash deltas inside that spread). Resume/drift tooling
   must not assert bit-exact replay through flash attention.
 - The flash-with-bias op saves the dense `(B,H,S,S)` bias tensor for backward, trading memory
-  for recompute. Peak memory still measures well below eager at the shipped packed configs, but
-  a recompute-in-backward knob is a prerequisite before running contexts longer than `4096` or a
-  larger batch-times-length product.
+  for recompute. Peak memory still measures well below eager at the shipped packed configs, and
+  the route table's `max_seq_len`/`max_batch_size` bounds on the dense rows keep unmeasured
+  larger shapes on the ragged route automatically. A recompute-in-backward knob remains a
+  prerequisite before forcing the dense route past those bounds (via `docblock_bias_seq_len` or
+  an override table).
 - Route counters are debug-only and off by default (`FLASHDEBERTA_DEBUG_STATS=1` to enable);
   per-call fallback warnings are on by default (`FLASHDEBERTA_WARN_FALLBACKS=0` to silence) but
   are skipped inside compiled forwards, and compiled training never mutates the Python-side

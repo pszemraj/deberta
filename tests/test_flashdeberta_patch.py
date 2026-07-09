@@ -648,6 +648,23 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
         )
         == "docblock_bias"
     )
+    # The dense rows also carry max_batch_size bounds: the saved bias scales
+    # linearly in batch size (about 4.8 GiB per batch element at 4096), so
+    # growing per-device batch size past the bound falls back to ragged
+    # instead of a step-1 CUDA OOM. The knob bypasses bounds explicitly.
+    assert _flash_route_hint_for_docblock_batch(seq_len=4096, batch_size=2, device=device) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=4096, batch_size=3, device=device) == "docblock"
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024, batch_size=8, device=device) == "docblock_bias"
+    assert _flash_route_hint_for_docblock_batch(seq_len=1024, batch_size=9, device=device) == "docblock"
+    assert (
+        _flash_route_hint_for_docblock_batch(
+            seq_len=4096,
+            batch_size=16,
+            flash_cfg={"docblock_bias_seq_len": 4096},
+            device=device,
+        )
+        == "docblock_bias"
+    )
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
