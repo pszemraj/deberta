@@ -2946,6 +2946,38 @@ def _docblock_route_notice_batch(*, batch_size: int = 2, seq_len: int = 5) -> di
     }
 
 
+def test_bounded_out_docblock_batches_get_the_wildcard_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded-out shapes must resolve exactly like hardware with no measured rows.
+
+    A bounded-out exact-capability row returns None from the table and the
+    consumer falls back to a hardcoded ragged default. Nothing in the code
+    forces that default to match the table's wildcard rows, so pin the
+    equality here: if a wildcard docblock row's choice ever changes, the
+    fallback must be revisited rather than silently diverging.
+    """
+
+    import deberta.training.compile as compile_mod
+    from deberta.modeling.flashdeberta_kernel_tuning import flash_route_choice, flash_seq_bucket
+
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
+    # One out-of-bound shape per density-less bucket with a bounded sm_120
+    # dense row: B=9 exceeds 1024_exact's cap, B=3 exceeds the 2048/4096 caps.
+    for seq_len, batch_size in [(1024, 9), (2048, 3), (4096, 3)]:
+        bounded_route = compile_mod._flash_route_hint_for_docblock_batch(
+            seq_len=seq_len,
+            batch_size=batch_size,
+            device=torch.device("cpu"),
+        )
+        wildcard_route = flash_route_choice(
+            policy="docblock",
+            seq_bucket=flash_seq_bucket(seq_len=seq_len),
+            compute_capability=None,
+        )
+        assert bounded_route == wildcard_route == "docblock", (seq_len, batch_size)
+
+
 def test_prepare_flash_metadata_logs_docblock_route_once_per_shape(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
