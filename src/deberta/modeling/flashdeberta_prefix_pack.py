@@ -47,15 +47,6 @@ _PACK_NUM_WARPS = 4
 _PACK_NUM_STAGES = 2
 
 
-def flashdeberta_prefix_pack_import_error() -> Exception | None:
-    """Return the Triton import failure for prefix-pack kernels, if any.
-
-    :return Exception | None: Stored Triton import failure or ``None``.
-    """
-
-    return _TRITON_IMPORT_ERROR
-
-
 def flashdeberta_prefix_pack_available() -> bool:
     """Return whether Triton-backed prefix pack kernels are importable.
 
@@ -1530,7 +1521,6 @@ def prefix_unpack_optional_pair(
 
 __all__ = [
     "flashdeberta_prefix_pack_available",
-    "flashdeberta_prefix_pack_import_error",
     "prefix_pack_optional_pair",
     "prefix_pack_padded_rows",
     "prefix_pack_padded_rows_pair",

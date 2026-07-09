@@ -46,15 +46,6 @@ _SEGMENT_NUM_WARPS = 4
 _SEGMENT_NUM_STAGES = 2
 
 
-def flashdeberta_segment_pack_import_error() -> Exception | None:
-    """Return the Triton import failure for segment-pack kernels, if any.
-
-    :return Exception | None: Stored Triton import failure or ``None``.
-    """
-
-    return _TRITON_IMPORT_ERROR
-
-
 def flashdeberta_segment_pack_available() -> bool:
     """Return whether Triton-backed segment pack kernels are importable.
 
@@ -1212,7 +1203,6 @@ def segment_unpack_optional_pair(
 
 __all__ = [
     "flashdeberta_segment_pack_available",
-    "flashdeberta_segment_pack_import_error",
     "segment_pack_grad_and_delta_from_padded",
     "segment_pack_optional_pair",
     "segment_pack_padded_rows",
