@@ -196,6 +196,34 @@ def _install_export_fakes(
     monkeypatch.setattr(export_cli, "merge_embeddings_into_export_backbone", lambda *args, **kwargs: None)
 
 
+def test_run_export_meta_carries_no_local_absolute_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=_new_export_call_counters(),
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+        )
+    )
+
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["checkpoint_name"] == checkpoint_dir.name
+    assert meta["run_name"] == run_dir.name
+    # Export directories ship to other machines and the Hub; provenance must
+    # not leak the exporting machine's directory layout.
+    assert str(tmp_path) not in json.dumps(meta)
+
+
 @pytest.mark.parametrize(
     ("fsdp2", "provide_torch_state_dict_api", "offload_to_cpu", "rank0"),
     [

@@ -613,8 +613,10 @@ def run_export(cfg: ExportConfig) -> None:
     stage_dir.mkdir(parents=True, exist_ok=False)
 
     meta: dict[str, Any] = {
-        "checkpoint_dir": str(checkpoint_dir),
-        "run_dir": str(run_dir),
+        # Directory names only: exported directories ship to other machines
+        # and the Hub, so provenance must not leak local absolute paths.
+        "checkpoint_name": checkpoint_dir.name,
+        "run_name": run_dir.name,
         "embedding_sharing": embedding_sharing,
         "backbone_type": model_cfg.backbone_type,
     }
