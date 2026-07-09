@@ -26,6 +26,16 @@ warnings.filterwarnings(
 
 
 def _format_docstring(value: Any) -> str:
+    source_module = str(getattr(value, "__module__", ""))
+    if inspect.isclass(value) and source_module.startswith("transformers."):
+        class_name = getattr(value, "__name__", type(value).__name__)
+        qualified_name = f"{source_module}.{class_name}"
+        detail = (
+            "\n\nIn this package it configures the repo-native `DebertaV2Model`."
+            if class_name == "DebertaV2Config"
+            else ""
+        )
+        return f"Re-export of `{qualified_name}`.{detail}"
     doc = inspect.getdoc(value)
     if not doc:
         return "No docstring available."

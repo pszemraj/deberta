@@ -12,7 +12,8 @@ deberta train configs/tiny_cpu_smoke.yaml
 
 ## 2) Small parity-style run on FineWeb-Edu
 
-Use the provided small parity config and shorten the run with dotted overrides:
+Use the provided small parity config and shorten the run with
+[dotted overrides](../guides/configuration.md#dotflag-examples):
 
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
@@ -37,18 +38,16 @@ accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml -
   --model.hf.attention_impl flash
 ```
 
-`--model.hf.attention_impl flash` requires the flash extra (see
-[Installation](installation.md#install-package)) and is valid only for the `hf_deberta_v2`
-backbone. Route selection, kernel tuning, benchmarking tools, and accepted caveats are covered in
-[Advanced / FlashDeBERTa attention](../advanced/flash-attention.md).
+This command requires the `flash` extra. Route selection and hardware constraints are covered in
+[FlashDeBERTa attention](../advanced/flash-attention.md).
 
-## 3) Export discriminator for downstream use
+## 3) Find the exported discriminator
 
-```bash
-deberta export runs/quickstart_hfv2_small/checkpoint-500 \
-  --what discriminator \
-  --output-dir runs/quickstart_hfv2_small/exported_hf
-```
+The supplied config enables `train.checkpoint.export_hf_final`. The first command therefore
+attempts to write the discriminator to `runs/quickstart_hfv2_small/final_hf`; the distributed
+examples use the config's `runs/hf_deberta_v2_parity_small/final_hf` unless given the same output
+override. For manual exports, other checkpoints, or both RTD components, see
+[Exporting models](../guides/exporting-models.md).
 
 ## 4) Check run snapshots
 

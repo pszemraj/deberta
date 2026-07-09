@@ -2,17 +2,14 @@
 
 ## Launch with Accelerate
 
-Single-node templates:
+Single-node FSDP2 templates:
 
-- `configs/accelerate/fsdp2_hf_deberta_1node.yaml`
-- `configs/accelerate/fsdp2_1node.yaml`
+- native `hf_deberta_v2`: [`fsdp2_hf_deberta_1node.yaml`](../../configs/accelerate/fsdp2_hf_deberta_1node.yaml)
+- experimental `rope`: [`fsdp2_1node.yaml`](../../configs/accelerate/fsdp2_1node.yaml)
 
-Example:
-
-```bash
-accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
-  deberta train configs/pretrain_hf_deberta_v2_parity_base.yaml
-```
+Both templates set `num_processes: 8`; change it to the number of GPUs on the node. See the
+[Quickstart](../getting-started/quickstart.md#2-small-parity-style-run-on-fineweb-edu) for a launch
+command.
 
 ## FSDP version handling
 

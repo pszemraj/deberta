@@ -121,11 +121,12 @@ def run_pretraining_dry_run(
     logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run non-destructive preflight checks for `deberta train`.
+    """Run preflight checks for `deberta train`.
 
     This validates configuration contracts and probes core runtime dependencies
     (tokenizer, dataset access, collator output, model config construction)
-    without starting optimization/training loops.
+    without starting optimization/training loops. It may access network sources and populate
+    dependency caches; see [Configuration](../guides/configuration.md#dry-run-behavior).
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.

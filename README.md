@@ -1,24 +1,21 @@
 # deberta: a modern refresh
 
-PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The default path is `backbone_type=hf_deberta_v2` (native DeBERTa-v2/v3 architecture in this repo) with optional `rope` experiments.
+PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The default path is
+`model.backbone_type=hf_deberta_v2` (the native DeBERTa-v2/v3 architecture in this repo), with an
+optional experimental `rope` backbone.
 
-Optional FlashDeBERTa acceleration is available for the native `hf_deberta_v2` backbone, including packed doc-block routing. Install the extra with `pip install -e '.[flash]'` and launch training with `deberta train ... --model.hf.attention_impl flash`; see [Advanced / FlashDeBERTa attention](docs/advanced/flash-attention.md).
+Optional FlashDeBERTa acceleration is available for the native backbone, including packed
+doc-block routing. See [FlashDeBERTa attention](docs/advanced/flash-attention.md).
 
-## Install
+## Get started
 
-Use [Getting Started / Installation](docs/getting-started/installation.md).
-
-## Train and export
-
-Use [Getting Started / Quickstart](docs/getting-started/quickstart.md) for first runs and
-[Guides / Exporting Models](docs/guides/exporting-models.md) for checkpoint consolidation and HF artifacts.
+Use [Installation](docs/getting-started/installation.md), then follow the
+[Quickstart](docs/getting-started/quickstart.md). For checkpoint consolidation and standalone model
+artifacts, see [Exporting models](docs/guides/exporting-models.md).
 
 ## Docs
 
-Start with [`docs/index.md`](docs/index.md), then use:
-- [Getting Started / Installation](docs/getting-started/installation.md)
-- [Getting Started / Quickstart](docs/getting-started/quickstart.md)
-- [Guides / Configuration](docs/guides/configuration.md)
+The complete documentation index is at [`docs/index.md`](docs/index.md).
 
 ## Citation
 

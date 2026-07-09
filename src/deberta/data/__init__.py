@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from .collator import DebertaV3ElectraCollator
+from .collator import DebertaV3ElectraCollator, MLMConfig
 from .loading import load_hf_dataset
-from .streaming import PackedStreamingDataset, SequentialStreamingDataset
+from .streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
 
 __all__ = [
     "DebertaV3ElectraCollator",
+    "MLMConfig",
     "load_hf_dataset",
+    "PackedStreamingConfig",
     "PackedStreamingDataset",
     "SequentialStreamingDataset",
 ]

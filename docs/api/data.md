@@ -19,17 +19,31 @@ class DebertaV3ElectraCollator(
 
 Dynamic MLM masking collator suitable for RTD/ELECTRA-style pretraining.
 
-Produces:
-- input_ids (masked)
-- labels (original token ids at masked positions, -100 elsewhere)
-- attention_mask (optional; omitted for fully-unpadded batches)
-- token_type_ids (if present)
+Produces masked ``input_ids``, MLM ``labels``, and optional attention/token-type tensors.
+Packed doc-block batches also carry ``doc_ids`` and ``flash_*`` metadata. See
+[Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
+batch-preparation contract.
 
-Notes:
-- If `special_tokens_mask` is provided, we merge it with tokenizer-inferred
-special ids so upstream partial masks cannot unprotect tokenizer specials.
-- Default behavior mirrors BERT's 80/10/10 replacement.
-- Supports optional whole-word n-gram masking (max_ngram > 1) as used by DeBERTa.
+Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
+those raw helper defaults for the selected backbone; see the
+[Config reference](../guides/config-reference.md).
+
+## `MLMConfig`
+
+```python
+class MLMConfig(
+    mlm_probability: 'float',
+    mask_token_prob: 'float' = 0.8,
+    random_token_prob: 'float' = 0.1,
+    max_ngram: 'int' = 1,
+) -> None
+```
+
+Masking configuration.
+
+Mask selection uses DeBERTa's windowed policy: ``max_ngram=1`` selects windowed unigrams and
+larger values enable whole-word n-grams. Replacement probabilities are conditional on token
+selection and must sum to at most one; the remainder keeps the original token.
 
 ## `load_hf_dataset`
 
@@ -37,12 +51,9 @@ special ids so upstream partial masks cannot unprotect tokenizer specials.
 load_hf_dataset(cfg: 'DataConfig') -> 'Any'
 ```
 
-Load a dataset split using 🤗 Datasets.
+Load the configured training split through Hugging Face Datasets.
 
-Supports:
-- load_from_disk
-- load_dataset(name)
-- load_dataset('text', data_files=...)
+Source selection is described in [Data pipeline](../guides/data-pipeline.md#dataset-source-selection).
 
 ### Parameters
 
@@ -52,8 +63,18 @@ Supports:
 
 - `Any`: Map-style Dataset or streaming IterableDataset.
 
-If both ``dataset_name`` and ``data_files`` are set, ``data_files`` are passed through
-to ``datasets.load_dataset`` for builders that support local files (for example ``text``).
+## `PackedStreamingConfig`
+
+```python
+class PackedStreamingConfig(
+    text_column_name: 'str',
+    max_seq_length: 'int',
+    seed: 'int',
+    shuffle_buffer_size: 'int',
+) -> None
+```
+
+Configuration for packing raw text into fixed-length token blocks.
 
 ## `PackedStreamingDataset`
 
@@ -68,17 +89,10 @@ class PackedStreamingDataset(
 ) -> 'None'
 ```
 
-Packs a streaming HF IterableDataset of text into fixed-length token blocks.
+Pack streaming text into fixed-length blocks across ranks and DataLoader workers.
 
-Key properties:
-- streaming-first
-- sharded across *both* distributed processes and dataloader workers
-- concatenates tokenized documents and chunks into blocks
-
-Output examples are dicts with:
-- input_ids: List[int]
-- special_tokens_mask: List[int]
-- attention_mask: List[int] (only emitted when padding is present)
+See [Data pipeline](../guides/data-pipeline.md#packed-streaming-path) for sample construction
+and output fields.
 
 ### Members
 

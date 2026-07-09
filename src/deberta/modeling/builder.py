@@ -819,8 +819,6 @@ def build_backbone_configs(
       is set, in which case that config is loaded.
     - For backbone_type='rope': returns DebertaRoPEConfig instances.
 
-    Generator config is loaded if specified, otherwise derived from discriminator config.
-
     :param ModelConfig model_cfg: User model configuration.
     :param Any tokenizer: Tokenizer used for vocab/pad metadata.
     :param int max_position_embeddings: Sequence length budget.

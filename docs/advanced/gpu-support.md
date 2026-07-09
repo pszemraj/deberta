@@ -74,7 +74,7 @@ Or a capability-scoped override table, selected with `model.hf.flash.kernel_over
 Override rows append to the shipped table, and an exact-capability row outranks the wildcard
 defaults, so promoting one route for your GPU takes one row per bucket. Buckets like
 `4096_plus` are open-ended, so bound dense rows with `max_seq_len` at the longest length you
-actually measured — the dense route's saved `(B,H,S,S)` bias grows quadratically, and a row
+actually measured - the dense route's saved `(B,H,S,S)` bias grows quadratically, and a row
 whose bounds exclude the batch length resolves to the ragged fallback instead:
 
 ```json
@@ -104,10 +104,20 @@ whose bounds exclude the batch length resolves to the ragged fallback instead:
 
 Before promoting a route on new hardware:
 
-1. Run `tools/flashdeberta_parity_test.py` on the target GPU - correctness is
-   hardware-independent in design, but verify it.
-2. Compare arms with `tools/flashdeberta_rtd_profile.py --mode eager` versus `--mode flash` on
-   your real config; keep whichever route wins.
+1. Run [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) on the target GPU -
+   correctness is hardware-independent in design, but verify it.
+2. Compare eager and flash on the same real config using distinct output directories:
+
+   ```bash
+   python tools/flashdeberta_rtd_profile.py \
+     configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
+     --mode eager --profile-dir local-scratch/profiles/eager
+   python tools/flashdeberta_rtd_profile.py \
+     configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
+     --mode flash --profile-dir local-scratch/profiles/flash
+   ```
+
+   Keep the route that wins without violating the memory budget.
 3. Mind memory: dense `docblock_bias` saves the `(B,H,S,S)` bias for backward. On cards with
    less VRAM than the 32 GiB benchmark GPU, try the ragged default first at `4096`. The cut
    works the other way too: the shipped `max_batch_size` bounds on the dense rows encode that
@@ -119,16 +129,8 @@ Before promoting a route on new hardware:
    "max_batch_size": 8}` is enough. Batch prep logs a warning when bounds (rather than missing
    measurements) keep a shape ragged, so the underfed case is visible in training logs.
 
-Kernel tile tuning (`tools/flashdeberta_varlen_tune.py`, `tools/flashdeberta_bias_tune.py`) is
-optional on top of route promotion; the workflow is described in
-[Advanced / FlashDeBERTa attention](flash-attention.md#retuning-for-new-hardware-or-kernel-changes).
-Durable results are welcome as additional capability-scoped rows in the shipped table.
-
-## Why kernel entries are capability-scoped
-
-Triton launch configs (`BLOCK_M`, `BLOCK_N`, stages, warps) are tuned against one chip's shared
-memory, scheduler, and SM count. Applying `sm_120` tiles globally could crash (out-of-resource at
-launch) or crawl on smaller GPUs. Scoping them by capability means unknown hardware gets each
-kernel's generic heuristics instead - slower than tuned, but always runnable. The same logic
-applies to the `bias_docblock_specialized` backward kernels: they engage only where a matching
-capability row exists.
+Kernel tile tuning is optional on top of route promotion; the workflow is described in
+[FlashDeBERTa attention](flash-attention.md#retuning).
+Durable results can be added as capability-scoped rows in the shipped table. Triton launch
+configurations depend on shared memory, scheduling, and SM count; applying one GPU's tiles globally
+can fail at launch or regress throughput on another architecture.

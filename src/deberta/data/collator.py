@@ -19,12 +19,9 @@ logger = logging.getLogger(__name__)
 class MLMConfig:
     """Masking configuration.
 
-    Notes:
-      - Mask selection uses DeBERTa's windowed n-gram policy for all max_ngram>=1.
-      - max_ngram == 1 corresponds to DeBERTa windowed unigram masking (not BERT iid masking).
-      - max_ngram > 1 enables whole-word n-gram grouping.
-      - Replacement probabilities are conditional on *being selected for masking*.
-        (i.e., they should sum to <= 1; remainder keeps the original token).
+    Mask selection uses DeBERTa's windowed policy: ``max_ngram=1`` selects windowed unigrams and
+    larger values enable whole-word n-grams. Replacement probabilities are conditional on token
+    selection and must sum to at most one; the remainder keeps the original token.
     """
 
     mlm_probability: float
@@ -36,17 +33,14 @@ class MLMConfig:
 class DebertaV3ElectraCollator:
     """Dynamic MLM masking collator suitable for RTD/ELECTRA-style pretraining.
 
-    Produces:
-      - input_ids (masked)
-      - labels (original token ids at masked positions, -100 elsewhere)
-      - attention_mask (optional; omitted for fully-unpadded batches)
-      - token_type_ids (if present)
+    Produces masked ``input_ids``, MLM ``labels``, and optional attention/token-type tensors.
+    Packed doc-block batches also carry ``doc_ids`` and ``flash_*`` metadata. See
+    [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
+    batch-preparation contract.
 
-    Notes:
-      - If `special_tokens_mask` is provided, we merge it with tokenizer-inferred
-        special ids so upstream partial masks cannot unprotect tokenizer specials.
-      - Default behavior mirrors BERT's 80/10/10 replacement.
-      - Supports optional whole-word n-gram masking (max_ngram > 1) as used by DeBERTa.
+    Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
+    those raw helper defaults for the selected backbone; see the
+    [Config reference](../guides/config-reference.md).
     """
 
     def __init__(
@@ -63,7 +57,7 @@ class DebertaV3ElectraCollator:
         :param Any tokenizer: HF tokenizer.
         :param MLMConfig cfg: Masking configuration.
         :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
-        :param bool block_cross_document_attention: Whether to emit 3D doc-block masks for packed inputs.
+        :param bool block_cross_document_attention: Whether to emit compact document metadata for packed inputs.
         :param int | None pad_to_multiple_of: Optional right-padding multiple.
         """
         self.tokenizer = tokenizer

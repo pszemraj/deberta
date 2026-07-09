@@ -32,7 +32,8 @@ Outputs:
 boundaries. It is only valid with `data.packing.enabled=true`.
 
 - `false`: packed samples attend across document boundaries; no document mask is built
-- `true`: the collator emits compact `doc_ids (B,S)` alongside the batch
+- `true`: the collator emits compact `doc_ids (B,S)` and precomputes fixed-capacity segment
+  descriptors plus host statistics before device transfer
 
 What consumes `doc_ids` depends on the attention path:
 
@@ -41,13 +42,15 @@ What consumes `doc_ids` depends on the attention path:
 - the flash ragged `docblock` route keeps the 2D `(B,S)` keep-mask and expands `doc_ids` into
   fixed-shape segment descriptors instead of a dense mask
 
-That conversion happens in exactly one place: `prepare_flash_attention_batch_metadata`
-(`deberta.training.compile`), which the training loop calls per batch for every backbone. Any
-other consumer of packed batches - a future eval script, a notebook - must call it too before
-the forward pass. The model forwards are keyword-only and reject a raw `doc_ids` key loudly,
-but manually dropping `doc_ids` and passing only `input_ids`/`attention_mask` silently
-re-enables cross-document attention *and* global-CLS conditioning in the RTD head; there is no
-in-model guard for that misuse.
+Batch preparation is a second stage. `prepare_flash_attention_batch_metadata` consumes `doc_ids`,
+chooses the attention route, and either materializes the pairwise mask or packages the collator's
+segment metadata into `FlashBatchMeta`. External consumers must preserve the collator's `flash_*`
+fields through device transfer and call this function before the forward pass. A device batch that
+has lost required segment metadata fails rather than rebuilding it on the GPU.
+
+Model forwards reject a raw `doc_ids` argument. Manually dropping `doc_ids` and forwarding only
+`input_ids` and `attention_mask` silently re-enables cross-document attention and global-CLS
+conditioning in the RTD head; there is no in-model guard for that misuse.
 
 Flash route selection for packed doc-block batches is described in
 [Advanced / FlashDeBERTa attention](../advanced/flash-attention.md).

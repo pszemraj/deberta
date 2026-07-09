@@ -21,17 +21,10 @@ class PackedStreamingConfig:
 
 
 class PackedStreamingDataset(torch.utils.data.IterableDataset):
-    """Packs a streaming HF IterableDataset of text into fixed-length token blocks.
+    """Pack streaming text into fixed-length blocks across ranks and DataLoader workers.
 
-    Key properties:
-      - streaming-first
-      - sharded across *both* distributed processes and dataloader workers
-      - concatenates tokenized documents and chunks into blocks
-
-    Output examples are dicts with:
-      - input_ids: List[int]
-      - special_tokens_mask: List[int]
-      - attention_mask: List[int] (only emitted when padding is present)
+    See [Data pipeline](../guides/data-pipeline.md#packed-streaming-path) for sample construction
+    and output fields.
     """
 
     def __init__(

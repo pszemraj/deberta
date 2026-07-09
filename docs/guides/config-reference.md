@@ -1,20 +1,12 @@
 # Config Reference
 
-`deberta train` accepts nested YAML/JSON config files and dotted CLI overrides.
+This page lists every accepted config leaf. Loading, precedence, variables, presets, dotted
+overrides, and dry-run behavior are described in [Configuration](configuration.md).
 
-Only these top-level config sections are accepted: `model`, `data`, `train`, `optim`, and `logging`.
-`variables` may be used for interpolation before validation, but it is removed before dataclass
-construction and is not a runtime config section. Unknown keys fail validation.
-
-Dotted CLI overrides use the exact same leaf names shown below, for example
-`--train.max_steps 2000 --optim.scheduler.warmup_steps 200`. CLI overrides take precedence over
-config-file values. `deberta train --preset deberta-v3-base` is available; with a config file it only
-overrides model fields, and without a config file it supplies model/data/train/optim/logging defaults.
-`--dry-run` validates config and runtime preflight without training or writing checkpoints, but may
-still touch tokenizer/dataset network caches.
-
-Backbone-specific effective defaults run after file/CLI parsing. The YAML below shows literal dataclass
-defaults; keys whose effective default can change say so on the key itself.
+The YAML below shows literal dataclass defaults. Field guidance identifies values that change under
+backbone-specific defaulting. For FlashDeBERTa operations, see
+[FlashDeBERTa attention](../advanced/flash-attention.md) and
+[GPU support](../advanced/gpu-support.md).
 
 ## Minimal Valid Skeleton
 
@@ -33,7 +25,7 @@ Everything else can be omitted and will use documented defaults, but real traini
 # Model/backbone, tokenizer, embedding sharing, dropout, and FlashDeBERTa policy.
 model:
   # Type: str. Default: "hf_deberta_v2". Required: no. Valid values: `hf_deberta_v2` | `rope`.
-  # Guidance: `hf_deberta_v2` is the native DeBERTa-v2/v3 parity backbone. `rope` is the modern RoPE/RMSNorm/SwiGLU-capable path and is the preferred speed baseline.
+  # Guidance: `hf_deberta_v2` is the native DeBERTa-v2/v3 parity backbone. `rope` is the experimental RoPE/RMSNorm/SwiGLU-capable path.
   backbone_type: "hf_deberta_v2"
   # Type: bool. Default: true. Required: no.
   # Guidance: When `false`, `model.pretrained.discriminator_path` is required. RoPE pretrained mode requires DebertaRoPE checkpoints, not Microsoft HF DeBERTa checkpoints.
@@ -59,13 +51,13 @@ model:
     vocab_multiple: 1
   hf:
     # Type: str. Default: "base". Required: no. Valid values: `base` | `large` | `small` | `xsmall`.
-    # Guidance: Native HF DeBERTa-v2/v3 model size preset. Applies only when `model.backbone_type=hf_deberta_v2`; ignored with a warning for `rope`.
+    # Guidance: Native HF DeBERTa-v2/v3 model size preset. Has no effect for `rope`; changing it from the default in that mode emits a warning.
     model_size: "base"
     # Type: str. Default: "dynamic". Required: no. Valid values: `cached_bmm` | `dynamic` | `stable`. Accepted CLI/config aliases: `cache` -> `cached_bmm`, `cached` -> `cached_bmm`, `compile_safe` -> `stable`, `default` -> `dynamic`, `safe` -> `stable`.
-    # Guidance: Native eager DeBERTa attention implementation choice. Applies only to `hf_deberta_v2`; ignored for `rope`.
+    # Guidance: Native eager DeBERTa attention implementation choice. Has no effect for `rope`; changing it from the default in that mode emits a warning.
     attention_kernel: "dynamic"
     # Type: str. Default: "eager". Required: no. Valid values: `eager` | `flash`.
-    # Guidance: `eager` is the portability default. `flash` is valid only with `model.backbone_type=hf_deberta_v2`, requires dropout disabled, and uses the JSON route/kernel policy under `model.hf.flash.*`. Route/kernel defaults are capability-scoped (measured rows ship for `sm_120`); other GPUs run flash with conservative defaults - see `docs/advanced/gpu-support.md`.
+    # Guidance: `eager` is the portability default. `flash` is valid only with `model.backbone_type=hf_deberta_v2`, requires dropout disabled, and uses the JSON policy under `model.hf.flash.*`.
     attention_impl: "eager"
     flash:
       # Type: bool. Default: false. Required: no.
@@ -144,16 +136,16 @@ model:
     # Guidance: RoPE token-type embedding size. Use 0/1/2 depending on segment-id needs; default 2 matches BERT-style inputs.
     type_vocab_size: 2
     # Type: str. Default: "post". Required: no. Valid values: `keel` | `post`.
-    # Guidance: `post` is standard LayerNorm placement. `keel` enables KEEL scaling and activates `keel_alpha_*` controls.
+    # Guidance: `post` applies RMSNorm after each residual addition. `keel` enables KEEL scaling and activates `keel_alpha_*` controls.
     norm_arch: "post"
     # Type: float. Default: 1e-06. Required: no.
     # Guidance: RoPE norm epsilon. Must be positive in practice; default 1e-6 is recommended for bf16 stability.
     norm_eps: 1e-06
     # Type: float | None. Default: null. Required: no.
-    # Guidance: Only used when `model.rope.norm_arch=keel`; ignored with a warning for `post`.
+    # Guidance: Only used when `model.rope.norm_arch=keel`; a non-default value with `post` has no effect and emits a warning.
     keel_alpha_init: null
     # Type: bool. Default: false. Required: no.
-    # Guidance: Only used when `model.rope.norm_arch=keel`; ignored with a warning for `post`.
+    # Guidance: Only used when `model.rope.norm_arch=keel`; enabling it with `post` has no effect and emits a warning.
     keel_alpha_learnable: false
     # Type: str. Default: "sdpa". Required: no. Valid values: `eager` | `sdpa`.
     # Guidance: `sdpa` uses PyTorch scaled dot-product attention and is recommended. `eager` is for debugging/parity.
@@ -165,7 +157,7 @@ model:
     # Guidance: Adds linear biases in RoPE modules. Keep false for the modern baseline unless matching a checkpoint that used biases.
     use_bias: false
     # Type: bool. Default: true. Required: no.
-    # Guidance: Only used when `model.rope.ffn_type=swiglu`; ignored with warning for `mlp`.
+    # Guidance: Only used when `model.rope.ffn_type=swiglu`; changing it from the default with `mlp` has no effect and emits a warning.
     swiglu_adjust_intermediate: true
     # Type: float. Default: 0.02. Required: no.
     # Guidance: RoPE scratch initializer standard deviation. Default 0.02 follows BERT/DeBERTa convention.
@@ -277,7 +269,7 @@ train:
   # Guidance: Enables TensorFloat-32 matmul policy where supported. Recommended true for speed on Ampere+ GPUs.
   tf32: true
   # Type: str. Default: "auto". Required: no. Valid values: `auto` | `flash` | `math` | `mem_efficient`. Accepted CLI/config aliases: `efficient` -> `mem_efficient`, `flash_attention` -> `flash`, `flashattention` -> `flash`, `mem` -> `mem_efficient`, `mem-efficient` -> `mem_efficient`.
-  # Guidance: PyTorch SDPA kernel policy. Only affects `model.backbone_type=rope` with `model.rope.attention_implementation=sdpa`; ignored with warning for `hf_deberta_v2`. `flash` is invalid with packed cross-document blocking because strict flash SDPA cannot consume doc-block masks.
+  # Guidance: PyTorch SDPA kernel policy. Only affects `rope` with `model.rope.attention_implementation=sdpa`. A non-default value for `hf_deberta_v2` has no effect and emits a warning; a non-default value with RoPE eager attention is invalid. `flash` is invalid with packed cross-document blocking.
   sdpa_kernel: "auto"
   # Type: bool. Default: true. Required: no.
   # Guidance: Runs generator/discriminator optimizer phases separately. Incompatible with `model.embedding_sharing=es`; recommended true with `gdes`.
@@ -294,7 +286,7 @@ train:
     # Guidance: Enables `torch.compile` on selected model scopes. Experimental per route; compile failures are hard errors.
     enabled: false
     # Type: str. Default: "default". Required: no. Valid values: `default` | `max-autotune` | `max-autotune-no-cudagraphs` | `reduce-overhead`. Accepted CLI/config aliases: `max_autotune` -> `max-autotune`, `max_autotune_no_cudagraphs` -> `max-autotune-no-cudagraphs`, `reduce_overhead` -> `reduce-overhead`.
-    # Guidance: Torch compile mode. Only used when `train.compile.enabled=true`; otherwise ignored with a warning.
+    # Guidance: Torch compile mode. Only used when `train.compile.enabled=true`; a non-default value while compile is disabled has no effect and emits a warning.
     mode: "default"
     # Type: str. Default: "auto". Required: no. Valid values: `auto` | `backbones` | `disc_encoder` | `disc_ffn` | `encoder` | `ffn` | `gen_encoder` | `gen_ffn`. Accepted CLI/config aliases: `backbone` -> `backbones`, `both` -> `backbones`, `disc_encoder` -> `disc_encoder`, `disc_ffn` -> `disc_ffn`, `discriminator_encoder` -> `disc_encoder`, `discriminator_ffn` -> `disc_ffn`, `encoder` -> `encoder`, `encoders` -> `encoder`, `ffn` -> `ffn`, `ffns` -> `ffn`, `full` -> `backbones`, `gen_encoder` -> `gen_encoder`, `gen_ffn` -> `gen_ffn`, `generator_encoder` -> `gen_encoder`, `generator_ffn` -> `gen_ffn`.
     # Guidance: Compile target scope. Only used when compile is enabled. `auto` may downgrade for dynamic masks; `backbones` is the main stable scope.
@@ -347,7 +339,7 @@ train:
     # Guidance: Replay budget for resume data alignment. Must be >= 0. Higher values improve exact replay tolerance but cost startup time.
     resume_replay_max_micro_batches: 10000
     # Type: bool. Default: true. Required: no.
-    # Guidance: Exports final discriminator HF artifacts after successful training. Disable for benchmark/probe runs to avoid extra final work.
+    # Guidance: Attempts to export final discriminator artifacts after successful training. Export failures are logged without changing the training exit status. Disable for benchmark/probe runs.
     export_hf_final: true
 
 # Optimizer, scheduler, learning rates, weight decay, and gradient clipping.

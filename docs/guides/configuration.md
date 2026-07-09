@@ -25,7 +25,7 @@ There is no flat/legacy mode and no extra top-level sections.
    validation on the file itself
 4. apply preset defaults (`--preset`, if provided)
 5. apply direct dotted CLI flags (`--train.max_steps 2000`, `--optim.scheduler.warmup_steps 500`, ...)
-6. re-apply backbone-specific effective defaults, sync legacy train aliases, and re-run validation
+6. re-apply backbone-specific effective defaults and re-run validation
    (`validate_model_config`, `validate_data_config`, `validate_train_config`,
    `validate_optim_config`, `validate_logging_config`, workflow checks) on the merged result
 
@@ -74,18 +74,11 @@ For YAML/JSON config files, boolean fields must be true booleans (`true`/`false`
 
 Dry-run may still access networked dataset/tokenizer sources and populate Hugging Face caches.
 
-## Parity++ effective defaults (`model.backbone_type=hf_deberta_v2`)
+## Backbone-specific effective defaults
 
-When these fields are not explicitly set by user config or CLI, the loader applies:
-
-- `train.objective.mask_token_prob = 1.0`
-- `train.objective.random_token_prob = 0.0`
-- `train.objective.disc_loss_weight = 10.0`
-- `optim.adam.epsilon = 1e-6`
-- `optim.scheduler.warmup_steps = 10000`
-- `train.token_weighted_gradient_accumulation = true`
-
-`optim.lr.base` is not auto-changed by parity++ defaults.
+The loader preserves explicit values and applies defaults for unset fields based on the selected
+backbone. Exact effective values are annotated on their fields in the
+[Config reference](config-reference.md).
 
 ## Snapshot files and reproducibility
 
@@ -104,7 +97,9 @@ At run start, the trainer writes:
 
 If `logging.output_dir` is unset, it defaults to `train.checkpoint.output_dir`.
 
-By default `train.checkpoint.export_hf_final=true`, so successful training also performs a final export pass into `<train.checkpoint.output_dir>/final_hf`.
+By default `train.checkpoint.export_hf_final=true`, so successful training attempts a final export
+into `<train.checkpoint.output_dir>/final_hf`. Export failure is logged without changing the
+training exit status.
 
 For W&B runs, the trainer uploads:
 

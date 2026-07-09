@@ -9,18 +9,12 @@ from deberta.config import DataConfig
 
 
 def load_hf_dataset(cfg: DataConfig) -> Any:
-    """Load a dataset split using 🤗 Datasets.
+    """Load the configured training split through Hugging Face Datasets.
 
-    Supports:
-      - load_from_disk
-      - load_dataset(name)
-      - load_dataset('text', data_files=...)
+    Source selection is described in [Data pipeline](../guides/data-pipeline.md#dataset-source-selection).
 
     :param DataConfig cfg: Data config containing dataset source settings.
     :return Any: Map-style Dataset or streaming IterableDataset.
-
-    If both ``dataset_name`` and ``data_files`` are set, ``data_files`` are passed through
-    to ``datasets.load_dataset`` for builders that support local files (for example ``text``).
     """
 
     try:

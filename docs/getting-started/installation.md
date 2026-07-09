@@ -2,14 +2,8 @@
 
 ## Requirements
 
-Core runtime requirements from `pyproject.toml`:
-
-- Python `>=3.10`
-- `torch>=2.9.1`
-- `transformers>=4.45.0`
-- `accelerate>=1.6.0`
-- `datasets>=3.0.0`
-- `sentencepiece>=0.2.0`
+Python `>=3.10` is required. Package installation resolves the runtime dependencies declared in
+[`pyproject.toml`](../../pyproject.toml).
 
 For GPU training, use a CUDA-capable PyTorch build compatible with your driver/toolkit.
 
@@ -30,7 +24,9 @@ pip install -e '.[tensorboard]'
 pip install -e '.[flash]'
 ```
 
-The `flash` extra installs the pinned `flashdeberta==0.0.7` package and `triton` for optional FlashDeBERTa attention used with the native `hf_deberta_v2` backbone.
+The `flash` extra installs the optional FlashDeBERTa and Triton dependencies used by the native
+`hf_deberta_v2` backbone. See [FlashDeBERTa attention](../advanced/flash-attention.md) for runtime
+requirements and configuration.
 
 ## Verify CLI
 
@@ -39,3 +35,5 @@ deberta --help
 deberta train --help
 deberta export --help
 ```
+
+Continue with the [Quickstart](quickstart.md).

@@ -26,22 +26,13 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 - `model.embedding_sharing` supports `none`, `es`, `gdes`
 - decoupled two-phase RTD updates are enabled by default (`train.decoupled_training=true`)
 
-## Default deltas vs released DeBERTa-v3 configs
-
-Intentional repo defaults:
-
-- dropout defaults are `0.0` (`model.dropout.hidden_prob`, `model.dropout.attention_probs_prob`)
-- `train.objective.disc_loss_weight` has an effective default of `10.0` for `hf_deberta_v2` when
-  left unset (the raw dataclass default is `50.0`)
-- default `optim.adam.beta2` is `0.999`
-
-Use explicit config values when you want different behavior.
-
 ## Parity divergences
 
-- Intentional divergence: generator sampling excludes special/control token ids via a forbidden vocabulary mask (for example PAD/CLS/SEP/MASK). This differs from original DeBERTa sampling and is kept intentionally.
-- TODO (strict parity follow-up): evaluate narrowing discriminator embedding sharing to only word+position embeddings; current sharing also includes `token_type_embeddings`.
-- TODO (architecture follow-up): evaluate defaulting `generator_intermediate_size` from `generator_hidden_size` when only width is overridden; current behavior inherits discriminator FFN width unless explicitly set.
+- Generator sampling excludes special/control token ids through a forbidden vocabulary mask (for
+  example PAD/CLS/SEP/MASK), unlike the original DeBERTa sampler.
+- Discriminator embedding sharing includes word, position, and token-type embeddings.
+- When only generator hidden size is overridden, generator FFN width still inherits the
+  discriminator width unless explicitly set.
 
 ## FlashDeBERTa
 

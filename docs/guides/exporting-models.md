@@ -36,17 +36,17 @@ Default output path is `<run_dir>/exported_hf` and must be empty if it already e
 - `--what discriminator` or `--what generator`: writes a single HF model in a flat directory at `--output-dir`.
 - `--what both`: writes `--output-dir/discriminator/` and `--output-dir/generator/` (each a standalone HF model dir).
 
-Single-model exports are ready for direct Hub upload from `--output-dir`.
+Native `hf_deberta_v2` exports load through stock Hugging Face `AutoModel` APIs. RoPE exports are
+standalone artifacts but require this package's `DebertaRoPEModel` implementation.
 
-## GDES merge behavior
+## Shared embedding export
 
-When training used `embedding_sharing=gdes`, discriminator embedding weights are represented as base + bias components.
+Embedding-sharing behavior is described in [Architectures](../advanced/architectures.md#rtd-architecture-notes).
+Export converts both shared modes back to ordinary embedding weights for word, position, and
+token-type embeddings:
 
-During export, embedding tensors are merged back into standard HF embedding weights:
-
-- `merged_weight = generator_weight + discriminator_bias`
-
-This produces standard export weights compatible with normal HF loading for the target backbone.
+- `es`: use the generator embedding weight
+- `gdes`: use `generator_weight + discriminator_bias`
 
 ## Partial export mode
 
@@ -54,4 +54,9 @@ By default export is strict on state-dict compatibility. Use `--allow-partial-ex
 
 ## Config/tokenizer artifacts
 
-Export writes tokenizer files, cleaned `config.json` artifacts, and model-card artifacts (`README.md`, `LICENSE`). Training-internal keys are stripped from exported model configs.
+Export writes tokenizer files, cleaned `config.json`, `README.md`, `LICENSE`, and
+`export_meta.json`. Training-internal keys are removed from model configs, and export metadata uses
+run/checkpoint directory names rather than machine-local absolute paths.
+
+Safetensors output is enabled by default. Use `--no-safe-serialization` only when a consumer
+requires PyTorch serialization.
