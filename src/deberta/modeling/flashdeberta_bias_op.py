@@ -9,6 +9,7 @@ the upstream Python autograd wrapper.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -183,6 +184,61 @@ def _bias_repo_tuned_config(
     )
 
 
+def _bias_config(
+    *,
+    kind: str,
+    lowlevel_helper: Callable[[int, int, int, int, int, bool], tuple[int, int, int, int]] | None,
+    unavailable_message: str,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[int, int, int, int]:
+    """Resolve a dense-bias Triton tile config.
+
+    :param str kind: Tuning kind name.
+    :param Callable | None lowlevel_helper: FlashDeBERTa fallback config helper.
+    :param str unavailable_message: Error raised when the fallback helper is unavailable.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int query_len: Query sequence length.
+    :param int key_len: Key sequence length.
+    :param int head_dim: Per-head hidden size.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.dtype dtype: Activation dtype.
+    :param torch.device device: CUDA device.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    tuned = _bias_repo_tuned_config(
+        kind=kind,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        causal=bool(causal),
+        dtype=dtype,
+        device=device,
+    )
+    if tuned is not None:
+        return tuned
+    if lowlevel_helper is None:
+        raise RuntimeError(unavailable_message)
+    return lowlevel_helper(
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        head_dim,
+        bool(causal),
+    )
+
+
 def _bias_forward_config(
     *,
     batch_size: int,
@@ -207,8 +263,10 @@ def _bias_forward_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    tuned = _bias_repo_tuned_config(
+    return _bias_config(
         kind="fwd",
+        lowlevel_helper=_get_fwd_config_bias_lowlevel,
+        unavailable_message="FlashDeBERTa local-bias config helper is unavailable.",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,
@@ -217,18 +275,6 @@ def _bias_forward_config(
         causal=bool(causal),
         dtype=dtype,
         device=device,
-    )
-    if tuned is not None:
-        return tuned
-    if _get_fwd_config_bias_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa local-bias config helper is unavailable.")
-    return _get_fwd_config_bias_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
     )
 
 
@@ -256,28 +302,18 @@ def _bias_backward_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    tuned = _bias_repo_tuned_config(
+    return _bias_config(
         kind="bwd",
+        lowlevel_helper=_get_bwd_config_bias_lowlevel,
+        unavailable_message="FlashDeBERTa local-bias backward is unavailable.",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
-        causal=bool(causal),
+        causal=causal,
         dtype=dtype,
         device=device,
-    )
-    if tuned is not None:
-        return tuned
-    if _get_bwd_config_bias_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
-    return _get_bwd_config_bias_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
     )
 
 

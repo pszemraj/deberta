@@ -6,16 +6,15 @@ tensor in ``(B,H,S,S)`` layout. Building that tensor with standard PyTorch ops
 works, but on current GPUs the compiled gather/mask/scaling chain is still a
 visible steady-state hotspot for packed doc-block training.
 
-This module exposes a repo-local fused forward builder as an opaque custom op.
-It gathers c2p/p2c positional terms and applies the optional keep mask plus
-softmax scale inside one Triton launch, while the backward path keeps the
-existing semantics via cached row-range reductions derived from the bucket map.
+This module owns the eager and Triton builders used by the production
+position-bias custom op. It gathers c2p/p2c positional terms and applies the
+optional keep mask plus softmax scale; backward helpers reduce dense bias
+gradients with cached row-range metadata derived from the bucket map.
 """
 
 from __future__ import annotations
 
 import weakref
-from typing import Any
 
 import torch
 
@@ -26,7 +25,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     keep_mask_head_stride,
-    lookup_registered_op,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     kernel_dtype_name as _kernel_dtype_name,
@@ -36,37 +34,13 @@ from deberta.modeling.mask_utils import is_torch_compiling
 try:
     import triton
     import triton.language as tl
-
-    _TRITON_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - optional import
+except Exception:  # pragma: no cover - optional import
     triton = None
     tl = None
-    _TRITON_IMPORT_ERROR = exc
-
-_DENSE_BIAS_NAMESPACE = "deberta"
-_DENSE_BIAS_OP_NAME = "flashdeberta_dense_bias"
 _DENSE_BUCKET_RANGE_CACHE: dict[
     tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int],
     tuple[weakref.ReferenceType[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
 ] = {}
-
-
-def flashdeberta_compiled_dense_bias_available() -> bool:
-    """Return whether the opaque dense-bias CUDA op is available.
-
-    :return bool: True when the custom-op based CUDA path is registered.
-    """
-
-    return _FLASHDEBERTA_DENSE_BIAS_CUSTOM_OP is not None
-
-
-def flashdeberta_dense_bias_import_error() -> Exception | None:
-    """Return the import/runtime error for the fused dense-bias builder, if any.
-
-    :return Exception | None: Import failure or ``None`` when the fused builder is available.
-    """
-
-    return _TRITON_IMPORT_ERROR
 
 
 def _dense_bias_repo_tuned_config(
@@ -590,218 +564,3 @@ def _dense_bias_forward_cuda(
             num_stages=num_stages,
         )
     return output
-
-
-def _build_dense_bias_custom_op() -> Any | None:
-    """Register or retrieve the opaque fused dense-bias custom op.
-
-    :return Any | None: Forward custom-op handle or ``None`` when unavailable.
-    """
-
-    existing = lookup_registered_op(_DENSE_BIAS_NAMESPACE, _DENSE_BIAS_OP_NAME)
-    if existing is not None:
-        return existing
-    if triton is None or not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
-        return None
-
-    @torch.library.custom_op(
-        f"{_DENSE_BIAS_NAMESPACE}::{_DENSE_BIAS_OP_NAME}",
-        mutates_args=(),
-        device_types="cuda",
-        schema=(
-            "(Tensor pos_key, Tensor pos_query, Tensor bucket_index, Tensor keep_mask, float scale, "
-            "bool has_pos_key, bool has_pos_query, bool has_keep_mask) -> Tensor"
-        ),
-    )
-    def _forward_op(
-        pos_key: torch.Tensor,
-        pos_query: torch.Tensor,
-        bucket_index: torch.Tensor,
-        keep_mask: torch.Tensor,
-        scale: float,
-        has_pos_key: bool,
-        has_pos_query: bool,
-        has_keep_mask: bool,
-    ) -> torch.Tensor:
-        """Run dense bias assembly as one opaque CUDA op.
-
-        :param torch.Tensor pos_key: c2p tensor or empty sentinel.
-        :param torch.Tensor pos_query: p2c tensor or empty sentinel.
-        :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-        :param torch.Tensor keep_mask: Keep mask tensor or empty sentinel.
-        :param float scale: Bias scale factor.
-        :param bool has_pos_key: Whether ``pos_key`` is active.
-        :param bool has_pos_query: Whether ``pos_query`` is active.
-        :param bool has_keep_mask: Whether ``keep_mask`` is active.
-        :return torch.Tensor: Scaled dense bias tensor.
-        """
-
-        return _dense_bias_forward_cuda(
-            pos_key=pos_key if bool(has_pos_key) else None,
-            pos_query=pos_query if bool(has_pos_query) else None,
-            bucket_index=bucket_index,
-            keep_mask=keep_mask if bool(has_keep_mask) else None,
-            scale=float(scale),
-        )
-
-    @torch.library.register_fake(_forward_op)
-    def _forward_op_fake(
-        pos_key: torch.Tensor,
-        pos_query: torch.Tensor,
-        bucket_index: torch.Tensor,
-        keep_mask: torch.Tensor,
-        scale: float,
-        has_pos_key: bool,
-        has_pos_query: bool,
-        has_keep_mask: bool,
-    ) -> torch.Tensor:
-        """Return fake dense-bias output with the correct static shape.
-
-        :param torch.Tensor pos_key: Fake c2p tensor or empty sentinel.
-        :param torch.Tensor pos_query: Fake p2c tensor or empty sentinel.
-        :param torch.Tensor bucket_index: Fake dense bucket map.
-        :param torch.Tensor keep_mask: Fake keep mask tensor or empty sentinel.
-        :param float scale: Fake scale factor.
-        :param bool has_pos_key: Whether ``pos_key`` is active.
-        :param bool has_pos_query: Whether ``pos_query`` is active.
-        :param bool has_keep_mask: Whether ``keep_mask`` is active.
-        :raises RuntimeError: If neither positional term is active.
-        :return torch.Tensor: Fake dense bias tensor.
-        """
-
-        del bucket_index, keep_mask, scale, has_keep_mask
-        reference = pos_key if bool(has_pos_key) else pos_query
-        if not bool(has_pos_key) and not bool(has_pos_query):
-            raise RuntimeError("Dense flash bias construction requires at least one positional term.")
-        seq_len = int(reference.shape[2])
-        return torch.empty(
-            (reference.shape[0], reference.shape[1], seq_len, seq_len),
-            device=reference.device,
-            dtype=reference.dtype,
-        )
-
-    def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor) -> None:
-        """Save tensors needed for the explicit dense-bias backward rule.
-
-        :param Any ctx: Autograd context.
-        :param tuple[Any, ...] inputs: Forward inputs.
-        :param torch.Tensor output: Forward output tensor.
-        """
-
-        del output
-        pos_key, pos_query, bucket_index, keep_mask, scale, has_pos_key, has_pos_query, has_keep_mask = inputs
-        num_key_buckets = int(pos_key.shape[-1]) if bool(has_pos_key) else 0
-        num_query_buckets = int(pos_query.shape[-1]) if bool(has_pos_query) else 0
-        start_key = end_key = start_query = end_query = torch.empty(
-            (0,), device=bucket_index.device, dtype=torch.int64
-        )
-        if bool(has_pos_key):
-            start_key, end_key = _dense_bucket_ranges(bucket_index, num_buckets=num_key_buckets)
-        if bool(has_pos_query):
-            # p2c forward reads pos_query[n, bucket_index[n, m]], so the p2c
-            # gradient for key row n reduces grad^T[n, :] over row n of the
-            # plain bucket map - the same row orientation as c2p, not the
-            # transposed map (which flips the signed relative bucket).
-            start_query, end_query = _dense_bucket_ranges(bucket_index, num_buckets=num_query_buckets)
-        ctx.save_for_backward(pos_key, pos_query, keep_mask, start_key, end_key, start_query, end_query)
-        ctx.scale = float(scale)
-        ctx.has_pos_key = bool(has_pos_key)
-        ctx.has_pos_query = bool(has_pos_query)
-        ctx.has_keep_mask = bool(has_keep_mask)
-
-    def _backward(ctx: Any, grad_out: torch.Tensor | None) -> tuple[torch.Tensor | None, ...]:
-        """Propagate dense-bias gradients back to c2p/p2c tensors.
-
-        :param Any ctx: Autograd context populated by ``_setup_context``.
-        :param torch.Tensor | None grad_out: Gradient of the dense bias output.
-        :return tuple[torch.Tensor | None, ...]: Gradients for the forward inputs.
-        """
-
-        pos_key, pos_query, keep_mask, start_key, end_key, start_query, end_query = ctx.saved_tensors
-        if grad_out is None:
-            return None, None, None, None, None, None, None, None
-
-        grad = grad_out.to(dtype=torch.float32)
-        if ctx.has_keep_mask:
-            grad = grad.masked_fill(~keep_mask, 0.0)
-        grad = grad * float(ctx.scale)
-
-        dpos_key: torch.Tensor | None = None
-        if ctx.has_pos_key:
-            dpos_key = _dense_bucket_reduce_from_ranges(
-                grad=grad,
-                start=start_key,
-                end=end_key,
-                output_dtype=pos_key.dtype,
-            )
-
-        dpos_query: torch.Tensor | None = None
-        if ctx.has_pos_query:
-            dpos_query = _dense_bucket_reduce_from_ranges(
-                grad=grad.transpose(-1, -2).contiguous(),
-                start=start_query,
-                end=end_query,
-                output_dtype=pos_query.dtype,
-            )
-
-        return dpos_key, dpos_query, None, None, None, None, None, None
-
-    torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
-    return _forward_op
-
-
-_FLASHDEBERTA_DENSE_BIAS_CUSTOM_OP = _build_dense_bias_custom_op()
-
-
-def flashdeberta_dense_bias(
-    *,
-    pos_key: torch.Tensor | None,
-    pos_query: torch.Tensor | None,
-    bucket_index: torch.Tensor,
-    keep_mask: torch.Tensor | None,
-    scale: float,
-) -> torch.Tensor:
-    """Build a scaled dense DeBERTa bias tensor for FlashDeBERTa bias routes.
-
-    :param torch.Tensor | None pos_key: Optional c2p term in ``(B,H,S,P)`` layout.
-    :param torch.Tensor | None pos_query: Optional p2c term in ``(B,H,S,P)`` layout.
-    :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
-    :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
-    :param float scale: Scale applied to the final additive bias.
-    :return torch.Tensor: Scaled dense bias tensor in ``(B,H,S,S)`` layout.
-    """
-
-    reference = pos_key if pos_key is not None else pos_query
-    if reference is None:
-        raise RuntimeError("Dense flash bias construction requires at least one positional term.")
-    if _FLASHDEBERTA_DENSE_BIAS_CUSTOM_OP is not None and reference.device.type == "cuda":
-        sentinel = torch.empty((0,), device=reference.device, dtype=reference.dtype)
-        keep_sentinel = (
-            keep_mask
-            if keep_mask is not None
-            else torch.empty((0,), device=reference.device, dtype=torch.bool)
-        )
-        return _FLASHDEBERTA_DENSE_BIAS_CUSTOM_OP(
-            pos_key if pos_key is not None else sentinel,
-            pos_query if pos_query is not None else sentinel,
-            bucket_index,
-            keep_sentinel,
-            float(scale),
-            bool(pos_key is not None),
-            bool(pos_query is not None),
-            bool(keep_mask is not None),
-        )
-    return _dense_bias_forward_fallback(
-        pos_key=pos_key,
-        pos_query=pos_query,
-        bucket_index=bucket_index,
-        keep_mask=keep_mask,
-        scale=float(scale),
-    )
-
-
-__all__ = [
-    "flashdeberta_compiled_dense_bias_available",
-    "flashdeberta_dense_bias",
-    "flashdeberta_dense_bias_import_error",
-]

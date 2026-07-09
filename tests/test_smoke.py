@@ -9,7 +9,7 @@ from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
-from deberta.training.compile import _build_doc_block_mask
+from deberta.modeling.mask_utils import build_doc_block_mask
 
 
 @pytest.fixture
@@ -418,7 +418,7 @@ def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
 def test_build_doc_block_mask_matches_expected_structure():
     # doc_ids: doc1=[1,1,1], doc2=[2,2], pad=[0]
     doc_ids = torch.tensor([[1, 1, 1, 2, 2, 0]], dtype=torch.long)
-    mask = _build_doc_block_mask(doc_ids)
+    mask = build_doc_block_mask(doc_ids)
     assert mask.shape == (1, 6, 6)
     assert mask.dtype == torch.bool
 

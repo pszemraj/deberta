@@ -1040,7 +1040,7 @@ def test_run_pretraining_builds_doc_block_mask_in_flash_batch_preparation(
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
-    from deberta.training.compile import _build_doc_block_mask
+    from deberta.modeling.mask_utils import build_doc_block_mask
 
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
@@ -1048,7 +1048,7 @@ def test_run_pretraining_builds_doc_block_mask_in_flash_batch_preparation(
         k: v.clone() for k, v in _PRETRAINING_BATCH.items() if isinstance(v, torch.Tensor)
     }
     batch_with_doc_ids["doc_ids"] = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
-    expected_mask = _build_doc_block_mask(batch_with_doc_ids["doc_ids"])
+    expected_mask = build_doc_block_mask(batch_with_doc_ids["doc_ids"])
 
     def _cycle_with_doc_ids(_loader: Any, *, start_epoch: int = 0):
         del _loader, start_epoch

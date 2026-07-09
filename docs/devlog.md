@@ -107,7 +107,7 @@ Running command shape:
 env TORCH_BLAS_PREFER_CUBLASLT=1 TOKENIZERS_PARALLELISM=false \
   conda run --name neobert --no-capture-output \
   python tools/flashdeberta_rtd_profile.py \
-    configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
+    configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
     --mode flash \
     --warmup-steps 2 \
     --profile-steps 4 \
@@ -326,7 +326,7 @@ behavior. The remaining speed gate is the ragged `docblock` route at 2048 and
 ### 2048 And 4096 Packed Docblock Profiles
 
 All profiles below used `block_cross_document_attention=true` and the packed
-RTD configs under `configs/custom/`. These are end-to-end RTD optimizer-step
+RTD configs now under `configs/flashdeberta/`. These are end-to-end RTD optimizer-step
 measurements, not attention-only microbenchmarks.
 
 Fresh 2048 pairwise eager baseline:
@@ -544,7 +544,7 @@ contexts beyond `4096`).
   snapshot/restores the flash module namespace so import state cached under
   `triton=None` cannot leak into later tests (the custom-op modules may
   legitimately report available via the process-global torch.library registry).
-- Committed `configs/custom/..._{2048,4096}_wp32k_v2_docblock.yaml` so packed
+- Committed doc-block configs so packed
   doc-block benchmark arms are config-owned instead of CLI-override-owned.
 
 ### Still Open (deliberately deferred)

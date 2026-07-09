@@ -1134,22 +1134,6 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     return entry
 
 
-def _get_unpad_metadata_cached(mask_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Return cached unpadding metadata for one mask tensor when possible.
-
-    Real training reuses the same padding-mask tensor across many attention
-    layers in one generator/discriminator phase and then again in backward.
-    Recomputing ``nonzero`` and cumulative lengths for every call adds a large
-    amount of host overhead, especially for varlen-heavy compiled runs.
-
-    :param torch.Tensor mask_2d: Boolean keep mask with shape ``(B, S)``.
-    :return tuple[torch.Tensor, torch.Tensor, int]: Cached or newly built metadata.
-    """
-
-    entry = _get_unpad_metadata_entry(mask_2d)
-    return entry.seqlens, entry.cu_seqlens, entry.max_seqlen
-
-
 def _varlen_eager_forward_impl(
     *,
     query_layer: torch.Tensor,

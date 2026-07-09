@@ -146,7 +146,7 @@ builder tile is `64 x 128, stages=2, warps=4` at the packed doc-block lengths.
   `FLASHDEBERTA_DOCBLOCK_CONFIG_PATH`.
 
 Tracked packed doc-block configs for benchmarking and training live at
-`configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_{1024,2048,4096}_wp32k_v2_docblock.yaml`
+`configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_{1024,2048,4096}_wp32k_v2_docblock.yaml`
 (plus non-doc-block `_v2` siblings).
 
 ## Accepted caveats
@@ -186,12 +186,7 @@ Tracked packed doc-block configs for benchmarking and training live at
 - Evaluate recomputing position/bucket tensors in backward versus saving them for longer
   contexts (pairs with the dense-bias recompute knob above).
 - Add a bucket-LUT path and deterministic position-gradient kernels before treating the
-  dense-bias builder as kernel-owned infrastructure. Fold the test-only public custom op in
-  `flashdeberta_dense_bias_op` (`flashdeberta_dense_bias` and its registration) into the one
-  production registration in `flashdeberta_bias_op` at the same time - today two near-identical
-  torch.library ops exist and only the bias_op one runs in training, but the test-only op's
-  wrapper is load-bearing for two GPU parity tests and the no-Triton import contract, so the
-  consolidation must re-point those tests at production seams.
+  dense-bias builder as kernel-owned infrastructure.
 - Keep reducing the ragged `docblock` route's varlen backward overhead; it currently trails the
   dense route at the shipped packed lengths.
 - Enforce the right-padding proof for doc-block `flash_seq_lengths`: batch prep publishes

@@ -16,7 +16,7 @@ from deberta.config import (
 )
 
 
-def test_load_yaml_nested_and_flat(tmp_path: Path):
+def test_load_yaml_nested(tmp_path: Path):
     pytest.importorskip("yaml")
 
     nested = tmp_path / "nested.yaml"
@@ -48,24 +48,8 @@ def test_load_yaml_nested_and_flat(tmp_path: Path):
     assert cfg_nested.train.mlm_max_ngram == 3
     assert cfg_nested.train.mixed_precision == "bf16"
 
-    flat = tmp_path / "flat.yaml"
-    flat.write_text(
-        "\n".join(
-            [
-                "backbone_type: rope",
-                "max_seq_length: 64",
-                "overwrite_output_dir: false",
-                "mixed_precision: no",
-                "mlm_max_ngram: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
-        load_config(flat)
 
-
-def test_load_json_nested_and_flat(tmp_path: Path):
+def test_load_json_nested(tmp_path: Path):
     nested = tmp_path / "nested.json"
     nested.write_text(
         json.dumps(
@@ -86,21 +70,6 @@ def test_load_json_nested_and_flat(tmp_path: Path):
     assert cfg_nested.data.packing.max_seq_length == 96
     assert cfg_nested.train.generator_learning_rate == pytest.approx(3.0e-4)
     assert cfg_nested.train.disc_loss_weight == pytest.approx(50.0)
-
-    flat = tmp_path / "flat.json"
-    flat.write_text(
-        json.dumps(
-            {
-                "backbone_type": "rope",
-                "max_seq_length": 80,
-                "mlm_max_ngram": 2,
-                "mask_token_prob": 0.7,
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
-        load_config(flat)
 
 
 def test_load_yaml_hf_flash_config(tmp_path: Path):

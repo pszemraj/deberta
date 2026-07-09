@@ -364,18 +364,6 @@ def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
     configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
 
 
-def _build_doc_segment_metadata(
-    doc_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Compatibility wrapper for shared doc-segment metadata construction.
-
-    :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
-    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]: Segment metadata.
-    """
-
-    return build_doc_segment_metadata(doc_ids)
-
-
 def _flash_active_tokens_host(value: Any) -> int | None:
     """Return a host active-token count when one is already available.
 
@@ -575,7 +563,7 @@ def prepare_flash_attention_batch_metadata(
     if btype != "hf_deberta_v2":
         doc_ids = batch.pop("doc_ids", None)
         if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
-            batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+            batch["attention_mask"] = build_doc_block_mask(doc_ids)
         _clear_flash_batch_metadata(batch)
         return batch, None
 
@@ -592,7 +580,7 @@ def prepare_flash_attention_batch_metadata(
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
         if not flash_enabled:
-            batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+            batch["attention_mask"] = build_doc_block_mask(doc_ids)
             _clear_flash_batch_metadata(batch)
             return batch, None
         route_hint = _flash_route_hint_for_docblock_batch(
@@ -627,7 +615,7 @@ def prepare_flash_attention_batch_metadata(
         else:
             batch.pop("flash_active_tokens_scalar", None)
         if route_hint == "docblock_bias":
-            batch["attention_mask"] = _build_doc_block_mask(doc_ids)
+            batch["attention_mask"] = build_doc_block_mask(doc_ids)
             _pop_flash_doc_segment_tensors(batch)
             _pop_flash_doc_segment_host_stats(batch)
             meta = FlashBatchMeta(
@@ -651,7 +639,7 @@ def prepare_flash_attention_batch_metadata(
                     "Flash doc-block metadata is missing for a device batch. "
                     "Build flash_doc_segment_* metadata in the collator before device transfer."
                 )
-            segment_offsets, segment_lengths, cu_seqlens, _ = _build_doc_segment_metadata(doc_ids)
+            segment_offsets, segment_lengths, cu_seqlens, _ = build_doc_segment_metadata(doc_ids)
         doc_num_segments, doc_max_seqlen = _flash_doc_segment_host_stats(batch)
         doc_num_segments_scalar = _flash_scalar_tensor(batch.get("flash_doc_num_segments_scalar"))
         doc_max_seqlen_scalar = _flash_scalar_tensor(batch.get("flash_doc_max_seqlen_scalar"))
@@ -1312,16 +1300,6 @@ def _prefill_rotary_caches_for_compile(
             prefill(int(seq_len), device=device, dtype=dtype)
             prefilled += 1
     return prefilled
-
-
-def _build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-    """Compatibility wrapper for shared doc-block mask construction.
-
-    :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
-    :return torch.Tensor: Boolean keep mask ``(B,S,S)``.
-    """
-
-    return build_doc_block_mask(doc_ids)
 
 
 def _stabilize_compile_attention_mask(

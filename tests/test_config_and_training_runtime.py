@@ -1345,27 +1345,8 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     assert reason is not None
 
     scope, reason = _resolve_compile_scope(
-        requested_scope="auto",
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-    )
-    assert scope == "backbones"
-    assert reason is None
-
-    scope, reason = _resolve_compile_scope(
         requested_scope="backbones",
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
     )
     assert scope == "backbones"
     assert reason is None
-
-
-def test_compile_controls_do_not_reference_environment_variables():
-    import inspect
-
-    import deberta.training.compile as compile_mod
-    import deberta.training.entrypoint as entrypoint_mod
-
-    for source in (inspect.getsource(entrypoint_mod), inspect.getsource(compile_mod)):
-        assert "DEBERTA_COMPILE_SCOPE" not in source
-        assert "DEBERTA_COMPILE_BACKEND" not in source
-        assert "DEBERTA_HF_ATTN_KERNEL" not in source

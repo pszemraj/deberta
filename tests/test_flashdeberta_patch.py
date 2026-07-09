@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import torch
 
-from deberta.modeling.mask_utils import FlashBatchMeta
+from deberta.modeling.mask_utils import FlashBatchMeta, build_doc_block_mask
 
 
 def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
@@ -2126,16 +2126,16 @@ def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.M
     monkeypatch.setattr(varlen_mod, "_build_unpad_metadata", _counting_build)
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
-    first_seqlens, first_cu, first_max = varlen_mod._get_unpad_metadata_cached(mask)
-    second_seqlens, second_cu, second_max = varlen_mod._get_unpad_metadata_cached(mask)
-    clone_seqlens, clone_cu, clone_max = varlen_mod._get_unpad_metadata_cached(mask.clone())
+    first_entry = varlen_mod._get_unpad_metadata_entry(mask)
+    second_entry = varlen_mod._get_unpad_metadata_entry(mask)
+    clone_entry = varlen_mod._get_unpad_metadata_entry(mask.clone())
 
     assert calls["count"] == 2
-    assert first_max == second_max == clone_max == 2
-    assert first_seqlens.data_ptr() == second_seqlens.data_ptr()
-    assert first_cu.data_ptr() == second_cu.data_ptr()
-    assert clone_seqlens.data_ptr() != first_seqlens.data_ptr()
-    assert clone_cu.data_ptr() != first_cu.data_ptr()
+    assert first_entry.max_seqlen == second_entry.max_seqlen == clone_entry.max_seqlen == 2
+    assert first_entry.seqlens.data_ptr() == second_entry.seqlens.data_ptr()
+    assert first_entry.cu_seqlens.data_ptr() == second_entry.cu_seqlens.data_ptr()
+    assert clone_entry.seqlens.data_ptr() != first_entry.seqlens.data_ptr()
+    assert clone_entry.cu_seqlens.data_ptr() != first_entry.cu_seqlens.data_ptr()
 
     varlen_mod._clear_unpad_metadata_cache()
 
@@ -2378,7 +2378,7 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         varlen_mod = importlib.import_module("deberta.modeling.flashdeberta_varlen_op")
         docblock_mod = importlib.import_module("deberta.modeling.flashdeberta_docblock_op")
         bias_mod = importlib.import_module("deberta.modeling.flashdeberta_bias_op")
-        dense_bias_mod = importlib.import_module("deberta.modeling.flashdeberta_dense_bias_op")
+        importlib.import_module("deberta.modeling.flashdeberta_dense_bias_op")
 
         assert prefix_mod.flashdeberta_prefix_pack_available() is False
         assert segment_mod.flashdeberta_segment_pack_available() is False
@@ -2390,7 +2390,6 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         assert isinstance(docblock_mod.flashdeberta_compiled_docblock_available(), bool)
         assert isinstance(bias_mod.flashdeberta_compiled_bias_available(), bool)
         assert isinstance(bias_mod.flashdeberta_compiled_position_bias_available(), bool)
-        assert isinstance(dense_bias_mod.flashdeberta_compiled_dense_bias_available(), bool)
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
 
@@ -2529,7 +2528,7 @@ def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbo
     assert meta is None
     assert "doc_ids" not in prepared
     assert tuple(prepared["attention_mask"].shape) == (1, 4, 4)
-    assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
+    assert torch.equal(prepared["attention_mask"], build_doc_block_mask(doc_ids))
 
 
 def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
@@ -2602,7 +2601,7 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_pairwise_mas
     assert "flash_seq_lengths" not in prepared
     assert "flash_active_tokens" not in prepared
     assert tuple(prepared["attention_mask"].shape) == (1, 4, 4)
-    assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
+    assert torch.equal(prepared["attention_mask"], build_doc_block_mask(doc_ids))
 
 
 def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_overrides(
@@ -2626,7 +2625,7 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_ove
 
         assert meta is None
         assert "flash_seq_lengths" not in prepared
-        assert torch.equal(prepared["attention_mask"], compile_mod._build_doc_block_mask(doc_ids))
+        assert torch.equal(prepared["attention_mask"], build_doc_block_mask(doc_ids))
         assert compile_mod._flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
     finally:
         configure_flashdeberta_kernel_overrides(None)
@@ -3259,7 +3258,7 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     _assert_single_flash_route_stat(attention_mod, "flash_docblock_bias_calls")
 
 
-def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
+def test_dense_bias_fallback_matches_scaled_reference() -> None:
     """CPU dense-bias fallback must match the eager DeBERTa gather convention.
 
     The reference is an explicit per-element loop:
@@ -3322,23 +3321,14 @@ def test_flashdeberta_dense_bias_wrapper_matches_scaled_reference() -> None:
                     expected[b, h, m, n] = (c2p + p2c) * scale
     expected = expected.masked_fill(~keep_mask, -1.0e4 * scale)
 
-    for actual in (
-        dense_bias_mod._dense_bias_forward_fallback(
-            pos_key=pos_key,
-            pos_query=pos_query,
-            bucket_index=bucket_index,
-            keep_mask=keep_mask,
-            scale=scale,
-        ),
-        dense_bias_mod.flashdeberta_dense_bias(
-            pos_key=pos_key,
-            pos_query=pos_query,
-            bucket_index=bucket_index,
-            keep_mask=keep_mask,
-            scale=scale,
-        ),
-    ):
-        torch.testing.assert_close(actual, expected)
+    actual = dense_bias_mod._dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
@@ -3551,7 +3541,7 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
     pos_key_ref = pos_key.detach().clone().requires_grad_()
     pos_query_ref = pos_query.detach().clone().requires_grad_()
 
-    ref_bias = dense_bias_mod.flashdeberta_dense_bias(
+    ref_bias = dense_bias_mod._dense_bias_forward_fallback(
         pos_key=pos_key_ref,
         pos_query=pos_query_ref,
         bucket_index=bucket_index,
@@ -3668,7 +3658,7 @@ def test_dense_bias_triton_builder_honors_per_head_keep_mask() -> None:
     import deberta.modeling.flashdeberta_attention as attention_mod
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
-    if dense_bias_mod.flashdeberta_dense_bias_import_error() is not None:
+    if dense_bias_mod.triton is None:
         pytest.skip("Fused dense-bias builder is unavailable in this environment.")
 
     torch.manual_seed(0)

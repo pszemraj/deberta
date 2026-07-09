@@ -62,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "config",
         nargs="?",
-        default="configs/custom/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2.yaml",
+        default="configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2.yaml",
     )
     parser.add_argument("--mode", choices=("eager", "flash"), required=True)
     parser.add_argument("--warmup-steps", type=int, default=2)

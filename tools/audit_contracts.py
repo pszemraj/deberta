@@ -339,12 +339,12 @@ def check_optimizer_state_ordering_risk(repo_root: Path) -> CheckResult:
 
 def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
     try:
-        from deberta.training.compile import _build_doc_block_mask as build_mask
+        from deberta.modeling.mask_utils import build_doc_block_mask
     except Exception as e:
         return _fail(
             "doc_block_mask_contract",
-            f"Failed to import _build_doc_block_mask: {type(e).__name__}: {e}",
-            hint="This harness expects src/deberta/training/compile.py to define _build_doc_block_mask(doc_ids).",
+            f"Failed to import build_doc_block_mask: {type(e).__name__}: {e}",
+            hint="This harness expects src/deberta/modeling/mask_utils.py to define build_doc_block_mask(doc_ids).",
         )
 
     # Build a small doc-id batch.
@@ -355,12 +355,12 @@ def check_doc_block_mask_contract(repo_root: Path) -> CheckResult:
         ],
         dtype=torch.long,
     )
-    keep = build_mask(doc_ids)
+    keep = build_doc_block_mask(doc_ids)
 
     if keep.dtype != torch.bool:
         return _fail(
             "doc_block_mask_contract",
-            f"_build_doc_block_mask must return torch.bool, got dtype={keep.dtype}",
+            f"build_doc_block_mask must return torch.bool, got dtype={keep.dtype}",
             hint="Return a boolean keep-mask (True=keep edge).",
         )
     if keep.shape != (2, 8, 8):
@@ -715,7 +715,7 @@ def check_rope_attention_mask_leak(repo_root: Path) -> CheckResult:
 
     # Prefer testing the *repo's* packed/doc-block mask builder.
     try:
-        from deberta.training.compile import _build_doc_block_mask as build_mask
+        from deberta.modeling.mask_utils import build_doc_block_mask as build_mask
     except Exception:
         build_mask = None  # We'll fall back to a minimal within-doc mask (no padding edge cases).
 
