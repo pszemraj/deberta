@@ -3945,7 +3945,10 @@ def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
 def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_fixed_op as fixed_mod
 
-    monkeypatch.setattr(fixed_mod.torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (12, 0))
+    # Patch the repo-level capability seam: patching torch.cuda internals is
+    # defeated by the per-index capability cache and initializes CUDA on
+    # CPU-only machines via current_device().
+    monkeypatch.setattr(fixed_mod, "device_compute_capability", lambda _device: (12, 0))
 
     assert fixed_mod._fixed_repo_tuned_config(
         kind="fwd",
@@ -4023,7 +4026,7 @@ def test_bias_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.M
 def test_bias_repo_tuned_config_is_table_owned(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_bias_op as bias_mod
 
-    monkeypatch.setattr(bias_mod.torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (12, 0))
+    monkeypatch.setattr(bias_mod, "device_compute_capability", lambda _device: (12, 0))
 
     base = dict(
         batch_size=2,
@@ -4190,7 +4193,7 @@ def test_specialized_docblock_bias_backward_enables_new_seq_len_from_table(tmp_p
 def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
-    monkeypatch.setattr(dense_bias_mod.torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (12, 0))
+    monkeypatch.setattr(dense_bias_mod, "device_compute_capability", lambda _device: (12, 0))
 
     assert dense_bias_mod._dense_bias_repo_tuned_config(
         batch_size=4,
