@@ -56,7 +56,7 @@ also carry `min_seq_len`/`max_seq_len`/`max_batch_size` bounds tighter than thei
 `4096_plus` bucket is open-ended, so the shipped dense doc-block row is bounded at
 `max_seq_len: 4096`, and every dense doc-block row carries a `max_batch_size` sized to its
 bucket's worst case (`8`/`2`/`2` at `1024`/`2048`-family/`4096` - the saved bias costs about
-`4.8 GiB` per batch element at `4096`). Out-of-bounds packed batches fall back to the ragged
+`4.5 GiB` per batch element at `4096`). Out-of-bounds packed batches fall back to the ragged
 `docblock` route instead of materializing a quadratic dense bias that OOMs at step 1; the
 `docblock_bias_seq_len` knob bypasses row bounds as the explicit opt-in. See
 [GPU support](gpu-support.md) for the per-hardware picture.
@@ -165,9 +165,15 @@ Tracked packed doc-block configs for benchmarking and training live at
 - Route counters are debug-only and off by default (`FLASHDEBERTA_DEBUG_STATS=1` to enable);
   per-call fallback warnings are on by default (`FLASHDEBERTA_WARN_FALLBACKS=0` to silence) but
   are skipped inside compiled forwards, and compiled training never mutates the Python-side
-  stats (see [Advanced / torch.compile](torch-compile.md)). The one fallback signal that
-  survives compiled training is host-side batch preparation, which warns once per process when
-  non-prefix padding masks start keeping batches on eager attention.
+  stats (see [Advanced / torch.compile](torch-compile.md)). The signals that survive compiled
+  training are host-side batch preparation's rank-0 notices: a once-per-process warning when
+  non-prefix padding masks start keeping batches on eager attention, a once-per-shape log of
+  the chosen doc-block route (warning when the table's `max_batch_size`/`max_seq_len` bounds -
+  not missing measurements - keep a shape ragged), and a once-per-shape warning when
+  `docblock_bias_seq_len` forces dense for a shape the bounded table would keep ragged.
+- Doc-block route stability within a run leans on the training dataloader's hardcoded
+  `drop_last=True`: the route hint is recomputed per batch from batch shape, so a smaller final
+  batch would flip routes (and recompile) mid-epoch if partial batches were ever allowed.
 
 ## Known follow-ups
 
@@ -194,8 +200,9 @@ Tracked packed doc-block configs for benchmarking and training live at
   is unverified there).
 - Validate `kernel_overrides_path` exists at config-validation time; today a typo'd path passes
   validation and model construction and only fails loudly at the first route lookup.
-- Surface per-run route counters in training metrics (wandb/console) so a mid-run routing shift
-  is visible beyond the once-per-process batch-prep warning.
+- Surface per-run route counters in training metrics (wandb/console); batch prep now logs the
+  doc-block route once per shape, but a metrics-visible counter would also cover padded-route
+  shifts and quantify how often each route runs.
 - Treat density as unknown in `flash_seq_bucket` when `total_tokens` is given without
   `batch_size` (it currently assumes `batch_size=1`, which can compute densities above `1.0`);
   no current caller passes that combination.

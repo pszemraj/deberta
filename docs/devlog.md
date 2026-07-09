@@ -911,7 +911,7 @@ summary-only). Environment unchanged: RTX 5090, driver `580.159.04`, torch
 Reviewer finding (confirmed live at `610148e`): the `4096_plus` bucket has no
 upper bound, and the `sm_120` docblock policy row mapped it to dense
 `docblock_bias` - so a packed doc-block batch at any `S > 4096` would route
-dense and save the quadratic `(B,H,S,S)` bias (about 1.6 GiB per layer at
+dense and save the quadratic `(B,H,S,S)` bias (about 1.5 GiB per layer at
 `8192`, B=1, H=12), an OOM instead of the ragged fallback the docs promise
 for unlisted shapes. Fix keeps policy table-owned: route-policy rows now
 accept optional `min_seq_len`/`max_seq_len` bounds (checked in
@@ -963,7 +963,7 @@ follow-ups with exact names.
   outside graphs) now warns once per process; docs corrected -
   `FLASHDEBERTA_WARN_FALLBACKS` defaults on, not off.
 - Dense doc-block routing had no batch-size guard: the saved `(B,H,S,S)`
-  bias costs ~4.8 GiB per batch element at 4096, so bumping batch size on a
+  bias costs ~4.5 GiB per batch element at 4096, so bumping batch size on a
   shipped packed config OOM'd at step 1 with no route linkage. Policy rows
   now accept `max_batch_size`; shipped sm_120 dense rows carry 8/2/2 at
   1024/2048-family/4096, sized to each bucket's worst case (the 2048 buckets

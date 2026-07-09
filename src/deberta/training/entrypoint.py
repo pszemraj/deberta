@@ -487,6 +487,9 @@ def run_pretraining(
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=bool(train_cfg.dataloader_pin_memory),
+        # drop_last keeps the batch shape invariant across steps; flash
+        # doc-block route hints depend on batch size, so a smaller final
+        # batch would flip routes (and recompile) mid-epoch.
         drop_last=True,
         persistent_workers=(num_workers > 0),
     )
