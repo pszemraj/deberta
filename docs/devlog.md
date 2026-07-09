@@ -527,7 +527,7 @@ using the new committed `_docblock` configs. Final-step values:
 Keep dense `docblock_bias` as the JSON-table default for packed
 `1024`/`2048`/`4096`; keep ragged `docblock` as the forced ablation and
 non-`sm_120` fallback route. Two accepted caveats are now documented in
-`docs/advanced/architectures.md`: flash gradients are not bitwise reproducible
+`docs/advanced/flash-attention.md`: flash gradients are not bitwise reproducible
 (atomic positional-gradient accumulation - resume/drift tooling must not
 assert bit-exact replay), and the dense route saves the `(B,H,S,S)` bias for
 backward (memory-for-recompute trade; a recompute knob is a prerequisite for
@@ -789,7 +789,7 @@ campaign. All findings either resolved or explicitly deferred below.
 
 ## 2026-07-07 - Documentation Pass (dedupe, verify, consolidate)
 
-Full read of all 15 tracked markdown files, then three parallel code-vs-doc
+Full read of all tracked markdown files, then three parallel code-vs-doc
 verification agents (getting-started/README, guides, advanced/flash) with
 every claim checked to file:line.
 
@@ -835,8 +835,8 @@ every claim checked to file:line.
 - Generated docs fresh: `generate_config_reference.py --check` passes and
   regenerating API docs produced no diff; `tests/test_config_reference_docs.py`
   passes.
-- All internal doc links resolve relatively (scripted check over all 16
-  files); no absolute self-repo URLs.
+- All internal doc links resolve relatively (scripted check over tracked
+  markdown files); no absolute self-repo URLs.
 - `rehuman` normalization was a no-op: hand-written docs are already pure
   ASCII.
 
@@ -978,10 +978,10 @@ follow-ups with exact names.
 
 ### Reviewed and intentionally not changed
 
-- The test-only public dense-bias custom op duplicates the production
-  bias_op registration but is load-bearing for two GPU parity tests and the
-  no-Triton import contract; consolidation is now spelled out in Known
-  follow-ups rather than rushed pre-merge.
+- The test-only public dense-bias custom op duplicated the production
+  bias_op registration but was load-bearing for GPU parity tests and the
+  no-Triton import contract during this round. Later consolidation moved
+  those tests to production seams and removed the wrapper.
 - `reduce_keep_mask_to_2d` still slices longer masks by design (embeddings /
   RTD activity path where masks legitimately outrun sliced hidden states).
 - Eval-bypass contract (callers that skip

@@ -32,14 +32,6 @@ pip install -e '.[flash]'
 
 The `flash` extra installs the pinned `flashdeberta==0.0.7` package and `triton` for optional FlashDeBERTa attention used with the native `hf_deberta_v2` backbone.
 
-## Generate API markdown docs
-
-```bash
-python tools/generate_api_docs.py
-```
-
-This writes static Markdown files to `docs/api/` directly from public package docstrings.
-
 ## Verify CLI
 
 ```bash

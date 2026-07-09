@@ -45,13 +45,12 @@ FlashDeBERTa path counters are debug-only and disabled by default. Normal compil
 not mutate Python stats or emit per-call warnings from inside attention forward; use the
 benchmark/probe tooling for path visibility instead.
 
-Every flash route runs through opaque `torch.library` custom ops on CUDA: the fixed and varlen
-attention ops, the flash-with-bias routes, the ragged doc-block op, and the dense bias-assembly
-builder op. That keeps the upstream Python autograd wrappers, config caches, and Triton launch
-setup out of the Dynamo trace while still executing the real kernels and backward passes, so each
-route behaves like one stable compiled attention primitive. In particular, the
-`bias_docblock_specialized` backward stays behind the same op boundary - specialization changes
-which kernels launch, not what Dynamo sees.
+Flash CUDA routes cross opaque `torch.library` custom-op boundaries: fixed and varlen attention,
+flash-with-bias attention, ragged doc-block attention, and fused position-bias attention. Dense
+bias assembly is private Triton work inside those production paths, so Dynamo sees a stable
+attention primitive rather than upstream Python autograd wrappers, config caches, or launch setup.
+In particular, the `bias_docblock_specialized` backward stays behind the same op boundary -
+specialization changes which kernels launch, not what Dynamo sees.
 
 Two metadata contracts matter for graph stability:
 
