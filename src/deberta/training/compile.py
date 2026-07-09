@@ -281,6 +281,7 @@ def _notice_docblock_route_once(
     seq_len: int,
     batch_size: int,
     device: torch.device | None,
+    flash_cfg: Any | None = None,
 ) -> None:
     """Log the doc-block route decision once per batch shape.
 
@@ -295,6 +296,7 @@ def _notice_docblock_route_once(
     :param int seq_len: Packed sequence length.
     :param int batch_size: Packed batch size.
     :param torch.device | None device: Batch device for capability lookup.
+    :param Any | None flash_cfg: Optional resolved flash config for override detection.
     """
 
     if not _is_main_process():
@@ -303,6 +305,27 @@ def _notice_docblock_route_once(
     if key in _DOCBLOCK_ROUTE_NOTICED:
         return
     _DOCBLOCK_ROUTE_NOTICED.add(key)
+    if route_hint == "docblock_bias":
+        override_bias_seq_len = _flash_cfg_optional_int(flash_cfg, name="docblock_bias_seq_len", default=None)
+        if override_bias_seq_len is not None:
+            bounded_route = flash_route_choice(
+                policy="docblock",
+                seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
+                compute_capability=device_compute_capability(device) if device is not None else None,
+                seq_len=int(seq_len),
+                batch_size=int(batch_size),
+            )
+            if bounded_route != "docblock_bias":
+                logger.warning(
+                    "model.hf.flash.docblock_bias_seq_len forces the dense doc-block route "
+                    "for (B=%d, S=%d), a shape the tuning table would keep ragged - the knob "
+                    "bypasses the table's max_batch_size/max_seq_len bounds and the dense "
+                    "route saves a (B,H,S,S) bias for backward. Clear the knob or verify "
+                    "memory headroom for this shape.",
+                    batch_size,
+                    seq_len,
+                )
+                return
     if route_hint != "docblock_bias":
         unbounded_route = flash_route_choice(
             policy="docblock",
@@ -583,6 +606,7 @@ def prepare_flash_attention_batch_metadata(
             seq_len=int(input_ids.shape[-1]),
             batch_size=int(input_ids.shape[0]),
             device=input_ids.device,
+            flash_cfg=flash_cfg,
         )
         keep_mask = doc_ids.ne(0)
         # These lengths skip the is_prefix_padding_keep_mask proof the

@@ -146,7 +146,15 @@ class ModelTokenizerConfig:
 
 @dataclass(frozen=True)
 class ModelHFFlashConfig:
-    """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention."""
+    """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention.
+
+    ``docblock_bias_seq_len`` forces the dense doc-block route at exactly that
+    sequence length on any GPU, bypassing the tuning table's
+    ``max_batch_size``/``max_seq_len`` safety bounds entirely - the dense
+    route saves a ``(B,H,S,S)`` bias for backward, so a forgotten knob plus a
+    larger batch can OOM. Training warns once when the knob forces dense past
+    the table bounds.
+    """
 
     force_varlen: bool = field(default=False)
     varlen_min_seq_len: int | None = field(default=None)

@@ -3007,6 +3007,45 @@ def test_prepare_flash_metadata_warns_when_bounds_exclude_dense_docblock_route(
     assert "kernel_overrides_path" in bound_warnings[0].getMessage()
 
 
+def test_prepare_flash_metadata_warns_when_knob_forces_dense_past_table_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """docblock_bias_seq_len bypasses the table's safety bounds; that must be loud."""
+
+    import deberta.training.compile as compile_mod
+
+    monkeypatch.setattr(compile_mod, "_DOCBLOCK_ROUTE_NOTICED", set())
+    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
+    flash_cfg = {"docblock_bias_seq_len": 1024}
+    with caplog.at_level(logging.INFO, logger=compile_mod.logger.name):
+        # B=9 exceeds the sm_120 dense row's max_batch_size=8, so only the
+        # knob keeps this shape dense.
+        _, meta = compile_mod.prepare_flash_attention_batch_metadata(
+            batch=_docblock_route_notice_batch(batch_size=9, seq_len=1024),
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+            flash_cfg=flash_cfg,
+        )
+        assert meta is not None
+        assert meta.normalized_route_hint() == "docblock_bias"
+        knob_warnings = [
+            r for r in caplog.records if r.levelno == logging.WARNING and "docblock_bias_seq_len" in r.message
+        ]
+        assert len(knob_warnings) == 1
+        caplog.clear()
+        # A knob shape the table would choose dense for anyway stays an
+        # info-level route line, not a warning.
+        compile_mod.prepare_flash_attention_batch_metadata(
+            batch=_docblock_route_notice_batch(batch_size=2, seq_len=1024),
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+            flash_cfg=flash_cfg,
+        )
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r for r in caplog.records if "doc-block route" in r.message]
+
+
 def test_flash_route_notices_are_rank_gated(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
