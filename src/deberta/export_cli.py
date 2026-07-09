@@ -36,10 +36,7 @@ from deberta.run_layout import (
     infer_run_dir_from_checkpoint,
     validate_run_metadata_file,
 )
-from deberta.utils.checkpoint import (
-    load_model_state_with_compile_key_remap,
-    load_state_with_compile_fallback,
-)
+from deberta.utils.checkpoint import load_state_with_compile_fallback
 from deberta.utils.io import load_json_mapping
 from deberta.utils.log import setup_process_logging
 from deberta.utils.paths import validate_existing_output_dir
@@ -429,12 +426,11 @@ def _export_component(
             disc_sd=disc_sd,
             gen_sd=gen_sd,
             mode=embedding_sharing,
-            fp32_accumulate=True,
         )
 
     out_dir = stage_dir if export_what == component_key else (stage_dir / component_key)
     export_model.save_pretrained(str(out_dir), safe_serialization=bool(safe_serialization))
-    clean_exported_config(out_dir / "config.json", strict=True)
+    clean_exported_config(out_dir / "config.json")
     write_export_readme_and_license(
         out_dir,
         model_cfg=model_cfg,
@@ -514,12 +510,6 @@ def run_export(cfg: ExportConfig) -> None:
         gen_config=gen_config,
         load_pretrained_weights=False,
     )
-    if model_cfg.gradient_checkpointing:
-        if hasattr(disc_backbone, "gradient_checkpointing_enable"):
-            disc_backbone.gradient_checkpointing_enable()
-        if hasattr(gen_backbone, "gradient_checkpointing_enable"):
-            gen_backbone.gradient_checkpointing_enable()
-
     model = DebertaV3RTDPretrainer(
         discriminator_backbone=disc_backbone,
         generator_backbone=gen_backbone,
@@ -537,7 +527,6 @@ def run_export(cfg: ExportConfig) -> None:
         model=model,
         checkpoint_dir=checkpoint_dir,
         context="export",
-        remap_loader=load_model_state_with_compile_key_remap,
     )
     accelerator.wait_for_everyone()
 

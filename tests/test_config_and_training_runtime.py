@@ -170,7 +170,6 @@ def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -
     )
 
     expected = {0, 1, 2, 3, 7, 15}
-    assert expected.issubset(model._forbidden_sample_token_ids)
     assert int(model._forbidden_sample_token_mask.numel()) == 32
     for tid in expected:
         assert bool(model._forbidden_sample_token_mask[tid].item())
@@ -545,12 +544,11 @@ def test_build_training_collator_propagates_packed_sequences_flag():
     assert collator._block_cross_document_attention is True
 
 
-def test_should_clip_gradients_on_sync_steps():
-    assert _should_clip_gradients(sync_gradients=False, max_grad_norm=1.0) is False
-    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=None) is False
-    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=0.0) is False
-    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=-1.0) is False
-    assert _should_clip_gradients(sync_gradients=True, max_grad_norm=1.0) is True
+def test_should_clip_gradients_for_positive_threshold():
+    assert _should_clip_gradients(max_grad_norm=None) is False
+    assert _should_clip_gradients(max_grad_norm=0.0) is False
+    assert _should_clip_gradients(max_grad_norm=-1.0) is False
+    assert _should_clip_gradients(max_grad_norm=1.0) is True
 
 
 @pytest.mark.parametrize(
@@ -1023,18 +1021,6 @@ def test_resolve_effective_mixed_precision_errors_for_bf16_preflight_failure(
     )
 
 
-def test_resolve_compile_enabled_or_raise_errors_when_torch_compile_missing(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    import deberta.training.compile as compile_mod
-
-    monkeypatch.delattr(compile_mod.torch, "compile", raising=False)
-    with pytest.raises(RuntimeError, match="does not expose torch.compile"):
-        _resolve_compile_enabled_or_raise(True)
-
-    assert _resolve_compile_enabled_or_raise(False) is False
-
-
 def test_normalizer_aliases_and_rejection():
     """All config normalizer functions accept documented aliases and reject unknown values."""
     cases: list[tuple[Any, list[tuple[str, str]], str, str]] = [
@@ -1150,84 +1136,24 @@ def test_stabilize_compile_attention_mask_hf_deberta_v2():
     assert torch.equal(out3["attention_mask"], torch.tensor([[True, True, False]], dtype=torch.bool))
 
 
-def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_supported_backbones(
+def test_compile_backbones_for_scope_compiles_generic_backbone_forwards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fake_compile, compile_calls = fake_torch_compile()
 
-    class _StableBackbone(torch.nn.Module):
+    class _Backbone(torch.nn.Module):
         def __init__(self, label: str) -> None:
             super().__init__()
             self.label = str(label)
 
-        def _resolve_forward_options(
-            self,
-            *,
-            output_attentions: bool | None,
-            output_hidden_states: bool | None,
-            return_dict: bool | None,
-        ) -> tuple[bool, bool, bool]:
-            return (
-                bool(False if output_attentions is None else output_attentions),
-                bool(False if output_hidden_states is None else output_hidden_states),
-                bool(True if return_dict is None else return_dict),
-            )
-
-        def _forward_dense_resolved(
-            self,
-            *,
-            input_ids: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-            position_ids: torch.Tensor | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-            output_attentions: bool,
-            output_hidden_states: bool,
-            return_dict: bool,
-        ) -> tuple[str, bool, bool, bool]:
-            del input_ids, token_type_ids, position_ids, inputs_embeds
-            return (
-                f"{self.label}:dense",
-                bool(output_attentions),
-                bool(output_hidden_states),
-                bool(return_dict),
-            )
-
-        def _forward_masked_resolved(
-            self,
-            *,
-            input_ids: torch.Tensor | None = None,
-            attention_mask: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            position_ids: torch.Tensor | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-            output_attentions: bool,
-            output_hidden_states: bool,
-            return_dict: bool,
-            flash_meta: Any | None = None,
-        ) -> tuple[str, bool, bool, bool, torch.Tensor]:
-            del (
-                input_ids,
-                token_type_ids,
-                position_ids,
-                inputs_embeds,
-                flash_meta,
-            )
-            return (
-                f"{self.label}:masked",
-                bool(output_attentions),
-                bool(output_hidden_states),
-                bool(return_dict),
-                attention_mask,
-            )
-
         def forward(self, **_: Any) -> tuple[str]:
-            return (f"{self.label}:raw-forward",)
+            return (self.label,)
 
     class _Wrapper(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.generator = _StableBackbone("generator")
-            self.discriminator = _StableBackbone("discriminator")
+            self.generator = _Backbone("generator")
+            self.discriminator = _Backbone("discriminator")
 
     monkeypatch.setattr(torch, "compile", _fake_compile)
 
@@ -1238,51 +1164,12 @@ def test_compile_backbones_for_scope_installs_stable_dense_masked_dispatch_for_s
         compile_kwargs={"mode": "default", "backend": "inductor", "dynamic": False},
     )
 
-    assert targets == [
-        "generator[dense_hs0]",
-        "generator[dense_hs1]",
-        "generator[masked_hs0]",
-        "generator[masked_hs1]",
-        "generator[masked_fixed_hs0]",
-        "generator[masked_fixed_hs1]",
-        "generator[masked_varlen_hs0]",
-        "generator[masked_varlen_hs1]",
-        "generator[masked_docblock_hs0]",
-        "generator[masked_docblock_hs1]",
-        "generator[masked_docblock_bias_hs0]",
-        "generator[masked_docblock_bias_hs1]",
-        "discriminator[dense_hs0]",
-        "discriminator[dense_hs1]",
-        "discriminator[masked_hs0]",
-        "discriminator[masked_hs1]",
-        "discriminator[masked_fixed_hs0]",
-        "discriminator[masked_fixed_hs1]",
-        "discriminator[masked_varlen_hs0]",
-        "discriminator[masked_varlen_hs1]",
-        "discriminator[masked_docblock_hs0]",
-        "discriminator[masked_docblock_hs1]",
-        "discriminator[masked_docblock_bias_hs0]",
-        "discriminator[masked_docblock_bias_hs1]",
-    ]
-    assert len(compile_calls) == 24
+    assert targets == ["generator", "discriminator"]
+    assert len(compile_calls) == 2
     for _, kwargs in compile_calls:
         assert kwargs == {"mode": "default", "backend": "inductor", "dynamic": False}
 
-    dense_out = wrapper.generator(
-        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
-        output_hidden_states=None,
-        return_dict=None,
-    )
-    masked_out = wrapper.generator(
-        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
-        attention_mask=torch.tensor([[True, True, False]], dtype=torch.bool),
-        output_hidden_states=True,
-        return_dict=True,
-    )
-
-    assert dense_out == ("generator:dense", False, False, True)
-    assert masked_out[:4] == ("generator:masked", False, True, True)
-    assert torch.equal(masked_out[4], torch.tensor([[True, True, False]], dtype=torch.bool))
+    assert wrapper.generator() == ("generator",)
 
 
 def test_stabilize_compile_attention_mask_rope_doc_blocking():

@@ -315,7 +315,6 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
 def test_derive_generator_config_uses_half_depth_for_hf_backbone():
     base_cfg = types.SimpleNamespace(num_hidden_layers=12)
     model_cfg = ModelConfig(
-        profile="modern",
         backbone_type="hf_deberta_v2",
         generator_num_hidden_layers=None,
     )
@@ -327,7 +326,6 @@ def test_derive_generator_config_uses_half_depth_for_hf_backbone():
 def test_derive_generator_config_keeps_third_depth_default_for_non_hf_backbone():
     base_cfg = types.SimpleNamespace(num_hidden_layers=12)
     model_cfg = ModelConfig(
-        profile="modern",
         backbone_type="rope",
         generator_num_hidden_layers=None,
     )

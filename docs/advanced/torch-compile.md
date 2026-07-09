@@ -69,9 +69,3 @@ from `seqlens`/`cu_seqlens` instead of generic `nonzero`/`gather`/`index_copy` f
 backward fuses packed `grad_out` construction with `delta` computation. When profiling unpacked
 runs, expect the remaining cost to be the varlen Triton backward kernel plus the smaller
 prefix pack/unpack kernels, not `aten::index`-style hotspots.
-
-## Compile debugging helpers
-
-- `tools/compile_drift_probe.py` runs eager and compiled models side by side from identical
-  initial weights on synthetic fixed-shape batches, reporting train-mode loss/parameter drift and
-  Dynamo recompile churn for a given compile scope/kernel.

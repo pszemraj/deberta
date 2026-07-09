@@ -171,13 +171,11 @@ class _SyncedBufferEmbedding(nn.Module):
         *,
         init_weight: torch.Tensor,
         padding_idx: int | None,
-        add_bias: bool,
     ) -> None:
         """Initialize synced embedding buffers.
 
         :param torch.Tensor init_weight: Source embedding matrix.
         :param int | None padding_idx: Optional padding index.
-        :param bool add_bias: Whether to create a trainable additive bias table.
         """
         super().__init__()
         if not isinstance(init_weight, torch.Tensor) or init_weight.ndim != 2:
@@ -187,11 +185,7 @@ class _SyncedBufferEmbedding(nn.Module):
         self.base_weight = nn.Parameter(init_weight.detach().clone(), requires_grad=False)
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
 
-        self.bias: torch.nn.Parameter | None
-        if add_bias:
-            self.bias = nn.Parameter(torch.zeros_like(init_weight))
-        else:
-            self.bias = None
+        self.bias = nn.Parameter(torch.zeros_like(init_weight))
 
     @torch.no_grad()
     def sync_from(self, weight: torch.Tensor) -> None:
@@ -219,9 +213,7 @@ class _SyncedBufferEmbedding(nn.Module):
         :return torch.Tensor: Embedded states.
         """
         out = F.embedding(input_ids, self.base_weight, padding_idx=self.padding_idx)
-        if self.bias is not None:
-            out = out + F.embedding(input_ids, self.bias, padding_idx=self.padding_idx)
-        return out
+        return out + F.embedding(input_ids, self.bias, padding_idx=self.padding_idx)
 
 
 # -----------------------------------------------------------------------------
@@ -248,9 +240,6 @@ class MLMTransform(nn.Module):
         hidden_size = int(config.hidden_size)
         embedding_size = int(getattr(config, "embedding_size", hidden_size))
 
-        self.hidden_size = hidden_size
-        self.embedding_size = embedding_size
-
         self.dense = nn.Linear(hidden_size, embedding_size)
         self.act = get_act_fn(getattr(config, "hidden_act", "gelu"))
 
@@ -274,72 +263,40 @@ class MLMTransform(nn.Module):
 
 
 class MaskedLMHead(nn.Module):
-    """Masked LM head with optional weight tying.
+    """Masked LM head tied to the generator input word embeddings."""
 
-    Tied mode:
-        logits = (transform(h) @ word_embedding_weight.T) + bias
-
-    Untied mode:
-        logits = decoder(transform(h))
-
-    Notes:
-        - We keep the bias as a dedicated Parameter in tied mode.
-        - We avoid casting the full embedding matrix under mixed precision; we cast
-          activations when needed.
-    """
-
-    def __init__(self, config: Any, *, tie_word_embeddings: bool = True) -> None:
+    def __init__(self, config: Any) -> None:
         """Initialize MLM head.
 
         :param Any config: Backbone config with vocab and hidden sizes.
-        :param bool tie_word_embeddings: Whether to project with tied input embeddings.
         """
         super().__init__()
         self.transform = MLMTransform(config)
-        self.vocab_size = int(config.vocab_size)
+        self.bias = nn.Parameter(torch.zeros(int(config.vocab_size)))
 
-        self.tie_word_embeddings = bool(tie_word_embeddings)
-        if self.tie_word_embeddings:
-            self.decoder = None
-            self.bias = nn.Parameter(torch.zeros(self.vocab_size))
-        else:
-            self.decoder = nn.Linear(self.transform.embedding_size, self.vocab_size, bias=True)
-            self.bias = self.decoder.bias
-
-    def forward(
-        self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor) -> torch.Tensor:
         """Project masked hidden states to vocabulary logits.
 
         :param torch.Tensor hidden_states: Hidden states for prediction positions.
-        :param torch.Tensor | None word_embedding_weight: Optional tied embedding matrix.
+        :param torch.Tensor word_embedding_weight: Tied input embedding matrix.
         :return torch.Tensor: Vocabulary logits.
         """
         x = self.transform(hidden_states)
 
-        if self.tie_word_embeddings:
-            if word_embedding_weight is None:
-                raise RuntimeError(
-                    "MaskedLMHead requires `word_embedding_weight` when tie_word_embeddings=True."
-                )
-            if word_embedding_weight.shape[1] != x.shape[-1]:
-                raise RuntimeError(
-                    "Tied word_embedding_weight hidden size mismatch: "
-                    f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
-                )
+        if word_embedding_weight.shape[1] != x.shape[-1]:
+            raise RuntimeError(
+                "Tied word_embedding_weight hidden size mismatch: "
+                f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
+            )
 
-            w = word_embedding_weight
-            b = self.bias
-            # Never cast full embedding matrix; cast activations if needed.
-            if not torch.is_autocast_enabled() and x.dtype != w.dtype:
-                x = x.to(dtype=w.dtype)
-            if b.dtype != w.dtype:
-                b = b.to(dtype=w.dtype)
-            return F.linear(x, w, b)
-
-        if self.decoder is None:
-            raise RuntimeError("MaskedLMHead decoder is not initialized.")
-        return self.decoder(x)
+        w = word_embedding_weight
+        b = self.bias
+        # Never cast the full embedding matrix; cast activations if needed.
+        if not torch.is_autocast_enabled() and x.dtype != w.dtype:
+            x = x.to(dtype=w.dtype)
+        if b.dtype != w.dtype:
+            b = b.to(dtype=w.dtype)
+        return F.linear(x, w, b)
 
 
 class EnhancedMaskDecoder(nn.Module):
@@ -360,14 +317,12 @@ class EnhancedMaskDecoder(nn.Module):
         still be compiled individually if desired)
     """
 
-    def __init__(self, config: Any, *, num_last_layer_passes: int = 2) -> None:
+    def __init__(self, *, num_last_layer_passes: int = 2) -> None:
         """Initialize Enhanced Mask Decoder.
 
-        :param Any config: Generator backbone config.
         :param int num_last_layer_passes: Number of last-layer EMD reapplication passes.
         """
         super().__init__()
-        self.position_biased_input = bool(getattr(config, "position_biased_input", True))
         self.num_passes = int(num_last_layer_passes)
         if self.num_passes < 1:
             raise ValueError("num_last_layer_passes must be >= 1")
@@ -448,10 +403,7 @@ class EnhancedMaskDecoder(nn.Module):
             Tensor (N,H) of contextual states for masked positions.
         """
 
-        if isinstance(encoder_hidden_states, tuple):
-            hs = list(encoder_hidden_states)
-        else:
-            hs = list(encoder_hidden_states)
+        hs = list(encoder_hidden_states)
 
         if len(hs) < 2:
             raise RuntimeError(
@@ -467,15 +419,6 @@ class EnhancedMaskDecoder(nn.Module):
             last = hs[-1]
             return last.reshape(-1, last.shape[-1]).index_select(0, masked_idx)
 
-        # Parity with the original implementation:
-        # - KV states come from the penultimate layer.
-        # - For position_biased_input=True, just use the last layer.
-        if self.position_biased_input:
-            last = hs[-1]
-            flat = last.reshape(-1, last.shape[-1])
-            return flat.index_select(0, masked_idx)
-
-        # --- EMD path (position_biased_input=False) ---
         # KV from penultimate layer.
         kv_states = hs[-2]
         bsz, seq_len, hidden_size = kv_states.shape
@@ -527,7 +470,6 @@ class EnhancedMaskDecoder(nn.Module):
             raise RuntimeError("EnhancedMaskDecoder expects encoder.layer to be a non-empty sequence")
         last_layer = layers[-1]
 
-        outputs: list[torch.Tensor] = []
         for _ in range(self.num_passes):
             # DebertaV2Layer signature: (hidden_states, attention_mask, ..., query_states=...)
             last_layer_kwargs: dict[str, Any] = {
@@ -544,11 +486,9 @@ class EnhancedMaskDecoder(nn.Module):
                 **last_layer_kwargs,
             )
             query_states = out
-            outputs.append(out)
 
         # Gather masked positions from the final pass.
-        final = outputs[-1]
-        flat = final.reshape(-1, final.shape[-1])
+        flat = query_states.reshape(-1, query_states.shape[-1])
         return flat.index_select(0, masked_idx)
 
 
@@ -702,8 +642,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_config: Any,
         gen_config: Any,
         embedding_sharing: str = "gdes",
-        tie_generator_word_embeddings: bool = True,
-        use_enhanced_mask_decoder: bool = True,
         additional_forbidden_token_ids: Iterable[int] | None = None,
     ) -> None:
         """Initialize RTD pretrainer wrapper.
@@ -713,8 +651,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param Any disc_config: Discriminator config.
         :param Any gen_config: Generator config.
         :param str embedding_sharing: Embedding-sharing policy (none|es|gdes).
-        :param bool tie_generator_word_embeddings: Whether MLM head ties word embeddings.
-        :param bool use_enhanced_mask_decoder: Whether EMD is enabled when applicable.
         :param Iterable[int] | None additional_forbidden_token_ids: Extra ids excluded from sampling.
         """
         super().__init__()
@@ -727,11 +663,10 @@ class DebertaV3RTDPretrainer(nn.Module):
         self._discriminator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.discriminator)
 
         # Generator heads
-        self.generator_lm_head = MaskedLMHead(gen_config, tie_word_embeddings=tie_generator_word_embeddings)
+        self.generator_lm_head = MaskedLMHead(gen_config)
 
         # EMD module (only active when gen_config.position_biased_input=False)
-        self.use_enhanced_mask_decoder = bool(use_enhanced_mask_decoder)
-        self.enhanced_mask_decoder = EnhancedMaskDecoder(gen_config, num_last_layer_passes=2)
+        self.enhanced_mask_decoder = EnhancedMaskDecoder(num_last_layer_passes=2)
 
         # Discriminator head
         self.discriminator_head = RTDHead(disc_config)
@@ -739,16 +674,14 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.embedding_sharing = str(embedding_sharing or "none")
 
         # Special ids excluded from generator sampling.
-        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids(
+        forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids(
             additional_forbidden_token_ids=additional_forbidden_token_ids
         )
 
         vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
         self.register_buffer(
             "_forbidden_sample_token_mask",
-            self._build_forbidden_token_mask(
-                vocab_size=vocab_size, forbidden_ids=self._forbidden_sample_token_ids
-            ),
+            self._build_forbidden_token_mask(vocab_size=vocab_size, forbidden_ids=forbidden_sample_token_ids),
             persistent=False,
         )
 
@@ -905,7 +838,7 @@ class DebertaV3RTDPretrainer(nn.Module):
                 continue
             gw = _validate(attr, gen_mod, disc_mod)
 
-            synced = _SyncedBufferEmbedding(init_weight=gw, padding_idx=_padding_idx(disc_mod), add_bias=True)
+            synced = _SyncedBufferEmbedding(init_weight=gw, padding_idx=_padding_idx(disc_mod))
             setattr(disc_embeddings, attr, synced)
             self._gdes_synced_embeddings.append((attr, synced, gen_mod))
 
@@ -1044,7 +977,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         # standalone EMD module again would double-apply that path.
         pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
         z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
-        use_emd = bool(self.use_enhanced_mask_decoder) and (not pos_biased) and z_steps <= 1
+        use_emd = not pos_biased and z_steps <= 1
 
         gen_forward_kwargs: dict[str, Any] = {
             "input_ids": input_ids,

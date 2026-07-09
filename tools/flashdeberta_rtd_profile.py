@@ -36,7 +36,6 @@ from deberta.training.compile import (  # noqa: E402
     _dtype_for_mixed_precision,
     _maybe_cudagraph_mark_step_begin,
     _prefill_rotary_caches_for_compile,
-    _resolve_compile_enabled_or_raise,
     _resolve_compile_scope,
     _stabilize_compile_attention_mask,
     prepare_flash_attention_batch_metadata,
@@ -326,7 +325,6 @@ def _run_decoupled_window(
                     ga_steps=ga_steps,
                     token_weighted_ga=token_weighted_ga,
                     disc_pad_token_id=disc_pad_token_id,
-                    include_has_gen_targets=True,
                     default_unweighted_token_count=1.0,
                 )
             )
@@ -348,7 +346,7 @@ def _run_decoupled_window(
         gen_token_count_window = 0.0
         disc_token_count_window = 0.0
 
-        for batch, gen_count, disc_count, has_gen_targets in window:
+        for batch, gen_count, disc_count in window:
             with _TimedPhase("batch_to_device", phase_times_ms):
                 batch = _move_batch_to_device(batch, device)
                 batch = _stabilize_compile_attention_mask(
@@ -392,10 +390,7 @@ def _run_decoupled_window(
             gen_token_count_window += micro_gen_token_count
             gen_loss_num += float(gen_phase_out.gen_loss_raw.detach().float().item()) * micro_gen_token_count
 
-            phase_has_targets = getattr(gen_phase_out, "has_masked_targets", None)
-            if phase_has_targets is None:
-                phase_has_targets = bool(has_gen_targets)
-            disc_objective_weight = 1.0 if bool(phase_has_targets) else 0.0
+            disc_objective_weight = 1.0 if bool(gen_phase_out.has_masked_targets) else 0.0
             disc_phase_inputs.append(
                 {
                     "input_ids": batch["input_ids"],
@@ -519,7 +514,6 @@ def _run_coupled_window(
                     ga_steps=ga_steps,
                     token_weighted_ga=token_weighted_ga,
                     disc_pad_token_id=disc_pad_token_id,
-                    include_has_gen_targets=False,
                     default_unweighted_token_count=0.0,
                 )
             )
@@ -654,7 +648,7 @@ def main() -> None:
         optimizer = _build_optimizer(model, train_cfg, mixed_precision=mixed_precision)
         lr_scheduler = _build_scheduler(optimizer, train_cfg)
 
-    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
+    compile_enabled = bool(train_cfg.torch_compile)
     compile_scope = _compile_model_if_enabled(
         model=model,
         compile_enabled=compile_enabled,

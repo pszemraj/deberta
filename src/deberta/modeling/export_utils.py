@@ -25,21 +25,18 @@ EXPORT_CONFIG_STRIP_KEYS = frozenset(
 _REPO_URL = "https://github.com/pszemraj/deberta"
 
 
-def clean_exported_config(config_path: Path, *, strict: bool) -> None:
+def clean_exported_config(config_path: Path) -> None:
     """Remove training-internal keys from exported HF ``config.json`` files.
 
     :param Path config_path: Path to exported ``config.json``.
-    :param bool strict: Whether malformed JSON should raise ``ValueError``.
-    :raises ValueError: If ``strict=True`` and ``config_path`` is malformed.
+    :raises ValueError: If ``config_path`` contains malformed JSON.
     """
     if not config_path.exists():
         return
     try:
         raw = load_json_mapping(config_path)
     except Exception as exc:
-        if strict:
-            raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from exc
-        return
+        raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from exc
 
     cleaned = {k: v for k, v in raw.items() if k not in EXPORT_CONFIG_STRIP_KEYS}
     dump_json(cleaned, config_path)
@@ -239,7 +236,6 @@ def merge_embeddings_into_export_backbone(
     disc_sd: dict[str, torch.Tensor],
     gen_sd: dict[str, torch.Tensor],
     mode: str,
-    fp32_accumulate: bool,
 ) -> None:
     """Merge generator/discriminator embedding tensors into an export backbone.
 
@@ -247,7 +243,6 @@ def merge_embeddings_into_export_backbone(
     :param dict[str, torch.Tensor] disc_sd: Discriminator state dict.
     :param dict[str, torch.Tensor] gen_sd: Generator state dict.
     :param str mode: Embedding sharing mode.
-    :param bool fp32_accumulate: Whether to add tensors in fp32 before casting.
     """
     if mode not in {"es", "gdes"}:
         return
@@ -272,10 +267,7 @@ def merge_embeddings_into_export_backbone(
             bias = disc_sd.get(f"embeddings.{attr}.bias")
             if bias is None:
                 raise RuntimeError(f"Missing discriminator bias for embeddings.{attr}.bias (gdes)")
-            if fp32_accumulate:
-                merged = gen_w.detach().float() + bias.detach().float()
-            else:
-                merged = gen_w.to(dtype=bias.dtype) + bias
+            merged = gen_w.detach().float() + bias.detach().float()
 
         emb_mod = getattr(export_model.embeddings, attr)
         if hasattr(emb_mod, "weight") and emb_mod.weight is not None:

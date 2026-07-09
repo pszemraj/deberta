@@ -79,17 +79,13 @@ def _build_run_metadata(
 
 
 def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
-    """Write a mapping payload to YAML, with JSON fallback if PyYAML is unavailable.
+    """Write a mapping payload to YAML.
 
     :param dict[str, Any] payload: Mapping payload.
     :param Path path: Destination path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        dump_json(payload, path)
-        return
+    import yaml
 
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=True, default_flow_style=False, allow_unicode=False)
@@ -432,14 +428,6 @@ def _persist_or_validate_run_configs(
         dump_json(asdict_without_private(resolved_optim_cfg), output_optim_cfg_path)
         dump_json(asdict_without_private(resolved_logging_cfg), output_logging_cfg_path)
         dump_json(run_meta, output_run_meta_path)
-        if resume_checkpoint is not None and source_run_dir is not None and source_run_dir != output_dir_abs:
-            dump_json(
-                {
-                    "resume_checkpoint": str(Path(resume_checkpoint).expanduser().resolve()),
-                    "resume_run_dir": str(source_run_dir),
-                },
-                output_dir / RESUME_SOURCE_FILENAME,
-            )
     _persist_config_yaml_snapshots(
         logging_output_dir=resolved_logging_output_dir,
         model_cfg=model_cfg,

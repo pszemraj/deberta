@@ -116,13 +116,10 @@ _GRAD_PACK_DELTA_BLOCK_ROWS = 32
 class _MaskMetadataCacheEntry:
     """Cached unpadding metadata for one padding-mask tensor."""
 
-    mask_ref: weakref.ReferenceType[torch.Tensor] | None
-    version: int
     seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
     total_tokens: int
-    cu_seqlens_host: tuple[int, ...]
 
 
 @dataclass
@@ -138,9 +135,6 @@ class _MidTensorCacheEntry:
     """Cached varlen tile-metadata tensors for one cumulative-seqlens tensor."""
 
     cu_ref: weakref.ReferenceType[torch.Tensor] | None
-    block_m: int
-    device_type: str
-    device_index: int | None
     mid_batch: torch.Tensor
     mid_start: torch.Tensor
     mn: int
@@ -563,9 +557,6 @@ def _get_mid_tensors_cached(
 
     _MID_TENSOR_CACHE[cache_key] = _MidTensorCacheEntry(
         cu_ref=cu_ref,
-        block_m=int(block_m),
-        device_type=str(device.type),
-        device_index=device.index,
         mid_batch=mid_batch,
         mid_start=mid_start,
         mn=int(mn),
@@ -1117,13 +1108,10 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     seqlens, cu_seqlens, max_seqlen, total_tokens, cu_seqlens_host = _build_unpad_metadata(mask_2d)
 
     entry = _MaskMetadataCacheEntry(
-        mask_ref=None,
-        version=cache_key[-1],
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
         total_tokens=total_tokens,
-        cu_seqlens_host=cu_seqlens_host,
     )
     _register_cu_seqlens_host_tuple(cu_seqlens=cu_seqlens, cu_seqlens_host=cu_seqlens_host)
     _MASK_METADATA_CACHE[cache_key] = entry

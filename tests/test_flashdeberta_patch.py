@@ -165,17 +165,12 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
     return calls
 
 
-def _reload_flash_modules() -> tuple[types.ModuleType, types.ModuleType]:
-    """Reload FlashDeBERTa adapter modules to pick up test-time fake imports.
-
-    :return tuple[types.ModuleType, types.ModuleType]: Reloaded attention and patch modules.
-    """
+def _reload_flash_modules() -> types.ModuleType:
+    """Reload the FlashDeBERTa adapter to pick up test-time fake imports."""
 
     sys.modules.pop("deberta.modeling.flashdeberta_attention", None)
-    sys.modules.pop("deberta.modeling.flashdeberta_patch", None)
     attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
-    patch_mod = importlib.import_module("deberta.modeling.flashdeberta_patch")
-    return importlib.reload(attention_mod), importlib.reload(patch_mod)
+    return importlib.reload(attention_mod)
 
 
 def _restore_saved_flash_modules(
@@ -860,7 +855,7 @@ def test_dense_bucket_index_reuses_native_log_bucket_math(monkeypatch: pytest.Mo
     import math as _math
 
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     _dense_bucket_index_tensor = attention_mod._dense_bucket_index_tensor
 
     def _prior_formula(seq_len: int, buckets: int, max_rel: int) -> torch.Tensor:
@@ -984,7 +979,7 @@ def _stats_attention_harness(
     """
 
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     cfg = cfg if cfg is not None else _small_deberta_config()
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
     monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
@@ -1013,32 +1008,17 @@ def _assert_single_flash_route_stat(attention_mod: types.ModuleType, route_count
     assert stats.get("fallback_calls", 0) == 0
 
 
-def test_enable_flashdeberta_attention_validates_without_global_patch(
+def test_native_flash_helpers_preserve_relative_positions_and_mask_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, patch_mod = _reload_flash_modules()
+    _reload_flash_modules()
 
     from deberta.modeling import deberta_v2_native as dv2
     from deberta.modeling import rtd
 
-    patch_mod.disable_flashdeberta_attention()
-
-    orig_attention = dv2.DisentangledSelfAttention
-    orig_get_rel_pos = dv2.DebertaV2Encoder.get_rel_pos
-    orig_emd_mask = rtd._ensure_emd_pairwise_attention_mask
-
-    patch_mod.enable_flashdeberta_attention(strict=True)
-
-    assert dv2.DisentangledSelfAttention is orig_attention
-    assert dv2.DebertaV2Encoder.get_rel_pos is orig_get_rel_pos
-    assert rtd._ensure_emd_pairwise_attention_mask is orig_emd_mask
-
     cfg = _small_deberta_config()
     cfg.hf_attention_impl = "flash"
-    attention = dv2.DebertaV2Attention(cfg)
-    assert isinstance(attention.self, attention_mod.FlashDisentangledSelfAttention)
-
     encoder = dv2.DebertaV2Encoder(cfg)
     hidden_states = torch.zeros((1, 4, cfg.hidden_size))
     relative_pos = torch.ones((4, 4), dtype=torch.long)
@@ -1055,25 +1035,6 @@ def test_enable_flashdeberta_attention_validates_without_global_patch(
     pairwise_mask = rtd._ensure_emd_flash_attention_mask(pairwise)
     assert tuple(pairwise_mask.shape) == (1, 1, 2, 2)
     assert torch.equal(pairwise_mask[:, 0], pairwise)
-
-    patch_mod.disable_flashdeberta_attention()
-
-    assert dv2.DisentangledSelfAttention is orig_attention
-    assert dv2.DebertaV2Encoder.get_rel_pos is orig_get_rel_pos
-    assert rtd._ensure_emd_pairwise_attention_mask is orig_emd_mask
-
-
-def test_native_attention_selects_flash_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
-    from deberta.modeling.deberta_v2_native import DebertaV2Attention
-
-    cfg = _small_deberta_config()
-    cfg.hf_attention_impl = "flash"
-
-    attention = DebertaV2Attention(cfg)
-
-    assert isinstance(attention.self, attention_mod.FlashDisentangledSelfAttention)
 
 
 def test_native_model_flash_output_attentions_returns_prob_tensors(
@@ -1107,34 +1068,9 @@ def test_native_model_flash_output_attentions_returns_prob_tensors(
     assert outputs.attentions[0].numel() > 0
 
 
-def test_enable_flashdeberta_attention_strict_false_is_noop_when_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delitem(sys.modules, "flashdeberta", raising=False)
-    monkeypatch.delitem(sys.modules, "flashdeberta.ops", raising=False)
-    monkeypatch.delitem(sys.modules, "flashdeberta.ops.flash_attention", raising=False)
-    _, patch_mod = _reload_flash_modules()
-
-    from deberta.modeling import deberta_v2_native as dv2
-
-    original_import_module = patch_mod.importlib.import_module
-
-    def _fake_import_module(name: str, package: str | None = None):
-        if name == "flashdeberta":
-            raise ImportError("simulated missing flashdeberta")
-        return original_import_module(name, package)
-
-    monkeypatch.setattr(patch_mod.importlib, "import_module", _fake_import_module)
-
-    patch_mod.disable_flashdeberta_attention()
-    orig_attention = dv2.DisentangledSelfAttention
-    patch_mod.enable_flashdeberta_attention(strict=False)
-    assert dv2.DisentangledSelfAttention is orig_attention
-
-
 def test_flash_attention_pairwise_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     cfg = _small_deberta_config()
     cfg.hf_flash = {"force_varlen": True, "varlen_min_seq_len": 2048, "eager_dense_max_seq_len": 0}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
@@ -1181,7 +1117,7 @@ def test_flash_attention_output_attentions_falls_back_to_eager_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
     monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
@@ -1228,7 +1164,7 @@ def test_flash_attention_explicit_relative_pos_falls_back_and_preserves_tensor(
     """An explicit relative_pos must route to eager with the exact tensor preserved."""
 
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
     monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
@@ -1305,7 +1241,7 @@ def test_non_prefix_padding_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyP
     """
 
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
     monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
@@ -1380,7 +1316,7 @@ def test_mask_to_2d_keep_mask_rejects_length_mismatch() -> None:
 
 def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     cfg = _small_deberta_config()
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
 
@@ -1577,7 +1513,7 @@ def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
 
     def _gate(hf_flash: dict[str, object], *, capability: tuple[int, int] = (12, 0)) -> bool:
         cfg = _small_deberta_config()
@@ -1606,6 +1542,20 @@ def test_local_bias_seq_len_gate_is_independent_of_docblock_override(
     # off by default, and the explicit runtime knobs re-enable it there.
     assert _gate({}, capability=(9, 0)) is False
     assert _gate({"local_bias_seq_len": 1024, "local_bias_max_batch_size": 4}, capability=(9, 0)) is True
+
+
+@pytest.mark.parametrize(
+    ("other", "message"),
+    [
+        (torch.empty((2, 4, 3)), "shape mismatch"),
+        (torch.empty((2, 3), device="meta"), "device mismatch"),
+    ],
+)
+def test_pack_layout_validation_rejects_shape_and_device_drift(other: torch.Tensor, message: str) -> None:
+    from deberta.modeling.flashdeberta_op_utils import require_matching_tensor_layout
+
+    with pytest.raises(ValueError, match=message):
+        require_matching_tensor_layout(torch.empty((2, 3)), other, context="test")
 
 
 def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
@@ -1997,7 +1947,7 @@ def test_docblock_backward_narrows_fixed_capacity_saved_aux(
 
 def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
 
     monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
     attention_mod.refresh_flashdeberta_runtime_config_from_env()
@@ -2025,7 +1975,7 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
@@ -2045,7 +1995,7 @@ def test_varlen_min_seq_len_config_override_restores_1024_varlen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
 
     mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
@@ -2694,7 +2644,7 @@ def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cp
     seq_len: int,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     from deberta.modeling.mask_utils import build_doc_segment_metadata
 
     cfg = _docblock_attention_config(seq_len=seq_len)
@@ -2742,7 +2692,7 @@ def test_docblock_missing_metadata_does_not_fallback_to_padding_mask(
     """
 
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
 
     seq_len = 8
     cfg = _docblock_attention_config(seq_len=seq_len)
@@ -2767,7 +2717,7 @@ def test_docblock_missing_metadata_can_fallback_with_explicit_pairwise_mask(
     """An explicit pairwise mask keeps eager fallback usable without metadata."""
 
     _install_fake_flashdeberta(monkeypatch)
-    attention_mod, _ = _reload_flash_modules()
+    attention_mod = _reload_flash_modules()
     from deberta.modeling.mask_utils import build_doc_block_mask
 
     seq_len = 8
@@ -4572,28 +4522,6 @@ def test_encoder_compile_hidden_state_snapshots_clone_outputs(monkeypatch: pytes
     assert outputs.hidden_states[0].data_ptr() != outputs.hidden_states[1].data_ptr()
     assert outputs.hidden_states[-1].data_ptr() != outputs.last_hidden_state.data_ptr()
     torch.testing.assert_close(outputs.hidden_states[-1], outputs.last_hidden_state)
-
-
-def test_native_model_forward_remains_valid_after_flash_patch_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    _, patch_mod = _reload_flash_modules()
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.deberta_v2_native import DebertaV2Model
-
-    patch_mod.disable_flashdeberta_attention()
-    patch_mod.enable_flashdeberta_attention(strict=True)
-
-    cfg = _small_deberta_config()
-    model = DebertaV2Model(cfg)
-    input_ids = torch.tensor([[1, 7, 8, 0]], dtype=torch.long)
-    attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.long)
-
-    output = model(input_ids=input_ids, attention_mask=attention_mask)
-
-    assert tuple(output.last_hidden_state.shape) == (1, 4, cfg.hidden_size)
-
-    patch_mod.disable_flashdeberta_attention()
 
 
 def test_docblock_varlen_backward_uses_docblock_tuning_namespace(monkeypatch: pytest.MonkeyPatch) -> None:

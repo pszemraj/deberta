@@ -232,20 +232,19 @@ def _collect_ga_window(
     ga_steps: int,
     token_weighted_ga: bool,
     disc_pad_token_id: int | None,
-    include_has_gen_targets: bool,
     default_unweighted_token_count: float,
-) -> tuple[list[Any], int, float, float, float]:
+) -> tuple[list[tuple[dict[str, torch.Tensor], float, float]], int, float, float, float]:
     """Collect one accumulation window and per-window token counts.
 
     :param Iterator[dict[str, torch.Tensor]] train_iter: Batch iterator.
     :param int ga_steps: Accumulation steps per window.
     :param bool token_weighted_ga: Token-weighted GA toggle.
     :param int | None disc_pad_token_id: Optional discriminator pad token id.
-    :param bool include_has_gen_targets: Whether to append per-batch generator-target flags.
     :param float default_unweighted_token_count: Fallback token count when token weighting is disabled.
-    :return tuple[list[Any], int, float, float, float]: Window payload and local token counters.
+    :return tuple[list[tuple[dict[str, torch.Tensor], float, float]], int, float, float, float]:
+        Window payload and local token counters.
     """
-    window: list[Any] = []
+    window: list[tuple[dict[str, torch.Tensor], float, float]] = []
     consumed_in_window = 0
     local_window_input_tokens = 0.0
     local_gen_tokens = 0.0
@@ -267,11 +266,7 @@ def _collect_ga_window(
             gen_count = float(default_unweighted_token_count)
             disc_count = float(default_unweighted_token_count)
 
-        if include_has_gen_targets:
-            has_gen_targets = bool(batch["labels"].ne(-100).any().item())
-            window.append((batch, gen_count, disc_count, has_gen_targets))
-        else:
-            window.append((batch, gen_count, disc_count))
+        window.append((batch, gen_count, disc_count))
 
     return (
         window,

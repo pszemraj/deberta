@@ -15,22 +15,6 @@ from deberta.utils.checkpoint import unwrap_compiled_model
 logger = logging.getLogger(__name__)
 
 
-def _wandb_save_with_fallback(save_fn: Any, src: Path) -> None:
-    """Call ``wandb.save``-style APIs across signature variants.
-
-    :param Any save_fn: Callable save function.
-    :param Path src: Source file path.
-    :return None: None.
-    """
-    try:
-        save_fn(str(src), base_path=str(src.parent), policy="now")
-    except TypeError:
-        try:
-            save_fn(str(src), base_path=str(src.parent))
-        except TypeError:
-            save_fn(str(src))
-
-
 def _init_trackers(
     *,
     accelerator: Any,
@@ -60,17 +44,7 @@ def _init_trackers(
         accelerator.init_trackers(**call_kwargs)
         return
 
-    try:
-        accelerator.init_trackers(**call_kwargs, init_kwargs=init_kwargs)
-    except TypeError as err:
-        # Some accelerate builds do not accept init_kwargs; retry without it.
-        if "init_kwargs" not in str(err):
-            raise
-        logger.warning(
-            "Accelerate init_trackers() rejected init_kwargs; W&B run name "
-            "cannot be set explicitly on this runtime."
-        )
-        accelerator.init_trackers(**call_kwargs)
+    accelerator.init_trackers(**call_kwargs, init_kwargs=init_kwargs)
 
 
 def _setup_wandb_watch(
@@ -111,10 +85,7 @@ def _setup_wandb_watch(
         logger.warning("W&B tracker does not expose watch(); skipping model watch setup.")
         return False
 
-    try:
-        watch_fn(watch_target, log=mode, log_freq=freq)
-    except TypeError:
-        watch_fn(watch_target, log=mode)
+    watch_fn(watch_target, log=mode, log_freq=freq)
 
     owner_type = type(watch_owner).__name__ if watch_owner is not None else "unknown"
     logger.info("Enabled W&B watch (mode=%s, log_freq=%d, tracker=%s).", mode, freq, owner_type)
@@ -222,7 +193,7 @@ def _upload_wandb_original_config(
             continue
         uploaded_any = False
         for src in deduped_upload_files:
-            _wandb_save_with_fallback(save_fn, src)
+            save_fn(str(src), base_path=str(src.parent), policy="now")
             uploaded_any = True
             logger.info(log_template, src)
         if uploaded_any:

@@ -267,7 +267,6 @@ def load_state_with_compile_fallback(
     model: torch.nn.Module,
     checkpoint_dir: str | Path,
     context: str,
-    remap_loader: Any | None = None,
 ) -> None:
     """Load accelerate state with fallback for ``torch.compile`` wrapper mismatches.
 
@@ -275,8 +274,6 @@ def load_state_with_compile_fallback(
     :param torch.nn.Module model: Potentially wrapped target model.
     :param str | Path checkpoint_dir: Checkpoint directory path.
     :param str context: Human-readable context label (for example ``resume`` or ``export``).
-    :param Any | None remap_loader: Optional loader callable for remapping state dict keys.
-        Signature must match ``load_model_state_with_compile_key_remap(model, checkpoint_dir)``.
     :raises RuntimeError: If normal load fails for non-compile reasons or remap fallback fails.
     """
     ckpt = str(checkpoint_dir)
@@ -295,8 +292,7 @@ def load_state_with_compile_fallback(
     )
     accelerator.load_state(ckpt, strict=False)
     unwrapped = unwrap_compiled_model(accelerator, model)
-    remap_fn = load_model_state_with_compile_key_remap if remap_loader is None else remap_loader
-    stats = remap_fn(unwrapped, Path(ckpt))
+    stats = load_model_state_with_compile_key_remap(unwrapped, Path(ckpt))
     logger.info(
         "%s model remap loaded %d tensors from %s.",
         ctx.capitalize(),

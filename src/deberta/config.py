@@ -16,7 +16,6 @@ from deberta.utils.serialize import asdict_without_private as _asdict_without_pr
 from deberta.utils.types import coerce_scalar, unwrap_optional_type
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
-_MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
 _NORM_ARCH_CHOICES = {"post", "keel"}
 _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
 _HF_ATTN_IMPL_CHOICES = {"eager", "flash"}
@@ -127,7 +126,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 5
+RUN_CONFIG_SCHEMA_VERSION = 6
 _VAR_FULL_RE = re.compile(r"^\$variables\.([A-Za-z0-9_.-]+)$")
 _VAR_INLINE_RE = re.compile(r"\{\$variables\.([A-Za-z0-9_.-]+)\}")
 _VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")
@@ -345,7 +344,6 @@ def _coerce_subconfig(value: Any, cls: type[Any], *, field_name: str) -> Any:
 class ModelConfig:
     """Model-related arguments."""
 
-    profile: str = field(default="modern")
     backbone_type: str = field(default="hf_deberta_v2")
     from_scratch: bool = field(default=True)
     embedding_sharing: str = field(default="gdes")
@@ -409,7 +407,6 @@ class ModelConfig:
 
     def __init__(
         self,
-        profile: str = "modern",
         backbone_type: str = "hf_deberta_v2",
         from_scratch: bool = True,
         embedding_sharing: str = "gdes",
@@ -424,7 +421,6 @@ class ModelConfig:
     ) -> None:
         """Initialize model config while accepting legacy flat kwargs.
 
-        :param str profile: Model profile.
         :param str backbone_type: Backbone type.
         :param bool from_scratch: Scratch/pretrained mode.
         :param str embedding_sharing: Embedding sharing policy.
@@ -468,9 +464,7 @@ class ModelConfig:
                 else:
                     unknown.append(str(key))
             else:
-                if mapped == "profile":
-                    profile = value
-                elif mapped == "backbone_type":
+                if mapped == "backbone_type":
                     backbone_type = value
                 elif mapped == "from_scratch":
                     from_scratch = value
@@ -498,7 +492,6 @@ class ModelConfig:
         if sub_updates["dropout"]:
             dropout_cfg = _apply_dotted_updates(dropout_cfg, sub_updates["dropout"])
 
-        object.__setattr__(self, "profile", str(profile))
         object.__setattr__(self, "backbone_type", str(backbone_type))
         object.__setattr__(self, "from_scratch", bool(from_scratch))
         object.__setattr__(self, "embedding_sharing", str(embedding_sharing))
@@ -1359,7 +1352,6 @@ def validate_model_config(cfg: ModelConfig) -> None:
     _cfg_set(
         cfg, "backbone_type", _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
     )
-    _cfg_set(cfg, "profile", _ensure_choice("model.profile", cfg.profile, _MODEL_PROFILE_CHOICES))
     _cfg_set(
         cfg,
         "embedding_sharing",
@@ -1803,7 +1795,6 @@ def validate_training_workflow_options(
     train_cfg: TrainConfig,
     model_cfg: ModelConfig | None = None,
     optim_cfg: OptimConfig | None = None,
-    logging_cfg: LoggingConfig | None = None,
 ) -> None:
     """Validate options tied to workflow support (for example, eval mode availability).
 
@@ -1811,7 +1802,6 @@ def validate_training_workflow_options(
     :param TrainConfig train_cfg: Training configuration.
     :param ModelConfig | None model_cfg: Optional model configuration.
     :param OptimConfig | None optim_cfg: Optional optimizer configuration.
-    :param LoggingConfig | None logging_cfg: Optional logging configuration.
     """
     sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
     reject_flash_sdpa_for_doc_block = (
@@ -1862,19 +1852,14 @@ def validate_training_workflow_options(
                 "Use embedding_sharing='gdes' or 'none' for decoupled training."
             )
 
-    if logging_cfg is not None:
-        # backend already validated as none|tensorboard.
-        # Effective backend is wandb when enabled; otherwise backend.
-        _ = "wandb" if bool(logging_cfg.wandb.enabled) else str(logging_cfg.backend).strip().lower()
 
-
-def apply_profile_defaults(
+def apply_backbone_defaults(
     *,
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     optim_cfg: OptimConfig | None = None,
 ) -> None:
-    """Apply profile/backbone-specific defaults while preserving explicit values.
+    """Apply backbone-specific defaults while preserving explicit values.
 
     :param ModelConfig model_cfg: Model config to update in-place.
     :param TrainConfig train_cfg: Train config to update in-place.
@@ -1883,30 +1868,11 @@ def apply_profile_defaults(
     # Explicit-field metadata is populated from YAML + dotted CLI flags and is
     # checked before equality comparisons so explicit values are preserved even
     # when they match raw dataclass defaults.
-    explicit_model_fields = _explicit_fields(model_cfg)
     explicit_train_fields = _explicit_fields(train_cfg)
     explicit_optim_fields = _explicit_fields(optim_cfg) if optim_cfg is not None else set()
 
-    profile = str(model_cfg.profile).strip().lower()
-    model_defaults = ModelConfig()
     train_defaults = TrainConfig()
     optim_defaults = OptimConfig()
-
-    if profile == "deberta_v3_parity":
-        if "backbone_type" not in explicit_model_fields and str(model_cfg.backbone_type) == str(
-            model_defaults.backbone_type
-        ):
-            _cfg_set(model_cfg, "backbone_type", "hf_deberta_v2")
-
-        if "embedding_sharing" not in explicit_model_fields and str(model_cfg.embedding_sharing) == str(
-            model_defaults.embedding_sharing
-        ):
-            _cfg_set(model_cfg, "embedding_sharing", "gdes")
-
-        if "hf.attention_kernel" not in explicit_model_fields and str(model_cfg.hf.attention_kernel) == str(
-            model_defaults.hf.attention_kernel
-        ):
-            _cfg_set(model_cfg.hf, "attention_kernel", "dynamic")
 
     if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
         if "objective.mask_token_prob" not in explicit_train_fields and float(
@@ -2518,7 +2484,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     if overrides:
         for expr in overrides:
             cfg = apply_dotted_override(cfg, expr)
-    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
+    apply_backbone_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
     validate_model_config(cfg.model)
     validate_data_config(cfg.data)
     validate_train_config(cfg.train)
@@ -2529,7 +2495,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         train_cfg=cfg.train,
         model_cfg=cfg.model,
         optim_cfg=cfg.optim,
-        logging_cfg=cfg.logging,
     )
     _sync_legacy_train_aliases(train_cfg=cfg.train, optim_cfg=cfg.optim, logging_cfg=cfg.logging)
     return cfg
@@ -2569,7 +2534,7 @@ __all__ = [
     "OptimConfig",
     "LoggingConfig",
     "apply_dotted_override",
-    "apply_profile_defaults",
+    "apply_backbone_defaults",
     "asdict_without_private",
     "iter_leaf_paths_for_dataclass",
     "load_config",

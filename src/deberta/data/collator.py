@@ -617,8 +617,6 @@ class DebertaV3ElectraCollator:
         batch, seq_len = input_ids.shape
         mask_token_id = int(self.tokenizer.mask_token_id)
         mlm_prob = float(self.cfg.mlm_probability)
-        if mlm_prob <= 0.0:
-            return input_ids, labels
 
         mask_prob, random_prob, keep_prob, mask_window, max_preds_per_seq = self._resolve_masking_hyperparams(
             seq_len=seq_len, mlm_prob=mlm_prob
@@ -674,9 +672,6 @@ class DebertaV3ElectraCollator:
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
 
-        if int(max_ngram) <= 1:
-            return self._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special_tokens_mask)
-
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
 
@@ -686,8 +681,6 @@ class DebertaV3ElectraCollator:
         B, S = input_ids.shape
         mask_token_id = int(self.tokenizer.mask_token_id)
         mlm_prob = float(self.cfg.mlm_probability)
-        if mlm_prob <= 0.0:
-            return input_ids, labels
         mask_prob, random_prob, keep_prob, mask_window, max_preds_per_seq = self._resolve_masking_hyperparams(
             seq_len=S, mlm_prob=mlm_prob
         )

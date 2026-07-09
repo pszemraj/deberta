@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from deberta.config import (
-    apply_profile_defaults,
     load_config,
     validate_data_config,
     validate_model_config,
@@ -162,13 +161,6 @@ def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
         load_config(cfg)
 
 
-def test_load_json_unknown_key_raises(tmp_path: Path):
-    bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps({"unknown_field": 1}), encoding="utf-8")
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
-        load_config(bad)
-
-
 def test_load_json_nested_unknown_top_level_key_raises(tmp_path: Path):
     bad = tmp_path / "bad_nested.json"
     bad.write_text(
@@ -215,7 +207,6 @@ def test_parity_yaml_configs_parse_and_validate(config_name: str) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_path = repo_root / "configs" / config_name
     cfg = load_config(config_path)
-    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
 
     validate_model_config(cfg.model)
     validate_data_config(cfg.data)
@@ -226,10 +217,8 @@ def test_parity_yaml_configs_parse_and_validate(config_name: str) -> None:
         train_cfg=cfg.train,
         model_cfg=cfg.model,
         optim_cfg=cfg.optim,
-        logging_cfg=cfg.logging,
     )
 
-    assert cfg.model.profile == "deberta_v3_parity"
     assert cfg.model.backbone_type == "hf_deberta_v2"
     assert cfg.model.pretrained_discriminator_path == ""
     assert bool(cfg.train.decoupled_training) is True

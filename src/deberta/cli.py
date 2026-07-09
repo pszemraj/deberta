@@ -20,7 +20,6 @@ from deberta.config import (
     _HF_MODEL_SIZE_CHOICES,
     _LOGGING_BACKEND_CHOICES,
     _LR_SCHEDULER_CHOICES,
-    _MODEL_PROFILE_CHOICES,
     _NORM_ARCH_CHOICES,
     _RESUME_DATA_STRATEGY_CHOICES,
     _SDPA_KERNEL_ALIASES,
@@ -46,7 +45,7 @@ from deberta.export_cli import (
     run_export,
 )
 from deberta.training import run_pretraining, run_pretraining_dry_run
-from deberta.training.runtime import _apply_profile_and_validate_training_configs
+from deberta.training.runtime import _apply_backbone_defaults_and_validate_training_configs
 from deberta.utils.mapping import flatten_mapping
 from deberta.utils.types import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap_optional_type
 
@@ -54,7 +53,6 @@ from deberta.utils.types import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap
 _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "deberta-v3-base": {
         "model": {
-            "profile": "deberta_v3_parity",
             "backbone_type": "hf_deberta_v2",
             "tokenizer": {
                 "name_or_path": "microsoft/deberta-v3-base",
@@ -94,7 +92,6 @@ _TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
 
 # Parse-time choices for dotted flags.
 _DOTFLAG_CHOICES: dict[str, tuple[str, ...]] = {
-    "model.profile": tuple(sorted(_MODEL_PROFILE_CHOICES)),
     "model.backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
     "model.embedding_sharing": tuple(sorted(_EMBED_SHARING_CHOICES)),
     "model.hf.model_size": tuple(sorted(_HF_MODEL_SIZE_CHOICES)),
@@ -461,9 +458,9 @@ def _run_train(
     cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns, dotflag_map=dotflag_map)
     reason_overrides.update(cli_reasons)
 
-    # Fail fast at the CLI boundary with the same profile/alias/validator
+    # Fail fast at the CLI boundary with the same defaulting/alias/validator
     # sequence the training entrypoint applies, so the two can never drift.
-    _apply_profile_and_validate_training_configs(
+    _apply_backbone_defaults_and_validate_training_configs(
         model_cfg=cfg.model,
         data_cfg=cfg.data,
         train_cfg=cfg.train,

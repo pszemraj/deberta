@@ -21,6 +21,7 @@ import torch
 from deberta.modeling.flashdeberta_op_utils import (
     can_use_triton_pack,
     flatten_padded_rows,
+    require_matching_tensor_layout,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     optional_triton_jit as _optional_triton_jit,
@@ -725,30 +726,6 @@ def _prefix_unpack_fallback(
     return out
 
 
-def _require_matching_padded_shapes(
-    tensor_a: torch.Tensor,
-    tensor_b: torch.Tensor,
-    tensor_c: torch.Tensor | None = None,
-) -> tuple[tuple[int, ...], int, int]:
-    """Validate that padded tensors share the same shape.
-
-    :param torch.Tensor tensor_a: First padded tensor.
-    :param torch.Tensor tensor_b: Second padded tensor.
-    :param torch.Tensor | None tensor_c: Optional third padded tensor.
-    :raises ValueError: If padded tensor shapes do not match.
-    :return tuple[tuple[int, ...], int, int]: Shared full shape, batch size, and sequence length.
-    """
-
-    shape = tuple(int(dim) for dim in tensor_a.shape)
-    if tuple(int(dim) for dim in tensor_b.shape) != shape:
-        raise ValueError(f"Padded tensor shape mismatch: expected {shape}, got {tuple(tensor_b.shape)}")
-    if tensor_c is not None and tuple(int(dim) for dim in tensor_c.shape) != shape:
-        raise ValueError(f"Padded tensor shape mismatch: expected {shape}, got {tuple(tensor_c.shape)}")
-    if len(shape) < 2:
-        raise ValueError(f"Expected padded tensors with leading (B,S) dims; got shape={shape}")
-    return shape, int(shape[0]), int(shape[1])
-
-
 def prefix_pack_padded_rows(
     tensor: torch.Tensor,
     *,
@@ -862,7 +839,10 @@ def prefix_pack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Packed tensors with leading shape ``(NNZ, ...)``.
     """
 
-    shape, batch_size, seq_len = _require_matching_padded_shapes(tensor_a, tensor_b)
+    shape = require_matching_tensor_layout(
+        tensor_a, tensor_b, context="Prefix-pack padded tensors", minimum_rank=2
+    )
+    batch_size, seq_len = int(shape[0]), int(shape[1])
     trailing_shape = shape[2:]
     if int(cu_seqlens.numel()) == 0:
         empty = tensor_a.new_empty((0, *trailing_shape))
@@ -998,7 +978,14 @@ def prefix_pack_padded_rows_triple(
         Packed tensors with leading shape ``(NNZ, ...)``.
     """
 
-    shape, batch_size, seq_len = _require_matching_padded_shapes(tensor_a, tensor_b, tensor_c)
+    shape = require_matching_tensor_layout(
+        tensor_a,
+        tensor_b,
+        tensor_c,
+        context="Prefix-pack padded tensors",
+        minimum_rank=2,
+    )
+    batch_size, seq_len = int(shape[0]), int(shape[1])
     trailing_shape = shape[2:]
     if int(cu_seqlens.numel()) == 0:
         empty_a = tensor_a.new_empty((0, *trailing_shape))
@@ -1199,30 +1186,6 @@ def prefix_unpack_padded_rows(
     return flat_output.view(batch_size, seq_len, *trailing_shape)
 
 
-def _require_matching_packed_shapes(
-    values_a: torch.Tensor,
-    values_b: torch.Tensor,
-    values_c: torch.Tensor | None = None,
-) -> tuple[int, tuple[int, ...]]:
-    """Validate that packed tensors share the same leading and trailing shape.
-
-    :param torch.Tensor values_a: First packed tensor.
-    :param torch.Tensor values_b: Second packed tensor.
-    :param torch.Tensor | None values_c: Optional third packed tensor.
-    :raises ValueError: If packed tensor shapes do not match.
-    :return tuple[int, tuple[int, ...]]: Shared packed-token count and trailing shape.
-    """
-
-    trailing_shape = tuple(int(dim) for dim in values_a.shape[1:])
-    total_tokens = int(values_a.shape[0]) if int(values_a.ndim) > 0 else 0
-    expected = (total_tokens, *trailing_shape)
-    if tuple(int(dim) for dim in values_b.shape) != expected:
-        raise ValueError(f"Packed tensor shape mismatch: expected {expected}, got {tuple(values_b.shape)}")
-    if values_c is not None and tuple(int(dim) for dim in values_c.shape) != expected:
-        raise ValueError(f"Packed tensor shape mismatch: expected {expected}, got {tuple(values_c.shape)}")
-    return total_tokens, trailing_shape
-
-
 def prefix_unpack_padded_rows_pair(
     values_a: torch.Tensor,
     values_b: torch.Tensor,
@@ -1243,7 +1206,8 @@ def prefix_unpack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Two padded tensors with leading shape ``(B, S, ...)``.
     """
 
-    _, trailing_shape = _require_matching_packed_shapes(values_a, values_b)
+    shape = require_matching_tensor_layout(values_a, values_b, context="Prefix-pack packed tensors")
+    trailing_shape = shape[1:]
     if batch_size == 0 or seq_len == 0 or values_a.numel() == 0:
         empty = values_a.new_zeros((batch_size, seq_len, *trailing_shape))
         return empty, values_b.new_zeros((batch_size, seq_len, *trailing_shape))
@@ -1336,7 +1300,8 @@ def prefix_unpack_padded_rows_triple(
         Three padded tensors with leading shape ``(B, S, ...)``.
     """
 
-    _, trailing_shape = _require_matching_packed_shapes(values_a, values_b, values_c)
+    shape = require_matching_tensor_layout(values_a, values_b, values_c, context="Prefix-pack packed tensors")
+    trailing_shape = shape[1:]
     if batch_size == 0 or seq_len == 0 or values_a.numel() == 0:
         empty_a = values_a.new_zeros((batch_size, seq_len, *trailing_shape))
         empty_b = values_b.new_zeros((batch_size, seq_len, *trailing_shape))

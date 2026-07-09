@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from deberta.config import DataConfig
 
-def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
+
+def load_hf_dataset(cfg: DataConfig) -> Any:
     """Load a dataset split using 🤗 Datasets.
 
     Supports:
@@ -14,9 +16,7 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
       - load_dataset(name)
       - load_dataset('text', data_files=...)
 
-    :param Any cfg: Data config containing dataset source settings.
-    :param str split: Split name to load.
-    :param bool streaming: Whether to request a streaming dataset.
+    :param DataConfig cfg: Data config containing dataset source settings.
     :return Any: Map-style Dataset or streaming IterableDataset.
 
     If both ``dataset_name`` and ``data_files`` are set, ``data_files`` are passed through
@@ -28,30 +28,28 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
     except Exception as e:  # pragma: no cover
         raise RuntimeError("datasets is required. Install with `pip install datasets`.") from e
 
-    cache_dir = getattr(cfg, "cache_dir", None)
-
     if cfg.load_from_disk:
-        if streaming:
+        if cfg.streaming:
             raise ValueError(
                 "--streaming true is not compatible with --load_from_disk. Set --streaming false."
             )
         ds = datasets.load_from_disk(cfg.load_from_disk)
         # Support DatasetDict
         if isinstance(ds, datasets.DatasetDict):
-            if split not in ds:
+            if cfg.train_split not in ds:
                 raise ValueError(
-                    f"Split '{split}' not found in load_from_disk dataset. Available: {list(ds.keys())}"
+                    f"Split '{cfg.train_split}' not found in load_from_disk dataset. "
+                    f"Available: {list(ds.keys())}"
                 )
-            ds = ds[split]
+            ds = ds[cfg.train_split]
         return ds
 
     _files = [p.strip() for p in cfg.data_files.split(",") if p.strip()] if cfg.data_files else []
 
     if cfg.dataset_name:
         load_kwargs: dict[str, Any] = {
-            "split": split,
-            "streaming": streaming,
-            "cache_dir": cache_dir,
+            "split": cfg.train_split,
+            "streaming": cfg.streaming,
         }
         if cfg.dataset_config_name:
             load_kwargs["name"] = cfg.dataset_config_name
@@ -63,9 +61,8 @@ def load_hf_dataset(*, cfg: Any, split: str, streaming: bool) -> Any:
         return datasets.load_dataset(
             "text",
             data_files=_files,
-            split=split,
-            streaming=streaming,
-            cache_dir=cache_dir,
+            split=cfg.train_split,
+            streaming=cfg.streaming,
         )
 
     raise ValueError(

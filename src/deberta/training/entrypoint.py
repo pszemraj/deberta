@@ -38,7 +38,6 @@ from deberta.training.compile import (
     _maybe_cudagraph_mark_step_begin,
     _maybe_enable_tf32,
     _prefill_rotary_caches_for_compile,
-    _resolve_compile_enabled_or_raise,
     _resolve_effective_compile_scope,
     _stabilize_compile_attention_mask,
     prepare_flash_attention_batch_metadata,
@@ -70,7 +69,7 @@ from deberta.training.run_management import (
     _save_training_checkpoint,
 )
 from deberta.training.runtime import (
-    _apply_profile_and_validate_training_configs,
+    _apply_backbone_defaults_and_validate_training_configs,
     _build_decoupled_optimizers,
     _build_optimizer,
     _build_scheduler,
@@ -148,7 +147,7 @@ def run_pretraining_dry_run(
         logging_cfg=resolved_logging_cfg,
     )
 
-    _apply_profile_and_validate_training_configs(
+    _apply_backbone_defaults_and_validate_training_configs(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
@@ -194,7 +193,7 @@ def run_pretraining_dry_run(
         train_cfg.mixed_precision,
         bf16_sanity_check=_bf16_runtime_sanity_check,
     )
-    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
+    compile_enabled = bool(train_cfg.torch_compile)
     _, compile_scope, compile_scope_reason = _resolve_effective_compile_scope(
         train_cfg=train_cfg,
         model_cfg=model_cfg,
@@ -237,7 +236,7 @@ def run_pretraining_dry_run(
         )
 
     try:
-        raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
+        raw_train = load_hf_dataset(data_cfg)
     except Exception as exc:
         raise RuntimeError(
             "Failed to load dataset for dry-run preflight. Check data.dataset_name/data_files/load_from_disk, "
@@ -326,13 +325,8 @@ def run_pretraining(
     :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path for auto output-dir naming.
     """
-    from accelerate import Accelerator
+    from accelerate import Accelerator, DistributedDataParallelKwargs
     from accelerate.utils import set_seed
-
-    try:
-        from accelerate import DistributedDataParallelKwargs
-    except Exception:  # pragma: no cover
-        DistributedDataParallelKwargs = None  # type: ignore[assignment]
 
     resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
         train_cfg=train_cfg,
@@ -351,14 +345,14 @@ def run_pretraining(
         bf16_sanity_check=_bf16_runtime_sanity_check,
     )
     compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
-    compile_enabled = _resolve_compile_enabled_or_raise(train_cfg.torch_compile)
+    compile_enabled = bool(train_cfg.torch_compile)
     object.__setattr__(train_cfg, "mixed_precision", mixed_precision)
     accelerator_kwargs: dict[str, Any] = {
         "gradient_accumulation_steps": train_cfg.gradient_accumulation_steps,
         "log_with": log_with,
         "mixed_precision": mixed_precision,
     }
-    if bool(train_cfg.decoupled_training) and DistributedDataParallelKwargs is not None:
+    if bool(train_cfg.decoupled_training):
         # Generator/discriminator phases each touch only a subset of parameters.
         # DDP must track unused params to avoid cross-rank reducer stalls.
         accelerator_kwargs["kwargs_handlers"] = [DistributedDataParallelKwargs(find_unused_parameters=True)]
@@ -367,7 +361,7 @@ def run_pretraining(
     )
 
     setup_process_logging(accelerator.is_main_process)
-    _apply_profile_and_validate_training_configs(
+    _apply_backbone_defaults_and_validate_training_configs(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
@@ -468,7 +462,7 @@ def run_pretraining(
         raise ValueError("Tokenizer must have pad_token_id.")
 
     # Data
-    raw_train = load_hf_dataset(cfg=data_cfg, split=data_cfg.train_split, streaming=data_cfg.streaming)
+    raw_train = load_hf_dataset(data_cfg)
 
     train_dataset, collator = _build_train_dataset_and_collator(
         raw_train=raw_train,
@@ -523,7 +517,6 @@ def run_pretraining(
         disc_config=disc_config,
         gen_config=gen_config,
         embedding_sharing=model_cfg.embedding_sharing,
-        tie_generator_word_embeddings=True,
         additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
 
@@ -1137,7 +1130,6 @@ def run_pretraining(
                     ga_steps=ga_steps,
                     token_weighted_ga=token_weighted_ga,
                     disc_pad_token_id=disc_pad_token_id,
-                    include_has_gen_targets=True,
                     default_unweighted_token_count=1.0,
                 )
                 consumed_micro_batches += int(consumed_in_window)
@@ -1190,7 +1182,7 @@ def run_pretraining(
                 gen_window_nonfinite_local = False
                 gen_first_nonfinite_reason_local: str | None = None
                 gen_first_nonfinite_micro_step: int | None = None
-                for step_idx, (batch, gen_count, disc_count, has_gen_targets) in enumerate(window):
+                for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                     batch = _move_batch_to_device(batch, accelerator.device)
                     batch = _stabilize_compile_attention_mask(
                         batch=batch,
@@ -1294,12 +1286,7 @@ def run_pretraining(
                         # Keep discriminator micro-step counts aligned across ranks:
                         # when local generator targets are absent we still run the
                         # corresponding discriminator pass with zero objective weight.
-                        # Prefer explicit phase metadata when available; otherwise
-                        # fall back to CPU labels metadata gathered pre-device transfer.
-                        phase_has_targets = getattr(gen_phase_out, "has_masked_targets", None)
-                        if phase_has_targets is None:
-                            phase_has_targets = bool(has_gen_targets)
-                        disc_objective_weight = 1.0 if bool(phase_has_targets) else 0.0
+                        disc_objective_weight = 1.0 if bool(gen_phase_out.has_masked_targets) else 0.0
                         disc_phase_inputs.append(
                             {
                                 "input_ids": batch["input_ids"],
@@ -1331,7 +1318,7 @@ def run_pretraining(
                             gen_optimizer.zero_grad(set_to_none=True)
                             disc_optimizer.zero_grad(set_to_none=True)
                             break
-                        if _should_clip_gradients(sync_gradients=True, max_grad_norm=train_cfg.max_grad_norm):
+                        if _should_clip_gradients(train_cfg.max_grad_norm):
                             accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
                         gen_optimizer.step()
                         gen_lr_scheduler.step()
@@ -1489,9 +1476,7 @@ def run_pretraining(
                                 gen_optimizer.zero_grad(set_to_none=True)
                                 disc_optimizer.zero_grad(set_to_none=True)
                                 break
-                            if _should_clip_gradients(
-                                sync_gradients=True, max_grad_norm=train_cfg.max_grad_norm
-                            ):
+                            if _should_clip_gradients(train_cfg.max_grad_norm):
                                 accelerator.clip_grad_norm_(
                                     model.parameters(), float(train_cfg.max_grad_norm)
                                 )
@@ -1587,7 +1572,6 @@ def run_pretraining(
                 ga_steps=ga_steps,
                 token_weighted_ga=token_weighted_ga,
                 disc_pad_token_id=disc_pad_token_id,
-                include_has_gen_targets=False,
                 default_unweighted_token_count=0.0,
             )
             consumed_micro_batches += int(consumed_in_window)
@@ -1789,10 +1773,7 @@ def run_pretraining(
                         optimizer.zero_grad(set_to_none=True)
                         break
 
-                    if _should_clip_gradients(
-                        sync_gradients=True,
-                        max_grad_norm=train_cfg.max_grad_norm,
-                    ):
+                    if _should_clip_gradients(train_cfg.max_grad_norm):
                         accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
                         post_clip_grad_norm = _global_grad_l2_norm(model)
                         if _has_nonfinite_grad_norm_any_rank(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import tempfile
 import types
@@ -19,32 +18,25 @@ from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
 from deberta.run_layout import validate_run_metadata_file
 
 
-class _FakeExportBackbone:
+class _FakeExportBackbone(torch.nn.Module):
     def __init__(
         self,
         *,
         weight_keys: tuple[str, ...] = ("weight",),
-        forced_missing_keys: tuple[str, ...] | None = None,
         write_config_payload: dict[str, Any] | None = None,
     ) -> None:
-        self._weights: dict[str, torch.Tensor] = {str(key): torch.tensor(0.0) for key in weight_keys}
-        self._forced_missing_keys = list(forced_missing_keys or ())
+        super().__init__()
+        for key in weight_keys:
+            module = self
+            *parents, parameter_name = str(key).split(".")
+            for parent in parents:
+                child = getattr(module, parent, None)
+                if child is None:
+                    child = torch.nn.Module()
+                    module.add_module(parent, child)
+                module = child
+            module.register_parameter(parameter_name, torch.nn.Parameter(torch.tensor(0.0)))
         self._write_config_payload = dict(write_config_payload or {})
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        return self._weights
-
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> Any:
-        del strict
-        model_keys = set(self._weights.keys())
-        source_keys = set(state_dict.keys())
-        missing = sorted(model_keys - source_keys)
-        if self._forced_missing_keys:
-            missing = sorted(set(missing) | set(self._forced_missing_keys))
-        unexpected = sorted(source_keys - model_keys)
-        for key in model_keys & source_keys:
-            self._weights[key] = state_dict[key]
-        return types.SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
 
     def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
         target = Path(path)
@@ -136,42 +128,35 @@ def _install_export_fakes(
 
     def _accelerator_factory(**kwargs: Any) -> FakeAccelerator:
         del kwargs
-        accel = FakeAccelerator(
-            distributed_type=distributed_type
-            if distributed_type is not None
-            else fake_utils.DistributedType.FSDP,
-            is_fsdp2=bool(fsdp2),
-            is_main_process=True,
-        )
 
-        def _prepare(self: FakeAccelerator, model: Any) -> Any:
-            self.calls["prepare"].append("export")
-            return model
-
-        def _load_state(self: FakeAccelerator, _checkpoint_dir: str, **load_kwargs: Any) -> None:
+        def _load_state(_checkpoint_dir: str, load_kwargs: dict[str, Any]) -> None:
             called["load_state_calls"] = list(called["load_state_calls"]) + [dict(load_kwargs)]
             if load_state_orig_mod_mismatch and load_kwargs.get("strict", True):
                 raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
-            return None
 
-        def _get_state_dict(self: FakeAccelerator, model: Any) -> dict[str, torch.Tensor]:
-            del model
+        def _get_state_dict(model: Any, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
+            del model, unwrap
             called["get_state_dict"] = int(called["get_state_dict"]) + 1
             return {
                 "discriminator.weight": torch.tensor(1.0),
                 "generator.weight": torch.tensor(2.0),
             }
 
-        def _unwrap_model(self: FakeAccelerator, model: Any, **unwrap_kwargs: Any) -> Any:
+        def _unwrap_model(model: Any, **unwrap_kwargs: Any) -> Any:
             del unwrap_kwargs
             called["unwrap_model"] = int(called["unwrap_model"]) + 1
             return model
 
-        accel.prepare = types.MethodType(_prepare, accel)  # type: ignore[method-assign]
-        accel.load_state = types.MethodType(_load_state, accel)  # type: ignore[method-assign]
-        accel.get_state_dict = types.MethodType(_get_state_dict, accel)  # type: ignore[method-assign]
-        accel.unwrap_model = types.MethodType(_unwrap_model, accel)  # type: ignore[method-assign]
-        return accel
+        return FakeAccelerator(
+            distributed_type=distributed_type
+            if distributed_type is not None
+            else fake_utils.DistributedType.FSDP,
+            is_fsdp2=bool(fsdp2),
+            is_main_process=True,
+            load_state_hook=_load_state,
+            get_state_dict_hook=_get_state_dict,
+            unwrap_model_hook=_unwrap_model,
+        )
 
     fake_accelerate.Accelerator = _accelerator_factory
     fake_accelerate.utils = fake_utils
@@ -281,6 +266,8 @@ def test_run_export_fsdp_state_dict_paths(
 def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
+    from deberta.utils import checkpoint as checkpoint_utils
+
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     called["remap_calls"] = []
@@ -296,7 +283,7 @@ def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
         called["remap_calls"] = list(called["remap_calls"]) + [(model, checkpoint_dir_for_remap)]
         return {"matched": 2, "missing": 0, "unexpected": 0}
 
-    monkeypatch.setattr(export_cli, "load_model_state_with_compile_key_remap", _fake_remap)
+    monkeypatch.setattr(checkpoint_utils, "load_model_state_with_compile_key_remap", _fake_remap)
 
     export_cli.run_export(
         export_cli.ExportConfig(
@@ -412,15 +399,12 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         lambda model_cfg, disc_config, gen_config, export_what: (
             _FakeExportBackbone(
                 weight_keys=("other_weight",),
-                forced_missing_keys=("weight",),
             ),
             None,
         ),
     )
 
     out_dir = tmp_path / f"exported-{int(allow_partial_export)}"
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
     if expect_error:
         with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
             export_cli.run_export(

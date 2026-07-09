@@ -139,7 +139,7 @@ def _masked_generator_logits(
     }
     pos_biased = bool(getattr(model.gen_config, "position_biased_input", True))
     z_steps = int(getattr(model.generator, "z_steps", getattr(model.gen_config, "z_steps", 0)) or 0)
-    use_emd = bool(model.use_enhanced_mask_decoder) and (not pos_biased) and z_steps <= 1
+    use_emd = (not pos_biased) and z_steps <= 1
     if use_emd:
         gen_forward_kwargs["output_hidden_states"] = True
     if flash_meta is not None and getattr(model, "_generator_accepts_flash_kwargs", False):
@@ -149,7 +149,7 @@ def _masked_generator_logits(
     hidden = gen_out.last_hidden_state
 
     if masked_idx.numel() == 0:
-        empty_logits = hidden.new_zeros((0, model.generator_lm_head.decoder.out_features))
+        empty_logits = hidden.new_zeros((0, model.generator_lm_head.bias.numel()))
         empty_labels = labels.new_zeros((0,))
         return hidden, empty_logits, empty_labels, masked_positions
 

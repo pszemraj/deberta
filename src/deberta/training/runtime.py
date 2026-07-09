@@ -17,7 +17,7 @@ from deberta.config import (
     OptimConfig,
     TrainConfig,
     _sync_legacy_train_aliases,
-    apply_profile_defaults,
+    apply_backbone_defaults,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
@@ -414,7 +414,7 @@ def _resolve_section_cfg_compat(
     return resolved_optim_cfg, resolved_logging_cfg
 
 
-def _apply_profile_and_validate_training_configs(
+def _apply_backbone_defaults_and_validate_training_configs(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
@@ -422,7 +422,7 @@ def _apply_profile_and_validate_training_configs(
     optim_cfg: OptimConfig,
     logging_cfg: LoggingConfig,
 ) -> None:
-    """Apply profile defaults and validate full training config contract.
+    """Apply backbone defaults and validate the full training config contract.
 
     :param ModelConfig model_cfg: Model config.
     :param DataConfig data_cfg: Data config.
@@ -431,7 +431,7 @@ def _apply_profile_and_validate_training_configs(
     :param LoggingConfig logging_cfg: Effective logging config.
     :return None: None.
     """
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
     _sync_legacy_train_aliases(
         train_cfg=train_cfg,
         optim_cfg=optim_cfg,
@@ -447,7 +447,6 @@ def _apply_profile_and_validate_training_configs(
         train_cfg=train_cfg,
         model_cfg=model_cfg,
         optim_cfg=optim_cfg,
-        logging_cfg=logging_cfg,
     )
 
 

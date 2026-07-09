@@ -4,7 +4,6 @@
 #     deberta train configs/pretrain_rope_fineweb_edu_4096.yaml
 
 model:
-  profile: modern
   backbone_type: rope
   from_scratch: true
   embedding_sharing: gdes

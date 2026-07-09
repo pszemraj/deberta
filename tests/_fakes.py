@@ -15,6 +15,8 @@ from typing import Any
 
 import torch
 
+from deberta.modeling.rtd import RTDDiscriminatorPhaseOutput, RTDGeneratorPhaseOutput, RTDOutput
+
 
 class DummyTokenizer:
     """Minimal tokenizer stub for unit tests (no network/model downloads)."""
@@ -298,8 +300,6 @@ class FakeAccelerator:
 class SimpleRTD(torch.nn.Module):
     """Minimal RTD-like module for ``run_pretraining`` integration tests.
 
-    Provides both ``_forbidden_sample_token_ids`` (set) and
-    ``_forbidden_sample_token_mask`` (tensor) so it works with all code paths.
     Tracks the last instantiated instance via ``last_instance``.
     """
 
@@ -311,8 +311,6 @@ class SimpleRTD(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(1))
         self.generator = torch.nn.Linear(2, 2)
         self.discriminator = torch.nn.Linear(2, 2)
-        self._forbidden_sample_token_ids = {0, 1, 2, 3}
-        self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
         self.disc_config = _types.SimpleNamespace(pad_token_id=0)
         self.calls: dict[str, list[Any]] = defaultdict(list)
         self._forward_calls = 0
@@ -372,7 +370,7 @@ class SimpleRTD(torch.nn.Module):
         t = anchor + base
         gen_loss_raw = anchor + gen_loss_v
         disc_loss_raw = anchor + disc_loss_v
-        return _types.SimpleNamespace(
+        return RTDOutput(
             loss=t,
             gen_loss=gen_loss_raw.detach(),
             disc_loss=disc_loss_raw.detach(),
@@ -410,7 +408,7 @@ class SimpleRTD(torch.nn.Module):
         gen_scale = self._behavior_value("generator_phase_loss_scale", 1.0, call_idx=call_idx)
         gen_loss = self._loss_anchor(self.generator, self.weight) * gen_scale
         gen_token_count = self._behavior_value("generator_phase_token_count", 1.0, call_idx=call_idx)
-        return _types.SimpleNamespace(
+        return RTDGeneratorPhaseOutput(
             gen_loss_raw=gen_loss,
             gen_token_count=torch.tensor(gen_token_count),
             corrupted_input_ids=input_ids.detach().clone(),
@@ -441,7 +439,7 @@ class SimpleRTD(torch.nn.Module):
             "discriminator_phase_positive_count", 1.0, call_idx=call_idx
         )
         disc_accuracy = self._behavior_value("discriminator_phase_accuracy", 1.0, call_idx=call_idx)
-        return _types.SimpleNamespace(
+        return RTDDiscriminatorPhaseOutput(
             disc_loss_raw=disc_loss,
             disc_accuracy=torch.tensor(disc_accuracy),
             disc_token_count=torch.tensor(disc_token_count),
@@ -515,6 +513,7 @@ def setup_pretraining_mocks(
 
     fake_accelerate = _types.ModuleType("accelerate")
     fake_accelerate.Accelerator = accelerator_cls
+    fake_accelerate.DistributedDataParallelKwargs = _types.SimpleNamespace
     fake_accelerate_utils = _types.ModuleType("accelerate.utils")
     fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
@@ -529,7 +528,7 @@ def setup_pretraining_mocks(
     monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
     monkeypatch.setattr(entrypoint_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda _cfg: [{"text": "hello"}])
     monkeypatch.setattr(
         entrypoint_mod,
         "_build_train_dataset_and_collator",

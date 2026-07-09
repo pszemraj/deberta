@@ -697,7 +697,7 @@ campaign. All findings either resolved or explicitly deferred below.
   dense + all 5 masked routes, hs0+hs1). Shared
   `_resolve_flash_seq_lengths_and_active_tokens` for the doc-block and
   padded branches.
-- `cli.py` now calls `runtime._apply_profile_and_validate_training_configs`
+- `cli.py` now calls `runtime._apply_backbone_defaults_and_validate_training_configs`
   instead of hand-copying the validator sequence (the CLI copy had already
   drifted: it skipped `_sync_legacy_train_aliases`).
 - `data/collator.py`: unigram/ngram masking share
@@ -771,7 +771,7 @@ campaign. All findings either resolved or explicitly deferred below.
 - `norm.py` RMSNorm (stable FSDP2 param names), `get/set_input_embeddings`
   duplicated native/rope (HF API convention), builder pooler kwargs
   (export interop), config `__init__` kwargs-partition pattern and the
-  table-drivable profile-default/inert-warning blocks (dedicated change),
+  table-drivable backbone-default/inert-warning blocks (dedicated change),
   audit_contracts-vs-pytest assertion overlap (intentional dual gate),
   `_config_and_training_shared_imports` grab-bag (documented tradeoff).
 
@@ -812,7 +812,7 @@ every claim checked to file:line.
   the defaults of tracked `tools/run_flashdeberta_benchmarks.sh` and
   described as shipped; both force-added.
 - configuration.md's load pipeline was wrong: `load_config` fully
-  validates the file (with profile defaults) before preset/CLI overrides
+  validates the file (with backbone defaults) before preset/CLI overrides
   apply, then validation re-runs on the merged result - a broken base
   file cannot be repaired by CLI flags (reproduced).
 - `metrics.jsonl.gz` is gated by `logging.debug.metrics`, not the removed

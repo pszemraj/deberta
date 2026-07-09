@@ -187,7 +187,7 @@ def load_tool_config_and_loader(
         raise RuntimeError(f"{tool_name} currently expects bf16 mixed precision.")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer_name_or_path, use_fast=True)
-    raw_train = load_hf_dataset(cfg=cfg.data, split=cfg.data.train_split, streaming=cfg.data.streaming)
+    raw_train = load_hf_dataset(cfg.data)
     train_dataset, collator = _build_train_dataset_and_collator(
         raw_train=raw_train,
         tokenizer=tokenizer,
@@ -286,7 +286,6 @@ def build_rtd_pretrainer(
         disc_config=disc_config,
         gen_config=gen_config,
         embedding_sharing=cfg.model.embedding_sharing,
-        tie_generator_word_embeddings=True,
         additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     ).to(device=device)
     _sync_discriminator_embeddings_if_available(model)

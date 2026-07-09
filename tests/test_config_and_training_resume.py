@@ -9,31 +9,16 @@ def _write_resume_source_snapshots(run_dir: Path) -> None:
     train_cfg = TrainConfig()
     optim_cfg = OptimConfig()
     logging_cfg = LoggingConfig(output_dir=str(run_dir))
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-    (run_dir / "model_config.json").write_text(
-        json.dumps(asdict(model_cfg), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (run_dir / "data_config.json").write_text(
-        json.dumps(asdict(data_cfg), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (run_dir / "train_config.json").write_text(
-        json.dumps(asdict(train_cfg), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (run_dir / "optim_config.json").write_text(
-        json.dumps(asdict(optim_cfg), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (run_dir / "logging_config.json").write_text(
-        json.dumps(asdict(logging_cfg), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (run_dir / "run_metadata.json").write_text(
-        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION)}, indent=2, sort_keys=True)
-        + "\n",
-        encoding="utf-8",
+    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
+    _persist_or_validate_run_configs(
+        output_dir=run_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
     )
 
 

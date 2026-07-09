@@ -119,22 +119,6 @@ def _bf16_runtime_sanity_check() -> bool:
         return False
 
 
-def _resolve_compile_enabled_or_raise(requested: bool) -> bool:
-    """Return compile-enabled flag, raising when torch.compile is unavailable.
-
-    :param bool requested: Whether compile was requested by config.
-    :raises RuntimeError: If compile was requested but torch.compile is unavailable.
-    :return bool: True when compile should be enabled.
-    """
-    if not bool(requested):
-        return False
-    if not hasattr(torch, "compile"):
-        raise RuntimeError(
-            "train.torch_compile=true requested but this PyTorch build does not expose torch.compile."
-        )
-    return True
-
-
 def _flash_route_hint_for_padding_batch(
     *,
     seq_len: int,
@@ -955,140 +939,18 @@ def _install_stable_backbone_compile_dispatch(
     dense_hs1 = getattr(module, "_forward_dense_hs1", None)
     masked_hs0 = getattr(module, "_forward_masked_hs0", None)
     masked_hs1 = getattr(module, "_forward_masked_hs1", None)
-    dense_forward = getattr(module, "_forward_dense_resolved", None)
-    masked_forward = getattr(module, "_forward_masked_resolved", None)
-    if not callable(resolve_options):
+    if not (
+        callable(resolve_options)
+        and callable(dense_hs0)
+        and callable(dense_hs1)
+        and callable(masked_hs0)
+        and callable(masked_hs1)
+    ):
         return False
-
-    if callable(dense_hs0) and callable(dense_hs1) and callable(masked_hs0) and callable(masked_hs1):
-        dense_hs0_fn = dense_hs0
-        dense_hs1_fn = dense_hs1
-        masked_hs0_fn = masked_hs0
-        masked_hs1_fn = masked_hs1
-    else:
-        if not callable(dense_forward) or not callable(masked_forward):
-            return False
-
-        def _dense_hs0_fn(
-            *,
-            input_ids: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-            position_ids: torch.Tensor | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-        ) -> Any:
-            """Call the generic dense helper with fixed ``hidden_states=False``.
-
-            :param torch.Tensor | None input_ids: Optional input token ids.
-            :param torch.Tensor | None token_type_ids: Optional token type ids.
-            :param torch.Tensor | None position_ids: Optional position ids.
-            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-            :return Any: Dense-path backbone outputs.
-            """
-
-            return dense_forward(
-                input_ids=input_ids,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-
-        def _dense_hs1_fn(
-            *,
-            input_ids: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-            position_ids: torch.Tensor | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-        ) -> Any:
-            """Call the generic dense helper with fixed ``hidden_states=True``.
-
-            :param torch.Tensor | None input_ids: Optional input token ids.
-            :param torch.Tensor | None token_type_ids: Optional token type ids.
-            :param torch.Tensor | None position_ids: Optional position ids.
-            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-            :return Any: Dense-path backbone outputs.
-            """
-
-            return dense_forward(
-                input_ids=input_ids,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-        def _masked_hs0_fn(
-            *,
-            input_ids: torch.Tensor | None = None,
-            attention_mask: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            position_ids: torch.Tensor | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-            flash_meta: FlashBatchMeta | None = None,
-        ) -> Any:
-            """Call the generic masked helper with fixed ``hidden_states=False``.
-
-            :param torch.Tensor | None input_ids: Optional input token ids.
-            :param torch.Tensor attention_mask: Attention mask tensor.
-            :param torch.Tensor | None token_type_ids: Optional token type ids.
-            :param torch.Tensor | None position_ids: Optional position ids.
-            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-            :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-            :return Any: Masked-path backbone outputs.
-            """
-
-            return masked_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
-                flash_meta=flash_meta,
-            )
-
-        def _masked_hs1_fn(
-            *,
-            input_ids: torch.Tensor | None = None,
-            attention_mask: torch.Tensor,
-            token_type_ids: torch.Tensor | None = None,
-            position_ids: torch.Tensor | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-            flash_meta: FlashBatchMeta | None = None,
-        ) -> Any:
-            """Call the generic masked helper with fixed ``hidden_states=True``.
-
-            :param torch.Tensor | None input_ids: Optional input token ids.
-            :param torch.Tensor attention_mask: Attention mask tensor.
-            :param torch.Tensor | None token_type_ids: Optional token type ids.
-            :param torch.Tensor | None position_ids: Optional position ids.
-            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
-            :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-            :return Any: Masked-path backbone outputs.
-            """
-
-            return masked_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-                flash_meta=flash_meta,
-            )
-
-        dense_hs0_fn = _dense_hs0_fn
-        dense_hs1_fn = _dense_hs1_fn
-        masked_hs0_fn = _masked_hs0_fn
-        masked_hs1_fn = _masked_hs1_fn
+    dense_hs0_fn = dense_hs0
+    dense_hs1_fn = dense_hs1
+    masked_hs0_fn = masked_hs0
+    masked_hs1_fn = masked_hs1
 
     def _make_routed_masked_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
         """Bind a fixed flash route onto one stable masked entrypoint.
@@ -1269,8 +1131,6 @@ def _dtype_for_mixed_precision(mode: str) -> torch.dtype:
     normalized = str(mode).strip().lower()
     if normalized == "bf16":
         return torch.bfloat16
-    if normalized in {"fp16", "float16"}:
-        return torch.float16
     return torch.float32
 
 

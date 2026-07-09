@@ -11,7 +11,7 @@ import uuid
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from deberta.utils.io import dump_json, load_json_mapping
 from deberta.utils.paths import validate_existing_output_dir
@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _CHECKPOINT_DATA_STATE_FILENAME = "data_state.json"
 _CHECKPOINT_COMPLETE_MARKER = ".complete"
+
+
+class _CheckpointStatus(NamedTuple):
+    """Structural checkpoint classification used by resume discovery."""
+
+    committed: bool
+    has_progress: bool
+    has_weights: bool
+
+    @property
+    def resumable(self) -> bool:
+        """Return whether all resume invariants are satisfied."""
+        return self.committed and self.has_progress and self.has_weights
 
 
 def _sanitize_run_label(raw: str) -> str:
@@ -311,20 +324,18 @@ def _is_checkpoint_committed(checkpoint_dir: Path) -> bool:
     return _checkpoint_complete_marker_path(checkpoint_dir).is_file()
 
 
-def _is_checkpoint_resumable(checkpoint_dir: Path) -> bool:
-    """Return whether a checkpoint satisfies strict resumability invariants.
+def _classify_checkpoint(checkpoint_dir: Path) -> _CheckpointStatus:
+    """Classify a checkpoint against strict resumability invariants.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return bool: ``True`` when marker, metadata, and weights are all present.
+    :return _CheckpointStatus: Marker, progress, and model-weight status.
     """
-    if not _is_checkpoint_committed(checkpoint_dir):
-        return False
     consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
-    if consumed is None:
-        return False
-    if not _checkpoint_weights_appear_valid(checkpoint_dir):
-        return False
-    return True
+    return _CheckpointStatus(
+        committed=_is_checkpoint_committed(checkpoint_dir),
+        has_progress=consumed is not None,
+        has_weights=_checkpoint_weights_appear_valid(checkpoint_dir),
+    )
 
 
 def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
@@ -342,10 +353,9 @@ def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
 
     checkpoints.sort(key=lambda x: x[0], reverse=True)
     for _, checkpoint_dir in checkpoints:
-        resumable = _is_checkpoint_resumable(checkpoint_dir)
-        if not resumable:
-            consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
-            if consumed is not None and not _checkpoint_weights_appear_valid(checkpoint_dir):
+        status = _classify_checkpoint(checkpoint_dir)
+        if not status.resumable:
+            if status.has_progress and not status.has_weights:
                 logger.warning(
                     "Checkpoint %s has resume metadata but model weights appear missing/empty; "
                     "skipping as unresumable.",
@@ -388,21 +398,19 @@ def _resolve_resume_checkpoint(
                 "train.resume_from_checkpoint must point to a checkpoint directory. "
                 f"Got a non-directory path: {checkpoint_path}"
             )
-        consumed, _, _ = _load_checkpoint_data_progress(checkpoint_path)
-        weights_ok = _checkpoint_weights_appear_valid(checkpoint_path)
-        committed = _is_checkpoint_committed(checkpoint_path)
-        if not committed:
+        status = _classify_checkpoint(checkpoint_path)
+        if not status.committed:
             raise ValueError(
                 f"Explicit resume checkpoint '{checkpoint_path}' is missing .complete marker. "
                 "Only transactionally committed checkpoints are resumable."
             )
-        if consumed is None:
+        if not status.has_progress:
             raise ValueError(
                 f"Explicit resume checkpoint '{checkpoint_path}' has .complete marker but failed "
                 "resume integrity checks (missing/invalid data_state.json with consumed_micro_batches). "
                 "The checkpoint may be incomplete due to a crashed save."
             )
-        if not weights_ok:
+        if not status.has_weights:
             raise ValueError(
                 f"Explicit resume checkpoint '{checkpoint_path}' has .complete marker but model weights "
                 "appear missing or empty. The checkpoint may be incomplete due to a crashed save."

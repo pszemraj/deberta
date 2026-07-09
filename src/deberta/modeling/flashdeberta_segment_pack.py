@@ -19,6 +19,7 @@ import torch
 from deberta.modeling.flashdeberta_op_utils import (
     can_use_triton_pack,
     flatten_padded_rows,
+    require_matching_tensor_layout,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     optional_triton_jit as _optional_triton_jit,
@@ -600,14 +601,16 @@ def segment_pack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
+    shape = require_matching_tensor_layout(
+        tensor_a, tensor_b, context="Segment-pack padded tensors", minimum_rank=2
+    )
+    trailing_shape = shape[2:]
     if not tensor_a.is_contiguous():
         tensor_a = tensor_a.contiguous()
     if not tensor_b.is_contiguous():
         tensor_b = tensor_b.contiguous()
-    flat_a, trailing_shape, _batch_size, _seq_len = _flatten_rows(tensor_a)
-    flat_b, trailing_shape_b, _, _ = _flatten_rows(tensor_b)
-    if trailing_shape_b != trailing_shape:
-        raise ValueError("segment_pack_padded_rows_pair requires matching trailing shapes.")
+    flat_a, _, _batch_size, _seq_len = _flatten_rows(tensor_a)
+    flat_b, _, _, _ = _flatten_rows(tensor_b)
     total = max(0, int(total_tokens))
     out_a = tensor_a.new_empty((total,) + trailing_shape)
     out_b = tensor_b.new_empty((total,) + trailing_shape)
@@ -617,14 +620,11 @@ def segment_pack_padded_rows_pair(
     out_flat_b = out_b.view(total, -1)
     row_size = int(out_flat_a.shape[1])
 
-    if (
-        _can_use_triton_segment_pack(
-            tensor=tensor_a,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-        )
-        and tensor_b.device == tensor_a.device
+    if _can_use_triton_segment_pack(
+        tensor=tensor_a,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
         grid = (
@@ -687,17 +687,23 @@ def segment_pack_padded_rows_triple(
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
+    shape = require_matching_tensor_layout(
+        tensor_a,
+        tensor_b,
+        tensor_c,
+        context="Segment-pack padded tensors",
+        minimum_rank=2,
+    )
+    trailing_shape = shape[2:]
     if not tensor_a.is_contiguous():
         tensor_a = tensor_a.contiguous()
     if not tensor_b.is_contiguous():
         tensor_b = tensor_b.contiguous()
     if not tensor_c.is_contiguous():
         tensor_c = tensor_c.contiguous()
-    flat_a, trailing_shape, _batch_size, _seq_len = _flatten_rows(tensor_a)
-    flat_b, trailing_shape_b, _, _ = _flatten_rows(tensor_b)
-    flat_c, trailing_shape_c, _, _ = _flatten_rows(tensor_c)
-    if trailing_shape_b != trailing_shape or trailing_shape_c != trailing_shape:
-        raise ValueError("segment_pack_padded_rows_triple requires matching trailing shapes.")
+    flat_a, _, _batch_size, _seq_len = _flatten_rows(tensor_a)
+    flat_b, _, _, _ = _flatten_rows(tensor_b)
+    flat_c, _, _, _ = _flatten_rows(tensor_c)
     total = max(0, int(total_tokens))
     out_a = tensor_a.new_empty((total,) + trailing_shape)
     out_b = tensor_b.new_empty((total,) + trailing_shape)
@@ -950,8 +956,9 @@ def segment_unpack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Padded tensors ``(B, S, ...)``.
     """
 
-    total = int(packed_a.shape[0])
-    trailing_shape = tuple(int(dim) for dim in packed_a.shape[1:])
+    shape = require_matching_tensor_layout(packed_a, packed_b, context="Segment-pack packed tensors")
+    total = int(shape[0])
+    trailing_shape = shape[1:]
     flat_a = packed_a.contiguous().view(total, -1)
     flat_b = packed_b.contiguous().view(total, -1)
     output_a = packed_a.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
@@ -962,14 +969,11 @@ def segment_unpack_padded_rows_pair(
     out_flat_b = output_b.view(int(batch_size) * int(seq_len), -1)
     row_size = int(flat_a.shape[1])
 
-    if (
-        _can_use_triton_segment_pack(
-            tensor=output_a,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-        )
-        and packed_b.device == packed_a.device
+    if _can_use_triton_segment_pack(
+        tensor=output_a,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
         grid = (
@@ -1034,8 +1038,14 @@ def segment_unpack_padded_rows_triple(
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Padded tensors ``(B, S, ...)``.
     """
 
-    total = int(packed_a.shape[0])
-    trailing_shape = tuple(int(dim) for dim in packed_a.shape[1:])
+    shape = require_matching_tensor_layout(
+        packed_a,
+        packed_b,
+        packed_c,
+        context="Segment-pack packed tensors",
+    )
+    total = int(shape[0])
+    trailing_shape = shape[1:]
     flat_a = packed_a.contiguous().view(total, -1)
     flat_b = packed_b.contiguous().view(total, -1)
     flat_c = packed_c.contiguous().view(total, -1)
@@ -1049,15 +1059,11 @@ def segment_unpack_padded_rows_triple(
     out_flat_c = output_c.view(int(batch_size) * int(seq_len), -1)
     row_size = int(flat_a.shape[1])
 
-    if (
-        _can_use_triton_segment_pack(
-            tensor=output_a,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-        )
-        and packed_b.device == packed_a.device
-        and packed_c.device == packed_a.device
+    if _can_use_triton_segment_pack(
+        tensor=output_a,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
         grid = (

@@ -34,12 +34,7 @@ special ids so upstream partial masks cannot unprotect tokenizer specials.
 ## `load_hf_dataset`
 
 ```python
-load_hf_dataset(
-    *,
-    cfg: 'Any',
-    split: 'str',
-    streaming: 'bool',
-) -> 'Any'
+load_hf_dataset(cfg: 'DataConfig') -> 'Any'
 ```
 
 Load a dataset split using 🤗 Datasets.
@@ -51,9 +46,7 @@ Supports:
 
 ### Parameters
 
-- `cfg` (`Any`): Data config containing dataset source settings.
-- `split` (`str`): Split name to load.
-- `streaming` (`bool`): Whether to request a streaming dataset.
+- `cfg` (`DataConfig`): Data config containing dataset source settings.
 
 ### Returns
 

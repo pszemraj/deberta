@@ -3,30 +3,6 @@ from _config_and_training_shared_imports import *
 from _fakes import checkpoint_saving_accelerator
 
 
-def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    def _fake_load_dataset(name: str, **kwargs: Any) -> list[dict[str, str]]:
-        calls.append((str(name), dict(kwargs)))
-        return [{"text": "ok"}]
-
-    fake_datasets = types.SimpleNamespace(
-        load_dataset=_fake_load_dataset,
-        load_from_disk=lambda _path: [],
-        DatasetDict=dict,
-    )
-    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
-
-    cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
-    out = load_hf_dataset(cfg=cfg, split="train", streaming=True)
-
-    assert out == [{"text": "ok"}]
-    assert calls
-    assert calls[0][0] == "hf-internal-testing/librispeech_asr_dummy"
-    assert "cache_dir" in calls[0][1]
-    assert calls[0][1]["cache_dir"] is None
-
-
 def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
     pytest.importorskip("yaml")
     cfg_path = tmp_path / "cfg.yaml"
@@ -146,7 +122,7 @@ def test_apply_dotted_override_preserves_existing_explicit_fields_per_section() 
     assert "objective.mask_token_prob" in explicit_train_fields
     assert "max_steps" in explicit_train_fields
 
-    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
+    apply_backbone_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
     assert cfg.train.mask_token_prob == pytest.approx(0.8)
 
 
@@ -735,8 +711,9 @@ def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
     )
 
 
-def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mod_keys(
-    tmp_path: Path,
+@pytest.mark.parametrize("orig_mod_placement", ["nested", "top_level"])
+def test_load_model_state_with_compile_key_remap_matches_orig_mod_variants(
+    tmp_path: Path, orig_mod_placement: str
 ) -> None:
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
     checkpoint = tmp_path / "checkpoint-1"
@@ -747,32 +724,12 @@ def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mo
         model[0].bias.fill_(-0.25)
 
     original = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    remapped = {key.replace("0.", "0._orig_mod."): value.detach().clone() for key, value in original.items()}
-    torch.save(remapped, checkpoint / "model.bin")
-
-    with torch.no_grad():
-        model[0].weight.zero_()
-        model[0].bias.zero_()
-
-    stats = load_model_state_with_compile_key_remap(model, checkpoint)
-    assert stats == {"matched": 2}
-    assert torch.allclose(model[0].weight, original["0.weight"])
-    assert torch.allclose(model[0].bias, original["0.bias"])
-
-
-def test_load_model_state_with_compile_key_remap_matches_top_level_orig_mod_keys(
-    tmp_path: Path,
-) -> None:
-    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
-    checkpoint = tmp_path / "checkpoint-1"
-    checkpoint.mkdir(parents=True, exist_ok=True)
-
-    with torch.no_grad():
-        model[0].weight.fill_(0.5)
-        model[0].bias.fill_(0.125)
-
-    original = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    remapped = {f"_orig_mod.{key}": value.detach().clone() for key, value in original.items()}
+    if orig_mod_placement == "nested":
+        remapped = {
+            key.replace("0.", "0._orig_mod."): value.detach().clone() for key, value in original.items()
+        }
+    else:
+        remapped = {f"_orig_mod.{key}": value.detach().clone() for key, value in original.items()}
     torch.save(remapped, checkpoint / "model.bin")
 
     with torch.no_grad():
@@ -950,28 +907,6 @@ def test_init_trackers_passes_wandb_name_with_wrapped_signature() -> None:
     assert first["init_kwargs"]["wandb"]["name"] == "demo-run"
 
 
-def test_init_trackers_falls_back_without_init_kwargs(caplog: pytest.LogCaptureFixture) -> None:
-    class _LegacyAccelerator:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
-
-        def init_trackers(self, *, project_name: str, config: dict[str, Any]) -> None:
-            self.calls.append({"project_name": project_name, "config": dict(config)})
-
-    accel = _LegacyAccelerator()
-    with caplog.at_level(logging.WARNING):
-        _init_trackers(
-            accelerator=accel,
-            project_name="demo-project",
-            tracker_cfg={"a": 1},
-            report_to="wandb",
-            run_name="demo-run",
-        )
-
-    assert accel.calls
-    assert "rejected init_kwargs" in caplog.text
-
-
 def test_setup_wandb_watch_calls_watch_with_mode_and_frequency() -> None:
     model = torch.nn.Linear(4, 4)
     run = FakeWandbRun()
@@ -1028,7 +963,7 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
         "model:\n  backbone_type: hf_deberta_v2\ntrain:\n  warmup_steps: 10000\n", encoding="utf-8"
     )
     src_source = tmp_path / "passed.yaml"
-    src_source.write_text("model:\n  profile: deberta_v3_parity\n", encoding="utf-8")
+    src_source.write_text("model:\n  backbone_type: hf_deberta_v2\n", encoding="utf-8")
 
     run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
@@ -1062,7 +997,6 @@ def test_coerce_dataclass_payload_types_accepts_mapping_inputs() -> None:
 
 def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
     model_cfg = ModelConfig(
-        profile="deberta_v3_parity",
         backbone_type="hf_deberta_v2",
         pretrained_discriminator_path="microsoft/deberta-v3-base",
         generator_num_hidden_layers=None,
@@ -1128,57 +1062,6 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
     assert payload["model"]["pretrained"]["discriminator_path"] == "microsoft/deberta-v3-base"
     assert "generator_path" not in payload["model"]["pretrained"]
     assert "resume_from_checkpoint" not in payload["train"]["checkpoint"]
-    assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
-    assert "effective" not in payload
-
-
-def test_build_runtime_resolved_tracker_config_omits_effective_backbone_payload() -> None:
-    model_cfg = ModelConfig(profile="deberta_v3_parity", backbone_type="hf_deberta_v2")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig()
-    disc_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
-            "model_type": "deberta-v2",
-            "hidden_size": 768,
-            "num_hidden_layers": 12,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-            "vocab_size": 32000,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 3,
-            "max_length": 20,
-            "top_k": 50,
-            "id2label": {"0": "LABEL_0"},
-            "_name_or_path": "",
-        },
-    )
-    gen_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
-            "model_type": "deberta-v2",
-            "hidden_size": 768,
-            "num_hidden_layers": 6,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-            "vocab_size": 32000,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 3,
-            "max_length": 20,
-            "top_k": 50,
-            "id2label": {"0": "LABEL_0"},
-            "_name_or_path": "",
-        },
-    )
-    tokenizer = DummyTokenizer(vocab_size=32000)
-
-    payload = _build_runtime_resolved_tracker_config(
-        model_cfg=model_cfg,
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        disc_config=disc_cfg,
-        gen_config=gen_cfg,
-        tokenizer=tokenizer,
-    )
-
     assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
     assert "effective" not in payload
 

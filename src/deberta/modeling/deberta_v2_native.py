@@ -853,10 +853,8 @@ class DebertaV2Encoder(nn.Module):
         else:
             self.rel_embeddings = None
 
-        self.norm_rel_ebd = [
-            x.strip() for x in str(getattr(config, "norm_rel_ebd", "none")).lower().split("|")
-        ]
-        if "layer_norm" in self.norm_rel_ebd:
+        norm_rel_ebd = [x.strip() for x in str(getattr(config, "norm_rel_ebd", "none")).lower().split("|")]
+        if "layer_norm" in norm_rel_ebd:
             self.LayerNorm = nn.LayerNorm(int(config.hidden_size), eps=float(config.layer_norm_eps))
         else:
             self.LayerNorm = None
@@ -868,7 +866,6 @@ class DebertaV2Encoder(nn.Module):
                 "DeBERTa-v2 conv-refinement checkpoints (e.g. v2-xlarge/xxlarge) are out of scope."
             )
         self.gradient_checkpointing = False
-        self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
         self.flash_attention_enabled = (
             str(getattr(config, "hf_attention_impl", "eager")).strip().lower() == "flash"
         )

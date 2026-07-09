@@ -40,7 +40,6 @@ TOP_LEVEL_NOTE = {
 }
 
 VALID_VALUES = {
-    "model.profile": sorted(cfg_mod._MODEL_PROFILE_CHOICES),
     "model.backbone_type": sorted(cfg_mod._BACKBONE_CHOICES),
     "model.embedding_sharing": sorted(cfg_mod._EMBED_SHARING_CHOICES),
     "model.hf.model_size": sorted(cfg_mod._HF_MODEL_SIZE_CHOICES),
@@ -80,7 +79,6 @@ REQUIREDNESS = {
 }
 
 FIELD_DOCS = {
-    "model.profile": "Selects profile-level effective defaults. `deberta_v3_parity` preserves DeBERTa-v3 RTD conventions and changes several train/optim defaults when those keys are unset.",
     "model.backbone_type": "`hf_deberta_v2` is the native DeBERTa-v2/v3 parity backbone. `rope` is the modern RoPE/RMSNorm/SwiGLU-capable path and is the preferred speed baseline.",
     "model.from_scratch": "When `false`, `model.pretrained.discriminator_path` is required. RoPE pretrained mode requires DebertaRoPE checkpoints, not Microsoft HF DeBERTa checkpoints.",
     "model.embedding_sharing": "`gdes` is recommended. `es` shares embeddings and is incompatible with `train.decoupled_training=true`; if using `es`, `optim.lr.generator` must inherit or equal `optim.lr.base`.",
@@ -104,7 +102,7 @@ FIELD_DOCS = {
     "model.pretrained.generator_path": "Optional separate generator checkpoint. If set, `model.generator.*` shape overrides must be unset.",
     "model.generator.num_hidden_layers": "Scratch/derived generator layer-count override. Must be unset when `model.pretrained.generator_path` is provided.",
     "model.generator.hidden_size": "Scratch/derived generator hidden-size override. Invalid with `model.from_scratch=false` unless loading a separate generator checkpoint.",
-    "model.generator.intermediate_size": "Scratch/derived generator FFN-size override. Leave `null` to derive from profile/backbone defaults.",
+    "model.generator.intermediate_size": "Scratch/derived generator FFN-size override. Leave `null` to derive from backbone defaults.",
     "model.generator.num_attention_heads": "Scratch/derived generator attention-head override. Hidden size must remain divisible by heads in the built backbone.",
     "model.rope.hidden_size": "RoPE scratch hidden size. Only valid when `model.backbone_type=rope` and `model.from_scratch=true`; must be > 0 and divisible by heads.",
     "model.rope.num_hidden_layers": "RoPE scratch layer count. Only valid for scratch RoPE; must be > 0.",
@@ -294,7 +292,7 @@ def render_config_reference() -> str:
         "`--dry-run` validates config and runtime preflight without training or writing checkpoints, but may",
         "still touch tokenizer/dataset network caches.",
         "",
-        "Profile/backbone effective defaults run after file/CLI parsing. The YAML below shows literal dataclass",
+        "Backbone-specific effective defaults run after file/CLI parsing. The YAML below shows literal dataclass",
         "defaults; keys whose effective default can change say so on the key itself.",
         "",
         "## Minimal Valid Skeleton",

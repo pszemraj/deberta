@@ -3,7 +3,6 @@
 #   accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python deberta train configs/pretrain_rope_fineweb_edu.yaml
 
 model:
-  profile: modern
   backbone_type: rope
   from_scratch: true
   embedding_sharing: gdes

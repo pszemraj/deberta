@@ -13,7 +13,7 @@ overrides model fields, and without a config file it supplies model/data/train/o
 `--dry-run` validates config and runtime preflight without training or writing checkpoints, but may
 still touch tokenizer/dataset network caches.
 
-Profile/backbone effective defaults run after file/CLI parsing. The YAML below shows literal dataclass
+Backbone-specific effective defaults run after file/CLI parsing. The YAML below shows literal dataclass
 defaults; keys whose effective default can change say so on the key itself.
 
 ## Minimal Valid Skeleton
@@ -32,9 +32,6 @@ Everything else can be omitted and will use documented defaults, but real traini
 ```yaml
 # Model/backbone, tokenizer, embedding sharing, dropout, and FlashDeBERTa policy.
 model:
-  # Type: str. Default: "modern". Required: no. Valid values: `deberta_v3_parity` | `modern`.
-  # Guidance: Selects profile-level effective defaults. `deberta_v3_parity` preserves DeBERTa-v3 RTD conventions and changes several train/optim defaults when those keys are unset.
-  profile: "modern"
   # Type: str. Default: "hf_deberta_v2". Required: no. Valid values: `hf_deberta_v2` | `rope`.
   # Guidance: `hf_deberta_v2` is the native DeBERTa-v2/v3 parity backbone. `rope` is the modern RoPE/RMSNorm/SwiGLU-capable path and is the preferred speed baseline.
   backbone_type: "hf_deberta_v2"
@@ -110,7 +107,7 @@ model:
     # Guidance: Scratch/derived generator hidden-size override. Invalid with `model.from_scratch=false` unless loading a separate generator checkpoint.
     hidden_size: null
     # Type: int | None. Default: null. Required: no.
-    # Guidance: Scratch/derived generator FFN-size override. Leave `null` to derive from profile/backbone defaults.
+    # Guidance: Scratch/derived generator FFN-size override. Leave `null` to derive from backbone defaults.
     intermediate_size: null
     # Type: int | None. Default: null. Required: no.
     # Guidance: Scratch/derived generator attention-head override. Hidden size must remain divisible by heads in the built backbone.

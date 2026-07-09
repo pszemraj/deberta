@@ -127,7 +127,6 @@ class DebertaRoPEEmbeddings(nn.Module):
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.config = config
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
@@ -180,7 +179,6 @@ class DebertaRoPESelfAttention(nn.Module):
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.config = config
         self.hidden_size = int(config.hidden_size)
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = self.hidden_size // self.num_heads
@@ -194,7 +192,6 @@ class DebertaRoPESelfAttention(nn.Module):
 
         rotary_dim = int(self.head_dim * float(config.rotary_pct))
         rotary_dim = rotary_dim - (rotary_dim % 2)  # ensure even
-        self.rotary_dim = rotary_dim
         self.rope = (
             RotaryEmbedding(rotary_dim, base=float(config.rope_theta), full_dim=self.head_dim)
             if rotary_dim > 0
@@ -357,7 +354,6 @@ class _KEELAlpha(nn.Module):
             self.alpha = nn.Parameter(torch.tensor(float(init), dtype=torch.float32))
         else:
             self.register_buffer("alpha", torch.tensor(float(init), dtype=torch.float32), persistent=False)
-        self.learnable = bool(learnable)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return alpha cast to the runtime dtype.
@@ -383,7 +379,6 @@ class DebertaRoPELayer(nn.Module):
         :param float alpha_init: KEEL alpha initial value.
         """
         super().__init__()
-        self.config = config
         self.norm_arch = str(config.norm_arch)
 
         self.attn = DebertaRoPESelfAttention(config)
@@ -438,8 +433,6 @@ class DebertaRoPEEncoder(nn.Module):
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.config = config
-
         if config.keel_alpha_init is not None:
             alpha_init = float(config.keel_alpha_init)
         else:

@@ -986,7 +986,6 @@ def test_self_attention_uses_pairwise_diagonal_for_query_activity(tiny_rope_conf
 
 
 def test_mlp_has_no_internal_residual_dropout():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1019,7 +1018,6 @@ def test_mlp_has_no_internal_residual_dropout():
 
 
 def test_self_attention_sdpa_matches_eager_with_padding_mask():
-    import pytest
     import torch.nn.functional as F
 
     pytest.importorskip("transformers")
@@ -1068,7 +1066,6 @@ def test_self_attention_sdpa_matches_eager_with_padding_mask():
 
 
 def test_rope_projections_respect_use_bias_config():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1105,8 +1102,6 @@ def test_rope_projections_respect_use_bias_config():
 
 def test_pretrainer_forward_smoke():
     """Requires transformers; skipped automatically if not installed."""
-
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1267,7 +1262,6 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
         disc_config=cfg,
         gen_config=cfg,
         embedding_sharing="none",
-        use_enhanced_mask_decoder=False,
     )
     assert model._generator_accepts_flash_kwargs is False
 
@@ -1290,7 +1284,6 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
 
 
 def test_pretrainer_sampler_avoids_configured_special_ids():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1404,9 +1397,6 @@ def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Modul
     """
     from deberta.modeling.rtd import EnhancedMaskDecoder
 
-    class _Cfg:
-        position_biased_input = False
-
     class _PositionEmbeddings(torch.nn.Module):
         def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
             bsz, seq_len = position_ids.shape
@@ -1423,7 +1413,7 @@ def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Modul
             super().__init__()
             self.layer = torch.nn.ModuleList([layer])
 
-    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
+    decoder = EnhancedMaskDecoder(num_last_layer_passes=1)
     encoder = _Encoder(last_layer)
     embeddings = _Embeddings()
     kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
@@ -1433,7 +1423,6 @@ def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Modul
 
 
 def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1489,7 +1478,6 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
 
 
 def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1529,7 +1517,6 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
 
 
 def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1599,8 +1586,7 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
     assert seen_meta.doc_max_segment_length_host == 2
 
 
-def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
-    import pytest
+def test_masked_lm_head_has_only_tied_projection_bias():
 
     pytest.importorskip("transformers")
 
@@ -1616,36 +1602,12 @@ def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
         max_position_embeddings=32,
         type_vocab_size=0,
     )
-    head = MaskedLMHead(cfg, tie_word_embeddings=True)
-    assert head.decoder is None
+    head = MaskedLMHead(cfg)
+    assert not hasattr(head, "decoder")
     assert head.bias.shape == (cfg.vocab_size,)
 
 
-def test_masked_lm_head_tied_mode_requires_embedding_weight():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig
-    from deberta.modeling.rtd import MaskedLMHead
-
-    cfg = DebertaRoPEConfig(
-        vocab_size=128,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-    )
-    head = MaskedLMHead(cfg, tie_word_embeddings=True)
-    hidden = torch.randn((2, cfg.hidden_size), dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="requires `word_embedding_weight`"):
-        _ = head(hidden)
-
-
 def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1665,7 +1627,6 @@ def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
 
 
 def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1681,7 +1642,7 @@ def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
         max_position_embeddings=16,
         type_vocab_size=0,
     )
-    head = MaskedLMHead(cfg, tie_word_embeddings=True)
+    head = MaskedLMHead(cfg)
     head.transform = torch.nn.Identity()
 
     hidden = torch.randn((3, cfg.hidden_size), dtype=torch.float64)
@@ -1694,7 +1655,6 @@ def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
 
 
 def test_rtd_head_does_not_apply_dropout_in_parity_path():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1731,7 +1691,6 @@ def test_rtd_head_does_not_apply_dropout_in_parity_path():
 
 
 def test_rtd_head_applies_cls_conditioning_before_dense_projection():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1779,7 +1738,6 @@ def test_rtd_head_applies_cls_conditioning_before_dense_projection():
 
 
 def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1834,7 +1792,6 @@ def test_rtd_head_skips_cls_conditioning_for_docblock_flash_meta():
     the first document only, so adding it globally would leak document 1 into
     every other document in the row (regression for the P1 review finding).
     """
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1913,7 +1870,6 @@ def test_flash_batch_meta_is_cross_document_predicate():
 
 
 def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -1972,7 +1928,6 @@ def test_synced_buffer_embedding_tracks_sync_updates():
     tied = _SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=False,
     )
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
 
@@ -1990,7 +1945,6 @@ def test_synced_buffer_embedding_tracks_sync_updates():
 
 
 def test_synced_buffer_embedding_sync_updates_compiled_module():
-    import pytest
 
     if not hasattr(torch, "compile"):
         pytest.skip("torch.compile not available")
@@ -2001,7 +1955,6 @@ def test_synced_buffer_embedding_sync_updates_compiled_module():
     tied = _SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=False,
     )
     compiled = torch.compile(tied, backend="aot_eager", mode="default", dynamic=False)
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
@@ -2018,7 +1971,6 @@ def test_synced_buffer_embedding_sync_updates_compiled_module():
 
 
 def test_synced_buffer_embedding_rejects_sharded_dtensor_sync(monkeypatch):
-    import pytest
 
     from deberta.modeling import rtd as rtd_mod
 
@@ -2026,7 +1978,6 @@ def test_synced_buffer_embedding_rejects_sharded_dtensor_sync(monkeypatch):
     tied = rtd_mod._SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=False,
     )
     new_weight = torch.randn_like(init_weight)
     original_probe = rtd_mod._is_sharded_dtensor
@@ -2048,14 +1999,11 @@ def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
     tied = _SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=True,
     )
-    assert tied.bias is not None
     assert tied.bias.dtype == init_weight.dtype
 
 
 def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2110,7 +2058,6 @@ def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
 
 
 def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2158,7 +2105,6 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
 
 def test_native_hf_deberta_v2_forward_smoke():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2196,7 +2142,6 @@ def test_native_hf_deberta_v2_forward_smoke():
     ids=["c2p_p2c", "with_p2p"],
 )
 def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_type: str, seed: int):
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2296,7 +2241,6 @@ def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: s
 def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2360,7 +2304,6 @@ def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
 def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2422,7 +2365,6 @@ def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
 
 
 def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2463,8 +2405,6 @@ def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
 
 def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
     import math
-
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2586,7 +2526,6 @@ def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
 
 
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2610,7 +2549,6 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
 
 
 def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2644,7 +2582,6 @@ def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
 
 
 def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2726,7 +2663,6 @@ def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
 
 
 def test_native_hf_deberta_v2_stable_compile_step_is_finite():
-    import pytest
 
     pytest.importorskip("transformers")
     if not hasattr(torch, "compile"):
@@ -2766,7 +2702,6 @@ def test_native_hf_deberta_v2_stable_compile_step_is_finite():
 
 @pytest.mark.parametrize("relative_attention", [False, True], ids=["plain", "disentangled"])
 def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_attention: bool):
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2801,7 +2736,6 @@ def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_a
 
 
 def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2844,7 +2778,6 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
 
 
 def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2867,7 +2800,6 @@ def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
 
 
 def test_rope_model_accepts_positional_input_ids_call():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2898,7 +2830,6 @@ def test_rope_model_accepts_positional_input_ids_call():
 
 
 def test_rope_keel_default_alpha_matches_paper_contract():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2929,7 +2860,6 @@ def test_rope_keel_default_alpha_matches_paper_contract():
 
 
 def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -2978,7 +2908,6 @@ def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
 
 
 def test_rope_model_supports_output_hidden_states():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -3010,7 +2939,6 @@ def test_rope_model_supports_output_hidden_states():
 
 
 def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -3094,7 +3022,6 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
 
 
 def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -3149,7 +3076,6 @@ def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
 
 
 def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_special(monkeypatch):
-    import pytest
 
     pytest.importorskip("transformers")
 
@@ -3209,7 +3135,6 @@ def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_spe
 
 
 def test_rope_config_rejects_unknown_ffn_type():
-    import pytest
 
     pytest.importorskip("transformers")
 

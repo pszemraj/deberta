@@ -14,8 +14,6 @@ class DebertaV3RTDPretrainer(
     disc_config: 'Any',
     gen_config: 'Any',
     embedding_sharing: 'str' = 'gdes',
-    tie_generator_word_embeddings: 'bool' = True,
-    use_enhanced_mask_decoder: 'bool' = True,
     additional_forbidden_token_ids: 'Iterable[int] | None' = None,
 ) -> 'None'
 ```
@@ -350,30 +348,6 @@ Run DeBERTa-v2 encoder forward pass.
 ### Returns
 
 - `BaseModelOutput | tuple[torch.Tensor, ...]`: Model outputs.
-
-## `disable_flashdeberta_attention`
-
-```python
-disable_flashdeberta_attention() -> 'None'
-```
-
-Compatibility no-op for the removed runtime patch path.
-
-## `enable_flashdeberta_attention`
-
-```python
-enable_flashdeberta_attention(*, strict: 'bool' = True) -> 'None'
-```
-
-Validate that FlashDeBERTa can be constructed by config.
-
-### Parameters
-
-- `strict` (`bool`): Whether missing FlashDeBERTa support should raise.
-
-### Raises
-
-- `RuntimeError`: If strict mode is enabled and FlashDeBERTa cannot be imported.
 
 ## `DebertaRoPEConfig`
 

@@ -125,14 +125,13 @@ def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighte
     return loss if not token_weighted_ga else (loss * float(max(1, int(ga_steps))))
 
 
-def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
-    """Return whether gradient clipping should run for this micro-step.
+def _should_clip_gradients(max_grad_norm: float | int | None) -> bool:
+    """Return whether gradient clipping is enabled.
 
-    :param bool sync_gradients: Whether gradients are synchronized this step.
     :param float | int | None max_grad_norm: Configured clipping norm.
     :return bool: ``True`` when clipping should be applied.
     """
-    return bool(sync_gradients) and max_grad_norm is not None and float(max_grad_norm) > 0.0
+    return max_grad_norm is not None and float(max_grad_norm) > 0.0
 
 
 def _sum_local_scalar(*, accelerator: Any, x: float) -> float:

@@ -105,6 +105,34 @@ def flatten_padded_rows(
     return flat, trailing_shape, batch_size, seq_len
 
 
+def require_matching_tensor_layout(
+    reference: torch.Tensor,
+    *others: torch.Tensor,
+    context: str,
+    minimum_rank: int = 1,
+) -> tuple[int, ...]:
+    """Require tensors to have the same shape and device.
+
+    :param torch.Tensor reference: Tensor defining the expected layout.
+    :param torch.Tensor others: Tensors that must match ``reference``.
+    :param str context: Caller name included in validation errors.
+    :param int minimum_rank: Minimum accepted tensor rank.
+    :raises ValueError: If rank, shape, or device differs.
+    :return tuple[int, ...]: Shared tensor shape.
+    """
+
+    shape = tuple(int(dim) for dim in reference.shape)
+    if len(shape) < int(minimum_rank):
+        raise ValueError(f"{context} expects rank >= {minimum_rank}; got shape={shape}")
+    for tensor in others:
+        other_shape = tuple(int(dim) for dim in tensor.shape)
+        if other_shape != shape:
+            raise ValueError(f"{context} shape mismatch: expected {shape}, got {other_shape}")
+        if tensor.device != reference.device:
+            raise ValueError(f"{context} device mismatch: expected {reference.device}, got {tensor.device}")
+    return shape
+
+
 def can_use_triton_pack(
     *,
     available: bool,

@@ -1204,9 +1204,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 flash_meta=flash_meta,
             )
 
-        if flashdeberta_fixed_import_error() is not None:  # pragma: no cover - guarded above
-            raise RuntimeError("FlashDeBERTa operator import unexpectedly unavailable during flash forward.")
-
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
         normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
