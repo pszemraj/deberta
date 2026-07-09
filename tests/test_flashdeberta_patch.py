@@ -537,6 +537,33 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         configure_flashdeberta_kernel_overrides(None)
 
 
+def test_flashdeberta_kernel_overrides_reload_when_same_path_content_changes(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        configure_flashdeberta_kernel_overrides,
+        flash_route_choice,
+    )
+
+    override_path = tmp_path / "flash_routes.json"
+    override_path.write_text(
+        '{"route_policies": {"padding": [{"seq_bucket": "under_2048", "choice": "varlen"}]}}',
+        encoding="utf-8",
+    )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        assert flash_route_choice(policy="padding", seq_bucket="under_2048") == "varlen"
+        # Tuning sweeps rewrite one path between candidates; reconfiguring the
+        # same path must pick up the new content, not serve the stale table.
+        override_path.write_text(
+            '{"route_policies": {"padding": [{"seq_bucket": "under_2048", "choice": "fixed"}]}}',
+            encoding="utf-8",
+        )
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        assert flash_route_choice(policy="padding", seq_bucket="under_2048") == "fixed"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         configure_flashdeberta_kernel_overrides,

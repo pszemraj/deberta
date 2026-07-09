@@ -10,6 +10,7 @@ from typing import Any
 
 _DEFAULT_TUNING_PATH = Path(__file__).with_name("flashdeberta_kernel_tuning.json")
 _ACTIVE_OVERRIDES_PATH: str | None = None
+_ACTIVE_OVERRIDES_SIGNATURE: tuple[int, int] | None = None
 
 # Shape-keyed lookups take per-batch values (total_tokens, batch_size) in their
 # cache keys, so those caches must be bounded LRUs: a long variably-packed run
@@ -38,21 +39,39 @@ class FlashKernelContext:
     has_mask: bool | None = None
 
 
+def _overrides_file_signature(path: str) -> tuple[int, int] | None:
+    """Return ``(mtime_ns, size)`` for an override table, or None when unreadable.
+
+    :param str path: Override table path.
+    :return tuple[int, int] | None: File content signature, or None if stat fails.
+    """
+
+    try:
+        stat = Path(path).expanduser().stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
 def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
     """Set the process-local FlashDeBERTa kernel override table.
 
-    Reapplying the already-active path is a no-op, so hot-path callers such as
-    per-step batch preparation do not invalidate the cached tuning table.
+    Reapplying the already-active path is a no-op only while the file content
+    is unchanged (checked via mtime/size), so hot-path callers such as
+    per-step batch preparation keep the cached tuning table, while tuning
+    tools that rewrite one path between candidates get fresh routing.
 
     :param str | None path: JSON table path, or None to use only the package default.
     """
 
-    global _ACTIVE_OVERRIDES_PATH
+    global _ACTIVE_OVERRIDES_PATH, _ACTIVE_OVERRIDES_SIGNATURE
     normalized = str(path).strip() if path is not None else ""
     resolved = normalized or None
-    if resolved == _ACTIVE_OVERRIDES_PATH:
+    signature = _overrides_file_signature(resolved) if resolved is not None else None
+    if resolved == _ACTIVE_OVERRIDES_PATH and signature == _ACTIVE_OVERRIDES_SIGNATURE:
         return
     _ACTIVE_OVERRIDES_PATH = resolved
+    _ACTIVE_OVERRIDES_SIGNATURE = signature
     _load_tuning_payload.cache_clear()
     flash_seq_bucket.cache_clear()
     flash_route_policy.cache_clear()
