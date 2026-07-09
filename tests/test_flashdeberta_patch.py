@@ -647,6 +647,40 @@ def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
         configure_flashdeberta_kernel_overrides(None)
 
 
+def test_flashdeberta_same_name_seq_bucket_override_replaces_shipped_row(tmp_path) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        configure_flashdeberta_kernel_overrides,
+        flash_seq_bucket,
+    )
+
+    override_path = tmp_path / "flash_buckets.json"
+    override_path.write_text(
+        """
+{
+  "seq_buckets": [
+    {
+      "name": "4096_plus",
+      "min_seq_len": 4096,
+      "max_seq_len": 8192
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        configure_flashdeberta_kernel_overrides(str(override_path))
+        # In-range lengths keep resolving to the (narrowed) bucket.
+        assert flash_seq_bucket(seq_len=4096) == "4096_plus"
+        assert flash_seq_bucket(seq_len=8192) == "4096_plus"
+        # A narrowing override must actually narrow: lengths past the new
+        # max_seq_len must not fall through to the shipped unbounded row.
+        assert flash_seq_bucket(seq_len=10000) == "default"
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
+
+
 def test_docblock_bias_route_uses_table_with_ragged_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

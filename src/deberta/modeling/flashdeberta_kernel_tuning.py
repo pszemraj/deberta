@@ -106,11 +106,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _load_tuning_payload() -> dict[str, Any]:
     """Load the default table plus optional user override entries.
 
-    Override rows append to the shipped rows rather than replacing them, both
-    for top-level lists (``seq_buckets``, ``kernels``) and per-namespace
-    route-policy lists, so an override table can promote a single row (for
-    example one capability-scoped route choice) without restating the shipped
-    policy. Appended rows outrank shipped rows of the same specificity.
+    ``route_policies`` and ``kernels`` override rows append to the shipped
+    rows rather than replacing them, so an override table can promote a
+    single row (for example one capability-scoped route choice) without
+    restating the shipped policy; appended rows outrank shipped rows of the
+    same specificity. ``seq_buckets`` override rows prepend, and a row whose
+    ``name`` matches a shipped bucket replaces that bucket entirely.
 
     :return dict[str, Any]: Merged tuning payload.
     """
@@ -133,7 +134,19 @@ def _load_tuning_payload() -> dict[str, Any]:
                 # set covers every length, so appended override buckets would
                 # be unreachable; prepend them instead. route_policies/kernels
                 # iterate reversed, so appending keeps "later rows win" there.
-                merged[key] = [*override_rows, *base_rows]
+                # A same-name override replaces the shipped bucket outright:
+                # keeping the shipped row would make a narrowing override
+                # (tighter max_seq_len/density window) silently fall through
+                # to the original shipped range.
+                override_names = {
+                    row.get("name") for row in override_rows if isinstance(row, dict) and row.get("name")
+                }
+                kept_base_rows = [
+                    row
+                    for row in base_rows
+                    if not (isinstance(row, dict) and row.get("name") in override_names)
+                ]
+                merged[key] = [*override_rows, *kept_base_rows]
             else:
                 merged[key] = [*base_rows, *override_rows]
         elif isinstance(base_value, dict) or isinstance(override_value, dict):
