@@ -999,3 +999,71 @@ dict lookup over prebuilt graphs); degenerate doc-block batches guarded;
 resume tooling asserts no bit-exactness on flash paths; no committed junk,
 stale docs, or dead config knobs; `doc_ids==0` means inactive consistently
 across attention, loss, GA, and logging.
+
+## 2026-07-09 - Second Adversarial Round: The Hardening Round Itself
+
+Five fresh adversarial reviewers re-attacked the previous round's 12 commits
+(`edfcd6a..876f896`): fix correctness, test integrity, docs-vs-code, blast
+radius, and a maintainer-in-3-months operational lens. The mechanisms all
+survived (override precedence, reload signature, bounds threading, guard
+boundary, export rename - several proven with CPU checks against the real
+loader), but the round had made routing *safer while quieter*: it added
+silent behavior changes without the signal to see them.
+
+### Fixed (one commit each, regression tests verified failing pre-fix)
+
+- Dense-vs-ragged doc-block routing was invisible in compiled training: the
+  per-layer `FLASHDEBERTA_DEBUG_STATS` counters are hard no-ops under
+  `torch.compile` and batch prep recorded nothing, so a batch-size bump
+  crossing a new `max_batch_size` bound silently cost the ~1.3x speedup.
+  Batch prep now logs the chosen route once per `(route, S, B)` and warns
+  when table bounds - not missing measurements - keep a shape ragged.
+  Validated on the 5090: all three notices fire with correct routes.
+- All host-side once-per-process flash notices are now rank-0 gated via the
+  launcher `RANK` env var; previously every rank logged its own copy,
+  against the `is_main_process` convention used elsewhere.
+- `docblock_bias_seq_len` bypassed the table's batch/seq bounds silently (it
+  is checked before the table and never read `batch_size`); a stale tuning
+  knob reused in a larger-batch config would OOM on the `(B,H,S,S)` backward
+  bias with no trail. Now warns once per shape when the knob (not the table)
+  is why dense engaged, and the bypass is documented on the config class and
+  in the generated config reference (guidance sourced from
+  `tools/generate_config_reference.py` - the checked-in doc is
+  generator-owned).
+- Same-name `seq_buckets` overrides could only widen a shipped bucket:
+  narrowing silently fell through to the still-present shipped row. Same
+  names now replace the shipped bucket; new names still prepend.
+- `flash_padding_route` had `batch_size` in hand (it feeds bucket density)
+  but never forwarded it to the bound check - the same fail-open asymmetry
+  the docblock path fixed, one namespace over.
+- The flash span guard silently no-oped when `max_position_embeddings` was
+  `None` (zero is rejected upstream, `None` skips that check); a pinned
+  `max_relative_positions` with no known position range now fails fast.
+- The active-token consistency test claimed four pinned definitions but
+  asserted three: `flash_active_tokens` (segment-metadata cumsum, a
+  structurally different algorithm) is now pinned through
+  `prepare_flash_attention_batch_metadata`, plus a genuinely-packed
+  single-row case (`attention_mask=None`) the padded fixture never reached.
+- New invariant test: a bounded-out sm_120 batch must resolve exactly like
+  hardware with no measured rows (the consumer's hardcoded ragged default
+  only coincidentally equals the table wildcard row; now pinned).
+- Docs: the `4.8`/`1.6 GiB` bias figures were bytes/1e9 mislabeled as GiB
+  (actual: `4.5`/`1.5 GiB` at the repo's `1024^3` convention); gpu-support
+  now states the sm_120 dense-row bounds encode the 32 GiB benchmark card's
+  VRAM (not a capability fact) with a copy-pasteable override row for
+  bigger same-capability cards; route stability's dependence on the
+  hardcoded `drop_last=True` is recorded at the DataLoader site and in the
+  flash caveats.
+
+### Verified clean this round (no action)
+
+Every doc claim about knob names, env defaults, forward signatures, and the
+`doc_ids` misuse contract; the 87% bucket-divergence figure (reproduced at
+87.54%); raising a bound via override tables (proven end-to-end against the
+real loader); all prior-round tests genuinely regression-sensitive; TOCTOU
+ordering in the override reload; export rename and deleted getters have zero
+stale references.
+
+Gates: full suite 581 passed / 12 skipped, `audit_contracts` 14/14 PASS,
+GPU notice validation plus a 2-step compiled flash RTD profile probe
+(6.73 GiB peak, step metrics consistent with the recorded baseline).
