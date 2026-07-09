@@ -652,8 +652,17 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
         raise ValueError(f"{component} flash attention requires relative_attention=true.")
     if int(getattr(cfg, "position_buckets", 0)) <= 0:
         raise ValueError(f"{component} flash attention requires position_buckets > 0.")
-    max_relative_positions = int(getattr(cfg, "max_relative_positions", -1))
-    max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 0))
+    max_relative_positions = int(getattr(cfg, "max_relative_positions", -1) or -1)
+    max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 0) or 0)
+    if max_relative_positions > 0 and max_position_embeddings <= 0:
+        # A pinned span with no known position range cannot be proven to
+        # cover every sequence length, so fail fast instead of silently
+        # skipping the coverage check below.
+        raise ValueError(
+            f"{component} flash attention cannot verify max_relative_positions="
+            f"{max_relative_positions} covers the position range: "
+            "max_position_embeddings is missing or non-positive on this config."
+        )
     if 0 < max_relative_positions < max_position_embeddings:
         # Eager attention clamps relative positions to the span before
         # log-bucketing; the FlashDeBERTa kernels bucket unclamped positions,

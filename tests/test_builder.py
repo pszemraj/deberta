@@ -502,6 +502,14 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         # relative positions to it before bucketing while the flash kernels
         # do not, so flash must refuse rather than silently diverge.
         ({"max_relative_positions": 128}, "max_relative_positions to cover"),
+        # A pinned span with no known position range must fail fast rather
+        # than let the coverage check silently no-op. (A zero value is
+        # already rejected earlier by _validate_required_max_positions;
+        # None skips that check and must be caught here.)
+        (
+            {"max_relative_positions": 128, "max_position_embeddings": None},
+            "cannot verify max_relative_positions",
+        ),
     ],
 )
 def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
