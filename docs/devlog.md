@@ -922,3 +922,80 @@ default applies), and the shipped `sm_120` `4096_plus` dense row carries
 exact-length opt-in for unmeasured lengths. Regression assertions added to
 the existing route test (verified failing pre-fix); gpu-support override
 example updated to model the bounded row.
+
+## 2026-07-09 - Pre-Merge Adversarial Review Campaign
+
+Five-perspective adversarial review of the whole branch before merging PR #5
+(model lifecycle, attention/mask semantics, repo hygiene, route-table/config,
+production long-run behavior), constrained to code reading plus small CPU
+repros. Every confirmed finding was fixed in its own commit with a regression
+test verified failing pre-fix (except the consistency-pinning test, which
+guards currently-correct behavior); the rest went into the flash doc's Known
+follow-ups with exact names.
+
+### Fixed (one commit each)
+
+- Three sm_120 tuning-table tests crashed (not skipped) on CPU-only machines:
+  they monkeypatched `torch.cuda.get_device_capability` behind an unpatched
+  `current_device()` call and a per-index capability cache. Now patch the
+  repo seam `device_compute_capability` at the consuming op module.
+- Override-table `seq_buckets` rows were unreachable: bucket resolution is
+  first-match-forward and the shipped buckets cover every length, while the
+  merge appended override rows. Override buckets now prepend. Reversing the
+  iteration instead was rejected - it would flip shipped resolution at 1024
+  (`under_2048` before `1024_exact`) and silently disable the local-bias
+  policy row and 1024_exact kernel rows.
+- Reconfiguring the same override path after rewriting the file served the
+  stale table forever (path-string no-op guard). The guard now also compares
+  an `(mtime_ns, size)` signature - one stat call on the per-batch hot path.
+- `flash_padding_route` ignored policy-row `min/max_seq_len` bounds (never
+  threaded `seq_len` into `flash_route_choice`); inert with the shipped
+  table but the same fail-open asymmetry the docblock bound fix closed.
+- Fail-open relative-position divergence: eager clamps relative positions to
+  `max_relative_positions` before log-bucketing, the flash kernels bucket
+  unclamped (87% of buckets differ at seq 1024 with span 128). Unreachable
+  with repo configs (`-1`), live for external checkpoints pinning a short
+  span. Build-time validation now rejects `0 < span < max_position_embeddings`
+  for flash.
+- Silent fallback invisibility under compiled training: per-call fallback
+  warnings are (correctly) dead inside compiled graphs and the batch-prep
+  non-prefix-mask eager downgrade logged nothing. Batch prep (host-side,
+  outside graphs) now warns once per process; docs corrected -
+  `FLASHDEBERTA_WARN_FALLBACKS` defaults on, not off.
+- Dense doc-block routing had no batch-size guard: the saved `(B,H,S,S)`
+  bias costs ~4.8 GiB per batch element at 4096, so bumping batch size on a
+  shipped packed config OOM'd at step 1 with no route linkage. Policy rows
+  now accept `max_batch_size`; shipped sm_120 dense rows carry 8/2/2 at
+  1024/2048-family/4096, sized to each bucket's worst case (the 2048 buckets
+  span to 4095 where bias cost matches 4096). Out-of-bounds goes ragged.
+- `export_meta.json` leaked the exporting machine's absolute checkpoint/run
+  paths inside every exported directory; now records directory names only.
+- New consistency test pins the three independent active-token definitions
+  (GA weighting, tokens/sec logging, RTD loss / `doc_ids.ne(0)`) to each
+  other for packed doc-block batches with padded tails.
+- Removed the two zero-caller pack import-error getters
+  (`flashdeberta_{prefix,segment}_pack_import_error`).
+
+### Reviewed and intentionally not changed
+
+- The test-only public dense-bias custom op duplicates the production
+  bias_op registration but is load-bearing for two GPU parity tests and the
+  no-Triton import contract; consolidation is now spelled out in Known
+  follow-ups rather than rushed pre-merge.
+- `reduce_keep_mask_to_2d` still slices longer masks by design (embeddings /
+  RTD activity path where masks legitimately outrun sliced hidden states).
+- Eval-bypass contract (callers that skip
+  `prepare_flash_attention_batch_metadata` and manually drop `doc_ids` get
+  cross-document attention with no in-model guard) is documented in the
+  data-pipeline guide; model forwards already reject a raw `doc_ids` kwarg
+  loudly, and the repo ships no eval CLI today.
+
+### Verified clean by the review (no action)
+
+Export config stripping complete and stock-`transformers` loadable exports;
+loud failures for missing/mispinned flashdeberta at resume; dropout+flash
+double-gated; no recompile storms possible (route dispatch is an uncompiled
+dict lookup over prebuilt graphs); degenerate doc-block batches guarded;
+resume tooling asserts no bit-exactness on flash paths; no committed junk,
+stale docs, or dead config knobs; `doc_ids==0` means inactive consistently
+across attention, loss, GA, and logging.

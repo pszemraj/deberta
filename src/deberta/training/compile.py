@@ -508,6 +508,11 @@ def prepare_flash_attention_batch_metadata(
             device=input_ids.device,
         )
         keep_mask = doc_ids.ne(0)
+        # These lengths skip the is_prefix_padding_keep_mask proof the
+        # FlashBatchMeta.seq_lengths contract asks producers for: the
+        # doc-block routes never read seq_lengths (they use segment
+        # descriptors or the pairwise mask). Do not start trusting them for
+        # doc-block batches without adding that proof here.
         seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
             batch, keep_mask
         )

@@ -178,9 +178,27 @@ Tracked packed doc-block configs for benchmarking and training live at
 - Evaluate recomputing position/bucket tensors in backward versus saving them for longer
   contexts (pairs with the dense-bias recompute knob above).
 - Add a bucket-LUT path and deterministic position-gradient kernels before treating the
-  dense-bias builder as kernel-owned infrastructure.
+  dense-bias builder as kernel-owned infrastructure. Fold the test-only public custom op in
+  `flashdeberta_dense_bias_op` (`flashdeberta_dense_bias` and its registration) into the one
+  production registration in `flashdeberta_bias_op` at the same time - today two near-identical
+  torch.library ops exist and only the bias_op one runs in training, but the test-only op's
+  wrapper is load-bearing for two GPU parity tests and the no-Triton import contract, so the
+  consolidation must re-point those tests at production seams.
 - Keep reducing the ragged `docblock` route's varlen backward overhead; it currently trails the
   dense route at the shipped packed lengths.
+- Enforce the right-padding proof for doc-block `flash_seq_lengths`: batch prep publishes
+  lengths derived from `doc_ids.ne(0)` without calling `is_prefix_padding_keep_mask` (the
+  doc-block routes never read `seq_lengths`, so this is inert today, but the dataclass contract
+  is unverified there).
+- Validate `kernel_overrides_path` exists at config-validation time; today a typo'd path passes
+  validation and model construction and only fails loudly at the first route lookup.
+- Surface per-run route counters in training metrics (wandb/console) so a mid-run routing shift
+  is visible beyond the once-per-process batch-prep warning.
+- Treat density as unknown in `flash_seq_bucket` when `total_tokens` is given without
+  `batch_size` (it currently assumes `batch_size=1`, which can compute densities above `1.0`);
+  no current caller passes that combination.
+- Add FSDP2 + `torch.compile` + flash coverage before relying on multi-GPU flash training: the
+  wrapping boundaries are sound by construction, but no test or benchmark exercises the triple.
 - Vendor or replace the upstream FlashDeBERTa kernels if this integration becomes a long-lived
   training dependency (currently pinned to `flashdeberta==0.0.7`).
 
