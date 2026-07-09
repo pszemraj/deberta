@@ -109,7 +109,15 @@ Before promoting a route on new hardware:
 2. Compare arms with `tools/flashdeberta_rtd_profile.py --mode eager` versus `--mode flash` on
    your real config; keep whichever route wins.
 3. Mind memory: dense `docblock_bias` saves the `(B,H,S,S)` bias for backward. On cards with
-   less VRAM than the 32 GiB benchmark GPU, try the ragged default first at `4096`.
+   less VRAM than the 32 GiB benchmark GPU, try the ragged default first at `4096`. The cut
+   works the other way too: the shipped `max_batch_size` bounds on the dense rows encode that
+   one card's memory, not a capability fact, so a same-capability card with more VRAM (for
+   example a 96 GiB `sm_120` workstation part) is deliberately underfed by the defaults. Raise
+   the bound with an override row for your own capability key - same-key rows appended via
+   `kernel_overrides_path` outrank the shipped ones, so a single row like
+   `{"seq_bucket": "2048_plus", "choice": "docblock_bias", "compute_capability": "sm_120",
+   "max_batch_size": 8}` is enough. Batch prep logs a warning when bounds (rather than missing
+   measurements) keep a shape ragged, so the underfed case is visible in training logs.
 
 Kernel tile tuning (`tools/flashdeberta_varlen_tune.py`, `tools/flashdeberta_bias_tune.py`) is
 optional on top of route promotion; the workflow is described in
