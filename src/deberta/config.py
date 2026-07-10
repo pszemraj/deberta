@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
 
 from deberta.utils.io import load_json_mapping
-from deberta.utils.mapping import flatten_mapping
 from deberta.utils.serialize import asdict_without_private as _asdict_without_private
 from deberta.utils.types import coerce_scalar, unwrap_optional_type
 
@@ -260,31 +259,6 @@ def _nested_get(obj: Any, path: str) -> Any:
     return cur
 
 
-def _legacy_getattr_from_map(
-    *,
-    obj: Any,
-    name: str,
-    legacy_map: dict[str, str],
-    dynamic_defaults: dict[str, Any] | None = None,
-) -> Any:
-    """Resolve legacy flat config attributes via dotted compatibility maps.
-
-    :param Any obj: Config object.
-    :param str name: Requested attribute name.
-    :param dict[str, str] legacy_map: Mapping of legacy flat names to dotted paths.
-    :param dict[str, Any] | None dynamic_defaults: Optional dynamic fallback values.
-    :raises AttributeError: If ``name`` is not mapped.
-    :return Any: Resolved attribute value.
-    """
-    key = str(name)
-    path = legacy_map.get(key)
-    if path is not None:
-        return _nested_get(obj, path)
-    if dynamic_defaults is not None and key in dynamic_defaults:
-        return dynamic_defaults[key]
-    raise AttributeError(name)
-
-
 def _replace_path(obj: Any, parts: list[str], value: Any) -> Any:
     """Replace one dotted path on a dataclass object.
 
@@ -303,39 +277,6 @@ def _replace_path(obj: Any, parts: list[str], value: Any) -> Any:
     return replace(obj, **{key: new_child})
 
 
-def _apply_dotted_updates(obj: Any, updates: dict[str, Any]) -> Any:
-    """Apply dotted update mapping to a dataclass object.
-
-    :param Any obj: Source dataclass instance.
-    :param dict[str, Any] updates: Dotted updates.
-    :return Any: Updated dataclass object.
-    """
-    out = obj
-    for path, value in updates.items():
-        parts = [str(p).strip() for p in str(path).split(".") if str(p).strip()]
-        if not parts:
-            continue
-        out = _replace_path(out, parts, value)
-    return out
-
-
-def _coerce_subconfig(value: Any, cls: type[Any], *, field_name: str) -> Any:
-    """Coerce constructor subconfig values to dataclass instances.
-
-    :param Any value: Candidate subconfig value.
-    :param type[Any] cls: Subconfig dataclass type.
-    :param str field_name: Field name for error reporting.
-    :return Any: Coerced subconfig dataclass instance.
-    """
-    if value is None:
-        return cls()
-    if isinstance(value, cls):
-        return value
-    if isinstance(value, dict):
-        return _apply_dotted_updates(cls(), flatten_mapping(value))
-    raise TypeError(f"{field_name} must be a {cls.__name__} or mapping, got {type(value).__name__}.")
-
-
 @dataclass(frozen=True)
 class ModelConfig:
     """Model-related arguments."""
@@ -351,7 +292,7 @@ class ModelConfig:
     rope: ModelRopeConfig = field(default_factory=ModelRopeConfig)
     dropout: ModelDropoutConfig = field(default_factory=ModelDropoutConfig)
 
-    _LEGACY_MAP = {
+    _MOVED_KEYS = {
         "tokenizer_name_or_path": "tokenizer.name_or_path",
         "tokenizer_allow_vocab_resize": "tokenizer.allow_vocab_resize",
         "tokenizer_vocab_target": "tokenizer.vocab_target",
@@ -401,112 +342,6 @@ class ModelConfig:
         "attention_probs_dropout_prob": "dropout.attention_probs_prob",
     }
 
-    def __init__(
-        self,
-        backbone_type: str = "hf_deberta_v2",
-        from_scratch: bool = True,
-        embedding_sharing: str = "gdes",
-        gradient_checkpointing: bool = False,
-        tokenizer: ModelTokenizerConfig | dict[str, Any] | None = None,
-        hf: ModelHFConfig | dict[str, Any] | None = None,
-        pretrained: ModelPretrainedConfig | dict[str, Any] | None = None,
-        generator: ModelGeneratorConfig | dict[str, Any] | None = None,
-        rope: ModelRopeConfig | dict[str, Any] | None = None,
-        dropout: ModelDropoutConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize model config while accepting legacy flat kwargs.
-
-        :param str backbone_type: Backbone type.
-        :param bool from_scratch: Scratch/pretrained mode.
-        :param str embedding_sharing: Embedding sharing policy.
-        :param bool gradient_checkpointing: Gradient checkpointing toggle.
-        :param ModelTokenizerConfig | dict[str, Any] | None tokenizer: Tokenizer config.
-        :param ModelHFConfig | dict[str, Any] | None hf: HF backbone config.
-        :param ModelPretrainedConfig | dict[str, Any] | None pretrained: Pretrained source config.
-        :param ModelGeneratorConfig | dict[str, Any] | None generator: Generator shape overrides.
-        :param ModelRopeConfig | dict[str, Any] | None rope: RoPE config.
-        :param ModelDropoutConfig | dict[str, Any] | None dropout: Dropout config.
-        :param Any legacy_kwargs: Optional legacy flat kwargs.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        tokenizer_cfg = _coerce_subconfig(tokenizer, ModelTokenizerConfig, field_name="tokenizer")
-        hf_cfg = _coerce_subconfig(hf, ModelHFConfig, field_name="hf")
-        pretrained_cfg = _coerce_subconfig(pretrained, ModelPretrainedConfig, field_name="pretrained")
-        generator_cfg = _coerce_subconfig(generator, ModelGeneratorConfig, field_name="generator")
-        rope_cfg = _coerce_subconfig(rope, ModelRopeConfig, field_name="rope")
-        dropout_cfg = _coerce_subconfig(dropout, ModelDropoutConfig, field_name="dropout")
-
-        sub_updates: dict[str, dict[str, Any]] = {
-            "tokenizer": {},
-            "hf": {},
-            "pretrained": {},
-            "generator": {},
-            "rope": {},
-            "dropout": {},
-        }
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            mapped = self._LEGACY_MAP.get(str(key))
-            if mapped is None and "." in str(key):
-                mapped = str(key)
-            if mapped is None:
-                unknown.append(str(key))
-                continue
-            if "." in mapped:
-                root, child = mapped.split(".", 1)
-                if root in sub_updates:
-                    sub_updates[root][child] = value
-                else:
-                    unknown.append(str(key))
-            else:
-                if mapped == "backbone_type":
-                    backbone_type = value
-                elif mapped == "from_scratch":
-                    from_scratch = value
-                elif mapped == "embedding_sharing":
-                    embedding_sharing = value
-                elif mapped == "gradient_checkpointing":
-                    gradient_checkpointing = value
-                else:
-                    unknown.append(str(key))
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"ModelConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if sub_updates["tokenizer"]:
-            tokenizer_cfg = _apply_dotted_updates(tokenizer_cfg, sub_updates["tokenizer"])
-        if sub_updates["hf"]:
-            hf_cfg = _apply_dotted_updates(hf_cfg, sub_updates["hf"])
-        if sub_updates["pretrained"]:
-            pretrained_cfg = _apply_dotted_updates(pretrained_cfg, sub_updates["pretrained"])
-        if sub_updates["generator"]:
-            generator_cfg = _apply_dotted_updates(generator_cfg, sub_updates["generator"])
-        if sub_updates["rope"]:
-            rope_cfg = _apply_dotted_updates(rope_cfg, sub_updates["rope"])
-        if sub_updates["dropout"]:
-            dropout_cfg = _apply_dotted_updates(dropout_cfg, sub_updates["dropout"])
-
-        object.__setattr__(self, "backbone_type", str(backbone_type))
-        object.__setattr__(self, "from_scratch", bool(from_scratch))
-        object.__setattr__(self, "embedding_sharing", str(embedding_sharing))
-        object.__setattr__(self, "gradient_checkpointing", bool(gradient_checkpointing))
-        object.__setattr__(self, "tokenizer", tokenizer_cfg)
-        object.__setattr__(self, "hf", hf_cfg)
-        object.__setattr__(self, "pretrained", pretrained_cfg)
-        object.__setattr__(self, "generator", generator_cfg)
-        object.__setattr__(self, "rope", rope_cfg)
-        object.__setattr__(self, "dropout", dropout_cfg)
-
-    def __getattr__(self, name: str) -> Any:
-        """Provide runtime read compatibility for legacy flat attributes.
-
-        :param str name: Attribute name.
-        :return Any: Legacy flat value when mapped.
-        """
-        return _legacy_getattr_from_map(obj=self, name=name, legacy_map=self._LEGACY_MAP)
-
 
 @dataclass(frozen=True)
 class DataSourceConfig:
@@ -540,7 +375,7 @@ class DataConfig:
     source: DataSourceConfig = field(default_factory=DataSourceConfig)
     packing: DataPackingConfig = field(default_factory=DataPackingConfig)
 
-    _LEGACY_MAP = {
+    _MOVED_KEYS = {
         "dataset_name": "source.dataset_name",
         "dataset_config_name": "source.dataset_config_name",
         "data_files": "source.data_files",
@@ -553,59 +388,6 @@ class DataConfig:
         "max_seq_length": "packing.max_seq_length",
         "block_cross_document_attention": "packing.block_cross_document_attention",
     }
-
-    def __init__(
-        self,
-        source: DataSourceConfig | dict[str, Any] | None = None,
-        packing: DataPackingConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize data config while accepting legacy flat kwargs.
-
-        :param DataSourceConfig | dict[str, Any] | None source: Data source config.
-        :param DataPackingConfig | dict[str, Any] | None packing: Packing config.
-        :param Any legacy_kwargs: Optional legacy flat kwargs.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        source_cfg = _coerce_subconfig(source, DataSourceConfig, field_name="source")
-        packing_cfg = _coerce_subconfig(packing, DataPackingConfig, field_name="packing")
-
-        source_updates: dict[str, Any] = {}
-        packing_updates: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            mapped = self._LEGACY_MAP.get(str(key))
-            if mapped is None and "." in str(key):
-                mapped = str(key)
-            if mapped is None:
-                unknown.append(str(key))
-                continue
-            if mapped.startswith("source."):
-                source_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("packing."):
-                packing_updates[mapped.split(".", 1)[1]] = value
-            else:
-                unknown.append(str(key))
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"DataConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if source_updates:
-            source_cfg = _apply_dotted_updates(source_cfg, source_updates)
-        if packing_updates:
-            packing_cfg = _apply_dotted_updates(packing_cfg, packing_updates)
-
-        object.__setattr__(self, "source", source_cfg)
-        object.__setattr__(self, "packing", packing_cfg)
-
-    def __getattr__(self, name: str) -> Any:
-        """Provide runtime read compatibility for legacy flat attributes.
-
-        :param str name: Attribute name.
-        :return Any: Legacy flat value when mapped.
-        """
-        return _legacy_getattr_from_map(obj=self, name=name, legacy_map=self._LEGACY_MAP)
 
 
 @dataclass(frozen=True)
@@ -671,7 +453,7 @@ class TrainConfig:
     objective: TrainObjectiveConfig = field(default_factory=TrainObjectiveConfig)
     checkpoint: TrainCheckpointConfig = field(default_factory=TrainCheckpointConfig)
 
-    _LEGACY_MAP = {
+    _MOVED_KEYS = {
         "dataloader_num_workers": "dataloader.num_workers",
         "dataloader_pin_memory": "dataloader.pin_memory",
         "torch_compile": "compile.enabled",
@@ -694,157 +476,6 @@ class TrainConfig:
         "resume_replay_max_micro_batches": "checkpoint.resume_replay_max_micro_batches",
         "export_hf_final": "checkpoint.export_hf_final",
     }
-
-    _LEGACY_DYNAMIC_DEFAULTS = {
-        "learning_rate": 5e-4,
-        "generator_learning_rate": -1.0,
-        "discriminator_learning_rate": -1.0,
-        "weight_decay": 0.01,
-        "adam_beta1": 0.9,
-        "adam_beta2": 0.999,
-        "adam_epsilon": 1e-8,
-        "warmup_steps": 1_000,
-        "lr_scheduler_type": "linear",
-        "max_grad_norm": 1.0,
-        "project_name": "deberta-train",
-        "run_name": None,
-        "logging_steps": 50,
-        "report_to": "none",
-        "wandb_watch": "gradients",
-        "wandb_watch_log_freq": 100,
-        "debug_metrics": False,
-        "logging_output_dir": None,
-    }
-
-    def __init__(
-        self,
-        seed: int = 42,
-        max_steps: int = 10_000,
-        per_device_train_batch_size: int = 4,
-        gradient_accumulation_steps: int = 1,
-        token_weighted_gradient_accumulation: bool = True,
-        mixed_precision: str = "bf16",
-        tf32: bool = True,
-        sdpa_kernel: str = "auto",
-        decoupled_training: bool = True,
-        dataloader: TrainDataloaderConfig | dict[str, Any] | None = None,
-        compile: TrainCompileConfig | dict[str, Any] | None = None,
-        objective: TrainObjectiveConfig | dict[str, Any] | None = None,
-        checkpoint: TrainCheckpointConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize train config while accepting legacy flat kwargs.
-
-        :param int seed: Random seed.
-        :param int max_steps: Max training steps.
-        :param int per_device_train_batch_size: Micro-batch size.
-        :param int gradient_accumulation_steps: Gradient accumulation steps.
-        :param bool token_weighted_gradient_accumulation: Token-weighted GA toggle.
-        :param str mixed_precision: Mixed precision mode.
-        :param bool tf32: TF32 toggle.
-        :param str sdpa_kernel: SDPA kernel policy.
-        :param bool decoupled_training: Decoupled training toggle.
-        :param TrainDataloaderConfig | dict[str, Any] | None dataloader: Dataloader config.
-        :param TrainCompileConfig | dict[str, Any] | None compile: Compile config.
-        :param TrainObjectiveConfig | dict[str, Any] | None objective: Objective config.
-        :param TrainCheckpointConfig | dict[str, Any] | None checkpoint: Checkpoint config.
-        :param Any legacy_kwargs: Optional legacy flat kwargs.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        dataloader_cfg = _coerce_subconfig(dataloader, TrainDataloaderConfig, field_name="dataloader")
-        compile_cfg = _coerce_subconfig(compile, TrainCompileConfig, field_name="compile")
-        objective_cfg = _coerce_subconfig(objective, TrainObjectiveConfig, field_name="objective")
-        checkpoint_cfg = _coerce_subconfig(checkpoint, TrainCheckpointConfig, field_name="checkpoint")
-
-        dataloader_updates: dict[str, Any] = {}
-        compile_updates: dict[str, Any] = {}
-        objective_updates: dict[str, Any] = {}
-        checkpoint_updates: dict[str, Any] = {}
-        dynamic_overrides: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            mapped = self._LEGACY_MAP.get(str(key))
-            if mapped is None and "." in str(key):
-                mapped = str(key)
-
-            if str(key) in self._LEGACY_DYNAMIC_DEFAULTS:
-                dynamic_overrides[str(key)] = value
-                continue
-
-            if mapped is None:
-                unknown.append(str(key))
-                continue
-            if mapped.startswith("dataloader."):
-                dataloader_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("compile."):
-                compile_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("objective."):
-                objective_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("checkpoint."):
-                checkpoint_updates[mapped.split(".", 1)[1]] = value
-            elif mapped == "seed":
-                seed = value
-            elif mapped == "max_steps":
-                max_steps = value
-            elif mapped == "per_device_train_batch_size":
-                per_device_train_batch_size = value
-            elif mapped == "gradient_accumulation_steps":
-                gradient_accumulation_steps = value
-            elif mapped == "token_weighted_gradient_accumulation":
-                token_weighted_gradient_accumulation = value
-            elif mapped == "mixed_precision":
-                mixed_precision = value
-            elif mapped == "tf32":
-                tf32 = value
-            elif mapped == "sdpa_kernel":
-                sdpa_kernel = value
-            elif mapped == "decoupled_training":
-                decoupled_training = value
-            else:
-                unknown.append(str(key))
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"TrainConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if dataloader_updates:
-            dataloader_cfg = _apply_dotted_updates(dataloader_cfg, dataloader_updates)
-        if compile_updates:
-            compile_cfg = _apply_dotted_updates(compile_cfg, compile_updates)
-        if objective_updates:
-            objective_cfg = _apply_dotted_updates(objective_cfg, objective_updates)
-        if checkpoint_updates:
-            checkpoint_cfg = _apply_dotted_updates(checkpoint_cfg, checkpoint_updates)
-
-        object.__setattr__(self, "seed", int(seed))
-        object.__setattr__(self, "max_steps", int(max_steps))
-        object.__setattr__(self, "per_device_train_batch_size", int(per_device_train_batch_size))
-        object.__setattr__(self, "gradient_accumulation_steps", int(gradient_accumulation_steps))
-        object.__setattr__(self, "token_weighted_gradient_accumulation", token_weighted_gradient_accumulation)
-        object.__setattr__(self, "mixed_precision", str(mixed_precision))
-        object.__setattr__(self, "tf32", tf32)
-        object.__setattr__(self, "sdpa_kernel", str(sdpa_kernel))
-        object.__setattr__(self, "decoupled_training", decoupled_training)
-        object.__setattr__(self, "dataloader", dataloader_cfg)
-        object.__setattr__(self, "compile", compile_cfg)
-        object.__setattr__(self, "objective", objective_cfg)
-        object.__setattr__(self, "checkpoint", checkpoint_cfg)
-
-        for key, value in dynamic_overrides.items():
-            object.__setattr__(self, str(key), value)
-
-    def __getattr__(self, name: str) -> Any:
-        """Provide runtime read compatibility for legacy flat attributes.
-
-        :param str name: Attribute name.
-        :return Any: Legacy flat value when mapped.
-        """
-        return _legacy_getattr_from_map(
-            obj=self,
-            name=name,
-            legacy_map=self._LEGACY_MAP,
-            dynamic_defaults=self._LEGACY_DYNAMIC_DEFAULTS,
-        )
 
 
 @dataclass(frozen=True)
@@ -883,71 +514,6 @@ class OptimConfig:
     weight_decay: float = field(default=0.01)
     max_grad_norm: float = field(default=1.0)
 
-    def __init__(
-        self,
-        lr: OptimLRConfig | dict[str, Any] | None = None,
-        adam: OptimAdamConfig | dict[str, Any] | None = None,
-        scheduler: OptimSchedulerConfig | dict[str, Any] | None = None,
-        weight_decay: float = 0.01,
-        max_grad_norm: float = 1.0,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize optimizer config with nested-dict coercion.
-
-        :param OptimLRConfig | dict[str, Any] | None lr: LR config.
-        :param OptimAdamConfig | dict[str, Any] | None adam: Adam config.
-        :param OptimSchedulerConfig | dict[str, Any] | None scheduler: Scheduler config.
-        :param float weight_decay: Weight decay.
-        :param float max_grad_norm: Gradient clipping norm.
-        :param Any legacy_kwargs: Optional legacy aliases.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        lr_cfg = _coerce_subconfig(lr, OptimLRConfig, field_name="lr")
-        adam_cfg = _coerce_subconfig(adam, OptimAdamConfig, field_name="adam")
-        scheduler_cfg = _coerce_subconfig(scheduler, OptimSchedulerConfig, field_name="scheduler")
-
-        scheduler_updates: dict[str, Any] = {}
-        lr_updates: dict[str, Any] = {}
-        adam_updates: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            k = str(key)
-            if k == "learning_rate":
-                lr_updates["base"] = value
-            elif k == "generator_learning_rate":
-                lr_updates["generator"] = value
-            elif k == "discriminator_learning_rate":
-                lr_updates["discriminator"] = value
-            elif k == "adam_beta1":
-                adam_updates["beta1"] = value
-            elif k == "adam_beta2":
-                adam_updates["beta2"] = value
-            elif k == "adam_epsilon":
-                adam_updates["epsilon"] = value
-            elif k == "lr_scheduler_type":
-                scheduler_updates["type"] = value
-            elif k == "warmup_steps":
-                scheduler_updates["warmup_steps"] = value
-            else:
-                unknown.append(k)
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"OptimConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if lr_updates:
-            lr_cfg = _apply_dotted_updates(lr_cfg, lr_updates)
-        if adam_updates:
-            adam_cfg = _apply_dotted_updates(adam_cfg, adam_updates)
-        if scheduler_updates:
-            scheduler_cfg = _apply_dotted_updates(scheduler_cfg, scheduler_updates)
-
-        object.__setattr__(self, "lr", lr_cfg)
-        object.__setattr__(self, "adam", adam_cfg)
-        object.__setattr__(self, "scheduler", scheduler_cfg)
-        object.__setattr__(self, "weight_decay", float(weight_decay))
-        object.__setattr__(self, "max_grad_norm", float(max_grad_norm))
-
 
 @dataclass(frozen=True)
 class LoggingWandbConfig:
@@ -976,70 +542,6 @@ class LoggingConfig:
     backend: str = field(default="none")
     wandb: LoggingWandbConfig = field(default_factory=LoggingWandbConfig)
     debug: LoggingDebugConfig = field(default_factory=LoggingDebugConfig)
-
-    def __init__(
-        self,
-        project_name: str = "deberta-train",
-        run_name: str | None = None,
-        output_dir: str | None = None,
-        logging_steps: int = 50,
-        backend: str = "none",
-        wandb: LoggingWandbConfig | dict[str, Any] | None = None,
-        debug: LoggingDebugConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize logging config with nested-dict coercion.
-
-        :param str project_name: Project name.
-        :param str | None run_name: Run name.
-        :param str | None output_dir: Logging output directory.
-        :param int logging_steps: Logging step interval.
-        :param str backend: Logging backend when W&B disabled.
-        :param LoggingWandbConfig | dict[str, Any] | None wandb: W&B config.
-        :param LoggingDebugConfig | dict[str, Any] | None debug: Debug logging config.
-        :param Any legacy_kwargs: Optional legacy aliases.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        wandb_cfg = _coerce_subconfig(wandb, LoggingWandbConfig, field_name="wandb")
-        debug_cfg = _coerce_subconfig(debug, LoggingDebugConfig, field_name="debug")
-
-        wandb_updates: dict[str, Any] = {}
-        debug_updates: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            k = str(key)
-            if k == "report_to":
-                report_to = str(value).strip().lower()
-                if report_to == "wandb":
-                    wandb_updates["enabled"] = True
-                else:
-                    wandb_updates["enabled"] = False
-                    backend = report_to
-            elif k == "wandb_watch":
-                wandb_updates["watch"] = value
-            elif k == "wandb_watch_log_freq":
-                wandb_updates["watch_log_freq"] = value
-            elif k == "debug_metrics":
-                debug_updates["metrics"] = value
-            else:
-                unknown.append(k)
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"LoggingConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if wandb_updates:
-            wandb_cfg = _apply_dotted_updates(wandb_cfg, wandb_updates)
-        if debug_updates:
-            debug_cfg = _apply_dotted_updates(debug_cfg, debug_updates)
-
-        object.__setattr__(self, "project_name", str(project_name))
-        object.__setattr__(self, "run_name", run_name if run_name is None else str(run_name))
-        object.__setattr__(self, "output_dir", output_dir if output_dir is None else str(output_dir))
-        object.__setattr__(self, "logging_steps", int(logging_steps))
-        object.__setattr__(self, "backend", str(backend))
-        object.__setattr__(self, "wandb", wandb_cfg)
-        object.__setattr__(self, "debug", debug_cfg)
 
 
 @dataclass(frozen=True)
@@ -1929,6 +1431,7 @@ _SnapshotConfigT = TypeVar(
     "_SnapshotConfigT",
     ModelConfig,
     DataConfig,
+    TrainConfig,
     OptimConfig,
     LoggingConfig,
 )
@@ -1964,8 +1467,8 @@ def _load_snapshot_dataclass(
         )
 
     try:
-        return cls(**raw)
-    except TypeError as e:
+        return _replace_from_mapping_recursive(cls(), dict(raw), section_name=config_name)
+    except (TypeError, ValueError) as e:
         raise ValueError(
             f"Failed to parse {config_name} at {source}. "
             "The persisted config schema does not match this code version."
@@ -1992,6 +1495,16 @@ def load_data_config_snapshot(raw: dict[str, object], *, source: str) -> DataCon
     return _load_snapshot_dataclass(raw, cls=DataConfig, source=source, config_name="data_config.json")
 
 
+def load_train_config_snapshot(raw: dict[str, object], *, source: str) -> TrainConfig:
+    """Parse persisted `train_config.json` into TrainConfig.
+
+    :param dict[str, object] raw: Raw train config mapping.
+    :param str source: Source path for error messages.
+    :return TrainConfig: Parsed training configuration.
+    """
+    return _load_snapshot_dataclass(raw, cls=TrainConfig, source=source, config_name="train_config.json")
+
+
 def load_optim_config_snapshot(raw: dict[str, object], *, source: str) -> OptimConfig:
     """Parse persisted `optim_config.json` into OptimConfig.
 
@@ -2012,8 +1525,8 @@ def load_logging_config_snapshot(raw: dict[str, object], *, source: str) -> Logg
     return _load_snapshot_dataclass(raw, cls=LoggingConfig, source=source, config_name="logging_config.json")
 
 
-# Legacy train-section keys that migrated to *other* sections. Same-section
-# migrations derive from each config class's _LEGACY_MAP instead.
+# Old train-section keys that moved to other sections. Same-section migrations
+# derive from each config class's moved-key table.
 _TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
     "project_name": "logging.project_name",
     "run_name": "logging.run_name",
@@ -2038,10 +1551,8 @@ _TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
 def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
     """Return an actionable migration suggestion for an unknown key.
 
-    Same-section suggestions derive from each config class's ``_LEGACY_MAP``
-    (the executable alias table), so the suggested dotted paths cannot drift
-    from the real ones; only cross-section train migrations need their own
-    table.
+    Same-section suggestions derive from each config class's moved-key table;
+    only cross-section train migrations need their own table.
 
     :param str section_name: Section path.
     :param str key: Unknown key.
@@ -2050,9 +1561,9 @@ def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
     section = str(section_name)
     k = str(key)
     section_maps: dict[str, dict[str, str]] = {
-        "model": ModelConfig._LEGACY_MAP,
-        "data": DataConfig._LEGACY_MAP,
-        "train": TrainConfig._LEGACY_MAP,
+        "model": ModelConfig._MOVED_KEYS,
+        "data": DataConfig._MOVED_KEYS,
+        "train": TrainConfig._MOVED_KEYS,
     }
     mapped = section_maps.get(section, {}).get(k)
     if mapped is not None:

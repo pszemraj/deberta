@@ -60,7 +60,7 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
     cli_mod.main(["train", str(cfg_path)])
 
     assert "train_cfg" in seen
-    assert int(seen["train_cfg"].warmup_steps) == 1000
+    assert int(seen["optim_cfg"].scheduler.warmup_steps) == 1000
     assert seen["config_path"] == cfg_path
     err = capsys.readouterr().err
     assert "optim.scheduler.warmup_steps" not in err
@@ -169,7 +169,7 @@ def test_main_cli_train_supports_null_for_optional_numeric_dotted_override(
         ]
     )
 
-    assert seen["model_cfg"].hf_max_position_embeddings is None
+    assert seen["model_cfg"].hf.max_position_embeddings is None
     err = capsys.readouterr().err
     assert (
         "model.hf.max_position_embeddings: 640 -> None (CLI override (--model.hf.max_position_embeddings))"
@@ -213,7 +213,7 @@ def test_main_cli_train_supports_null_for_optional_constrained_dotted_override(
         ]
     )
 
-    assert seen["model_cfg"].pretrained_norm_arch is None
+    assert seen["model_cfg"].rope.pretrained.norm_arch is None
     err = capsys.readouterr().err
     assert (
         "model.rope.pretrained.norm_arch: 'keel' -> None (CLI override (--model.rope.pretrained.norm_arch))"
@@ -387,7 +387,7 @@ def test_export_parser_rejects_conflicting_boolean_flags(argv: list[str]):
 def test_validate_data_config_rejects_conflicting_sources():
     with pytest.raises(ValueError, match="cannot be combined"):
         validate_data_config(
-            DataConfig(
+            make_data_config(
                 load_from_disk="runs/saved_ds",
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 streaming=False,
@@ -398,7 +398,7 @@ def test_validate_data_config_rejects_conflicting_sources():
 def test_validate_train_config_rejects_overwrite_with_resume_conflict():
     with pytest.raises(ValueError, match="cannot be combined with train.checkpoint.resume_from_checkpoint"):
         validate_train_config(
-            TrainConfig(
+            make_train_config(
                 overwrite_output_dir=True,
                 resume_from_checkpoint="auto",
             )
@@ -411,36 +411,36 @@ def test_validate_train_config_rejects_overwrite_with_resume_conflict():
     ids=["blank_to_none", "trimmed_value"],
 )
 def test_validate_train_config_normalizes_resume_hints(resume_hint: str, expected: str | None):
-    cfg = TrainConfig(resume_from_checkpoint=resume_hint)
+    cfg = make_train_config(resume_from_checkpoint=resume_hint)
     validate_train_config(cfg)
     assert cfg.checkpoint.resume_from_checkpoint == expected
 
 
 def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
-    cfg = ModelConfig()
+    cfg = make_model_config()
     assert cfg.backbone_type == "hf_deberta_v2"
 
 
 def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
-    assert bool(TrainConfig().decoupled_training) is True
-    assert bool(TrainConfig(decoupled_training=False).decoupled_training) is False
+    assert bool(make_train_config().decoupled_training) is True
+    assert bool(make_train_config(decoupled_training=False).decoupled_training) is False
 
 
 def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
-    cfg = TrainConfig(decoupled_training=None)  # type: ignore[arg-type]
+    cfg = make_train_config(decoupled_training=None)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="train.decoupled_training must be a boolean"):
         validate_train_config(cfg)
 
 
 @pytest.mark.parametrize("value", [-1.0, 1.0e-4, 2.5e-3])
 def test_validate_train_config_allows_discriminator_learning_rate_inherit_or_positive(value: float) -> None:
-    cfg = OptimConfig(discriminator_learning_rate=value)
+    cfg = make_optim_config(discriminator_learning_rate=value)
     validate_optim_config(cfg)
 
 
 @pytest.mark.parametrize("value", [0.0, -0.5, -2.0])
 def test_validate_train_config_rejects_invalid_discriminator_learning_rate(value: float) -> None:
-    cfg = OptimConfig(discriminator_learning_rate=value)
+    cfg = make_optim_config(discriminator_learning_rate=value)
     with pytest.raises(ValueError, match="optim.lr.discriminator"):
         validate_optim_config(cfg)
 
@@ -452,9 +452,9 @@ def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Pa
 
     with pytest.raises(ValueError, match="Output directory exists and is not empty"):
         run_pretraining_dry_run(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(output_dir=str(out_dir), overwrite_output_dir=False, max_steps=5),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=make_train_config(output_dir=str(out_dir), overwrite_output_dir=False, max_steps=5),
             config_path=None,
         )
 
@@ -462,7 +462,7 @@ def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Pa
 def test_validate_data_config_rejects_non_streaming_shuffle_buffer_above_one():
     with pytest.raises(ValueError, match="shuffle_buffer_size must be 0 or 1"):
         validate_data_config(
-            DataConfig(
+            make_data_config(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 streaming=False,
                 shuffle_buffer_size=10_000,
@@ -473,7 +473,7 @@ def test_validate_data_config_rejects_non_streaming_shuffle_buffer_above_one():
 def test_validate_data_config_rejects_doc_blocking_when_not_packed():
     with pytest.raises(ValueError, match="requires data.packing.enabled=true"):
         validate_data_config(
-            DataConfig(
+            make_data_config(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=False,
                 block_cross_document_attention=True,
@@ -484,7 +484,7 @@ def test_validate_data_config_rejects_doc_blocking_when_not_packed():
 def test_validate_data_config_warns_on_long_context_dense_doc_blocking():
     with pytest.warns(UserWarning, match="segment-aware attention backends"):
         validate_data_config(
-            DataConfig(
+            make_data_config(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=True,
                 block_cross_document_attention=True,
@@ -498,108 +498,108 @@ def test_validate_training_workflow_options_rejects_flash_with_packing():
         ValueError, match="train.sdpa_kernel=flash is not supported with data.packing.enabled=true"
     ):
         validate_training_workflow_options(
-            data_cfg=DataConfig(
+            data_cfg=make_data_config(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=True,
                 block_cross_document_attention=True,
             ),
-            train_cfg=TrainConfig(sdpa_kernel="flash"),
+            train_cfg=make_train_config(sdpa_kernel="flash"),
         )
 
 
 def test_validate_training_workflow_options_allows_flash_when_packed_doc_blocking_disabled():
     validate_training_workflow_options(
-        data_cfg=DataConfig(
+        data_cfg=make_data_config(
             dataset_name="HuggingFaceFW/fineweb-edu",
             pack_sequences=True,
             block_cross_document_attention=False,
         ),
-        train_cfg=TrainConfig(sdpa_kernel="flash"),
+        train_cfg=make_train_config(sdpa_kernel="flash"),
     )
 
 
 def test_validate_training_workflow_options_rejects_sdpa_kernel_override_when_rope_attention_is_eager():
     with pytest.raises(ValueError, match="train.sdpa_kernel only affects rope attention"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
-            train_cfg=TrainConfig(sdpa_kernel="flash"),
-            model_cfg=ModelConfig(backbone_type="rope", attention_implementation="eager"),
+            data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu", pack_sequences=False),
+            train_cfg=make_train_config(sdpa_kernel="flash"),
+            model_cfg=make_model_config(backbone_type="rope", attention_implementation="eager"),
         )
 
 
 def test_validate_training_workflow_options_allows_hf_backbone_doc_blocking_in_packed_mode():
     validate_training_workflow_options(
-        data_cfg=DataConfig(
+        data_cfg=make_data_config(
             dataset_name="HuggingFaceFW/fineweb-edu",
             pack_sequences=True,
             block_cross_document_attention=True,
         ),
-        train_cfg=TrainConfig(),
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        train_cfg=make_train_config(),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
     )
 
 
 def test_validate_training_workflow_options_allows_hf_backbone_doc_blocking_when_sdpa_kernel_is_flash():
     with pytest.warns(UserWarning, match="train.sdpa_kernel has no effect"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(
+            data_cfg=make_data_config(
                 dataset_name="HuggingFaceFW/fineweb-edu",
                 pack_sequences=True,
                 block_cross_document_attention=True,
             ),
-            train_cfg=TrainConfig(sdpa_kernel="flash"),
-            model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+            train_cfg=make_train_config(sdpa_kernel="flash"),
+            model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
         )
 
 
 def test_validate_training_workflow_options_rejects_es_with_divergent_gen_lr():
     with pytest.raises(ValueError, match="embedding_sharing='es'"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(),
-            model_cfg=ModelConfig(embedding_sharing="es"),
-            optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+            data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=make_train_config(),
+            model_cfg=make_model_config(embedding_sharing="es"),
+            optim_cfg=make_optim_config(learning_rate=5e-4, generator_learning_rate=3e-4),
         )
 
 
 def test_validate_training_workflow_options_allows_es_with_matching_gen_lr():
     # Explicit gen LR matching disc LR — should pass.
     validate_training_workflow_options(
-        data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(decoupled_training=False),
-        model_cfg=ModelConfig(embedding_sharing="es"),
-        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=5e-4),
+        data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=make_train_config(decoupled_training=False),
+        model_cfg=make_model_config(embedding_sharing="es"),
+        optim_cfg=make_optim_config(learning_rate=5e-4, generator_learning_rate=5e-4),
     )
     # Inherited gen LR (-1) — should pass.
     validate_training_workflow_options(
-        data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(decoupled_training=False),
-        model_cfg=ModelConfig(embedding_sharing="es"),
-        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=-1.0),
+        data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=make_train_config(decoupled_training=False),
+        model_cfg=make_model_config(embedding_sharing="es"),
+        optim_cfg=make_optim_config(learning_rate=5e-4, generator_learning_rate=-1.0),
     )
 
 
 def test_validate_training_workflow_options_allows_gdes_with_divergent_gen_lr():
     # GDES handles separate LR correctly — should not raise.
     validate_training_workflow_options(
-        data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-        train_cfg=TrainConfig(),
-        model_cfg=ModelConfig(embedding_sharing="gdes"),
-        optim_cfg=OptimConfig(learning_rate=5e-4, generator_learning_rate=3e-4),
+        data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=make_train_config(),
+        model_cfg=make_model_config(embedding_sharing="gdes"),
+        optim_cfg=make_optim_config(learning_rate=5e-4, generator_learning_rate=3e-4),
     )
 
 
 def test_validate_training_workflow_options_rejects_decoupled_with_es_embedding_sharing():
     with pytest.raises(ValueError, match="gradients.*dropped"):
         validate_training_workflow_options(
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(decoupled_training=True),
-            model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="es"),
+            data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=make_train_config(decoupled_training=True),
+            model_cfg=make_model_config(backbone_type="hf_deberta_v2", embedding_sharing="es"),
         )
 
 
 def test_validate_model_config_rejects_rope_knobs_in_hf_mode():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         rope_theta=50_000.0,
     )
@@ -608,17 +608,17 @@ def test_validate_model_config_rejects_rope_knobs_in_hf_mode():
 
 
 def test_validate_model_config_normalizes_hf_attention_kernel_alias():
-    cfg = ModelConfig(backbone_type="hf_deberta_v2", hf_attention_kernel="cache")
+    cfg = make_model_config(backbone_type="hf_deberta_v2", hf_attention_kernel="cache")
     validate_model_config(cfg)
-    assert cfg.hf_attention_kernel == "cached_bmm"
+    assert cfg.hf.attention_kernel == "cached_bmm"
 
-    cfg = ModelConfig(backbone_type="hf_deberta_v2", hf_attention_kernel="safe")
+    cfg = make_model_config(backbone_type="hf_deberta_v2", hf_attention_kernel="safe")
     validate_model_config(cfg)
-    assert cfg.hf_attention_kernel == "stable"
+    assert cfg.hf.attention_kernel == "stable"
 
 
 def test_validate_model_config_normalizes_hf_flash_config():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         hf={"attention_impl": "flash", "flash": {"force_varlen": True, "varlen_min_seq_len": "4096"}},
     )
@@ -630,7 +630,7 @@ def test_validate_model_config_normalizes_hf_flash_config():
 
 
 def test_validate_model_config_rejects_flash_attention_for_rope():
-    cfg = ModelConfig(backbone_type="rope", hf={"attention_impl": "flash"})
+    cfg = make_model_config(backbone_type="rope", hf={"attention_impl": "flash"})
     with pytest.raises(ValueError, match="only supported with model.backbone_type='hf_deberta_v2'"):
         validate_model_config(cfg)
 
@@ -643,25 +643,25 @@ def test_validate_model_config_rejects_flash_attention_for_rope():
     ],
 )
 def test_validate_model_config_rejects_flash_attention_with_dropout(dropout: dict[str, float]):
-    cfg = ModelConfig(backbone_type="hf_deberta_v2", hf={"attention_impl": "flash"}, dropout=dropout)
+    cfg = make_model_config(backbone_type="hf_deberta_v2", hf={"attention_impl": "flash"}, dropout=dropout)
     with pytest.raises(ValueError, match="requires dropout disabled"):
         validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_multiple():
-    cfg = ModelConfig(tokenizer_vocab_multiple=0)
+    cfg = make_model_config(tokenizer_vocab_multiple=0)
     with pytest.raises(ValueError, match="model.tokenizer.vocab_multiple"):
         validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_non_positive_tokenizer_vocab_target():
-    cfg = ModelConfig(tokenizer_vocab_target=0)
+    cfg = make_model_config(tokenizer_vocab_target=0)
     with pytest.raises(ValueError, match="model.tokenizer.vocab_target"):
         validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_generator_source():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         pretrained_generator_path="microsoft/deberta-v3-small",
         generator_hidden_size=256,
@@ -671,7 +671,7 @@ def test_validate_model_config_rejects_derived_generator_knobs_with_explicit_gen
 
 
 def test_validate_model_config_rejects_hf_max_position_embeddings_for_rope():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         hf_max_position_embeddings=1024,
     )
@@ -680,7 +680,7 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_for_rope():
 
 
 def test_validate_model_config_allows_hf_max_position_embeddings_in_hf_scratch_mode():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=True,
         hf_max_position_embeddings=1024,
@@ -689,7 +689,7 @@ def test_validate_model_config_allows_hf_max_position_embeddings_in_hf_scratch_m
 
 
 def test_validate_model_config_rejects_pretrained_derived_generator_shape_overrides():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",
@@ -700,7 +700,7 @@ def test_validate_model_config_rejects_pretrained_derived_generator_shape_overri
 
 
 def test_validate_model_config_allows_pretrained_derived_generator_layer_override():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",
@@ -719,7 +719,7 @@ def test_looks_like_hf_deberta_checkpoint_avoids_local_rope_false_positive():
 
 
 def test_validate_model_config_allows_local_rope_checkpoint_path_with_deberta_in_name():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="runs/deberta-v3-rope/checkpoint-1000",
@@ -728,7 +728,7 @@ def test_validate_model_config_allows_local_rope_checkpoint_path_with_deberta_in
 
 
 def test_validate_model_config_rejects_scratch_rope_knobs_in_pretrained_mode():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",
@@ -739,7 +739,7 @@ def test_validate_model_config_rejects_scratch_rope_knobs_in_pretrained_mode():
 
 
 def test_validate_model_config_allows_explicit_pretrained_rope_overrides():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",
@@ -750,7 +750,7 @@ def test_validate_model_config_allows_explicit_pretrained_rope_overrides():
 
 
 def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_rope_theta=50_000.0,
@@ -807,7 +807,7 @@ def test_export_help_does_not_show_misleading_defaults_on_no_flags() -> None:
     ],
 )
 def test_validate_model_config_inert_param_warnings(cfg_kwargs, expect_warn):
-    cfg = ModelConfig(**cfg_kwargs)
+    cfg = make_model_config(**cfg_kwargs)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         validate_model_config(cfg)
@@ -866,8 +866,8 @@ def test_validate_train_config_inert_param_warnings(cfg_kwargs, expect_warn):
     train_kwargs = {k: v for k, v in cfg_kwargs.items() if k in train_keys}
     logging_kwargs = {k: v for k, v in cfg_kwargs.items() if k in logging_keys}
 
-    train_cfg = TrainConfig(**train_kwargs)
-    logging_cfg = LoggingConfig(**logging_kwargs) if logging_kwargs else None
+    train_cfg = make_train_config(**train_kwargs)
+    logging_cfg = make_logging_config(**logging_kwargs) if logging_kwargs else None
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         validate_train_config(train_cfg)
@@ -899,9 +899,9 @@ def test_validate_train_config_inert_param_warnings(cfg_kwargs, expect_warn):
     ],
 )
 def test_validate_workflow_sdpa_kernel_inert_warning(model_kwargs, train_kwargs, expect_warn):
-    model_cfg = ModelConfig(**model_kwargs)
-    train_cfg = TrainConfig(**train_kwargs)
-    data_cfg = DataConfig(data_files="dummy.txt")
+    model_cfg = make_model_config(**model_kwargs)
+    train_cfg = make_train_config(**train_kwargs)
+    data_cfg = make_data_config(data_files="dummy.txt")
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         validate_training_workflow_options(data_cfg=data_cfg, train_cfg=train_cfg, model_cfg=model_cfg)
@@ -950,7 +950,7 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
         "version",
         lambda name: "0.0.7" if str(name) == "flashdeberta" else "0.0.0",
     )
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         hf={"attention_impl": "flash", "flash": {"force_varlen": True}},
     )
@@ -965,7 +965,7 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
 
 
 def test_build_run_metadata_omits_flash_attention_for_eager_config():
-    model_cfg = ModelConfig(backbone_type="hf_deberta_v2")
+    model_cfg = make_model_config(backbone_type="hf_deberta_v2")
     validate_model_config(model_cfg)
 
     meta = _build_run_metadata(model_cfg=model_cfg)
@@ -978,9 +978,9 @@ def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_
     out.mkdir(parents=True, exist_ok=True)
     _persist_or_validate_run_configs(
         output_dir=out,
-        model_cfg=ModelConfig(),
-        data_cfg=DataConfig(data_files="dummy.txt"),
-        train_cfg=TrainConfig(),
+        model_cfg=make_model_config(),
+        data_cfg=make_data_config(data_files="dummy.txt"),
+        train_cfg=make_train_config(),
         resume_checkpoint=None,
         is_main_process=True,
         preflight_only=True,
@@ -992,9 +992,9 @@ def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_
 def test_persist_run_configs_writes_compile_scope_to_metadata(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(data_files="dummy.txt")
-    train_cfg = TrainConfig()
+    model_cfg = make_model_config()
+    data_cfg = make_data_config(data_files="dummy.txt")
+    train_cfg = make_train_config()
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,
@@ -1015,9 +1015,9 @@ def test_persist_run_configs_writes_compile_scope_to_metadata(tmp_path: Path):
 def test_persist_run_configs_warns_on_compile_scope_drift_on_resume(tmp_path: Path, caplog):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(data_files="dummy.txt")
-    train_cfg = TrainConfig()
+    model_cfg = make_model_config()
+    data_cfg = make_data_config(data_files="dummy.txt")
+    train_cfg = make_train_config()
 
     # Initial run persists scope=backbones.
     _persist_or_validate_run_configs(

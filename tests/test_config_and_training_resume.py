@@ -4,11 +4,11 @@ from _config_and_training_shared_imports import *
 
 def _write_resume_source_snapshots(run_dir: Path) -> None:
     """Write minimal config snapshots required for strict resume validation."""
-    model_cfg = ModelConfig()
-    data_cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
-    train_cfg = TrainConfig()
-    optim_cfg = OptimConfig()
-    logging_cfg = LoggingConfig(output_dir=str(run_dir))
+    model_cfg = make_model_config()
+    data_cfg = make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    train_cfg = make_train_config()
+    optim_cfg = make_optim_config()
+    logging_cfg = make_logging_config(output_dir=str(run_dir))
     _persist_or_validate_run_configs(
         output_dir=run_dir,
         model_cfg=model_cfg,
@@ -41,11 +41,10 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
         accelerator_cls=FakeAccelerator,
         cycle_fn=_fail_cycle,
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=2,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -58,8 +57,8 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
     assert replay_calls["next"] == 0
@@ -72,11 +71,10 @@ def test_run_pretraining_resume_requires_data_state_json(
     _write_resume_source_snapshots(checkpoint_dir.parent)
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=3,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -90,8 +88,8 @@ def test_run_pretraining_resume_requires_data_state_json(
 
     with pytest.raises(ValueError, match="missing/invalid data_state.json"):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
         )
 
@@ -108,11 +106,10 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
     _write_resume_source_snapshots(checkpoint_dir.parent)
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=3,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -126,8 +123,8 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
 
     with pytest.raises(RuntimeError, match="Checkpoint step mismatch on resume"):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
         )
 
@@ -151,12 +148,10 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
             **kwargs,
         ),
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=1,
         save_steps=0,
-        report_to="tensorboard",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -169,10 +164,10 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
-        logging_cfg=LoggingConfig(backend="tensorboard", logging_steps=1),
+        logging_cfg=make_logging_config(backend="tensorboard", logging_steps=1),
     )
 
     accel = FakeAccelerator.last_instance
@@ -214,12 +209,10 @@ def test_run_pretraining_decoupled_integration(
             "on_discriminator_phase": lambda _m, _i: call_order.append("disc_forward"),
             "on_sync_discriminator_embeddings": lambda _m: call_order.append("sync"),
         }
-        train_cfg = TrainConfig(
+        train_cfg = make_train_config(
             output_dir=str(tmp_path / "run"),
             max_steps=1,
-            logging_steps=1,
             save_steps=0,
-            report_to="tensorboard",
             mixed_precision="no",
             tf32=False,
             dataloader_num_workers=0,
@@ -245,12 +238,10 @@ def test_run_pretraining_decoupled_integration(
             return next(micro_counts)
 
         extra_patches = {"_count_rtd_tokens_for_batch": _count_tokens_for_microbatch}
-        train_cfg = TrainConfig(
+        train_cfg = make_train_config(
             output_dir=str(tmp_path / "run"),
             max_steps=1,
-            logging_steps=1,
             save_steps=0,
-            report_to="none",
             mixed_precision="no",
             tf32=False,
             dataloader_num_workers=0,
@@ -265,12 +256,10 @@ def test_run_pretraining_decoupled_integration(
         )
     elif scenario == "branch_loss_weights":
         behavior = {"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0}
-        train_cfg = TrainConfig(
+        train_cfg = make_train_config(
             output_dir=str(tmp_path / "run"),
             max_steps=1,
-            logging_steps=0,
             save_steps=0,
-            report_to="none",
             mixed_precision="no",
             tf32=False,
             dataloader_num_workers=0,
@@ -285,12 +274,10 @@ def test_run_pretraining_decoupled_integration(
         )
     elif scenario == "skip_generator_step":
         behavior = {"generator_phase_loss_scale": 2.0, "discriminator_phase_loss_scale": 3.0}
-        train_cfg = TrainConfig(
+        train_cfg = make_train_config(
             output_dir=str(tmp_path / "run"),
             max_steps=1,
-            logging_steps=0,
             save_steps=0,
-            report_to="none",
             mixed_precision="no",
             tf32=False,
             dataloader_num_workers=0,
@@ -309,12 +296,10 @@ def test_run_pretraining_decoupled_integration(
             "generator_phase_token_count": [0.0, 1.0],
             "discriminator_phase_loss_scale": 3.0,
         }
-        train_cfg = TrainConfig(
+        train_cfg = make_train_config(
             output_dir=str(tmp_path / "run"),
             max_steps=1,
-            logging_steps=0,
             save_steps=0,
-            report_to="none",
             mixed_precision="no",
             tf32=False,
             dataloader_num_workers=0,
@@ -362,10 +347,10 @@ def test_run_pretraining_decoupled_integration(
     monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
-        logging_cfg=LoggingConfig(
+        logging_cfg=make_logging_config(
             backend="tensorboard" if scenario == "steps_and_sync" else "none",
             logging_steps=1 if scenario == "steps_and_sync" else 0,
         ),
@@ -438,12 +423,10 @@ def test_run_pretraining_nonfinite_all_reduce_only_on_sync_microstep(
 
     monkeypatch.setattr(pretrain_mod, "_any_rank_flag_true", _counted_any_rank_flag_true)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=0,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -456,8 +439,8 @@ def test_run_pretraining_nonfinite_all_reduce_only_on_sync_microstep(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -499,12 +482,10 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
 
     monkeypatch.setattr(pretrain_mod, "_build_scheduler", _build_counted_scheduler)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=0,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -517,8 +498,8 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -540,12 +521,10 @@ def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens
             **kwargs,
         ),
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=0,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -558,8 +537,8 @@ def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -576,12 +555,10 @@ def test_run_pretraining_decoupled_routes_phase_calls_through_forward(
         accelerator_cls=FakeAccelerator,
         rtd_cls=SimpleRTD,
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=0,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -594,8 +571,8 @@ def test_run_pretraining_decoupled_routes_phase_calls_through_forward(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -634,12 +611,10 @@ def test_run_pretraining_final_export_uses_subprocess_helper(
         save_checkpoint_fn=_fake_save_checkpoint,
         extra_patches={"_export_discriminator_hf_subprocess": _fake_export_subprocess},
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=0,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -651,8 +626,8 @@ def test_run_pretraining_final_export_uses_subprocess_helper(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -685,12 +660,10 @@ def _run_zero_token_weighted_case(
         ),
         extra_patches={"_count_rtd_tokens_for_batch": lambda *args, **kwargs: (0.0, 0.0)},
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=1,
         save_steps=0,
-        report_to="tensorboard",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -698,21 +671,20 @@ def _run_zero_token_weighted_case(
         gradient_accumulation_steps=2,
         token_weighted_gradient_accumulation=True,
         decoupled_training=False,
-        debug_metrics=bool(debug_metrics),
         torch_compile=False,
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
-        logging_cfg=LoggingConfig(
+        logging_cfg=make_logging_config(
             backend="tensorboard",
             logging_steps=1,
             debug={"metrics": bool(debug_metrics)},
         ),
     )
-    return Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    return Path(train_cfg.checkpoint.output_dir) / "metrics.jsonl.gz"
 
 
 def _latest_zero_token_tracker_metrics() -> dict[str, Any]:
@@ -788,12 +760,10 @@ def test_run_pretraining_decoupled_debug_metrics_writes_local_rows(
         accelerator_cls=FakeAccelerator,
         rtd_cls=SimpleRTD,
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=1,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -801,18 +771,17 @@ def test_run_pretraining_decoupled_debug_metrics_writes_local_rows(
         gradient_accumulation_steps=1,
         token_weighted_gradient_accumulation=False,
         decoupled_training=True,
-        debug_metrics=True,
         torch_compile=False,
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
-        logging_cfg=LoggingConfig(logging_steps=1, debug={"metrics": True}),
+        logging_cfg=make_logging_config(logging_steps=1, debug={"metrics": True}),
     )
 
-    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    metrics_path = Path(train_cfg.checkpoint.output_dir) / "metrics.jsonl.gz"
     assert metrics_path.exists()
     last = _load_last_debug_metrics_row(metrics_path)
     assert int(last["step"]) == 1
@@ -830,11 +799,10 @@ def test_run_pretraining_compiles_generator_and_discriminator(
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -846,8 +814,8 @@ def test_run_pretraining_compiles_generator_and_discriminator(
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="rope"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -904,12 +872,10 @@ def test_run_pretraining_builds_doc_block_mask_in_flash_batch_preparation(
 
     monkeypatch.setattr(pretrain_mod, "prepare_flash_attention_batch_metadata", _prepare_spy)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
-        logging_steps=0,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -922,8 +888,8 @@ def test_run_pretraining_builds_doc_block_mask_in_flash_batch_preparation(
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="rope"),
-        data_cfg=DataConfig(
+        model_cfg=make_model_config(backbone_type="rope"),
+        data_cfg=make_data_config(
             dataset_name="hf-internal-testing/librispeech_asr_dummy",
             block_cross_document_attention=True,
         ),
@@ -971,11 +937,10 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
     )
     monkeypatch.setattr(pretrain_mod.torch, "compile", _fake_compile)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -987,8 +952,8 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
         export_hf_final=False,
     )
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
 
@@ -1012,11 +977,10 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
         monkeypatch,
         extra_patches={"_global_grad_l2_norm": lambda _model: float("inf")},
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -1026,13 +990,12 @@ def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
         decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
-        max_grad_norm=1.0,
     )
 
     with caplog.at_level(logging.WARNING):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
         )
     assert "nonfinite_window_skipped=1" in caplog.text
@@ -1065,11 +1028,10 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
             "_build_optimizer": _build_optimizer,
         },
     )
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=1,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -1079,12 +1041,11 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
         decoupled_training=False,
         torch_compile=False,
         export_hf_final=False,
-        max_grad_norm=1.0,
     )
 
     pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+        model_cfg=make_model_config(),
+        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
     )
     opt = opt_ref.get("opt")
@@ -1138,9 +1099,9 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    base_model = ModelConfig(backbone_type="rope")
-    base_data = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    base_train = TrainConfig()
+    base_model = make_model_config(backbone_type="rope")
+    base_data = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    base_train = make_train_config()
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=base_model,
@@ -1152,7 +1113,7 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
     run_meta = json.loads((out / "run_metadata.json").read_text(encoding="utf-8"))
     assert int(run_meta["config_schema_version"]) == int(RUN_CONFIG_SCHEMA_VERSION)
 
-    changed_model = ModelConfig(backbone_type="rope", hidden_size=1024)
+    changed_model = make_model_config(backbone_type="rope", hidden_size=1024)
     with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
         _persist_or_validate_run_configs(
             output_dir=out,
@@ -1168,9 +1129,9 @@ def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_re
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig()
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config()
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,
@@ -1182,7 +1143,7 @@ def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_re
 
     run_meta_path = out / "run_metadata.json"
     run_meta_path.unlink()
-    changed_model = ModelConfig(backbone_type="rope", hidden_size=1024)
+    changed_model = make_model_config(backbone_type="rope", hidden_size=1024)
 
     with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
         _persist_or_validate_run_configs(
@@ -1199,9 +1160,9 @@ def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_re
 def test_persist_or_validate_run_configs_validates_against_resume_source_run_dir(tmp_path: Path):
     source_run = tmp_path / "source-run"
     source_run.mkdir(parents=True, exist_ok=True)
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(max_steps=10)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config(max_steps=10)
     _persist_or_validate_run_configs(
         output_dir=source_run,
         model_cfg=model_cfg,
@@ -1215,7 +1176,7 @@ def test_persist_or_validate_run_configs_validates_against_resume_source_run_dir
 
     new_output_dir = tmp_path / "new-run"
     new_output_dir.mkdir(parents=True, exist_ok=True)
-    mismatched_model = ModelConfig(backbone_type="rope", hidden_size=1024)
+    mismatched_model = make_model_config(backbone_type="rope", hidden_size=1024)
     with pytest.raises(ValueError, match="Resume configuration mismatch for model_config.json"):
         _persist_or_validate_run_configs(
             output_dir=new_output_dir,
@@ -1230,9 +1191,9 @@ def test_persist_or_validate_run_configs_validates_against_resume_source_run_dir
 def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_differs(tmp_path: Path):
     source_run = tmp_path / "source-run"
     source_run.mkdir(parents=True, exist_ok=True)
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(max_steps=10)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config(max_steps=10)
     _persist_or_validate_run_configs(
         output_dir=source_run,
         model_cfg=model_cfg,
@@ -1246,7 +1207,7 @@ def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_di
 
     new_output_dir = tmp_path / "new-run"
     new_output_dir.mkdir(parents=True, exist_ok=True)
-    changed_train_cfg = TrainConfig(max_steps=25)
+    changed_train_cfg = make_train_config(max_steps=25)
     _persist_or_validate_run_configs(
         output_dir=new_output_dir,
         model_cfg=model_cfg,
@@ -1275,10 +1236,10 @@ def test_persist_or_validate_run_configs_allows_resume_when_only_logging_output_
     source_logging_dir = source_run / "logs"
     source_logging_dir.mkdir(parents=True, exist_ok=True)
 
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(max_steps=10)
-    source_logging_cfg = LoggingConfig(output_dir=str(source_logging_dir))
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config(max_steps=10)
+    source_logging_cfg = make_logging_config(output_dir=str(source_logging_dir))
     _persist_or_validate_run_configs(
         output_dir=source_run,
         logging_output_dir=source_logging_dir,
@@ -1296,7 +1257,7 @@ def test_persist_or_validate_run_configs_allows_resume_when_only_logging_output_
     new_output_dir.mkdir(parents=True, exist_ok=True)
     new_logging_dir = new_output_dir / "logs"
     new_logging_dir.mkdir(parents=True, exist_ok=True)
-    resumed_logging_cfg = LoggingConfig(output_dir=str(new_logging_dir))
+    resumed_logging_cfg = make_logging_config(output_dir=str(new_logging_dir))
     _persist_or_validate_run_configs(
         output_dir=new_output_dir,
         logging_output_dir=new_logging_dir,
@@ -1319,9 +1280,9 @@ def test_persist_or_validate_run_configs_allows_resume_when_only_logging_output_
 def test_persist_or_validate_run_configs_preflight_rejects_conflicting_resume_snapshot(tmp_path: Path):
     source_run = tmp_path / "source-run"
     source_run.mkdir(parents=True, exist_ok=True)
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(max_steps=10)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config(max_steps=10)
     _persist_or_validate_run_configs(
         output_dir=source_run,
         model_cfg=model_cfg,
@@ -1360,9 +1321,9 @@ def test_persist_or_validate_run_configs_rejects_resume_when_source_snapshots_mi
     with pytest.raises(ValueError, match="source run directory is missing required config snapshots"):
         _persist_or_validate_run_configs(
             output_dir=out,
-            model_cfg=ModelConfig(backbone_type="rope"),
-            data_cfg=DataConfig(dataset_name="HuggingFaceFW/fineweb-edu"),
-            train_cfg=TrainConfig(),
+            model_cfg=make_model_config(backbone_type="rope"),
+            data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=make_train_config(),
             resume_checkpoint=str(checkpoint_dir),
             is_main_process=True,
         )
@@ -1372,9 +1333,9 @@ def test_persist_or_validate_run_configs_allows_resume_when_only_inert_model_fie
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    base_model = ModelConfig(backbone_type="rope")
-    base_data = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    base_train = TrainConfig()
+    base_model = make_model_config(backbone_type="rope")
+    base_data = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    base_train = make_train_config()
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=base_model,
@@ -1384,7 +1345,7 @@ def test_persist_or_validate_run_configs_allows_resume_when_only_inert_model_fie
         is_main_process=True,
     )
 
-    inert_changed_model = ModelConfig(
+    inert_changed_model = make_model_config(
         backbone_type="rope",
         hf_attention_kernel="stable",
         hf_max_position_embeddings=1024,
@@ -1410,9 +1371,9 @@ def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
     src_text = "model:\n  backbone_type: rope\ntrain:\n  max_steps: 7\n"
     src_cfg.write_text(src_text, encoding="utf-8")
 
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(max_steps=7)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config(max_steps=7)
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,
@@ -1429,7 +1390,7 @@ def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
     assert resolved_path.exists()
     loaded_resolved = load_config(resolved_path)
     assert loaded_resolved.model.backbone_type == model_cfg.backbone_type
-    assert loaded_resolved.data.dataset_name == data_cfg.dataset_name
+    assert loaded_resolved.data.source.dataset_name == data_cfg.source.dataset_name
     assert loaded_resolved.train.max_steps == train_cfg.max_steps
 
 
@@ -1437,9 +1398,9 @@ def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matchin
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(max_steps=10)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config(max_steps=10)
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,
@@ -1450,7 +1411,7 @@ def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matchin
     )
     original_train_snapshot = json.loads((out / "train_config.json").read_text(encoding="utf-8"))
 
-    changed_train_cfg = TrainConfig(max_steps=20)
+    changed_train_cfg = make_train_config(max_steps=20)
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,
@@ -1472,9 +1433,9 @@ def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
-    model_cfg = ModelConfig(backbone_type="rope")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig()
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config()
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,

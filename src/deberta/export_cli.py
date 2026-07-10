@@ -18,6 +18,7 @@ from deberta.config import (
     TrainConfig,
     load_data_config_snapshot,
     load_model_config_snapshot,
+    load_train_config_snapshot,
     validate_data_config,
     validate_model_config,
 )
@@ -136,7 +137,7 @@ def _load_optional_train_config(run_dir: Path) -> TrainConfig | None:
 
     try:
         raw = load_json_mapping(train_cfg_path)
-        return TrainConfig(**raw)
+        return load_train_config_snapshot(raw, source=str(train_cfg_path))
     except Exception as exc:
         logger.warning("Failed to parse optional train config at %s: %s", train_cfg_path, exc)
         return None

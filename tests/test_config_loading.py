@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _config_factories import make_model_config, make_optim_config, make_train_config
 
 from deberta.config import (
     ModelConfig,
@@ -48,8 +49,8 @@ def test_load_yaml_nested(tmp_path: Path):
     cfg_nested = load_config(nested)
     assert cfg_nested.model.rope.ffn_type == "swiglu"
     assert cfg_nested.data.packing.max_seq_length == 128
-    assert cfg_nested.train.overwrite_output_dir is True
-    assert cfg_nested.train.mlm_max_ngram == 3
+    assert cfg_nested.train.checkpoint.overwrite_output_dir is True
+    assert cfg_nested.train.objective.mlm_max_ngram == 3
     assert cfg_nested.train.mixed_precision == "bf16"
 
 
@@ -120,11 +121,11 @@ def test_config_reference_loads() -> None:
 @pytest.mark.parametrize(
     ("cfg", "match"),
     [
-        (ModelConfig(generator={"hidden_size": 0}), "model.generator.hidden_size"),
-        (ModelConfig(rope={"rope_theta": 0.0}), "model.rope.rope_theta"),
-        (ModelConfig(dropout={"hidden_prob": 1.1}), "model.dropout.hidden_prob"),
+        (make_model_config(generator={"hidden_size": 0}), "model.generator.hidden_size"),
+        (make_model_config(rope={"rope_theta": 0.0}), "model.rope.rope_theta"),
+        (make_model_config(dropout={"hidden_prob": 1.1}), "model.dropout.hidden_prob"),
         (
-            ModelConfig(
+            make_model_config(
                 hf={"attention_impl": "flash"},
                 dropout={"hidden_prob": None, "attention_probs_prob": 0.0},
             ),
@@ -140,9 +141,9 @@ def test_model_constraints_fail_during_validation(cfg: ModelConfig, match: str) 
 @pytest.mark.parametrize(
     ("cfg", "match"),
     [
-        (TrainConfig(objective={"gen_loss_weight": -1.0}), "loss weights"),
+        (make_train_config(objective={"gen_loss_weight": -1.0}), "loss weights"),
         (
-            TrainConfig(objective={"gen_loss_weight": 0.0, "disc_loss_weight": 0.0}),
+            make_train_config(objective={"gen_loss_weight": 0.0, "disc_loss_weight": 0.0}),
             "At least one",
         ),
     ],
@@ -155,8 +156,8 @@ def test_train_constraints_fail_during_validation(cfg: TrainConfig, match: str) 
 @pytest.mark.parametrize(
     ("cfg", "match"),
     [
-        (OptimConfig(adam={"beta1": 1.0}), "optim.adam.beta1"),
-        (OptimConfig(adam={"epsilon": 0.0}), "optim.adam.epsilon"),
+        (make_optim_config(adam={"beta1": 1.0}), "optim.adam.beta1"),
+        (make_optim_config(adam={"epsilon": 0.0}), "optim.adam.epsilon"),
     ],
 )
 def test_optim_constraints_fail_during_validation(cfg: OptimConfig, match: str) -> None:
@@ -223,5 +224,5 @@ def test_parity_yaml_configs_parse_and_validate(config_name: str) -> None:
     )
 
     assert cfg.model.backbone_type == "hf_deberta_v2"
-    assert cfg.model.pretrained_discriminator_path == ""
+    assert cfg.model.pretrained.discriminator_path == ""
     assert bool(cfg.train.decoupled_training) is True

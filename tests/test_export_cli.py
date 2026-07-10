@@ -11,10 +11,11 @@ from typing import Any
 
 import pytest
 import torch
+from _config_factories import make_data_config, make_model_config
 from _fakes import DummyTokenizer, FakeAccelerator
 
 import deberta.export_cli as export_cli
-from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
+from deberta.config import RUN_CONFIG_SCHEMA_VERSION
 from deberta.run_layout import validate_run_metadata_file
 
 
@@ -53,7 +54,7 @@ class _FakeExportBackbone(torch.nn.Module):
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         tokenizer_name_or_path="dummy-tokenizer",
         embedding_sharing="none",
     )
@@ -61,7 +62,7 @@ def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> 
         json.dumps(asdict(model_cfg)),
         encoding="utf-8",
     )
-    data_cfg = DataConfig(dataset_name="dummy-dataset", max_seq_length=32)
+    data_cfg = make_data_config(dataset_name="dummy-dataset", max_seq_length=32)
     (run_dir / "data_config.json").write_text(
         json.dumps(asdict(data_cfg)),
         encoding="utf-8",

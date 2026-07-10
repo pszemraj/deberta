@@ -21,7 +21,7 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
     cfg = load_config(cfg_path)
     assert isinstance(cfg, Config)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        cfg.train = TrainConfig(max_steps=2)  # type: ignore[misc]
+        cfg.train = make_train_config(max_steps=2)  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
 
@@ -103,8 +103,8 @@ def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumula
 
 def test_apply_dotted_override_supports_nested_section_paths() -> None:
     cfg = Config(
-        data=DataConfig(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
-        train=TrainConfig(max_steps=1),
+        data=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
+        train=make_train_config(max_steps=1),
     )
     cfg2 = apply_dotted_override(cfg, "logging.wandb.watch=all")
     cfg2 = apply_dotted_override(cfg2, "optim.scheduler.warmup_steps=123")
@@ -129,14 +129,14 @@ def test_load_data_config_snapshot_rejects_unknown_legacy_key() -> None:
 
 
 def test_load_model_config_snapshot_rejects_missing_required_key() -> None:
-    model_raw = asdict(ModelConfig())
+    model_raw = asdict(make_model_config())
     model_raw.pop("backbone_type")
     with pytest.raises(ValueError, match="Missing required model_config.json keys"):
         load_model_config_snapshot(model_raw, source="model_config.json")
 
 
 def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
-    data_raw = asdict(DataConfig())
+    data_raw = asdict(make_data_config())
     data_raw.pop("source")
     with pytest.raises(ValueError, match="Missing required data_config.json keys"):
         load_data_config_snapshot(data_raw, source="data_config.json")
@@ -574,7 +574,7 @@ def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
 
 def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:
     model = TinyRTDLikeModel()
-    cfg = OptimConfig()
+    cfg = make_optim_config()
     opt = _build_optimizer(model, cfg)
 
     param_to_name = {id(p): n for n, p in model.named_parameters() if p.requires_grad}
@@ -589,7 +589,7 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
 
 def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
     model = TinyRTDLikeModel()
-    cfg = OptimConfig(
+    cfg = make_optim_config(
         lr={"base": 5.0e-4, "generator": 2.5e-4},
         weight_decay=0.01,
     )
@@ -619,7 +619,7 @@ def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_o
             self.discriminator = torch.nn.Linear(8, 8)
 
     model = _ModelWithEmd()
-    cfg = OptimConfig(
+    cfg = make_optim_config(
         lr={"base": 5.0e-4, "generator": 2.5e-4},
         weight_decay=0.01,
     )
@@ -969,7 +969,7 @@ def test_coerce_dataclass_payload_types_accepts_mapping_inputs() -> None:
 
 
 def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         pretrained_discriminator_path="microsoft/deberta-v3-base",
         generator_num_hidden_layers=None,
@@ -977,16 +977,12 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
         attention_probs_dropout_prob=None,
         tokenizer_vocab_target=None,
     )
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(
-        learning_rate=5e-4,
-        generator_learning_rate=-1.0,
-        discriminator_learning_rate=-1.0,
-    )
-    optim_cfg = OptimConfig(
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    train_cfg = make_train_config()
+    optim_cfg = make_optim_config(
         learning_rate=5e-4, generator_learning_rate=-1.0, discriminator_learning_rate=-1.0
     )
-    logging_cfg = LoggingConfig()
+    logging_cfg = make_logging_config()
     disc_cfg = types.SimpleNamespace(
         num_hidden_layers=12,
         hidden_dropout_prob=0.1,
@@ -1040,7 +1036,7 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
 
 
 def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None:
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         hidden_size="768",  # type: ignore[arg-type]
         num_hidden_layers="12",  # type: ignore[arg-type]
@@ -1049,11 +1045,11 @@ def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None
         hidden_dropout_prob="0.0",  # type: ignore[arg-type]
         attention_probs_dropout_prob="0.0",  # type: ignore[arg-type]
     )
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
-    train_cfg = TrainConfig(
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
+    train_cfg = make_train_config(
         token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
     )
-    optim_cfg = OptimConfig(
+    optim_cfg = make_optim_config(
         learning_rate="5e-4",  # type: ignore[arg-type]
         adam_epsilon="1e-6",  # type: ignore[arg-type]
         warmup_steps="1000",  # type: ignore[arg-type]
@@ -1128,11 +1124,10 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=2,
         save_steps=0,
-        report_to="wandb",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -1144,10 +1139,10 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     with pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
-            logging_cfg=LoggingConfig(wandb={"enabled": True}),
+            logging_cfg=make_logging_config(wandb={"enabled": True}),
         )
 
     metrics_path = Path(str(train_cfg.checkpoint.output_dir)) / "metrics.jsonl.gz"
@@ -1212,11 +1207,10 @@ def test_run_pretraining_logs_crash_save_failure(
 
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=2,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -1229,8 +1223,8 @@ def test_run_pretraining_logs_crash_save_failure(
     with caplog.at_level(logging.ERROR):
         with pytest.raises(KeyboardInterrupt):
             pretrain_mod.run_pretraining(
-                model_cfg=ModelConfig(),
-                data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+                model_cfg=make_model_config(),
+                data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
                 train_cfg=train_cfg,
             )
 
@@ -1274,11 +1268,10 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
 
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
-    train_cfg = TrainConfig(
+    train_cfg = make_train_config(
         output_dir=str(tmp_path / "run"),
         max_steps=3,
         save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
         dataloader_num_workers=0,
@@ -1290,8 +1283,8 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
 
     with pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
         )
 

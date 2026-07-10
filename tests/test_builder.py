@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 import torch
+from _config_factories import make_model_config
 from _fakes import DummyTokenizer
 
 from deberta.config import ModelConfig, load_config
@@ -85,7 +86,7 @@ def test_build_backbone_configs_rope_overrides(
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(backbone_type="rope", **model_kwargs)
+    model_cfg = make_model_config(backbone_type="rope", **model_kwargs)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=DummyTokenizer(vocab_size=50265),
@@ -116,7 +117,7 @@ def test_build_backbone_configs_from_scratch_avoids_pretrained_config_load(
         classmethod(_raise_if_called),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -201,7 +202,7 @@ def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_expl
     )
     monkeypatch.setattr(builder_mod, "_build_repo_hf_deberta_v2_config", _count_repo_builder)
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=from_scratch,
         pretrained_discriminator_path=("disc_weights" if not from_scratch else ""),
@@ -236,7 +237,7 @@ def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_expl
 def test_build_backbone_configs_propagates_tokenizer_special_ids_for_rope():
     pytest.importorskip("transformers")
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -276,7 +277,7 @@ def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monke
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -296,7 +297,7 @@ def test_build_backbone_configs_can_disable_swiglu_intermediate_adjustment(monke
 def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
     pytest.importorskip("transformers")
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -315,7 +316,7 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
 
 def test_derive_generator_config_uses_half_depth_for_hf_backbone():
     base_cfg = types.SimpleNamespace(num_hidden_layers=12)
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         generator_num_hidden_layers=None,
     )
@@ -326,7 +327,7 @@ def test_derive_generator_config_uses_half_depth_for_hf_backbone():
 
 def test_derive_generator_config_keeps_third_depth_default_for_non_hf_backbone():
     base_cfg = types.SimpleNamespace(num_hidden_layers=12)
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         generator_num_hidden_layers=None,
     )
@@ -350,7 +351,7 @@ def test_build_backbone_configs_respects_explicit_generator_intermediate_with_sw
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -383,7 +384,7 @@ def test_build_backbone_configs_preserves_explicit_generator_ffn_for_pretrained(
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="disc",
@@ -430,7 +431,7 @@ def test_resolve_backbone_sources_matrix(
     expected_gen_weight_src: str | None,
     expected_gen_derived: bool,
 ):
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type=backbone_type,
         from_scratch=from_scratch,
         pretrained_discriminator_path="disc",
@@ -446,7 +447,7 @@ def test_resolve_backbone_sources_matrix(
 
 
 def test_validate_model_config_rejects_hf_max_position_embeddings_in_pretrained_mode():
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="microsoft/deberta-v3-base",
@@ -459,7 +460,7 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_in_pretrained_
 def test_build_hf_configs_propagates_flash_runtime_policy():
     pytest.importorskip("transformers")
 
-    cfg = ModelConfig(
+    cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         hf={
             "attention_impl": "flash",
@@ -502,7 +503,7 @@ def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
         disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
             model_cfg=cfg.model,
             tokenizer=DummyTokenizer(vocab_size=50265),
-            max_position_embeddings=cfg.data.max_seq_length,
+            max_position_embeddings=cfg.data.packing.max_seq_length,
         )
         assert disc_cfg.hf_attention_impl == "flash", config_path
         assert gen_cfg.hf_attention_impl == "flash", config_path
@@ -535,7 +536,7 @@ def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
 ):
     pytest.importorskip("transformers")
     invalid_cfg = builder_mod._build_repo_hf_deberta_v2_config(
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2")
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2")
     )
     for key, value in updates.items():
         setattr(invalid_cfg, key, value)
@@ -550,7 +551,7 @@ def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
         "from_pretrained",
         classmethod(_fake_from_pretrained),
     )
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="custom-deberta",
@@ -589,7 +590,7 @@ def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritativ
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -669,7 +670,7 @@ def test_build_backbone_configs_rejects_pretrained_config_contract_mismatches(
     else:
         _patch_hf_pretrained_config_loader(monkeypatch, config_overrides=config_overrides)
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type=backbone_type, from_scratch=False, pretrained_discriminator_path=pretrained_path
     )
     with pytest.raises(ValueError, match=error_match):
@@ -703,7 +704,7 @@ def test_build_backbone_configs_applies_explicit_pretrained_rope_overrides(
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",
@@ -802,7 +803,7 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
     if attention_probs_dropout_prob is not _USE_MODEL_DEFAULT:
         model_kwargs["attention_probs_dropout_prob"] = attention_probs_dropout_prob
 
-    model_cfg = ModelConfig(**model_kwargs)
+    model_cfg = make_model_config(**model_kwargs)
     tokenizer_vocab = 128100 if not from_scratch else 50265
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
@@ -835,7 +836,7 @@ def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
 ):
     pytest.importorskip("transformers")
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=True,
         hf_model_size=hf_model_size,
@@ -890,7 +891,7 @@ def test_build_backbone_configs_hf_deberta_rejects_explicit_generator_z_steps_fo
         classmethod(_fake_hf_cfg_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=True,
         hf_model_size="xsmall",
@@ -908,7 +909,7 @@ def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():
     pytest.importorskip("transformers")
 
     tokenizer = DummyTokenizer(vocab_size=500)
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         tokenizer_allow_vocab_resize=True,
@@ -929,7 +930,7 @@ def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():
 def test_build_backbone_configs_scratch_rejects_vocab_growth_without_resize_permission():
     pytest.importorskip("transformers")
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         tokenizer_allow_vocab_resize=False,
@@ -950,7 +951,7 @@ def test_build_backbone_configs_pretrained_hf_can_auto_grow_tokenizer_to_config_
     _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"vocab_size": 512})
 
     tokenizer = DummyTokenizer(vocab_size=500)
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="disc",
@@ -973,7 +974,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
     pytest.importorskip("transformers")
     _patch_hf_pretrained_config_loader(monkeypatch, config_overrides={"vocab_size": 500})
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="disc",
@@ -1001,7 +1002,7 @@ def test_build_backbones_uses_resolved_rope_weight_sources(monkeypatch: pytest.M
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1030,7 +1031,7 @@ def test_build_backbones_uses_discriminator_fallback_for_derived_pretrained_rope
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1059,7 +1060,7 @@ def test_build_backbones_uses_resolved_hf_weight_sources(monkeypatch: pytest.Mon
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1104,7 +1105,7 @@ def test_build_backbones_pretrained_hf_does_not_fetch_external_config(monkeypatc
         classmethod(_raise_cfg_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1122,7 +1123,7 @@ def test_build_backbones_hf_from_scratch_uses_native_implementation():
     pytest.importorskip("transformers")
     from transformers import DebertaV2Config
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=True,
         pretrained_discriminator_path="disc",
@@ -1167,7 +1168,7 @@ def test_build_backbones_uses_discriminator_fallback_for_derived_pretrained_hf(
         classmethod(_fake_from_pretrained),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1198,7 +1199,7 @@ def test_build_backbones_pretrained_rope_can_skip_pretrained_weight_loading(
         classmethod(_raise_if_called),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1250,7 +1251,7 @@ def test_build_backbones_pretrained_hf_can_skip_pretrained_weight_loading(
         classmethod(_raise_if_called),
     )
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
         pretrained_discriminator_path="disc_weights",
@@ -1307,7 +1308,7 @@ def test_native_deberta_v2_model_honors_config_z_steps():
 def test_build_backbone_configs_rejects_invalid_model_options_early():
     pytest.importorskip("transformers")
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
         norm_arch="not-valid",
@@ -1321,7 +1322,7 @@ def test_build_backbone_configs_rejects_invalid_model_options_early():
 
 
 def test_build_backbone_configs_rejects_hf_deberta_sources_for_pretrained_rope():
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="microsoft/deberta-v3-base",
@@ -1338,7 +1339,7 @@ def test_build_backbone_configs_sets_tokenizer_special_ids_for_hf_configs():
     pytest.importorskip("transformers")
     tokenizer = DummyTokenizer(vocab_size=128)
 
-    model_cfg = ModelConfig(backbone_type="hf_deberta_v2", from_scratch=True)
+    model_cfg = make_model_config(backbone_type="hf_deberta_v2", from_scratch=True)
     disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=tokenizer,
@@ -1387,7 +1388,7 @@ def test_build_backbone_configs_preserves_pretrained_rope_architecture_by_defaul
     )
     tokenizer = DummyTokenizer(vocab_size=32000)
 
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
         pretrained_discriminator_path="local-rope-disc",

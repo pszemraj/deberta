@@ -3,7 +3,8 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
-from deberta.config import DataConfig, ModelConfig, TrainConfig
+from _config_factories import make_data_config, make_model_config, make_train_config
+
 from deberta.modeling.export_utils import write_export_readme_and_license
 
 
@@ -13,9 +14,9 @@ def test_write_export_readme_rope_usage_warns_auto_model_limitation(tmp_path: Pa
 
     write_export_readme_and_license(
         out_dir,
-        model_cfg=ModelConfig(backbone_type="rope"),
-        data_cfg=DataConfig(max_seq_length=777),
-        train_cfg=TrainConfig(max_steps=100),
+        model_cfg=make_model_config(backbone_type="rope"),
+        data_cfg=make_data_config(max_seq_length=777),
+        train_cfg=make_train_config(max_steps=100),
         embedding_sharing="gdes",
     )
 
@@ -33,9 +34,9 @@ def test_write_export_readme_hf_uses_auto_model_snippet(tmp_path: Path) -> None:
 
     write_export_readme_and_license(
         out_dir,
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
-        data_cfg=DataConfig(max_seq_length=333),
-        train_cfg=TrainConfig(max_steps=100),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
+        data_cfg=make_data_config(max_seq_length=333),
+        train_cfg=make_train_config(max_steps=100),
         embedding_sharing="gdes",
     )
 
@@ -59,10 +60,10 @@ def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_pa
 
     write_export_readme_and_license(
         out_dir,
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2", hf_model_size="small"),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2", hf_model_size="small"),
         export_config=export_cfg,
         data_cfg=None,
-        train_cfg=TrainConfig(max_steps=100),
+        train_cfg=make_train_config(max_steps=100),
         embedding_sharing="gdes",
     )
 

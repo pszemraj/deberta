@@ -16,6 +16,13 @@ from typing import Any
 
 import pytest
 import torch
+from _config_factories import (
+    make_data_config,
+    make_logging_config,
+    make_model_config,
+    make_optim_config,
+    make_train_config,
+)
 from _fakes import (
     DummyTokenizer,
     FakeAccelerator,

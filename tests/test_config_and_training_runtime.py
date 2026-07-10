@@ -53,7 +53,7 @@ def test_cycle_dataloader_honors_start_epoch_offset():
 
 
 def test_resolve_data_resume_policy_auto_replays_when_small():
-    cfg = TrainConfig(resume_data_strategy="auto", resume_replay_max_micro_batches=100)
+    cfg = make_train_config(resume_data_strategy="auto", resume_replay_max_micro_batches=100)
     start_epoch, do_replay, reason = _resolve_data_resume_policy(
         train_cfg=cfg,
         consumed_micro_batches=42,
@@ -65,7 +65,7 @@ def test_resolve_data_resume_policy_auto_replays_when_small():
 
 
 def test_resolve_data_resume_policy_auto_restarts_epoch_when_large():
-    cfg = TrainConfig(resume_data_strategy="auto", resume_replay_max_micro_batches=10)
+    cfg = make_train_config(resume_data_strategy="auto", resume_replay_max_micro_batches=10)
     start_epoch, do_replay, reason = _resolve_data_resume_policy(
         train_cfg=cfg,
         consumed_micro_batches=42,
@@ -77,7 +77,7 @@ def test_resolve_data_resume_policy_auto_restarts_epoch_when_large():
 
 
 def test_resolve_data_resume_policy_respects_explicit_strategy():
-    replay_cfg = TrainConfig(resume_data_strategy="replay", resume_replay_max_micro_batches=0)
+    replay_cfg = make_train_config(resume_data_strategy="replay", resume_replay_max_micro_batches=0)
     start_epoch_replay, do_replay_replay, _ = _resolve_data_resume_policy(
         train_cfg=replay_cfg,
         consumed_micro_batches=999,
@@ -86,7 +86,9 @@ def test_resolve_data_resume_policy_respects_explicit_strategy():
     assert start_epoch_replay == 0
     assert do_replay_replay is True
 
-    restart_cfg = TrainConfig(resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=1_000_000)
+    restart_cfg = make_train_config(
+        resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=1_000_000
+    )
     start_epoch_restart, do_replay_restart, _ = _resolve_data_resume_policy(
         train_cfg=restart_cfg,
         consumed_micro_batches=12,
@@ -280,7 +282,7 @@ def test_build_optimizer_supports_branch_specific_lrs(
     lr = {"base": 1.0e-3, "generator": 5.0e-4}
     if discriminator_lr is not None:
         lr["discriminator"] = float(discriminator_lr)
-    cfg = OptimConfig(lr=lr, weight_decay=0.1)
+    cfg = make_optim_config(lr=lr, weight_decay=0.1)
     opt = _build_optimizer(model, cfg)
 
     lrs = {float(g["lr"]) for g in opt.param_groups}
@@ -293,7 +295,7 @@ def test_build_optimizer_supports_branch_specific_lrs(
 
 def test_build_decoupled_optimizers_support_discriminator_specific_lr():
     model = TinyRTDLikeModel()
-    cfg = OptimConfig(
+    cfg = make_optim_config(
         lr={"base": 1.0e-3, "generator": 5.0e-4, "discriminator": 2.0e-4},
         weight_decay=0.1,
     )
@@ -311,7 +313,7 @@ def test_build_optimizer_keeps_fused_in_bf16_mode(monkeypatch: pytest.MonkeyPatc
     import deberta.training.runtime as runtime_mod
 
     model = TinyRTDLikeModel()
-    cfg = OptimConfig()
+    cfg = make_optim_config()
 
     monkeypatch.setattr(runtime_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
     opt = runtime_mod._build_optimizer(
@@ -325,7 +327,7 @@ def test_build_optimizer_keeps_fused_in_bf16_mode(monkeypatch: pytest.MonkeyPatc
 
 def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
     model = TinyRTDLikeModel()
-    cfg = OptimConfig(adam={"epsilon": 1e-8})
+    cfg = make_optim_config(adam={"epsilon": 1e-8})
 
     opt = _build_optimizer(model, cfg, mixed_precision="bf16")
     assert float(opt.defaults["eps"]) == pytest.approx(1e-6)
@@ -336,20 +338,20 @@ def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
 
 def test_config_defaults():
     """Key config defaults match design requirements."""
-    train = TrainConfig()
+    train = make_train_config()
     assert train.mixed_precision == "bf16"
     assert train.sdpa_kernel == "auto"
     assert train.token_weighted_gradient_accumulation is True
 
-    model = ModelConfig()
-    assert model.hidden_dropout_prob == pytest.approx(0.0)
-    assert model.attention_probs_dropout_prob == pytest.approx(0.0)
-    assert model.hf_model_size == "base"
-    assert model.ffn_type == "mlp"
-    assert model.swiglu_adjust_intermediate is True
+    model = make_model_config()
+    assert model.dropout.hidden_prob == pytest.approx(0.0)
+    assert model.dropout.attention_probs_prob == pytest.approx(0.0)
+    assert model.hf.model_size == "base"
+    assert model.rope.ffn_type == "mlp"
+    assert model.rope.swiglu_adjust_intermediate is True
 
-    data = DataConfig()
-    assert data.block_cross_document_attention is False
+    data = make_data_config()
+    assert data.packing.block_cross_document_attention is False
 
 
 @pytest.mark.parametrize(
@@ -370,49 +372,49 @@ def test_config_defaults():
     ],
 )
 def test_validate_train_config_accepts_mixed_precision_aliases(raw: str, expected: str):
-    cfg = TrainConfig(mixed_precision=raw)
+    cfg = make_train_config(mixed_precision=raw)
     validate_train_config(cfg)
     assert cfg.mixed_precision == expected
 
 
 def test_validate_train_config_rejects_invalid_mixed_precision():
-    cfg = TrainConfig(mixed_precision="fp16")
+    cfg = make_train_config(mixed_precision="fp16")
     with pytest.raises(ValueError, match="train.mixed_precision must be one of: bf16\\|no"):
         validate_train_config(cfg)
 
 
 def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
-    cfg = TrainConfig(
+    cfg = make_train_config(
         torch_compile=True,
         torch_compile_scope="generator_ffn",
         torch_compile_backend="aot-eager",
     )
     validate_train_config(cfg)
-    assert cfg.torch_compile_scope == "gen_ffn"
-    assert cfg.torch_compile_backend == "aot_eager"
+    assert cfg.compile.scope == "gen_ffn"
+    assert cfg.compile.backend == "aot_eager"
 
 
 def test_validate_train_config_normalizes_wandb_watch_aliases():
-    cfg = LoggingConfig(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
+    cfg = make_logging_config(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
     validate_logging_config(cfg)
     assert cfg.wandb.watch == "parameters"
     assert cfg.wandb.watch_log_freq == 25
 
 
 def test_validate_train_config_rejects_invalid_wandb_watch_mode():
-    cfg = LoggingConfig(wandb_watch="histogram")
+    cfg = make_logging_config(wandb_watch="histogram")
     with pytest.raises(ValueError, match="logging.wandb.watch must be one of"):
         validate_logging_config(cfg)
 
 
 def test_validate_train_config_rejects_non_positive_wandb_watch_log_freq():
-    cfg = LoggingConfig(wandb_watch_log_freq=0)
+    cfg = make_logging_config(wandb_watch_log_freq=0)
     with pytest.raises(ValueError, match="logging.wandb.watch_log_freq must be >= 1"):
         validate_logging_config(cfg)
 
 
 def test_validate_train_config_accepts_resume_data_strategy_values():
-    cfg = TrainConfig(
+    cfg = make_train_config(
         checkpoint={"resume_data_strategy": "restart_epoch", "resume_replay_max_micro_batches": 123}
     )
     validate_train_config(cfg)
@@ -421,13 +423,13 @@ def test_validate_train_config_accepts_resume_data_strategy_values():
 
 
 def test_validate_train_config_rejects_invalid_resume_data_strategy():
-    cfg = TrainConfig(checkpoint={"resume_data_strategy": "fast"})
+    cfg = make_train_config(checkpoint={"resume_data_strategy": "fast"})
     with pytest.raises(ValueError, match="train.checkpoint.resume_data_strategy must be one of"):
         validate_train_config(cfg)
 
 
 def test_validate_train_config_rejects_negative_resume_replay_threshold():
-    cfg = TrainConfig(checkpoint={"resume_replay_max_micro_batches": -1})
+    cfg = make_train_config(checkpoint={"resume_replay_max_micro_batches": -1})
     with pytest.raises(ValueError, match="train.checkpoint.resume_replay_max_micro_batches must be >= 0"):
         validate_train_config(cfg)
 
@@ -517,7 +519,7 @@ def test_scale_loss_for_backward_cancels_accelerate_ga_division_for_token_weight
 
 def test_build_training_collator_propagates_packed_sequences_flag():
     tokenizer = DummyTokenizer(vocab_size=64)
-    train_cfg = TrainConfig(mlm_probability=0.2, mlm_max_ngram=2)
+    train_cfg = make_train_config(mlm_probability=0.2, mlm_max_ngram=2)
     collator = _build_training_collator(
         tokenizer=tokenizer,
         train_cfg=train_cfg,
@@ -928,7 +930,7 @@ def _weight_decay_for_param(opt: torch.optim.Optimizer, param: torch.nn.Paramete
 
 
 def test_build_optimizer_marks_scalar_params_as_no_decay():
-    optim_cfg = OptimConfig()
+    optim_cfg = make_optim_config()
 
     class _RegressionModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -950,7 +952,7 @@ def test_build_optimizer_marks_scalar_params_as_no_decay():
 
 
 def test_build_optimizer_applies_decay_to_high_rank_bias_parameters():
-    optim_cfg = OptimConfig()
+    optim_cfg = make_optim_config()
 
     class _BiasMatrixModule(torch.nn.Module):
         def __init__(self) -> None:
@@ -1185,14 +1187,14 @@ def test_stabilize_compile_attention_mask_rope_doc_blocking():
 def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking():
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
     )
     assert scope == "backbones"
     assert reason is None
 
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
-        model_cfg=ModelConfig(backbone_type="rope"),
+        model_cfg=make_model_config(backbone_type="rope"),
     )
     assert scope == "backbones"
     assert reason is None
@@ -1200,7 +1202,7 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
     # RoPE + doc-blocking auto-downgrades to FFN to avoid mask shape churn.
     scope, reason = _resolve_compile_scope(
         requested_scope="auto",
-        model_cfg=ModelConfig(backbone_type="rope"),
+        model_cfg=make_model_config(backbone_type="rope"),
         block_cross_document_attention=True,
     )
     assert scope == "ffn"
@@ -1208,7 +1210,7 @@ def test_resolve_compile_scope_auto_prefers_backbones_except_rope_doc_blocking()
 
     scope, reason = _resolve_compile_scope(
         requested_scope="backbones",
-        model_cfg=ModelConfig(backbone_type="hf_deberta_v2"),
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
     )
     assert scope == "backbones"
     assert reason is None

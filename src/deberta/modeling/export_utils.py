@@ -82,12 +82,13 @@ def write_export_readme_and_license(
 
     backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
     runtime_cfg = export_config if export_config is not None else model_cfg
-    hidden = _first_int_attr(runtime_cfg, model_cfg, attr="hidden_size")
-    layers = _first_int_attr(runtime_cfg, model_cfg, attr="num_hidden_layers")
-    heads = _first_int_attr(runtime_cfg, model_cfg, attr="num_attention_heads")
-    seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
+    configured_arch = model_cfg.rope if backbone == "rope" else None
+    hidden = _first_int_attr(runtime_cfg, configured_arch, attr="hidden_size")
+    layers = _first_int_attr(runtime_cfg, configured_arch, attr="num_hidden_layers")
+    heads = _first_int_attr(runtime_cfg, configured_arch, attr="num_attention_heads")
+    seq_len = int(data_cfg.packing.max_seq_length if data_cfg is not None else 0)
     if seq_len == 0:
-        seq_len = _first_int_attr(runtime_cfg, model_cfg, attr="max_position_embeddings")
+        seq_len = _first_int_attr(runtime_cfg, configured_arch, attr="max_position_embeddings")
     steps = int(getattr(train_cfg, "max_steps", 0) or 0)
 
     if backbone == "rope":

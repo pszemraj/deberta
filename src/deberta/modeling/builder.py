@@ -471,14 +471,14 @@ def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
             default_gen_layers = max(1, disc_layers // 2)
         else:
             default_gen_layers = max(1, disc_layers // 3)
-        gen_cfg.num_hidden_layers = int(model_cfg.generator_num_hidden_layers or default_gen_layers)
+        gen_cfg.num_hidden_layers = int(model_cfg.generator.num_hidden_layers or default_gen_layers)
 
-    if model_cfg.generator_hidden_size is not None:
-        gen_cfg.hidden_size = int(model_cfg.generator_hidden_size)
-    if model_cfg.generator_intermediate_size is not None:
-        gen_cfg.intermediate_size = int(model_cfg.generator_intermediate_size)
-    if model_cfg.generator_num_attention_heads is not None:
-        gen_cfg.num_attention_heads = int(model_cfg.generator_num_attention_heads)
+    if model_cfg.generator.hidden_size is not None:
+        gen_cfg.hidden_size = int(model_cfg.generator.hidden_size)
+    if model_cfg.generator.intermediate_size is not None:
+        gen_cfg.intermediate_size = int(model_cfg.generator.intermediate_size)
+    if model_cfg.generator.num_attention_heads is not None:
+        gen_cfg.num_attention_heads = int(model_cfg.generator.num_attention_heads)
 
     # Sanity
     if getattr(gen_cfg, "hidden_size", None) and getattr(gen_cfg, "num_attention_heads", None):
@@ -497,10 +497,10 @@ def _apply_dropout_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     """
-    if model_cfg.hidden_dropout_prob is not None:
-        cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
-    if model_cfg.attention_probs_dropout_prob is not None:
-        cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
+    if model_cfg.dropout.hidden_prob is not None:
+        cfg.hidden_dropout_prob = float(model_cfg.dropout.hidden_prob)
+    if model_cfg.dropout.attention_probs_prob is not None:
+        cfg.attention_probs_dropout_prob = float(model_cfg.dropout.attention_probs_prob)
 
 
 def _apply_rope_runtime_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
@@ -509,7 +509,7 @@ def _apply_rope_runtime_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     """
-    cfg.attention_implementation = str(model_cfg.attention_implementation)
+    cfg.attention_implementation = str(model_cfg.rope.attention_implementation)
     cfg.use_rmsnorm_heads = True
     _apply_dropout_overrides(cfg, model_cfg)
 
@@ -531,24 +531,26 @@ def _apply_rope_scratch_arch_overrides(
     :param bool adjust_swiglu_intermediate: Whether to apply 2/3 intermediate-size scaling for SwiGLU.
     """
     if include_arch_from_model_cfg:
-        cfg.hidden_size = int(model_cfg.hidden_size)
-        cfg.num_hidden_layers = int(model_cfg.num_hidden_layers)
-        cfg.num_attention_heads = int(model_cfg.num_attention_heads)
-        cfg.intermediate_size = int(model_cfg.intermediate_size)
-        cfg.hidden_act = str(model_cfg.hidden_act)
+        cfg.hidden_size = int(model_cfg.rope.hidden_size)
+        cfg.num_hidden_layers = int(model_cfg.rope.num_hidden_layers)
+        cfg.num_attention_heads = int(model_cfg.rope.num_attention_heads)
+        cfg.intermediate_size = int(model_cfg.rope.intermediate_size)
+        cfg.hidden_act = str(model_cfg.rope.hidden_act)
 
-    cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
-    cfg.rope_theta = float(model_cfg.rope_theta)
-    cfg.rotary_pct = float(model_cfg.rotary_pct)
-    cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
-    cfg.type_vocab_size = int(model_cfg.type_vocab_size)
-    cfg.norm_eps = float(model_cfg.norm_eps)
-    cfg.norm_arch = str(model_cfg.norm_arch)
-    cfg.keel_alpha_init = float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
-    cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
-    cfg.ffn_type = str(model_cfg.ffn_type)
-    cfg.use_bias = bool(model_cfg.use_bias)
-    cfg.initializer_range = float(model_cfg.initializer_range)
+    cfg.max_position_embeddings = int(model_cfg.rope.max_position_embeddings or max_position_embeddings)
+    cfg.rope_theta = float(model_cfg.rope.rope_theta)
+    cfg.rotary_pct = float(model_cfg.rope.rotary_pct)
+    cfg.use_absolute_position_embeddings = bool(model_cfg.rope.use_absolute_position_embeddings)
+    cfg.type_vocab_size = int(model_cfg.rope.type_vocab_size)
+    cfg.norm_eps = float(model_cfg.rope.norm_eps)
+    cfg.norm_arch = str(model_cfg.rope.norm_arch)
+    cfg.keel_alpha_init = (
+        float(model_cfg.rope.keel_alpha_init) if model_cfg.rope.keel_alpha_init is not None else None
+    )
+    cfg.keel_alpha_learnable = bool(model_cfg.rope.keel_alpha_learnable)
+    cfg.ffn_type = str(model_cfg.rope.ffn_type)
+    cfg.use_bias = bool(model_cfg.rope.use_bias)
+    cfg.initializer_range = float(model_cfg.rope.initializer_range)
 
     if adjust_swiglu_intermediate:
         curr_intermediate = int(cfg.intermediate_size)
@@ -556,18 +558,18 @@ def _apply_rope_scratch_arch_overrides(
 
 
 _PRETRAINED_OVERRIDE_MAP: tuple[tuple[str, str, type], ...] = (
-    ("pretrained_max_position_embeddings", "max_position_embeddings", int),
-    ("pretrained_rope_theta", "rope_theta", float),
-    ("pretrained_rotary_pct", "rotary_pct", float),
-    ("pretrained_use_absolute_position_embeddings", "use_absolute_position_embeddings", bool),
-    ("pretrained_type_vocab_size", "type_vocab_size", int),
-    ("pretrained_norm_arch", "norm_arch", str),
-    ("pretrained_norm_eps", "norm_eps", float),
-    ("pretrained_keel_alpha_init", "keel_alpha_init", float),
-    ("pretrained_keel_alpha_learnable", "keel_alpha_learnable", bool),
-    ("pretrained_ffn_type", "ffn_type", str),
-    ("pretrained_use_bias", "use_bias", bool),
-    ("pretrained_initializer_range", "initializer_range", float),
+    ("max_position_embeddings", "max_position_embeddings", int),
+    ("rope_theta", "rope_theta", float),
+    ("rotary_pct", "rotary_pct", float),
+    ("use_absolute_position_embeddings", "use_absolute_position_embeddings", bool),
+    ("type_vocab_size", "type_vocab_size", int),
+    ("norm_arch", "norm_arch", str),
+    ("norm_eps", "norm_eps", float),
+    ("keel_alpha_init", "keel_alpha_init", float),
+    ("keel_alpha_learnable", "keel_alpha_learnable", bool),
+    ("ffn_type", "ffn_type", str),
+    ("use_bias", "use_bias", bool),
+    ("initializer_range", "initializer_range", float),
 )
 
 
@@ -578,7 +580,7 @@ def _apply_rope_pretrained_explicit_overrides(cfg: Any, model_cfg: ModelConfig) 
     :param ModelConfig model_cfg: User model configuration.
     """
     for src_attr, dst_attr, cast in _PRETRAINED_OVERRIDE_MAP:
-        val = getattr(model_cfg, src_attr, None)
+        val = getattr(model_cfg.rope.pretrained, src_attr)
         if val is not None:
             setattr(cfg, dst_attr, cast(val))
 
@@ -767,8 +769,8 @@ def _apply_rope_config_normalization(
     """
     if model_cfg.from_scratch:
         if explicit_source:
-            if model_cfg.max_position_embeddings is not None:
-                cfg.max_position_embeddings = int(model_cfg.max_position_embeddings)
+            if model_cfg.rope.max_position_embeddings is not None:
+                cfg.max_position_embeddings = int(model_cfg.rope.max_position_embeddings)
             else:
                 cfg_max = getattr(cfg, "max_position_embeddings", None)
                 if cfg_max is None:
@@ -778,8 +780,8 @@ def _apply_rope_config_normalization(
             pass
         else:
             should_adjust_swiglu = bool(
-                str(model_cfg.ffn_type).strip().lower() == "swiglu"
-                and bool(model_cfg.swiglu_adjust_intermediate)
+                str(model_cfg.rope.ffn_type).strip().lower() == "swiglu"
+                and bool(model_cfg.rope.swiglu_adjust_intermediate)
             )
             _apply_rope_scratch_arch_overrides(
                 cfg,
@@ -897,11 +899,11 @@ def build_backbone_configs(
     # RoPE backbone
     if resolved.discriminator.config_source is None:
         disc_cfg = DebertaRoPEConfig(
-            hidden_size=model_cfg.hidden_size,
-            num_hidden_layers=model_cfg.num_hidden_layers,
-            num_attention_heads=model_cfg.num_attention_heads,
-            intermediate_size=model_cfg.intermediate_size,
-            hidden_act=model_cfg.hidden_act,
+            hidden_size=model_cfg.rope.hidden_size,
+            num_hidden_layers=model_cfg.rope.num_hidden_layers,
+            num_attention_heads=model_cfg.rope.num_attention_heads,
+            intermediate_size=model_cfg.rope.intermediate_size,
+            hidden_act=model_cfg.rope.hidden_act,
         )
     else:
         disc_cfg = DebertaRoPEConfig.from_pretrained(resolved.discriminator.config_source)

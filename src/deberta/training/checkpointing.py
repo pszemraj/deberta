@@ -32,8 +32,8 @@ def _resolve_data_resume_policy(
     if consumed <= 0:
         return 0, False, "fresh-start"
 
-    strategy = str(getattr(train_cfg, "resume_data_strategy", "auto") or "auto").strip().lower()
-    max_replay = max(0, int(getattr(train_cfg, "resume_replay_max_micro_batches", 10_000) or 10_000))
+    strategy = str(train_cfg.checkpoint.resume_data_strategy or "auto").strip().lower()
+    max_replay = max(0, int(train_cfg.checkpoint.resume_replay_max_micro_batches))
 
     if strategy == "replay":
         return 0, True, "resume_data_strategy=replay"
