@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 from deberta.config import (
+    ModelConfig,
+    OptimConfig,
+    TrainConfig,
     load_config,
     validate_data_config,
     validate_model_config,
@@ -13,6 +16,8 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_load_yaml_nested(tmp_path: Path):
@@ -104,6 +109,59 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
     assert cfg.model.hf.flash.local_bias_seq_len == 1024
     assert cfg.model.hf.flash.local_bias_max_batch_size == 2
+
+
+def test_config_reference_loads() -> None:
+    cfg = load_config(REPO_ROOT / "configs" / "config-reference.yaml")
+    assert cfg.model.backbone_type == "hf_deberta_v2"
+    assert cfg.data.source.dataset_name == "HuggingFaceFW/fineweb-edu"
+
+
+@pytest.mark.parametrize(
+    ("cfg", "match"),
+    [
+        (ModelConfig(generator={"hidden_size": 0}), "model.generator.hidden_size"),
+        (ModelConfig(rope={"rope_theta": 0.0}), "model.rope.rope_theta"),
+        (ModelConfig(dropout={"hidden_prob": 1.1}), "model.dropout.hidden_prob"),
+        (
+            ModelConfig(
+                hf={"attention_impl": "flash"},
+                dropout={"hidden_prob": None, "attention_probs_prob": 0.0},
+            ),
+            "explicitly set to 0.0",
+        ),
+    ],
+)
+def test_model_constraints_fail_during_validation(cfg: ModelConfig, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_model_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("cfg", "match"),
+    [
+        (TrainConfig(objective={"gen_loss_weight": -1.0}), "loss weights"),
+        (
+            TrainConfig(objective={"gen_loss_weight": 0.0, "disc_loss_weight": 0.0}),
+            "At least one",
+        ),
+    ],
+)
+def test_train_constraints_fail_during_validation(cfg: TrainConfig, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_train_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("cfg", "match"),
+    [
+        (OptimConfig(adam={"beta1": 1.0}), "optim.adam.beta1"),
+        (OptimConfig(adam={"epsilon": 0.0}), "optim.adam.epsilon"),
+    ],
+)
+def test_optim_constraints_fail_during_validation(cfg: OptimConfig, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_optim_config(cfg)
 
 
 def test_load_yaml_resolves_variables(tmp_path: Path):

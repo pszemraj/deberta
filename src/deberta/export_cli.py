@@ -661,22 +661,3 @@ def run_export(cfg: ExportConfig) -> None:
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
 
-
-def main(argv: list[str] | None = None) -> None:
-    """Run checkpoint export CLI.
-
-    :param list[str] | None argv: Optional CLI argv (excluding program name).
-    """
-    parser = argparse.ArgumentParser(
-        prog="deberta export",
-        description="Consolidate a training checkpoint and export standalone HF artifacts.",
-        formatter_class=ExportArgumentDefaultsHelpFormatter,
-    )
-    add_export_arguments(parser)
-    args = parser.parse_args(argv)
-    cfg = namespace_to_export_config(args)
-    run_export(cfg)
-
-
-if __name__ == "__main__":
-    main()

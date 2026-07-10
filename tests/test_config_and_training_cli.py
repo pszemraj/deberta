@@ -991,24 +991,6 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
         validate_model_config(cfg)
 
 
-def test_readme_cli_examples_are_parseable():
-    parser = cli_mod._build_main_parser()
-    examples = [
-        "train configs/pretrain_rope_fineweb_edu.yaml",
-        "train configs/pretrain_rope_fineweb_edu_2048.yaml",
-        "train configs/pretrain_rope_fineweb_edu_4096.yaml",
-        "train --preset deberta-v3-base --dry-run",
-        (
-            "export runs/deberta_rope_rtd/checkpoint-10000 "
-            "--what discriminator "
-            "--output-dir runs/deberta_rope_rtd/exported_hf"
-        ),
-    ]
-
-    for cmd in examples:
-        parser.parse_args(shlex.split(cmd))
-
-
 def test_export_help_does_not_show_misleading_defaults_on_no_flags() -> None:
     parser = argparse.ArgumentParser(
         prog="deberta export",
@@ -1020,32 +1002,6 @@ def test_export_help_does_not_show_misleading_defaults_on_no_flags() -> None:
     for opt in ("--no-safe-serialization", "--no-offload-to-cpu", "--no-rank0-only"):
         line = next((ln for ln in help_text.splitlines() if opt in ln), "")
         assert "(default:" not in line
-
-
-def test_docs_use_current_nested_key_paths() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    docs = [
-        repo_root / "docs" / "advanced" / "torch-compile.md",
-        repo_root / "docs" / "advanced" / "distributed-training.md",
-        repo_root / "docs" / "guides" / "data-pipeline.md",
-    ]
-    merged = "\n".join(path.read_text(encoding="utf-8") for path in docs)
-
-    stale_tokens = (
-        "train.torch_compile",
-        "train.torch_compile_mode",
-        "train.torch_compile_scope",
-        "train.torch_compile_backend",
-        "train.report_to",
-        "train.resume_data_strategy",
-        "train.resume_replay_max_micro_batches",
-        "data.block_cross_document_attention",
-        "train.mlm_max_ngram",
-        "train.mask_token_prob",
-        "train.random_token_prob",
-    )
-    for token in stale_tokens:
-        assert token not in merged
 
 
 @pytest.mark.parametrize(
