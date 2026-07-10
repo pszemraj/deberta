@@ -938,11 +938,6 @@ def run_pretraining(
         )
         train_iter = _cycle_dataloader(train_loader, start_epoch=start_epoch)
         token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
-        unwrapped_model = unwrap_compiled_model(accelerator, model)
-        disc_pad_token_id = getattr(getattr(unwrapped_model, "disc_config", None), "pad_token_id", None)
-        if disc_pad_token_id is not None:
-            disc_pad_token_id = int(disc_pad_token_id)
-
         if consumed_micro_batches > 0:
             if int(global_step) >= int(train_cfg.max_steps):
                 logger.info(
@@ -1130,7 +1125,6 @@ def run_pretraining(
                     train_iter=train_iter,
                     ga_steps=ga_steps,
                     token_weighted_ga=token_weighted_ga,
-                    disc_pad_token_id=disc_pad_token_id,
                     default_unweighted_token_count=1.0,
                 )
                 consumed_micro_batches += int(consumed_in_window)
@@ -1572,7 +1566,6 @@ def run_pretraining(
                 train_iter=train_iter,
                 ga_steps=ga_steps,
                 token_weighted_ga=token_weighted_ga,
-                disc_pad_token_id=disc_pad_token_id,
                 default_unweighted_token_count=0.0,
             )
             consumed_micro_batches += int(consumed_in_window)

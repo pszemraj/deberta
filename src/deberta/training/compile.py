@@ -28,10 +28,11 @@ from deberta.modeling.mask_utils import (
     _flash_cfg_optional_int,
     build_doc_block_mask,
     build_doc_segment_metadata,
+    build_validated_prefix_lengths,
     doc_segment_metadata_host_stats,
     is_pairwise_mask,
-    is_prefix_padding_keep_mask,
     mask_to_2d_keep_mask,
+    validate_doc_segments_against_mask,
 )
 
 logger = logging.getLogger(__name__)
@@ -357,13 +358,11 @@ def _flash_active_tokens_host(value: Any) -> int | None:
 
     if value is None:
         return None
-    if isinstance(value, bool | int):
-        return int(value)
-    if isinstance(value, float):
+    if isinstance(value, int) and not isinstance(value, bool):
         return int(value)
     if isinstance(value, torch.Tensor) and value.ndim == 0 and value.device.type == "cpu":
         return int(value)
-    return None
+    raise ValueError("flash_active_tokens must be a Python int or CPU scalar tensor.")
 
 
 def _flash_scalar_tensor(value: Any) -> torch.Tensor | None:
@@ -386,6 +385,40 @@ def _cpu_int_scalar(value: int | None) -> torch.Tensor | None:
     """
 
     return torch.tensor(int(value), dtype=torch.int32) if value is not None else None
+
+
+def _reconcile_host_scalar_int(
+    *,
+    label: str,
+    host_value: int | None,
+    scalar_tensor: torch.Tensor | None,
+    derived_value: int | None,
+    required: bool = False,
+) -> tuple[int | None, torch.Tensor | None]:
+    """Reconcile duplicate integer forms without touching device tensors.
+
+    :param str label: Field label used in errors.
+    :param int | None host_value: Optional Python integer.
+    :param torch.Tensor | None scalar_tensor: Optional CPU scalar tensor.
+    :param int | None derived_value: Optional authoritative CPU-derived value.
+    :param bool required: Whether absence is an error.
+    :raises ValueError: If available values disagree.
+    :raises RuntimeError: If a required value is unavailable.
+    :return tuple[int | None, torch.Tensor | None]: Reconciled host and CPU scalar forms.
+    """
+
+    scalar_value = int(scalar_tensor) if scalar_tensor is not None else None
+    values = [value for value in (derived_value, host_value, scalar_value) if value is not None]
+    if len(set(values)) > 1:
+        raise ValueError(
+            f"{label} values disagree: derived={derived_value}, host={host_value}, scalar={scalar_value}."
+        )
+    resolved = values[0] if values else None
+    if required and resolved is None:
+        raise RuntimeError(
+            f"{label} is missing for a device batch; build and validate it before device transfer."
+        )
+    return resolved, scalar_tensor if scalar_tensor is not None else _cpu_int_scalar(resolved)
 
 
 def _flash_meta_with_route(
@@ -428,35 +461,37 @@ def _flash_existing_seq_lengths(batch: dict[str, Any]) -> torch.Tensor | None:
     """
 
     value = batch.get("flash_seq_lengths")
-    return value if isinstance(value, torch.Tensor) and value.ndim == 1 else None
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor) or value.ndim != 1:
+        raise ValueError("flash_seq_lengths shape disagrees with its required rank-1 contract.")
+    return value
 
 
 def _resolve_flash_seq_lengths_and_active_tokens(
     batch: dict[str, Any],
-    keep_mask: torch.Tensor,
+    seq_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, int | None, torch.Tensor | None]:
-    """Resolve per-example lengths and active-token scalars for one flash batch.
+    """Reconcile active-token counters with authoritative sequence lengths.
 
-    Precomputed batch entries win; otherwise lengths derive from the keep mask
-    and the active-token count falls back through scalar-tensor and host paths.
+    CPU lengths are the validation boundary and must agree with both optional
+    counter forms. Device lengths arrive only after a collator-issued CPU
+    attestation, so their already-validated host/scalar counters are reused
+    without synchronizing the device.
 
     :param dict[str, Any] batch: Batch mapping.
-    :param torch.Tensor keep_mask: Boolean keep mask in ``(B,S)`` layout.
+    :param torch.Tensor seq_lengths: Authoritative per-example lengths.
+    :raises ValueError: If host/scalar counters disagree with each other or CPU lengths.
     :return tuple[torch.Tensor, int | None, torch.Tensor | None]: Sequence
         lengths, host active-token count, and CPU scalar active-token tensor.
     """
 
-    seq_lengths = _flash_existing_seq_lengths(batch)
-    if seq_lengths is None:
-        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
-    active_tokens = _flash_active_tokens_host(batch.get("flash_active_tokens"))
-    active_tokens_scalar = _flash_scalar_tensor(batch.get("flash_active_tokens_scalar"))
-    if active_tokens is None and active_tokens_scalar is not None:
-        active_tokens = int(active_tokens_scalar)
-    if active_tokens is None:
-        active_tokens = _flash_active_tokens_from_seq_lengths(seq_lengths)
-    if active_tokens_scalar is None:
-        active_tokens_scalar = _cpu_int_scalar(active_tokens)
+    active_tokens, active_tokens_scalar = _reconcile_host_scalar_int(
+        label="Flash active-token count",
+        host_value=_flash_active_tokens_host(batch.get("flash_active_tokens")),
+        scalar_tensor=_flash_scalar_tensor(batch.get("flash_active_tokens_scalar")),
+        derived_value=_flash_active_tokens_from_seq_lengths(seq_lengths),
+    )
     return seq_lengths, active_tokens, active_tokens_scalar
 
 
@@ -469,9 +504,57 @@ def _flash_doc_segment_host_stats(batch: dict[str, Any]) -> tuple[int | None, in
 
     num_segments = batch.get("flash_doc_num_segments")
     max_seqlen = batch.get("flash_doc_max_seqlen")
-    if isinstance(num_segments, bool | int) and isinstance(max_seqlen, bool | int):
+    if num_segments is None and max_seqlen is None:
+        return None, None
+    if (
+        isinstance(num_segments, int)
+        and not isinstance(num_segments, bool)
+        and isinstance(max_seqlen, int)
+        and not isinstance(max_seqlen, bool)
+    ):
         return int(num_segments), int(max_seqlen)
-    return None, None
+    raise ValueError("flash_doc_num_segments and flash_doc_max_seqlen must be supplied together as integers.")
+
+
+def _resolve_flash_doc_segment_stats(
+    batch: dict[str, Any],
+    *,
+    segment_lengths: torch.Tensor,
+    active_tokens: int | None,
+) -> tuple[int, int, torch.Tensor, torch.Tensor]:
+    """Reconcile document segment host/scalar statistics.
+
+    :param dict[str, Any] batch: Batch mapping.
+    :param torch.Tensor segment_lengths: Validated segment lengths.
+    :param int | None active_tokens: Validated active-token count.
+    :raises ValueError: If duplicate host/scalar or CPU-derived values disagree.
+    :raises RuntimeError: If device metadata lacks prevalidated host statistics.
+    :return tuple[int, int, torch.Tensor, torch.Tensor]: Segment count, maximum
+        segment length, and their CPU scalar tensors.
+    """
+
+    host_num, host_max = _flash_doc_segment_host_stats(batch)
+    derived_num, derived_max, _ = doc_segment_metadata_host_stats(
+        segment_lengths,
+        active_tokens=active_tokens,
+    )
+    num_segments, num_scalar = _reconcile_host_scalar_int(
+        label="Flash document segment count",
+        host_value=host_num,
+        scalar_tensor=_flash_scalar_tensor(batch.get("flash_doc_num_segments_scalar")),
+        derived_value=derived_num,
+        required=True,
+    )
+    max_seqlen, max_scalar = _reconcile_host_scalar_int(
+        label="Flash document max segment length",
+        host_value=host_max,
+        scalar_tensor=_flash_scalar_tensor(batch.get("flash_doc_max_seqlen_scalar")),
+        derived_value=derived_max,
+        required=True,
+    )
+    assert num_segments is not None and max_seqlen is not None
+    assert num_scalar is not None and max_scalar is not None
+    return int(num_segments), int(max_seqlen), num_scalar, max_scalar
 
 
 def _pop_flash_doc_segment_host_stats(batch: dict[str, Any]) -> None:
@@ -517,9 +600,29 @@ def _clear_flash_batch_metadata(batch: dict[str, Any]) -> None:
     """
 
     batch.pop("flash_seq_lengths", None)
+    batch.pop("flash_mask_contract", None)
+    batch.pop("flash_mask_contract_validated", None)
     _pop_flash_active_token_stats(batch)
     _pop_flash_doc_segment_tensors(batch)
     _pop_flash_doc_segment_host_stats(batch)
+
+
+def _take_flash_mask_attestation(batch: dict[str, Any]) -> str | None:
+    """Consume a collator-issued mask contract attestation.
+
+    :param dict[str, Any] batch: Batch mapping.
+    :raises ValueError: If an asserted contract is unknown.
+    :return str | None: Validated contract name, or ``None`` when unattested.
+    """
+
+    contract = batch.pop("flash_mask_contract", None)
+    validated = batch.pop("flash_mask_contract_validated", False)
+    if validated is not True:
+        return None
+    normalized = str(contract).strip().lower()
+    if normalized not in {"prefix", "docblock"}:
+        raise ValueError(f"Unknown validated flash mask contract: {contract!r}.")
+    return normalized
 
 
 def prepare_flash_attention_batch_metadata(
@@ -528,6 +631,7 @@ def prepare_flash_attention_batch_metadata(
     backbone_type: str,
     flash_enabled: bool = False,
     flash_cfg: Any | None = None,
+    route_device: torch.device | None = None,
 ) -> tuple[dict[str, Any], FlashBatchMeta | None]:
     """Attach precomputed flash metadata and return an out-of-graph metadata bundle.
 
@@ -540,79 +644,84 @@ def prepare_flash_attention_batch_metadata(
     :param str backbone_type: Backbone type string.
     :param bool flash_enabled: Whether the active backend can consume flash metadata.
     :param Any | None flash_cfg: Optional resolved flash config for route selection.
+    :param torch.device | None route_device: Optional eventual activation device
+        when preparing metadata before transfer.
     :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
     """
-
-    btype = str(backbone_type).strip().lower()
-    if btype != "hf_deberta_v2":
-        doc_ids = batch.pop("doc_ids", None)
-        if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
-            batch["attention_mask"] = build_doc_block_mask(doc_ids)
-        _clear_flash_batch_metadata(batch)
-        return batch, None
 
     input_ids = batch.get("input_ids")
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
         _clear_flash_batch_metadata(batch)
         return batch, None
 
+    btype = str(backbone_type).strip().lower()
+    seq_len = int(input_ids.shape[-1])
+    batch_size = int(input_ids.shape[0])
+    validated_contract = _take_flash_mask_attestation(batch)
+    routing_device = route_device if route_device is not None else input_ids.device
     flash_enabled = bool(flash_enabled)
-    if flash_enabled:
+    if flash_enabled and btype == "hf_deberta_v2":
         _configure_flash_kernel_overrides_from_cfg(flash_cfg)
-        _notice_untuned_flash_hardware_once(input_ids.device)
+        _notice_untuned_flash_hardware_once(routing_device)
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
-        if not flash_enabled:
+        if doc_ids.shape != input_ids.shape:
+            raise ValueError(
+                "doc_ids must match input_ids shape; "
+                f"got doc_ids={tuple(doc_ids.shape)}, input_ids={tuple(input_ids.shape)}."
+            )
+        source_attention_mask = batch.get("attention_mask")
+        if validated_contract is not None:
+            if validated_contract != "docblock":
+                raise ValueError(f"Packed document batch carried mask_contract={validated_contract!r}.")
+            keep_mask = doc_ids.ne(0)
+        else:
+            if doc_ids.device.type != "cpu":
+                raise RuntimeError(
+                    "Unvalidated document metadata reached a device batch. Validate it on CPU "
+                    "before device transfer."
+                )
+            if source_attention_mask is None:
+                keep_mask = torch.ones_like(doc_ids, dtype=torch.bool)
+            elif isinstance(source_attention_mask, torch.Tensor):
+                keep_mask = mask_to_2d_keep_mask(source_attention_mask, seq_len=seq_len)
+            else:
+                raise TypeError("Packed attention_mask must be a tensor or None.")
+            if not torch.equal(doc_ids.ne(0), keep_mask):
+                raise ValueError("doc_ids liveness disagrees with attention_mask.")
+
+        if btype != "hf_deberta_v2" or not flash_enabled:
             batch["attention_mask"] = build_doc_block_mask(doc_ids)
             _clear_flash_batch_metadata(batch)
             return batch, None
         route_hint = _flash_route_hint_for_docblock_batch(
-            seq_len=int(input_ids.shape[-1]),
-            batch_size=int(input_ids.shape[0]),
+            seq_len=seq_len,
+            batch_size=batch_size,
             flash_cfg=flash_cfg,
-            device=input_ids.device,
+            device=routing_device,
         )
         _notice_docblock_route_once(
             route_hint=route_hint,
-            seq_len=int(input_ids.shape[-1]),
-            batch_size=int(input_ids.shape[0]),
-            device=input_ids.device,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            device=routing_device,
             flash_cfg=flash_cfg,
         )
-        keep_mask = doc_ids.ne(0)
-        # These lengths skip the is_prefix_padding_keep_mask proof the
-        # FlashBatchMeta.seq_lengths contract asks producers for: the
-        # doc-block routes never read seq_lengths (they use segment
-        # descriptors or the pairwise mask). Do not start trusting them for
-        # doc-block batches without adding that proof here.
-        seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
-            batch, keep_mask
-        )
-        batch["flash_seq_lengths"] = seq_lengths
-        if active_tokens is not None:
-            batch["flash_active_tokens"] = int(active_tokens)
-        else:
-            batch.pop("flash_active_tokens", None)
-        if active_tokens_scalar is not None:
-            batch["flash_active_tokens_scalar"] = active_tokens_scalar
-        else:
-            batch.pop("flash_active_tokens_scalar", None)
-        if route_hint == "docblock_bias":
-            batch["attention_mask"] = build_doc_block_mask(doc_ids)
-            _pop_flash_doc_segment_tensors(batch)
-            _pop_flash_doc_segment_host_stats(batch)
-            meta = FlashBatchMeta(
-                seq_lengths=seq_lengths,
-                active_tokens_host=active_tokens,
-                active_tokens_scalar=active_tokens_scalar,
-                route_hint=route_hint,
-            )
-            return batch, meta
-        batch["attention_mask"] = keep_mask
+
         segment_offsets = batch.get("flash_doc_segment_offsets")
         segment_lengths = batch.get("flash_doc_segment_lengths")
         cu_seqlens = batch.get("flash_doc_cu_seqlens")
+        supplied_segment_fields = (
+            segment_offsets is not None,
+            segment_lengths is not None,
+            cu_seqlens is not None,
+        )
+        if any(supplied_segment_fields) and not all(supplied_segment_fields):
+            raise ValueError(
+                "flash_doc_segment_offsets, flash_doc_segment_lengths, and "
+                "flash_doc_cu_seqlens must be supplied together."
+            )
         if not (
             isinstance(segment_offsets, torch.Tensor)
             and isinstance(segment_lengths, torch.Tensor)
@@ -624,105 +733,160 @@ def prepare_flash_attention_batch_metadata(
                     "Build flash_doc_segment_* metadata in the collator before device transfer."
                 )
             segment_offsets, segment_lengths, cu_seqlens, _ = build_doc_segment_metadata(doc_ids)
-        doc_num_segments, doc_max_seqlen = _flash_doc_segment_host_stats(batch)
-        doc_num_segments_scalar = _flash_scalar_tensor(batch.get("flash_doc_num_segments_scalar"))
-        doc_max_seqlen_scalar = _flash_scalar_tensor(batch.get("flash_doc_max_seqlen_scalar"))
-        if doc_num_segments is None and doc_num_segments_scalar is not None:
-            doc_num_segments = int(doc_num_segments_scalar)
-        if doc_max_seqlen is None and doc_max_seqlen_scalar is not None:
-            doc_max_seqlen = int(doc_max_seqlen_scalar)
-        if doc_num_segments is None or doc_max_seqlen is None:
-            doc_num_segments, doc_max_seqlen, _ = doc_segment_metadata_host_stats(
-                segment_lengths,
-                active_tokens=active_tokens,
+        if (
+            segment_offsets.ndim != 1
+            or segment_lengths.ndim != 1
+            or cu_seqlens.ndim != 1
+            or segment_offsets.shape != segment_lengths.shape
+            or int(cu_seqlens.numel()) != int(segment_lengths.numel()) + 1
+        ):
+            raise ValueError(
+                "Flash document descriptor tensor shapes disagree: "
+                f"offsets={tuple(segment_offsets.shape)}, "
+                f"lengths={tuple(segment_lengths.shape)}, cu={tuple(cu_seqlens.shape)}."
             )
-        if doc_num_segments_scalar is None:
-            doc_num_segments_scalar = _cpu_int_scalar(doc_num_segments)
-        if doc_max_seqlen_scalar is None:
-            doc_max_seqlen_scalar = _cpu_int_scalar(doc_max_seqlen)
-        if doc_num_segments is None or doc_max_seqlen is None:
-            raise RuntimeError(
-                "Flash doc-block host stats are missing for a device batch. "
-                "Build flash_doc_num_segments and flash_doc_max_seqlen in the collator before device transfer."
+        if validated_contract is None:
+            validate_doc_segments_against_mask(
+                attention_mask=keep_mask,
+                segment_offsets=segment_offsets,
+                segment_lengths=segment_lengths,
+                seq_len=seq_len,
+                doc_ids=doc_ids,
+                cu_seqlens=cu_seqlens,
             )
-        batch["flash_doc_segment_offsets"] = segment_offsets
-        batch["flash_doc_segment_lengths"] = segment_lengths
-        batch["flash_doc_cu_seqlens"] = cu_seqlens
-        batch["flash_doc_num_segments"] = int(doc_num_segments)
-        batch["flash_doc_max_seqlen"] = int(doc_max_seqlen)
-        if doc_num_segments_scalar is not None:
-            batch["flash_doc_num_segments_scalar"] = doc_num_segments_scalar
-        if doc_max_seqlen_scalar is not None:
-            batch["flash_doc_max_seqlen_scalar"] = doc_max_seqlen_scalar
-        return batch, FlashBatchMeta(
-            seq_lengths=seq_lengths,
-            doc_segment_offsets=segment_offsets,
-            doc_segment_lengths=segment_lengths,
-            doc_cu_seqlens=cu_seqlens,
-            active_tokens_host=active_tokens,
-            doc_num_segments_host=doc_num_segments,
-            doc_max_segment_length_host=doc_max_seqlen,
-            active_tokens_scalar=active_tokens_scalar,
-            doc_num_segments_scalar=doc_num_segments_scalar,
-            doc_max_segment_length_scalar=doc_max_seqlen_scalar,
-            route_hint=route_hint,
+        derived_active_tokens = (
+            int(keep_mask.sum(dtype=torch.int32)) if keep_mask.device.type == "cpu" else None
+        )
+        active_tokens, active_tokens_scalar = _reconcile_host_scalar_int(
+            label="Flash active-token count",
+            host_value=_flash_active_tokens_host(batch.get("flash_active_tokens")),
+            scalar_tensor=_flash_scalar_tensor(batch.get("flash_active_tokens_scalar")),
+            derived_value=derived_active_tokens,
+            required=True,
+        )
+        assert active_tokens is not None
+        (
+            doc_num_segments,
+            doc_max_seqlen,
+            doc_num_segments_scalar,
+            doc_max_seqlen_scalar,
+        ) = _resolve_flash_doc_segment_stats(
+            batch,
+            segment_lengths=segment_lengths,
+            active_tokens=active_tokens,
         )
 
-    attention_mask = batch.get("attention_mask")
-    seq_len = int(input_ids.shape[-1])
-    if attention_mask is None:
+        if route_hint == "docblock_bias":
+            batch["attention_mask"] = build_doc_block_mask(doc_ids)
+            meta = FlashBatchMeta(
+                active_tokens_host=active_tokens,
+                active_tokens_scalar=active_tokens_scalar,
+                route_hint=route_hint,
+                mask_contract="docblock",
+                mask_contract_validated=True,
+            )
+        else:
+            batch["attention_mask"] = keep_mask
+            meta = FlashBatchMeta(
+                doc_segment_offsets=segment_offsets,
+                doc_segment_lengths=segment_lengths,
+                doc_cu_seqlens=cu_seqlens,
+                active_tokens_host=active_tokens,
+                doc_num_segments_host=doc_num_segments,
+                doc_max_segment_length_host=doc_max_seqlen,
+                active_tokens_scalar=active_tokens_scalar,
+                doc_num_segments_scalar=doc_num_segments_scalar,
+                doc_max_segment_length_scalar=doc_max_seqlen_scalar,
+                route_hint=route_hint,
+                mask_contract="docblock",
+                mask_contract_validated=True,
+            )
         _clear_flash_batch_metadata(batch)
-        return batch, FlashBatchMeta(route_hint="dense") if flash_enabled else None
-    if is_pairwise_mask(attention_mask, query_len=int(seq_len), key_len=int(seq_len)):
+        return batch, meta
+
+    if doc_ids is not None:
+        raise ValueError(f"doc_ids must be rank-2; got shape={getattr(doc_ids, 'shape', None)}.")
+
+    if btype != "hf_deberta_v2":
         _clear_flash_batch_metadata(batch)
         return batch, None
 
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None:
+        _clear_flash_batch_metadata(batch)
+        return (
+            batch,
+            FlashBatchMeta(
+                route_hint="dense",
+                mask_contract="all_active",
+                mask_contract_validated=True,
+            )
+            if flash_enabled
+            else None,
+        )
+    if is_pairwise_mask(attention_mask, query_len=seq_len, key_len=seq_len):
+        _clear_flash_batch_metadata(batch)
+        return batch, None
     if not isinstance(attention_mask, torch.Tensor):
         _clear_flash_batch_metadata(batch)
         return batch, None
-
     if not flash_enabled:
         _clear_flash_batch_metadata(batch)
         return batch, None
 
-    keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-    if not is_prefix_padding_keep_mask(keep_mask, seq_len=seq_len):
-        # Fixed/varlen flash routes interpret seq_lengths as right-padded
-        # prefixes; publishing lengths for a mask with holes or left padding
-        # would bake in wrong attention semantics. Leave the batch on eager.
-        _notice_non_prefix_padding_fallback_once()
-        _clear_flash_batch_metadata(batch)
-        return batch, None
+    supplied_seq_lengths = _flash_existing_seq_lengths(batch)
+    if validated_contract is not None:
+        if validated_contract != "prefix":
+            raise ValueError(f"Padding batch carried mask_contract={validated_contract!r}.")
+        if supplied_seq_lengths is None:
+            raise ValueError("Validated prefix batch is missing flash_seq_lengths.")
+        seq_lengths = supplied_seq_lengths
+    else:
+        if attention_mask.device.type != "cpu":
+            # Ordinary device-side model calls have no trusted pre-transfer
+            # metadata. Keep the original mask authoritative and use eager
+            # attention rather than synchronizing it into Python.
+            _clear_flash_batch_metadata(batch)
+            return batch, None
+        try:
+            seq_lengths = build_validated_prefix_lengths(
+                attention_mask,
+                seq_len=seq_len,
+                supplied_lengths=supplied_seq_lengths,
+            )
+        except ValueError as exc:
+            if "right-padded prefix mask" not in str(exc):
+                raise
+            _notice_non_prefix_padding_fallback_once()
+            _clear_flash_batch_metadata(batch)
+            return batch, None
+
+    if tuple(seq_lengths.shape) != (batch_size,):
+        raise ValueError(
+            "Flash sequence-length batch shape disagrees with input_ids: "
+            f"lengths={tuple(seq_lengths.shape)}, batch_size={batch_size}."
+        )
     seq_lengths, active_tokens, active_tokens_scalar = _resolve_flash_seq_lengths_and_active_tokens(
-        batch, keep_mask
+        batch, seq_lengths
     )
-    route_active_tokens = (
-        int(active_tokens) if active_tokens is not None else int(seq_len) * int(input_ids.shape[0])
-    )
+    route_active_tokens = int(active_tokens) if active_tokens is not None else int(seq_len) * batch_size
     route_hint = _flash_route_hint_for_padding_batch(
         seq_len=seq_len,
         active_tokens=route_active_tokens,
-        batch_size=int(input_ids.shape[0]),
+        batch_size=batch_size,
         flash_cfg=flash_cfg,
-        device=input_ids.device,
+        device=routing_device,
     )
-    batch["flash_seq_lengths"] = seq_lengths
-    if active_tokens is not None:
-        batch["flash_active_tokens"] = int(active_tokens)
-    else:
-        batch.pop("flash_active_tokens", None)
-    if active_tokens_scalar is not None:
-        batch["flash_active_tokens_scalar"] = active_tokens_scalar
-    else:
-        batch.pop("flash_active_tokens_scalar", None)
-    _pop_flash_doc_segment_tensors(batch)
-    _pop_flash_doc_segment_host_stats(batch)
-    return batch, FlashBatchMeta(
+    meta = FlashBatchMeta(
         seq_lengths=seq_lengths,
         active_tokens_host=active_tokens,
         active_tokens_scalar=active_tokens_scalar,
         route_hint=route_hint,
+        mask_contract="prefix",
+        mask_contract_validated=True,
     )
+    _clear_flash_batch_metadata(batch)
+    return batch, meta
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:

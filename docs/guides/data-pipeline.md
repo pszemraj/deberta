@@ -33,7 +33,8 @@ boundaries. It is only valid with `data.packing.enabled=true`.
 
 - `false`: packed samples attend across document boundaries; no document mask is built
 - `true`: the collator emits compact `doc_ids (B,S)` and precomputes fixed-capacity segment
-  descriptors plus host statistics before device transfer
+  descriptors plus host statistics before device transfer. It validates exact, non-overlapping
+  segment coverage against `attention_mask` before attesting the metadata.
 
 What consumes `doc_ids` depends on the attention path:
 
@@ -46,7 +47,13 @@ Batch preparation is a second stage. `prepare_flash_attention_batch_metadata` co
 chooses the attention route, and either materializes the pairwise mask or packages the collator's
 segment metadata into `FlashBatchMeta`. External consumers must preserve the collator's `flash_*`
 fields through device transfer and call this function before the forward pass. A device batch that
-has lost required segment metadata fails rather than rebuilding it on the GPU.
+has lost required segment metadata fails rather than rebuilding it on the GPU. Preparation consumes
+the raw fields, leaving `FlashBatchMeta` as the only metadata object passed to the model.
+
+`attention_mask` is the only token-liveness authority. A token whose numeric ID equals
+`pad_token_id` remains active when its mask value is true, and an arbitrary non-pad filler remains
+inactive when its mask value is false. Token IDs identify document separators only at active
+positions. Omitting `attention_mask` means every position is active.
 
 Model forwards reject a raw `doc_ids` argument. Manually dropping `doc_ids` and forwarding only
 `input_ids` and `attention_mask` silently re-enables cross-document attention and global-CLS

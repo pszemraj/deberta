@@ -299,7 +299,6 @@ def _run_decoupled_window(
     train_iter: Any,
     ga_steps: int,
     token_weighted_ga: bool,
-    disc_pad_token_id: int | None,
     device: torch.device,
     compile_enabled: bool,
     compile_scope: str,
@@ -324,7 +323,6 @@ def _run_decoupled_window(
                     train_iter=train_iter,
                     ga_steps=ga_steps,
                     token_weighted_ga=token_weighted_ga,
-                    disc_pad_token_id=disc_pad_token_id,
                     default_unweighted_token_count=1.0,
                 )
             )
@@ -488,7 +486,6 @@ def _run_coupled_window(
     train_iter: Any,
     ga_steps: int,
     token_weighted_ga: bool,
-    disc_pad_token_id: int | None,
     device: torch.device,
     compile_enabled: bool,
     compile_scope: str,
@@ -513,7 +510,6 @@ def _run_coupled_window(
                     train_iter=train_iter,
                     ga_steps=ga_steps,
                     token_weighted_ga=token_weighted_ga,
-                    disc_pad_token_id=disc_pad_token_id,
                     default_unweighted_token_count=0.0,
                 )
             )
@@ -662,7 +658,6 @@ def main() -> None:
 
     ga_steps = int(args.ga_steps) if args.ga_steps is not None else int(train_cfg.gradient_accumulation_steps)
     token_weighted_ga = bool(train_cfg.token_weighted_gradient_accumulation)
-    disc_pad_token_id = getattr(tokenizer, "pad_token_id", None)
     flash_enabled = str(model_cfg.hf.attention_impl).strip().lower() == "flash"
     phase_times_ms: dict[str, list[float]] = defaultdict(list)
 
@@ -673,7 +668,6 @@ def main() -> None:
                 train_iter=train_iter,
                 ga_steps=ga_steps,
                 token_weighted_ga=token_weighted_ga,
-                disc_pad_token_id=disc_pad_token_id,
                 device=device,
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
@@ -695,7 +689,6 @@ def main() -> None:
                 train_iter=train_iter,
                 ga_steps=ga_steps,
                 token_weighted_ga=token_weighted_ga,
-                disc_pad_token_id=disc_pad_token_id,
                 device=device,
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
@@ -721,7 +714,6 @@ def main() -> None:
                 train_iter=train_iter,
                 ga_steps=ga_steps,
                 token_weighted_ga=token_weighted_ga,
-                disc_pad_token_id=disc_pad_token_id,
                 device=device,
                 compile_enabled=compile_enabled,
                 compile_scope=compile_scope,
@@ -742,7 +734,6 @@ def main() -> None:
             train_iter=train_iter,
             ga_steps=ga_steps,
             token_weighted_ga=token_weighted_ga,
-            disc_pad_token_id=disc_pad_token_id,
             device=device,
             compile_enabled=compile_enabled,
             compile_scope=compile_scope,

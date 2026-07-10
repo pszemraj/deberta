@@ -146,7 +146,7 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
         seq_lengths = attention_mask.sum(-1, dtype=torch.int32)
 
     flash_meta = FlashBatchMeta(
-        seq_lengths=seq_lengths,
+        seq_lengths=None if case.docblock else seq_lengths,
         doc_segment_offsets=doc_segment_offsets,
         doc_segment_lengths=doc_segment_lengths,
         doc_cu_seqlens=doc_cu_seqlens,
@@ -154,6 +154,10 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
         doc_num_segments_host=doc_num_segments,
         doc_max_segment_length_host=doc_max_seqlen,
         route_hint=case.route_hint,
+        mask_contract=(
+            "docblock" if case.docblock else "prefix" if attention_mask is not None else "all_active"
+        ),
+        mask_contract_validated=True,
     )
 
     return {

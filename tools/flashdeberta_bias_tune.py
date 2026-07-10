@@ -9,6 +9,7 @@ flash-with-bias route, and sweeps repo-local dense-bias kernel overrides.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import statistics
 from pathlib import Path
@@ -16,8 +17,6 @@ from typing import Any
 
 import _bench_common as bench
 import torch
-
-from deberta.modeling.mask_utils import FlashBatchMeta
 
 
 def _parse_args() -> argparse.Namespace:
@@ -120,7 +119,14 @@ def main() -> None:
                 timing = bench.run_timed_candidate(
                     model=model,
                     samples=samples,
-                    meta_fn=lambda sample: FlashBatchMeta(route_hint="docblock_bias"),
+                    meta_fn=lambda sample: (
+                        dataclasses.replace(
+                            sample.flash_meta,
+                            route_hint="docblock_bias",
+                        )
+                        if sample.flash_meta is not None
+                        else None
+                    ),
                     warmup=int(args.warmup),
                     steps=int(args.steps),
                 )

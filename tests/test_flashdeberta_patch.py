@@ -1268,7 +1268,7 @@ def test_non_prefix_padding_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyP
     )
 
     stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats.get("fallback_non_prefix_padding_mask", 0) == 1
+    assert stats.get("fallback_unvalidated_mask_metadata", 0) == 1
     with torch.no_grad():
         expected, _ = reference(
             hidden_states=hidden_states,
@@ -1279,8 +1279,8 @@ def test_non_prefix_padding_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyP
     torch.testing.assert_close(output, expected)
 
     # A length-mismatched mask is a shape error, not a reinterpretable input:
-    # flash refuses to derive prefix lengths from it (padding_mask_shape
-    # fallback) and eager then rejects the non-broadcastable mask itself.
+    # Unattested masks take the static eager fallback; eager then rejects the
+    # non-broadcastable shape itself.
     attention_mod.reset_flashdeberta_stats()
     with pytest.raises((RuntimeError, ValueError)):
         attention(
@@ -1290,13 +1290,13 @@ def test_non_prefix_padding_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyP
             rel_embeddings=rel_embeddings,
         )
     stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats.get("fallback_padding_mask_shape", 0) == 1
+    assert stats.get("fallback_unvalidated_mask_metadata", 0) == 1
 
 
 def test_mask_to_2d_keep_mask_rejects_length_mismatch() -> None:
     """Length-mismatched padding masks must raise instead of silently slicing."""
 
-    from deberta.modeling.mask_utils import is_prefix_padding_keep_mask, mask_to_2d_keep_mask
+    from deberta.modeling.mask_utils import mask_to_2d_keep_mask
 
     too_long = torch.ones((1, 5), dtype=torch.bool)
     too_short = torch.ones((1, 3), dtype=torch.bool)
@@ -1308,10 +1308,6 @@ def test_mask_to_2d_keep_mask_rejects_length_mismatch() -> None:
         mask_to_2d_keep_mask(too_short, seq_len=4)
     with pytest.raises(ValueError, match="exactly match seq_len=4"):
         mask_to_2d_keep_mask(broadcast_too_long, seq_len=4)
-
-    assert is_prefix_padding_keep_mask(torch.tensor([[True, True, False, False]]), seq_len=4)
-    assert not is_prefix_padding_keep_mask(torch.tensor([[True, False, True, False]]), seq_len=4)
-    assert not is_prefix_padding_keep_mask(torch.tensor([[False, False, True, True]]), seq_len=4)
 
 
 def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1971,6 +1967,94 @@ def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.Mon
     assert len(captured) == 0
 
 
+def test_flash_dispatch_is_fullgraph_without_mask_scalar_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real attention dispatcher must compile with a static mask attestation."""
+
+    _install_fake_flashdeberta(monkeypatch)
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "0")
+    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
+    attention_mod = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.tensor([True, True, False, False]).view(1, 1, 1, 4)
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
+    flash_meta = FlashBatchMeta(
+        seq_lengths=torch.tensor([2], dtype=torch.int32),
+        active_tokens_host=2,
+        route_hint="fixed",
+        mask_contract="prefix",
+        mask_contract_validated=True,
+    )
+
+    compiled = torch.compile(attention, backend="eager", fullgraph=True, dynamic=False)
+    output, probs = compiled(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        rel_embeddings=rel_embeddings,
+        flash_meta=flash_meta,
+    )
+
+    assert output.shape == hidden_states.shape
+    assert probs is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for dispatch profiling.")
+def test_flash_dispatch_profiler_has_no_local_scalar_dense(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validated CUDA dispatch must not synchronize mask data into Python."""
+
+    _install_fake_flashdeberta(monkeypatch)
+    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "0")
+    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
+    attention_mod = _reload_flash_modules()
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    attention.eval()
+    hidden_states = torch.randn(
+        (1, 4, cfg.hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    attention_mask = torch.tensor(
+        [[[[True, True, False, False]]]],
+        device="cuda",
+    )
+    rel_embeddings = torch.randn(
+        (cfg.position_buckets * 2, cfg.hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    flash_meta = FlashBatchMeta(
+        seq_lengths=torch.tensor([2], device="cuda", dtype=torch.int32),
+        active_tokens_host=2,
+        route_hint="fixed",
+        mask_contract="prefix",
+        mask_contract_validated=True,
+    )
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        output, _ = attention(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
+        )
+        assert output.shape == hidden_states.shape
+        torch.cuda.synchronize()
+
+    event_names = {event.key for event in profiler.key_averages()}
+    assert "aten::_local_scalar_dense" not in event_names
+
+
 def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2396,8 +2480,8 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     )
     assert fixed_meta is not None
     assert fixed_meta.normalized_route_hint() == "fixed"
-    assert torch.equal(prepared_fixed["flash_seq_lengths"], torch.tensor([1024, 768], dtype=torch.int32))
-    assert prepared_fixed["flash_active_tokens"] == 1792
+    assert not any(key.startswith("flash_") for key in prepared_fixed)
+    assert torch.equal(fixed_meta.seq_lengths, torch.tensor([1024, 768], dtype=torch.int32))
     assert fixed_meta.active_tokens_host == 1792
 
     padded_2048 = {
@@ -2429,9 +2513,117 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     )
     assert varlen_meta is not None
     assert varlen_meta.normalized_route_hint() == "varlen"
-    assert torch.equal(prepared_varlen["flash_seq_lengths"], torch.tensor([1800, 1700], dtype=torch.int32))
-    assert prepared_varlen["flash_active_tokens"] == 3500
+    assert not any(key.startswith("flash_") for key in prepared_varlen)
+    assert torch.equal(varlen_meta.seq_lengths, torch.tensor([1800, 1700], dtype=torch.int32))
     assert varlen_meta.active_tokens_host == 3500
+
+
+@pytest.mark.parametrize(
+    "stale_metadata",
+    [
+        {"flash_seq_lengths": torch.tensor([[2]], dtype=torch.int32)},
+        {"flash_seq_lengths": torch.tensor([3], dtype=torch.int32)},
+        {"flash_seq_lengths": torch.tensor([2.0], dtype=torch.float32)},
+        {
+            "flash_seq_lengths": torch.tensor([2], dtype=torch.int32),
+            "flash_active_tokens": 3,
+        },
+        {
+            "flash_seq_lengths": torch.tensor([2], dtype=torch.int32),
+            "flash_active_tokens_scalar": torch.tensor(3, dtype=torch.int32),
+        },
+    ],
+)
+def test_prepare_flash_padding_metadata_rejects_values_that_disagree_with_mask(
+    stale_metadata: dict[str, torch.Tensor | int],
+) -> None:
+    import deberta.training.compile as compile_mod
+
+    batch = {
+        "input_ids": torch.tensor([[11, 0, 99, 0]], dtype=torch.long),
+        "attention_mask": torch.tensor([[True, True, False, False]]),
+        **stale_metadata,
+    }
+
+    with pytest.raises(ValueError, match="disagree"):
+        compile_mod.prepare_flash_attention_batch_metadata(
+            batch=batch,
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("offsets", "lengths", "cu_seqlens", "message"),
+    [
+        ([0, 2, 0, 0], [2, 1, 0, 0], [0, 2, 3, 0, 0], "ends inside"),
+        ([0, 1, 0, 0], [2, 2, 0, 0], [0, 2, 4, 0, 0], "Overlapping"),
+        ([0, 3, 0, 0], [2, 2, 0, 0], [0, 2, 4, 0, 0], "exceeds"),
+        ([0, 2, 0, 0], [2, 2, 0, 0], [0, 2, 3, 0, 0], "cumulative lengths disagree"),
+    ],
+)
+def test_prepare_flash_doc_metadata_rejects_invalid_descriptors(
+    offsets: list[int],
+    lengths: list[int],
+    cu_seqlens: list[int],
+    message: str,
+) -> None:
+    import deberta.training.compile as compile_mod
+
+    doc_ids = torch.tensor([[1, 1, 2, 2]], dtype=torch.long)
+    batch = {
+        "input_ids": torch.tensor([[101, 11, 12, 102]], dtype=torch.long),
+        "attention_mask": torch.ones((1, 4), dtype=torch.bool),
+        "doc_ids": doc_ids,
+        "flash_doc_segment_offsets": torch.tensor(offsets, dtype=torch.int32),
+        "flash_doc_segment_lengths": torch.tensor(lengths, dtype=torch.int32),
+        "flash_doc_cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
+    }
+
+    with pytest.raises(ValueError, match=message):
+        compile_mod.prepare_flash_attention_batch_metadata(
+            batch=batch,
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("length", "message"),
+    [
+        (2, "missing_active_tokens=1"),
+        (4, "included_masked_tokens=1"),
+    ],
+)
+def test_doc_segments_must_exactly_cover_attention_mask(length: int, message: str) -> None:
+    from deberta.modeling.mask_utils import validate_doc_segments_against_mask
+
+    with pytest.raises(ValueError, match=message):
+        validate_doc_segments_against_mask(
+            attention_mask=torch.tensor([[True, True, True, False]]),
+            segment_offsets=torch.tensor([0, 0, 0, 0], dtype=torch.int32),
+            segment_lengths=torch.tensor([length, 0, 0, 0], dtype=torch.int32),
+            seq_len=4,
+        )
+
+
+def test_prepare_flash_doc_metadata_rejects_incomplete_descriptor_bundle() -> None:
+    import deberta.training.compile as compile_mod
+
+    doc_ids = torch.tensor([[1, 1, 2, 2]], dtype=torch.long)
+    batch = {
+        "input_ids": torch.tensor([[101, 11, 12, 102]], dtype=torch.long),
+        "attention_mask": torch.ones((1, 4), dtype=torch.bool),
+        "doc_ids": doc_ids,
+        "flash_doc_segment_offsets": torch.tensor([0, 2, 0, 0], dtype=torch.int32),
+    }
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        compile_mod.prepare_flash_attention_batch_metadata(
+            batch=batch,
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+        )
 
 
 def test_prepare_flash_attention_batch_metadata_clears_metadata_for_other_backbones() -> None:
@@ -2467,7 +2659,11 @@ def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbo
     # non-hf_deberta_v2 batch carrying doc_ids gets the dense pairwise mask
     # built here, or packed documents silently attend across boundaries.
     doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
-    batch = {"input_ids": torch.zeros((1, 4), dtype=torch.long), "doc_ids": doc_ids}
+    batch = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "attention_mask": doc_ids.ne(0),
+        "doc_ids": doc_ids,
+    }
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
@@ -2494,6 +2690,7 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
             dtype=torch.long,
         ),
     }
+    batch["attention_mask"] = batch["doc_ids"].ne(0)
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
@@ -2514,32 +2711,39 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
             dtype=torch.bool,
         ),
     )
-    assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([4, 3], dtype=torch.int32))
-    assert prepared["flash_active_tokens"] == 7
+    assert not any(key.startswith("flash_") for key in prepared)
+    assert meta.seq_lengths is None
     assert meta.active_tokens_host == 7
-    assert tuple(prepared["flash_doc_segment_offsets"].shape) == (10,)
-    assert tuple(prepared["flash_doc_segment_lengths"].shape) == (10,)
-    assert tuple(prepared["flash_doc_cu_seqlens"].shape) == (11,)
+    assert meta.doc_segment_offsets is not None
+    assert meta.doc_segment_lengths is not None
+    assert meta.doc_cu_seqlens is not None
+    assert tuple(meta.doc_segment_offsets.shape) == (10,)
+    assert tuple(meta.doc_segment_lengths.shape) == (10,)
+    assert tuple(meta.doc_cu_seqlens.shape) == (11,)
     assert torch.equal(
-        prepared["flash_doc_segment_offsets"][:4],
+        meta.doc_segment_offsets[:4],
         torch.tensor([0, 2, 5, 6], dtype=torch.int32),
     )
     assert torch.equal(
-        prepared["flash_doc_segment_lengths"][:4],
+        meta.doc_segment_lengths[:4],
         torch.tensor([2, 2, 1, 2], dtype=torch.int32),
     )
     assert torch.equal(
-        prepared["flash_doc_cu_seqlens"][:5],
+        meta.doc_cu_seqlens[:5],
         torch.tensor([0, 2, 4, 5, 7], dtype=torch.int32),
     )
-    assert torch.count_nonzero(prepared["flash_doc_segment_lengths"][4:]).item() == 0
+    assert torch.count_nonzero(meta.doc_segment_lengths[4:]).item() == 0
 
 
 def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_pairwise_mask() -> None:
     import deberta.training.compile as compile_mod
 
     doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
-    batch = {"input_ids": torch.zeros((1, 4), dtype=torch.long), "doc_ids": doc_ids}
+    batch = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "attention_mask": doc_ids.ne(0),
+        "doc_ids": doc_ids,
+    }
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
@@ -2562,7 +2766,11 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_ove
 
     configure_flashdeberta_kernel_overrides(None)
     doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
-    batch = {"input_ids": torch.zeros((1, 4), dtype=torch.long), "doc_ids": doc_ids}
+    batch = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "attention_mask": doc_ids.ne(0),
+        "doc_ids": doc_ids,
+    }
     missing_override_path = tmp_path / "missing-flash-routes.json"
 
     try:
@@ -2673,6 +2881,8 @@ def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cp
             doc_num_segments_host=2,
             doc_max_segment_length_host=seq_len // 2,
             route_hint="docblock",
+            mask_contract="docblock",
+            mask_contract_validated=True,
         ),
     )
 
@@ -2761,6 +2971,7 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock_bias() -> None:
             dtype=torch.long,
         ),
     }
+    batch["attention_mask"] = batch["doc_ids"].ne(0)
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
@@ -2777,8 +2988,8 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock_bias() -> None:
     assert "flash_doc_cu_seqlens" not in prepared
     assert tuple(prepared["attention_mask"].shape) == (2, 5, 5)
     assert prepared["attention_mask"].dtype == torch.bool
-    assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([4, 3], dtype=torch.int32))
-    assert prepared["flash_active_tokens"] == 7
+    assert not any(key.startswith("flash_") for key in prepared)
+    assert meta.seq_lengths is None
     assert meta.active_tokens_host == 7
 
 
@@ -2795,6 +3006,7 @@ def test_prepare_flash_attention_batch_metadata_docblock_host_stats() -> None:
             dtype=torch.long,
         ),
     }
+    batch["attention_mask"] = batch["doc_ids"].ne(0)
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
@@ -2802,8 +3014,7 @@ def test_prepare_flash_attention_batch_metadata_docblock_host_stats() -> None:
         flash_enabled=True,
     )
 
-    assert prepared["flash_doc_num_segments"] == 4
-    assert prepared["flash_doc_max_seqlen"] == 2
+    assert not any(key.startswith("flash_") for key in prepared)
     assert meta is not None
     assert meta.doc_num_segments_host == 4
     assert meta.doc_max_segment_length_host == 2
@@ -2842,8 +3053,8 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
     )
     assert meta is not None
     assert meta.normalized_route_hint() == "varlen"
-    assert torch.equal(prepared["flash_seq_lengths"], torch.tensor([2, 3], dtype=torch.int32))
-    assert prepared["flash_active_tokens"] == 5
+    assert not any(key.startswith("flash_") for key in prepared)
+    assert torch.equal(meta.seq_lengths, torch.tensor([2, 3], dtype=torch.int32))
     assert meta.active_tokens_host == 5
     assert meta.active_tokens_scalar is not None
     assert meta.active_tokens_scalar.device.type == "cpu"
@@ -3864,9 +4075,10 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
     if route == "docblock_bias":
         attention_mask: torch.Tensor = build_doc_block_mask(doc_ids.to(device=device))
         flash_meta = FlashBatchMeta(
-            seq_lengths=doc_ids.ne(0).sum(-1, dtype=torch.int32).to(device=device),
             active_tokens_host=seq_len,
             route_hint="docblock_bias",
+            mask_contract="docblock",
+            mask_contract_validated=True,
         )
     else:
         segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(doc_ids)
@@ -3876,7 +4088,6 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
         )
         attention_mask = doc_ids.ne(0).to(device=device)
         flash_meta = FlashBatchMeta(
-            seq_lengths=doc_ids.ne(0).sum(-1, dtype=torch.int32).to(device=device),
             doc_segment_offsets=segment_offsets.to(device=device),
             doc_segment_lengths=segment_lengths.to(device=device),
             doc_cu_seqlens=cu_seqlens.to(device=device),
@@ -3884,6 +4095,8 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
             doc_num_segments_host=num_segments,
             doc_max_segment_length_host=max_seqlen,
             route_hint="docblock",
+            mask_contract="docblock",
+            mask_contract_validated=True,
         )
 
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), device=device, dtype=dtype).requires_grad_()
@@ -3981,9 +4194,10 @@ def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
     ).to(device=device)
     attention_mask = build_doc_block_mask(doc_ids)
     flash_meta = FlashBatchMeta(
-        seq_lengths=doc_ids.ne(0).sum(-1, dtype=torch.int32),
         active_tokens_host=active_len,
         route_hint="docblock_bias",
+        mask_contract="docblock",
+        mask_contract_validated=True,
     )
 
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), device=device, dtype=dtype)
@@ -4093,7 +4307,7 @@ def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
             rel_embeddings=rel_embeddings,
         )
     stats = attention_mod.flashdeberta_stats_snapshot()
-    assert stats.get("fallback_non_prefix_padding_mask", 0) >= 1, f"expected eager fallback: {stats}"
+    assert stats.get("fallback_unvalidated_mask_metadata", 0) >= 1, f"expected eager fallback: {stats}"
 
     with torch.no_grad():
         eager_out, _ = reference(

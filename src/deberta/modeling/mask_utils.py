@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
 import torch
 
 _FLASH_TRUTHY = {"1", "true", "yes", "y", "on"}
+_INTEGER_DTYPES = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
 
 
 def is_torch_compiling() -> bool:
@@ -30,8 +31,8 @@ class FlashBatchMeta:
 
     :param torch.Tensor | None seq_lengths: Optional per-example active prefix lengths.
         Right-padding contract: position ``i`` is active iff ``i < length``, so
-        producers must prove the batch mask is a contiguous-prefix mask (see
-        :func:`is_prefix_padding_keep_mask`) before publishing lengths here.
+        producers must derive and reconcile lengths with
+        :func:`build_validated_prefix_lengths` before publishing them here.
     :param torch.Tensor | None doc_segment_offsets: Optional flat padded row offsets per doc segment.
     :param torch.Tensor | None doc_segment_lengths: Optional per-segment doc lengths.
     :param torch.Tensor | None doc_cu_seqlens: Optional cumulative packed doc offsets.
@@ -42,6 +43,11 @@ class FlashBatchMeta:
     :param torch.Tensor | None doc_num_segments_scalar: Optional CPU scalar segment-count tensor for compiled routes.
     :param torch.Tensor | None doc_max_segment_length_scalar: Optional CPU scalar max-segment tensor for compiled routes.
     :param str | None route_hint: Optional normalized flash route hint.
+    :param Literal["all_active", "prefix", "docblock"] mask_contract: Static mask
+        contract proven by the batch metadata producer.
+    :param bool mask_contract_validated: Whether the mask and all consumed metadata
+        were reconciled before entering the model. Direct construction leaves this
+        false; normal training metadata preparation is responsible for attestation.
     """
 
     seq_lengths: torch.Tensor | None = None
@@ -55,6 +61,8 @@ class FlashBatchMeta:
     doc_num_segments_scalar: torch.Tensor | None = None
     doc_max_segment_length_scalar: torch.Tensor | None = None
     route_hint: str | None = None
+    mask_contract: Literal["all_active", "prefix", "docblock"] = "all_active"
+    mask_contract_validated: bool = False
 
     def normalized_route_hint(self) -> str | None:
         """Return the normalized route hint.
@@ -82,6 +90,40 @@ class FlashBatchMeta:
         return (
             self.normalized_route_hint() in {"docblock", "docblock_bias"}
             or self.doc_segment_offsets is not None
+        )
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> FlashBatchMeta:
+        """Move kernel-consumed metadata tensors while keeping host scalars on CPU.
+
+        :param torch.device | str device: Destination device.
+        :param bool non_blocking: Whether tensor copies may proceed asynchronously.
+        :return FlashBatchMeta: Metadata bundle for the destination device.
+        """
+
+        def _move(value: torch.Tensor | None) -> torch.Tensor | None:
+            """Move one optional kernel metadata tensor.
+
+            :param torch.Tensor | None value: Optional source tensor.
+            :return torch.Tensor | None: Tensor on the destination device.
+            """
+
+            return (
+                value.to(device=device, non_blocking=non_blocking)
+                if isinstance(value, torch.Tensor)
+                else None
+            )
+
+        return replace(
+            self,
+            seq_lengths=_move(self.seq_lengths),
+            doc_segment_offsets=_move(self.doc_segment_offsets),
+            doc_segment_lengths=_move(self.doc_segment_lengths),
+            doc_cu_seqlens=_move(self.doc_cu_seqlens),
         )
 
 
@@ -207,26 +249,197 @@ def mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch
     )
 
 
-def is_prefix_padding_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> bool:
-    """Return whether a padding keep mask is a right-padded contiguous prefix.
+def build_validated_prefix_lengths(
+    attention_mask: torch.Tensor,
+    *,
+    seq_len: int,
+    supplied_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Derive and validate right-padded prefix lengths on CPU.
 
-    The flash fixed/varlen routes compress padding masks into per-example
-    prefix lengths, which only preserves eager semantics when every row keeps
-    a contiguous prefix (right padding). Masks with holes or left padding must
-    stay on eager attention, which honors arbitrary key-padding masks.
+    ``attention_mask`` is authoritative. Optional precomputed lengths are only
+    accepted after exact reconciliation with the mask; they never override it.
+    This boundary helper intentionally rejects device tensors so validation
+    cannot introduce a hidden CUDA synchronization in a compiled attention
+    layer.
 
-    :param torch.Tensor attention_mask: Padding-style keep mask ``(B,S)`` or ``(B,1,1,S)``.
-    :param int seq_len: Expected sequence length.
-    :raises ValueError: If the mask is not an exact-length padding mask.
-    :return bool: True when each row's kept positions form a contiguous prefix.
+    :param torch.Tensor attention_mask: CPU padding keep mask.
+    :param int seq_len: Exact sequence length.
+    :param torch.Tensor | None supplied_lengths: Optional CPU lengths to verify.
+    :raises ValueError: If tensors are not CPU-resident, the mask is not a
+        right-padded prefix, or supplied lengths disagree.
+    :return torch.Tensor: Mask-derived CPU int32 lengths with shape ``(B,)``.
     """
 
-    keep = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-    if int(keep.shape[-1]) <= 1:
-        return True
-    # A prefix mask never rises from False back to True along the key axis.
-    rises = ~keep[:, :-1] & keep[:, 1:]
-    return not bool(rises.any())
+    if attention_mask.device.type != "cpu":
+        raise ValueError("Flash padding metadata must be validated on CPU before device transfer.")
+    keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+    lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+    positions = torch.arange(int(seq_len), dtype=torch.int32)
+    expected_keep_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
+    if not torch.equal(keep_mask, expected_keep_mask):
+        raise ValueError("Flash fixed/varlen attention requires a right-padded prefix mask.")
+
+    if supplied_lengths is not None:
+        if supplied_lengths.device.type != "cpu":
+            raise ValueError(
+                "Supplied flash sequence lengths must be validated on CPU before device transfer."
+            )
+        if supplied_lengths.dtype not in _INTEGER_DTYPES:
+            raise ValueError(
+                "Supplied flash sequence lengths disagree with their contract: integer dtype required."
+            )
+        supplied = supplied_lengths.to(dtype=torch.int32)
+        if supplied.ndim != 1 or supplied.shape != lengths.shape or not torch.equal(supplied, lengths):
+            raise ValueError(
+                "Supplied flash sequence lengths disagree with attention_mask: "
+                f"derived={lengths.tolist()}, supplied={supplied.tolist()}."
+            )
+    return lengths
+
+
+def validate_doc_segments_against_mask(
+    *,
+    attention_mask: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    seq_len: int,
+    doc_ids: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+) -> None:
+    """Validate flat doc-segment descriptors against authoritative CPU masks.
+
+    The repo stores offsets as flat ``batch_index * seq_len + token_index``
+    values rather than a padded ``(B,max_segments)`` matrix. Active descriptors
+    must form one positive-length prefix, cover every active position exactly
+    once, stay within a single batch row, and agree with document boundaries.
+
+    :param torch.Tensor attention_mask: CPU padding keep mask in ``(B,S)`` form.
+    :param torch.Tensor segment_offsets: Flat CPU segment offsets.
+    :param torch.Tensor segment_lengths: Flat CPU segment lengths with zero tail padding.
+    :param int seq_len: Exact sequence length.
+    :param torch.Tensor | None doc_ids: Optional authoritative document ids.
+    :param torch.Tensor | None cu_seqlens: Optional padded cumulative lengths.
+    :raises ValueError: If descriptors are malformed or disagree with the mask/layout.
+    """
+
+    tensors = {
+        "attention_mask": attention_mask,
+        "segment_offsets": segment_offsets,
+        "segment_lengths": segment_lengths,
+    }
+    if doc_ids is not None:
+        tensors["doc_ids"] = doc_ids
+    if cu_seqlens is not None:
+        tensors["cu_seqlens"] = cu_seqlens
+    for name, tensor in tensors.items():
+        if tensor.device.type != "cpu":
+            raise ValueError(f"{name} must be validated on CPU before document metadata device transfer.")
+
+    keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+    if segment_offsets.ndim != 1 or segment_lengths.ndim != 1:
+        raise ValueError(
+            "Document segment offsets and lengths must be flat 1D tensors; "
+            f"got offsets={tuple(segment_offsets.shape)}, lengths={tuple(segment_lengths.shape)}."
+        )
+    if segment_offsets.shape != segment_lengths.shape:
+        raise ValueError(
+            "Document segment offsets and lengths must have identical shapes; "
+            f"got offsets={tuple(segment_offsets.shape)}, lengths={tuple(segment_lengths.shape)}."
+        )
+    if segment_offsets.dtype not in _INTEGER_DTYPES or segment_lengths.dtype not in _INTEGER_DTYPES:
+        raise ValueError("Document segment offsets and lengths must use integer dtypes.")
+    if cu_seqlens is not None and cu_seqlens.dtype not in _INTEGER_DTYPES:
+        raise ValueError("Document cumulative lengths must use an integer dtype.")
+
+    batch_size = int(keep_mask.shape[0])
+    offsets = segment_offsets.to(dtype=torch.int64)
+    lengths = segment_lengths.to(dtype=torch.int64)
+    covered = torch.zeros_like(keep_mask, dtype=torch.bool)
+    if bool((offsets < 0).any().item()) or bool((lengths < 0).any().item()):
+        raise ValueError("Document segment offsets and lengths must be non-negative.")
+    positive = lengths > 0
+    active_segments = int(positive.sum().item())
+    expected_positive = torch.arange(int(lengths.numel())) < active_segments
+    if not torch.equal(positive, expected_positive):
+        raise ValueError("Positive document segments must precede zero-padded descriptors.")
+    if bool(offsets[active_segments:].ne(0).any().item()):
+        raise ValueError("Zero-length document descriptors must have offset=0.")
+    cumulative = int(lengths[:active_segments].sum().item())
+
+    ids = None
+    if doc_ids is not None:
+        if doc_ids.dtype not in _INTEGER_DTYPES:
+            raise ValueError("doc_ids must use an integer dtype.")
+        if doc_ids.ndim != 2 or doc_ids.shape != keep_mask.shape:
+            raise ValueError(
+                "doc_ids must match attention_mask shape; "
+                f"got doc_ids={tuple(doc_ids.shape)}, mask={tuple(keep_mask.shape)}."
+            )
+        ids = doc_ids.to(dtype=torch.long)
+        if not torch.equal(ids.ne(0), keep_mask):
+            raise ValueError("doc_ids liveness disagrees with attention_mask.")
+
+    for segment_idx in range(active_segments):
+        start = int(offsets[segment_idx].item())
+        length = int(lengths[segment_idx].item())
+        row = start // int(seq_len)
+        row_start = start % int(seq_len)
+        row_end = row_start + length
+        if row >= batch_size or row_end > int(seq_len):
+            raise ValueError(
+                f"Document segment exceeds its batch row at segment={segment_idx}: "
+                f"offset={start}, length={length}, batch_size={batch_size}, seq_len={seq_len}."
+            )
+        if bool(covered[row, row_start:row_end].any().item()):
+            raise ValueError(f"Overlapping document segments at segment={segment_idx}.")
+
+        if ids is not None:
+            segment_doc_ids = ids[row, row_start:row_end]
+            doc_id = int(segment_doc_ids[0].item())
+            if doc_id <= 0 or not bool(segment_doc_ids.eq(doc_id).all().item()):
+                raise ValueError(f"Document segment crosses a document boundary at segment={segment_idx}.")
+            if (
+                row_start > 0
+                and bool(keep_mask[row, row_start - 1].item())
+                and int(ids[row, row_start - 1].item()) == doc_id
+            ):
+                raise ValueError(f"Document segment starts inside document {doc_id}.")
+            if (
+                row_end < int(seq_len)
+                and bool(keep_mask[row, row_end].item())
+                and int(ids[row, row_end].item()) == doc_id
+            ):
+                raise ValueError(f"Document segment ends inside document {doc_id}.")
+
+        covered[row, row_start:row_end] = True
+
+    if not torch.equal(covered, keep_mask):
+        missing = int((keep_mask & ~covered).sum().item())
+        extra = int((covered & ~keep_mask).sum().item())
+        raise ValueError(
+            "Document segment descriptors disagree with attention_mask: "
+            f"missing_active_tokens={missing}, included_masked_tokens={extra}."
+        )
+
+    if cu_seqlens is not None:
+        if cu_seqlens.ndim != 1 or int(cu_seqlens.numel()) != int(lengths.numel()) + 1:
+            raise ValueError(
+                "Document cumulative lengths must be flat with one more entry than segment lengths."
+            )
+        expected_cu = torch.zeros_like(cu_seqlens, dtype=torch.int64)
+        if active_segments > 0:
+            expected_cu[1 : active_segments + 1] = torch.cumsum(
+                lengths[:active_segments], dim=0, dtype=torch.int64
+            )
+        actual_cu = cu_seqlens.to(dtype=torch.int64)
+        if not torch.equal(actual_cu, expected_cu):
+            raise ValueError(
+                "Document cumulative lengths disagree with segment lengths: "
+                f"expected={expected_cu.tolist()}, supplied={actual_cu.tolist()}."
+            )
+        if cumulative != int(expected_cu[active_segments].item()):
+            raise ValueError("Document cumulative token count is internally inconsistent.")
 
 
 def is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
@@ -479,14 +692,15 @@ __all__ = [
     "FlashBatchMeta",
     "_flash_cfg_bool",
     "_flash_cfg_get",
+    "build_validated_prefix_lengths",
     "build_doc_block_mask",
     "build_doc_segment_metadata",
     "doc_segment_metadata_host_stats",
     "doc_ids_from_segments",
     "expand_keep_mask_to_4d",
     "is_pairwise_mask",
-    "is_prefix_padding_keep_mask",
     "mask_to_2d_keep_mask",
     "normalize_keep_mask",
     "reduce_keep_mask_to_2d",
+    "validate_doc_segments_against_mask",
 ]

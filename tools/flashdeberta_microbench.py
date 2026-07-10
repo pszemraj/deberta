@@ -34,14 +34,17 @@ import torch
 
 from deberta.config import ModelHFFlashConfig  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
+from deberta.training.compile import prepare_flash_attention_batch_metadata  # noqa: E402
 
 try:  # noqa: E402
     from deberta.modeling.flashdeberta_attention import (  # type: ignore
         flashdeberta_stats_snapshot,
+        refresh_flashdeberta_runtime_config_from_env,
         reset_flashdeberta_stats,
     )
 except Exception:  # pragma: no cover
     flashdeberta_stats_snapshot = None
+    refresh_flashdeberta_runtime_config_from_env = None
     reset_flashdeberta_stats = None
 
 
@@ -157,16 +160,29 @@ def main() -> None:
 
     if str(args.mode) == "flash":
         os.environ.setdefault("FLASHDEBERTA_DEBUG_STATS", "1")
+        if callable(refresh_flashdeberta_runtime_config_from_env):
+            refresh_flashdeberta_runtime_config_from_env()
 
     cfg = _build_config(args)
     model = DebertaV2Model(cfg).to(device=device, dtype=dtype)
     model.train()
 
-    batch = _build_batch(args, device=device, pad_token_id=int(cfg.pad_token_id))
-    input_ids = batch["input_ids"]
-    attention_mask = batch["attention_mask"]
+    batch = _build_batch(args, device=torch.device("cpu"), pad_token_id=int(cfg.pad_token_id))
     active_tokens_per_batch = int(batch["active_tokens_per_batch"])
     slot_tokens_per_batch = int(batch["slot_tokens_per_batch"])
+    batch, flash_meta = prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=str(args.mode) == "flash",
+        flash_cfg=cfg.hf_flash,
+        route_device=device,
+    )
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = (
+        batch["attention_mask"].to(device) if isinstance(batch.get("attention_mask"), torch.Tensor) else None
+    )
+    if flash_meta is not None:
+        flash_meta = flash_meta.to(device)
 
     if callable(reset_flashdeberta_stats):
         reset_flashdeberta_stats()
@@ -178,7 +194,11 @@ def main() -> None:
     for _ in range(total_warmup):
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize(device)
-        out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            flash_meta=flash_meta,
+        ).last_hidden_state
         loss = out.float().pow(2).mean()
         loss.backward()
         torch.cuda.synchronize(device)
@@ -200,7 +220,11 @@ def main() -> None:
             torch.cuda.synchronize(device)
             start = time.perf_counter()
 
-            out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                flash_meta=flash_meta,
+            ).last_hidden_state
             loss = out.float().pow(2).mean()
             loss.backward()
 

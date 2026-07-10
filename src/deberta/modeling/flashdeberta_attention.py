@@ -83,7 +83,6 @@ from deberta.modeling.mask_utils import (
     build_doc_block_mask,
     doc_ids_from_segments,
     is_pairwise_mask,
-    is_prefix_padding_keep_mask,
     is_torch_compiling,
     mask_to_2d_keep_mask,
     normalize_keep_mask,
@@ -258,22 +257,6 @@ def _record_stat(name: str, value: int = 1) -> None:
     _FLASH_STATS[name] += int(value)
 
 
-def _mask4d_to_seqlens(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
-    """Convert a padding-style keep mask into per-example sequence lengths.
-
-    Supported mask shapes:
-    - ``(B, S)``
-    - ``(B, 1, 1, S)``
-
-    :param torch.Tensor attention_mask: Padding-style keep mask.
-    :param int seq_len: Expected sequence length.
-    :return torch.Tensor: Per-example sequence lengths with dtype ``int32``.
-    """
-
-    key_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-    return key_mask.sum(dim=-1, dtype=torch.int32)
-
-
 def _pairwise_mask_to_4d_keep_mask(
     attention_mask: torch.Tensor,
     *,
@@ -383,19 +366,6 @@ def _resolve_docblock_scalars(
         else flash_meta.doc_max_segment_length_host
     )
     return active_tokens, num_segments, max_segment_length
-
-
-def _seqlens_to_mask_2d(seq_lengths: torch.Tensor, *, seq_len: int) -> torch.Tensor:
-    """Build a canonical prefix-padding keep mask from per-example lengths.
-
-    :param torch.Tensor seq_lengths: Per-example active lengths with shape ``(B,)``.
-    :param int seq_len: Padded sequence length.
-    :return torch.Tensor: Boolean keep mask in ``(B,S)`` layout.
-    """
-
-    clipped = seq_lengths.to(dtype=torch.int32).clamp(min=0, max=int(seq_len))
-    positions = torch.arange(int(seq_len), device=clipped.device, dtype=torch.int32)
-    return positions.unsqueeze(0) < clipped.unsqueeze(-1)
 
 
 def _dense_bucket_index_cache_key(
@@ -547,31 +517,26 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "pairwise_mask",
                 "FlashDeBERTa attention does not support pairwise (B,S,S)/(B,1,S,S) masks; using eager attention.",
             )
-        if (
-            attention_mask is not None
-            and (flash_meta is None or flash_meta.seq_lengths is None)
-            and not (flash_meta is not None and flash_meta.is_cross_document())
-            and not is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
-        ):
-            # Without metadata lengths, the fixed/varlen routes would derive
-            # per-example prefix lengths from this mask, which is only faithful
-            # to eager semantics for exact-shape right-padded prefix masks.
-            # When flash_meta.seq_lengths is present the mask is not consulted;
-            # the metadata producer owns the prefix contract instead.
-            try:
-                prefix_ok = is_prefix_padding_keep_mask(attention_mask, seq_len=key_len)
-            except ValueError as exc:
+        if attention_mask is not None:
+            if flash_meta is None or not flash_meta.mask_contract_validated:
                 return (
-                    "padding_mask_shape",
-                    f"FlashDeBERTa padding routes require an exact (B,S) or (B,1,1,S) keep mask ({exc}); "
+                    "unvalidated_mask_metadata",
+                    "FlashDeBERTa requires mask metadata validated before the model boundary; "
+                    "using eager attention without inspecting device mask contents.",
+                )
+            expected_contract = "docblock" if flash_meta.is_cross_document() else "prefix"
+            if flash_meta.mask_contract != expected_contract:
+                return (
+                    "invalid_mask_contract",
+                    "FlashDeBERTa mask contract does not match the selected route: "
+                    f"expected={expected_contract!r}, got={flash_meta.mask_contract!r}; "
                     "using eager attention.",
                 )
-            if not prefix_ok:
+            if expected_contract == "prefix" and flash_meta.seq_lengths is None:
                 return (
-                    "non_prefix_padding_mask",
-                    "FlashDeBERTa fixed/varlen padding routes compress masks into right-padded prefix "
-                    "lengths; the supplied mask has holes or left padding, so eager attention is used "
-                    "to preserve native DeBERTa mask semantics.",
+                    "missing_prefix_lengths",
+                    "Validated FlashDeBERTa prefix metadata is missing sequence lengths; "
+                    "using eager attention.",
                 )
         if "p2p" in self.pos_att_type:
             return (
@@ -668,7 +633,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
-        attention_mask: torch.Tensor | None,
         flash_meta: FlashBatchMeta | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
@@ -679,7 +643,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
         :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
-        :param torch.Tensor | None attention_mask: Optional padding mask.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
@@ -688,8 +651,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
-        if seq_lengths is None and attention_mask is not None:
-            seq_lengths = _mask4d_to_seqlens(attention_mask, seq_len=int(key_layer.shape[-2]))
         if _RUNTIME_CONFIG.enable_debug_stats:
             _record_stat("flash_fixed_calls")
         return flashdeberta_fixed(
@@ -816,7 +777,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask: torch.Tensor,
-        flash_meta: FlashBatchMeta | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -827,7 +787,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param torch.Tensor attention_mask: Padding-style keep mask.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
@@ -835,11 +794,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_len = int(query_layer.shape[1])
-        seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
-        if seq_lengths is not None:
-            mask_2d = _seqlens_to_mask_2d(seq_lengths, seq_len=seq_len)
-        else:
-            mask_2d = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
+        mask_2d = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
         out = flashdeberta_varlen_padded(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -1024,6 +979,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "Refusing to fall back to a compact 2D padding mask because that would allow "
                 "cross-document attention."
             )
+        if not flash_meta.mask_contract_validated or flash_meta.mask_contract != "docblock":
+            raise RuntimeError("FlashDeBERTa doc-block eager fallback refuses unvalidated segment metadata.")
         doc_ids = doc_ids_from_segments(
             offsets=flash_meta.doc_segment_offsets,
             lengths=flash_meta.doc_segment_lengths,
@@ -1419,7 +1376,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 key_layer=key_layer,
                 value_layer=value_layer,
                 attention_mask=attention_mask,
-                flash_meta=flash_meta,
                 pos_key=pos_key,
                 pos_query=pos_query,
                 sm_scale=sm_scale,
@@ -1447,7 +1403,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     query_layer=query_layer,
                     key_layer=key_layer,
                     value_layer=value_layer,
-                    attention_mask=attention_mask,
                     flash_meta=flash_meta,
                     pos_key=pos_key,
                     pos_query=pos_query,
@@ -1462,7 +1417,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
 __all__ = [
     "FlashDisentangledSelfAttention",
-    "_mask4d_to_seqlens",
     "flashdeberta_import_error",
     "flashdeberta_stats_snapshot",
     "refresh_flashdeberta_runtime_config_from_env",

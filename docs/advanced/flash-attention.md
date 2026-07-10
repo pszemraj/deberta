@@ -45,21 +45,25 @@ shapes without a measured dense policy.
 
 The ordinary fixed and varlen routes accept only right-padded prefix masks in exact `(B,S)` or
 `(B,1,1,S)` form. Non-prefix masks use eager attention for that call; length mismatches raise.
-Training metadata preparation verifies the prefix contract before publishing `seq_lengths` for
-these routes.
+The collator derives and verifies `seq_lengths` from the CPU mask before device transfer. Batch
+preparation reconciles any supplied lengths and counters, then carries a static attestation into
+the model. Unattested device masks use eager attention without a tensor-to-Python layout check in
+each layer.
 
 Packed doc-block batches use a two-stage collator and batch-preparation contract described in the
 [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking). Dense doc-block
 attention consumes a pairwise keep mask. Ragged doc-block attention consumes the two-dimensional
-keep mask plus fixed-capacity segment descriptors. The doc-block routes do not use
-`FlashBatchMeta.seq_lengths`.
+keep mask plus fixed-capacity segment descriptors. Before transfer, validation proves that segments
+do not overlap, stay inside their batch rows, exactly cover active positions, match document
+boundaries, and agree with cumulative lengths. The doc-block routes do not use
+`FlashBatchMeta.seq_lengths`; only the validated metadata object reaches the model.
 
 Per-call eager fallbacks preserve semantics:
 
 - `output_attentions=true` uses eager attention to return `(B,H,S,S)` probabilities.
 - An explicit `relative_pos` tensor is forwarded through eager attention unchanged.
-- A doc-block fallback requires an explicit pairwise mask or complete segment metadata from which
-  it can rebuild one; it never degrades to a padding-only mask.
+- A doc-block fallback requires an explicit pairwise mask or validated segment metadata from which
+  it can rebuild one; it never trusts unattested descriptors or degrades to a padding-only mask.
 
 ## Configuration and overrides
 

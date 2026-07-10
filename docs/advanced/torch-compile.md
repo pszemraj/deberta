@@ -54,6 +54,9 @@ specialization changes which kernels launch, not what Dynamo sees.
 
 Two metadata contracts matter for graph stability:
 
+- Padded fixed/varlen batches carry mask-derived lengths plus a static prefix attestation. Route
+  dispatch reads only that Python-level contract; it does not call `torch.equal`, `.item()`, or
+  `bool(tensor)` in each layer. Device masks without an attestation take the eager route.
 - Ragged doc-block batches keep the 2D keep mask plus fixed-shape segment descriptors sized to
   `B*S`. The opaque doc-block op slices the active segment prefix, repacks those document spans
   into a ragged batch, runs the disentangled varlen kernels, and scatters results back into the

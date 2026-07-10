@@ -11,13 +11,10 @@ from deberta.modeling.rtd import attention_mask_to_active_tokens
 
 def _count_rtd_tokens_for_batch(
     batch: dict[str, torch.Tensor],
-    *,
-    pad_token_id: int | None,
 ) -> tuple[float, float]:
     """Return generator/discriminator active-token counts for one microbatch.
 
     :param dict[str, torch.Tensor] batch: Microbatch tensors.
-    :param int | None pad_token_id: Padding token id.
     :return tuple[float, float]: (generator_count, discriminator_count).
     """
     labels = batch["labels"]
@@ -25,7 +22,6 @@ def _count_rtd_tokens_for_batch(
     disc_active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
         attention_mask=batch.get("attention_mask"),
-        pad_token_id=pad_token_id,
     )
     disc_count = float(disc_active.sum().item())
     return gen_count, disc_count
@@ -45,7 +41,6 @@ def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=batch.get("attention_mask"),
-        pad_token_id=None,
     )
     return float(active.detach().sum().item())
 

@@ -775,12 +775,10 @@ def test_sync_discriminator_embeddings_if_available_supports_fsdp2_unshard_resha
 def test_count_rtd_tokens_for_batch_keeps_masked_positions_active_for_discriminator():
     batch = {
         "input_ids": torch.tensor([[1, 3, 11, 2, 0]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.bool),
         "labels": torch.tensor([[-100, 99, -100, -100, -100]], dtype=torch.long),
     }
-    gen_count, disc_count = _count_rtd_tokens_for_batch(
-        batch,
-        pad_token_id=0,
-    )
+    gen_count, disc_count = _count_rtd_tokens_for_batch(batch)
     assert gen_count == pytest.approx(1.0)
     assert disc_count == pytest.approx(4.0)
 
@@ -814,18 +812,17 @@ def test_count_input_tokens_for_batch_with_various_mask_shapes():
     assert _count_input_tokens_for_batch(batch_4d) == pytest.approx(2.0)
 
 
-def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_3d_masks():
+def test_attention_mask_to_active_tokens_treats_pairwise_mask_as_authoritative():
     input_ids = torch.tensor([[11, 12, 13, 0]], dtype=torch.long)
-    # Row 2 has diagonal=False but off-diagonal keep=True. Active-token recovery
-    # must respect diagonal activity even when pad_token_id is available.
-    # Row 3 is explicit pad and must remain inactive.
+    # Row 2 is a masked non-pad filler. Row 3 is an active pad-valued token.
+    # Numeric token identity must not override the pairwise mask diagonal.
     pair_keep = torch.tensor(
         [
             [
                 [1, 1, 0, 0],
                 [1, 1, 0, 0],
-                [1, 0, 0, 0],
-                [1, 0, 0, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
             ]
         ],
         dtype=torch.bool,
@@ -833,9 +830,8 @@ def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_3d_
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=pair_keep,
-        pad_token_id=0,
     )
-    expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+    expected = torch.tensor([[True, True, False, True]], dtype=torch.bool)
     assert torch.equal(active, expected)
 
 
@@ -850,7 +846,6 @@ def test_attention_mask_to_active_tokens_rejects_floating_masks() -> None:
         _ = attention_mask_to_active_tokens(
             input_ids=input_ids,
             attention_mask=torch.tensor([[0.0, -1.0, 0.0]], dtype=torch.float32),
-            pad_token_id=None,
         )
 
 
@@ -875,7 +870,6 @@ def test_attention_mask_to_active_tokens_uses_diagonal_not_any_for_3d_no_pad():
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=pair_keep,
-        pad_token_id=None,
     )
     # Diagonal: [True, True, False]
     expected = torch.tensor([[True, True, False]], dtype=torch.bool)
@@ -901,7 +895,6 @@ def test_attention_mask_to_active_tokens_uses_diagonal_for_4d_no_pad():
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=pair_keep,
-        pad_token_id=None,
     )
     expected = torch.tensor([[True, True, False]], dtype=torch.bool)
     assert torch.equal(active, expected)
@@ -914,7 +907,6 @@ def test_attention_mask_to_active_tokens_handles_4d_broadcast_no_pad():
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=broadcast_keep,
-        pad_token_id=None,
     )
     expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
     assert torch.equal(active, expected)
@@ -938,7 +930,6 @@ def test_attention_mask_to_active_tokens_uses_diagonal_activity_with_pad_for_4d_
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=pair_keep,
-        pad_token_id=0,
     )
     expected = torch.tensor([[True, True, False, False]], dtype=torch.bool)
     assert torch.equal(active, expected)

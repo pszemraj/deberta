@@ -81,7 +81,6 @@ def attention_mask_to_active_tokens(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
-    pad_token_id: int | None,
 ) -> torch.Tensor:
     """Convert optional attention mask variants into a 2D active-token mask.
 
@@ -92,22 +91,14 @@ def attention_mask_to_active_tokens(
 
     :param torch.Tensor input_ids: Input ids with shape ``(B,S)``.
     :param torch.Tensor | None attention_mask: Optional keep mask in rank-2/3/4 layout.
-    :param int | None pad_token_id: Optional padding id used when inferring activity.
     :return torch.Tensor: Boolean active-token mask with shape ``(B,S)``.
     """
 
     if attention_mask is None:
-        if pad_token_id is None:
-            return torch.ones_like(input_ids, dtype=torch.bool)
-        return input_ids.ne(int(pad_token_id))
+        return torch.ones_like(input_ids, dtype=torch.bool)
 
     mask = normalize_keep_mask(attention_mask)
-    active = reduce_keep_mask_to_2d(mask)
-    if mask.ndim > 2 and pad_token_id is not None:
-        # Pairwise/broadcast masks encode attention structure, not padding;
-        # re-intersect with padding activity derived from the token ids.
-        active = active & input_ids.ne(int(pad_token_id))
-    return active
+    return reduce_keep_mask_to_2d(mask)
 
 
 def _ensure_emd_pairwise_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -1086,11 +1077,9 @@ class DebertaV3RTDPretrainer(nn.Module):
             disc_hidden, attention_mask=attention_mask, flash_meta=flash_meta
         )
 
-        pad_token_id = getattr(self.disc_config, "pad_token_id", None)
         active = attention_mask_to_active_tokens(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
         )
 
         disc_active_f = active.to(dtype=torch.float32)

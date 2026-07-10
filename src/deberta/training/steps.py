@@ -231,7 +231,6 @@ def _collect_ga_window(
     train_iter: Iterator[dict[str, torch.Tensor]],
     ga_steps: int,
     token_weighted_ga: bool,
-    disc_pad_token_id: int | None,
     default_unweighted_token_count: float,
 ) -> tuple[list[tuple[dict[str, torch.Tensor], float, float]], int, float, float, float]:
     """Collect one accumulation window and per-window token counts.
@@ -239,7 +238,6 @@ def _collect_ga_window(
     :param Iterator[dict[str, torch.Tensor]] train_iter: Batch iterator.
     :param int ga_steps: Accumulation steps per window.
     :param bool token_weighted_ga: Token-weighted GA toggle.
-    :param int | None disc_pad_token_id: Optional discriminator pad token id.
     :param float default_unweighted_token_count: Fallback token count when token weighting is disabled.
     :return tuple[list[tuple[dict[str, torch.Tensor], float, float]], int, float, float, float]:
         Window payload and local token counters.
@@ -256,10 +254,7 @@ def _collect_ga_window(
         local_window_input_tokens += _count_input_tokens_for_batch(batch)
 
         if token_weighted_ga:
-            gen_count, disc_count = _count_rtd_tokens_for_batch(
-                batch,
-                pad_token_id=disc_pad_token_id,
-            )
+            gen_count, disc_count = _count_rtd_tokens_for_batch(batch)
             local_gen_tokens += gen_count
             local_disc_tokens += disc_count
         else:

@@ -271,7 +271,6 @@ def test_collator_emits_document_ids_when_packed():
     assert doc_ids[0, 3].item() == doc_ids[0, 5].item()
     # Cross-document ids differ.
     assert doc_ids[0, 1].item() != doc_ids[0, 3].item()
-    assert torch.equal(batch["flash_seq_lengths"], torch.tensor([6], dtype=torch.int32))
     assert batch["flash_active_tokens"] == 6
     assert torch.equal(batch["flash_doc_segment_offsets"][:2], torch.tensor([0, 3], dtype=torch.int32))
     assert torch.equal(batch["flash_doc_segment_lengths"][:2], torch.tensor([3, 3], dtype=torch.int32))
@@ -324,7 +323,7 @@ def test_collator_skips_document_ids_for_single_doc_packed_chunk():
     assert "attention_mask" not in batch
 
 
-def _assert_active_token_definitions_agree(batch, *, expected_active: int, tok) -> None:
+def _assert_active_token_definitions_agree(batch, *, expected_active: int) -> None:
     """Pin every production active-token definition for one collator batch."""
 
     from deberta.modeling.rtd import attention_mask_to_active_tokens
@@ -336,13 +335,12 @@ def _assert_active_token_definitions_agree(batch, *, expected_active: int, tok) 
     tokens_per_sec_count = _count_input_tokens_for_batch(batch)
     assert int(tokens_per_sec_count) == expected_active
 
-    _, disc_ga_count = _count_rtd_tokens_for_batch(batch, pad_token_id=tok.pad_token_id)
+    _, disc_ga_count = _count_rtd_tokens_for_batch(batch)
     assert int(disc_ga_count) == expected_active
 
     rtd_loss_active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
         attention_mask=batch.get("attention_mask"),
-        pad_token_id=tok.pad_token_id,
     )
     assert int(rtd_loss_active.sum().item()) == expected_active
     assert torch.equal(rtd_loss_active, batch["doc_ids"].ne(0))
@@ -355,7 +353,7 @@ def _assert_active_token_definitions_agree(batch, *, expected_active: int, tok) 
         flash_enabled=True,
     )
     assert meta is not None
-    assert int(prepared["flash_active_tokens"]) == expected_active
+    assert not any(key.startswith("flash_") for key in prepared)
     assert int(meta.active_tokens_host) == expected_active
 
 
@@ -389,7 +387,7 @@ def test_active_token_definitions_agree_for_packed_docblock_batches():
     batch = coll(features)
     assert "doc_ids" in batch
     assert batch.get("attention_mask") is not None
-    _assert_active_token_definitions_agree(batch, expected_active=10, tok=tok)
+    _assert_active_token_definitions_agree(batch, expected_active=10)
 
 
 def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
@@ -412,7 +410,62 @@ def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
     batch = coll(features)
     assert "doc_ids" in batch
     assert batch.get("attention_mask") is None
-    _assert_active_token_definitions_agree(batch, expected_active=6, tok=tok)
+    _assert_active_token_definitions_agree(batch, expected_active=6)
+
+
+def test_packed_document_ids_follow_attention_mask_not_token_values():
+    """Active pad-valued tokens stay live while masked non-pad fillers stay dead."""
+
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+    )
+    batch = coll(
+        [
+            {
+                "input_ids": [
+                    tok.cls_token_id,
+                    11,
+                    tok.pad_token_id,
+                    tok.sep_token_id,
+                    12,
+                    tok.sep_token_id,
+                    99,
+                ],
+                "attention_mask": [1, 1, 1, 1, 1, 1, 0],
+                "special_tokens_mask": [1, 0, 1, 1, 0, 1, 0],
+            }
+        ]
+    )
+
+    assert batch["doc_ids"][0, 2].item() != 0
+    assert batch["doc_ids"][0, 6].item() == 0
+    assert batch["flash_active_tokens"] == 6
+
+
+def test_collator_replaces_dataset_flash_metadata_with_its_own_attestation():
+    """Dataset columns cannot attest a mask contract on the collator's behalf."""
+
+    coll = DebertaV3ElectraCollator(
+        tokenizer=DummyTokenizer(vocab_size=128),
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+    )
+    batch = coll(
+        [
+            {
+                "input_ids": [1, 11, 12, 2],
+                "attention_mask": [1, 0, 1, 0],
+                "special_tokens_mask": [1, 0, 0, 1],
+                "flash_seq_lengths": [3, 0, 0, 0],
+                "flash_mask_contract_validated": [1, 1, 1, 1],
+            }
+        ]
+    )
+
+    assert not any(key.startswith("flash_") for key in batch)
 
 
 def test_build_doc_block_mask_matches_expected_structure():
@@ -2938,7 +2991,7 @@ def test_rope_model_supports_output_hidden_states():
     assert len(out_tuple[1]) == (cfg.num_hidden_layers + 1)
 
 
-def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
+def test_pretrainer_missing_attention_mask_means_all_tokens_are_active():
 
     pytest.importorskip("transformers")
 
@@ -3016,12 +3069,11 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
         disc_loss_weight=50.0,
     )
 
-    torch.testing.assert_close(
-        out_missing.disc_token_count, out_explicit.disc_token_count, rtol=0.0, atol=0.0
-    )
+    assert out_missing.disc_token_count.item() == input_ids.numel()
+    assert out_explicit.disc_token_count.item() == explicit_mask.sum().item()
 
 
-def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
+def test_pretrainer_disc_loss_supervises_all_tokens_without_attention_mask():
 
     pytest.importorskip("transformers")
 
@@ -3071,8 +3123,7 @@ def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
         gen_loss_weight=1.0,
         disc_loss_weight=50.0,
     )
-    expected_active = (input_ids != 0).sum()
-    assert int(out.disc_token_count.item()) == int(expected_active.item())
+    assert int(out.disc_token_count.item()) == input_ids.numel()
 
 
 def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_special(monkeypatch):

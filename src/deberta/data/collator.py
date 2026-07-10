@@ -10,7 +10,12 @@ from typing import Any
 
 import torch
 
-from deberta.modeling.mask_utils import build_doc_segment_metadata, doc_segment_metadata_host_stats
+from deberta.modeling.mask_utils import (
+    build_doc_segment_metadata,
+    build_validated_prefix_lengths,
+    doc_segment_metadata_host_stats,
+    validate_doc_segments_against_mask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +104,7 @@ class DebertaV3ElectraCollator:
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         features = self._harmonize_optional_attention_masks(features)
+        needs_padding = self._needs_padding(features)
 
         # Let tokenizer handle padding for non-packed datasets.
         pad_kwargs: dict[str, Any] = {
@@ -107,7 +113,7 @@ class DebertaV3ElectraCollator:
         }
         # If no padding is needed and the dataset does not provide attention_mask, avoid
         # materializing an all-ones mask.
-        if not any("attention_mask" in f for f in features) and not self._needs_padding(features):
+        if not any("attention_mask" in f for f in features) and not needs_padding:
             pad_kwargs["return_attention_mask"] = False
         try:
             batch = self.tokenizer.pad(features, **pad_kwargs)
@@ -116,14 +122,17 @@ class DebertaV3ElectraCollator:
             pad_kwargs.pop("return_attention_mask", None)
             batch = self.tokenizer.pad(features, **pad_kwargs)
 
-        # Safety fallback: if tokenizer did not emit an attention mask, infer one from
-        # padded input_ids when pad tokens are present.
-        if "attention_mask" not in batch:
-            pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-            if pad_token_id is not None:
-                attn = batch["input_ids"].ne(int(pad_token_id))
-                if not bool(attn.all().item()):
-                    batch["attention_mask"] = attn.long()
+        # Flash metadata is an internal attestation created from this collated
+        # batch. Never inherit stale or user-supplied claims from dataset rows.
+        for key in tuple(batch):
+            if key.startswith("flash_"):
+                batch.pop(key)
+
+        if "attention_mask" not in batch and needs_padding:
+            raise ValueError(
+                "tokenizer.pad must return attention_mask when it adds padding; "
+                "token IDs are not a valid substitute for token liveness."
+            )
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         inferred_special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
@@ -177,14 +186,25 @@ class DebertaV3ElectraCollator:
         :param torch.Tensor doc_ids: Compact document ids in ``(B,S)`` layout.
         """
 
-        keep_mask = doc_ids.ne(0)
-        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        attention_mask = batch.get("attention_mask")
+        keep_mask = (
+            attention_mask.to(dtype=torch.bool)
+            if isinstance(attention_mask, torch.Tensor)
+            else torch.ones_like(doc_ids, dtype=torch.bool)
+        )
         segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(doc_ids)
+        validate_doc_segments_against_mask(
+            attention_mask=keep_mask,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            seq_len=int(doc_ids.shape[-1]),
+            doc_ids=doc_ids,
+            cu_seqlens=cu_seqlens,
+        )
         num_segments, max_segment_length, _ = doc_segment_metadata_host_stats(
             segment_lengths,
             active_tokens=int(active_tokens),
         )
-        batch["flash_seq_lengths"] = seq_lengths
         batch["flash_active_tokens"] = int(active_tokens)
         batch["flash_active_tokens_scalar"] = torch.tensor(int(active_tokens), dtype=torch.int32)
         batch["flash_doc_num_segments"] = int(num_segments)
@@ -194,6 +214,8 @@ class DebertaV3ElectraCollator:
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
+        batch["flash_mask_contract"] = "docblock"
+        batch["flash_mask_contract_validated"] = True
 
     @staticmethod
     def _attach_flash_padding_metadata(batch: dict[str, Any]) -> None:
@@ -205,12 +227,29 @@ class DebertaV3ElectraCollator:
         attention_mask = batch.get("attention_mask")
         if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
             return
-        keep_mask = attention_mask.to(dtype=torch.bool)
-        seq_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        if attention_mask.shape != batch["input_ids"].shape:
+            raise ValueError(
+                "attention_mask must match input_ids before flash metadata is attested; "
+                f"got mask={tuple(attention_mask.shape)}, "
+                f"input_ids={tuple(batch['input_ids'].shape)}."
+            )
+        try:
+            seq_lengths = build_validated_prefix_lengths(
+                attention_mask,
+                seq_len=int(batch["input_ids"].shape[-1]),
+            )
+        except ValueError as exc:
+            # Arbitrary legal keep masks remain eager. Do not publish a lossy
+            # length summary or an attestation for them.
+            if "right-padded prefix mask" not in str(exc):
+                raise
+            return
         active_tokens = int(seq_lengths.sum(dtype=torch.int32))
         batch["flash_seq_lengths"] = seq_lengths
         batch["flash_active_tokens"] = active_tokens
         batch["flash_active_tokens_scalar"] = torch.tensor(active_tokens, dtype=torch.int32)
+        batch["flash_mask_contract"] = "prefix"
+        batch["flash_mask_contract_validated"] = True
 
     def _harmonize_optional_attention_masks(self, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Ensure optional ``attention_mask`` keys are consistent before tokenizer padding.
@@ -456,15 +495,16 @@ class DebertaV3ElectraCollator:
             return None
         sep_id = int(sep_id)
 
-        sep_positions = input_ids.eq(sep_id) & special_tokens_mask
-
-        pad_id = getattr(self.tokenizer, "pad_token_id", None)
-        if attention_mask is not None and attention_mask.ndim == 2:
+        if attention_mask is not None:
+            if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "Packed attention_mask must match input_ids shape; "
+                    f"got mask={tuple(attention_mask.shape)}, input_ids={tuple(input_ids.shape)}."
+                )
             active = attention_mask.to(dtype=torch.bool)
-        elif pad_id is not None:
-            active = input_ids.ne(int(pad_id))
         else:
             active = torch.ones_like(input_ids, dtype=torch.bool)
+        sep_positions = input_ids.eq(sep_id) & special_tokens_mask & active
 
         # Packed batches that contain only single-document chunks have no internal
         # separators and do not need doc-blocking metadata.
@@ -485,8 +525,7 @@ class DebertaV3ElectraCollator:
             cls_positions = input_ids.eq(int(cls_id)) & active
             # Keep CLS in document 1 so strict packed doc-blocking stays block-diagonal.
             doc_ids = doc_ids.masked_fill(cls_positions, 1)
-        if pad_id is not None:
-            doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
+        doc_ids = doc_ids.masked_fill(~active, 0)
 
         return doc_ids
 

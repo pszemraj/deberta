@@ -10,6 +10,7 @@ HF DeBERTa backbone under explicit fixed or varlen flash routing.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -53,16 +54,7 @@ def _route_meta(sample: bench.BatchSample, route: str) -> FlashBatchMeta:
 
     if sample.flash_meta is None:
         return FlashBatchMeta(route_hint=str(route))
-    return FlashBatchMeta(
-        seq_lengths=sample.flash_meta.seq_lengths,
-        doc_segment_offsets=sample.flash_meta.doc_segment_offsets,
-        doc_segment_lengths=sample.flash_meta.doc_segment_lengths,
-        doc_cu_seqlens=sample.flash_meta.doc_cu_seqlens,
-        active_tokens_host=sample.flash_meta.active_tokens_host,
-        doc_num_segments_host=sample.flash_meta.doc_num_segments_host,
-        doc_max_segment_length_host=sample.flash_meta.doc_max_segment_length_host,
-        route_hint=str(route),
-    )
+    return dataclasses.replace(sample.flash_meta, route_hint=str(route))
 
 
 def main() -> None:

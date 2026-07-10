@@ -376,14 +376,10 @@ def sample_flash_batches(
         input_ids = batch["input_ids"].detach().clone()
         seq_len = int(input_ids.shape[-1])
         batch_size = int(input_ids.shape[0])
-        active_value = batch.get("flash_active_tokens", 0)
-        active_from_batch = (
-            int(active_value.item()) if isinstance(active_value, torch.Tensor) else int(active_value)
-        )
         active_tokens = (
             int(flash_meta.active_tokens_host)
-            if flash_meta is not None and flash_meta.active_tokens_host
-            else active_from_batch
+            if flash_meta is not None and flash_meta.active_tokens_host is not None
+            else batch_size * seq_len
         )
 
         density_bucket: str | None = None

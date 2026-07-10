@@ -189,12 +189,14 @@ def _discriminator_logits_and_loss(
     if flash_meta is not None and getattr(model, "_discriminator_accepts_flash_kwargs", False):
         disc_forward_kwargs["flash_meta"] = flash_meta
     disc_out = model.discriminator(**disc_forward_kwargs)
-    logits = model.discriminator_head(disc_out.last_hidden_state, attention_mask=batch.get("attention_mask"))
-    pad_token_id = getattr(model.disc_config, "pad_token_id", None)
+    logits = model.discriminator_head(
+        disc_out.last_hidden_state,
+        attention_mask=batch.get("attention_mask"),
+        flash_meta=flash_meta,
+    )
     active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
         attention_mask=batch.get("attention_mask"),
-        pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
     )
     active_f = active.to(dtype=torch.float32)
     loss = (
@@ -373,7 +375,6 @@ def main() -> None:
     active = attention_mask_to_active_tokens(
         input_ids=eager_batch["input_ids"],
         attention_mask=eager_batch.get("attention_mask"),
-        pad_token_id=getattr(eager_model.disc_config, "pad_token_id", None),
     )
     report: dict[str, Any] = {
         "config": str(args.config),
