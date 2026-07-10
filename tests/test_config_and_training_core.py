@@ -106,8 +106,24 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
         data=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
         train=make_train_config(max_steps=1),
     )
-    cfg2 = apply_dotted_override(cfg, "logging.wandb.watch=all")
+    cfg2 = apply_dotted_override(cfg, "model.backbone_type=rope")
+    assert cfg2.train.objective.mask_token_prob == pytest.approx(0.8)
+    assert cfg2.train.objective.random_token_prob == pytest.approx(0.1)
+    assert cfg2.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg2.optim.adam.epsilon == pytest.approx(1e-8)
+    assert cfg2.optim.scheduler.warmup_steps == 1_000
+
+    cfg2 = apply_dotted_override(cfg2, "model.backbone_type=hf_deberta_v2")
+    assert cfg2.train.objective.mask_token_prob == pytest.approx(1.0)
+    assert cfg2.train.objective.random_token_prob == pytest.approx(0.0)
+    assert cfg2.train.objective.disc_loss_weight == pytest.approx(10.0)
+    assert cfg2.optim.adam.epsilon == pytest.approx(1e-6)
+    assert cfg2.optim.scheduler.warmup_steps == 10_000
+
+    cfg2 = apply_dotted_override(cfg2, "model.backbone_type=rope")
+    cfg2 = apply_dotted_override(cfg2, "logging.wandb.watch=all")
     cfg2 = apply_dotted_override(cfg2, "optim.scheduler.warmup_steps=123")
+    cfg2 = apply_dotted_override(cfg2, "model.backbone_type=hf_deberta_v2")
     assert cfg2.logging.wandb.watch == "all"
     assert int(cfg2.optim.scheduler.warmup_steps) == 123
 

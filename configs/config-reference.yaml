@@ -1004,21 +1004,23 @@ train:
     # [train.objective.mask_token_prob]
     # type: float
     # schema default: 1.0
-    # default: literal 1.0
+    # default: when omitted, 1.0 for hf_deberta_v2 and 0.8 for rope
     # required: optional
     # values: finite number >= 0; sum with random_token_prob must be <= 1
     # contract: conditional probability that a selected token becomes [MASK]. The remaining probability
-    #   after mask+random keeps the original token. This file uses the native parity value 1.0.
+    #   after mask+random keeps the original token. Explicit values are never replaced by the backbone
+    #   profile. This file uses the native parity value 1.0.
     mask_token_prob: 1.0
 
     # [train.objective.random_token_prob]
     # type: float
     # schema default: 0.0
-    # default: literal 0.0
+    # default: when omitted, 0.0 for hf_deberta_v2 and 0.1 for rope
     # required: optional
     # values: finite number >= 0; sum with mask_token_prob must be <= 1
     # contract: conditional probability that a selected token becomes a sampled random token. Special/control
-    #   ids are excluded. This file uses the native parity value 0.0.
+    #   ids are excluded. Explicit values are never replaced by the backbone profile. This file uses the
+    #   native parity value 0.0.
     random_token_prob: 0.0
 
     # [train.objective.mlm_max_ngram]
@@ -1054,11 +1056,12 @@ train:
     # [train.objective.disc_loss_weight]
     # type: float
     # schema default: 10.0
-    # default: literal 10.0
+    # default: when omitted, 10.0 for hf_deberta_v2 and 50.0 for rope
     # required: optional
     # values: finite number >= 0; at least one objective weight must be > 0
     # contract: multiplies discriminator RTD loss. 0 disables discriminator optimization in decoupled mode.
-    #   This file uses the native parity value 10.0.
+    #   Explicit values are never replaced by the backbone profile. This file uses the native parity value
+    #   10.0.
     disc_loss_weight: 10.0
 
   checkpoint:
@@ -1200,11 +1203,12 @@ optim:
     # [optim.adam.epsilon]
     # type: float
     # schema default: 1e-6
-    # default: literal 1e-6
+    # default: when omitted, 1e-6 for hf_deberta_v2 and 1e-8 for rope
     # required: optional
     # values: finite number > 0
-    # contract: Adam denominator epsilon. This file uses native parity value 1e-6. Copying 1e-8 explicitly
-    #   with hf_deberta_v2 disables the computed parity default.
+    # contract: Adam denominator epsilon. Explicit values are never replaced by the backbone profile. At
+    #   optimizer construction, bf16 raises values below 1e-6 to 1e-6 for stability. This file uses the
+    #   native parity value 1e-6.
     epsilon: 1e-6
 
   scheduler:
@@ -1223,11 +1227,12 @@ optim:
     # [optim.scheduler.warmup_steps]
     # type: int
     # schema default: 10000
-    # default: literal 10000
+    # default: when omitted, 10000 for hf_deberta_v2 and 1000 for rope
     # required: optional
     # values: integer >= 0
     # contract: optimizer steps spent warming the learning rate. Ignored by scheduler.type=constant. This
-    #   file uses native parity value 10000; ensure it is meaningfully smaller than train.max_steps.
+    #   file uses native parity value 10000; explicit values are never replaced by the backbone profile.
+    #   Ensure warmup is meaningfully smaller than train.max_steps.
     warmup_steps: 10000
 
   # [optim.weight_decay]

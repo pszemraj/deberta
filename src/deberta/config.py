@@ -6,7 +6,7 @@ import dataclasses
 import math
 import warnings
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import InitVar, asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
 
@@ -87,6 +87,27 @@ _TORCH_COMPILE_SCOPE_ALIASES = {
     "generator_ffn": "gen_ffn",
     "disc_ffn": "disc_ffn",
     "discriminator_ffn": "disc_ffn",
+}
+
+# The literal dataclass defaults below describe the default hf_deberta_v2
+# profile. Config-file omissions still need to resolve against the selected
+# backbone without overwriting values explicitly supplied in YAML/JSON or by a
+# dotted CLI override.
+_BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
+    "hf_deberta_v2": {
+        "train.objective.mask_token_prob": 1.0,
+        "train.objective.random_token_prob": 0.0,
+        "train.objective.disc_loss_weight": 10.0,
+        "optim.adam.epsilon": 1e-6,
+        "optim.scheduler.warmup_steps": 10_000,
+    },
+    "rope": {
+        "train.objective.mask_token_prob": 0.8,
+        "train.objective.random_token_prob": 0.1,
+        "train.objective.disc_loss_weight": 50.0,
+        "optim.adam.epsilon": 1e-8,
+        "optim.scheduler.warmup_steps": 1_000,
+    },
 }
 _TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
 _TORCH_COMPILE_BACKEND_ALIASES = {
@@ -553,6 +574,70 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    _explicit_fields: InitVar[frozenset[str] | None] = None
+
+    def __post_init__(self, _explicit_fields: frozenset[str] | None) -> None:
+        """Resolve omitted fields against the selected backbone profile.
+
+        :param frozenset[str] | None _explicit_fields: Dotted input paths, or None for programmatic inference.
+        """
+        if _explicit_fields is None:
+            schema_profile = _BACKBONE_PROFILE_DEFAULTS["hf_deberta_v2"]
+            explicit = frozenset(
+                path
+                for path, schema_default in schema_profile.items()
+                if _nested_get(self, path) != schema_default
+            )
+        else:
+            explicit = frozenset(_explicit_fields)
+        object.__setattr__(self, "_explicit_field_paths", explicit)
+
+        profile = _BACKBONE_PROFILE_DEFAULTS.get(str(self.model.backbone_type).strip().lower())
+        if profile is None:
+            return
+
+        objective_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("train.objective.") and path not in explicit
+        }
+        adam_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("optim.adam.") and path not in explicit
+        }
+        scheduler_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("optim.scheduler.") and path not in explicit
+        }
+
+        object.__setattr__(
+            self,
+            "train",
+            replace(
+                self.train,
+                objective=replace(self.train.objective, **objective_updates),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "optim",
+            replace(
+                self.optim,
+                adam=replace(self.optim.adam, **adam_updates),
+                scheduler=replace(self.optim.scheduler, **scheduler_updates),
+            ),
+        )
+
+
+def _explicit_config_fields(cfg: Config) -> frozenset[str]:
+    """Return non-serialized explicit-field provenance for a config bundle.
+
+    :param Config cfg: Config bundle.
+    :return frozenset[str]: Explicit dotted field paths.
+    """
+    return frozenset(getattr(cfg, "_explicit_field_paths", frozenset()))
 
 
 def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
@@ -1637,6 +1722,23 @@ def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, 
     return sections
 
 
+def _collect_mapping_leaf_paths(value: Any, *, prefix: str = "") -> set[str]:
+    """Collect dotted leaf paths from a nested config mapping.
+
+    :param Any value: Nested config value.
+    :param str prefix: Current dotted path.
+    :return set[str]: Dotted leaf paths explicitly present in the mapping.
+    """
+    if not isinstance(value, dict):
+        return {prefix} if prefix else set()
+
+    paths: set[str] = set()
+    for key, item in value.items():
+        child = f"{prefix}.{key}" if prefix else str(key)
+        paths.update(_collect_mapping_leaf_paths(item, prefix=child))
+    return paths
+
+
 def _replace_from_mapping_recursive(cfg_obj: Any, mapping: dict[str, Any], *, section_name: str) -> Any:
     """Apply mapping values onto a frozen dataclass recursively.
 
@@ -1771,12 +1873,17 @@ def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]])
         LoggingConfig(), section_maps.get("logging", {}), section_name="logging"
     )
 
+    explicit_fields: set[str] = set()
+    for section_name, section_mapping in section_maps.items():
+        explicit_fields.update(_collect_mapping_leaf_paths(section_mapping, prefix=section_name))
+
     cfg = Config(
         model=model_cfg,
         data=data_cfg,
         train=train_cfg,
         optim=optim_cfg,
         logging=logging_cfg,
+        _explicit_fields=frozenset(explicit_fields),
     )
     return cfg
 
@@ -1813,10 +1920,10 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
         )
 
     root = parts[0]
-    if root not in {f.name for f in fields(Config)}:
+    public_roots = {f.name for f in fields(Config) if not f.name.startswith("_")}
+    if root not in public_roots:
         raise ValueError(
-            "Unknown override section "
-            f"{root!r}; expected one of {', '.join(sorted(f.name for f in fields(Config)))}."
+            f"Unknown override section {root!r}; expected one of {', '.join(sorted(public_roots))}."
         )
 
     def _resolve_override_leaf_type(obj: Any, remaining: list[str], full_path: str) -> Any:
@@ -1842,7 +1949,11 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
     leaf_type = _resolve_override_leaf_type(root_obj, parts[1:], path)
     coerced_value = _coerce_override_value(raw_value, leaf_type)
     new_root = _replace_path(root_obj, parts[1:], coerced_value)
-    new_cfg = replace(cfg, **{root: new_root})
+    new_cfg = replace(
+        cfg,
+        **{root: new_root},
+        _explicit_fields=_explicit_config_fields(cfg) | {path},
+    )
 
     return new_cfg
 
@@ -1884,6 +1995,8 @@ def iter_leaf_paths_for_dataclass(cls: type[Any], *, prefix: str = "") -> list[t
     out: list[tuple[str, Any]] = []
     type_hints = get_type_hints(cls)
     for f in fields(cls):
+        if f.name.startswith("_"):
+            continue
         path = f"{prefix}.{f.name}" if prefix else str(f.name)
         field_type = type_hints.get(f.name, f.type)
         target_t, _allows_none = unwrap_optional_type(field_type)

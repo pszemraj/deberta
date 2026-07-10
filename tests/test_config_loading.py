@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -7,9 +8,11 @@ import pytest
 from _config_factories import make_model_config, make_optim_config, make_train_config
 
 from deberta.config import (
+    Config,
     ModelConfig,
     OptimConfig,
     TrainConfig,
+    apply_dotted_override,
     load_config,
     validate_data_config,
     validate_model_config,
@@ -19,6 +22,48 @@ from deberta.config import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_programmatic_config_resolves_rope_profile_without_serializing_provenance() -> None:
+    cfg = Config(model=ModelConfig(backbone_type="rope"))
+
+    assert cfg.train.objective.mask_token_prob == pytest.approx(0.8)
+    assert cfg.train.objective.random_token_prob == pytest.approx(0.1)
+    assert cfg.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg.optim.adam.epsilon == pytest.approx(1e-8)
+    assert cfg.optim.scheduler.warmup_steps == 1_000
+    assert set(dataclasses.asdict(cfg)) == {"model", "data", "train", "optim", "logging"}
+
+
+def test_programmatic_config_preserves_custom_profile_values() -> None:
+    cfg = Config(
+        model=ModelConfig(backbone_type="rope"),
+        train=make_train_config(
+            objective={
+                "mask_token_prob": 0.6,
+                "random_token_prob": 0.2,
+                "disc_loss_weight": 7.0,
+            }
+        ),
+        optim=make_optim_config(
+            adam={"epsilon": 2e-7},
+            scheduler={"warmup_steps": 77},
+        ),
+    )
+
+    assert cfg.train.objective.mask_token_prob == pytest.approx(0.6)
+    assert cfg.train.objective.random_token_prob == pytest.approx(0.2)
+    assert cfg.train.objective.disc_loss_weight == pytest.approx(7.0)
+    assert cfg.optim.adam.epsilon == pytest.approx(2e-7)
+    assert cfg.optim.scheduler.warmup_steps == 77
+
+    cfg = apply_dotted_override(cfg, "model.backbone_type=hf_deberta_v2")
+    cfg = apply_dotted_override(cfg, "model.backbone_type=rope")
+    assert cfg.train.objective.mask_token_prob == pytest.approx(0.6)
+    assert cfg.train.objective.random_token_prob == pytest.approx(0.2)
+    assert cfg.train.objective.disc_loss_weight == pytest.approx(7.0)
+    assert cfg.optim.adam.epsilon == pytest.approx(2e-7)
+    assert cfg.optim.scheduler.warmup_steps == 77
 
 
 def test_load_yaml_nested(tmp_path: Path):
@@ -52,6 +97,11 @@ def test_load_yaml_nested(tmp_path: Path):
     assert cfg_nested.train.checkpoint.overwrite_output_dir is True
     assert cfg_nested.train.objective.mlm_max_ngram == 3
     assert cfg_nested.train.mixed_precision == "bf16"
+    assert cfg_nested.train.objective.mask_token_prob == pytest.approx(0.8)
+    assert cfg_nested.train.objective.random_token_prob == pytest.approx(0.1)
+    assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg_nested.optim.adam.epsilon == pytest.approx(1e-8)
+    assert cfg_nested.optim.scheduler.warmup_steps == 1_000
 
 
 def test_load_json_nested(tmp_path: Path):
@@ -64,8 +114,18 @@ def test_load_json_nested(tmp_path: Path):
                     "source": {"dataset_name": "HuggingFaceFW/fineweb-edu"},
                     "packing": {"max_seq_length": 96},
                 },
-                "train": {"objective": {"disc_loss_weight": 50.0}},
-                "optim": {"lr": {"generator": 3.0e-4}},
+                "train": {
+                    "objective": {
+                        "mask_token_prob": 1.0,
+                        "random_token_prob": 0.0,
+                        "disc_loss_weight": 10.0,
+                    }
+                },
+                "optim": {
+                    "lr": {"generator": 3.0e-4},
+                    "adam": {"epsilon": 1.0e-6},
+                    "scheduler": {"warmup_steps": 10_000},
+                },
             }
         ),
         encoding="utf-8",
@@ -74,7 +134,11 @@ def test_load_json_nested(tmp_path: Path):
     assert cfg_nested.model.rope.ffn_type == "mlp"
     assert cfg_nested.data.packing.max_seq_length == 96
     assert cfg_nested.optim.lr.generator == pytest.approx(3.0e-4)
-    assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg_nested.train.objective.mask_token_prob == pytest.approx(1.0)
+    assert cfg_nested.train.objective.random_token_prob == pytest.approx(0.0)
+    assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(10.0)
+    assert cfg_nested.optim.adam.epsilon == pytest.approx(1e-6)
+    assert cfg_nested.optim.scheduler.warmup_steps == 10_000
 
 
 def test_load_yaml_hf_flash_config(tmp_path: Path):
