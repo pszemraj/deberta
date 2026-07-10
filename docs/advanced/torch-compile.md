@@ -62,6 +62,9 @@ Two metadata contracts matter for graph stability:
   into a ragged batch, runs the disentangled varlen kernels, and scatters results back into the
   packed layout. The fixed-shape descriptors keep the compiled `masked_docblock_*` entrypoints
   from recompiling when the number of documents per packed batch changes.
+- Packed objective metadata is also fixed-shape: `position_ids (B,S)` passes through the compiled
+  backbone, while `doc_context_index (B,S)` is consumed by the eager RTD head outside the compiled
+  scope. Document count changes do not change either tensor's shape.
 - Dense (unpadded) batches route through a fast path that takes no flash metadata at all;
   dense-route metadata is semantically empty by contract, so nothing dynamic threads through the
   Dynamo guards.

@@ -6,6 +6,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any
 
 import torch
@@ -103,6 +104,7 @@ class DebertaV3ElectraCollator:
             )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        self._validate_structural_doc_id_types(features)
         features = self._harmonize_optional_attention_masks(features)
         needs_padding = self._needs_padding(features)
 
@@ -127,6 +129,9 @@ class DebertaV3ElectraCollator:
         for key in tuple(batch):
             if key.startswith("flash_"):
                 batch.pop(key)
+        batch.pop("doc_context_index", None)
+        if self._packed_sequences and self._block_cross_document_attention:
+            batch.pop("position_ids", None)
 
         if "attention_mask" not in batch and needs_padding:
             raise ValueError(
@@ -144,17 +149,34 @@ class DebertaV3ElectraCollator:
             # so corruption targets stay aligned with forbidden sampling ids.
             special_tokens_mask = special_tokens_mask.bool() | inferred_special_tokens_mask
 
-        doc_ids = (
-            self._compute_document_ids(
-                input_ids=batch["input_ids"],
-                special_tokens_mask=special_tokens_mask,
-                attention_mask=batch.get("attention_mask"),
-            )
-            if self._packed_sequences and self._block_cross_document_attention
-            else None
-        )
+        supplied_doc_ids = batch.pop("doc_ids", None)
+        doc_ids = None
+        if self._packed_sequences and self._block_cross_document_attention:
+            if supplied_doc_ids is not None:
+                if not isinstance(supplied_doc_ids, torch.Tensor):
+                    raise TypeError("Packed doc_ids must be a tensor after tokenizer padding.")
+                if (
+                    supplied_doc_ids.dtype == torch.bool
+                    or supplied_doc_ids.is_floating_point()
+                    or supplied_doc_ids.is_complex()
+                ):
+                    raise TypeError("Packed doc_ids must use an integer dtype.")
+                if supplied_doc_ids.shape != batch["input_ids"].shape:
+                    raise ValueError(
+                        "Packed doc_ids must match input_ids shape; "
+                        f"got doc_ids={tuple(supplied_doc_ids.shape)}, "
+                        f"input_ids={tuple(batch['input_ids'].shape)}."
+                    )
+                doc_ids = supplied_doc_ids.to(dtype=torch.long)
+            else:
+                doc_ids = self._compute_document_ids(
+                    input_ids=batch["input_ids"],
+                    special_tokens_mask=special_tokens_mask,
+                    attention_mask=batch.get("attention_mask"),
+                )
         if doc_ids is not None:
             batch["doc_ids"] = doc_ids
+            self._attach_document_objective_metadata(batch=batch, doc_ids=doc_ids)
             self._attach_flash_doc_metadata(batch=batch, doc_ids=doc_ids)
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
@@ -177,6 +199,27 @@ class DebertaV3ElectraCollator:
         batch["input_ids"] = input_ids
         batch["labels"] = labels
         return batch
+
+    @staticmethod
+    def _validate_structural_doc_id_types(features: list[dict[str, Any]]) -> None:
+        """Reject structural document ids that padding could silently coerce.
+
+        :param list[dict[str, Any]] features: Raw dataset rows before tokenizer padding.
+        :raises TypeError: If a row's document ids are not integer-valued.
+        """
+
+        for feature in features:
+            values = feature.get("doc_ids")
+            if values is None:
+                continue
+            if isinstance(values, torch.Tensor):
+                invalid = values.dtype == torch.bool or values.is_floating_point() or values.is_complex()
+            elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                invalid = any(isinstance(value, bool) or not isinstance(value, Integral) for value in values)
+            else:
+                invalid = True
+            if invalid:
+                raise TypeError("Packed doc_ids must use an integer dtype.")
 
     @staticmethod
     def _attach_flash_doc_metadata(*, batch: dict[str, Any], doc_ids: torch.Tensor) -> None:
@@ -216,6 +259,57 @@ class DebertaV3ElectraCollator:
         batch["flash_doc_cu_seqlens"] = cu_seqlens
         batch["flash_mask_contract"] = "docblock"
         batch["flash_mask_contract_validated"] = True
+
+    def _attach_document_objective_metadata(
+        self,
+        *,
+        batch: dict[str, Any],
+        doc_ids: torch.Tensor,
+    ) -> None:
+        """Attach document-local positions and per-token CLS context indices.
+
+        :param dict[str, Any] batch: Collated batch mapping.
+        :param torch.Tensor doc_ids: Validated document ids in ``(B,S)`` layout.
+        :raises ValueError: If any active segment does not have standalone CLS/SEP boundaries.
+        """
+
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        active = (
+            attention_mask.to(dtype=torch.bool)
+            if isinstance(attention_mask, torch.Tensor)
+            else torch.ones_like(doc_ids, dtype=torch.bool)
+        )
+        if not torch.equal(doc_ids.ne(0), active):
+            raise ValueError("Packed doc_ids liveness disagrees with attention_mask.")
+
+        batch_size, seq_len = doc_ids.shape
+        positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        previous = torch.zeros_like(doc_ids)
+        previous[:, 1:] = doc_ids[:, :-1]
+        segment_starts = active & doc_ids.ne(previous)
+        start_positions = torch.where(segment_starts, positions, torch.zeros_like(positions))
+        doc_context_index = torch.cummax(start_positions, dim=-1).values
+
+        cls_token_id = getattr(self.tokenizer, "cls_token_id", None)
+        if cls_token_id is None:
+            raise ValueError("Packed document segments require tokenizer.cls_token_id.")
+        context_tokens = input_ids.gather(1, doc_context_index)
+        if bool((active & context_tokens.ne(int(cls_token_id))).any().item()):
+            raise ValueError("Every packed document segment must begin with its own CLS token.")
+
+        sep_token_id = getattr(self.tokenizer, "sep_token_id", None)
+        if sep_token_id is None:
+            raise ValueError("Packed document segments require tokenizer.sep_token_id.")
+        following = torch.zeros_like(doc_ids)
+        following[:, :-1] = doc_ids[:, 1:]
+        segment_ends = active & doc_ids.ne(following)
+        if bool(input_ids[segment_ends].ne(int(sep_token_id)).any().item()):
+            raise ValueError("Every packed document segment must end with its own SEP token.")
+
+        position_ids = (positions - doc_context_index).masked_fill(~active, 0)
+        batch["position_ids"] = position_ids
+        batch["doc_context_index"] = doc_context_index.masked_fill(~active, 0)
 
     @staticmethod
     def _attach_flash_padding_metadata(batch: dict[str, Any]) -> None:
@@ -490,10 +584,10 @@ class DebertaV3ElectraCollator:
         if special_tokens_mask.ndim != 2 or special_tokens_mask.shape != input_ids.shape:
             return None
 
+        cls_id = getattr(self.tokenizer, "cls_token_id", None)
         sep_id = getattr(self.tokenizer, "sep_token_id", None)
-        if sep_id is None or input_ids.shape[1] < 3:
+        if cls_id is None or sep_id is None or input_ids.shape[1] < 3:
             return None
-        sep_id = int(sep_id)
 
         if attention_mask is not None:
             if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
@@ -504,30 +598,13 @@ class DebertaV3ElectraCollator:
             active = attention_mask.to(dtype=torch.bool)
         else:
             active = torch.ones_like(input_ids, dtype=torch.bool)
-        sep_positions = input_ids.eq(sep_id) & special_tokens_mask & active
-
-        # Packed batches that contain only single-document chunks have no internal
-        # separators and do not need doc-blocking metadata.
-        internal_sep_positions = sep_positions[:, 1:-1] & active[:, 1:-1]
-        if not bool(internal_sep_positions.any().item()):
+        document_starts = input_ids.eq(int(cls_id)) & special_tokens_mask & active
+        if not bool(document_starts.sum(dim=-1).gt(1).any().item()):
+            separator_count = (input_ids.eq(int(sep_id)) & special_tokens_mask & active).sum(dim=-1)
+            if bool(separator_count.gt(1).any().item()):
+                raise ValueError("Cross-document packing requires every document segment to begin with CLS.")
             return None
-
-        # Collapse contiguous separator runs into one boundary increment so packed
-        # "... [SEP] [SEP] ..." tails do not create phantom empty-document segments.
-        sep_prev = torch.zeros_like(sep_positions)
-        sep_prev[:, 1:] = sep_positions[:, :-1]
-        sep_boundaries = sep_positions & (~sep_prev)
-        sep_before = sep_boundaries.long().cumsum(dim=1) - sep_boundaries.long()
-        doc_ids = sep_before + 1
-
-        cls_id = getattr(self.tokenizer, "cls_token_id", None)
-        if cls_id is not None:
-            cls_positions = input_ids.eq(int(cls_id)) & active
-            # Keep CLS in document 1 so strict packed doc-blocking stays block-diagonal.
-            doc_ids = doc_ids.masked_fill(cls_positions, 1)
-        doc_ids = doc_ids.masked_fill(~active, 0)
-
-        return doc_ids
+        return document_starts.to(dtype=torch.long).cumsum(dim=-1).masked_fill(~active, 0)
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor

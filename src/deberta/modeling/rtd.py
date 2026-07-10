@@ -290,6 +290,21 @@ class MaskedLMHead(nn.Module):
         return F.linear(x, w, b)
 
 
+def _initialize_new_head(*, head: nn.Module, backbone: nn.Module, name: str) -> None:
+    """Initialize a newly attached task head without touching its backbone.
+
+    :param nn.Module head: Newly constructed task head.
+    :param nn.Module backbone: Backbone providing the HF initialization contract.
+    :param str name: Component name used in errors.
+    :raises TypeError: If the backbone cannot initialize newly attached modules.
+    """
+
+    initialize = getattr(backbone, "_initialize_weights", None)
+    if not callable(initialize):
+        raise TypeError(f"{name} backbone does not expose the required _initialize_weights contract.")
+    head.apply(initialize)
+
+
 class EnhancedMaskDecoder(nn.Module):
     """Enhanced Mask Decoder (EMD) for DeBERTa-v2/v3.
 
@@ -434,13 +449,8 @@ class EnhancedMaskDecoder(nn.Module):
         z_states = self._position_states(
             embeddings=embeddings, position_ids=position_ids, hidden_size=hidden_size
         )
-        # Parity with upstream DeBERTa EMD path: normalize position states with
-        # embedding LayerNorm before combining with penultimate hidden states.
-        emb_ln = getattr(embeddings, "LayerNorm", None)
-        if callable(emb_ln):
-            z_states = emb_ln(z_states)
-
-        # Initial query = z + KV (matches original `z_states += hidden_states`).
+        # EMD consumes the raw, optionally projected position embedding. The
+        # input embedding LayerNorm belongs to the token-input path, not z.
         query_states = z_states + kv_states
 
         # Resolve relative-position ids and relative embedding table if available.
@@ -523,54 +533,67 @@ class RTDHead(nn.Module):
         self.classifier = nn.Linear(hidden_size, 1)
 
     @staticmethod
-    def _use_global_cls_context(
+    def _requires_document_context(
         attention_mask: torch.Tensor | None,
         flash_meta: FlashBatchMeta | None = None,
     ) -> bool:
-        """Return whether global CLS conditioning is safe for this batch.
+        """Return whether the attention graph encodes multiple documents.
 
-        Pairwise masks with an explicit query axis encode per-query visibility
-        (for example packed doc-block masks). In that regime, adding one global
-        CLS vector to all tokens would reintroduce cross-segment information flow.
-        Flash doc-block routes encode the same packed-document semantics in
-        ``FlashBatchMeta`` while shipping a compact 2D keep mask, so doc-block
-        metadata must disable global CLS exactly like a pairwise mask does.
+        Pairwise masks are the eager/dense representation of document blocking;
+        ragged Flash routes carry the same contract in ``FlashBatchMeta``.
 
         :param torch.Tensor | None attention_mask: Optional attention keep mask.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return bool: ``True`` when global CLS conditioning should be applied.
+        :return bool: Whether a per-token document context map is required.
         """
         if flash_meta is not None and flash_meta.is_cross_document():
-            return False
-        if attention_mask is None:
             return True
+        if attention_mask is None:
+            return False
 
         mask = attention_mask
         if mask.ndim == 4:
             mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if mask.ndim == 3 and mask.shape[-2] != 1:
-            return False
-        return True
+        return bool(mask.ndim == 3 and mask.shape[-2] != 1)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        doc_context_index: torch.Tensor | None = None,
         flash_meta: FlashBatchMeta | None = None,
     ) -> torch.Tensor:
         """Compute per-token replacement logits.
 
         :param torch.Tensor hidden_states: Discriminator hidden states ``(B,S,H)``.
         :param torch.Tensor | None attention_mask: Optional discriminator attention mask.
+        :param torch.Tensor | None doc_context_index: Optional CLS index per token in ``(B,S)``.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :raises RuntimeError: If document-block attention lacks a context map.
+        :raises ValueError: If the context map shape or dtype is invalid.
         :return torch.Tensor: Per-token logits ``(B,S)``.
         """
-        # hidden_states: (B,S,H)
-        if self._use_global_cls_context(attention_mask, flash_meta=flash_meta):
-            ctx = hidden_states[:, 0:1, :]  # (B,1,H)
-            x = self.norm(hidden_states + ctx)
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        if doc_context_index is None:
+            if self._requires_document_context(attention_mask, flash_meta=flash_meta):
+                raise RuntimeError(
+                    "Packed RTD attention requires doc_context_index so each token uses its document CLS."
+                )
+            context = hidden_states[:, 0:1, :]
         else:
-            x = self.norm(hidden_states)
+            if tuple(doc_context_index.shape) != (batch_size, seq_len):
+                raise ValueError(
+                    "doc_context_index must match hidden_states (B,S); "
+                    f"got {tuple(doc_context_index.shape)} for {(batch_size, seq_len)}."
+                )
+            if doc_context_index.dtype == torch.bool or doc_context_index.dtype.is_floating_point:
+                raise ValueError("doc_context_index must use an integer dtype.")
+            gather_index = doc_context_index.to(device=hidden_states.device, dtype=torch.long)
+            context = hidden_states.gather(
+                dim=1,
+                index=gather_index.unsqueeze(-1).expand(-1, -1, hidden_size),
+            )
+        x = self.norm(hidden_states + context)
         x = self.dense(x)
         x = self.act(x)
         return self.classifier(x).squeeze(-1)  # (B,S)
@@ -637,12 +660,16 @@ class DebertaV3RTDPretrainer(nn.Module):
     ) -> None:
         """Initialize RTD pretrainer wrapper.
 
-        :param nn.Module discriminator_backbone: Discriminator encoder backbone.
-        :param nn.Module generator_backbone: Generator encoder backbone.
+        :param nn.Module discriminator_backbone: Discriminator encoder backbone with the
+            ``_initialize_weights`` contract used for newly attached task heads.
+        :param nn.Module generator_backbone: Generator encoder backbone with the
+            ``_initialize_weights`` contract used for newly attached task heads.
         :param Any disc_config: Discriminator config.
         :param Any gen_config: Generator config.
         :param str embedding_sharing: Embedding-sharing policy (none|es|gdes).
         :param Iterable[int] | None additional_forbidden_token_ids: Extra ids excluded from sampling.
+        :raises TypeError: If either backbone cannot initialize its task head.
+        :raises ValueError: If generator ``z_steps`` conflicts with Enhanced Mask Decoding.
         """
         super().__init__()
         self.disc_config = disc_config
@@ -653,14 +680,33 @@ class DebertaV3RTDPretrainer(nn.Module):
         self._generator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.generator)
         self._discriminator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.discriminator)
 
+        pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
+        z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
+        if not pos_biased and z_steps > 1:
+            raise ValueError(
+                "RTD Enhanced Mask Decoding is not equivalent to backbone z_steps; "
+                "set generator z_steps=0 when position_biased_input=false."
+            )
+        self._use_emd = not pos_biased
+
         # Generator heads
         self.generator_lm_head = MaskedLMHead(gen_config)
+        _initialize_new_head(
+            head=self.generator_lm_head,
+            backbone=self.generator,
+            name="generator",
+        )
 
         # EMD module (only active when gen_config.position_biased_input=False)
         self.enhanced_mask_decoder = EnhancedMaskDecoder(num_last_layer_passes=2)
 
         # Discriminator head
         self.discriminator_head = RTDHead(disc_config)
+        _initialize_new_head(
+            head=self.discriminator_head,
+            backbone=self.discriminator,
+            name="discriminator",
+        )
 
         self.embedding_sharing = str(embedding_sharing or "none")
 
@@ -937,6 +983,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
         flash_meta: FlashBatchMeta | None = None,
     ) -> RTDGeneratorPhaseOutput:
@@ -946,6 +993,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor labels: MLM labels with ``-100`` ignore index.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional document-local position ids.
         :param float sampling_temperature: Generator sampling temperature.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return RTDGeneratorPhaseOutput: Generator loss and corruption artifacts.
@@ -961,14 +1009,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         masked_idx = torch.nonzero(masked_flat, as_tuple=False).squeeze(-1)  # (N,)
         gen_token_count = masked_flat.sum().to(dtype=torch.float32)
 
-        # EMD is only applicable for DeBERTa-v2/v3 when position_biased_input=False.
-        #
-        # When the generator backbone already applies iterative last-layer passes
-        # via z_steps>1, its output is already in the EMD-style regime; running the
-        # standalone EMD module again would double-apply that path.
-        pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
-        z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
-        use_emd = not pos_biased and z_steps <= 1
+        # EMD is the RTD objective-owned decoder whenever absolute positions
+        # are absent from the generator input embedding.
+        use_emd = self._use_emd
 
         gen_forward_kwargs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -976,6 +1019,8 @@ class DebertaV3RTDPretrainer(nn.Module):
             "token_type_ids": token_type_ids,
             "return_dict": True,
         }
+        if position_ids is not None:
+            gen_forward_kwargs["position_ids"] = position_ids
         if flash_meta is not None and self._generator_accepts_flash_kwargs:
             gen_forward_kwargs["flash_meta"] = flash_meta
         if use_emd:
@@ -1004,6 +1049,7 @@ class DebertaV3RTDPretrainer(nn.Module):
                 attention_mask=attention_mask,
                 embeddings=self.generator.embeddings,
                 encoder=self.generator.encoder,
+                position_ids=position_ids,
                 flash_meta=flash_meta if self._generator_accepts_flash_kwargs else None,
             )
         else:
@@ -1050,6 +1096,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_labels: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        doc_context_index: torch.Tensor | None = None,
         flash_meta: FlashBatchMeta | None = None,
     ) -> RTDDiscriminatorPhaseOutput:
         """Run discriminator scoring only, given prebuilt corrupted ids/labels.
@@ -1059,6 +1107,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor disc_labels: Binary RTD labels.
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional document-local position ids.
+        :param torch.Tensor | None doc_context_index: Optional CLS index per token.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return RTDDiscriminatorPhaseOutput: Discriminator loss and metrics.
         """
@@ -1069,12 +1119,17 @@ class DebertaV3RTDPretrainer(nn.Module):
             "token_type_ids": token_type_ids,
             "return_dict": True,
         }
+        if position_ids is not None:
+            disc_forward_kwargs["position_ids"] = position_ids
         if flash_meta is not None and self._discriminator_accepts_flash_kwargs:
             disc_forward_kwargs["flash_meta"] = flash_meta
         disc_out = self.discriminator(**disc_forward_kwargs)
         disc_hidden = disc_out.last_hidden_state
         disc_logits = self.discriminator_head(
-            disc_hidden, attention_mask=attention_mask, flash_meta=flash_meta
+            disc_hidden,
+            attention_mask=attention_mask,
+            doc_context_index=doc_context_index,
+            flash_meta=flash_meta,
         )
 
         active = attention_mask_to_active_tokens(
@@ -1113,6 +1168,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        doc_context_index: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
         gen_loss_weight: float = 1.0,
         disc_loss_weight: float = 50.0,
@@ -1127,6 +1184,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None labels: MLM labels with ``-100`` ignore index.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional document-local position ids.
+        :param torch.Tensor | None doc_context_index: Optional CLS index per token.
         :param float sampling_temperature: Generator sampling temperature.
         :param float gen_loss_weight: Generator loss weight.
         :param float disc_loss_weight: Discriminator loss weight.
@@ -1146,6 +1205,7 @@ class DebertaV3RTDPretrainer(nn.Module):
                 attention_mask=attention_mask,
                 labels=labels,
                 token_type_ids=token_type_ids,
+                position_ids=position_ids,
                 sampling_temperature=sampling_temperature,
                 flash_meta=flash_meta,
             )
@@ -1160,6 +1220,8 @@ class DebertaV3RTDPretrainer(nn.Module):
                 disc_labels=disc_labels,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                doc_context_index=doc_context_index,
                 flash_meta=flash_meta,
             )
         if phase_norm != "both":
@@ -1172,6 +1234,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
             token_type_ids=token_type_ids,
+            position_ids=position_ids,
             sampling_temperature=sampling_temperature,
             flash_meta=flash_meta,
         )
@@ -1193,6 +1256,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_phase = self.forward_discriminator_phase(
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            doc_context_index=doc_context_index,
             input_ids=input_ids,
             corrupted_input_ids=gen_phase.corrupted_input_ids,
             disc_labels=gen_phase.disc_labels,

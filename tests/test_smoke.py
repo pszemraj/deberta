@@ -64,6 +64,95 @@ def test_packed_streaming_marks_internal_sep_as_special():
             assert stm[i] == 1
 
 
+def test_docblock_streaming_gives_every_segment_its_own_cls() -> None:
+    tok = DummyTokenizer(vocab_size=64)
+    ds = PackedStreamingDataset(
+        hf_dataset=[{"text": "a b"}, {"text": "c d"}],
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            block_cross_document_attention=True,
+        ),
+        process_index=0,
+        num_processes=1,
+    )
+
+    rows = list(ds)
+    assert len(rows) == 1
+    assert rows[0]["input_ids"][0] == tok.cls_token_id
+    assert rows[0]["input_ids"][3] == tok.sep_token_id
+    assert rows[0]["input_ids"][4] == tok.cls_token_id
+    assert rows[0]["input_ids"][7] == tok.sep_token_id
+    assert rows[0]["doc_ids"] == [1, 1, 1, 1, 2, 2, 2, 2]
+
+
+def test_docblock_streaming_rows_collate_with_structural_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the normal packer-to-collator structural ``doc_ids`` path."""
+
+    tok = DummyTokenizer(vocab_size=64)
+    dataset = PackedStreamingDataset(
+        hf_dataset=[{"text": "a b"}, {"text": "c d"}, {"text": "e"}],
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            block_cross_document_attention=True,
+        ),
+    )
+    rows = list(dataset)
+    assert len(rows) == 2
+    assert "attention_mask" not in rows[0]
+    assert "attention_mask" in rows[1]
+
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+    )
+    monkeypatch.setattr(
+        collator,
+        "_compute_document_ids",
+        lambda **_kwargs: pytest.fail("packer-supplied doc_ids must remain authoritative"),
+    )
+    batch = collator(rows)
+
+    assert torch.equal(batch["doc_ids"][0], torch.tensor([1, 1, 1, 1, 2, 2, 2, 2]))
+    assert torch.equal(batch["doc_ids"][1], torch.tensor([1, 1, 1, 0, 0, 0, 0, 0]))
+    assert torch.equal(batch["position_ids"][0], torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]))
+    assert torch.equal(batch["position_ids"][1], torch.tensor([0, 1, 2, 0, 0, 0, 0, 0]))
+    assert torch.equal(batch["doc_context_index"][0], torch.tensor([0, 0, 0, 0, 4, 4, 4, 4]))
+
+
+def test_docblock_streaming_long_document_chunks_keep_standalone_boundaries() -> None:
+    tok = DummyTokenizer(vocab_size=64)
+    dataset = PackedStreamingDataset(
+        hf_dataset=[{"text": "a b c d e f g h i"}, {"text": "j"}],
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            block_cross_document_attention=True,
+        ),
+    )
+
+    for row in dataset:
+        doc_ids = row["doc_ids"]
+        for document_id in sorted(set(doc_ids) - {0}):
+            positions = [idx for idx, value in enumerate(doc_ids) if value == document_id]
+            assert row["input_ids"][positions[0]] == tok.cls_token_id
+            assert row["input_ids"][positions[-1]] == tok.sep_token_id
+
+
 def test_packed_streaming_flushes_tail_instead_of_dropping():
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a b"}, {"text": "c d"}, {"text": "e"}]
@@ -249,8 +338,15 @@ def test_collator_emits_document_ids_when_packed():
 
     features = [
         {
-            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+            "input_ids": [
+                tok.cls_token_id,
+                11,
+                tok.sep_token_id,
+                tok.cls_token_id,
+                12,
+                tok.sep_token_id,
+            ],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
         }
     ]
     batch = coll(features)
@@ -275,9 +371,11 @@ def test_collator_emits_document_ids_when_packed():
     assert torch.equal(batch["flash_doc_segment_offsets"][:2], torch.tensor([0, 3], dtype=torch.int32))
     assert torch.equal(batch["flash_doc_segment_lengths"][:2], torch.tensor([3, 3], dtype=torch.int32))
     assert torch.equal(batch["flash_doc_cu_seqlens"][:3], torch.tensor([0, 3, 6], dtype=torch.int32))
+    assert torch.equal(batch["position_ids"], torch.tensor([[0, 1, 2, 0, 1, 2]]))
+    assert torch.equal(batch["doc_context_index"], torch.tensor([[0, 0, 0, 3, 3, 3]]))
 
 
-def test_collator_treats_consecutive_internal_separators_as_single_boundary():
+def test_collator_rejects_legacy_packing_without_per_document_cls():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
@@ -293,14 +391,36 @@ def test_collator_treats_consecutive_internal_separators_as_single_boundary():
             "special_tokens_mask": [1, 0, 1, 1, 0, 1],
         }
     ]
-    batch = coll(features)
-    assert "doc_ids" in batch
-    doc_ids = batch["doc_ids"]
+    with pytest.raises(ValueError, match="every document segment to begin with CLS"):
+        coll(features)
 
-    # Token in doc1 should differ from doc2 token.
-    assert doc_ids[0, 1].item() != doc_ids[0, 4].item()
-    # Consecutive [SEP] should not create an extra phantom boundary — pos 3 and 4 share a doc.
-    assert doc_ids[0, 3].item() == doc_ids[0, 4].item()
+
+@pytest.mark.parametrize(
+    ("doc_ids", "expected_error"),
+    [
+        ([1.0, 1.0, 1.0], "integer dtype"),
+        ([1, 1, 1], "end with its own SEP"),
+    ],
+)
+def test_collator_rejects_invalid_structural_document_metadata(
+    doc_ids: list[int] | list[float],
+    expected_error: str,
+) -> None:
+    tok = DummyTokenizer(vocab_size=128)
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(mlm_probability=0.2),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+    )
+    feature = {
+        "input_ids": [tok.cls_token_id, 11, 12],
+        "special_tokens_mask": [1, 0, 0],
+        "doc_ids": doc_ids,
+    }
+
+    with pytest.raises((TypeError, ValueError), match=expected_error):
+        collator([feature])
 
 
 def test_collator_skips_document_ids_for_single_doc_packed_chunk():
@@ -355,6 +475,8 @@ def _assert_active_token_definitions_agree(batch, *, expected_active: int) -> No
     assert meta is not None
     assert not any(key.startswith("flash_") for key in prepared)
     assert int(meta.active_tokens_host) == expected_active
+    assert torch.equal(prepared["position_ids"], batch["position_ids"])
+    assert torch.equal(prepared["doc_context_index"], batch["doc_context_index"])
 
 
 def test_active_token_definitions_agree_for_packed_docblock_batches():
@@ -376,8 +498,15 @@ def test_active_token_definitions_agree_for_packed_docblock_batches():
     # Rows of different lengths force a padded tail on the shorter row.
     features = [
         {
-            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+            "input_ids": [
+                tok.cls_token_id,
+                11,
+                tok.sep_token_id,
+                tok.cls_token_id,
+                13,
+                tok.sep_token_id,
+            ],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
         },
         {
             "input_ids": [tok.cls_token_id, 21, 22, tok.sep_token_id],
@@ -403,8 +532,15 @@ def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
 
     features = [
         {
-            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+            "input_ids": [
+                tok.cls_token_id,
+                11,
+                tok.sep_token_id,
+                tok.cls_token_id,
+                13,
+                tok.sep_token_id,
+            ],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
         }
     ]
     batch = coll(features)
@@ -431,19 +567,20 @@ def test_packed_document_ids_follow_attention_mask_not_token_values():
                     11,
                     tok.pad_token_id,
                     tok.sep_token_id,
+                    tok.cls_token_id,
                     12,
                     tok.sep_token_id,
                     99,
                 ],
-                "attention_mask": [1, 1, 1, 1, 1, 1, 0],
-                "special_tokens_mask": [1, 0, 1, 1, 0, 1, 0],
+                "attention_mask": [1, 1, 1, 1, 1, 1, 1, 0],
+                "special_tokens_mask": [1, 0, 1, 1, 1, 0, 1, 0],
             }
         ]
     )
 
     assert batch["doc_ids"][0, 2].item() != 0
-    assert batch["doc_ids"][0, 6].item() == 0
-    assert batch["flash_active_tokens"] == 6
+    assert batch["doc_ids"][0, 7].item() == 0
+    assert batch["flash_active_tokens"] == 7
 
 
 def test_collator_replaces_dataset_flash_metadata_with_its_own_attestation():
@@ -1282,8 +1419,15 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
     class _BaseSignatureBackbone(torch.nn.Module):
         def __init__(self, cfg: SimpleNamespace) -> None:
             super().__init__()
+            self.cfg = cfg
             self.embeddings = _Embeddings(cfg.vocab_size, cfg.hidden_size)
             self.proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size)
+
+        def _initialize_weights(self, module: torch.nn.Module) -> None:
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
 
         def forward(
             self,
@@ -1385,9 +1529,7 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
         assert not bool((sampled == int(sid)).any().item())
 
 
-def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_pretrainer_rejects_z_steps_as_enhanced_mask_decoder_substitute() -> None:
     pytest.importorskip("transformers")
 
     from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
@@ -1413,36 +1555,22 @@ def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_act
     )
     disc_cfg = DebertaV2Config(**common_kwargs, z_steps=0)
     gen_cfg = DebertaV2Config(**common_kwargs, z_steps=2)
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=DebertaV2Model(disc_cfg),
-        generator_backbone=DebertaV2Model(gen_cfg),
-        disc_config=disc_cfg,
-        gen_config=gen_cfg,
-        embedding_sharing="none",
-    )
-
-    def _raise_if_called(*args, **kwargs) -> torch.Tensor:
-        del args, kwargs
-        raise AssertionError("EnhancedMaskDecoder should be skipped when generator z_steps>1.")
-
-    monkeypatch.setattr(model.enhanced_mask_decoder, "forward", _raise_if_called)
-
-    input_ids = torch.tensor([[1, 7, 8, 9, 2, 0]], dtype=torch.long)
-    labels = torch.full_like(input_ids, -100)
-    labels[0, 2] = input_ids[0, 2]
-
-    out = model.forward_generator_phase(
-        input_ids=input_ids,
-        attention_mask=input_ids.ne(0).long(),
-        labels=labels,
-        sampling_temperature=1.0,
-    )
-
-    assert torch.isfinite(out.gen_loss_raw)
-    assert int(out.gen_token_count.item()) == 1
+    with pytest.raises(ValueError, match="not equivalent to backbone z_steps"):
+        DebertaV3RTDPretrainer(
+            discriminator_backbone=DebertaV2Model(disc_cfg),
+            generator_backbone=DebertaV2Model(gen_cfg),
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
+            embedding_sharing="none",
+        )
 
 
-def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Module | None = None):
+def _make_emd_harness(
+    last_layer: torch.nn.Module,
+    *,
+    layer_norm: torch.nn.Module | None = None,
+    num_last_layer_passes: int = 1,
+):
     """Build an EnhancedMaskDecoder harness around one instrumented last layer.
 
     The three EMD contract tests share this scaffolding and differ only in the
@@ -1452,8 +1580,8 @@ def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Modul
 
     class _PositionEmbeddings(torch.nn.Module):
         def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-            bsz, seq_len = position_ids.shape
-            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
+            offsets = torch.tensor([0.25, -0.5, 1.0, -1.5], dtype=torch.float32)
+            return position_ids.to(dtype=torch.float32).unsqueeze(-1) + offsets
 
     class _Embeddings(torch.nn.Module):
         def __init__(self) -> None:
@@ -1466,7 +1594,7 @@ def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Modul
             super().__init__()
             self.layer = torch.nn.ModuleList([layer])
 
-    decoder = EnhancedMaskDecoder(num_last_layer_passes=1)
+    decoder = EnhancedMaskDecoder(num_last_layer_passes=num_last_layer_passes)
     encoder = _Encoder(last_layer)
     embeddings = _Embeddings()
     kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
@@ -1475,23 +1603,20 @@ def _make_emd_harness(last_layer: torch.nn.Module, *, layer_norm: torch.nn.Modul
     return decoder, encoder, embeddings, kv_states, encoder_hidden_states, masked_positions
 
 
-def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition():
+def test_enhanced_mask_decoder_adds_raw_position_states_without_embedding_norm():
 
     pytest.importorskip("transformers")
 
-    class _ShiftNorm(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls = 0
-
+    class _ForbiddenNorm(torch.nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            self.calls += 1
-            return x + 5.0
+            del x
+            raise AssertionError("EMD must not apply the input embedding LayerNorm to raw positions.")
 
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.query_states_seen: torch.Tensor | None = None
+            self.hidden_states_seen: list[torch.Tensor] = []
+            self.query_states_seen: list[torch.Tensor] = []
 
         def forward(
             self,
@@ -1503,15 +1628,18 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
             relative_pos: torch.Tensor | None = None,
             rel_embeddings: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, None]:
-            del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
+            del attention_mask, output_attentions, relative_pos, rel_embeddings
             assert query_states is not None
-            self.query_states_seen = query_states.detach().clone()
-            return query_states, None
+            self.hidden_states_seen.append(hidden_states.detach().clone())
+            self.query_states_seen.append(query_states.detach().clone())
+            pass_number = float(len(self.query_states_seen))
+            return query_states + pass_number, None
 
     last_layer = _LastLayer()
-    shift_norm = _ShiftNorm()
     decoder, encoder, embeddings, kv_states, encoder_hidden_states, masked_positions = _make_emd_harness(
-        last_layer, layer_norm=shift_norm
+        last_layer,
+        layer_norm=_ForbiddenNorm(),
+        num_last_layer_passes=2,
     )
     attention_mask = torch.ones((1, 3), dtype=torch.bool)
 
@@ -1523,11 +1651,18 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
         encoder=encoder,
     )
 
-    expected_query = kv_states + 5.0
-    assert shift_norm.calls == 1
-    assert last_layer.query_states_seen is not None
-    torch.testing.assert_close(last_layer.query_states_seen, expected_query, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(masked, expected_query[:, 1:2, :].reshape(1, 4), rtol=0.0, atol=0.0)
+    position_ids = torch.arange(kv_states.shape[1]).unsqueeze(0)
+    raw_positions = embeddings.position_embeddings(position_ids)
+    first_query = kv_states + raw_positions
+    first_output = first_query + 1.0
+    second_output = first_output + 2.0
+    assert len(last_layer.query_states_seen) == 2
+    assert len(last_layer.hidden_states_seen) == 2
+    torch.testing.assert_close(last_layer.hidden_states_seen[0], kv_states, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(last_layer.hidden_states_seen[1], kv_states, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(last_layer.query_states_seen[0], first_query, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(last_layer.query_states_seen[1], first_output, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(masked, second_output[:, 1:2, :].reshape(1, 4), rtol=0.0, atol=0.0)
 
 
 def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
@@ -1660,6 +1795,74 @@ def test_masked_lm_head_has_only_tied_projection_bias():
     assert head.bias.shape == (cfg.vocab_size,)
 
 
+@pytest.mark.parametrize("backbone_type", ["native", "rope"])
+def test_pretrainer_initializes_only_new_heads_from_backbone_contract(backbone_type: str) -> None:
+    pytest.importorskip("transformers")
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    initializer_range = 0.005
+    if backbone_type == "native":
+        from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+
+        cfg = DebertaV2Config(
+            vocab_size=96,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=128,
+            max_position_embeddings=16,
+            type_vocab_size=0,
+            initializer_range=initializer_range,
+            position_biased_input=True,
+        )
+        generator = DebertaV2Model(cfg)
+        discriminator = DebertaV2Model(cfg)
+    else:
+        from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+
+        cfg = DebertaRoPEConfig(
+            vocab_size=96,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=128,
+            max_position_embeddings=16,
+            type_vocab_size=0,
+            initializer_range=initializer_range,
+        )
+        generator = DebertaRoPEModel(cfg)
+        discriminator = DebertaRoPEModel(cfg)
+
+    generator_before = {name: value.detach().clone() for name, value in generator.named_parameters()}
+    discriminator_before = {name: value.detach().clone() for name, value in discriminator.named_parameters()}
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=discriminator,
+        generator_backbone=generator,
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    )
+
+    for name, value in generator.named_parameters():
+        torch.testing.assert_close(value, generator_before[name], rtol=0.0, atol=0.0)
+    for name, value in discriminator.named_parameters():
+        torch.testing.assert_close(value, discriminator_before[name], rtol=0.0, atol=0.0)
+
+    linears = (
+        model.generator_lm_head.transform.dense,
+        model.discriminator_head.dense,
+        model.discriminator_head.classifier,
+    )
+    for linear in linears:
+        assert float(linear.weight.detach().std(unbiased=False)) == pytest.approx(
+            initializer_range,
+            rel=0.35,
+        )
+        assert linear.bias is not None
+        assert torch.count_nonzero(linear.bias).item() == 0
+    assert torch.count_nonzero(model.generator_lm_head.bias).item() == 0
+
+
 def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
 
     pytest.importorskip("transformers")
@@ -1790,7 +1993,7 @@ def test_rtd_head_applies_cls_conditioning_before_dense_projection():
     assert logits.shape == (2, 3)
 
 
-def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
+def test_rtd_head_gathers_per_document_cls_for_pairwise_attention_masks():
 
     pytest.importorskip("transformers")
 
@@ -1827,18 +2030,34 @@ def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
         head.classifier.weight.fill_(1.0)
 
     hidden = torch.arange(0, 2 * 3 * cfg.hidden_size, dtype=torch.float32).view(2, 3, cfg.hidden_size)
-    pairwise_mask = torch.ones((2, 3, 3), dtype=torch.bool)
-    logits = head(hidden, attention_mask=pairwise_mask)
+    pairwise_mask = torch.tensor(
+        [
+            [[True, True, False], [True, True, False], [False, False, True]],
+            [[True, True, False], [True, True, False], [False, False, True]],
+        ]
+    )
+    with pytest.raises(RuntimeError, match="requires doc_context_index"):
+        head(hidden, attention_mask=pairwise_mask)
+    doc_context_index = torch.tensor([[0, 0, 2], [0, 0, 2]])
+    logits = head(
+        hidden,
+        attention_mask=pairwise_mask,
+        doc_context_index=doc_context_index,
+    )
 
     assert norm_spy.seen is not None
     assert dense_spy.seen is not None
-    torch.testing.assert_close(norm_spy.seen, hidden)
-    torch.testing.assert_close(dense_spy.seen, hidden)
+    context = hidden.gather(
+        1,
+        doc_context_index.unsqueeze(-1).expand_as(hidden),
+    )
+    torch.testing.assert_close(norm_spy.seen, hidden + context)
+    torch.testing.assert_close(dense_spy.seen, hidden + context)
     assert logits.shape == (2, 3)
 
 
-def test_rtd_head_skips_cls_conditioning_for_docblock_flash_meta():
-    """Doc-block flash metadata must disable global CLS like a pairwise mask.
+def test_rtd_head_requires_per_document_cls_for_docblock_flash_meta():
+    """Ragged Flash metadata must not silently drop or globalize CLS context.
 
     The ragged flash `docblock` route ships a compact 2D keep mask plus
     `FlashBatchMeta` segment metadata. Position 0 of a packed row belongs to
@@ -1888,23 +2107,352 @@ def test_rtd_head_skips_cls_conditioning_for_docblock_flash_meta():
         route_hint="docblock",
     )
 
-    _ = head(hidden, attention_mask=keep_mask_2d, flash_meta=docblock_meta)
+    with pytest.raises(RuntimeError, match="requires doc_context_index"):
+        head(hidden, attention_mask=keep_mask_2d, flash_meta=docblock_meta)
+    doc_context_index = torch.tensor([[0, 0, 2, 2], [0, 0, 2, 2]])
+    _ = head(
+        hidden,
+        attention_mask=keep_mask_2d,
+        doc_context_index=doc_context_index,
+        flash_meta=docblock_meta,
+    )
     assert norm_spy.seen is not None
-    torch.testing.assert_close(norm_spy.seen, hidden)
+    context = hidden.gather(1, doc_context_index.unsqueeze(-1).expand_as(hidden))
+    torch.testing.assert_close(norm_spy.seen, hidden + context)
 
     # The same 2D mask without doc-block metadata keeps the original
     # single-document behavior: global CLS conditioning stays enabled.
     _ = head(hidden, attention_mask=keep_mask_2d)
     torch.testing.assert_close(norm_spy.seen, hidden + hidden[:, 0:1, :])
 
-    assert RTDHead._use_global_cls_context(keep_mask_2d, flash_meta=docblock_meta) is False
+    assert RTDHead._requires_document_context(keep_mask_2d, flash_meta=docblock_meta) is True
     assert (
-        RTDHead._use_global_cls_context(keep_mask_2d, flash_meta=FlashBatchMeta(route_hint="docblock_bias"))
+        RTDHead._requires_document_context(
+            keep_mask_2d,
+            flash_meta=FlashBatchMeta(route_hint="docblock_bias"),
+        )
+        is True
+    )
+    assert (
+        RTDHead._requires_document_context(
+            keep_mask_2d,
+            flash_meta=FlashBatchMeta(route_hint="varlen"),
+        )
         is False
     )
-    assert (
-        RTDHead._use_global_cls_context(keep_mask_2d, flash_meta=FlashBatchMeta(route_hint="varlen")) is True
+
+
+def test_packed_rtd_matches_standalone_documents_with_local_positions_and_cls() -> None:
+    """Packing must preserve generator and discriminator objective semantics."""
+
+    pytest.importorskip("transformers")
+    from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    torch.manual_seed(41)
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        max_relative_positions=16,
+        position_buckets=-1,
+        relative_attention=True,
+        pos_att_type=["c2p", "p2c"],
+        position_biased_input=False,
+        z_steps=0,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
     )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaV2Model(cfg),
+        generator_backbone=DebertaV2Model(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    ).eval()
+
+    standalone_inputs = (
+        torch.tensor([[1, 10, 3, 2]], dtype=torch.long),
+        torch.tensor([[1, 20, 3, 2]], dtype=torch.long),
+    )
+    standalone_labels = (
+        torch.tensor([[-100, -100, 12, -100]], dtype=torch.long),
+        torch.tensor([[-100, -100, 22, -100]], dtype=torch.long),
+    )
+    standalone_positions = torch.arange(4).unsqueeze(0)
+    standalone_mask = torch.ones((1, 4), dtype=torch.bool)
+    packed_input = torch.cat(standalone_inputs, dim=1)
+    packed_labels = torch.cat(standalone_labels, dim=1)
+    packed_positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+    packed_doc_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]], dtype=torch.long)
+    packed_mask = build_doc_block_mask(packed_doc_ids)
+    packed_context = torch.tensor([[0, 0, 0, 0, 4, 4, 4, 4]], dtype=torch.long)
+
+    def _generator_logits(
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        masked_positions = labels.ne(-100)
+        output = model.generator(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        masked_hidden = model.enhanced_mask_decoder(
+            encoder_hidden_states=output.hidden_states,
+            masked_positions=masked_positions,
+            attention_mask=attention_mask,
+            embeddings=model.generator.embeddings,
+            encoder=model.generator.encoder,
+            position_ids=position_ids,
+        )
+        return model.generator_lm_head(
+            masked_hidden,
+            word_embedding_weight=model._get_generator_word_embedding_weight(),
+        )
+
+    def _discriminator_logits(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        doc_context_index: torch.Tensor | None,
+    ) -> torch.Tensor:
+        output = model.discriminator(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
+        return model.discriminator_head(
+            output.last_hidden_state,
+            attention_mask=attention_mask,
+            doc_context_index=doc_context_index,
+        )
+
+    with torch.no_grad():
+        packed_gen_logits = _generator_logits(
+            packed_input,
+            packed_labels,
+            packed_mask,
+            packed_positions,
+        )
+        standalone_gen_logits = [
+            _generator_logits(ids, labels, standalone_mask, standalone_positions)
+            for ids, labels in zip(standalone_inputs, standalone_labels, strict=True)
+        ]
+        torch.testing.assert_close(
+            packed_gen_logits,
+            torch.cat(standalone_gen_logits, dim=0),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+        packed_gen_phase = model.forward_generator_phase(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            labels=packed_labels,
+            position_ids=packed_positions,
+        )
+        packed_targets = packed_labels[packed_labels.ne(-100)]
+        packed_emd_loss = torch.nn.functional.cross_entropy(
+            packed_gen_logits.float(),
+            packed_targets,
+        )
+        torch.testing.assert_close(
+            packed_gen_phase.gen_loss_raw,
+            packed_emd_loss,
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        standalone_gen_phases = [
+            model.forward_generator_phase(
+                input_ids=ids,
+                attention_mask=standalone_mask,
+                labels=labels,
+                position_ids=standalone_positions,
+            )
+            for ids, labels in zip(standalone_inputs, standalone_labels, strict=True)
+        ]
+        torch.testing.assert_close(
+            packed_gen_phase.gen_loss_raw,
+            torch.stack([phase.gen_loss_raw for phase in standalone_gen_phases]).mean(),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+        packed_corrupted = packed_input.clone()
+        packed_corrupted[0, 2] = 30
+        packed_corrupted[0, 6] = 31
+        packed_disc_labels = torch.zeros_like(packed_input, dtype=torch.float32)
+        packed_disc_labels[0, 2] = 1.0
+        packed_disc_labels[0, 6] = 1.0
+        packed_disc_logits = _discriminator_logits(
+            packed_corrupted,
+            packed_mask,
+            packed_positions,
+            packed_context,
+        )
+        standalone_disc_logits: list[torch.Tensor] = []
+        standalone_disc_losses: list[torch.Tensor] = []
+        for document_idx, ids in enumerate(standalone_inputs):
+            corrupted = ids.clone()
+            corrupted[0, 2] = 30 + document_idx
+            labels = torch.zeros_like(ids, dtype=torch.float32)
+            labels[0, 2] = 1.0
+            standalone_disc_logits.append(
+                _discriminator_logits(
+                    corrupted,
+                    standalone_mask,
+                    standalone_positions,
+                    None,
+                )
+            )
+            standalone_disc_losses.append(
+                model.forward_discriminator_phase(
+                    input_ids=ids,
+                    corrupted_input_ids=corrupted,
+                    disc_labels=labels,
+                    attention_mask=standalone_mask,
+                    position_ids=standalone_positions,
+                ).disc_loss_raw
+            )
+
+        torch.testing.assert_close(
+            packed_disc_logits,
+            torch.cat(standalone_disc_logits, dim=1),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        packed_disc_phase = model.forward_discriminator_phase(
+            input_ids=packed_input,
+            corrupted_input_ids=packed_corrupted,
+            disc_labels=packed_disc_labels,
+            attention_mask=packed_mask,
+            position_ids=packed_positions,
+            doc_context_index=packed_context,
+        )
+        torch.testing.assert_close(
+            packed_disc_phase.disc_loss_raw,
+            torch.stack(standalone_disc_losses).mean(),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+
+def test_packed_rope_rtd_accepts_local_positions_and_matches_standalone() -> None:
+    """RoPE packed training must preserve optional learned absolute positions."""
+
+    pytest.importorskip("transformers")
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    torch.manual_seed(43)
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+        use_absolute_position_embeddings=True,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        attention_implementation="eager",
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    ).eval()
+
+    standalone_input = torch.tensor([[1, 10, 3, 2]], dtype=torch.long)
+    standalone_labels = torch.tensor([[-100, -100, 12, -100]], dtype=torch.long)
+    standalone_mask = torch.ones((1, 4), dtype=torch.bool)
+    standalone_positions = torch.arange(4).unsqueeze(0)
+    packed_input = torch.cat((standalone_input, standalone_input), dim=1)
+    packed_labels = torch.cat((standalone_labels, standalone_labels), dim=1)
+    packed_doc_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]], dtype=torch.long)
+    packed_mask = build_doc_block_mask(packed_doc_ids)
+    packed_positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+    packed_context = torch.tensor([[0, 0, 0, 0, 4, 4, 4, 4]], dtype=torch.long)
+
+    with torch.no_grad():
+        standalone_hidden = model.generator(
+            input_ids=standalone_input,
+            attention_mask=standalone_mask,
+            position_ids=standalone_positions,
+            return_dict=True,
+        ).last_hidden_state
+        packed_hidden = model.generator(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            position_ids=packed_positions,
+            return_dict=True,
+        ).last_hidden_state
+        expected_hidden = torch.cat((standalone_hidden, standalone_hidden), dim=1)
+        torch.testing.assert_close(packed_hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+
+        row_global_hidden = model.generator(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            position_ids=torch.arange(8).unsqueeze(0),
+            return_dict=True,
+        ).last_hidden_state
+        assert not torch.allclose(row_global_hidden[:, 4:], standalone_hidden)
+
+        standalone_gen = model.forward_generator_phase(
+            input_ids=standalone_input,
+            attention_mask=standalone_mask,
+            labels=standalone_labels,
+            position_ids=standalone_positions,
+        )
+        packed_gen = model.forward_generator_phase(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            labels=packed_labels,
+            position_ids=packed_positions,
+        )
+        torch.testing.assert_close(packed_gen.gen_loss_raw, standalone_gen.gen_loss_raw)
+
+        standalone_corrupted = standalone_input.clone()
+        standalone_corrupted[0, 2] = 30
+        standalone_disc_labels = torch.zeros_like(standalone_input, dtype=torch.float32)
+        standalone_disc_labels[0, 2] = 1.0
+        standalone_disc = model.forward_discriminator_phase(
+            input_ids=standalone_input,
+            corrupted_input_ids=standalone_corrupted,
+            disc_labels=standalone_disc_labels,
+            attention_mask=standalone_mask,
+            position_ids=standalone_positions,
+        )
+        packed_disc = model.forward_discriminator_phase(
+            input_ids=packed_input,
+            corrupted_input_ids=torch.cat((standalone_corrupted, standalone_corrupted), dim=1),
+            disc_labels=torch.cat((standalone_disc_labels, standalone_disc_labels), dim=1),
+            attention_mask=packed_mask,
+            position_ids=packed_positions,
+            doc_context_index=packed_context,
+        )
+        torch.testing.assert_close(packed_disc.disc_loss_raw, standalone_disc.disc_loss_raw)
 
 
 def test_flash_batch_meta_is_cross_document_predicate():
@@ -2238,6 +2786,144 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_
 
     torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("term", ["c2p", "p2c"])
+@pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])
+def test_native_disentangled_signed_bucket_forward_and_gradients_match_definition(
+    term: str,
+    kernel: str,
+) -> None:
+    """Each positional term must use the same canonical signed q-k bucket."""
+
+    pytest.importorskip("transformers")
+    from transformers import DebertaV2Config
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    torch.manual_seed(17)
+    cfg = DebertaV2Config(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        position_buckets=-1,
+        relative_attention=True,
+        pos_att_type=term,
+        share_att_key=False,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = kernel
+    attention = DisentangledSelfAttention(cfg).eval()
+    attention.float()
+
+    batch_size = 2
+    seq_len = 4
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    query_actual = torch.randn((batch_size, cfg.num_attention_heads, seq_len, head_dim), requires_grad=True)
+    key_actual = torch.randn_like(query_actual, requires_grad=True)
+    rel_actual = torch.randn((2 * cfg.max_relative_positions, cfg.hidden_size), requires_grad=True)
+    query_expected = query_actual.detach().clone().requires_grad_()
+    key_expected = key_actual.detach().clone().requires_grad_()
+    rel_expected = rel_actual.detach().clone().requires_grad_()
+    relative_pos = torch.arange(seq_len)[:, None] - torch.arange(seq_len)[None, :]
+    scale_factor = 2
+
+    actual = attention.disentangled_attention_bias(
+        query_layer=query_actual,
+        key_layer=key_actual,
+        relative_pos=relative_pos,
+        rel_embeddings=rel_actual,
+        scale_factor=scale_factor,
+    )
+
+    use_query_projection = term == "p2c"
+    position_scores = attention._project_rel(
+        rel_expected,
+        use_query=use_query_projection,
+    )
+    bucket = (relative_pos + int(attention.pos_ebd_size)).clamp(
+        min=0,
+        max=(2 * int(attention.pos_ebd_size)) - 1,
+    )
+    selected_positions = position_scores[:, bucket, :]
+    content = key_expected[:, :, None, :, :] if term == "p2c" else query_expected[:, :, :, None, :]
+    expected = (content * selected_positions.unsqueeze(0)).sum(dim=-1)
+    expected = expected / math.sqrt(float(head_dim * scale_factor))
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    loss_weight = torch.randn_like(actual)
+    projection = attention.pos_query_proj if term == "p2c" else attention.pos_key_proj
+    assert projection is not None
+    actual_grads = torch.autograd.grad(
+        (actual * loss_weight).sum(),
+        (query_actual, key_actual, rel_actual, projection.weight, projection.bias),
+        allow_unused=True,
+    )
+    expected_grads = torch.autograd.grad(
+        (expected * loss_weight).sum(),
+        (query_expected, key_expected, rel_expected, projection.weight, projection.bias),
+        allow_unused=True,
+    )
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        if actual_grad is None or expected_grad is None:
+            assert actual_grad is None and expected_grad is None
+        else:
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-6, atol=1e-6)
+
+
+def test_native_attention_matches_transformers_reference_on_active_tokens() -> None:
+    """Corrected native attention must match the independent HF implementation."""
+
+    pytest.importorskip("transformers")
+    from transformers import DebertaV2Config
+    from transformers.models.deberta_v2.modeling_deberta_v2 import (
+        DisentangledSelfAttention as TransformersDisentangledSelfAttention,
+    )
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    torch.manual_seed(29)
+    cfg = DebertaV2Config(
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=32,
+        max_position_embeddings=8,
+        max_relative_positions=8,
+        position_buckets=-1,
+        relative_attention=True,
+        pos_att_type=["c2p", "p2c"],
+        share_att_key=False,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    cfg.hf_attention_kernel = "dynamic"
+    reference = TransformersDisentangledSelfAttention(cfg).eval()
+    native = DisentangledSelfAttention(cfg).eval()
+    native.load_state_dict(reference.state_dict(), strict=True)
+
+    hidden_states = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
+    keep_mask = torch.tensor([[True, True, True, True, False, False], [True, True, True, True, True, False]])
+    attention_mask = keep_mask[:, None, None, :]
+    rel_embeddings = torch.randn((2 * cfg.max_relative_positions, cfg.hidden_size))
+
+    with torch.no_grad():
+        native_out, _ = native(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            rel_embeddings=rel_embeddings,
+        )
+        reference_out, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            rel_embeddings=rel_embeddings,
+        )
+
+    torch.testing.assert_close(native_out[keep_mask], reference_out[keep_mask], rtol=2e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])

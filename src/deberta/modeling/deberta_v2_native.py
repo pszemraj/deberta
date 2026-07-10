@@ -434,8 +434,10 @@ class DisentangledSelfAttention(nn.Module):
             else:
                 p2c_att = torch.einsum("bhkd,hqd->bhkq", key_layer, pos_query_layer)
 
-            # Convert [Q,K] relative ids into [K,Q] gather indices for p2c.
-            p2c_idx = (-rel_pos.transpose(0, 1) + att_span).clamp(min=0, max=(2 * att_span) - 1)
+            # Convert canonical signed buckets from query-major [Q,K] to the
+            # key-major [K,Q] layout of p2c_att without reversing their sign.
+            # Entry [k,q] must still select bucket(q-k).
+            p2c_idx = (rel_pos.transpose(0, 1) + att_span).clamp(min=0, max=(2 * att_span) - 1)
             p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
             p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
             score = p2c_bias if score is None else score + p2c_bias

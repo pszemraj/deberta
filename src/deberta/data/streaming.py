@@ -18,6 +18,7 @@ class PackedStreamingConfig:
     max_seq_length: int
     seed: int
     shuffle_buffer_size: int
+    block_cross_document_attention: bool = False
 
 
 class PackedStreamingDataset(torch.utils.data.IterableDataset):
@@ -196,10 +197,93 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
             ex_out["attention_mask"] = [1] * (max_seq - pad_len) + [0] * pad_len
         return ex_out
 
+    def _build_docblock_example(
+        self,
+        *,
+        segments: list[list[int]],
+        max_seq: int,
+    ) -> dict[str, Any]:
+        """Build one row whose document segments each own CLS and local positions.
+
+        :param list[list[int]] segments: Lexical token chunks without specials.
+        :param int max_seq: Fixed output sequence length.
+        :return dict[str, Any]: Packed row with structural document ids.
+        """
+
+        cls_id = int(self.tokenizer.cls_token_id)
+        sep_id = int(self.tokenizer.sep_token_id)
+        pad_id = int(self.tokenizer.pad_token_id)
+        special_ids = {cls_id, sep_id, pad_id}
+        input_ids: list[int] = []
+        special_tokens_mask: list[int] = []
+        doc_ids: list[int] = []
+
+        for document_id, segment in enumerate(segments, start=1):
+            wrapped = [cls_id, *segment, sep_id]
+            input_ids.extend(wrapped)
+            special_tokens_mask.extend([1, *[1 if token in special_ids else 0 for token in segment], 1])
+            doc_ids.extend([document_id] * len(wrapped))
+
+        pad_len = int(max_seq) - len(input_ids)
+        if pad_len < 0:
+            raise RuntimeError("Doc-block segment packing exceeded max_seq_length.")
+        if pad_len:
+            input_ids.extend([pad_id] * pad_len)
+            special_tokens_mask.extend([1] * pad_len)
+            doc_ids.extend([0] * pad_len)
+
+        output: dict[str, Any] = {
+            "input_ids": input_ids,
+            "special_tokens_mask": special_tokens_mask,
+            "doc_ids": doc_ids,
+        }
+        if pad_len:
+            output["attention_mask"] = [1] * (int(max_seq) - pad_len) + [0] * pad_len
+        return output
+
+    def _iter_docblock_examples(self) -> Iterator[dict[str, Any]]:
+        """Yield greedily packed whole document chunks with per-segment CLS.
+
+        Long documents are split independently at ``max_seq_length - 2`` so
+        their chunk boundaries do not depend on the remaining space in a row.
+
+        :return Iterator[dict[str, Any]]: Fixed-length doc-block examples.
+        """
+
+        max_seq = int(self.cfg.max_seq_length)
+        max_content = max_seq - 2
+        row_segments: list[list[int]] = []
+        row_length = 0
+
+        for example in self._iter_examples():
+            token_ids = self._tokenize_text(self._normalize_raw_text(example))
+            for start in range(0, len(token_ids), max_content):
+                segment = token_ids[start : start + max_content]
+                if not segment:
+                    continue
+                wrapped_length = len(segment) + 2
+                if row_segments and row_length + wrapped_length > max_seq:
+                    yield self._build_docblock_example(segments=row_segments, max_seq=max_seq)
+                    row_segments = []
+                    row_length = 0
+                row_segments.append(segment)
+                row_length += wrapped_length
+                if row_length == max_seq:
+                    yield self._build_docblock_example(segments=row_segments, max_seq=max_seq)
+                    row_segments = []
+                    row_length = 0
+
+        if row_segments:
+            yield self._build_docblock_example(segments=row_segments, max_seq=max_seq)
+
     def __iter__(self) -> Iterator[dict[str, Any]]:
         max_seq = int(self.cfg.max_seq_length)
         if max_seq < 8:
             raise ValueError("max_seq_length is too small for pretraining.")
+
+        if bool(self.cfg.block_cross_document_attention):
+            yield from self._iter_docblock_examples()
+            return
 
         sep_id = int(self.tokenizer.sep_token_id)
         block_len = max_seq - 2

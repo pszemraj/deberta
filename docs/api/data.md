@@ -70,6 +70,7 @@ class PackedStreamingConfig(
     max_seq_length: 'int',
     seed: 'int',
     shuffle_buffer_size: 'int',
+    block_cross_document_attention: 'bool' = False,
 ) -> None
 ```
 

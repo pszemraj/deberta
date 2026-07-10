@@ -127,7 +127,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 6
+RUN_CONFIG_SCHEMA_VERSION = 7
 _VAR_FULL_RE = re.compile(r"^\$variables\.([A-Za-z0-9_.-]+)$")
 _VAR_INLINE_RE = re.compile(r"\{\$variables\.([A-Za-z0-9_.-]+)\}")
 _VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")

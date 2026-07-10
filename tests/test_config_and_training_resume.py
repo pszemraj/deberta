@@ -1623,7 +1623,11 @@ def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matchin
     assert resumed_train_snapshot == original_train_snapshot
 
 
-def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(tmp_path: Path):
+@pytest.mark.parametrize("schema_offset", [-1, 1])
+def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(
+    tmp_path: Path,
+    schema_offset: int,
+):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -1640,7 +1644,7 @@ def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(tmp
     )
 
     (out / "run_metadata.json").write_text(
-        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION) + 1}),
+        json.dumps({"config_schema_version": int(RUN_CONFIG_SCHEMA_VERSION) + schema_offset}),
         encoding="utf-8",
     )
 

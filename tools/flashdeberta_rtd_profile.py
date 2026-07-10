@@ -369,6 +369,7 @@ def _run_decoupled_window(
                         attention_mask=batch.get("attention_mask"),
                         labels=batch["labels"],
                         token_type_ids=batch.get("token_type_ids"),
+                        position_ids=batch.get("position_ids"),
                         sampling_temperature=float(sampling_temperature),
                         phase="generator",
                         flash_meta=flash_meta,
@@ -394,6 +395,8 @@ def _run_decoupled_window(
                     "input_ids": batch["input_ids"],
                     "attention_mask": batch.get("attention_mask"),
                     "token_type_ids": batch.get("token_type_ids"),
+                    "position_ids": batch.get("position_ids"),
+                    "doc_context_index": batch.get("doc_context_index"),
                     "flash_meta": flash_meta,
                     "corrupted_input_ids": gen_phase_out.corrupted_input_ids,
                     "disc_labels": gen_phase_out.disc_labels,
@@ -424,6 +427,8 @@ def _run_decoupled_window(
                         disc_labels=payload["disc_labels"],  # type: ignore[arg-type]
                         attention_mask=payload["attention_mask"],  # type: ignore[arg-type]
                         token_type_ids=payload["token_type_ids"],  # type: ignore[arg-type]
+                        position_ids=payload["position_ids"],  # type: ignore[arg-type]
+                        doc_context_index=payload["doc_context_index"],  # type: ignore[arg-type]
                         phase="discriminator",
                         flash_meta=payload["flash_meta"],  # type: ignore[arg-type]
                     )
@@ -553,6 +558,8 @@ def _run_coupled_window(
                         attention_mask=batch.get("attention_mask"),
                         labels=batch["labels"],
                         token_type_ids=batch.get("token_type_ids"),
+                        position_ids=batch.get("position_ids"),
+                        doc_context_index=batch.get("doc_context_index"),
                         sampling_temperature=float(sampling_temperature),
                         gen_loss_weight=gen_loss_weight,
                         disc_loss_weight=disc_loss_weight,

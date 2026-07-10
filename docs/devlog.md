@@ -562,22 +562,21 @@ Two unresolved PR #5 review findings were verified and fixed:
 
 - P1 (`rtd.py`): the RTD head gated global CLS conditioning on attention-mask
   rank alone, so the ragged flash `docblock` route (2D keep mask + segment
-  metadata) added the packed row's first token to every token - cross-document
-  leakage through the head and a silent objective difference versus eager and
-  the dense route. The head now also consults `FlashBatchMeta`; doc-block
-  metadata disables global CLS like a pairwise mask. Note the 2026-07-06
-  equivalence battery used the dense default route and is unaffected.
+  metadata) added the packed row's first token to every token. The first fix
+  prevented leakage by dropping CLS conditioning for packed rows, but that made
+  packed and standalone examples optimize different classifiers. The 2026-07-10
+  correction gives every packed segment its own CLS and maps every token to that
+  context, preserving the standalone RTD head while keeping documents isolated.
 - P2 (`flashdeberta_dense_bias_op.py` and `flashdeberta_bias_op.py`): the
-  eager dense-bias fallback gathered p2c with the transposed bucket map,
-  flipping the signed relative bucket (empirically: c2p matched Triton, p2c
-  diverged, corrected gather matches Triton exactly). Investigation widened
-  the finding: both PyTorch `dpos_query` reductions (bias_op scatter reduce,
-  dense_bias_op bucket-range backward) baked in the same reversed convention
-  and are the live CUDA gradient path whenever the specialized direct-dpos
-  kernels do not engage. Both now match analytic ground truth; the dead
-  `_build_dense_flash_bias` duplicate was removed and its self-confirming
-  test replaced with an explicit loop-reference test on an asymmetric bucket
-  map. Full suite (546) and the whole parity matrix re-passed on GPU.
+  original conclusion was wrong: it treated the repo-local Triton builder as
+  the semantic oracle, but both that builder and native eager attention used
+  the reversed P2C bucket. The canonical term is
+  `pos_query[key, bucket(query,key)]`, using the same signed `query - key`
+  bucket as C2P. The 2026-07-10 correction realigned native eager, dense
+  PyTorch, Triton forward, and both P2C backward reductions against an
+  independent scalar definition and the Hugging Face implementation. The
+  earlier 546-test parity result compared implementations sharing the same
+  reversal and was not evidence of canonical DeBERTa semantics.
 
 ## 2026-07-07 - PR #5 Review Remediation Campaign
 

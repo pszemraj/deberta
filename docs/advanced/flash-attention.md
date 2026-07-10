@@ -32,6 +32,9 @@ The adapter selects one route per batch:
 | `docblock_bias` | packed doc-block batches where enabled | document masking folded into a dense attention bias |
 | `docblock` | packed doc-block batches using the ragged path | document spans repacked and processed independently by varlen kernels |
 
+Every route uses the same canonical signed relative bucket `query_position - key_position` for
+both C2P and P2C terms. Route changes must not change the encoder's attention function.
+
 Route selection comes from `route_policies` in the JSON tuning table. Upstream FlashDeBERTa
 environment-variable routing is not consulted. The shipped padding policy switches from `fixed`
 to `varlen` at `2048`; capability-scoped doc-block and local-bias behavior is described in

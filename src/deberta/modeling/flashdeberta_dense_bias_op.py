@@ -145,11 +145,10 @@ def _dense_bias_forward_fallback(
         bias = torch.take_along_dim(pos_key, gather_index, dim=-1)
 
     if pos_query is not None:
-        # p2c at (query m, key n) reads pos_query[n, bucket_index[n, m]]: gather
-        # each key row with its own signed bucket map, then transpose to (m, n).
-        # Gathering the transposed map instead would flip the signed bucket and
-        # diverge from the Triton builder and eager attention.
-        p2c_bias = torch.take_along_dim(pos_query, gather_index, dim=-1).transpose(-1, -2)
+        # pos_query is key-major before the final transpose. At [n,m] it must
+        # select the canonical query-major bucket [m,n], i.e. bucket(q-k).
+        p2c_index = bucket_index.transpose(0, 1).view(1, 1, seq_len, seq_len)
+        p2c_bias = torch.take_along_dim(pos_query, p2c_index, dim=-1).transpose(-1, -2)
         if bias is None:
             bias = p2c_bias
         else:
@@ -162,6 +161,21 @@ def _dense_bias_forward_fallback(
     if keep_mask is not None:
         bias.masked_fill_(~keep_mask, -1.0e4 * float(scale))
     return bias
+
+
+def _dense_bucket_cache_owner(bucket_index: torch.Tensor) -> torch.Tensor:
+    """Return the stable tensor that owns a bucket view's storage.
+
+    Transposed bucket views are created on each P2C backward call. Keying the
+    range cache by the ephemeral view would discard its entry immediately;
+    the stable base tensor plus the view stride distinguishes both orientations.
+
+    :param torch.Tensor bucket_index: Bucket tensor or view.
+    :return torch.Tensor: Stable storage-owning tensor.
+    """
+
+    base = getattr(bucket_index, "_base", None)
+    return base if isinstance(base, torch.Tensor) else bucket_index
 
 
 def _dense_bucket_range_cache_key(
@@ -177,9 +191,10 @@ def _dense_bucket_range_cache_key(
         Tensor id, version, storage offset, shape, stride, device text, and bucket count.
     """
 
+    owner = _dense_bucket_cache_owner(bucket_index)
     return (
-        id(bucket_index),
-        int(bucket_index._version),
+        id(owner),
+        int(owner._version),
         int(bucket_index.storage_offset()),
         tuple(int(dim) for dim in bucket_index.shape),
         tuple(int(dim) for dim in bucket_index.stride()),
@@ -214,7 +229,7 @@ def _dense_bucket_ranges(
             cached = _DENSE_BUCKET_RANGE_CACHE.get(cache_key)
             if cached is not None:
                 bucket_ref, ranges = cached
-                if bucket_ref() is bucket_index:
+                if bucket_ref() is _dense_bucket_cache_owner(bucket_index):
                     return ranges
                 _DENSE_BUCKET_RANGE_CACHE.pop(cache_key, None)
 
@@ -255,7 +270,7 @@ def _dense_bucket_ranges(
     if cache_key is not None:
         try:
             bucket_ref = weakref.ref(
-                bucket_index,
+                _dense_bucket_cache_owner(bucket_index),
                 lambda _ref, key=cache_key: _DENSE_BUCKET_RANGE_CACHE.pop(key, None),
             )
         except TypeError:
@@ -436,8 +451,8 @@ if triton is not None:
             acc += tl.load(pk_ptrs, mask=valid, other=0.0).to(tl.float32)
 
         if HAS_POS_QUERY:
-            bucket_t = tl.load(
-                bucket_ptr + offs_n[None, :] * stride_bucket_s + offs_m[:, None] * stride_bucket_n,
+            bucket = tl.load(
+                bucket_ptr + offs_m[:, None] * stride_bucket_s + offs_n[None, :] * stride_bucket_n,
                 mask=valid,
                 other=0,
             ).to(tl.int32)
@@ -446,7 +461,7 @@ if triton is not None:
                 + off_b * stride_pq_b
                 + off_h * stride_pq_h
                 + offs_n[None, :] * stride_pq_s
-                + bucket_t * stride_pq_p
+                + bucket * stride_pq_p
             )
             acc += tl.load(pq_ptrs, mask=valid, other=0.0).to(tl.float32)
 

@@ -44,6 +44,7 @@ forward_generator_phase(
     attention_mask: 'torch.Tensor | None' = None,
     labels: 'torch.Tensor',
     token_type_ids: 'torch.Tensor | None' = None,
+    position_ids: 'torch.Tensor | None' = None,
     sampling_temperature: 'float' = 1.0,
     flash_meta: 'FlashBatchMeta | None' = None,
 ) -> 'RTDGeneratorPhaseOutput'
@@ -59,6 +60,7 @@ Run generator forward/corruption only, returning discriminator targets.
 - `attention_mask` (`torch.Tensor | None`): Optional attention mask.
 - `labels` (`torch.Tensor`): MLM labels with ``-100`` ignore index.
 - `token_type_ids` (`torch.Tensor | None`): Optional token type ids.
+- `position_ids` (`torch.Tensor | None`): Optional document-local position ids.
 - `sampling_temperature` (`float`): Generator sampling temperature.
 - `flash_meta` (`FlashBatchMeta | None`): Optional FlashDeBERTa metadata bundle.
 
@@ -77,6 +79,8 @@ forward_discriminator_phase(
     disc_labels: 'torch.Tensor',
     attention_mask: 'torch.Tensor | None' = None,
     token_type_ids: 'torch.Tensor | None' = None,
+    position_ids: 'torch.Tensor | None' = None,
+    doc_context_index: 'torch.Tensor | None' = None,
     flash_meta: 'FlashBatchMeta | None' = None,
 ) -> 'RTDDiscriminatorPhaseOutput'
 ```
@@ -92,6 +96,8 @@ Run discriminator scoring only, given prebuilt corrupted ids/labels.
 - `disc_labels` (`torch.Tensor`): Binary RTD labels.
 - `attention_mask` (`torch.Tensor | None`): Optional attention mask.
 - `token_type_ids` (`torch.Tensor | None`): Optional token type ids.
+- `position_ids` (`torch.Tensor | None`): Optional document-local position ids.
+- `doc_context_index` (`torch.Tensor | None`): Optional CLS index per token.
 - `flash_meta` (`FlashBatchMeta | None`): Optional FlashDeBERTa metadata bundle.
 
 ### Returns
@@ -108,6 +114,8 @@ forward(
     attention_mask: 'torch.Tensor | None' = None,
     labels: 'torch.Tensor | None' = None,
     token_type_ids: 'torch.Tensor | None' = None,
+    position_ids: 'torch.Tensor | None' = None,
+    doc_context_index: 'torch.Tensor | None' = None,
     sampling_temperature: 'float' = 1.0,
     gen_loss_weight: 'float' = 1.0,
     disc_loss_weight: 'float' = 50.0,
@@ -128,6 +136,8 @@ Run RTD forward in combined or phase-specific mode.
 - `attention_mask` (`torch.Tensor | None`): Optional attention mask.
 - `labels` (`torch.Tensor | None`): MLM labels with ``-100`` ignore index.
 - `token_type_ids` (`torch.Tensor | None`): Optional token type ids.
+- `position_ids` (`torch.Tensor | None`): Optional document-local position ids.
+- `doc_context_index` (`torch.Tensor | None`): Optional CLS index per token.
 - `sampling_temperature` (`float`): Generator sampling temperature.
 - `gen_loss_weight` (`float`): Generator loss weight.
 - `disc_loss_weight` (`float`): Discriminator loss weight.
@@ -384,6 +394,7 @@ forward(
     input_ids: 'torch.Tensor',
     attention_mask: 'torch.Tensor | None' = None,
     token_type_ids: 'torch.Tensor | None' = None,
+    position_ids: 'torch.Tensor | None' = None,
     output_hidden_states: 'bool | None' = None,
     output_attentions: 'bool | None' = None,
     return_dict: 'bool | None' = None,
@@ -399,6 +410,7 @@ Run encoder forward pass.
 - `input_ids` (`torch.Tensor`): Input token ids.
 - `attention_mask` (`torch.Tensor | None`): Optional attention mask. ``None`` means unpadded input (fast path); callers must pass a mask when padding exists.
 - `token_type_ids` (`torch.Tensor | None`): Optional segment ids.
+- `position_ids` (`torch.Tensor | None`): Optional learned absolute-position ids. Packed document rows use local ids; rotary attention itself is invariant to each isolated segment's constant row offset.
 - `output_hidden_states` (`bool | None`): Optional hidden-state output flag.
 - `output_attentions` (`bool | None`): Optional attention output flag.
 - `return_dict` (`bool | None`): Optional return-dataclass flag.

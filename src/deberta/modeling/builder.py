@@ -854,13 +854,10 @@ def build_backbone_configs(
                     f"(resolved from {resolved.generator.config_origin})."
                 ) from e
 
-        # Match released DeBERTa-v3 xsmall generator behavior for derived configs.
-        # Explicit generator configs keep their own z_steps contract.
+        # RTD uses the objective-owned Enhanced Mask Decoder. Generic backbone
+        # z_steps starts from a different query state and cannot replace it.
         if not generator_from_explicit_source:
-            if str(model_cfg.hf_model_size).strip().lower() == "xsmall":
-                gen_cfg.z_steps = 2
-            else:
-                gen_cfg.z_steps = 0
+            gen_cfg.z_steps = 0
 
         _apply_hf_config_normalization(
             disc_cfg,
@@ -886,6 +883,14 @@ def build_backbone_configs(
         )
         _validate_hf_flash_attention_config(disc_cfg, component="discriminator")
         _validate_hf_flash_attention_config(gen_cfg, component="generator")
+        if (
+            not bool(getattr(gen_cfg, "position_biased_input", True))
+            and int(getattr(gen_cfg, "z_steps", 0) or 0) > 1
+        ):
+            raise ValueError(
+                "RTD Enhanced Mask Decoding is not equivalent to generator z_steps; "
+                "set generator z_steps=0 when position_biased_input=false."
+            )
 
         return disc_cfg, gen_cfg
 

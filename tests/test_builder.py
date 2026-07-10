@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 from _fakes import DummyTokenizer
 
-from deberta.config import ModelConfig
+from deberta.config import ModelConfig, load_config
 from deberta.modeling import builder as builder_mod
 
 
@@ -490,6 +491,23 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         assert built_cfg.hf_flash["eager_dense_max_seq_len"] == 512
 
 
+def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
+    pytest.importorskip("transformers")
+
+    config_paths = sorted(Path("configs/flashdeberta").glob("*.yaml"))
+    assert config_paths
+    for config_path in config_paths:
+        cfg = load_config(config_path)
+        assert cfg.model.hf.attention_impl == "flash", config_path
+        disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+            model_cfg=cfg.model,
+            tokenizer=DummyTokenizer(vocab_size=50265),
+            max_position_embeddings=cfg.data.max_seq_length,
+        )
+        assert disc_cfg.hf_attention_impl == "flash", config_path
+        assert gen_cfg.hf_attention_impl == "flash", config_path
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -801,7 +819,7 @@ def test_build_backbone_configs_hf_deberta_dropout_overrides(
 @pytest.mark.parametrize(
     ("hf_model_size", "hidden_size", "layers", "heads", "intermediate", "gen_z_steps"),
     [
-        ("xsmall", 384, 12, 6, 1536, 2),
+        ("xsmall", 384, 12, 6, 1536, 0),
         ("small", 768, 6, 12, 3072, 0),
         ("base", 768, 12, 12, 3072, 0),
         ("large", 1024, 24, 16, 4096, 0),
@@ -841,7 +859,7 @@ def test_build_backbone_configs_hf_deberta_uses_repo_architecture_presets(
     assert int(getattr(gen_cfg, "z_steps", 0)) == gen_z_steps
 
 
-def test_build_backbone_configs_hf_deberta_preserves_explicit_generator_z_steps(
+def test_build_backbone_configs_hf_deberta_rejects_explicit_generator_z_steps_for_rtd(
     monkeypatch: pytest.MonkeyPatch,
 ):
     pytest.importorskip("transformers")
@@ -878,14 +896,12 @@ def test_build_backbone_configs_hf_deberta_preserves_explicit_generator_z_steps(
         hf_model_size="xsmall",
         pretrained_generator_path="gen_model",
     )
-    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=DummyTokenizer(vocab_size=50265),
-        max_position_embeddings=128,
-    )
-
-    assert int(getattr(disc_cfg, "z_steps", 0)) == 0
-    assert int(getattr(gen_cfg, "z_steps", 0)) == 7
+    with pytest.raises(ValueError, match="not equivalent to generator z_steps"):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=50265),
+            max_position_embeddings=128,
+        )
 
 
 def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():

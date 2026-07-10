@@ -70,6 +70,7 @@ train_eager_case() {
         "${name}" \
         env HF_HUB_DOWNLOAD_TIMEOUT=120 HF_HUB_ETAG_TIMEOUT=120 TOKENIZERS_PARALLELISM=false \
         conda run --name neobert --no-capture-output deberta train "${config_path}" \
+        --model.hf.attention_impl eager \
         --train.max_steps "${steps}" \
         --logging.logging_steps "${LOGGING_STEPS}" \
         --train.checkpoint.output_dir "${output_dir}" \

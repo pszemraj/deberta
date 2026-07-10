@@ -144,11 +144,18 @@ class DebertaRoPEEmbeddings(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids: torch.Tensor, token_type_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Embed token ids and apply normalization/dropout.
 
         :param torch.Tensor input_ids: Input token ids.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :param torch.Tensor | None position_ids: Optional learned absolute-position ids.
+        :raises ValueError: If explicit position ids do not match ``input_ids``.
         :return torch.Tensor: Embedded hidden states.
         """
         bsz, seq_len = input_ids.shape
@@ -160,9 +167,19 @@ class DebertaRoPEEmbeddings(nn.Module):
             x = x + self.token_type_embeddings(token_type_ids)
 
         if self.position_embeddings is not None:
-            position_ids = (
-                torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
-            )
+            if position_ids is None:
+                position_ids = (
+                    torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(bsz, -1)
+                )
+            elif tuple(position_ids.shape) != (bsz, seq_len):
+                raise ValueError(
+                    "position_ids must match input_ids (B,S); "
+                    f"got {tuple(position_ids.shape)} for {(bsz, seq_len)}."
+                )
+            else:
+                position_ids = position_ids.to(device=input_ids.device, dtype=torch.long)
             x = x + self.position_embeddings(position_ids)
 
         x = self.norm(x)
@@ -539,6 +556,7 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
         output_attentions: bool | None = None,
         return_dict: bool | None = None,
@@ -549,6 +567,9 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         :param torch.Tensor | None attention_mask: Optional attention mask. ``None`` means
             unpadded input (fast path); callers must pass a mask when padding exists.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :param torch.Tensor | None position_ids: Optional learned absolute-position ids. Packed
+            document rows use local ids; rotary attention itself is invariant to each isolated
+            segment's constant row offset.
         :param bool | None output_hidden_states: Optional hidden-state output flag.
         :param bool | None output_attentions: Optional attention output flag.
         :param bool | None return_dict: Optional return-dataclass flag.
@@ -573,7 +594,11 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
                 "DebertaRoPEModel does not currently expose attention maps; set output_attentions=False."
             )
 
-        x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
+        x = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+        )
         if output_hidden_states:
             encoder_outputs = self.encoder(
                 x,

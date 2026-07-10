@@ -3419,14 +3419,48 @@ def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.Mo
     _assert_single_flash_route_stat(attention_mod, "flash_docblock_bias_calls")
 
 
+def _canonical_dense_bias_reference(
+    *,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    bucket_index: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Build a test-only dense bias from the canonical scalar definition."""
+
+    reference = pos_key if pos_key is not None else pos_query
+    assert reference is not None
+    batch_size, num_heads, seq_len, _ = reference.shape
+    batches: list[torch.Tensor] = []
+    for batch_idx in range(batch_size):
+        heads: list[torch.Tensor] = []
+        for head_idx in range(num_heads):
+            rows: list[torch.Tensor] = []
+            for query_idx in range(seq_len):
+                cells: list[torch.Tensor] = []
+                for key_idx in range(seq_len):
+                    bucket = int(bucket_index[query_idx, key_idx])
+                    terms: list[torch.Tensor] = []
+                    if pos_key is not None:
+                        terms.append(pos_key[batch_idx, head_idx, query_idx, bucket])
+                    if pos_query is not None:
+                        terms.append(pos_query[batch_idx, head_idx, key_idx, bucket])
+                    cells.append(torch.stack(terms).sum() * float(scale))
+                rows.append(torch.stack(cells))
+            heads.append(torch.stack(rows))
+        batches.append(torch.stack(heads))
+    bias = torch.stack(batches)
+    return bias.masked_fill(~keep_mask, -1.0e4 * float(scale)) if keep_mask is not None else bias
+
+
 def test_dense_bias_fallback_matches_scaled_reference() -> None:
-    """CPU dense-bias fallback must match the eager DeBERTa gather convention.
+    """CPU dense-bias fallback must match the canonical DeBERTa definition.
 
     The reference is an explicit per-element loop:
-    ``bias[m, n] = pos_key[m, bucket[m, n]] + pos_query[n, bucket[n, m]]``.
+    ``bias[m,n] = pos_key[m,bucket[m,n]] + pos_query[n,bucket[m,n]]``.
     The bucket map is deliberately asymmetric because signed relative-position
-    buckets are not symmetric; a p2c gather that uses ``bucket[m, n]`` instead
-    of ``bucket[n, m]`` (the pre-fix fallback bug) fails this test.
+    buckets are not symmetric; reversing the P2C bucket fails this test.
     """
 
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
@@ -3472,15 +3506,13 @@ def test_dense_bias_fallback_matches_scaled_reference() -> None:
         dtype=torch.bool,
     )
 
-    expected = torch.empty((batch_size, num_heads, seq_len, seq_len), dtype=torch.float32)
-    for b in range(batch_size):
-        for h in range(num_heads):
-            for m in range(seq_len):
-                for n in range(seq_len):
-                    c2p = pos_key[b, h, m, int(bucket_index[m, n])]
-                    p2c = pos_query[b, h, n, int(bucket_index[n, m])]
-                    expected[b, h, m, n] = (c2p + p2c) * scale
-    expected = expected.masked_fill(~keep_mask, -1.0e4 * scale)
+    expected = _canonical_dense_bias_reference(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=keep_mask,
+        scale=scale,
+    )
 
     actual = dense_bias_mod._dense_bias_forward_fallback(
         pos_key=pos_key,
@@ -3529,7 +3561,6 @@ def test_position_bias_dense_grad_reduction_matches_autograd(
     use_mask: bool,
 ) -> None:
     import deberta.modeling.flashdeberta_bias_op as bias_mod
-    import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
     torch.manual_seed(0)
     batch_size, num_heads, seq_len, num_buckets = 2, 3, 4, 6
@@ -3578,7 +3609,7 @@ def test_position_bias_dense_grad_reduction_matches_autograd(
     )
     d_bias = torch.randn((batch_size, num_heads, seq_len, seq_len), dtype=torch.float32)
 
-    bias = dense_bias_mod._dense_bias_forward_fallback(
+    bias = _canonical_dense_bias_reference(
         pos_key=pos_key,
         pos_query=pos_query,
         bucket_index=bucket_index,
@@ -3754,6 +3785,144 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for FlashDeBERTa parity.")
+@pytest.mark.parametrize("route", ["fixed", "varlen"])
+def test_fixed_and_varlen_kernels_match_canonical_unit_scale_p2c(route: str) -> None:
+    """Pinned kernels must use the canonical signed P2C bucket in forward/backward."""
+
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
+        sys.modules.pop(name, None)
+    try:
+        attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
+        fixed_mod = importlib.import_module("deberta.modeling.flashdeberta_fixed_op")
+        varlen_mod = importlib.import_module("deberta.modeling.flashdeberta_varlen_op")
+        if fixed_mod.flashdeberta_fixed_import_error() is not None:
+            pytest.skip("Fixed FlashDeBERTa kernels are unavailable.")
+        if varlen_mod.flashdeberta_varlen_import_error() is not None:
+            pytest.skip("Varlen FlashDeBERTa kernels are unavailable.")
+        _run_fixed_or_varlen_canonical_p2c_check(
+            route=route,
+            attention_mod=attention_mod,
+            fixed_mod=fixed_mod,
+            varlen_mod=varlen_mod,
+        )
+    finally:
+        _restore_saved_flash_modules(saved, affected_prefixes)
+
+
+def _run_fixed_or_varlen_canonical_p2c_check(*, route, attention_mod, fixed_mod, varlen_mod) -> None:
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, num_heads, seq_len, head_dim, num_buckets = 2, 2, 32, 64, 16
+    scale = float(head_dim) ** -0.5
+    lengths = torch.tensor(
+        [seq_len, seq_len if route == "fixed" else 19],
+        dtype=torch.int32,
+        device=device,
+    )
+    bucket_index = attention_mod._dense_bucket_index_tensor(
+        seq_len=seq_len,
+        position_buckets=num_buckets // 2,
+        max_relative_distance=seq_len,
+        device=device,
+    )
+
+    q = torch.randn((batch_size, num_heads, seq_len, head_dim), device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    # Unit-scale, asymmetric values prevent initialization scale from hiding a
+    # signed-bucket reversal. Isolating P2C prevents C2P from compensating.
+    pos_query = torch.randn(
+        (batch_size, num_heads, seq_len, num_buckets),
+        device=device,
+        dtype=dtype,
+    )
+    q_kernel = q.clone().requires_grad_()
+    k_kernel = k.clone().requires_grad_()
+    v_kernel = v.clone().requires_grad_()
+    pos_query_kernel = pos_query.clone().requires_grad_()
+
+    if route == "fixed":
+        output_kernel = fixed_mod.flashdeberta_fixed(
+            query_layer=q_kernel,
+            key_layer=k_kernel,
+            value_layer=v_kernel,
+            seq_lengths=None,
+            pos_key=None,
+            pos_query=pos_query_kernel,
+            sm_scale=scale,
+            position_buckets=num_buckets // 2,
+            max_relative_distance=seq_len,
+            causal=False,
+        )
+    else:
+        mask = torch.arange(seq_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        output_kernel = varlen_mod.flashdeberta_varlen_padded(
+            query_layer=q_kernel.permute(0, 2, 1, 3).contiguous(),
+            key_layer=k_kernel.permute(0, 2, 1, 3).contiguous(),
+            value_layer=v_kernel.permute(0, 2, 1, 3).contiguous(),
+            attention_mask_2d=mask,
+            pos_key=None,
+            pos_query=pos_query_kernel.permute(0, 2, 1, 3).contiguous(),
+            sm_scale=scale,
+            position_buckets=num_buckets // 2,
+            max_relative_distance=seq_len,
+            causal=False,
+        ).permute(0, 2, 1, 3)
+
+    q_ref = q.clone().float().requires_grad_()
+    k_ref = k.clone().float().requires_grad_()
+    v_ref = v.clone().float().requires_grad_()
+    pos_query_ref = pos_query.clone().float().requires_grad_()
+    reference_batches: list[torch.Tensor] = []
+    for batch_idx, active_len in enumerate(lengths.tolist()):
+        active_len = int(active_len)
+        buckets = bucket_index[:active_len, :active_len]
+        p2c_source = pos_query_ref[batch_idx : batch_idx + 1, :, None, :active_len, :]
+        p2c_index = buckets.view(1, 1, active_len, active_len, 1).expand(
+            1,
+            num_heads,
+            active_len,
+            active_len,
+            1,
+        )
+        p2c = torch.gather(
+            p2c_source.expand(-1, -1, active_len, -1, -1),
+            dim=-1,
+            index=p2c_index,
+        ).squeeze(-1)
+        scores = (
+            torch.matmul(
+                q_ref[batch_idx : batch_idx + 1, :, :active_len],
+                k_ref[batch_idx : batch_idx + 1, :, :active_len].transpose(-1, -2),
+            )
+            + p2c
+        ) * scale
+        active_output = torch.matmul(
+            torch.softmax(scores, dim=-1),
+            v_ref[batch_idx : batch_idx + 1, :, :active_len],
+        )
+        reference_batches.append(torch.nn.functional.pad(active_output, (0, 0, 0, seq_len - active_len)))
+    output_ref = torch.cat(reference_batches, dim=0)
+
+    grad_output = torch.randn_like(output_kernel)
+    kernel_grads = torch.autograd.grad(
+        (output_kernel * grad_output).sum(),
+        (q_kernel, k_kernel, v_kernel, pos_query_kernel),
+    )
+    reference_grads = torch.autograd.grad(
+        (output_ref * grad_output.float()).sum(),
+        (q_ref, k_ref, v_ref, pos_query_ref),
+    )
+
+    torch.testing.assert_close(output_kernel.float(), output_ref, atol=3e-2, rtol=3e-2)
+    for actual, expected in zip(kernel_grads, reference_grads, strict=True):
+        torch.testing.assert_close(actual.float(), expected, atol=7e-2, rtol=7e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for saved-tensor hook coverage.")
 def test_position_bias_attention_cuda_saves_dense_bias_aux_tensor() -> None:
     import deberta.modeling.flashdeberta_attention as attention_mod
@@ -3871,9 +4040,9 @@ def test_specialized_docblock_backward_honors_per_head_keep_mask() -> None:
 
     The positional-gradient accumulation (dpos_key/dpos_query) gates its
     atomic adds on the keep mask; with a per-head ``(B,H,S,S)`` mask, head h
-    must use plane h, not head 0's plane. The reference is the same impl run
-    one head at a time with ``(B,1,S,S)`` masks - a regime that never depended
-    on the mask head stride.
+    must use plane h, not head 0's plane. A generic dense backward plus the
+    independently validated canonical bucket reduction checks every gradient;
+    one-head launches separately pin the mask-head stride.
 
     Other tests in this file reload the flash module tree against fake
     flashdeberta packages, so this test re-imports a clean real-kernel tree
@@ -3973,6 +4142,35 @@ def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod
         sm_scale=sm_scale,
     )
 
+    ref_dq, ref_dk, ref_dv, ref_d_bias = bias_mod._bias_generic_backward_impl(
+        grad_out=grad_out,
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        out=out,
+        lse=lse,
+        sm_scale=sm_scale,
+        causal=False,
+    )
+    ref_dpos_key, ref_dpos_query = bias_mod._position_bias_backward_from_dense_grad(
+        d_bias=ref_d_bias,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=bucket_index,
+        keep_mask=per_head_mask,
+        scale=bias_scale,
+    )
+    torch.testing.assert_close(dq, ref_dq, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(dk, ref_dk, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(dv, ref_dv, atol=5e-2, rtol=5e-2)
+    assert ref_dpos_key is not None
+    assert ref_dpos_query is not None
+    torch.testing.assert_close(dpos_key, ref_dpos_key, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(dpos_query, ref_dpos_query, atol=5e-2, rtol=5e-2)
+
+    # Keep the per-head comparison as a separate stride regression. The
+    # generic comparison above is the independent canonical P2C oracle.
     for head in range(num_heads):
         sl = slice(head, head + 1)
         ref = bias_mod._position_bias_specialized_docblock_backward_impl(

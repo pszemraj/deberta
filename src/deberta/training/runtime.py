@@ -478,6 +478,7 @@ def _build_train_dataset_and_collator(
             max_seq_length=data_cfg.max_seq_length,
             seed=train_cfg.seed,
             shuffle_buffer_size=data_cfg.shuffle_buffer_size,
+            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
         ),
         process_index=process_index,
         num_processes=num_processes,

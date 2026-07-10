@@ -12,19 +12,21 @@ If none are provided, config validation fails.
 
 ## Packed streaming path
 
-`PackedStreamingDataset` (default when `data.packing.enabled=true`) does:
+`PackedStreamingDataset` (default when `data.packing.enabled=true`) tokenizes documents without
+automatic special tokens. Its row structure depends on document blocking:
 
-1. tokenize documents without auto special tokens
-2. insert internal `[SEP]` between documents
-3. pack tokens to `max_seq_length - 2`
-4. wrap each sample as `[CLS] ... [SEP]`
-5. pad only when needed
+- With `block_cross_document_attention=false`, it inserts `[SEP]` between source documents, fills
+  `max_seq_length - 2` content slots, and wraps the whole row as `[CLS] ... [SEP]`.
+- With `block_cross_document_attention=true`, it first chunks each source document independently,
+  wraps every chunk as `[CLS] document [SEP]`, then greedily packs whole wrapped segments. Segment
+  chunking never depends on the remaining space in another row.
 
 Outputs:
 
 - `input_ids`
 - `special_tokens_mask`
 - optional `attention_mask` (only when padding exists)
+- `doc_ids` for document-blocked packing
 
 ## Cross-document attention blocking
 
@@ -34,7 +36,16 @@ boundaries. It is only valid with `data.packing.enabled=true`.
 - `false`: packed samples attend across document boundaries; no document mask is built
 - `true`: the collator emits compact `doc_ids (B,S)` and precomputes fixed-capacity segment
   descriptors plus host statistics before device transfer. It validates exact, non-overlapping
-  segment coverage against `attention_mask` before attesting the metadata.
+  segment coverage against `attention_mask` before attesting the metadata. Every segment begins
+  with its own CLS token.
+
+The collator also emits two fixed-shape objective tensors for blocked rows:
+
+- `position_ids (B,S)` restarts at zero for each document segment, so EMD sees the same learned
+  absolute positions whether a document is standalone or packed at a later row offset.
+- `doc_context_index (B,S)` maps each token to its document's CLS position. The RTD classifier
+  gathers that context before LayerNorm, preserving the standalone `LayerNorm(token + CLS)`
+  architecture for every packed document.
 
 What consumes `doc_ids` depends on the attention path:
 
@@ -46,18 +57,19 @@ What consumes `doc_ids` depends on the attention path:
 Batch preparation is a second stage. `prepare_flash_attention_batch_metadata` consumes `doc_ids`,
 chooses the attention route, and either materializes the pairwise mask or packages the collator's
 segment metadata into `FlashBatchMeta`. External consumers must preserve the collator's `flash_*`
-fields through device transfer and call this function before the forward pass. A device batch that
-has lost required segment metadata fails rather than rebuilding it on the GPU. Preparation consumes
-the raw fields, leaving `FlashBatchMeta` as the only metadata object passed to the model.
+fields, `position_ids`, and `doc_context_index` through device transfer and call this function
+before the forward pass. A device batch that has lost required segment metadata fails rather than
+rebuilding it on the GPU. Preparation consumes the raw Flash fields while leaving the two objective
+tensors in the batch.
 
 `attention_mask` is the only token-liveness authority. A token whose numeric ID equals
 `pad_token_id` remains active when its mask value is true, and an arbitrary non-pad filler remains
 inactive when its mask value is false. Token IDs identify document separators only at active
 positions. Omitting `attention_mask` means every position is active.
 
-Model forwards reject a raw `doc_ids` argument. Manually dropping `doc_ids` and forwarding only
-`input_ids` and `attention_mask` silently re-enables cross-document attention and global-CLS
-conditioning in the RTD head; there is no in-model guard for that misuse.
+Model forwards reject a raw `doc_ids` argument. Manually dropping `doc_ids` before batch preparation
+loses the cross-document attention graph. Conversely, a pairwise/doc-block attention graph without
+`doc_context_index` fails in the RTD head rather than silently dropping CLS conditioning.
 
 Flash route selection for packed doc-block batches is described in
 [Advanced / FlashDeBERTa attention](../advanced/flash-attention.md).

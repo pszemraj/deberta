@@ -80,7 +80,7 @@ class FlashBatchMeta:
 
         This is the single source of truth for "is this a doc-block batch".
         Consumers that mix information across sequence positions (for example
-        global CLS conditioning) must check it before doing so, because
+        per-document CLS conditioning) must check it before doing so, because
         doc-block batches ship a compact 2D keep mask whose pairwise
         document-blocking semantics live in this metadata instead.
 

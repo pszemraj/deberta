@@ -137,6 +137,12 @@ def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -
                 word_embeddings=torch.nn.Embedding(vocab_size, hidden_size),
             )
 
+        def _initialize_weights(self, module: torch.nn.Module) -> None:
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
         def forward(
             self,
             *,
@@ -184,6 +190,12 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
             self.embeddings = types.SimpleNamespace(
                 word_embeddings=torch.nn.Embedding(vocab_size, hidden_size),
             )
+
+        def _initialize_weights(self, module: torch.nn.Module) -> None:
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
 
         def forward(
             self,

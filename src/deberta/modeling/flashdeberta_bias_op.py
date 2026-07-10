@@ -913,7 +913,7 @@ if triton is not None:
             dq += tl.dot(ds, k)
             if HAS_POS_QUERY:
                 bucket = tl.load(
-                    BUCKET + offs_n[None, :] * stride_bucket_m + offs_m[:, None] * stride_bucket_n
+                    BUCKET + offs_m[:, None] * stride_bucket_m + offs_n[None, :] * stride_bucket_n
                 ).to(tl.int32)
                 dpos_query_ptrs = (
                     DPOS_QUERY
@@ -1927,12 +1927,11 @@ def _position_bias_backward_from_dense_grad(
 
     dpos_query: torch.Tensor | None = None
     if pos_query is not None:
-        # p2c forward reads pos_query[n, bucket_index[n, m]], so the p2c
-        # gradient reduces grad^T rows along the plain bucket map, not the
-        # transposed map (which would flip the signed relative bucket).
+        # P2C forward reads pos_query[n, bucket_index[m,n]]. In key-major
+        # layout both the dense gradient and canonical bucket map transpose.
         dpos_query = _dense_bucket_reduce(
             grad=grad.transpose(-1, -2).contiguous(),
-            bucket_index=bucket_index,
+            bucket_index=bucket_index.transpose(0, 1),
             num_buckets=int(pos_query.shape[-1]),
             output_dtype=pos_query.dtype,
         )

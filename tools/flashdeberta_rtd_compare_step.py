@@ -83,7 +83,7 @@ def _model_overrides(*, attention_impl: str, docblock_bias_seq_len: int) -> list
         "train.compile.enabled=false",
     ]
     if str(attention_impl).strip().lower() == "flash":
-        value = "null" if int(docblock_bias_seq_len) <= 0 else str(int(docblock_bias_seq_len))
+        value = str(max(0, int(docblock_bias_seq_len)))
         overrides.append(f"model.hf.flash.docblock_bias_seq_len={value}")
     return overrides
 
@@ -137,9 +137,10 @@ def _masked_generator_logits(
         "token_type_ids": batch.get("token_type_ids"),
         "return_dict": True,
     }
+    if batch.get("position_ids") is not None:
+        gen_forward_kwargs["position_ids"] = batch["position_ids"]
     pos_biased = bool(getattr(model.gen_config, "position_biased_input", True))
-    z_steps = int(getattr(model.generator, "z_steps", getattr(model.gen_config, "z_steps", 0)) or 0)
-    use_emd = (not pos_biased) and z_steps <= 1
+    use_emd = not pos_biased
     if use_emd:
         gen_forward_kwargs["output_hidden_states"] = True
     if flash_meta is not None and getattr(model, "_generator_accepts_flash_kwargs", False):
@@ -160,6 +161,7 @@ def _masked_generator_logits(
             attention_mask=batch.get("attention_mask"),
             embeddings=model.generator.embeddings,
             encoder=model.generator.encoder,
+            position_ids=batch.get("position_ids"),
             flash_meta=flash_meta if getattr(model, "_generator_accepts_flash_kwargs", False) else None,
         )
     else:
@@ -186,12 +188,15 @@ def _discriminator_logits_and_loss(
         "token_type_ids": batch.get("token_type_ids"),
         "return_dict": True,
     }
+    if batch.get("position_ids") is not None:
+        disc_forward_kwargs["position_ids"] = batch["position_ids"]
     if flash_meta is not None and getattr(model, "_discriminator_accepts_flash_kwargs", False):
         disc_forward_kwargs["flash_meta"] = flash_meta
     disc_out = model.discriminator(**disc_forward_kwargs)
     logits = model.discriminator_head(
         disc_out.last_hidden_state,
         attention_mask=batch.get("attention_mask"),
+        doc_context_index=batch.get("doc_context_index"),
         flash_meta=flash_meta,
     )
     active = attention_mask_to_active_tokens(
@@ -433,6 +438,7 @@ def main() -> None:
             attention_mask=eager_batch.get("attention_mask"),
             labels=eager_batch["labels"],
             token_type_ids=eager_batch.get("token_type_ids"),
+            position_ids=eager_batch.get("position_ids"),
             sampling_temperature=float(eager_cfg.train.sampling_temperature),
             phase="generator",
             flash_meta=eager_meta,
@@ -445,6 +451,7 @@ def main() -> None:
             attention_mask=flash_batch.get("attention_mask"),
             labels=flash_batch["labels"],
             token_type_ids=flash_batch.get("token_type_ids"),
+            position_ids=flash_batch.get("position_ids"),
             sampling_temperature=float(flash_cfg.train.sampling_temperature),
             phase="generator",
             flash_meta=flash_meta,
