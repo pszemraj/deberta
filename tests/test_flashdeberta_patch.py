@@ -2422,7 +2422,6 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         # here when an earlier healthy import registered them. The contract
         # under test is import safety: the calls must not raise.
         assert isinstance(docblock_mod.flashdeberta_compiled_docblock_available(), bool)
-        assert isinstance(bias_mod.flashdeberta_compiled_bias_available(), bool)
         assert isinstance(bias_mod.flashdeberta_compiled_position_bias_available(), bool)
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
@@ -3354,7 +3353,7 @@ def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyP
 def test_flash_attention_docblock_bias_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
     attention_mod, attention, cfg = _stats_attention_harness(monkeypatch)
     monkeypatch.setattr(attention_mod, "flashdeberta_bias_import_error", lambda: None)
-    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_bias_available", lambda: True)
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_position_bias_available", lambda: True)
     seen: dict[str, torch.Tensor] = {}
 
     def _fake_bias_wrapper(
@@ -3749,14 +3748,9 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
             scale=scale,
         )
     torch.testing.assert_close(fallback_bias, ref_bias.detach(), atol=2e-2, rtol=2e-2)
-    ref_out = bias_mod.flashdeberta_bias(
-        query_layer=q_ref,
-        key_layer=k_ref,
-        value_layer=v_ref,
-        bias=ref_bias,
-        sm_scale=scale,
-        causal=False,
-    )
+    ref_scores = torch.matmul(q_ref.float(), k_ref.float().transpose(-1, -2)) * scale
+    ref_probs = torch.softmax(ref_scores + ref_bias.float(), dim=-1)
+    ref_out = torch.matmul(ref_probs, v_ref.float()).to(dtype=dtype)
     fused_out = bias_mod.flashdeberta_bias_from_positions(
         query_layer=q,
         key_layer=k,

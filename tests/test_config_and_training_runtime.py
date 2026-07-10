@@ -2,7 +2,8 @@
 from _config_and_training_shared_imports import *
 
 
-def test_cycle_dataloader_advances_dataset_epoch_each_pass():
+@pytest.mark.parametrize(("start_epoch", "count"), [(0, 3), (7, 2)])
+def test_cycle_dataloader_advances_dataset_epoch_each_pass(start_epoch: int, count: int):
     class _EpochDataset(torch.utils.data.IterableDataset):
         def __init__(self) -> None:
             super().__init__()
@@ -18,38 +19,11 @@ def test_cycle_dataloader_advances_dataset_epoch_each_pass():
 
     ds = _EpochDataset()
     dl = torch.utils.data.DataLoader(ds, batch_size=None, num_workers=0)
-    it = _cycle_dataloader(dl)
-
-    e0 = int(next(it)["epoch"].item())
-    e1 = int(next(it)["epoch"].item())
-    e2 = int(next(it)["epoch"].item())
-
-    assert (e0, e1, e2) == (0, 1, 2)
-    assert ds.seen_epochs[:3] == [0, 1, 2]
-
-
-def test_cycle_dataloader_honors_start_epoch_offset():
-    class _EpochDataset(torch.utils.data.IterableDataset):
-        def __init__(self) -> None:
-            super().__init__()
-            self.current_epoch = -1
-            self.seen_epochs: list[int] = []
-
-        def set_epoch(self, epoch: int) -> None:
-            self.current_epoch = int(epoch)
-            self.seen_epochs.append(int(epoch))
-
-        def __iter__(self):
-            yield {"epoch": torch.tensor(self.current_epoch, dtype=torch.long)}
-
-    ds = _EpochDataset()
-    dl = torch.utils.data.DataLoader(ds, batch_size=None, num_workers=0)
-    it = _cycle_dataloader(dl, start_epoch=7)
-
-    e0 = int(next(it)["epoch"].item())
-    e1 = int(next(it)["epoch"].item())
-    assert (e0, e1) == (7, 8)
-    assert ds.seen_epochs[:2] == [7, 8]
+    it = _cycle_dataloader(dl, start_epoch=start_epoch)
+    observed = [int(next(it)["epoch"].item()) for _ in range(count)]
+    expected = list(range(start_epoch, start_epoch + count))
+    assert observed == expected
+    assert ds.seen_epochs[:count] == expected
 
 
 def test_resolve_data_resume_policy_auto_replays_when_small():
@@ -528,6 +502,7 @@ def test_build_training_collator_propagates_packed_sequences_flag():
     )
     assert collator._packed_sequences is True
     assert collator._block_cross_document_attention is True
+    assert collator._emit_flash_metadata is False
 
 
 def test_should_clip_gradients_for_positive_threshold():

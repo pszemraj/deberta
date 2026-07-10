@@ -947,24 +947,11 @@ class DebertaV3RTDPretrainer(nn.Module):
             if forbidden_vocab_mask.device != x.device:
                 forbidden_vocab_mask = forbidden_vocab_mask.to(device=x.device)
             mask = forbidden_vocab_mask.to(dtype=torch.bool)
-            if mask.ndim == 1:
-                if int(mask.shape[0]) != int(x.shape[-1]):
-                    raise ValueError(
-                        "forbidden_vocab_mask length must match logits vocabulary dimension: "
-                        f"{int(mask.shape[0])} vs {int(x.shape[-1])}."
-                    )
-            else:
-                if int(mask.shape[-1]) != int(x.shape[-1]):
-                    raise ValueError(
-                        "forbidden_vocab_mask last dimension must match logits vocabulary dimension: "
-                        f"{int(mask.shape[-1])} vs {int(x.shape[-1])}."
-                    )
-                try:
-                    mask = mask.expand_as(x)
-                except RuntimeError as exc:
-                    raise ValueError(
-                        "forbidden_vocab_mask with rank > 1 must be broadcastable to logits."
-                    ) from exc
+            if mask.ndim != 1 or int(mask.shape[0]) != int(x.shape[-1]):
+                raise ValueError(
+                    "forbidden_vocab_mask must have shape (vocab_size,); "
+                    f"got {tuple(mask.shape)} for vocabulary size {int(x.shape[-1])}."
+                )
             x = x.masked_fill(mask, -1e9)
 
         # Gumbel noise

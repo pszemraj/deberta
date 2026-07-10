@@ -2745,9 +2745,15 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
             super().__init__()
             self.seen_attention_mask: torch.Tensor | None = None
 
-        def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            *,
+            output_hidden_states: bool,
+        ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
             self.seen_attention_mask = attention_mask
-            return x
+            return x, (x,) if output_hidden_states else None
 
     input_ids = torch.tensor(
         [

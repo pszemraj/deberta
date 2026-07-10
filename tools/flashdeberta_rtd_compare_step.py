@@ -64,9 +64,6 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-_autocast_context = bench.autocast_context
-
-
 def _tensor_batch_clone(batch: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in batch.items():
@@ -396,7 +393,7 @@ def main() -> None:
         "flash_meta": _metadata_summary(flash_meta),
     }
 
-    with _autocast_context(str(mixed_precision)):
+    with bench.autocast_context(str(mixed_precision)):
         eager_hidden, eager_gen_logits, eager_masked_labels, masked_positions = _masked_generator_logits(
             model=eager_model,
             batch=eager_batch,
@@ -432,27 +429,27 @@ def main() -> None:
     _zero_grad(eager_model, flash_model)
     torch.manual_seed(int(args.sample_seed))
     torch.cuda.manual_seed_all(int(args.sample_seed))
-    with _autocast_context(str(mixed_precision)):
+    with bench.autocast_context(str(mixed_precision)):
         eager_gen_phase = eager_model(
             input_ids=eager_batch["input_ids"],
             attention_mask=eager_batch.get("attention_mask"),
             labels=eager_batch["labels"],
             token_type_ids=eager_batch.get("token_type_ids"),
             position_ids=eager_batch.get("position_ids"),
-            sampling_temperature=float(eager_cfg.train.sampling_temperature),
+            sampling_temperature=float(eager_cfg.train.objective.sampling_temperature),
             phase="generator",
             flash_meta=eager_meta,
         )
     torch.manual_seed(int(args.sample_seed))
     torch.cuda.manual_seed_all(int(args.sample_seed))
-    with _autocast_context(str(mixed_precision)):
+    with bench.autocast_context(str(mixed_precision)):
         flash_gen_phase = flash_model(
             input_ids=flash_batch["input_ids"],
             attention_mask=flash_batch.get("attention_mask"),
             labels=flash_batch["labels"],
             token_type_ids=flash_batch.get("token_type_ids"),
             position_ids=flash_batch.get("position_ids"),
-            sampling_temperature=float(flash_cfg.train.sampling_temperature),
+            sampling_temperature=float(flash_cfg.train.objective.sampling_temperature),
             phase="generator",
             flash_meta=flash_meta,
         )
@@ -483,7 +480,7 @@ def main() -> None:
     corrupted = eager_gen_phase.corrupted_input_ids.detach()
     disc_labels = eager_gen_phase.disc_labels.detach()
     _zero_grad(eager_model, flash_model)
-    with _autocast_context(str(mixed_precision)):
+    with bench.autocast_context(str(mixed_precision)):
         eager_disc_logits, eager_disc_loss, eager_disc_active = _discriminator_logits_and_loss(
             model=eager_model,
             batch=eager_batch,

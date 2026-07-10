@@ -365,8 +365,6 @@ def validate_doc_segments_against_mask(
         raise ValueError("Positive document segments must precede zero-padded descriptors.")
     if bool(offsets[active_segments:].ne(0).any().item()):
         raise ValueError("Zero-length document descriptors must have offset=0.")
-    cumulative = int(lengths[:active_segments].sum().item())
-
     ids = None
     if doc_ids is not None:
         if doc_ids.dtype not in _INTEGER_DTYPES:
@@ -438,8 +436,6 @@ def validate_doc_segments_against_mask(
                 "Document cumulative lengths disagree with segment lengths: "
                 f"expected={expected_cu.tolist()}, supplied={actual_cu.tolist()}."
             )
-        if cumulative != int(expected_cu[active_segments].item()):
-            raise ValueError("Document cumulative token count is internally inconsistent.")
 
 
 def is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:

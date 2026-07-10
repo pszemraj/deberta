@@ -32,12 +32,10 @@ try:  # pragma: no cover - optional Triton dependency
     import triton
     import triton.language as tl
 
-    _TRITON_IMPORT_ERROR: Exception | None = None
     _TRITON_AVAILABLE = True
-except Exception as exc:  # pragma: no cover - optional Triton dependency
+except Exception:  # pragma: no cover - optional Triton dependency
     triton = None
     tl = None
-    _TRITON_IMPORT_ERROR = exc
     _TRITON_AVAILABLE = False
 
 _SEGMENT_BLOCK_ROWS = 32

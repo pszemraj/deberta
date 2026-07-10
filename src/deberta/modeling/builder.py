@@ -985,61 +985,31 @@ def build_backbones(
     validate_model_config(model_cfg)
     bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
     resolved = _resolve_backbone_sources(model_cfg)
-
-    if bt == "hf_deberta_v2":
-        if model_cfg.from_scratch or not bool(load_pretrained_weights):
-            disc = DebertaV2Model(disc_config)
-            gen = DebertaV2Model(gen_config)
-            return disc, gen
-
-        disc_src = resolved.discriminator.weight_source
-        gen_src = resolved.generator.weight_source
-        if disc_src is None or gen_src is None:
-            raise RuntimeError("Resolved pretrained HF weight source is missing.")
-
-        disc = _load_pretrained_backbone_or_raise(
-            DebertaV2Model,
-            disc_src,
-            config=disc_config,
-            component="discriminator",
-            kind="HF backbone",
-            origin=resolved.discriminator.weight_origin,
-        )
-        gen = _load_pretrained_backbone_or_raise(
-            DebertaV2Model,
-            gen_src,
-            config=gen_config,
-            component="generator",
-            kind="HF backbone",
-            origin=resolved.generator.weight_origin,
-        )
-        return disc, gen
-
-    # RoPE backbone
+    model_cls, kind = (
+        (DebertaV2Model, "HF backbone") if bt == "hf_deberta_v2" else (DebertaRoPEModel, "RoPE checkpoint")
+    )
     if model_cfg.from_scratch or not bool(load_pretrained_weights):
-        disc = DebertaRoPEModel(disc_config)
-        gen = DebertaRoPEModel(gen_config)
-        return disc, gen
+        return model_cls(disc_config), model_cls(gen_config)
 
     disc_src = resolved.discriminator.weight_source
     gen_src = resolved.generator.weight_source
     if disc_src is None or gen_src is None:
-        raise RuntimeError("Resolved pretrained RoPE weight source is missing.")
+        raise RuntimeError(f"Resolved pretrained {kind} weight source is missing.")
 
     disc = _load_pretrained_backbone_or_raise(
-        DebertaRoPEModel,
+        model_cls,
         disc_src,
         config=disc_config,
         component="discriminator",
-        kind="RoPE checkpoint",
+        kind=kind,
         origin=resolved.discriminator.weight_origin,
     )
     gen = _load_pretrained_backbone_or_raise(
-        DebertaRoPEModel,
+        model_cls,
         gen_src,
         config=gen_config,
         component="generator",
-        kind="RoPE checkpoint",
+        kind=kind,
         origin=resolved.generator.weight_origin,
     )
     return disc, gen

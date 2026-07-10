@@ -115,20 +115,6 @@ def _bool_text(value: str) -> bool:
     raise ValueError(f"Expected true/false, got: {value}")
 
 
-_autocast_context = bench.autocast_context
-
-
-def _write_profiler_outputs(profile_dir: Path, profiler: torch.profiler.profile) -> None:
-    """Persist profiler summaries and a Chrome trace."""
-
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    profiler.export_chrome_trace(str(profile_dir / "trace.json"))
-    cuda_table = profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=120)
-    cpu_table = profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=120)
-    (profile_dir / "key_averages_cuda.txt").write_text(cuda_table + "\n", encoding="utf-8")
-    (profile_dir / "key_averages_cpu.txt").write_text(cpu_table + "\n", encoding="utf-8")
-
-
 def _package_version(name: str) -> str | None:
     """Return an installed package version when available."""
 
@@ -363,7 +349,7 @@ def _run_decoupled_window(
                 _maybe_cudagraph_mark_step_begin()
 
             with _TimedPhase("generator_forward", phase_times_ms):
-                with _autocast_context(mixed_precision):
+                with bench.autocast_context(mixed_precision):
                     gen_phase_out = model(
                         input_ids=batch["input_ids"],
                         attention_mask=batch.get("attention_mask"),
@@ -420,7 +406,7 @@ def _run_decoupled_window(
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()
             with _TimedPhase("discriminator_forward", phase_times_ms):
-                with _autocast_context(mixed_precision):
+                with bench.autocast_context(mixed_precision):
                     disc_phase_out = model(
                         input_ids=payload["input_ids"],  # type: ignore[arg-type]
                         corrupted_input_ids=payload["corrupted_input_ids"],  # type: ignore[arg-type]
@@ -552,7 +538,7 @@ def _run_coupled_window(
                 _maybe_cudagraph_mark_step_begin()
 
             with _TimedPhase("coupled_forward", phase_times_ms):
-                with _autocast_context(mixed_precision):
+                with bench.autocast_context(mixed_precision):
                     out = model(
                         input_ids=batch["input_ids"],
                         attention_mask=batch.get("attention_mask"),
@@ -771,7 +757,7 @@ def main() -> None:
             for _ in range(int(args.profile_steps)):
                 metrics.append(_run_measured_window())
                 profiler.step()
-        _write_profiler_outputs(args.profile_dir, profiler)
+        bench.write_profiler_outputs(args.profile_dir, profiler, row_limit=120)
 
     phase_summary: dict[str, dict[str, float]] = {}
     for name, values in sorted(phase_times_ms.items()):

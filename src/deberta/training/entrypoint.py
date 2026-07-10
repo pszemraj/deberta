@@ -239,6 +239,7 @@ def run_pretraining_dry_run(
         train_cfg=train_cfg,
         process_index=0,
         num_processes=1,
+        flash_enabled=str(model_cfg.hf.attention_impl).strip().lower() == "flash",
     )
 
     example_iter = iter(train_dataset)
@@ -452,6 +453,7 @@ def run_pretraining(
         train_cfg=train_cfg,
         process_index=int(accelerator.process_index),
         num_processes=int(accelerator.num_processes),
+        flash_enabled=str(model_cfg.hf.attention_impl).strip().lower() == "flash",
     )
 
     # Dataloader

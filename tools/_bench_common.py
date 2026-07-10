@@ -63,6 +63,21 @@ from deberta.training.steps import (  # noqa: E402
 )
 
 
+def write_profiler_outputs(
+    profile_dir: Path,
+    profiler: torch.profiler.profile,
+    *,
+    row_limit: int,
+) -> None:
+    """Persist profiler summaries and a Chrome trace."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profiler.export_chrome_trace(str(profile_dir / "trace.json"))
+    averages = profiler.key_averages()
+    for device in ("cuda", "cpu"):
+        table = averages.table(sort_by=f"self_{device}_time_total", row_limit=int(row_limit))
+        (profile_dir / f"key_averages_{device}.txt").write_text(table + "\n", encoding="utf-8")
+
+
 def autocast_context(mixed_precision: str) -> Any:
     """Return the autocast context matching a mixed-precision mode.
 
@@ -195,14 +210,15 @@ def load_tool_config_and_loader(
         train_cfg=cfg.train,
         process_index=0,
         num_processes=1,
+        flash_enabled=str(cfg.model.hf.attention_impl).strip().lower() == "flash",
     )
-    num_workers = 0 if deterministic_loader else int(cfg.train.dataloader_num_workers)
+    num_workers = 0 if deterministic_loader else int(cfg.train.dataloader.num_workers)
     loader = DataLoader(
         train_dataset,
         batch_size=int(cfg.train.per_device_train_batch_size),
         collate_fn=collator,
         num_workers=num_workers,
-        pin_memory=False if deterministic_loader else bool(cfg.train.dataloader_pin_memory),
+        pin_memory=False if deterministic_loader else bool(cfg.train.dataloader.pin_memory),
         drop_last=True,
         persistent_workers=num_workers > 0,
     )

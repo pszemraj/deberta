@@ -55,6 +55,7 @@ class DebertaV3ElectraCollator:
         cfg: MLMConfig,
         packed_sequences: bool = False,
         block_cross_document_attention: bool = True,
+        emit_flash_metadata: bool = True,
         pad_to_multiple_of: int | None = None,
     ) -> None:
         """Initialize collator state.
@@ -63,6 +64,7 @@ class DebertaV3ElectraCollator:
         :param MLMConfig cfg: Masking configuration.
         :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
         :param bool block_cross_document_attention: Whether to emit compact document metadata for packed inputs.
+        :param bool emit_flash_metadata: Whether to attest Flash routing metadata.
         :param int | None pad_to_multiple_of: Optional right-padding multiple.
         """
         self.tokenizer = tokenizer
@@ -70,6 +72,7 @@ class DebertaV3ElectraCollator:
         self.pad_to_multiple_of = pad_to_multiple_of
         self._packed_sequences = bool(packed_sequences)
         self._block_cross_document_attention = bool(block_cross_document_attention)
+        self._emit_flash_metadata = bool(emit_flash_metadata)
 
         if self.tokenizer.mask_token_id is None:
             raise ValueError("Tokenizer must define a mask token for MLM masking.")
@@ -117,12 +120,7 @@ class DebertaV3ElectraCollator:
         # materializing an all-ones mask.
         if not any("attention_mask" in f for f in features) and not needs_padding:
             pad_kwargs["return_attention_mask"] = False
-        try:
-            batch = self.tokenizer.pad(features, **pad_kwargs)
-        except TypeError:
-            # Some minimal tokenizer stubs do not accept return_attention_mask.
-            pad_kwargs.pop("return_attention_mask", None)
-            batch = self.tokenizer.pad(features, **pad_kwargs)
+        batch = self.tokenizer.pad(features, **pad_kwargs)
 
         # Flash metadata is an internal attestation created from this collated
         # batch. Never inherit stale or user-supplied claims from dataset rows.
@@ -177,22 +175,20 @@ class DebertaV3ElectraCollator:
         if doc_ids is not None:
             batch["doc_ids"] = doc_ids
             self._attach_document_objective_metadata(batch=batch, doc_ids=doc_ids)
-            self._attach_flash_doc_metadata(batch=batch, doc_ids=doc_ids)
+            if self._emit_flash_metadata:
+                self._attach_flash_doc_metadata(batch=batch, doc_ids=doc_ids)
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
             attn = batch.get("attention_mask")
             if attn is not None:
-                try:
-                    if attn.dtype == torch.bool:
-                        all_active = bool(attn.all().item())
-                    else:
-                        all_active = bool((attn == 1).all().item())
-                    if all_active:
-                        batch.pop("attention_mask", None)
-                except Exception:
-                    pass
-            self._attach_flash_padding_metadata(batch)
+                all_active = (
+                    bool(attn.all().item()) if attn.dtype == torch.bool else bool((attn == 1).all().item())
+                )
+                if all_active:
+                    batch.pop("attention_mask", None)
+            if self._emit_flash_metadata:
+                self._attach_flash_padding_metadata(batch)
 
         input_ids, labels = self._mask_tokens(batch["input_ids"], special_tokens_mask=special_tokens_mask)
 

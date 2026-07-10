@@ -968,42 +968,10 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
-def test_run_pretraining_skips_nonfinite_grad_window_and_retries(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        extra_patches={"_global_grad_l2_norm": lambda _model: float("inf")},
-    )
-    train_cfg = make_train_config(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        save_steps=0,
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        token_weighted_gradient_accumulation=False,
-        decoupled_training=False,
-        torch_compile=False,
-        export_hf_final=False,
-    )
-
-    with caplog.at_level(logging.WARNING):
-        pretrain_mod.run_pretraining(
-            model_cfg=make_model_config(),
-            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-            train_cfg=train_cfg,
-        )
-    assert "nonfinite_window_skipped=1" in caplog.text
-
-
 def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     opt_ref: dict[str, Any] = {}
 
@@ -1043,14 +1011,16 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
         export_hf_final=False,
     )
 
-    pretrain_mod.run_pretraining(
-        model_cfg=make_model_config(),
-        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
+    with caplog.at_level(logging.WARNING):
+        pretrain_mod.run_pretraining(
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
     opt = opt_ref.get("opt")
     assert isinstance(opt, _CountingSGD)
     assert int(opt.step_calls) == 0
+    assert "nonfinite_window_skipped=1" in caplog.text
 
 
 def test_apply_nonfinite_recovery_ratchets_lr_mult_and_resets_state_on_interval() -> None:

@@ -407,7 +407,7 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
 
     out_dir = tmp_path / f"exported-{int(allow_partial_export)}"
     if expect_error:
-        with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+        with pytest.raises(RuntimeError, match="Missing key.*other_weight"):
             export_cli.run_export(
                 export_cli.ExportConfig(
                     checkpoint_dir=str(checkpoint_dir),

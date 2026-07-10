@@ -165,36 +165,16 @@ def test_optim_constraints_fail_during_validation(cfg: OptimConfig, match: str) 
         validate_optim_config(cfg)
 
 
-def test_load_json_nested_unknown_top_level_key_raises(tmp_path: Path):
-    bad = tmp_path / "bad_nested.json"
-    bad.write_text(
-        json.dumps(
-            {
-                "model": {"backbone_type": "rope"},
-                "unexpected_top_level_key": 1,
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested JSON config"):
-        load_config(bad)
-
-
-def test_load_yaml_nested_unknown_top_level_key_raises(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    bad = tmp_path / "bad_nested.yaml"
-    bad.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  backbone_type: rope",
-                "unexpected_top_level_key: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown top-level keys in nested YAML config"):
+@pytest.mark.parametrize("format_name", ["JSON", "YAML"])
+def test_load_nested_unknown_top_level_key_raises(tmp_path: Path, format_name: str):
+    if format_name == "YAML":
+        pytest.importorskip("yaml")
+        content = "model:\n  backbone_type: rope\nunexpected_top_level_key: 1"
+    else:
+        content = json.dumps({"model": {"backbone_type": "rope"}, "unexpected_top_level_key": 1})
+    bad = tmp_path / f"bad_nested.{format_name.lower()}"
+    bad.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=f"Unknown top-level keys in nested {format_name} config"):
         load_config(bad)
 
 

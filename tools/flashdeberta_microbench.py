@@ -61,8 +61,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--num-heads", type=int, default=12)
     parser.add_argument("--intermediate-size", type=int, default=3072)
-    parser.add_argument("--drop-all-ones-mask", action="store_true", default=True)
-    parser.add_argument("--no-drop-all-ones-mask", dest="drop_all_ones_mask", action="store_false")
+    parser.add_argument("--drop-all-ones-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--profile-dir", type=Path, default=None)
     return parser.parse_args()
 
@@ -127,24 +126,6 @@ def _format_stats(stats: dict[str, int] | None) -> str:
         return "{}"
     items = ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
     return "{" + items + "}"
-
-
-def _write_profiler_outputs(profile_dir: Path, profiler: torch.profiler.profile) -> None:
-    """Persist profiler summaries and a Chrome trace.
-
-    :param Path profile_dir: Output directory for profiler artifacts.
-    :param torch.profiler.profile profiler: Completed profiler object.
-    """
-
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = profile_dir / "trace.json"
-    profiler.export_chrome_trace(str(trace_path))
-
-    cuda_table = profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=80)
-    cpu_table = profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=80)
-
-    (profile_dir / "key_averages_cuda.txt").write_text(cuda_table + "\n", encoding="utf-8")
-    (profile_dir / "key_averages_cpu.txt").write_text(cpu_table + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -236,7 +217,7 @@ def main() -> None:
                 profiler.step()
 
     if args.profile_dir is not None and profiler is not None:
-        _write_profiler_outputs(Path(args.profile_dir), profiler)
+        _bench_common.write_profiler_outputs(Path(args.profile_dir), profiler, row_limit=80)
 
     elapsed_s = sum(times_ms) / 1000.0
     active_tok_s = (active_tokens_per_batch * measured_steps) / elapsed_s

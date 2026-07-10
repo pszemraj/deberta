@@ -347,6 +347,7 @@ def _build_training_collator(
     train_cfg: TrainConfig,
     packed_sequences: bool,
     block_cross_document_attention: bool,
+    emit_flash_metadata: bool = False,
 ) -> DebertaV3ElectraCollator:
     """Build the RTD masking collator from train/data config.
 
@@ -354,6 +355,7 @@ def _build_training_collator(
     :param TrainConfig train_cfg: Training configuration.
     :param bool packed_sequences: Whether dataset packing is enabled.
     :param bool block_cross_document_attention: Whether packed batches should block cross-document attention.
+    :param bool emit_flash_metadata: Whether to build Flash routing metadata.
     :return DebertaV3ElectraCollator: Configured collator.
     """
     return DebertaV3ElectraCollator(
@@ -366,6 +368,7 @@ def _build_training_collator(
         ),
         packed_sequences=bool(packed_sequences),
         block_cross_document_attention=bool(block_cross_document_attention),
+        emit_flash_metadata=bool(emit_flash_metadata),
     )
 
 
@@ -407,6 +410,7 @@ def _build_train_dataset_and_collator(
     train_cfg: TrainConfig,
     process_index: int,
     num_processes: int,
+    flash_enabled: bool = False,
 ) -> tuple[Any, Any]:
     """Build streaming train dataset and collator.
 
@@ -416,6 +420,7 @@ def _build_train_dataset_and_collator(
     :param TrainConfig train_cfg: Train config.
     :param int process_index: Current process index.
     :param int num_processes: Total process count.
+    :param bool flash_enabled: Whether Flash metadata should be emitted.
     :return tuple[Any, Any]: ``(train_dataset, collator)``.
     """
     dataset_cls = PackedStreamingDataset if bool(data_cfg.packing.enabled) else SequentialStreamingDataset
@@ -439,5 +444,6 @@ def _build_train_dataset_and_collator(
         train_cfg=train_cfg,
         packed_sequences=bool(data_cfg.packing.enabled),
         block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
+        emit_flash_metadata=bool(flash_enabled),
     )
     return train_dataset, collator

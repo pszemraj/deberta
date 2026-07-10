@@ -54,7 +54,6 @@ from deberta.modeling.deberta_v2_native import (
 from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_from_positions,
     flashdeberta_bias_import_error,
-    flashdeberta_compiled_bias_available,
     flashdeberta_compiled_position_bias_available,
 )
 from deberta.modeling.flashdeberta_docblock_op import (
@@ -77,7 +76,7 @@ from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_padded,
 )
-from deberta.modeling.flashdeberta_version import flashdeberta_version_error, require_flashdeberta_version
+from deberta.modeling.flashdeberta_version import require_flashdeberta_version
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     build_doc_block_mask,
@@ -206,21 +205,6 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
         enable_debug_stats=bool(_RUNTIME_CONFIG.enable_debug_stats),
         warn_fallbacks=bool(_RUNTIME_CONFIG.warn_fallbacks),
     )
-
-
-def flashdeberta_import_error() -> Exception | None:
-    """Return the fixed-kernel import error, if any.
-
-    Flash attention construction requires the fixed kernel. The varlen kernel is
-    optional and only affects padding-heavy workloads.
-
-    :return Exception | None: Stored fixed-kernel import failure, if one occurred.
-    """
-
-    version_error = flashdeberta_version_error()
-    if version_error is not None:
-        return version_error
-    return flashdeberta_fixed_import_error()
 
 
 def flashdeberta_stats_snapshot() -> dict[str, int]:
@@ -720,11 +704,60 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if flashdeberta_bias_import_error() is not None:
             return False
-        if is_torch_compiling() and not (
-            flashdeberta_compiled_bias_available() and flashdeberta_compiled_position_bias_available()
-        ):
+        if is_torch_compiling() and not flashdeberta_compiled_position_bias_available():
             return False
         return True
+
+    def _flash_dense_bias(
+        self,
+        *,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        keep_mask: torch.Tensor | None,
+        stat: str,
+    ) -> torch.Tensor:
+        """Run dense position-bias attention with optional pairwise masking.
+
+        :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
+        :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
+        :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor | None pos_key: Optional c2p term.
+        :param torch.Tensor | None pos_query: Optional p2c term.
+        :param float sm_scale: Softmax scale.
+        :param torch.Tensor | None keep_mask: Optional pairwise keep mask.
+        :param str stat: Debug counter name.
+        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        """
+
+        seq_len = int(query_layer.shape[-2])
+        bucket_index = _dense_bucket_index_tensor(
+            seq_len=seq_len,
+            position_buckets=int(self.position_buckets),
+            max_relative_distance=int(self.max_relative_positions),
+            device=query_layer.device,
+        )
+        if _RUNTIME_CONFIG.enable_debug_stats:
+            _record_stat(stat)
+        output = flashdeberta_bias_from_positions(
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            bucket_index=bucket_index,
+            keep_mask=keep_mask,
+            bias_scale=float(sm_scale),
+            sm_scale=sm_scale,
+            causal=False,
+        )
+        if keep_mask is None:
+            return output
+        query_live = torch.diagonal(keep_mask, dim1=-2, dim2=-1).unsqueeze(-1)
+        return output * query_live.to(dtype=output.dtype)
 
     def _flash_local_bias(
         self,
@@ -736,38 +769,25 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         pos_query: torch.Tensor | None,
         sm_scale: float,
     ) -> torch.Tensor:
-        """Run dense local-bias flash attention.
+        """Run unmasked dense local-bias attention.
 
-        :param torch.Tensor query_layer: Projected queries in ``(B, H, S, D)`` layout.
-        :param torch.Tensor key_layer: Projected keys in ``(B, H, S, D)`` layout.
-        :param torch.Tensor value_layer: Projected values in ``(B, H, S, D)`` layout.
+        :param torch.Tensor query_layer: Projected queries.
+        :param torch.Tensor key_layer: Projected keys.
+        :param torch.Tensor value_layer: Projected values.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
-        :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
+        :return torch.Tensor: Dense attention output.
         """
-
-        batch_size, num_heads, seq_len, _ = query_layer.shape
-        bucket_index = _dense_bucket_index_tensor(
-            seq_len=seq_len,
-            position_buckets=int(self.position_buckets),
-            max_relative_distance=int(self.max_relative_positions),
-            device=query_layer.device,
-        )
-        del batch_size, num_heads
-        if _RUNTIME_CONFIG.enable_debug_stats:
-            _record_stat("flash_bias_calls")
-        return flashdeberta_bias_from_positions(
+        return self._flash_dense_bias(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
             pos_key=pos_key,
             pos_query=pos_query,
-            bucket_index=bucket_index,
-            keep_mask=None,
-            bias_scale=float(sm_scale),
             sm_scale=sm_scale,
-            causal=False,
+            keep_mask=None,
+            stat="flash_bias_calls",
         )
 
     def _flash_varlen(
@@ -894,40 +914,22 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             inactive query rows zeroed to match eager attention.
         """
 
-        batch_size, num_heads, seq_len, _ = query_layer.shape
+        seq_len = int(query_layer.shape[-2])
         keep_mask = _pairwise_mask_to_4d_keep_mask(
             attention_mask,
             query_len=seq_len,
             key_len=int(key_layer.shape[-2]),
         )
-        del batch_size, num_heads
-        if _RUNTIME_CONFIG.enable_debug_stats:
-            _record_stat("flash_docblock_bias_calls")
-        bucket_index = _dense_bucket_index_tensor(
-            seq_len=seq_len,
-            position_buckets=int(self.position_buckets),
-            max_relative_distance=int(self.max_relative_positions),
-            device=query_layer.device,
-        )
-        output = flashdeberta_bias_from_positions(
+        return self._flash_dense_bias(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
             pos_key=pos_key,
             pos_query=pos_query,
-            bucket_index=bucket_index,
             keep_mask=keep_mask,
-            bias_scale=float(sm_scale),
             sm_scale=sm_scale,
-            causal=False,
+            stat="flash_docblock_bias_calls",
         )
-        # The pairwise-mask diagonal encodes query activity; inactive (padding)
-        # queries only keep a CLS fallback edge so their softmax rows stay
-        # finite inside the kernel. Eager attention zeroes those rows after
-        # softmax - mirror that here so padding positions match eager outputs
-        # (and gradients through them) exactly.
-        query_live = torch.diagonal(keep_mask, dim1=-2, dim2=-1).unsqueeze(-1)
-        return output * query_live.to(dtype=output.dtype)
 
     def _eager_fallback_attention_mask(
         self,
@@ -1215,7 +1217,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     rel_embeddings=rel_embeddings,
                     flash_meta=flash_meta,
                 )
-            if is_torch_compiling() and not flashdeberta_compiled_bias_available():
+            if is_torch_compiling() and not flashdeberta_compiled_position_bias_available():
                 return self._fallback_to_eager(
                     reason="docblock_bias_compile",
                     message=(
@@ -1417,7 +1419,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
 __all__ = [
     "FlashDisentangledSelfAttention",
-    "flashdeberta_import_error",
     "flashdeberta_stats_snapshot",
     "refresh_flashdeberta_runtime_config_from_env",
     "reset_flashdeberta_stats",

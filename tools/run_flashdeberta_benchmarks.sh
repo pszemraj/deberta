@@ -16,6 +16,8 @@ DOCBLOCK_MAX_STEPS="${FLASHDEBERTA_DOCBLOCK_MAX_STEPS:-100}"
 LOGGING_STEPS="${FLASHDEBERTA_LOGGING_STEPS:-10}"
 AVG_FROM_STEP="${FLASHDEBERTA_AVG_FROM_STEP:-20}"
 INCLUDE_DOCBLOCK="${FLASHDEBERTA_INCLUDE_DOCBLOCK:-0}"
+RETRY_ATTEMPTS="${FLASHDEBERTA_BENCH_RETRY_ATTEMPTS:-3}"
+RETRY_BACKOFF_SECONDS="${FLASHDEBERTA_BENCH_RETRY_BACKOFF_SECONDS:-5}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -25,16 +27,36 @@ run_case() {
 
     local log_path="${OUT_DIR}/${name}.log"
     local meta_path="${OUT_DIR}/${name}.meta"
-    local start_ts end_ts elapsed_s
+    local start_ts end_ts elapsed_s attempt attempts_run delay status
 
     echo "==> ${name}"
     echo "    log: ${log_path}"
 
     start_ts="$(date +%s)"
-    (
-        cd "${ROOT_DIR}"
-        "$@"
-    ) >"${log_path}" 2>&1
+    : >"${log_path}"
+    status="failed"
+    attempts_run=0
+    for ((attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++)); do
+        attempts_run="${attempt}"
+        printf '\n== attempt %d/%d ==\n' "${attempt}" "${RETRY_ATTEMPTS}" >>"${log_path}"
+        if (
+            cd "${ROOT_DIR}"
+            "$@"
+        ) >>"${log_path}" 2>&1; then
+            status="success"
+            break
+        fi
+        if ! grep -Eiq \
+            'timeout|connection(reset|error|aborted)?|temporar(il)?y unavailable|remote.*disconnect|incomplete(read| download)|chunkedencoding|http[^0-9]*5[0-9][0-9]|shard.*(unavailable|failed)' \
+            "${log_path}"; then
+            break
+        fi
+        if ((attempt < RETRY_ATTEMPTS)); then
+            delay="$((RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))))"
+            printf 'Transient failure; retrying in %ss.\n' "${delay}" | tee -a "${log_path}"
+            sleep "${delay}"
+        fi
+    done
     end_ts="$(date +%s)"
     elapsed_s="$((end_ts - start_ts))"
 
@@ -42,7 +64,14 @@ run_case() {
         printf 'name=%s\n' "${name}"
         printf 'elapsed_s=%s\n' "${elapsed_s}"
         printf 'log=%s\n' "${log_path}"
+        printf 'attempts=%s\n' "${attempts_run}"
+        printf 'status=%s\n' "${status}"
     } >"${meta_path}"
+
+    if [[ "${status}" != "success" ]]; then
+        echo "Case ${name} failed after ${attempts_run} attempt(s); see ${log_path}." >&2
+        return 1
+    fi
 }
 
 micro_case() {
@@ -57,37 +86,13 @@ micro_case() {
         "$@"
 }
 
-train_eager_case() {
+train_case() {
     local name="$1"
-    local steps="$2"
-    local config_path="$3"
-    shift 3
-
-    local output_dir="${OUT_DIR}/${name}"
-    mkdir -p "${output_dir}"
-
-    run_case \
-        "${name}" \
-        env HF_HUB_DOWNLOAD_TIMEOUT=120 HF_HUB_ETAG_TIMEOUT=120 TOKENIZERS_PARALLELISM=false \
-        conda run --name neobert --no-capture-output deberta train "${config_path}" \
-        --model.hf.attention_impl eager \
-        --train.max_steps "${steps}" \
-        --logging.logging_steps "${LOGGING_STEPS}" \
-        --train.checkpoint.output_dir "${output_dir}" \
-        --logging.output_dir "${output_dir}" \
-        --logging.backend none \
-        --logging.wandb.enabled false \
-        --train.checkpoint.export_hf_final false \
-        --train.checkpoint.save_steps 1000000 \
-        "$@"
-}
-
-train_flash_case() {
-    local name="$1"
-    local steps="$2"
-    local dense_policy="${3:-}"
-    local config_path="$4"
-    shift 4
+    local mode="$2"
+    local steps="$3"
+    local dense_policy="${4:-}"
+    local config_path="$5"
+    shift 5
 
     local output_dir="${OUT_DIR}/${name}"
     local -a env_prefix=(
@@ -96,22 +101,22 @@ train_flash_case() {
         HF_HUB_ETAG_TIMEOUT=120
         TOKENIZERS_PARALLELISM=false
     )
-    local -a flash_args=()
+    local -a mode_args=(--model.hf.attention_impl "${mode}")
     mkdir -p "${output_dir}"
 
-    if [[ -n "${dense_policy}" ]]; then
-        flash_args+=(--model.hf.flash.eager_dense_max_seq_len "${dense_policy}")
+    if [[ "${mode}" == "flash" && -n "${dense_policy}" ]]; then
+        mode_args+=(--model.hf.flash.eager_dense_max_seq_len "${dense_policy}")
     fi
 
     run_case \
         "${name}" \
         "${env_prefix[@]}" \
         conda run --name neobert --no-capture-output deberta train "${config_path}" \
-        --model.hf.attention_impl flash \
-        "${flash_args[@]}" \
+        "${mode_args[@]}" \
         --train.max_steps "${steps}" \
         --logging.logging_steps "${LOGGING_STEPS}" \
         --train.checkpoint.output_dir "${output_dir}" \
+        --train.checkpoint.overwrite_output_dir true \
         --logging.output_dir "${output_dir}" \
         --logging.backend none \
         --logging.wandb.enabled false \
@@ -129,15 +134,15 @@ micro_case micro_flash_padded2048 --mode flash --seq-len 2048 --batch-size 4 --p
 micro_case micro_eager_padded4096 --mode eager --seq-len 4096 --batch-size 2 --pad-ratio 0.35
 micro_case micro_flash_padded4096 --mode flash --seq-len 4096 --batch-size 2 --pad-ratio 0.35
 
-train_eager_case train_packed_eager "${PACKED_MAX_STEPS}" "${CONFIG_PATH}"
-train_flash_case train_packed_flash "${PACKED_MAX_STEPS}" "" "${CONFIG_PATH}"
-train_flash_case train_packed_flash_densepolicy "${PACKED_MAX_STEPS}" "1024" "${CONFIG_PATH}"
-train_eager_case train_unpacked_eager "${UNPACKED_MAX_STEPS}" "${CONFIG_PATH}" --data.packing.enabled false
-train_flash_case train_unpacked_flash "${UNPACKED_MAX_STEPS}" "" "${CONFIG_PATH}" --data.packing.enabled false
+train_case train_packed_eager eager "${PACKED_MAX_STEPS}" "" "${CONFIG_PATH}"
+train_case train_packed_flash flash "${PACKED_MAX_STEPS}" "" "${CONFIG_PATH}"
+train_case train_packed_flash_densepolicy flash "${PACKED_MAX_STEPS}" "1024" "${CONFIG_PATH}"
+train_case train_unpacked_eager eager "${UNPACKED_MAX_STEPS}" "" "${CONFIG_PATH}" --data.packing.enabled false
+train_case train_unpacked_flash flash "${UNPACKED_MAX_STEPS}" "" "${CONFIG_PATH}" --data.packing.enabled false
 
 if [[ "${INCLUDE_DOCBLOCK}" == "1" ]]; then
-    train_eager_case train_packed_docblock_eager "${DOCBLOCK_MAX_STEPS}" "${DOCBLOCK_CONFIG_PATH}"
-    train_flash_case train_packed_docblock_flash "${DOCBLOCK_MAX_STEPS}" "" "${DOCBLOCK_CONFIG_PATH}"
+    train_case train_packed_docblock_eager eager "${DOCBLOCK_MAX_STEPS}" "" "${DOCBLOCK_CONFIG_PATH}"
+    train_case train_packed_docblock_flash flash "${DOCBLOCK_MAX_STEPS}" "" "${DOCBLOCK_CONFIG_PATH}"
 fi
 
 summary_micro() {
