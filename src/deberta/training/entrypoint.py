@@ -24,6 +24,7 @@ from deberta.config import (
 )
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
 from deberta.training.checkpointing import _resolve_data_resume_policy, _save_periodic_checkpoint_if_due
 from deberta.training.compile import (
     _bf16_runtime_sanity_check,
@@ -103,7 +104,7 @@ def _flash_attention_enabled_for_runtime(model_cfg: ModelConfig) -> bool:
     """
 
     hf_cfg = getattr(model_cfg, "hf", None)
-    return str(getattr(hf_cfg, "attention_impl", "eager")).strip().lower() == "flash"
+    return is_flash_attention_impl(getattr(hf_cfg, "attention_impl", "eager"))
 
 
 def run_pretraining_dry_run(
@@ -239,7 +240,7 @@ def run_pretraining_dry_run(
         train_cfg=train_cfg,
         process_index=0,
         num_processes=1,
-        flash_enabled=str(model_cfg.hf.attention_impl).strip().lower() == "flash",
+        flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
     )
 
     example_iter = iter(train_dataset)
@@ -453,7 +454,7 @@ def run_pretraining(
         train_cfg=train_cfg,
         process_index=int(accelerator.process_index),
         num_processes=int(accelerator.num_processes),
-        flash_enabled=str(model_cfg.hf.attention_impl).strip().lower() == "flash",
+        flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
     )
 
     # Dataloader

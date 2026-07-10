@@ -71,7 +71,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     flash_route_policy,
     flash_seq_bucket,
 )
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability
+from deberta.modeling.flashdeberta_op_utils import BoundedLRUCache, device_compute_capability
 from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_padded,
@@ -90,7 +90,9 @@ from deberta.modeling.mask_utils import (
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
 _TRUTHY = {"1", "true", "yes", "y", "on"}
-_DENSE_BUCKET_INDEX_CACHE: dict[tuple[int, int, int, str, int | None], torch.Tensor] = {}
+_DENSE_BUCKET_INDEX_CACHE = BoundedLRUCache[tuple[int, int, int, str, int | None], torch.Tensor](
+    max_entries=8
+)
 
 
 @dataclass(frozen=True)
@@ -418,10 +420,6 @@ def _dense_bucket_index_tensor(
         .clamp_(0, 2 * int(position_buckets) - 1)
     )
     _DENSE_BUCKET_INDEX_CACHE[key] = bucket_index
-    if len(_DENSE_BUCKET_INDEX_CACHE) > 8:
-        stale_keys = list(_DENSE_BUCKET_INDEX_CACHE.keys())[:4]
-        for stale_key in stale_keys:
-            _DENSE_BUCKET_INDEX_CACHE.pop(stale_key, None)
     return bucket_index
 
 

@@ -35,6 +35,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     resolve_flash_kernel_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
+    BoundedLRUCache,
     device_compute_capability,
     lookup_existing_op_pair,
 )
@@ -140,9 +141,9 @@ class _MidTensorCacheEntry:
     mn: int
 
 
-_MASK_METADATA_CACHE: dict[
+_MASK_METADATA_CACHE = BoundedLRUCache[
     tuple[int, int, tuple[int, ...], tuple[int, ...], str, int], _MaskMetadataCacheEntry
-] = {}
+](max_entries=512)
 _CU_SEQLENS_HOST_CACHE: dict[int, _CuSeqlensHostCacheEntry] = {}
 _MID_TENSOR_CACHE: dict[tuple[int, int, str, int | None], _MidTensorCacheEntry] = {}
 
@@ -1115,10 +1116,6 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     )
     _register_cu_seqlens_host_tuple(cu_seqlens=cu_seqlens, cu_seqlens_host=cu_seqlens_host)
     _MASK_METADATA_CACHE[cache_key] = entry
-    if len(_MASK_METADATA_CACHE) > 512:
-        stale_keys = list(_MASK_METADATA_CACHE.keys())[:256]
-        for stale_key in stale_keys:
-            _MASK_METADATA_CACHE.pop(stale_key, None)
     return entry
 
 

@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from deberta.config import ModelConfig, validate_model_config
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 _SPECIAL_ID_ATTRS = (
@@ -641,7 +642,7 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
     :raises ValueError: If flash attention is enabled for an unsupported config.
     """
 
-    if str(getattr(cfg, "hf_attention_impl", "eager")).strip().lower() != "flash":
+    if not is_flash_attention_impl(getattr(cfg, "hf_attention_impl", "eager")):
         return
     hidden_dropout = float(getattr(cfg, "hidden_dropout_prob", 0.0))
     attention_dropout = float(getattr(cfg, "attention_probs_dropout_prob", 0.0))

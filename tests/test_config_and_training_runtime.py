@@ -2,6 +2,24 @@
 from _config_and_training_shared_imports import *
 
 
+def test_move_batch_to_device_keeps_shared_cpu_scalars_host_resident() -> None:
+    from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
+    from deberta.training.steps import _move_batch_to_device
+
+    batch = {
+        key: torch.tensor(index, dtype=torch.int32)
+        for index, key in enumerate(CPU_SCALAR_BATCH_KEYS, start=1)
+    }
+    batch["input_ids"] = torch.ones((1, 2), dtype=torch.long)
+    batch["ordinary_scalar"] = torch.tensor(7, dtype=torch.int32)
+
+    moved = _move_batch_to_device(batch, torch.device("meta"))
+
+    assert all(moved[key].device.type == "cpu" for key in CPU_SCALAR_BATCH_KEYS)
+    assert moved["input_ids"].device.type == "meta"
+    assert moved["ordinary_scalar"].device.type == "meta"
+
+
 @pytest.mark.parametrize(("start_epoch", "count"), [(0, 3), (7, 2)])
 def test_cycle_dataloader_advances_dataset_epoch_each_pass(start_epoch: int, count: int):
     class _EpochDataset(torch.utils.data.IterableDataset):

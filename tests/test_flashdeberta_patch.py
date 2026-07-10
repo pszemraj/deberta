@@ -1554,6 +1554,31 @@ def test_pack_layout_validation_rejects_shape_and_device_drift(other: torch.Tens
         require_matching_tensor_layout(torch.empty((2, 3)), other, context="test")
 
 
+def test_bounded_lru_cache_refreshes_hot_entries_before_eviction() -> None:
+    from deberta.modeling.flashdeberta_op_utils import BoundedLRUCache
+
+    cache = BoundedLRUCache[str, int](max_entries=3)
+    cache["hot"] = 1
+    cache["cold-1"] = 2
+    cache["cold-2"] = 3
+
+    assert cache.get("hot") == 1
+    cache["new"] = 4
+
+    assert list(cache) == ["cold-2", "hot", "new"]
+    assert "cold-1" not in cache
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("flash", True), (" FLASH ", True), ("eager", False), (None, False)],
+)
+def test_flash_attention_impl_predicate_is_shared_and_normalized(value: object, expected: bool) -> None:
+    from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
+
+    assert is_flash_attention_impl(value) is expected
+
+
 def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
     from deberta.modeling.flashdeberta_prefix_pack import (
         prefix_pack_padded_rows_pair,
@@ -1729,6 +1754,147 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
     assert torch.equal(unpacked_c1, expected_unpacked_a)
     assert torch.equal(unpacked_c2, expected_unpacked_b)
     assert torch.equal(unpacked_c3, expected_unpacked_c)
+
+
+def test_segment_pack_rank4_strided_avoids_contiguous_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.modeling.flashdeberta_segment_pack as segment_mod
+
+    seen: dict[str, object] = {}
+
+    def _record_launch(inputs, outputs, **kwargs):
+        seen["inputs"] = inputs
+        seen["outputs"] = outputs
+        seen["address_mode"] = kwargs["address_mode"]
+
+    monkeypatch.setattr(segment_mod, "_can_use_triton_segment_rank4_pack", lambda *args, **kwargs: True)
+    monkeypatch.setattr(segment_mod, "launch_triton_row_copy", _record_launch)
+
+    base = torch.empty((2, 5, 3, 9))
+    tensors = (base[..., 0::3], base[..., 1::3], base[..., 2::3])
+    segment_offsets = torch.tensor([0, 2, 5, 6], dtype=torch.int32)
+    segment_lengths = torch.tensor([2, 2, 1, 2], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 4, 5, 7], dtype=torch.int32)
+
+    outputs = segment_mod.segment_pack_padded_rows_triple(
+        *tensors,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+        total_tokens=7,
+    )
+
+    assert all(not tensor.is_contiguous() for tensor in tensors)
+    assert all(actual is expected for actual, expected in zip(seen["inputs"], tensors, strict=True))
+    assert seen["address_mode"] == segment_mod.TRITON_ROW_COPY_SEGMENT_PACK_STRIDED
+    assert all(tuple(output.shape) == (7, 3, 3) for output in outputs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton row-copy parity.")
+def test_shared_triton_row_copy_cuda_roundtrips_prefix_and_segments() -> None:
+    pytest.importorskip("triton")
+    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
+    import deberta.modeling.flashdeberta_segment_pack as segment_mod
+
+    base = torch.arange(2 * 5 * 3 * 9, dtype=torch.float32, device="cuda").view(2, 5, 3, 9)
+    tensors = (base[..., 0::3], base[..., 1::3], base[..., 2::3])
+    assert all(not tensor.is_contiguous() for tensor in tensors)
+
+    prefix_lengths = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+    prefix_cu = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+    prefix_packed = prefix_mod.prefix_pack_padded_rows_triple(
+        *tensors,
+        seqlens=prefix_lengths,
+        cu_seqlens=prefix_cu,
+        max_seqlen=3,
+        total_tokens=5,
+    )
+    prefix_unpacked = prefix_mod.prefix_unpack_padded_rows_triple(
+        *prefix_packed,
+        seqlens=prefix_lengths,
+        cu_seqlens=prefix_cu,
+        batch_size=2,
+        seq_len=5,
+    )
+    for source, packed, unpacked in zip(tensors, prefix_packed, prefix_unpacked, strict=True):
+        expected_packed = torch.cat((source[0, :3], source[1, :2]))
+        expected_unpacked = torch.zeros_like(source)
+        expected_unpacked[0, :3] = source[0, :3]
+        expected_unpacked[1, :2] = source[1, :2]
+        assert torch.equal(packed, expected_packed)
+        assert torch.equal(unpacked, expected_unpacked)
+
+    prefix_source = tensors[0].contiguous()
+    prefix_single = prefix_mod.prefix_pack_padded_rows(
+        prefix_source,
+        seqlens=prefix_lengths,
+        cu_seqlens=prefix_cu,
+        max_seqlen=3,
+        total_tokens=5,
+    )
+    prefix_single_unpacked = prefix_mod.prefix_unpack_padded_rows(
+        prefix_single,
+        seqlens=prefix_lengths,
+        cu_seqlens=prefix_cu,
+        batch_size=2,
+        seq_len=5,
+    )
+    assert torch.equal(prefix_single, torch.cat((prefix_source[0, :3], prefix_source[1, :2])))
+    assert torch.equal(prefix_single_unpacked, prefix_unpacked[0])
+
+    segment_offsets = torch.tensor([0, 2, 5, 6], dtype=torch.int32, device="cuda")
+    segment_lengths = torch.tensor([2, 2, 1, 3], dtype=torch.int32, device="cuda")
+    segment_cu = torch.tensor([0, 2, 4, 5, 8], dtype=torch.int32, device="cuda")
+    segment_packed = segment_mod.segment_pack_padded_rows_triple(
+        *tensors,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=segment_cu,
+        total_tokens=8,
+        max_segment_length=3,
+    )
+    segment_unpacked = segment_mod.segment_unpack_padded_rows_triple(
+        *segment_packed,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=segment_cu,
+        batch_size=2,
+        seq_len=5,
+        max_segment_length=3,
+    )
+    for source, packed, unpacked in zip(tensors, segment_packed, segment_unpacked, strict=True):
+        expected_packed = torch.cat((source[0, :2], source[0, 2:4], source[1, :1], source[1, 1:4]))
+        expected_unpacked = torch.zeros_like(source)
+        expected_unpacked[0, :4] = source[0, :4]
+        expected_unpacked[1, :4] = source[1, :4]
+        assert torch.equal(packed, expected_packed)
+        assert torch.equal(unpacked, expected_unpacked)
+
+    segment_sources = (tensors[0].contiguous(), tensors[1].contiguous())
+    segment_pair = segment_mod.segment_pack_padded_rows_pair(
+        *segment_sources,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=segment_cu,
+        total_tokens=8,
+        max_segment_length=3,
+    )
+    segment_pair_unpacked = segment_mod.segment_unpack_padded_rows_pair(
+        *segment_pair,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=segment_cu,
+        batch_size=2,
+        seq_len=5,
+        max_segment_length=3,
+    )
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(segment_pair, segment_packed[:2], strict=True)
+    )
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(segment_pair_unpacked, segment_unpacked[:2], strict=True)
+    )
 
 
 def test_docblock_forward_pads_saved_aux_without_expanding_kernel_tokens(
@@ -2674,6 +2840,31 @@ def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbo
     assert "doc_ids" not in prepared
     assert tuple(prepared["attention_mask"].shape) == (1, 4, 4)
     assert torch.equal(prepared["attention_mask"], build_doc_block_mask(doc_ids))
+
+
+@pytest.mark.parametrize("backbone_type", ["rope", "hf_deberta_v2"])
+def test_prepare_eager_doc_mask_accepts_device_resident_doc_ids(backbone_type: str) -> None:
+    import deberta.training.compile as compile_mod
+
+    # The training loop transfers the batch before preparation. A meta tensor
+    # exercises the non-CPU contract without requiring CUDA in the unit suite.
+    doc_ids = torch.empty((1, 4), dtype=torch.long, device="meta")
+    batch = {
+        "input_ids": torch.empty((1, 4), dtype=torch.long, device="meta"),
+        "attention_mask": torch.empty((1, 4), dtype=torch.bool, device="meta"),
+        "doc_ids": doc_ids,
+    }
+
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type=backbone_type,
+        flash_enabled=False,
+    )
+
+    assert meta is None
+    assert "doc_ids" not in prepared
+    assert prepared["attention_mask"].device.type == "meta"
+    assert tuple(prepared["attention_mask"].shape) == (1, 4, 4)
 
 
 def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:

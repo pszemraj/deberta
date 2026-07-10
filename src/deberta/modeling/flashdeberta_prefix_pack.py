@@ -19,25 +19,21 @@ from functools import partial
 import torch
 
 from deberta.modeling.flashdeberta_op_utils import (
+    TRITON_ROW_COPY_PREFIX_PACK,
+    TRITON_ROW_COPY_PREFIX_PACK_STRIDED,
+    TRITON_ROW_COPY_PREFIX_UNPACK,
     can_use_triton_pack,
     flatten_padded_rows,
+    launch_triton_row_copy,
     require_matching_tensor_layout,
-)
-from deberta.modeling.flashdeberta_op_utils import (
-    optional_triton_jit as _optional_triton_jit,
-)
-from deberta.modeling.flashdeberta_op_utils import (
-    traceable_triton_kernel as _traceable_triton_kernel,
 )
 
 try:  # pragma: no cover - optional Triton dependency
     import triton
-    import triton.language as tl
 
     _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover - optional Triton dependency
     triton = None
-    tl = None
     _TRITON_AVAILABLE = False
 
 _PACK_BLOCK_ROWS = 32
@@ -79,595 +75,29 @@ def _can_use_triton_prefix_pack(
     )
 
 
-@_optional_triton_jit
-def _pack_prefix_rows_kernel(
-    input_ptr: None,
-    output_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    seq_len: int,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy valid prefix rows from padded ``(B*S, F)`` into packed ``(NNZ, F)``.
+def _can_use_triton_prefix_rank4_pack(
+    tensors: tuple[torch.Tensor, ...],
+    *,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> bool:
+    """Return whether rank-4 inputs can use the stride-aware Triton copy mode.
 
-    :param Any input_ptr: Triton pointer to the padded row-major input tensor.
-    :param Any output_ptr: Triton pointer to the packed row-major output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any seq_len: Padded sequence length.
-    :param Any row_size: Flattened trailing feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to ``output_ptr``.
+    :param tuple[torch.Tensor, ...] tensors: Candidate padded rank-4 tensors.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative active lengths.
+    :return bool: True when the inputs and metadata share one CUDA device.
     """
 
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    src_rows = batch_idx * seq_len + row_offsets
-    dst_rows = packed_base + row_offsets
-
-    mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
-    src_ptrs = input_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_ptrs = output_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values = tl.load(src_ptrs, mask=mask, other=0)
-    tl.store(dst_ptrs, values, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_prefix_rows_pair_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    seq_len: int,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy valid prefix rows from two padded tensors into packed outputs.
-
-    :param Any input_a_ptr: Triton pointer to the first padded input tensor.
-    :param Any input_b_ptr: Triton pointer to the second padded input tensor.
-    :param Any output_a_ptr: Triton pointer to the first packed output tensor.
-    :param Any output_b_ptr: Triton pointer to the second packed output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any seq_len: Padded sequence length.
-    :param Any row_size: Flattened trailing feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to the output pointers.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    src_rows = batch_idx * seq_len + row_offsets
-    dst_rows = packed_base + row_offsets
-
-    mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_prefix_rows_triple_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    input_c_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    output_c_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    seq_len: int,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy valid prefix rows from three padded tensors into packed outputs.
-
-    :param Any input_a_ptr: Triton pointer to the first padded input tensor.
-    :param Any input_b_ptr: Triton pointer to the second padded input tensor.
-    :param Any input_c_ptr: Triton pointer to the third padded input tensor.
-    :param Any output_a_ptr: Triton pointer to the first packed output tensor.
-    :param Any output_b_ptr: Triton pointer to the second packed output tensor.
-    :param Any output_c_ptr: Triton pointer to the third packed output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any seq_len: Padded sequence length.
-    :param Any row_size: Flattened trailing feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to the output pointers.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    src_rows = batch_idx * seq_len + row_offsets
-    dst_rows = packed_base + row_offsets
-
-    mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    values_c = tl.load(src_c_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-    tl.store(dst_c_ptrs, values_c, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_prefix_rows_rank4_strided_kernel(
-    input_ptr: None,
-    output_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    stride_b: int,
-    stride_s: int,
-    stride_h: int,
-    stride_f: int,
-    seq_len: int,
-    num_heads: int,
-    feature_size: int,
-    col_tiles: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Pack strided ``(B, S, H, F)`` tensors into contiguous ``(NNZ, H, F)``.
-
-    :param Any input_ptr: Triton pointer to the padded strided input tensor.
-    :param Any output_ptr: Triton pointer to the packed contiguous output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any stride_b: Input stride for the batch dimension.
-    :param Any stride_s: Input stride for the sequence dimension.
-    :param Any stride_h: Input stride for the head dimension.
-    :param Any stride_f: Input stride for the per-head feature dimension.
-    :param Any seq_len: Padded sequence length.
-    :param Any num_heads: Number of heads in the input tensor.
-    :param Any feature_size: Per-head feature width.
-    :param Any col_tiles: Number of feature tiles per head.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to ``output_ptr``.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_hf = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    head_idx = tile_hf // col_tiles
-    tile_col = tile_hf % col_tiles
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    dst_row_offsets = packed_base + row_offsets
-
-    src_ptrs = (
-        input_ptr
-        + batch_idx * stride_b
-        + row_offsets[:, None] * stride_s
-        + head_idx * stride_h
-        + col_offsets[None, :] * stride_f
+    if not flashdeberta_prefix_pack_available() or not tensors:
+        return False
+    device = tensors[0].device
+    return (
+        device.type == "cuda"
+        and all(tensor.device == device and tensor.ndim == 4 for tensor in tensors)
+        and seqlens.device == device
+        and cu_seqlens.device == device
     )
-    dst_ptrs = (
-        output_ptr
-        + dst_row_offsets[:, None] * (num_heads * feature_size)
-        + head_idx * feature_size
-        + col_offsets[None, :]
-    )
-    mask = (head_idx < num_heads) & (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < feature_size)
-    values = tl.load(src_ptrs, mask=mask, other=0)
-    tl.store(dst_ptrs, values, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_prefix_rows_rank4_strided_pair_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    stride_a_b: int,
-    stride_a_s: int,
-    stride_a_h: int,
-    stride_a_f: int,
-    stride_b_b: int,
-    stride_b_s: int,
-    stride_b_h: int,
-    stride_b_f: int,
-    seq_len: int,
-    num_heads: int,
-    feature_size: int,
-    col_tiles: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Pack two strided ``(B, S, H, F)`` tensors into contiguous packed outputs.
-
-    :param Any input_a_ptr: Triton pointer to the first padded strided input tensor.
-    :param Any input_b_ptr: Triton pointer to the second padded strided input tensor.
-    :param Any output_a_ptr: Triton pointer to the first packed contiguous output tensor.
-    :param Any output_b_ptr: Triton pointer to the second packed contiguous output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any stride_a_b: First-input batch stride.
-    :param Any stride_a_s: First-input sequence stride.
-    :param Any stride_a_h: First-input head stride.
-    :param Any stride_a_f: First-input feature stride.
-    :param Any stride_b_b: Second-input batch stride.
-    :param Any stride_b_s: Second-input sequence stride.
-    :param Any stride_b_h: Second-input head stride.
-    :param Any stride_b_f: Second-input feature stride.
-    :param Any seq_len: Padded sequence length.
-    :param Any num_heads: Number of heads.
-    :param Any feature_size: Per-head feature width.
-    :param Any col_tiles: Number of feature tiles per head.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to the output pointers.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_hf = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    head_idx = tile_hf // col_tiles
-    tile_col = tile_hf % col_tiles
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    dst_row_offsets = packed_base + row_offsets
-
-    src_a_ptrs = (
-        input_a_ptr
-        + batch_idx * stride_a_b
-        + row_offsets[:, None] * stride_a_s
-        + head_idx * stride_a_h
-        + col_offsets[None, :] * stride_a_f
-    )
-    src_b_ptrs = (
-        input_b_ptr
-        + batch_idx * stride_b_b
-        + row_offsets[:, None] * stride_b_s
-        + head_idx * stride_b_h
-        + col_offsets[None, :] * stride_b_f
-    )
-    dst_a_ptrs = (
-        output_a_ptr
-        + dst_row_offsets[:, None] * (num_heads * feature_size)
-        + head_idx * feature_size
-        + col_offsets[None, :]
-    )
-    dst_b_ptrs = (
-        output_b_ptr
-        + dst_row_offsets[:, None] * (num_heads * feature_size)
-        + head_idx * feature_size
-        + col_offsets[None, :]
-    )
-    mask = (head_idx < num_heads) & (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < feature_size)
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_prefix_rows_rank4_strided_triple_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    input_c_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    output_c_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    stride_a_b: int,
-    stride_a_s: int,
-    stride_a_h: int,
-    stride_a_f: int,
-    stride_b_b: int,
-    stride_b_s: int,
-    stride_b_h: int,
-    stride_b_f: int,
-    stride_c_b: int,
-    stride_c_s: int,
-    stride_c_h: int,
-    stride_c_f: int,
-    seq_len: int,
-    num_heads: int,
-    feature_size: int,
-    col_tiles: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Pack three strided ``(B, S, H, F)`` tensors into contiguous packed outputs.
-
-    :param Any input_a_ptr: Triton pointer to the first padded strided input tensor.
-    :param Any input_b_ptr: Triton pointer to the second padded strided input tensor.
-    :param Any input_c_ptr: Triton pointer to the third padded strided input tensor.
-    :param Any output_a_ptr: Triton pointer to the first packed contiguous output tensor.
-    :param Any output_b_ptr: Triton pointer to the second packed contiguous output tensor.
-    :param Any output_c_ptr: Triton pointer to the third packed contiguous output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any stride_a_b: First-input batch stride.
-    :param Any stride_a_s: First-input sequence stride.
-    :param Any stride_a_h: First-input head stride.
-    :param Any stride_a_f: First-input feature stride.
-    :param Any stride_b_b: Second-input batch stride.
-    :param Any stride_b_s: Second-input sequence stride.
-    :param Any stride_b_h: Second-input head stride.
-    :param Any stride_b_f: Second-input feature stride.
-    :param Any stride_c_b: Third-input batch stride.
-    :param Any stride_c_s: Third-input sequence stride.
-    :param Any stride_c_h: Third-input head stride.
-    :param Any stride_c_f: Third-input feature stride.
-    :param Any seq_len: Padded sequence length.
-    :param Any num_heads: Number of heads.
-    :param Any feature_size: Per-head feature width.
-    :param Any col_tiles: Number of feature tiles per head.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to the output pointers.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_hf = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    head_idx = tile_hf // col_tiles
-    tile_col = tile_hf % col_tiles
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    dst_row_offsets = packed_base + row_offsets
-
-    src_a_ptrs = (
-        input_a_ptr
-        + batch_idx * stride_a_b
-        + row_offsets[:, None] * stride_a_s
-        + head_idx * stride_a_h
-        + col_offsets[None, :] * stride_a_f
-    )
-    src_b_ptrs = (
-        input_b_ptr
-        + batch_idx * stride_b_b
-        + row_offsets[:, None] * stride_b_s
-        + head_idx * stride_b_h
-        + col_offsets[None, :] * stride_b_f
-    )
-    src_c_ptrs = (
-        input_c_ptr
-        + batch_idx * stride_c_b
-        + row_offsets[:, None] * stride_c_s
-        + head_idx * stride_c_h
-        + col_offsets[None, :] * stride_c_f
-    )
-    dst_a_ptrs = (
-        output_a_ptr
-        + dst_row_offsets[:, None] * (num_heads * feature_size)
-        + head_idx * feature_size
-        + col_offsets[None, :]
-    )
-    dst_b_ptrs = (
-        output_b_ptr
-        + dst_row_offsets[:, None] * (num_heads * feature_size)
-        + head_idx * feature_size
-        + col_offsets[None, :]
-    )
-    dst_c_ptrs = (
-        output_c_ptr
-        + dst_row_offsets[:, None] * (num_heads * feature_size)
-        + head_idx * feature_size
-        + col_offsets[None, :]
-    )
-    mask = (head_idx < num_heads) & (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < feature_size)
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    values_c = tl.load(src_c_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-    tl.store(dst_c_ptrs, values_c, mask=mask)
-
-
-@_optional_triton_jit
-def _unpack_prefix_rows_kernel(
-    input_ptr: None,
-    output_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    seq_len: int,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy packed rows back into padded layout with zero tail fill.
-
-    :param Any input_ptr: Triton pointer to the packed row-major input tensor.
-    :param Any output_ptr: Triton pointer to the padded row-major output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any seq_len: Padded sequence length.
-    :param Any row_size: Flattened trailing feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to ``output_ptr``.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    dst_rows = batch_idx * seq_len + row_offsets
-    src_rows = packed_base + row_offsets
-
-    output_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
-    input_mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
-    src_ptrs = input_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_ptrs = output_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values = tl.load(src_ptrs, mask=input_mask, other=0)
-    tl.store(dst_ptrs, values, mask=output_mask)
-
-
-@_optional_triton_jit
-def _unpack_prefix_rows_pair_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    seq_len: int,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy two packed tensors back into padded layout with shared prefix metadata.
-
-    :param Any input_a_ptr: Triton pointer to the first packed row-major input tensor.
-    :param Any input_b_ptr: Triton pointer to the second packed row-major input tensor.
-    :param Any output_a_ptr: Triton pointer to the first padded row-major output tensor.
-    :param Any output_b_ptr: Triton pointer to the second padded row-major output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any seq_len: Padded sequence length.
-    :param Any row_size: Flattened trailing feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to the output pointers.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    dst_rows = batch_idx * seq_len + row_offsets
-    src_rows = packed_base + row_offsets
-
-    output_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
-    input_mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=input_mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=input_mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=output_mask)
-    tl.store(dst_b_ptrs, values_b, mask=output_mask)
-
-
-@_optional_triton_jit
-def _unpack_prefix_rows_triple_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    input_c_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    output_c_ptr: None,
-    seqlens_ptr: None,
-    cu_seqlens_ptr: None,
-    seq_len: int,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy three packed tensors back into padded layout with shared prefix metadata.
-
-    :param Any input_a_ptr: Triton pointer to the first packed row-major input tensor.
-    :param Any input_b_ptr: Triton pointer to the second packed row-major input tensor.
-    :param Any input_c_ptr: Triton pointer to the third packed row-major input tensor.
-    :param Any output_a_ptr: Triton pointer to the first padded row-major output tensor.
-    :param Any output_b_ptr: Triton pointer to the second padded row-major output tensor.
-    :param Any output_c_ptr: Triton pointer to the third padded row-major output tensor.
-    :param Any seqlens_ptr: Triton pointer to per-example active lengths.
-    :param Any cu_seqlens_ptr: Triton pointer to cumulative active lengths.
-    :param Any seq_len: Padded sequence length.
-    :param Any row_size: Flattened trailing feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes directly to the output pointers.
-    """
-
-    batch_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    seqlen = tl.load(seqlens_ptr + batch_idx)
-    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
-    dst_rows = batch_idx * seq_len + row_offsets
-    src_rows = packed_base + row_offsets
-
-    output_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
-    input_mask = (row_offsets[:, None] < seqlen) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=input_mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=input_mask, other=0)
-    values_c = tl.load(src_c_ptrs, mask=input_mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=output_mask)
-    tl.store(dst_b_ptrs, values_b, mask=output_mask)
-    tl.store(dst_c_ptrs, values_c, mask=output_mask)
 
 
 def _prefix_pack_fallback(
@@ -751,12 +181,9 @@ def prefix_pack_padded_rows(
     if total_tokens == 0:
         return tensor.new_empty((0, *tensor.shape[2:]))
     if (
-        flashdeberta_prefix_pack_available()
-        and tensor.device.type == "cuda"
+        _can_use_triton_prefix_rank4_pack((tensor,), seqlens=seqlens, cu_seqlens=cu_seqlens)
         and not tensor.is_contiguous()
-        and tensor.ndim == 4
     ):
-        batch_size = int(tensor.shape[0])
         num_heads = int(tensor.shape[2])
         feature_size = int(tensor.shape[3])
         flat_output = torch.empty(
@@ -764,27 +191,20 @@ def prefix_pack_padded_rows(
             device=tensor.device,
             dtype=tensor.dtype,
         )
-        col_tiles = triton.cdiv(feature_size, _PACK_BLOCK_COLS)
-        grid = (
-            batch_size,
-            triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS),
-            num_heads * col_tiles,
-        )
-        _traceable_triton_kernel(_pack_prefix_rows_rank4_strided_kernel)[grid](
-            tensor,
-            flat_output,
-            seqlens,
-            cu_seqlens,
-            tensor.stride(0),
-            tensor.stride(1),
-            tensor.stride(2),
-            tensor.stride(3),
-            int(tensor.shape[1]),
-            num_heads,
-            feature_size,
-            col_tiles,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
+        launch_triton_row_copy(
+            (tensor,),
+            (flat_output,),
+            offsets=seqlens,
+            lengths=seqlens,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_PREFIX_PACK_STRIDED,
+            seq_len=int(tensor.shape[1]),
+            row_size=num_heads * feature_size,
+            max_rows=int(max_seqlen),
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_PACK_BLOCK_ROWS,
+            block_cols=_PACK_BLOCK_COLS,
             num_warps=_PACK_NUM_WARPS,
             num_stages=_PACK_NUM_STAGES,
         )
@@ -794,23 +214,21 @@ def prefix_pack_padded_rows(
     if not _can_use_triton_prefix_pack(tensor=tensor, seqlens=seqlens, cu_seqlens=cu_seqlens):
         return _prefix_pack_fallback(tensor, seqlens=seqlens, cu_seqlens=cu_seqlens)
 
-    flat_input, trailing_shape, batch_size, seq_len = _flatten_rows(tensor)
+    flat_input, trailing_shape, _batch_size, seq_len = _flatten_rows(tensor)
     row_size = int(flat_input.shape[1])
     flat_output = torch.empty((total_tokens, row_size), device=tensor.device, dtype=tensor.dtype)
-    grid = (
-        batch_size,
-        triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS),
-        triton.cdiv(row_size, _PACK_BLOCK_COLS),
-    )
-    _traceable_triton_kernel(_pack_prefix_rows_kernel)[grid](
-        flat_input,
-        flat_output,
-        seqlens,
-        cu_seqlens,
-        seq_len,
-        row_size,
-        BLOCK_ROWS=_PACK_BLOCK_ROWS,
-        BLOCK_COLS=_PACK_BLOCK_COLS,
+    launch_triton_row_copy(
+        (flat_input,),
+        (flat_output,),
+        offsets=seqlens,
+        lengths=seqlens,
+        cu_seqlens=cu_seqlens,
+        address_mode=TRITON_ROW_COPY_PREFIX_PACK,
+        seq_len=seq_len,
+        row_size=row_size,
+        max_rows=int(max_seqlen),
+        block_rows=_PACK_BLOCK_ROWS,
+        block_cols=_PACK_BLOCK_COLS,
         num_warps=_PACK_NUM_WARPS,
         num_stages=_PACK_NUM_STAGES,
     )
@@ -840,7 +258,7 @@ def prefix_pack_padded_rows_pair(
     shape = require_matching_tensor_layout(
         tensor_a, tensor_b, context="Prefix-pack padded tensors", minimum_rank=2
     )
-    batch_size, seq_len = int(shape[0]), int(shape[1])
+    _batch_size, seq_len = int(shape[0]), int(shape[1])
     trailing_shape = shape[2:]
     if int(cu_seqlens.numel()) == 0:
         empty = tensor_a.new_empty((0, *trailing_shape))
@@ -853,14 +271,9 @@ def prefix_pack_padded_rows_pair(
         empty = tensor_a.new_empty((0, *trailing_shape))
         return empty, tensor_b.new_empty((0, *trailing_shape))
 
-    can_rank4 = (
-        flashdeberta_prefix_pack_available()
-        and tensor_a.device.type == "cuda"
-        and tensor_a.ndim == 4
-        and tensor_b.ndim == 4
-        and not tensor_a.is_contiguous()
-        and not tensor_b.is_contiguous()
-    )
+    can_rank4 = _can_use_triton_prefix_rank4_pack(
+        (tensor_a, tensor_b), seqlens=seqlens, cu_seqlens=cu_seqlens
+    ) and (not tensor_a.is_contiguous() or not tensor_b.is_contiguous())
     if can_rank4:
         num_heads = int(tensor_a.shape[2])
         feature_size = int(tensor_a.shape[3])
@@ -874,29 +287,20 @@ def prefix_pack_padded_rows_pair(
             device=tensor_b.device,
             dtype=tensor_b.dtype,
         )
-        col_tiles = triton.cdiv(feature_size, _PACK_BLOCK_COLS)
-        grid = (batch_size, triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS), num_heads * col_tiles)
-        _traceable_triton_kernel(_pack_prefix_rows_rank4_strided_pair_kernel)[grid](
-            tensor_a,
-            tensor_b,
-            flat_output_a,
-            flat_output_b,
-            seqlens,
-            cu_seqlens,
-            tensor_a.stride(0),
-            tensor_a.stride(1),
-            tensor_a.stride(2),
-            tensor_a.stride(3),
-            tensor_b.stride(0),
-            tensor_b.stride(1),
-            tensor_b.stride(2),
-            tensor_b.stride(3),
-            seq_len,
-            num_heads,
-            feature_size,
-            col_tiles,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
+        launch_triton_row_copy(
+            (tensor_a, tensor_b),
+            (flat_output_a, flat_output_b),
+            offsets=seqlens,
+            lengths=seqlens,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_PREFIX_PACK_STRIDED,
+            seq_len=seq_len,
+            row_size=num_heads * feature_size,
+            max_rows=int(max_seqlen),
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_PACK_BLOCK_ROWS,
+            block_cols=_PACK_BLOCK_COLS,
             num_warps=_PACK_NUM_WARPS,
             num_stages=_PACK_NUM_STAGES,
         )
@@ -928,22 +332,18 @@ def prefix_pack_padded_rows_pair(
     row_size = int(flat_a.shape[1])
     flat_output_a = torch.empty((total_tokens, row_size), device=tensor_a.device, dtype=tensor_a.dtype)
     flat_output_b = torch.empty((total_tokens, row_size), device=tensor_b.device, dtype=tensor_b.dtype)
-    grid = (
-        batch_size,
-        triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS),
-        triton.cdiv(row_size, _PACK_BLOCK_COLS),
-    )
-    _traceable_triton_kernel(_pack_prefix_rows_pair_kernel)[grid](
-        flat_a,
-        flat_b,
-        flat_output_a,
-        flat_output_b,
-        seqlens,
-        cu_seqlens,
-        seq_len,
-        row_size,
-        BLOCK_ROWS=_PACK_BLOCK_ROWS,
-        BLOCK_COLS=_PACK_BLOCK_COLS,
+    launch_triton_row_copy(
+        (flat_a, flat_b),
+        (flat_output_a, flat_output_b),
+        offsets=seqlens,
+        lengths=seqlens,
+        cu_seqlens=cu_seqlens,
+        address_mode=TRITON_ROW_COPY_PREFIX_PACK,
+        seq_len=seq_len,
+        row_size=row_size,
+        max_rows=int(max_seqlen),
+        block_rows=_PACK_BLOCK_ROWS,
+        block_cols=_PACK_BLOCK_COLS,
         num_warps=_PACK_NUM_WARPS,
         num_stages=_PACK_NUM_STAGES,
     )
@@ -983,7 +383,7 @@ def prefix_pack_padded_rows_triple(
         context="Prefix-pack padded tensors",
         minimum_rank=2,
     )
-    batch_size, seq_len = int(shape[0]), int(shape[1])
+    _batch_size, seq_len = int(shape[0]), int(shape[1])
     trailing_shape = shape[2:]
     if int(cu_seqlens.numel()) == 0:
         empty_a = tensor_a.new_empty((0, *trailing_shape))
@@ -1000,16 +400,9 @@ def prefix_pack_padded_rows_triple(
         empty_c = tensor_c.new_empty((0, *trailing_shape))
         return empty_a, empty_b, empty_c
 
-    can_rank4 = (
-        flashdeberta_prefix_pack_available()
-        and tensor_a.device.type == "cuda"
-        and tensor_a.ndim == 4
-        and tensor_b.ndim == 4
-        and tensor_c.ndim == 4
-        and not tensor_a.is_contiguous()
-        and not tensor_b.is_contiguous()
-        and not tensor_c.is_contiguous()
-    )
+    can_rank4 = _can_use_triton_prefix_rank4_pack(
+        (tensor_a, tensor_b, tensor_c), seqlens=seqlens, cu_seqlens=cu_seqlens
+    ) and (not tensor_a.is_contiguous() or not tensor_b.is_contiguous() or not tensor_c.is_contiguous())
     if can_rank4:
         num_heads = int(tensor_a.shape[2])
         feature_size = int(tensor_a.shape[3])
@@ -1028,35 +421,20 @@ def prefix_pack_padded_rows_triple(
             device=tensor_c.device,
             dtype=tensor_c.dtype,
         )
-        col_tiles = triton.cdiv(feature_size, _PACK_BLOCK_COLS)
-        grid = (batch_size, triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS), num_heads * col_tiles)
-        _traceable_triton_kernel(_pack_prefix_rows_rank4_strided_triple_kernel)[grid](
-            tensor_a,
-            tensor_b,
-            tensor_c,
-            flat_output_a,
-            flat_output_b,
-            flat_output_c,
-            seqlens,
-            cu_seqlens,
-            tensor_a.stride(0),
-            tensor_a.stride(1),
-            tensor_a.stride(2),
-            tensor_a.stride(3),
-            tensor_b.stride(0),
-            tensor_b.stride(1),
-            tensor_b.stride(2),
-            tensor_b.stride(3),
-            tensor_c.stride(0),
-            tensor_c.stride(1),
-            tensor_c.stride(2),
-            tensor_c.stride(3),
-            seq_len,
-            num_heads,
-            feature_size,
-            col_tiles,
-            BLOCK_ROWS=_PACK_BLOCK_ROWS,
-            BLOCK_COLS=_PACK_BLOCK_COLS,
+        launch_triton_row_copy(
+            (tensor_a, tensor_b, tensor_c),
+            (flat_output_a, flat_output_b, flat_output_c),
+            offsets=seqlens,
+            lengths=seqlens,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_PREFIX_PACK_STRIDED,
+            seq_len=seq_len,
+            row_size=num_heads * feature_size,
+            max_rows=int(max_seqlen),
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_PACK_BLOCK_ROWS,
+            block_cols=_PACK_BLOCK_COLS,
             num_warps=_PACK_NUM_WARPS,
             num_stages=_PACK_NUM_STAGES,
         )
@@ -1098,24 +476,18 @@ def prefix_pack_padded_rows_triple(
     flat_output_a = torch.empty((total_tokens, row_size), device=tensor_a.device, dtype=tensor_a.dtype)
     flat_output_b = torch.empty((total_tokens, row_size), device=tensor_b.device, dtype=tensor_b.dtype)
     flat_output_c = torch.empty((total_tokens, row_size), device=tensor_c.device, dtype=tensor_c.dtype)
-    grid = (
-        batch_size,
-        triton.cdiv(int(max_seqlen), _PACK_BLOCK_ROWS),
-        triton.cdiv(row_size, _PACK_BLOCK_COLS),
-    )
-    _traceable_triton_kernel(_pack_prefix_rows_triple_kernel)[grid](
-        flat_a,
-        flat_b,
-        flat_c,
-        flat_output_a,
-        flat_output_b,
-        flat_output_c,
-        seqlens,
-        cu_seqlens,
-        seq_len,
-        row_size,
-        BLOCK_ROWS=_PACK_BLOCK_ROWS,
-        BLOCK_COLS=_PACK_BLOCK_COLS,
+    launch_triton_row_copy(
+        (flat_a, flat_b, flat_c),
+        (flat_output_a, flat_output_b, flat_output_c),
+        offsets=seqlens,
+        lengths=seqlens,
+        cu_seqlens=cu_seqlens,
+        address_mode=TRITON_ROW_COPY_PREFIX_PACK,
+        seq_len=seq_len,
+        row_size=row_size,
+        max_rows=int(max_seqlen),
+        block_rows=_PACK_BLOCK_ROWS,
+        block_cols=_PACK_BLOCK_COLS,
         num_warps=_PACK_NUM_WARPS,
         num_stages=_PACK_NUM_STAGES,
     )
@@ -1164,20 +536,18 @@ def prefix_unpack_padded_rows(
     flat_values = values.view(int(values.shape[0]), -1)
     row_size = int(flat_values.shape[1])
     flat_output = torch.empty((batch_size * seq_len, row_size), device=values.device, dtype=values.dtype)
-    grid = (
-        batch_size,
-        triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
-        triton.cdiv(row_size, _PACK_BLOCK_COLS),
-    )
-    _traceable_triton_kernel(_unpack_prefix_rows_kernel)[grid](
-        flat_values,
-        flat_output,
-        seqlens,
-        cu_seqlens,
-        seq_len,
-        row_size,
-        BLOCK_ROWS=_PACK_BLOCK_ROWS,
-        BLOCK_COLS=_PACK_BLOCK_COLS,
+    launch_triton_row_copy(
+        (flat_values,),
+        (flat_output,),
+        offsets=seqlens,
+        lengths=seqlens,
+        cu_seqlens=cu_seqlens,
+        address_mode=TRITON_ROW_COPY_PREFIX_UNPACK,
+        seq_len=seq_len,
+        row_size=row_size,
+        max_rows=seq_len,
+        block_rows=_PACK_BLOCK_ROWS,
+        block_cols=_PACK_BLOCK_COLS,
         num_warps=_PACK_NUM_WARPS,
         num_stages=_PACK_NUM_STAGES,
     )
@@ -1250,22 +620,18 @@ def prefix_unpack_padded_rows_pair(
     flat_output_b = torch.empty(
         (batch_size * seq_len, row_size), device=values_b.device, dtype=values_b.dtype
     )
-    grid = (
-        batch_size,
-        triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
-        triton.cdiv(row_size, _PACK_BLOCK_COLS),
-    )
-    _traceable_triton_kernel(_unpack_prefix_rows_pair_kernel)[grid](
-        flat_values_a,
-        flat_values_b,
-        flat_output_a,
-        flat_output_b,
-        seqlens,
-        cu_seqlens,
-        seq_len,
-        row_size,
-        BLOCK_ROWS=_PACK_BLOCK_ROWS,
-        BLOCK_COLS=_PACK_BLOCK_COLS,
+    launch_triton_row_copy(
+        (flat_values_a, flat_values_b),
+        (flat_output_a, flat_output_b),
+        offsets=seqlens,
+        lengths=seqlens,
+        cu_seqlens=cu_seqlens,
+        address_mode=TRITON_ROW_COPY_PREFIX_UNPACK,
+        seq_len=seq_len,
+        row_size=row_size,
+        max_rows=seq_len,
+        block_rows=_PACK_BLOCK_ROWS,
+        block_cols=_PACK_BLOCK_COLS,
         num_warps=_PACK_NUM_WARPS,
         num_stages=_PACK_NUM_STAGES,
     )
@@ -1364,24 +730,18 @@ def prefix_unpack_padded_rows_triple(
     flat_output_c = torch.empty(
         (batch_size * seq_len, row_size), device=values_c.device, dtype=values_c.dtype
     )
-    grid = (
-        batch_size,
-        triton.cdiv(seq_len, _PACK_BLOCK_ROWS),
-        triton.cdiv(row_size, _PACK_BLOCK_COLS),
-    )
-    _traceable_triton_kernel(_unpack_prefix_rows_triple_kernel)[grid](
-        flat_values_a,
-        flat_values_b,
-        flat_values_c,
-        flat_output_a,
-        flat_output_b,
-        flat_output_c,
-        seqlens,
-        cu_seqlens,
-        seq_len,
-        row_size,
-        BLOCK_ROWS=_PACK_BLOCK_ROWS,
-        BLOCK_COLS=_PACK_BLOCK_COLS,
+    launch_triton_row_copy(
+        (flat_values_a, flat_values_b, flat_values_c),
+        (flat_output_a, flat_output_b, flat_output_c),
+        offsets=seqlens,
+        lengths=seqlens,
+        cu_seqlens=cu_seqlens,
+        address_mode=TRITON_ROW_COPY_PREFIX_UNPACK,
+        seq_len=seq_len,
+        row_size=row_size,
+        max_rows=seq_len,
+        block_rows=_PACK_BLOCK_ROWS,
+        block_cols=_PACK_BLOCK_COLS,
         num_warps=_PACK_NUM_WARPS,
         num_stages=_PACK_NUM_STAGES,
     )

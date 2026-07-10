@@ -23,6 +23,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     resolve_flash_kernel_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
+    BoundedLRUCache,
     device_compute_capability,
     keep_mask_head_stride,
 )
@@ -37,10 +38,10 @@ try:
 except Exception:  # pragma: no cover - optional import
     triton = None
     tl = None
-_DENSE_BUCKET_RANGE_CACHE: dict[
+_DENSE_BUCKET_RANGE_CACHE = BoundedLRUCache[
     tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int],
     tuple[weakref.ReferenceType[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
-] = {}
+](max_entries=32)
 
 
 def _dense_bias_repo_tuned_config(
@@ -277,10 +278,6 @@ def _dense_bucket_ranges(
             bucket_ref = None
         if bucket_ref is not None:
             _DENSE_BUCKET_RANGE_CACHE[cache_key] = (bucket_ref, (start, end))
-        if len(_DENSE_BUCKET_RANGE_CACHE) > 32:
-            stale_keys = list(_DENSE_BUCKET_RANGE_CACHE.keys())[:16]
-            for stale_key in stale_keys:
-                _DENSE_BUCKET_RANGE_CACHE.pop(stale_key, None)
     return start, end
 
 

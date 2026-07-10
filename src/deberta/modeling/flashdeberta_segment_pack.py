@@ -17,8 +17,12 @@ from functools import partial
 import torch
 
 from deberta.modeling.flashdeberta_op_utils import (
+    TRITON_ROW_COPY_SEGMENT_PACK,
+    TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
+    TRITON_ROW_COPY_SEGMENT_UNPACK,
     can_use_triton_pack,
     flatten_padded_rows,
+    launch_triton_row_copy,
     require_matching_tensor_layout,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -95,163 +99,32 @@ def _can_use_triton_segment_pack(
     )
 
 
-@_optional_triton_jit
-def _pack_segment_rows_kernel(
-    input_ptr: None,
-    output_ptr: None,
-    offsets_ptr: None,
-    lengths_ptr: None,
-    cu_seqlens_ptr: None,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy contiguous padded segment rows into packed row-major output.
+def _can_use_triton_segment_rank4_pack(
+    tensors: tuple[torch.Tensor, ...],
+    *,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> bool:
+    """Return whether rank-4 inputs can use the stride-aware Triton copy mode.
 
-    :param Any input_ptr: Pointer to padded input rows.
-    :param Any output_ptr: Pointer to packed output rows.
-    :param Any offsets_ptr: Pointer to flat source row offsets per segment.
-    :param Any lengths_ptr: Pointer to per-segment lengths.
-    :param Any cu_seqlens_ptr: Pointer to cumulative packed offsets.
-    :param Any row_size: Flattened feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes in place.
+    :param tuple[torch.Tensor, ...] tensors: Candidate padded rank-4 tensors.
+    :param torch.Tensor segment_offsets: Flat padded-row offsets per segment.
+    :param torch.Tensor segment_lengths: Active row count per segment.
+    :param torch.Tensor cu_seqlens: Cumulative packed-row offsets.
+    :return bool: True when the inputs and metadata share one CUDA device.
     """
 
-    segment_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    src_base = tl.load(offsets_ptr + segment_idx)
-    seg_len = tl.load(lengths_ptr + segment_idx)
-    dst_base = tl.load(cu_seqlens_ptr + segment_idx)
-
-    src_rows = src_base + row_offsets
-    dst_rows = dst_base + row_offsets
-
-    mask = (row_offsets[:, None] < seg_len) & (col_offsets[None, :] < row_size)
-    src_ptrs = input_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_ptrs = output_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values = tl.load(src_ptrs, mask=mask, other=0)
-    tl.store(dst_ptrs, values, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_segment_rows_pair_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    offsets_ptr: None,
-    lengths_ptr: None,
-    cu_seqlens_ptr: None,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy two contiguous padded segment tensors into packed outputs.
-
-    :param Any input_a_ptr: Pointer to the first padded input rows.
-    :param Any input_b_ptr: Pointer to the second padded input rows.
-    :param Any output_a_ptr: Pointer to the first packed output rows.
-    :param Any output_b_ptr: Pointer to the second packed output rows.
-    :param Any offsets_ptr: Pointer to flat source row offsets per segment.
-    :param Any lengths_ptr: Pointer to per-segment lengths.
-    :param Any cu_seqlens_ptr: Pointer to cumulative packed offsets.
-    :param Any row_size: Flattened feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes in place.
-    """
-
-    segment_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    src_base = tl.load(offsets_ptr + segment_idx)
-    seg_len = tl.load(lengths_ptr + segment_idx)
-    dst_base = tl.load(cu_seqlens_ptr + segment_idx)
-
-    src_rows = src_base + row_offsets
-    dst_rows = dst_base + row_offsets
-
-    mask = (row_offsets[:, None] < seg_len) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-
-
-@_optional_triton_jit
-def _pack_segment_rows_triple_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    input_c_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    output_c_ptr: None,
-    offsets_ptr: None,
-    lengths_ptr: None,
-    cu_seqlens_ptr: None,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Copy three contiguous padded segment tensors into packed outputs.
-
-    :param Any input_a_ptr: Pointer to the first padded input rows.
-    :param Any input_b_ptr: Pointer to the second padded input rows.
-    :param Any input_c_ptr: Pointer to the third padded input rows.
-    :param Any output_a_ptr: Pointer to the first packed output rows.
-    :param Any output_b_ptr: Pointer to the second packed output rows.
-    :param Any output_c_ptr: Pointer to the third packed output rows.
-    :param Any offsets_ptr: Pointer to flat source row offsets per segment.
-    :param Any lengths_ptr: Pointer to per-segment lengths.
-    :param Any cu_seqlens_ptr: Pointer to cumulative packed offsets.
-    :param Any row_size: Flattened feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes in place.
-    """
-
-    segment_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    src_base = tl.load(offsets_ptr + segment_idx)
-    seg_len = tl.load(lengths_ptr + segment_idx)
-    dst_base = tl.load(cu_seqlens_ptr + segment_idx)
-
-    src_rows = src_base + row_offsets
-    dst_rows = dst_base + row_offsets
-
-    mask = (row_offsets[:, None] < seg_len) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    values_c = tl.load(src_c_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-    tl.store(dst_c_ptrs, values_c, mask=mask)
+    if not flashdeberta_segment_pack_available() or not tensors:
+        return False
+    device = tensors[0].device
+    return (
+        device.type == "cuda"
+        and all(tensor.device == device and tensor.ndim == 4 for tensor in tensors)
+        and segment_offsets.device == device
+        and segment_lengths.device == device
+        and cu_seqlens.device == device
+    )
 
 
 @_optional_triton_jit
@@ -350,165 +223,6 @@ def _pack_segment_grad_and_delta_kernel(
     tl.store(delta_ptrs, delta, mask=mask_rows)
 
 
-@_optional_triton_jit
-def _unpack_segment_rows_kernel(
-    input_ptr: None,
-    output_ptr: None,
-    offsets_ptr: None,
-    lengths_ptr: None,
-    cu_seqlens_ptr: None,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Scatter packed rows back into padded row-major layout.
-
-    :param Any input_ptr: Pointer to packed input rows.
-    :param Any output_ptr: Pointer to padded output rows.
-    :param Any offsets_ptr: Pointer to flat padded row offsets per segment.
-    :param Any lengths_ptr: Pointer to per-segment lengths.
-    :param Any cu_seqlens_ptr: Pointer to cumulative packed offsets.
-    :param Any row_size: Flattened feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes in place.
-    """
-
-    segment_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    dst_base = tl.load(offsets_ptr + segment_idx)
-    seg_len = tl.load(lengths_ptr + segment_idx)
-    src_base = tl.load(cu_seqlens_ptr + segment_idx)
-
-    dst_rows = dst_base + row_offsets
-    src_rows = src_base + row_offsets
-
-    mask = (row_offsets[:, None] < seg_len) & (col_offsets[None, :] < row_size)
-    src_ptrs = input_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_ptrs = output_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values = tl.load(src_ptrs, mask=mask, other=0)
-    tl.store(dst_ptrs, values, mask=mask)
-
-
-@_optional_triton_jit
-def _unpack_segment_rows_pair_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    offsets_ptr: None,
-    lengths_ptr: None,
-    cu_seqlens_ptr: None,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Scatter two packed tensors back into padded row-major layout.
-
-    :param Any input_a_ptr: Pointer to the first packed input rows.
-    :param Any input_b_ptr: Pointer to the second packed input rows.
-    :param Any output_a_ptr: Pointer to the first padded output rows.
-    :param Any output_b_ptr: Pointer to the second padded output rows.
-    :param Any offsets_ptr: Pointer to flat padded row offsets per segment.
-    :param Any lengths_ptr: Pointer to per-segment lengths.
-    :param Any cu_seqlens_ptr: Pointer to cumulative packed offsets.
-    :param Any row_size: Flattened feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes in place.
-    """
-
-    segment_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    dst_base = tl.load(offsets_ptr + segment_idx)
-    seg_len = tl.load(lengths_ptr + segment_idx)
-    src_base = tl.load(cu_seqlens_ptr + segment_idx)
-
-    dst_rows = dst_base + row_offsets
-    src_rows = src_base + row_offsets
-
-    mask = (row_offsets[:, None] < seg_len) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-
-
-@_optional_triton_jit
-def _unpack_segment_rows_triple_kernel(
-    input_a_ptr: None,
-    input_b_ptr: None,
-    input_c_ptr: None,
-    output_a_ptr: None,
-    output_b_ptr: None,
-    output_c_ptr: None,
-    offsets_ptr: None,
-    lengths_ptr: None,
-    cu_seqlens_ptr: None,
-    row_size: int,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-) -> None:
-    """Scatter three packed tensors back into padded row-major layout.
-
-    :param Any input_a_ptr: Pointer to the first packed input rows.
-    :param Any input_b_ptr: Pointer to the second packed input rows.
-    :param Any input_c_ptr: Pointer to the third packed input rows.
-    :param Any output_a_ptr: Pointer to the first padded output rows.
-    :param Any output_b_ptr: Pointer to the second padded output rows.
-    :param Any output_c_ptr: Pointer to the third padded output rows.
-    :param Any offsets_ptr: Pointer to flat padded row offsets per segment.
-    :param Any lengths_ptr: Pointer to per-segment lengths.
-    :param Any cu_seqlens_ptr: Pointer to cumulative packed offsets.
-    :param Any row_size: Flattened feature width.
-    :param Any BLOCK_ROWS: Triton row tile size.
-    :param Any BLOCK_COLS: Triton feature tile size.
-    :return None: This Triton kernel writes in place.
-    """
-
-    segment_idx = tl.program_id(0)
-    tile_row = tl.program_id(1)
-    tile_col = tl.program_id(2)
-
-    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-
-    dst_base = tl.load(offsets_ptr + segment_idx)
-    seg_len = tl.load(lengths_ptr + segment_idx)
-    src_base = tl.load(cu_seqlens_ptr + segment_idx)
-
-    dst_rows = dst_base + row_offsets
-    src_rows = src_base + row_offsets
-
-    mask = (row_offsets[:, None] < seg_len) & (col_offsets[None, :] < row_size)
-    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
-    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = tl.load(src_a_ptrs, mask=mask, other=0)
-    values_b = tl.load(src_b_ptrs, mask=mask, other=0)
-    values_c = tl.load(src_c_ptrs, mask=mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=mask)
-    tl.store(dst_b_ptrs, values_b, mask=mask)
-    tl.store(dst_c_ptrs, values_c, mask=mask)
-
-
 def segment_pack_padded_rows(
     tensor: torch.Tensor,
     *,
@@ -520,7 +234,7 @@ def segment_pack_padded_rows(
 ) -> torch.Tensor:
     """Pack contiguous padded token segments into one packed tensor.
 
-    :param torch.Tensor tensor: Contiguous input tensor with shape ``(B, S, ...)``.
+    :param torch.Tensor tensor: Input tensor with shape ``(B, S, ...)``.
     :param torch.Tensor segment_offsets: Flat ``(B*S)`` source row offsets per segment.
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
@@ -529,15 +243,48 @@ def segment_pack_padded_rows(
     :return torch.Tensor: Packed tensor with shape ``(NNZ, ...)``.
     """
 
-    if not tensor.is_contiguous():
-        tensor = tensor.contiguous()
-    flat, trailing_shape, _batch_size, _seq_len = _flatten_rows(tensor)
+    trailing_shape = tuple(int(dim) for dim in tensor.shape[2:])
     total = max(0, int(total_tokens))
     output = tensor.new_empty((total,) + trailing_shape)
     if total == 0:
         return output
     out_flat = output.view(total, -1)
     row_size = int(out_flat.shape[1])
+    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
+
+    if (
+        _can_use_triton_segment_rank4_pack(
+            (tensor,),
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+        )
+        and not tensor.is_contiguous()
+    ):
+        num_heads = int(tensor.shape[2])
+        feature_size = int(tensor.shape[3])
+        launch_triton_row_copy(
+            (tensor,),
+            (out_flat,),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
+            seq_len=int(tensor.shape[1]),
+            row_size=row_size,
+            max_rows=max_len,
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
+            num_warps=_SEGMENT_NUM_WARPS,
+            num_stages=_SEGMENT_NUM_STAGES,
+        )
+        return output
+
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    flat, _, _batch_size, seq_len = _flatten_rows(tensor)
 
     if _can_use_triton_segment_pack(
         tensor=tensor,
@@ -545,21 +292,18 @@ def segment_pack_padded_rows(
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     ):
-        max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
-        grid = (
-            int(segment_lengths.shape[0]),
-            triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
-            triton.cdiv(row_size, _SEGMENT_BLOCK_COLS),
-        )
-        _traceable_triton_kernel(_pack_segment_rows_kernel)[grid](
-            flat,
-            out_flat,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            row_size,
-            BLOCK_ROWS=_SEGMENT_BLOCK_ROWS,
-            BLOCK_COLS=_SEGMENT_BLOCK_COLS,
+        launch_triton_row_copy(
+            (flat,),
+            (out_flat,),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
+            seq_len=seq_len,
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
             num_warps=_SEGMENT_NUM_WARPS,
             num_stages=_SEGMENT_NUM_STAGES,
         )
@@ -589,8 +333,8 @@ def segment_pack_padded_rows_pair(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack two contiguous padded tensors with shared segment metadata.
 
-    :param torch.Tensor tensor_a: First contiguous input tensor ``(B, S, ...)``.
-    :param torch.Tensor tensor_b: Second contiguous input tensor ``(B, S, ...)``.
+    :param torch.Tensor tensor_a: First input tensor ``(B, S, ...)``.
+    :param torch.Tensor tensor_b: Second input tensor ``(B, S, ...)``.
     :param torch.Tensor segment_offsets: Flat ``(B*S)`` source row offsets per segment.
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
@@ -603,12 +347,6 @@ def segment_pack_padded_rows_pair(
         tensor_a, tensor_b, context="Segment-pack padded tensors", minimum_rank=2
     )
     trailing_shape = shape[2:]
-    if not tensor_a.is_contiguous():
-        tensor_a = tensor_a.contiguous()
-    if not tensor_b.is_contiguous():
-        tensor_b = tensor_b.contiguous()
-    flat_a, _, _batch_size, _seq_len = _flatten_rows(tensor_a)
-    flat_b, _, _, _ = _flatten_rows(tensor_b)
     total = max(0, int(total_tokens))
     out_a = tensor_a.new_empty((total,) + trailing_shape)
     out_b = tensor_b.new_empty((total,) + trailing_shape)
@@ -617,6 +355,41 @@ def segment_pack_padded_rows_pair(
     out_flat_a = out_a.view(total, -1)
     out_flat_b = out_b.view(total, -1)
     row_size = int(out_flat_a.shape[1])
+    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
+
+    if _can_use_triton_segment_rank4_pack(
+        (tensor_a, tensor_b),
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+    ) and (not tensor_a.is_contiguous() or not tensor_b.is_contiguous()):
+        num_heads = int(tensor_a.shape[2])
+        feature_size = int(tensor_a.shape[3])
+        launch_triton_row_copy(
+            (tensor_a, tensor_b),
+            (out_flat_a, out_flat_b),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
+            seq_len=int(shape[1]),
+            row_size=row_size,
+            max_rows=max_len,
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
+            num_warps=_SEGMENT_NUM_WARPS,
+            num_stages=_SEGMENT_NUM_STAGES,
+        )
+        return out_a, out_b
+
+    if not tensor_a.is_contiguous():
+        tensor_a = tensor_a.contiguous()
+    if not tensor_b.is_contiguous():
+        tensor_b = tensor_b.contiguous()
+    flat_a, _, _batch_size, seq_len = _flatten_rows(tensor_a)
+    flat_b, _, _, _ = _flatten_rows(tensor_b)
 
     if _can_use_triton_segment_pack(
         tensor=tensor_a,
@@ -624,23 +397,18 @@ def segment_pack_padded_rows_pair(
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     ):
-        max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
-        grid = (
-            int(segment_lengths.shape[0]),
-            triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
-            triton.cdiv(row_size, _SEGMENT_BLOCK_COLS),
-        )
-        _traceable_triton_kernel(_pack_segment_rows_pair_kernel)[grid](
-            flat_a,
-            flat_b,
-            out_flat_a,
-            out_flat_b,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            row_size,
-            BLOCK_ROWS=_SEGMENT_BLOCK_ROWS,
-            BLOCK_COLS=_SEGMENT_BLOCK_COLS,
+        launch_triton_row_copy(
+            (flat_a, flat_b),
+            (out_flat_a, out_flat_b),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
+            seq_len=seq_len,
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
             num_warps=_SEGMENT_NUM_WARPS,
             num_stages=_SEGMENT_NUM_STAGES,
         )
@@ -674,9 +442,9 @@ def segment_pack_padded_rows_triple(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack three contiguous padded tensors with shared segment metadata.
 
-    :param torch.Tensor tensor_a: First contiguous input tensor ``(B, S, ...)``.
-    :param torch.Tensor tensor_b: Second contiguous input tensor ``(B, S, ...)``.
-    :param torch.Tensor tensor_c: Third contiguous input tensor ``(B, S, ...)``.
+    :param torch.Tensor tensor_a: First input tensor ``(B, S, ...)``.
+    :param torch.Tensor tensor_b: Second input tensor ``(B, S, ...)``.
+    :param torch.Tensor tensor_c: Third input tensor ``(B, S, ...)``.
     :param torch.Tensor segment_offsets: Flat ``(B*S)`` source row offsets per segment.
     :param torch.Tensor segment_lengths: Per-segment lengths.
     :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
@@ -693,15 +461,6 @@ def segment_pack_padded_rows_triple(
         minimum_rank=2,
     )
     trailing_shape = shape[2:]
-    if not tensor_a.is_contiguous():
-        tensor_a = tensor_a.contiguous()
-    if not tensor_b.is_contiguous():
-        tensor_b = tensor_b.contiguous()
-    if not tensor_c.is_contiguous():
-        tensor_c = tensor_c.contiguous()
-    flat_a, _, _batch_size, _seq_len = _flatten_rows(tensor_a)
-    flat_b, _, _, _ = _flatten_rows(tensor_b)
-    flat_c, _, _, _ = _flatten_rows(tensor_c)
     total = max(0, int(total_tokens))
     out_a = tensor_a.new_empty((total,) + trailing_shape)
     out_b = tensor_b.new_empty((total,) + trailing_shape)
@@ -712,6 +471,44 @@ def segment_pack_padded_rows_triple(
     out_flat_b = out_b.view(total, -1)
     out_flat_c = out_c.view(total, -1)
     row_size = int(out_flat_a.shape[1])
+    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
+
+    if _can_use_triton_segment_rank4_pack(
+        (tensor_a, tensor_b, tensor_c),
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+    ) and (not tensor_a.is_contiguous() or not tensor_b.is_contiguous() or not tensor_c.is_contiguous()):
+        num_heads = int(tensor_a.shape[2])
+        feature_size = int(tensor_a.shape[3])
+        launch_triton_row_copy(
+            (tensor_a, tensor_b, tensor_c),
+            (out_flat_a, out_flat_b, out_flat_c),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
+            seq_len=int(shape[1]),
+            row_size=row_size,
+            max_rows=max_len,
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
+            num_warps=_SEGMENT_NUM_WARPS,
+            num_stages=_SEGMENT_NUM_STAGES,
+        )
+        return out_a, out_b, out_c
+
+    if not tensor_a.is_contiguous():
+        tensor_a = tensor_a.contiguous()
+    if not tensor_b.is_contiguous():
+        tensor_b = tensor_b.contiguous()
+    if not tensor_c.is_contiguous():
+        tensor_c = tensor_c.contiguous()
+    flat_a, _, _batch_size, seq_len = _flatten_rows(tensor_a)
+    flat_b, _, _, _ = _flatten_rows(tensor_b)
+    flat_c, _, _, _ = _flatten_rows(tensor_c)
 
     if _can_use_triton_segment_pack(
         tensor=tensor_a,
@@ -719,25 +516,18 @@ def segment_pack_padded_rows_triple(
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
     ):
-        max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
-        grid = (
-            int(segment_lengths.shape[0]),
-            triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
-            triton.cdiv(row_size, _SEGMENT_BLOCK_COLS),
-        )
-        _traceable_triton_kernel(_pack_segment_rows_triple_kernel)[grid](
-            flat_a,
-            flat_b,
-            flat_c,
-            out_flat_a,
-            out_flat_b,
-            out_flat_c,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            row_size,
-            BLOCK_ROWS=_SEGMENT_BLOCK_ROWS,
-            BLOCK_COLS=_SEGMENT_BLOCK_COLS,
+        launch_triton_row_copy(
+            (flat_a, flat_b, flat_c),
+            (out_flat_a, out_flat_b, out_flat_c),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
+            seq_len=seq_len,
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
             num_warps=_SEGMENT_NUM_WARPS,
             num_stages=_SEGMENT_NUM_STAGES,
         )
@@ -897,20 +687,18 @@ def segment_unpack_padded_rows(
         cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
-        grid = (
-            int(segment_lengths.shape[0]),
-            triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
-            triton.cdiv(row_size, _SEGMENT_BLOCK_COLS),
-        )
-        _traceable_triton_kernel(_unpack_segment_rows_kernel)[grid](
-            flat,
-            out_flat,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            row_size,
-            BLOCK_ROWS=_SEGMENT_BLOCK_ROWS,
-            BLOCK_COLS=_SEGMENT_BLOCK_COLS,
+        launch_triton_row_copy(
+            (flat,),
+            (out_flat,),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
+            seq_len=int(seq_len),
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
             num_warps=_SEGMENT_NUM_WARPS,
             num_stages=_SEGMENT_NUM_STAGES,
         )
@@ -974,22 +762,18 @@ def segment_unpack_padded_rows_pair(
         cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
-        grid = (
-            int(segment_lengths.shape[0]),
-            triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
-            triton.cdiv(row_size, _SEGMENT_BLOCK_COLS),
-        )
-        _traceable_triton_kernel(_unpack_segment_rows_pair_kernel)[grid](
-            flat_a,
-            flat_b,
-            out_flat_a,
-            out_flat_b,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            row_size,
-            BLOCK_ROWS=_SEGMENT_BLOCK_ROWS,
-            BLOCK_COLS=_SEGMENT_BLOCK_COLS,
+        launch_triton_row_copy(
+            (flat_a, flat_b),
+            (out_flat_a, out_flat_b),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
+            seq_len=int(seq_len),
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
             num_warps=_SEGMENT_NUM_WARPS,
             num_stages=_SEGMENT_NUM_STAGES,
         )
@@ -1064,24 +848,18 @@ def segment_unpack_padded_rows_triple(
         cu_seqlens=cu_seqlens,
     ):
         max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
-        grid = (
-            int(segment_lengths.shape[0]),
-            triton.cdiv(max_len, _SEGMENT_BLOCK_ROWS),
-            triton.cdiv(row_size, _SEGMENT_BLOCK_COLS),
-        )
-        _traceable_triton_kernel(_unpack_segment_rows_triple_kernel)[grid](
-            flat_a,
-            flat_b,
-            flat_c,
-            out_flat_a,
-            out_flat_b,
-            out_flat_c,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            row_size,
-            BLOCK_ROWS=_SEGMENT_BLOCK_ROWS,
-            BLOCK_COLS=_SEGMENT_BLOCK_COLS,
+        launch_triton_row_copy(
+            (flat_a, flat_b, flat_c),
+            (out_flat_a, out_flat_b, out_flat_c),
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
+            seq_len=int(seq_len),
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
             num_warps=_SEGMENT_NUM_WARPS,
             num_stages=_SEGMENT_NUM_STAGES,
         )

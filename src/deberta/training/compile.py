@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
+from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
 from deberta.modeling.flashdeberta_kernel_tuning import (
     compute_capability_key,
     configure_flashdeberta_kernel_overrides,
@@ -489,7 +490,7 @@ def _resolve_flash_seq_lengths_and_active_tokens(
     active_tokens, active_tokens_scalar = _reconcile_host_scalar_int(
         label="Flash active-token count",
         host_value=_flash_active_tokens_host(batch.get("flash_active_tokens")),
-        scalar_tensor=_flash_scalar_tensor(batch.get("flash_active_tokens_scalar")),
+        scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.active_tokens)),
         derived_value=_flash_active_tokens_from_seq_lengths(seq_lengths),
     )
     return seq_lengths, active_tokens, active_tokens_scalar
@@ -541,14 +542,14 @@ def _resolve_flash_doc_segment_stats(
     num_segments, num_scalar = _reconcile_host_scalar_int(
         label="Flash document segment count",
         host_value=host_num,
-        scalar_tensor=_flash_scalar_tensor(batch.get("flash_doc_num_segments_scalar")),
+        scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.doc_num_segments)),
         derived_value=derived_num,
         required=True,
     )
     max_seqlen, max_scalar = _reconcile_host_scalar_int(
         label="Flash document max segment length",
         host_value=host_max,
-        scalar_tensor=_flash_scalar_tensor(batch.get("flash_doc_max_seqlen_scalar")),
+        scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.doc_max_seqlen)),
         derived_value=derived_max,
         required=True,
     )
@@ -565,8 +566,8 @@ def _pop_flash_doc_segment_host_stats(batch: dict[str, Any]) -> None:
 
     batch.pop("flash_doc_num_segments", None)
     batch.pop("flash_doc_max_seqlen", None)
-    batch.pop("flash_doc_num_segments_scalar", None)
-    batch.pop("flash_doc_max_seqlen_scalar", None)
+    batch.pop(CPU_SCALAR_BATCH_KEYS.doc_num_segments, None)
+    batch.pop(CPU_SCALAR_BATCH_KEYS.doc_max_seqlen, None)
 
 
 def _pop_flash_active_token_stats(batch: dict[str, Any]) -> None:
@@ -576,7 +577,7 @@ def _pop_flash_active_token_stats(batch: dict[str, Any]) -> None:
     """
 
     batch.pop("flash_active_tokens", None)
-    batch.pop("flash_active_tokens_scalar", None)
+    batch.pop(CPU_SCALAR_BATCH_KEYS.active_tokens, None)
 
 
 def _pop_flash_doc_segment_tensors(batch: dict[str, Any]) -> None:
@@ -676,6 +677,11 @@ def prepare_flash_attention_batch_metadata(
             if validated_contract != "docblock":
                 raise ValueError(f"Packed document batch carried mask_contract={validated_contract!r}.")
             keep_mask = doc_ids.ne(0)
+        elif (btype != "hf_deberta_v2" or not flash_enabled) and doc_ids.device.type != "cpu":
+            # General batch transfer happens before attention preparation. For eager
+            # attention, doc_ids is itself the complete pairwise-mask source, so keep
+            # mask construction on-device rather than forcing a quadratic CPU copy.
+            keep_mask = doc_ids.ne(0)
         else:
             if doc_ids.device.type != "cpu":
                 raise RuntimeError(
@@ -760,7 +766,7 @@ def prepare_flash_attention_batch_metadata(
         active_tokens, active_tokens_scalar = _reconcile_host_scalar_int(
             label="Flash active-token count",
             host_value=_flash_active_tokens_host(batch.get("flash_active_tokens")),
-            scalar_tensor=_flash_scalar_tensor(batch.get("flash_active_tokens_scalar")),
+            scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.active_tokens)),
             derived_value=derived_active_tokens,
             required=True,
         )

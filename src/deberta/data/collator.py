@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
 from deberta.modeling.mask_utils import (
     build_doc_segment_metadata,
     build_validated_prefix_lengths,
@@ -245,11 +246,11 @@ class DebertaV3ElectraCollator:
             active_tokens=int(active_tokens),
         )
         batch["flash_active_tokens"] = int(active_tokens)
-        batch["flash_active_tokens_scalar"] = torch.tensor(int(active_tokens), dtype=torch.int32)
+        batch[CPU_SCALAR_BATCH_KEYS.active_tokens] = torch.tensor(int(active_tokens), dtype=torch.int32)
         batch["flash_doc_num_segments"] = int(num_segments)
-        batch["flash_doc_num_segments_scalar"] = torch.tensor(int(num_segments), dtype=torch.int32)
+        batch[CPU_SCALAR_BATCH_KEYS.doc_num_segments] = torch.tensor(int(num_segments), dtype=torch.int32)
         batch["flash_doc_max_seqlen"] = int(max_segment_length)
-        batch["flash_doc_max_seqlen_scalar"] = torch.tensor(int(max_segment_length), dtype=torch.int32)
+        batch[CPU_SCALAR_BATCH_KEYS.doc_max_seqlen] = torch.tensor(int(max_segment_length), dtype=torch.int32)
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
@@ -337,7 +338,7 @@ class DebertaV3ElectraCollator:
         active_tokens = int(seq_lengths.sum(dtype=torch.int32))
         batch["flash_seq_lengths"] = seq_lengths
         batch["flash_active_tokens"] = active_tokens
-        batch["flash_active_tokens_scalar"] = torch.tensor(active_tokens, dtype=torch.int32)
+        batch[CPU_SCALAR_BATCH_KEYS.active_tokens] = torch.tensor(active_tokens, dtype=torch.int32)
         batch["flash_mask_contract"] = "prefix"
         batch["flash_mask_contract_validated"] = True
 

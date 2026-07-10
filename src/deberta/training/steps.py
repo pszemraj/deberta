@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
 from deberta.training.loop_utils import (
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
@@ -330,13 +331,6 @@ def _resolve_window_token_weights(
     )
 
 
-_CPU_SCALAR_BATCH_KEYS = {
-    "flash_active_tokens_scalar",
-    "flash_doc_num_segments_scalar",
-    "flash_doc_max_seqlen_scalar",
-}
-
-
 def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     """Move all batch tensors onto a device.
 
@@ -346,7 +340,7 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[s
     """
     return {
         k: v
-        if k in _CPU_SCALAR_BATCH_KEYS and isinstance(v, torch.Tensor) and v.ndim == 0
+        if k in CPU_SCALAR_BATCH_KEYS and isinstance(v, torch.Tensor) and v.ndim == 0
         else v.to(device, non_blocking=True)
         if isinstance(v, torch.Tensor)
         else v

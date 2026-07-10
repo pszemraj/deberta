@@ -16,6 +16,7 @@ import torch.nn as nn
 
 from deberta.config import _normalize_hf_attention_kernel
 from deberta.modeling.activations import get_act_fn
+from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     expand_keep_mask_to_4d,
@@ -567,8 +568,7 @@ class DebertaV2Attention(nn.Module):
         :param DebertaV2Config config: Backbone configuration.
         """
         super().__init__()
-        attention_impl = str(getattr(config, "hf_attention_impl", "eager")).strip().lower()
-        if attention_impl == "flash":
+        if is_flash_attention_impl(getattr(config, "hf_attention_impl", "eager")):
             from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
 
             self.self = FlashDisentangledSelfAttention(config)
@@ -868,9 +868,7 @@ class DebertaV2Encoder(nn.Module):
                 "DeBERTa-v2 conv-refinement checkpoints (e.g. v2-xlarge/xxlarge) are out of scope."
             )
         self.gradient_checkpointing = False
-        self.flash_attention_enabled = (
-            str(getattr(config, "hf_attention_impl", "eager")).strip().lower() == "flash"
-        )
+        self.flash_attention_enabled = is_flash_attention_impl(getattr(config, "hf_attention_impl", "eager"))
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         """Return optionally normalized relative embedding table.

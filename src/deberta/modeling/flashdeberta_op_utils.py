@@ -2,15 +2,74 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from functools import cache
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 
 try:  # pragma: no cover - optional Triton dependency
     import triton as _triton
+    import triton.language as _tl
 except Exception:  # pragma: no cover - optional Triton dependency
     _triton = None
+    _tl = None
+
+_KeyT = TypeVar("_KeyT")
+_ValueT = TypeVar("_ValueT")
+
+
+class BoundedLRUCache(OrderedDict[_KeyT, _ValueT]):
+    """Ordered mapping that refreshes reads and evicts least-recently-used entries.
+
+    :param int max_entries: Maximum number of retained entries.
+    :raises ValueError: If ``max_entries`` is not positive.
+    """
+
+    def __init__(self, *, max_entries: int) -> None:
+        """Initialize a bounded least-recently-used mapping."""
+
+        if int(max_entries) <= 0:
+            raise ValueError(f"max_entries must be positive; got {max_entries}.")
+        super().__init__()
+        self.max_entries = int(max_entries)
+
+    def __getitem__(self, key: _KeyT) -> _ValueT:
+        """Return and refresh one cached value."""
+
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key: _KeyT, default: Any = None) -> _ValueT | Any:
+        """Return and refresh one cached value, or ``default`` on a miss.
+
+        :param _KeyT key: Cache key to look up.
+        :param Any default: Value returned on a miss, defaults to None.
+        :return _ValueT | Any: Cached value or ``default``.
+        """
+
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __setitem__(self, key: _KeyT, value: _ValueT) -> None:
+        """Insert one value and evict least-recently-used entries past the bound."""
+
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_entries:
+            self.popitem(last=False)
+
+
+TRITON_ROW_COPY_PREFIX_PACK = 0
+TRITON_ROW_COPY_PREFIX_PACK_STRIDED = 1
+TRITON_ROW_COPY_PREFIX_UNPACK = 2
+TRITON_ROW_COPY_SEGMENT_PACK = 3
+TRITON_ROW_COPY_SEGMENT_PACK_STRIDED = 4
+TRITON_ROW_COPY_SEGMENT_UNPACK = 5
 
 
 def lookup_registered_op(namespace: str, name: str) -> Any | None:
@@ -55,6 +114,16 @@ def kernel_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def is_flash_attention_impl(value: object) -> bool:
+    """Return whether an attention-implementation value selects FlashDeBERTa.
+
+    :param object value: Raw config value.
+    :return bool: True only for the normalized ``flash`` implementation name.
+    """
+
+    return str(value).strip().lower() == "flash"
+
+
 def optional_triton_jit(fn: object) -> object:
     """Apply ``triton.jit`` only when Triton imported successfully.
 
@@ -80,6 +149,258 @@ def traceable_triton_kernel(kernel: object) -> object:
         return torch.library.wrap_triton(kernel)
     except Exception:
         return kernel
+
+
+@optional_triton_jit
+def _triton_row_copy_kernel(
+    input_a_ptr: None,
+    input_b_ptr: None,
+    input_c_ptr: None,
+    output_a_ptr: None,
+    output_b_ptr: None,
+    output_c_ptr: None,
+    offsets_ptr: None,
+    lengths_ptr: None,
+    cu_seqlens_ptr: None,
+    stride_a_b: int,
+    stride_a_s: int,
+    stride_a_h: int,
+    stride_a_f: int,
+    stride_b_b: int,
+    stride_b_s: int,
+    stride_b_h: int,
+    stride_b_f: int,
+    stride_c_b: int,
+    stride_c_s: int,
+    stride_c_h: int,
+    stride_c_f: int,
+    seq_len: int,
+    row_size: int,
+    num_heads: int,
+    feature_size: int,
+    col_tiles: int,
+    ARITY: _tl.constexpr,
+    ADDRESS_MODE: _tl.constexpr,
+    BLOCK_ROWS: _tl.constexpr,
+    BLOCK_COLS: _tl.constexpr,
+) -> None:
+    """Copy one to three tensors between padded and ragged row layouts.
+
+    :param Any input_a_ptr: First source tensor pointer.
+    :param Any input_b_ptr: Second source tensor pointer, used when ``ARITY >= 2``.
+    :param Any input_c_ptr: Third source tensor pointer, used when ``ARITY >= 3``.
+    :param Any output_a_ptr: First destination tensor pointer.
+    :param Any output_b_ptr: Second destination tensor pointer, used when ``ARITY >= 2``.
+    :param Any output_c_ptr: Third destination tensor pointer, used when ``ARITY >= 3``.
+    :param Any offsets_ptr: Flat padded-row offsets for segment modes.
+    :param Any lengths_ptr: Active row count per metadata record.
+    :param Any cu_seqlens_ptr: Cumulative packed-row offsets.
+    :param Any stride_a_b: First-input batch stride for rank-4 strided modes.
+    :param Any stride_a_s: First-input sequence stride for rank-4 strided modes.
+    :param Any stride_a_h: First-input head stride for rank-4 strided modes.
+    :param Any stride_a_f: First-input feature stride for rank-4 strided modes.
+    :param Any stride_b_b: Second-input batch stride for rank-4 strided modes.
+    :param Any stride_b_s: Second-input sequence stride for rank-4 strided modes.
+    :param Any stride_b_h: Second-input head stride for rank-4 strided modes.
+    :param Any stride_b_f: Second-input feature stride for rank-4 strided modes.
+    :param Any stride_c_b: Third-input batch stride for rank-4 strided modes.
+    :param Any stride_c_s: Third-input sequence stride for rank-4 strided modes.
+    :param Any stride_c_h: Third-input head stride for rank-4 strided modes.
+    :param Any stride_c_f: Third-input feature stride for rank-4 strided modes.
+    :param Any seq_len: Padded sequence length.
+    :param Any row_size: Flattened trailing row width.
+    :param Any num_heads: Rank-4 head count for strided modes.
+    :param Any feature_size: Rank-4 per-head width for strided modes.
+    :param Any col_tiles: Feature-tile count per head for strided modes.
+    :param Any ARITY: Compile-time source/destination tensor count.
+    :param Any ADDRESS_MODE: Compile-time prefix/segment and pack/unpack addressing mode.
+    :param Any BLOCK_ROWS: Compile-time row tile size.
+    :param Any BLOCK_COLS: Compile-time column tile size.
+    :return None: This Triton kernel writes directly to destination pointers.
+    """
+
+    record_idx = _tl.program_id(0)
+    tile_row = _tl.program_id(1)
+    tile_col_or_hf = _tl.program_id(2)
+    row_offsets = tile_row * BLOCK_ROWS + _tl.arange(0, BLOCK_ROWS)
+
+    is_prefix = ADDRESS_MODE <= 2
+    is_pack = ADDRESS_MODE == 0 or ADDRESS_MODE == 1 or ADDRESS_MODE == 3 or ADDRESS_MODE == 4
+    is_strided = ADDRESS_MODE == 1 or ADDRESS_MODE == 4
+
+    length = _tl.load(lengths_ptr + record_idx)
+    packed_base = _tl.load(cu_seqlens_ptr + record_idx)
+    if is_prefix:
+        padded_base = record_idx * seq_len
+    else:
+        padded_base = _tl.load(offsets_ptr + record_idx)
+
+    if is_strided:
+        head_idx = tile_col_or_hf // col_tiles
+        tile_col = tile_col_or_hf % col_tiles
+        col_offsets = tile_col * BLOCK_COLS + _tl.arange(0, BLOCK_COLS)
+        padded_rows = padded_base + row_offsets
+        batch_idx = padded_rows // seq_len
+        seq_idx = padded_rows % seq_len
+        packed_rows = packed_base + row_offsets
+        packed_cols = head_idx * feature_size + col_offsets
+        copy_mask = (
+            (head_idx < num_heads) & (row_offsets[:, None] < length) & (col_offsets[None, :] < feature_size)
+        )
+
+        src_a_ptrs = (
+            input_a_ptr
+            + batch_idx[:, None] * stride_a_b
+            + seq_idx[:, None] * stride_a_s
+            + head_idx * stride_a_h
+            + col_offsets[None, :] * stride_a_f
+        )
+        dst_a_ptrs = output_a_ptr + packed_rows[:, None] * row_size + packed_cols[None, :]
+        values_a = _tl.load(src_a_ptrs, mask=copy_mask, other=0)
+        _tl.store(dst_a_ptrs, values_a, mask=copy_mask)
+        if ARITY >= 2:
+            src_b_ptrs = (
+                input_b_ptr
+                + batch_idx[:, None] * stride_b_b
+                + seq_idx[:, None] * stride_b_s
+                + head_idx * stride_b_h
+                + col_offsets[None, :] * stride_b_f
+            )
+            dst_b_ptrs = output_b_ptr + packed_rows[:, None] * row_size + packed_cols[None, :]
+            values_b = _tl.load(src_b_ptrs, mask=copy_mask, other=0)
+            _tl.store(dst_b_ptrs, values_b, mask=copy_mask)
+        if ARITY >= 3:
+            src_c_ptrs = (
+                input_c_ptr
+                + batch_idx[:, None] * stride_c_b
+                + seq_idx[:, None] * stride_c_s
+                + head_idx * stride_c_h
+                + col_offsets[None, :] * stride_c_f
+            )
+            dst_c_ptrs = output_c_ptr + packed_rows[:, None] * row_size + packed_cols[None, :]
+            values_c = _tl.load(src_c_ptrs, mask=copy_mask, other=0)
+            _tl.store(dst_c_ptrs, values_c, mask=copy_mask)
+        return
+
+    col_offsets = tile_col_or_hf * BLOCK_COLS + _tl.arange(0, BLOCK_COLS)
+    padded_rows = padded_base + row_offsets
+    packed_rows = packed_base + row_offsets
+    active_mask = (row_offsets[:, None] < length) & (col_offsets[None, :] < row_size)
+    if is_pack:
+        src_rows = padded_rows
+        dst_rows = packed_rows
+        store_mask = active_mask
+    else:
+        src_rows = packed_rows
+        dst_rows = padded_rows
+        if ADDRESS_MODE == 2:
+            store_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
+        else:
+            store_mask = active_mask
+
+    src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+    dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+    values_a = _tl.load(src_a_ptrs, mask=active_mask, other=0)
+    _tl.store(dst_a_ptrs, values_a, mask=store_mask)
+    if ARITY >= 2:
+        src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+        dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+        values_b = _tl.load(src_b_ptrs, mask=active_mask, other=0)
+        _tl.store(dst_b_ptrs, values_b, mask=store_mask)
+    if ARITY >= 3:
+        src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
+        dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
+        values_c = _tl.load(src_c_ptrs, mask=active_mask, other=0)
+        _tl.store(dst_c_ptrs, values_c, mask=store_mask)
+
+
+def launch_triton_row_copy(
+    inputs: tuple[torch.Tensor, ...],
+    outputs: tuple[torch.Tensor, ...],
+    *,
+    offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    address_mode: int,
+    seq_len: int,
+    row_size: int,
+    max_rows: int,
+    num_heads: int = 1,
+    feature_size: int = 1,
+    block_rows: int = 32,
+    block_cols: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> None:
+    """Launch the shared one-to-three-tensor Triton row-copy kernel.
+
+    :param tuple[torch.Tensor, ...] inputs: One to three source tensors.
+    :param tuple[torch.Tensor, ...] outputs: Matching destination tensors.
+    :param torch.Tensor offsets: Flat padded-row offsets for segment modes; ignored for prefix modes.
+    :param torch.Tensor lengths: Active row count per prefix or segment.
+    :param torch.Tensor cu_seqlens: Packed cumulative row offsets.
+    :param int address_mode: One of the ``TRITON_ROW_COPY_*`` addressing modes.
+    :param int seq_len: Padded sequence length.
+    :param int row_size: Flattened trailing row width.
+    :param int max_rows: Maximum rows processed by any metadata record.
+    :param int num_heads: Rank-4 head count for strided pack modes, defaults to 1.
+    :param int feature_size: Rank-4 per-head width for strided pack modes, defaults to 1.
+    :param int block_rows: Triton row tile size, defaults to 32.
+    :param int block_cols: Triton column tile size, defaults to 128.
+    :param int num_warps: Triton launch warp count, defaults to 4.
+    :param int num_stages: Triton launch pipeline stages, defaults to 2.
+    :raises RuntimeError: If Triton is unavailable.
+    :raises ValueError: If arity or rank-4 strided inputs are invalid.
+    """
+
+    if _triton is None:
+        raise RuntimeError("Triton row-copy launch requested without Triton installed.")
+    arity = len(inputs)
+    if arity not in (1, 2, 3) or len(outputs) != arity:
+        raise ValueError(f"Triton row-copy expects matching arity 1..3; got {arity} and {len(outputs)}.")
+
+    strided = address_mode in (
+        TRITON_ROW_COPY_PREFIX_PACK_STRIDED,
+        TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
+    )
+    if strided and any(tensor.ndim != 4 for tensor in inputs):
+        raise ValueError("Strided Triton row-copy inputs must have shape (B,S,H,F).")
+
+    padded_inputs = inputs + (inputs[-1],) * (3 - arity)
+    padded_outputs = outputs + (outputs[-1],) * (3 - arity)
+    if strided:
+        input_strides = tuple(tuple(int(value) for value in tensor.stride()) for tensor in padded_inputs)
+        col_programs = int(num_heads) * _triton.cdiv(int(feature_size), int(block_cols))
+    else:
+        input_strides = ((0, 0, 0, 0),) * 3
+        col_programs = _triton.cdiv(int(row_size), int(block_cols))
+
+    grid = (
+        int(lengths.shape[0]),
+        _triton.cdiv(max(1, int(max_rows)), int(block_rows)),
+        col_programs,
+    )
+    traceable_triton_kernel(_triton_row_copy_kernel)[grid](
+        *padded_inputs,
+        *padded_outputs,
+        offsets,
+        lengths,
+        cu_seqlens,
+        *input_strides[0],
+        *input_strides[1],
+        *input_strides[2],
+        int(seq_len),
+        int(row_size),
+        int(num_heads),
+        int(feature_size),
+        _triton.cdiv(int(feature_size), int(block_cols)) if strided else 1,
+        ARITY=arity,
+        ADDRESS_MODE=int(address_mode),
+        BLOCK_ROWS=int(block_rows),
+        BLOCK_COLS=int(block_cols),
+        num_warps=int(num_warps),
+        num_stages=int(num_stages),
+    )
 
 
 def flatten_padded_rows(
