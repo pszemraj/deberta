@@ -25,8 +25,7 @@ Packed doc-block batches also carry ``doc_ids`` and ``flash_*`` metadata. See
 batch-preparation contract.
 
 Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
-those raw helper defaults for the selected backbone; see the
-[Config reference](../guides/config-reference.md).
+those raw helper defaults for the selected backbone; see ``configs/config-reference.yaml``.
 
 ## `MLMConfig`
 

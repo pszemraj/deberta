@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 import warnings
 from collections.abc import Callable
@@ -1391,6 +1392,16 @@ def validate_model_config(cfg: ModelConfig) -> None:
         ),
     )
     _cfg_set(cfg.rope, "ffn_type", _ensure_choice("model.rope.ffn_type", cfg.rope.ffn_type, _FFN_CHOICES))
+    hidden_act = str(cfg.rope.hidden_act).strip().lower()
+    try:
+        from transformers.activations import ACT2FN
+
+        if hidden_act not in ACT2FN:
+            allowed = "|".join(sorted(ACT2FN))
+            raise ValueError(f"model.rope.hidden_act must be one of: {allowed}. Got: {cfg.rope.hidden_act}")
+    except ImportError:  # pragma: no cover - transformers is a required runtime dependency
+        pass
+    _cfg_set(cfg.rope, "hidden_act", hidden_act)
 
     _cfg_set(cfg.tokenizer, "name_or_path", str(cfg.tokenizer.name_or_path).strip())
     _cfg_set(cfg.pretrained, "discriminator_path", str(cfg.pretrained.discriminator_path or "").strip())
@@ -1407,8 +1418,38 @@ def validate_model_config(cfg: ModelConfig) -> None:
 
     if cfg.rope.max_position_embeddings is not None and int(cfg.rope.max_position_embeddings) <= 0:
         raise ValueError("model.rope.max_position_embeddings must be > 0 when provided.")
-    if float(cfg.rope.rotary_pct) <= 0.0 or float(cfg.rope.rotary_pct) > 1.0:
-        raise ValueError("model.rope.rotary_pct must be in (0, 1].")
+    if not math.isfinite(float(cfg.rope.rope_theta)) or float(cfg.rope.rope_theta) <= 0.0:
+        raise ValueError("model.rope.rope_theta must be finite and > 0.")
+    if (
+        not math.isfinite(float(cfg.rope.rotary_pct))
+        or float(cfg.rope.rotary_pct) <= 0.0
+        or float(cfg.rope.rotary_pct) > 1.0
+    ):
+        raise ValueError("model.rope.rotary_pct must be finite and in (0, 1].")
+    if int(cfg.rope.type_vocab_size) < 0:
+        raise ValueError("model.rope.type_vocab_size must be >= 0.")
+    if not math.isfinite(float(cfg.rope.norm_eps)) or float(cfg.rope.norm_eps) <= 0.0:
+        raise ValueError("model.rope.norm_eps must be finite and > 0.")
+    if not math.isfinite(float(cfg.rope.initializer_range)) or float(cfg.rope.initializer_range) < 0.0:
+        raise ValueError("model.rope.initializer_range must be finite and >= 0.")
+    if cfg.rope.keel_alpha_init is not None and not math.isfinite(float(cfg.rope.keel_alpha_init)):
+        raise ValueError("model.rope.keel_alpha_init must be finite when provided.")
+    for field_name in (
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+    ):
+        value = getattr(cfg.generator, field_name)
+        if value is not None and int(value) <= 0:
+            raise ValueError(f"model.generator.{field_name} must be > 0 when provided.")
+    for field_name in ("hidden_prob", "attention_probs_prob"):
+        value = getattr(cfg.dropout, field_name)
+        if value is None:
+            continue
+        probability = float(value)
+        if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
+            raise ValueError(f"model.dropout.{field_name} must be finite and in [0, 1] or null.")
     if cfg.hf.flash.varlen_min_seq_len is not None and int(cfg.hf.flash.varlen_min_seq_len) <= 0:
         raise ValueError("model.hf.flash.varlen_min_seq_len must be > 0.")
     if cfg.hf.flash.docblock_bias_seq_len is not None and int(cfg.hf.flash.docblock_bias_seq_len) < 0:
@@ -1429,13 +1470,15 @@ def validate_model_config(cfg: ModelConfig) -> None:
             "model.dropout.attention_probs_prob": cfg.dropout.attention_probs_prob,
         }
         enabled_dropout = [
-            f"{name}={float(value)}"
+            f"{name}={value!r}"
             for name, value in dropout_values.items()
-            if value is not None and float(value) > 0.0
+            if value is None or float(value) != 0.0
         ]
         if enabled_dropout:
             raise ValueError(
-                "model.hf.attention_impl='flash' requires dropout disabled; invalid values: "
+                "model.hf.attention_impl='flash' requires dropout disabled: both fields must be "
+                "explicitly set to 0.0; "
+                "null preserves backbone/checkpoint dropout and is not accepted. Invalid values: "
                 + ", ".join(enabled_dropout)
             )
     if int(cfg.tokenizer.vocab_multiple) <= 0:
@@ -1514,8 +1557,26 @@ def validate_model_config(cfg: ModelConfig) -> None:
             raise ValueError("model.rope.pretrained.max_position_embeddings must be > 0 when provided.")
         if pre.rotary_pct is not None:
             pct = float(pre.rotary_pct)
-            if pct <= 0.0 or pct > 1.0:
-                raise ValueError("model.rope.pretrained.rotary_pct must be in (0, 1] when provided.")
+            if not math.isfinite(pct) or pct <= 0.0 or pct > 1.0:
+                raise ValueError(
+                    "model.rope.pretrained.rotary_pct must be finite and in (0, 1] when provided."
+                )
+        if pre.rope_theta is not None and (
+            not math.isfinite(float(pre.rope_theta)) or float(pre.rope_theta) <= 0.0
+        ):
+            raise ValueError("model.rope.pretrained.rope_theta must be finite and > 0 when provided.")
+        if pre.type_vocab_size is not None and int(pre.type_vocab_size) < 0:
+            raise ValueError("model.rope.pretrained.type_vocab_size must be >= 0 when provided.")
+        if pre.norm_eps is not None and (
+            not math.isfinite(float(pre.norm_eps)) or float(pre.norm_eps) <= 0.0
+        ):
+            raise ValueError("model.rope.pretrained.norm_eps must be finite and > 0 when provided.")
+        if pre.keel_alpha_init is not None and not math.isfinite(float(pre.keel_alpha_init)):
+            raise ValueError("model.rope.pretrained.keel_alpha_init must be finite when provided.")
+        if pre.initializer_range is not None and (
+            not math.isfinite(float(pre.initializer_range)) or float(pre.initializer_range) < 0.0
+        ):
+            raise ValueError("model.rope.pretrained.initializer_range must be finite and >= 0 when provided.")
         if pre.norm_arch is not None:
             _cfg_set(
                 pre,
@@ -1592,6 +1653,16 @@ def validate_data_config(cfg: DataConfig) -> None:
     """
     src = cfg.source
     pack = cfg.packing
+
+    for field_name in ("dataset_name", "dataset_config_name", "data_files", "load_from_disk"):
+        value = getattr(src, field_name)
+        if value is not None:
+            _cfg_set(src, field_name, str(value).strip() or None)
+    for field_name in ("train_split", "text_column_name"):
+        value = str(getattr(src, field_name)).strip()
+        if not value:
+            raise ValueError(f"data.source.{field_name} must be a non-empty string.")
+        _cfg_set(src, field_name, value)
 
     if src.load_from_disk:
         if src.streaming:
@@ -1699,17 +1770,35 @@ def validate_train_config(cfg: TrainConfig) -> None:
             raise ValueError(f"train.{_name} must be >= {_min}.")
 
     mlm = float(cfg.objective.mlm_probability)
-    if mlm <= 0.0 or mlm >= 1.0:
-        raise ValueError("train.objective.mlm_probability must be in (0, 1).")
+    if not math.isfinite(mlm) or mlm <= 0.0 or mlm >= 1.0:
+        raise ValueError("train.objective.mlm_probability must be finite and in (0, 1).")
     mask_p = float(cfg.objective.mask_token_prob)
     rand_p = float(cfg.objective.random_token_prob)
-    if mask_p < 0.0 or rand_p < 0.0 or (mask_p + rand_p) > 1.0:
+    if (
+        not math.isfinite(mask_p)
+        or not math.isfinite(rand_p)
+        or mask_p < 0.0
+        or rand_p < 0.0
+        or (mask_p + rand_p) > 1.0
+    ):
         raise ValueError(
             "Invalid masking probabilities: train.objective.mask_token_prob + "
-            "train.objective.random_token_prob must be <= 1."
+            "train.objective.random_token_prob must be finite, nonnegative, and <= 1."
         )
-    if float(cfg.objective.sampling_temperature) <= 0.0:
-        raise ValueError("train.objective.sampling_temperature must be > 0.")
+    temperature = float(cfg.objective.sampling_temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("train.objective.sampling_temperature must be finite and > 0.")
+    gen_weight = float(cfg.objective.gen_loss_weight)
+    disc_weight = float(cfg.objective.disc_loss_weight)
+    if (
+        not math.isfinite(gen_weight)
+        or not math.isfinite(disc_weight)
+        or gen_weight < 0.0
+        or disc_weight < 0.0
+    ):
+        raise ValueError("train objective loss weights must be finite and >= 0.")
+    if gen_weight == 0.0 and disc_weight == 0.0:
+        raise ValueError("At least one train objective loss weight must be > 0.")
     if not isinstance(cfg.decoupled_training, bool):
         raise ValueError(
             "train.decoupled_training must be a boolean (true/false). "
@@ -1740,16 +1829,26 @@ def validate_optim_config(cfg: OptimConfig) -> None:
         _ensure_choice("optim.scheduler.type", cfg.scheduler.type, _LR_SCHEDULER_CHOICES),
     )
 
-    if float(cfg.lr.base) <= 0.0:
-        raise ValueError("optim.lr.base must be > 0.")
-    if float(cfg.lr.generator) != -1.0 and float(cfg.lr.generator) <= 0.0:
-        raise ValueError("optim.lr.generator must be -1 (inherit) or > 0.")
-    if float(cfg.lr.discriminator) != -1.0 and float(cfg.lr.discriminator) <= 0.0:
-        raise ValueError("optim.lr.discriminator must be -1 (inherit) or > 0.")
-    if float(cfg.weight_decay) < 0.0:
-        raise ValueError("optim.weight_decay must be >= 0.")
-    if float(cfg.max_grad_norm) < 0.0:
-        raise ValueError("optim.max_grad_norm must be >= 0.")
+    if not math.isfinite(float(cfg.lr.base)) or float(cfg.lr.base) <= 0.0:
+        raise ValueError("optim.lr.base must be finite and > 0.")
+    if float(cfg.lr.generator) != -1.0 and (
+        not math.isfinite(float(cfg.lr.generator)) or float(cfg.lr.generator) <= 0.0
+    ):
+        raise ValueError("optim.lr.generator must be -1 (inherit) or finite and > 0.")
+    if float(cfg.lr.discriminator) != -1.0 and (
+        not math.isfinite(float(cfg.lr.discriminator)) or float(cfg.lr.discriminator) <= 0.0
+    ):
+        raise ValueError("optim.lr.discriminator must be -1 (inherit) or finite and > 0.")
+    for field_name in ("beta1", "beta2"):
+        value = float(getattr(cfg.adam, field_name))
+        if not math.isfinite(value) or value < 0.0 or value >= 1.0:
+            raise ValueError(f"optim.adam.{field_name} must be finite and in [0, 1).")
+    if not math.isfinite(float(cfg.adam.epsilon)) or float(cfg.adam.epsilon) <= 0.0:
+        raise ValueError("optim.adam.epsilon must be finite and > 0.")
+    if not math.isfinite(float(cfg.weight_decay)) or float(cfg.weight_decay) < 0.0:
+        raise ValueError("optim.weight_decay must be finite and >= 0.")
+    if not math.isfinite(float(cfg.max_grad_norm)) or float(cfg.max_grad_norm) < 0.0:
+        raise ValueError("optim.max_grad_norm must be finite and >= 0.")
     if int(cfg.scheduler.warmup_steps) < 0:
         raise ValueError("optim.scheduler.warmup_steps must be >= 0.")
 

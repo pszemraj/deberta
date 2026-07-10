@@ -33,7 +33,8 @@ FSDP1 is not maintained as a first-class path in this repo; use FSDP2 configs fo
 
 ## Runtime snapshots and tracking
 
-Run snapshot files are described in [Guides / Configuration](../guides/configuration.md#snapshot-files-and-reproducibility).
+Run snapshot files are described in the
+[config reference](../../configs/config-reference.yaml).
 
 `metrics.jsonl.gz` is written when `logging.debug.metrics=true`. Crash rows are appended to the same file on abnormal exit regardless of that setting.
 

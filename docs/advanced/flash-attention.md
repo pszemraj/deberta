@@ -12,7 +12,8 @@ set `model.hf.attention_impl: flash` or pass `--model.hf.attention_impl flash`.
 The flash path has these constraints:
 
 - `model.backbone_type` must be `hf_deberta_v2`.
-- Hidden and attention-probability dropout must be `0.0` or `null`.
+- Hidden and attention-probability dropout must both be explicitly `0.0`; `null` may preserve
+  nonzero backbone/checkpoint dropout and is rejected for flash.
 - `max_relative_positions` must cover `max_position_embeddings`. The default `-1` derives a
   compatible span. A shorter explicit span is rejected because eager and flash bucket distant
   positions differently.
@@ -63,7 +64,8 @@ Per-call eager fallbacks preserve semantics:
 ## Configuration and overrides
 
 All route and override fields live under `model.hf.flash.*`. Their exact null, zero, and
-exact-length semantics are defined in the [Config reference](../guides/config-reference.md).
+exact-length semantics are defined on each field in the
+[config reference](../../configs/config-reference.yaml).
 
 An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to
 the dense memory cost. `kernel_overrides_path` is loaded at route lookup time, so a missing or

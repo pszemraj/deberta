@@ -12,8 +12,9 @@ deberta train configs/tiny_cpu_smoke.yaml
 
 ## 2) Small parity-style run on FineWeb-Edu
 
-Use the provided small parity config and shorten the run with
-[dotted overrides](../guides/configuration.md#dotflag-examples):
+Use the provided small parity config and shorten the run with dotted overrides. Every accepted
+field and matching CLI flag is listed in the
+[config reference](../../configs/config-reference.yaml):
 
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
@@ -51,5 +52,5 @@ override. For manual exports, other checkpoints, or both RTD components, see
 
 ## 4) Check run snapshots
 
-Snapshot files and metadata are documented in
-[Guides / Configuration](../guides/configuration.md#snapshot-files-and-reproducibility).
+Snapshot files and output-directory behavior are documented in the
+[config reference](../../configs/config-reference.yaml).

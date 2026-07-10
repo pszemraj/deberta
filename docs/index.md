@@ -7,8 +7,7 @@
 
 ## Guides
 
-- config loading, precedence, defaults, and overrides: [Guides / Configuration](guides/configuration.md)
-- config keys, defaults, and validation notes: [Guides / Config Reference](guides/config-reference.md)
+- complete runnable YAML config contract: [Config reference](../configs/config-reference.yaml)
 - streaming packing, doc-block masking, and collator behavior: [Guides / Data Pipeline](guides/data-pipeline.md)
 - checkpoint consolidation and Hugging Face export: [Guides / Exporting Models](guides/exporting-models.md)
 

@@ -39,8 +39,7 @@ class DebertaV3ElectraCollator:
     batch-preparation contract.
 
     Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
-    those raw helper defaults for the selected backbone; see the
-    [Config reference](../guides/config-reference.md).
+    those raw helper defaults for the selected backbone; see ``configs/config-reference.yaml``.
     """
 
     def __init__(

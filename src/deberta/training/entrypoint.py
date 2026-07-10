@@ -126,7 +126,7 @@ def run_pretraining_dry_run(
     This validates configuration contracts and probes core runtime dependencies
     (tokenizer, dataset access, collator output, model config construction)
     without starting optimization/training loops. It may access network sources and populate
-    dependency caches; see [Configuration](../guides/configuration.md#dry-run-behavior).
+    dependency caches; see ``configs/config-reference.yaml``.
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
