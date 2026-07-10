@@ -366,6 +366,35 @@ def test_streaming_does_not_retry_non_transient_errors() -> None:
     assert source.iterations == 1
 
 
+def test_streaming_stops_after_retry_budget_is_exhausted() -> None:
+    class _UnavailableDataset:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            raise OSError("shard unavailable")
+            yield
+
+    source = _UnavailableDataset()
+    dataset = PackedStreamingDataset(
+        hf_dataset=source,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            retry_attempts=3,
+            retry_backoff_seconds=0.0,
+        ),
+    )
+
+    with pytest.raises(OSError, match="shard unavailable"):
+        list(dataset._iter_examples())
+    assert source.iterations == 3
+
+
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a b c d e f g h i"}]

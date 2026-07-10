@@ -204,18 +204,18 @@ def _build_branch_param_groups(
     return groups, ordered_names
 
 
-def _build_optimizer(
+def _prepare_optimizer_groups(
     model: torch.nn.Module,
     cfg: OptimConfig,
     *,
-    mixed_precision: str = "no",
-) -> torch.optim.Optimizer:
-    """Create AdamW with parameter grouping for RTD training.
+    mixed_precision: str,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[str], float, float, dict[str, Any]]:
+    """Resolve ordered branch groups and shared AdamW arguments.
 
-    :param torch.nn.Module model: RTD model.
+    :param torch.nn.Module model: Model whose parameters are partitioned.
     :param OptimConfig cfg: Optimizer configuration.
-    :param str mixed_precision: Effective mixed-precision mode.
-    :return torch.optim.Optimizer: Configured AdamW optimizer.
+    :param str mixed_precision: Effective precision mode.
+    :return tuple: Generator/discriminator groups, names, learning rates, and shared kwargs.
     """
     eps, betas, gen_lr, disc_lr, fused_kwargs = _resolve_optimizer_hyperparams(
         cfg=cfg,
@@ -234,12 +234,43 @@ def _build_optimizer(
         lr=disc_lr,
         weight_decay=float(cfg.weight_decay),
     )
+    return (
+        gen_groups,
+        gen_names,
+        disc_groups,
+        disc_names,
+        gen_lr,
+        disc_lr,
+        {
+            "betas": betas,
+            "eps": eps,
+            **fused_kwargs,
+        },
+    )
+
+
+def _build_optimizer(
+    model: torch.nn.Module,
+    cfg: OptimConfig,
+    *,
+    mixed_precision: str = "no",
+) -> torch.optim.Optimizer:
+    """Create AdamW with parameter grouping for RTD training.
+
+    :param torch.nn.Module model: RTD model.
+    :param OptimConfig cfg: Optimizer configuration.
+    :param str mixed_precision: Effective mixed-precision mode.
+    :return torch.optim.Optimizer: Configured AdamW optimizer.
+    """
+    gen_groups, gen_names, disc_groups, disc_names, _, disc_lr, adamw_kwargs = _prepare_optimizer_groups(
+        model,
+        cfg,
+        mixed_precision=mixed_precision,
+    )
     optimizer = torch.optim.AdamW(
         [*gen_groups, *disc_groups],
         lr=disc_lr,
-        betas=betas,
-        eps=eps,
-        **fused_kwargs,
+        **adamw_kwargs,
     )
     optimizer._param_order_digest = _digest_param_name_order([*gen_names, *disc_names])
     return optimizer
@@ -258,36 +289,18 @@ def _build_decoupled_optimizers(
     :param str mixed_precision: Effective mixed-precision mode.
     :return tuple[torch.optim.Optimizer, torch.optim.Optimizer]: (generator_optimizer, discriminator_optimizer).
     """
-    eps, betas, gen_lr, disc_lr, fused_kwargs = _resolve_optimizer_hyperparams(
-        cfg=cfg,
-        mixed_precision=mixed_precision,
-    )
-    partitions = _partition_optimizer_params(model)
-    gen_groups, gen_names = _build_branch_param_groups(
-        partitions=partitions,
-        branch_key="gen",
-        lr=gen_lr,
-        weight_decay=float(cfg.weight_decay),
-    )
-    disc_groups, disc_names = _build_branch_param_groups(
-        partitions=partitions,
-        branch_key="disc",
-        lr=disc_lr,
-        weight_decay=float(cfg.weight_decay),
+    gen_groups, gen_names, disc_groups, disc_names, gen_lr, disc_lr, adamw_kwargs = _prepare_optimizer_groups(
+        model, cfg, mixed_precision=mixed_precision
     )
     gen_opt = torch.optim.AdamW(
         gen_groups,
         lr=gen_lr,
-        betas=betas,
-        eps=eps,
-        **fused_kwargs,
+        **adamw_kwargs,
     )
     disc_opt = torch.optim.AdamW(
         disc_groups,
         lr=disc_lr,
-        betas=betas,
-        eps=eps,
-        **fused_kwargs,
+        **adamw_kwargs,
     )
     gen_opt._param_order_digest = _digest_param_name_order(gen_names)
     disc_opt._param_order_digest = _digest_param_name_order(disc_names)
