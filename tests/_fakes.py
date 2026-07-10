@@ -549,7 +549,7 @@ def setup_pretraining_mocks(
     monkeypatch.setattr(
         entrypoint_mod,
         "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
+        lambda optimizer, **_kwargs: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
     )
     monkeypatch.setattr(entrypoint_mod, "_cycle_dataloader", cycle_fn)
     monkeypatch.setattr(entrypoint_mod, "_move_batch_to_device", lambda b, _device: b)

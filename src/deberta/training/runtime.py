@@ -16,8 +16,6 @@ from deberta.config import (
     ModelConfig,
     OptimConfig,
     TrainConfig,
-    _sync_legacy_train_aliases,
-    apply_backbone_defaults,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
@@ -155,27 +153,27 @@ def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
 
 def _resolve_optimizer_hyperparams(
     *,
-    cfg: TrainConfig,
+    cfg: OptimConfig,
     mixed_precision: str,
 ) -> tuple[float, tuple[float, float], float, float, dict[str, Any]]:
     """Resolve shared AdamW hyperparameters for optimizer construction.
 
-    :param TrainConfig cfg: Training configuration.
+    :param OptimConfig cfg: Optimizer configuration.
     :param str mixed_precision: Effective mixed-precision mode.
     :return tuple[float, tuple[float, float], float, float, dict[str, Any]]:
         ``(eps, betas, gen_lr, disc_lr, fused_kwargs)``.
     """
-    eps = float(cfg.adam_epsilon)
+    eps = float(cfg.adam.epsilon)
     if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
         eps = 1e-6
         logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
 
-    base_lr = float(cfg.learning_rate)
-    gen_lr_raw = float(cfg.generator_learning_rate)
-    disc_lr_raw = float(getattr(cfg, "discriminator_learning_rate", -1.0))
+    base_lr = float(cfg.lr.base)
+    gen_lr_raw = float(cfg.lr.generator)
+    disc_lr_raw = float(cfg.lr.discriminator)
     gen_lr = gen_lr_raw if gen_lr_raw > 0 else base_lr
     disc_lr = disc_lr_raw if disc_lr_raw > 0 else base_lr
-    betas = (float(cfg.adam_beta1), float(cfg.adam_beta2))
+    betas = (float(cfg.adam.beta1), float(cfg.adam.beta2))
     fused_kwargs = _maybe_fused_adamw_kwargs()
     return eps, betas, gen_lr, disc_lr, fused_kwargs
 
@@ -208,14 +206,14 @@ def _build_branch_param_groups(
 
 def _build_optimizer(
     model: torch.nn.Module,
-    cfg: TrainConfig,
+    cfg: OptimConfig,
     *,
     mixed_precision: str = "no",
 ) -> torch.optim.Optimizer:
     """Create AdamW with parameter grouping for RTD training.
 
     :param torch.nn.Module model: RTD model.
-    :param TrainConfig cfg: Training configuration.
+    :param OptimConfig cfg: Optimizer configuration.
     :param str mixed_precision: Effective mixed-precision mode.
     :return torch.optim.Optimizer: Configured AdamW optimizer.
     """
@@ -249,14 +247,14 @@ def _build_optimizer(
 
 def _build_decoupled_optimizers(
     model: torch.nn.Module,
-    cfg: TrainConfig,
+    cfg: OptimConfig,
     *,
     mixed_precision: str = "no",
 ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
     """Create separate generator/discriminator AdamW optimizers.
 
     :param torch.nn.Module model: RTD model.
-    :param TrainConfig cfg: Training configuration.
+    :param OptimConfig cfg: Optimizer configuration.
     :param str mixed_precision: Effective mixed-precision mode.
     :return tuple[torch.optim.Optimizer, torch.optim.Optimizer]: (generator_optimizer, discriminator_optimizer).
     """
@@ -296,11 +294,17 @@ def _build_decoupled_optimizers(
     return gen_opt, disc_opt
 
 
-def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig,
+) -> Any:
     """Build a Hugging Face learning-rate scheduler.
 
     :param torch.optim.Optimizer optimizer: Optimizer instance.
-    :param TrainConfig cfg: Training configuration.
+    :param TrainConfig train_cfg: Training step budget.
+    :param OptimConfig optim_cfg: Scheduler configuration.
     :return Any: Scheduler object from ``transformers.get_scheduler``.
     """
     try:
@@ -309,10 +313,10 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
         raise RuntimeError("transformers is required for schedulers.") from e
 
     return get_scheduler(
-        name=cfg.lr_scheduler_type,
+        name=optim_cfg.scheduler.type,
         optimizer=optimizer,
-        num_warmup_steps=int(cfg.warmup_steps),
-        num_training_steps=int(cfg.max_steps),
+        num_warmup_steps=int(optim_cfg.scheduler.warmup_steps),
+        num_training_steps=int(train_cfg.max_steps),
     )
 
 
@@ -332,10 +336,7 @@ def _cycle_dataloader(
     while True:
         set_epoch = getattr(dataset, "set_epoch", None)
         if callable(set_epoch):
-            try:
-                set_epoch(epoch)
-            except Exception:
-                pass
+            set_epoch(epoch)
         yield from dl
         epoch += 1
 
@@ -358,63 +359,17 @@ def _build_training_collator(
     return DebertaV3ElectraCollator(
         tokenizer=tokenizer,
         cfg=MLMConfig(
-            mlm_probability=train_cfg.mlm_probability,
-            mask_token_prob=train_cfg.mask_token_prob,
-            random_token_prob=train_cfg.random_token_prob,
-            max_ngram=train_cfg.mlm_max_ngram,
+            mlm_probability=train_cfg.objective.mlm_probability,
+            mask_token_prob=train_cfg.objective.mask_token_prob,
+            random_token_prob=train_cfg.objective.random_token_prob,
+            max_ngram=train_cfg.objective.mlm_max_ngram,
         ),
         packed_sequences=bool(packed_sequences),
         block_cross_document_attention=bool(block_cross_document_attention),
     )
 
 
-def _resolve_section_cfg_compat(
-    *,
-    train_cfg: TrainConfig,
-    optim_cfg: OptimConfig | None,
-    logging_cfg: LoggingConfig | None,
-) -> tuple[OptimConfig, LoggingConfig]:
-    """Resolve optional optim/logging configs with train-legacy compatibility.
-
-    :param TrainConfig train_cfg: Train config object.
-    :param OptimConfig | None optim_cfg: Optional explicit optim config.
-    :param LoggingConfig | None logging_cfg: Optional explicit logging config.
-    :return tuple[OptimConfig, LoggingConfig]: Effective optim/logging configs.
-    """
-    if optim_cfg is None:
-        resolved_optim_cfg = OptimConfig(
-            learning_rate=getattr(train_cfg, "learning_rate", 5e-4),
-            generator_learning_rate=getattr(train_cfg, "generator_learning_rate", -1.0),
-            discriminator_learning_rate=getattr(train_cfg, "discriminator_learning_rate", -1.0),
-            weight_decay=getattr(train_cfg, "weight_decay", 0.01),
-            adam_beta1=getattr(train_cfg, "adam_beta1", 0.9),
-            adam_beta2=getattr(train_cfg, "adam_beta2", 0.999),
-            adam_epsilon=getattr(train_cfg, "adam_epsilon", 1e-8),
-            lr_scheduler_type=getattr(train_cfg, "lr_scheduler_type", "linear"),
-            warmup_steps=getattr(train_cfg, "warmup_steps", 1_000),
-            max_grad_norm=getattr(train_cfg, "max_grad_norm", 1.0),
-        )
-    else:
-        resolved_optim_cfg = optim_cfg
-
-    if logging_cfg is None:
-        resolved_logging_cfg = LoggingConfig(
-            project_name=getattr(train_cfg, "project_name", "deberta-train"),
-            run_name=getattr(train_cfg, "run_name", None),
-            output_dir=getattr(train_cfg, "logging_output_dir", None),
-            logging_steps=getattr(train_cfg, "logging_steps", 50),
-            report_to=getattr(train_cfg, "report_to", "none"),
-            wandb_watch=getattr(train_cfg, "wandb_watch", "gradients"),
-            wandb_watch_log_freq=getattr(train_cfg, "wandb_watch_log_freq", 100),
-            debug_metrics=getattr(train_cfg, "debug_metrics", False),
-        )
-    else:
-        resolved_logging_cfg = logging_cfg
-
-    return resolved_optim_cfg, resolved_logging_cfg
-
-
-def _apply_backbone_defaults_and_validate_training_configs(
+def _validate_training_configs(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
@@ -422,7 +377,7 @@ def _apply_backbone_defaults_and_validate_training_configs(
     optim_cfg: OptimConfig,
     logging_cfg: LoggingConfig,
 ) -> None:
-    """Apply backbone defaults and validate the full training config contract.
+    """Validate the full training config contract.
 
     :param ModelConfig model_cfg: Model config.
     :param DataConfig data_cfg: Data config.
@@ -431,12 +386,6 @@ def _apply_backbone_defaults_and_validate_training_configs(
     :param LoggingConfig logging_cfg: Effective logging config.
     :return None: None.
     """
-    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=optim_cfg,
-        logging_cfg=logging_cfg,
-    )
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
@@ -469,16 +418,18 @@ def _build_train_dataset_and_collator(
     :param int num_processes: Total process count.
     :return tuple[Any, Any]: ``(train_dataset, collator)``.
     """
-    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
+    dataset_cls = PackedStreamingDataset if bool(data_cfg.packing.enabled) else SequentialStreamingDataset
     train_dataset = dataset_cls(
         hf_dataset=raw_train,
         tokenizer=tokenizer,
         cfg=PackedStreamingConfig(
-            text_column_name=data_cfg.text_column_name,
-            max_seq_length=data_cfg.max_seq_length,
+            text_column_name=data_cfg.source.text_column_name,
+            max_seq_length=data_cfg.packing.max_seq_length,
             seed=train_cfg.seed,
-            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
-            block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+            shuffle_buffer_size=data_cfg.source.shuffle_buffer_size,
+            block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
+            retry_attempts=data_cfg.source.retry_attempts,
+            retry_backoff_seconds=data_cfg.source.retry_backoff_seconds,
         ),
         process_index=process_index,
         num_processes=num_processes,
@@ -486,7 +437,7 @@ def _build_train_dataset_and_collator(
     collator = _build_training_collator(
         tokenizer=tokenizer,
         train_cfg=train_cfg,
-        packed_sequences=bool(data_cfg.pack_sequences),
-        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        packed_sequences=bool(data_cfg.packing.enabled),
+        block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
     )
     return train_dataset, collator

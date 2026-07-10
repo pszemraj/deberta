@@ -186,7 +186,7 @@ def load_tool_config_and_loader(
     if require_bf16 and str(mixed_precision).strip().lower() != "bf16":
         raise RuntimeError(f"{tool_name} currently expects bf16 mixed precision.")
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer.name_or_path, use_fast=True)
     raw_train = load_hf_dataset(cfg.data)
     train_dataset, collator = _build_train_dataset_and_collator(
         raw_train=raw_train,
@@ -228,7 +228,7 @@ def build_branch_backbone_config(
     disc_config, gen_config = build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=tokenizer,
-        max_position_embeddings=int(data_cfg.max_seq_length),
+        max_position_embeddings=int(data_cfg.packing.max_seq_length),
     )
     backbone_config = disc_config if str(branch) == "discriminator" else gen_config
     head_dim = int(backbone_config.hidden_size) // int(backbone_config.num_attention_heads)
@@ -272,7 +272,7 @@ def build_rtd_pretrainer(
     disc_config, gen_config = build_backbone_configs(
         model_cfg=cfg.model,
         tokenizer=tokenizer,
-        max_position_embeddings=int(cfg.data.max_seq_length),
+        max_position_embeddings=int(cfg.data.packing.max_seq_length),
     )
     disc_backbone, gen_backbone = build_backbones(
         model_cfg=cfg.model,

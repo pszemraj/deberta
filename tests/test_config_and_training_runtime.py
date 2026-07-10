@@ -96,27 +96,6 @@ def test_resolve_data_resume_policy_respects_explicit_strategy():
     assert do_replay_restart is False
 
 
-def test_normalize_resume_consumed_micro_batches_clamps_legacy_partial_window():
-    consumed, reason = _normalize_resume_consumed_micro_batches(
-        consumed_micro_batches=35,
-        global_step=11,
-        gradient_accumulation_steps=3,
-    )
-    assert consumed == 33
-    assert reason is not None
-    assert "clamped_legacy_partial_accumulation_delta" in reason
-
-
-def test_normalize_resume_consumed_micro_batches_keeps_non_legacy_mismatch():
-    consumed, reason = _normalize_resume_consumed_micro_batches(
-        consumed_micro_batches=100,
-        global_step=11,
-        gradient_accumulation_steps=3,
-    )
-    assert consumed == 100
-    assert reason is None
-
-
 def test_build_forbidden_token_mask_rejects_all_forbidden_vocab():
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -298,14 +277,10 @@ def test_build_optimizer_supports_branch_specific_lrs(
     discriminator_lr: float | None, expected_lrs: set[float]
 ):
     model = TinyRTDLikeModel()
-    cfg_kwargs: dict[str, float] = {
-        "learning_rate": 1.0e-3,
-        "generator_learning_rate": 5.0e-4,
-        "weight_decay": 0.1,
-    }
+    lr = {"base": 1.0e-3, "generator": 5.0e-4}
     if discriminator_lr is not None:
-        cfg_kwargs["discriminator_learning_rate"] = float(discriminator_lr)
-    cfg = TrainConfig(**cfg_kwargs)
+        lr["discriminator"] = float(discriminator_lr)
+    cfg = OptimConfig(lr=lr, weight_decay=0.1)
     opt = _build_optimizer(model, cfg)
 
     lrs = {float(g["lr"]) for g in opt.param_groups}
@@ -318,12 +293,9 @@ def test_build_optimizer_supports_branch_specific_lrs(
 
 def test_build_decoupled_optimizers_support_discriminator_specific_lr():
     model = TinyRTDLikeModel()
-    cfg = TrainConfig(
-        learning_rate=1.0e-3,
-        generator_learning_rate=5.0e-4,
-        discriminator_learning_rate=2.0e-4,
+    cfg = OptimConfig(
+        lr={"base": 1.0e-3, "generator": 5.0e-4, "discriminator": 2.0e-4},
         weight_decay=0.1,
-        mixed_precision="no",
     )
     gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
 
@@ -339,7 +311,7 @@ def test_build_optimizer_keeps_fused_in_bf16_mode(monkeypatch: pytest.MonkeyPatc
     import deberta.training.runtime as runtime_mod
 
     model = TinyRTDLikeModel()
-    cfg = TrainConfig()
+    cfg = OptimConfig()
 
     monkeypatch.setattr(runtime_mod, "_maybe_fused_adamw_kwargs", lambda: {"fused": True})
     opt = runtime_mod._build_optimizer(
@@ -353,7 +325,7 @@ def test_build_optimizer_keeps_fused_in_bf16_mode(monkeypatch: pytest.MonkeyPatc
 
 def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
     model = TinyRTDLikeModel()
-    cfg = TrainConfig(adam_epsilon=1e-8)
+    cfg = OptimConfig(adam={"epsilon": 1e-8})
 
     opt = _build_optimizer(model, cfg, mixed_precision="bf16")
     assert float(opt.defaults["eps"]) == pytest.approx(1e-6)
@@ -956,7 +928,7 @@ def _weight_decay_for_param(opt: torch.optim.Optimizer, param: torch.nn.Paramete
 
 
 def test_build_optimizer_marks_scalar_params_as_no_decay():
-    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
 
     class _RegressionModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -969,16 +941,16 @@ def test_build_optimizer_marks_scalar_params_as_no_decay():
             self.discriminator_norm = torch.nn.LayerNorm(4)
 
     model = _RegressionModel()
-    opt = _build_optimizer(model, train_cfg)
+    opt = _build_optimizer(model, optim_cfg)
 
     assert _weight_decay_for_param(opt, model.generator.alpha) == pytest.approx(0.0)
     assert _weight_decay_for_param(opt, model.discriminator.alpha) == pytest.approx(0.0)
     assert _weight_decay_for_param(opt, model.discriminator_norm.weight) == pytest.approx(0.0)
-    assert _weight_decay_for_param(opt, model.generator.weight) == pytest.approx(train_cfg.weight_decay)
+    assert _weight_decay_for_param(opt, model.generator.weight) == pytest.approx(optim_cfg.weight_decay)
 
 
 def test_build_optimizer_applies_decay_to_high_rank_bias_parameters():
-    train_cfg = TrainConfig()
+    optim_cfg = OptimConfig()
 
     class _BiasMatrixModule(torch.nn.Module):
         def __init__(self) -> None:
@@ -994,9 +966,9 @@ def test_build_optimizer_applies_decay_to_high_rank_bias_parameters():
             self.discriminator = torch.nn.Linear(4, 4)
 
     model = _RegressionModel()
-    opt = _build_optimizer(model, train_cfg)
+    opt = _build_optimizer(model, optim_cfg)
 
-    assert _weight_decay_for_param(opt, model.generator_bias.bias) == pytest.approx(train_cfg.weight_decay)
+    assert _weight_decay_for_param(opt, model.generator_bias.bias) == pytest.approx(optim_cfg.weight_decay)
 
 
 def test_normalize_mixed_precision_accepts_bool_and_synonyms():

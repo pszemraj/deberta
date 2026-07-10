@@ -54,11 +54,11 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
         encoding="utf-8",
     )
     cfg = load_config(cfg_path)
-    assert int(cfg.train.warmup_steps) == 222
-    assert int(cfg.train.save_steps) == 777
-    assert str(cfg.train.report_to) == "wandb"
-    assert str(cfg.train.wandb_watch) == "all"
-    assert bool(cfg.train.debug_metrics) is True
+    assert int(cfg.optim.scheduler.warmup_steps) == 222
+    assert int(cfg.train.checkpoint.save_steps) == 777
+    assert bool(cfg.logging.wandb.enabled) is True
+    assert str(cfg.logging.wandb.watch) == "all"
+    assert bool(cfg.logging.debug.metrics) is True
 
 
 def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -> None:
@@ -110,20 +110,6 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
     cfg2 = apply_dotted_override(cfg2, "optim.scheduler.warmup_steps=123")
     assert cfg2.logging.wandb.watch == "all"
     assert int(cfg2.optim.scheduler.warmup_steps) == 123
-    assert int(cfg2.train.warmup_steps) == 123
-
-
-def test_apply_dotted_override_preserves_existing_explicit_fields_per_section() -> None:
-    cfg = Config()
-    cfg = apply_dotted_override(cfg, "train.objective.mask_token_prob=0.8")
-    cfg = apply_dotted_override(cfg, "train.max_steps=20")
-
-    explicit_train_fields = set(getattr(cfg.train, "_explicit_fields", set()))
-    assert "objective.mask_token_prob" in explicit_train_fields
-    assert "max_steps" in explicit_train_fields
-
-    apply_backbone_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
-    assert cfg.train.mask_token_prob == pytest.approx(0.8)
 
 
 def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
@@ -481,15 +467,6 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert global_step == 17
     assert saved_ga == 4
 
-    # Back-compat: old checkpoints without lr_mult or digest default gracefully.
-    import json
-
-    (ckpt / "data_state.json").write_text(json.dumps({"consumed_micro_batches": 50}))
-    consumed_old, lr_mult_old, digest_old = _load_checkpoint_data_progress(ckpt)
-    assert consumed_old == 50
-    assert lr_mult_old == 1.0
-    assert digest_old is None
-
 
 def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path: Path):
     ckpt = tmp_path / "checkpoint-12"
@@ -597,7 +574,7 @@ def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
 
 def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:
     model = TinyRTDLikeModel()
-    cfg = TrainConfig()
+    cfg = OptimConfig()
     opt = _build_optimizer(model, cfg)
 
     param_to_name = {id(p): n for n, p in model.named_parameters() if p.requires_grad}
@@ -612,11 +589,9 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
 
 def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
     model = TinyRTDLikeModel()
-    cfg = TrainConfig(
-        learning_rate=5.0e-4,
-        generator_learning_rate=2.5e-4,
+    cfg = OptimConfig(
+        lr={"base": 5.0e-4, "generator": 2.5e-4},
         weight_decay=0.01,
-        mixed_precision="no",
     )
     gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
 
@@ -644,11 +619,9 @@ def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_o
             self.discriminator = torch.nn.Linear(8, 8)
 
     model = _ModelWithEmd()
-    cfg = TrainConfig(
-        learning_rate=5.0e-4,
-        generator_learning_rate=2.5e-4,
+    cfg = OptimConfig(
+        lr={"base": 5.0e-4, "generator": 2.5e-4},
         weight_decay=0.01,
-        mixed_precision="no",
     )
     gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
 
@@ -1174,9 +1147,10 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
             model_cfg=ModelConfig(),
             data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
             train_cfg=train_cfg,
+            logging_cfg=LoggingConfig(wandb={"enabled": True}),
         )
 
-    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    metrics_path = Path(str(train_cfg.checkpoint.output_dir)) / "metrics.jsonl.gz"
     with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
         rows = [json.loads(line) for line in f.read().splitlines()]
     assert rows and rows[-1]["crash"] is True

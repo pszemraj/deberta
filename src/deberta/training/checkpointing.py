@@ -50,39 +50,6 @@ def _resolve_data_resume_policy(
     )
 
 
-def _normalize_resume_consumed_micro_batches(
-    *,
-    consumed_micro_batches: int,
-    global_step: int,
-    gradient_accumulation_steps: int,
-) -> tuple[int, str | None]:
-    """Normalize legacy resume data progress to committed optimizer-step boundaries.
-
-    Legacy checkpoints may contain micro-batch progress ahead of ``global_step`` when
-    a crash happened mid-accumulation window. Detect this pattern and clamp to the
-    last committed window boundary.
-
-    :param int consumed_micro_batches: Restored consumed micro-batch count.
-    :param int global_step: Resumed optimizer step from checkpoint path.
-    :param int gradient_accumulation_steps: Accumulation steps used to interpret saved progress.
-    :return tuple[int, str | None]: ``(normalized_consumed, reason_or_none)``.
-    """
-    consumed = max(0, int(consumed_micro_batches))
-    step = max(0, int(global_step))
-    ga_steps = max(1, int(gradient_accumulation_steps))
-
-    # Non-standard checkpoint names can parse as step=0; avoid clamping in that case.
-    if step <= 0:
-        return int(consumed), None
-
-    expected_committed = int(step * ga_steps)
-    if consumed > expected_committed:
-        delta = int(consumed - expected_committed)
-        if 0 < delta < ga_steps:
-            return int(expected_committed), f"clamped_legacy_partial_accumulation_delta={delta}"
-    return int(consumed), None
-
-
 def _save_periodic_checkpoint_if_due(
     *,
     accelerator: Any,
@@ -108,7 +75,7 @@ def _save_periodic_checkpoint_if_due(
     :param int last_saved_step: Last checkpoint step already saved.
     :return int: Updated ``last_saved_step`` value.
     """
-    if not train_cfg.save_steps or (global_step % int(train_cfg.save_steps) != 0):
+    if not train_cfg.checkpoint.save_steps or (global_step % int(train_cfg.checkpoint.save_steps) != 0):
         return int(last_saved_step)
 
     ckpt_dir = output_dir / f"checkpoint-{int(global_step)}"
@@ -117,7 +84,7 @@ def _save_periodic_checkpoint_if_due(
         checkpoint_dir=ckpt_dir,
         output_dir=output_dir,
         consumed_micro_batches=consumed_micro_batches_committed,
-        save_total_limit=int(train_cfg.save_total_limit),
+        save_total_limit=int(train_cfg.checkpoint.save_total_limit),
         log_label="periodic",
         lr_mult=float(lr_mult),
         optimizer_param_digest=optimizer_param_digest,

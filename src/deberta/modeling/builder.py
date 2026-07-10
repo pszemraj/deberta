@@ -139,9 +139,9 @@ def _resolve_required_tokenizer_vocab_size(
     :return int: Required tokenizer size.
     """
     requested_target = (
-        int(model_cfg.tokenizer_vocab_target) if model_cfg.tokenizer_vocab_target is not None else None
+        int(model_cfg.tokenizer.vocab_target) if model_cfg.tokenizer.vocab_target is not None else None
     )
-    multiple = int(model_cfg.tokenizer_vocab_multiple)
+    multiple = int(model_cfg.tokenizer.vocab_multiple)
     desired = int(current_size)
 
     if requested_target is not None:
@@ -163,7 +163,7 @@ def _resolve_required_tokenizer_vocab_size(
             )
         # Optional convenience path: when resize is enabled and no explicit target is provided,
         # align tokenizer length to checkpoint vocab_size.
-        if requested_target is None and bool(model_cfg.tokenizer_allow_vocab_resize):
+        if requested_target is None and bool(model_cfg.tokenizer.allow_vocab_resize):
             desired = max(desired, cfg_vocab)
         if desired > cfg_vocab:
             raise ValueError(
@@ -192,52 +192,52 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     from_scratch = bool(model_cfg.from_scratch)
 
     if bt == "hf_deberta_v2":
-        disc_cfg_source = None if from_scratch else model_cfg.pretrained_discriminator_path
+        disc_cfg_source = None if from_scratch else model_cfg.pretrained.discriminator_path
         discriminator = _ResolvedComponentSources(
             component="discriminator",
             config_source=disc_cfg_source,
             config_origin=(
                 "repo_hf_defaults" if disc_cfg_source is None else "pretrained_discriminator_path"
             ),
-            weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
+            weight_source=(None if from_scratch else model_cfg.pretrained.discriminator_path),
             weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
         )
         if from_scratch:
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=model_cfg.pretrained_generator_path or None,
+                config_source=model_cfg.pretrained.generator_path or None,
                 config_origin=(
                     "pretrained_generator_path"
-                    if model_cfg.pretrained_generator_path
+                    if model_cfg.pretrained.generator_path
                     else "derived_from_discriminator_config"
                 ),
                 weight_source=None,
                 weight_origin="scratch",
-                derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
+                derived_from_discriminator=not bool(model_cfg.pretrained.generator_path),
             )
         else:
-            gen_weight_src = model_cfg.pretrained_generator_path or model_cfg.pretrained_discriminator_path
+            gen_weight_src = model_cfg.pretrained.generator_path or model_cfg.pretrained.discriminator_path
             gen_weight_origin = (
                 "pretrained_generator_path"
-                if model_cfg.pretrained_generator_path
+                if model_cfg.pretrained.generator_path
                 else "derived_from_pretrained_discriminator_path"
             )
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=model_cfg.pretrained_generator_path or None,
+                config_source=model_cfg.pretrained.generator_path or None,
                 config_origin=(
                     "pretrained_generator_path"
-                    if model_cfg.pretrained_generator_path
+                    if model_cfg.pretrained.generator_path
                     else "derived_from_discriminator_config"
                 ),
                 weight_source=gen_weight_src,
                 weight_origin=gen_weight_origin,
-                derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
+                derived_from_discriminator=not bool(model_cfg.pretrained.generator_path),
             )
         return _ResolvedBackboneSources(discriminator=discriminator, generator=generator)
 
-    disc_cfg_source = model_cfg.pretrained_discriminator_path
+    disc_cfg_source = model_cfg.pretrained.discriminator_path
     if bt == "rope" and from_scratch:
         discriminator = _ResolvedComponentSources(
             component="discriminator",
@@ -252,16 +252,16 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
             component="discriminator",
             config_source=disc_cfg_source,
             config_origin="pretrained_discriminator_path",
-            weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
+            weight_source=(None if from_scratch else model_cfg.pretrained.discriminator_path),
             weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
         )
 
     if from_scratch:
-        if model_cfg.pretrained_generator_path:
+        if model_cfg.pretrained.generator_path:
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=model_cfg.pretrained_generator_path,
+                config_source=model_cfg.pretrained.generator_path,
                 config_origin="pretrained_generator_path",
                 weight_source=None,
                 weight_origin="scratch",
@@ -277,12 +277,12 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 derived_from_discriminator=True,
             )
     else:
-        if model_cfg.pretrained_generator_path:
+        if model_cfg.pretrained.generator_path:
             generator = _ResolvedComponentSources(
                 component="generator",
-                config_source=model_cfg.pretrained_generator_path,
+                config_source=model_cfg.pretrained.generator_path,
                 config_origin="pretrained_generator_path",
-                weight_source=model_cfg.pretrained_generator_path,
+                weight_source=model_cfg.pretrained.generator_path,
                 weight_origin="pretrained_generator_path",
                 derived_from_discriminator=False,
             )
@@ -291,7 +291,7 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
                 component="generator",
                 config_source=None,
                 config_origin="derived_from_discriminator_config",
-                weight_source=model_cfg.pretrained_discriminator_path,
+                weight_source=model_cfg.pretrained.discriminator_path,
                 weight_origin="derived_from_pretrained_discriminator_path",
                 derived_from_discriminator=True,
             )
@@ -382,7 +382,7 @@ def _align_or_validate_tokenizer_contract(
             tokenizer=tokenizer,
             target_size=required_vocab,
             component=component,
-            allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+            allow_resize=bool(model_cfg.tokenizer.allow_vocab_resize),
         )
         tok_vocab = _tokenizer_vocab_size(tokenizer)
         cfg.vocab_size = tok_vocab
@@ -405,7 +405,7 @@ def _align_or_validate_tokenizer_contract(
         tokenizer=tokenizer,
         target_size=required_vocab,
         component=component,
-        allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+        allow_resize=bool(model_cfg.tokenizer.allow_vocab_resize),
     )
     tok_vocab = _tokenizer_vocab_size(tokenizer)
 
@@ -603,10 +603,10 @@ def _apply_hf_config_normalization(
         component=component,
         model_cfg=model_cfg,
     )
-    if model_cfg.hf_max_position_embeddings is not None:
-        cfg.max_position_embeddings = int(model_cfg.hf_max_position_embeddings)
+    if model_cfg.hf.max_position_embeddings is not None:
+        cfg.max_position_embeddings = int(model_cfg.hf.max_position_embeddings)
     _apply_dropout_overrides(cfg, model_cfg)
-    cfg.hf_attention_kernel = str(model_cfg.hf_attention_kernel)
+    cfg.hf_attention_kernel = str(model_cfg.hf.attention_kernel)
     cfg.hf_attention_impl = str(model_cfg.hf.attention_impl)
     flash_cfg = model_cfg.hf.flash
 
@@ -714,7 +714,7 @@ def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Conf
             "intermediate_size": 4096,
         },
     }
-    size_key = str(model_cfg.hf_model_size).strip().lower()
+    size_key = str(model_cfg.hf.model_size).strip().lower()
     dims = presets[size_key]
 
     return DebertaV2Config(

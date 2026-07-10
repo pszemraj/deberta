@@ -494,13 +494,13 @@ def run_export(cfg: ExportConfig) -> None:
     strict_export_load = not bool(cfg.allow_partial_export)
 
     # Tokenizer (needed for configs, and we also export it)
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
 
     # Rebuild configs (must match training!)
     disc_config, gen_config = build_backbone_configs(
         model_cfg=model_cfg,
         tokenizer=tokenizer,
-        max_position_embeddings=int(data_cfg.max_seq_length),
+        max_position_embeddings=int(data_cfg.packing.max_seq_length),
     )
 
     # Build backbones + pretrainer container so accelerate.load_state can restore the exact structure.
@@ -660,4 +660,3 @@ def run_export(cfg: ExportConfig) -> None:
         # Cleanup staged partial output so failed exports are re-runnable.
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
-

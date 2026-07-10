@@ -9,7 +9,6 @@ def _write_resume_source_snapshots(run_dir: Path) -> None:
     train_cfg = TrainConfig()
     optim_cfg = OptimConfig()
     logging_cfg = LoggingConfig(output_dir=str(run_dir))
-    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
     _persist_or_validate_run_configs(
         output_dir=run_dir,
         model_cfg=model_cfg,
@@ -64,104 +63,6 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
         train_cfg=train_cfg,
     )
     assert replay_calls["next"] == 0
-
-
-def test_run_pretraining_resume_normalizes_legacy_partial_window_progress(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
-) -> None:
-    checkpoint_dir = mock_checkpoint(root=tmp_path / "run", name="checkpoint-1", consumed_micro_batches=3)
-    _write_resume_source_snapshots(checkpoint_dir.parent)
-
-    captured: dict[str, int] = {}
-
-    def _capture_policy(*, train_cfg: Any, consumed_micro_batches: int, global_step: int):
-        del train_cfg
-        captured["consumed_micro_batches"] = int(consumed_micro_batches)
-        captured["global_step"] = int(global_step)
-        return 0, False, "captured"
-
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=FakeAccelerator,
-    )
-    monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
-
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        save_steps=0,
-        report_to="none",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        token_weighted_gradient_accumulation=False,
-        torch_compile=False,
-        export_hf_final=False,
-        resume_from_checkpoint=str(checkpoint_dir),
-    )
-
-    pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
-
-    assert captured["global_step"] == 1
-    assert captured["consumed_micro_batches"] == 2
-
-
-def test_run_pretraining_resume_normalization_uses_save_time_ga_steps(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
-) -> None:
-    checkpoint_dir = mock_checkpoint(
-        root=tmp_path / "run",
-        name="checkpoint-1",
-        consumed_micro_batches=3,
-        data_state_extra={"global_step": 1, "gradient_accumulation_steps": 3},
-    )
-    _write_resume_source_snapshots(checkpoint_dir.parent)
-
-    captured: dict[str, int] = {}
-
-    def _capture_policy(*, train_cfg: Any, consumed_micro_batches: int, global_step: int):
-        del train_cfg
-        captured["consumed_micro_batches"] = int(consumed_micro_batches)
-        captured["global_step"] = int(global_step)
-        return 0, False, "captured"
-
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=FakeAccelerator,
-    )
-    monkeypatch.setattr(pretrain_mod, "_resolve_data_resume_policy", _capture_policy)
-
-    # Current run uses GA=2, but resume normalization should use save-time GA=3.
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        save_steps=0,
-        report_to="none",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        token_weighted_gradient_accumulation=False,
-        torch_compile=False,
-        export_hf_final=False,
-        resume_from_checkpoint=str(checkpoint_dir),
-    )
-
-    pretrain_mod.run_pretraining(
-        model_cfg=ModelConfig(),
-        data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
-
-    assert captured["global_step"] == 1
-    assert captured["consumed_micro_batches"] == 3
 
 
 def test_run_pretraining_resume_requires_data_state_json(
@@ -231,77 +132,6 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
         )
 
 
-def test_run_pretraining_resume_accepts_legacy_single_digest_in_decoupled_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    mock_checkpoint,
-) -> None:
-    checkpoint_dir = mock_checkpoint(
-        root=tmp_path / "run",
-        name="checkpoint-0",
-        consumed_micro_batches=0,
-        data_state_extra={"global_step": 0, "optimizer_param_digest": "legacydeadbeef000"},
-    )
-    _write_resume_source_snapshots(checkpoint_dir.parent)
-    (checkpoint_dir.parent / "model_config.json").write_text(
-        json.dumps(asdict(ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes")), indent=2)
-        + "\n",
-        encoding="utf-8",
-    )
-
-    pretrain_mod = setup_pretraining_mocks(
-        monkeypatch,
-        accelerator_cls=FakeAccelerator,
-        rtd_cls=SimpleRTD,
-    )
-
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
-        max_steps=1,
-        logging_steps=1,
-        save_steps=0,
-        report_to="none",
-        mixed_precision="no",
-        tf32=False,
-        dataloader_num_workers=0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        token_weighted_gradient_accumulation=False,
-        torch_compile=False,
-        export_hf_final=False,
-        decoupled_training=True,
-        resume_from_checkpoint=str(checkpoint_dir),
-    )
-    (checkpoint_dir.parent / "logging_config.json").write_text(
-        json.dumps(
-            asdict(
-                LoggingConfig(
-                    output_dir=str(checkpoint_dir.parent),
-                    logging_steps=1,
-                    report_to="none",
-                )
-            ),
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    with caplog.at_level(logging.WARNING):
-        pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-            train_cfg=train_cfg,
-        )
-
-    assert any(
-        "legacy single optimizer digest while current run uses decoupled mode" in rec.message
-        for rec in caplog.records
-    )
-
-
 def test_run_pretraining_logs_window_averaged_rtd_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -342,6 +172,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         model_cfg=ModelConfig(),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
+        logging_cfg=LoggingConfig(backend="tensorboard", logging_steps=1),
     )
 
     accel = FakeAccelerator.last_instance
@@ -507,7 +338,7 @@ def test_run_pretraining_decoupled_integration(
     )
     original_build_decoupled = pretrain_mod._build_decoupled_optimizers
 
-    def _build_logged_decoupled(model: torch.nn.Module, cfg: TrainConfig, *, mixed_precision: str = "no"):
+    def _build_logged_decoupled(model: torch.nn.Module, cfg: OptimConfig, *, mixed_precision: str = "no"):
         gen_opt, disc_opt = original_build_decoupled(model, cfg, mixed_precision=mixed_precision)
         original_gen_step = gen_opt.step
         original_disc_step = disc_opt.step
@@ -534,6 +365,10 @@ def test_run_pretraining_decoupled_integration(
         model_cfg=ModelConfig(backbone_type="rope", embedding_sharing="gdes"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
+        logging_cfg=LoggingConfig(
+            backend="tensorboard" if scenario == "steps_and_sync" else "none",
+            logging_steps=1 if scenario == "steps_and_sync" else 0,
+        ),
     )
 
     accel = FakeAccelerator.last_instance
@@ -648,7 +483,7 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
 
     scheduler_build_count = 0
 
-    def _build_counted_scheduler(optimizer: torch.optim.Optimizer, _cfg: TrainConfig):
+    def _build_counted_scheduler(optimizer: torch.optim.Optimizer, **_kwargs: Any):
         nonlocal scheduler_build_count
         phase = "gen" if scheduler_build_count == 0 else "disc"
         scheduler_build_count += 1
@@ -871,6 +706,11 @@ def _run_zero_token_weighted_case(
         model_cfg=ModelConfig(backbone_type="rope"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
+        logging_cfg=LoggingConfig(
+            backend="tensorboard",
+            logging_steps=1,
+            debug={"metrics": bool(debug_metrics)},
+        ),
     )
     return Path(train_cfg.output_dir) / "metrics.jsonl.gz"
 
@@ -969,6 +809,7 @@ def test_run_pretraining_decoupled_debug_metrics_writes_local_rows(
         model_cfg=ModelConfig(backbone_type="hf_deberta_v2", embedding_sharing="gdes"),
         data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
+        logging_cfg=LoggingConfig(logging_steps=1, debug={"metrics": True}),
     )
 
     metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"

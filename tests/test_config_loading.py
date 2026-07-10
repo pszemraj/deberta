@@ -72,8 +72,8 @@ def test_load_json_nested(tmp_path: Path):
     cfg_nested = load_config(nested)
     assert cfg_nested.model.rope.ffn_type == "mlp"
     assert cfg_nested.data.packing.max_seq_length == 96
-    assert cfg_nested.train.generator_learning_rate == pytest.approx(3.0e-4)
-    assert cfg_nested.train.disc_loss_weight == pytest.approx(50.0)
+    assert cfg_nested.optim.lr.generator == pytest.approx(3.0e-4)
+    assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(50.0)
 
 
 def test_load_yaml_hf_flash_config(tmp_path: Path):
@@ -162,61 +162,6 @@ def test_train_constraints_fail_during_validation(cfg: TrainConfig, match: str) 
 def test_optim_constraints_fail_during_validation(cfg: OptimConfig, match: str) -> None:
     with pytest.raises(ValueError, match=match):
         validate_optim_config(cfg)
-
-
-def test_load_yaml_resolves_variables(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    cfg = tmp_path / "vars.yaml"
-    cfg.write_text(
-        "\n".join(
-            [
-                "variables:",
-                "  seq: 256",
-                "  lr: 5e-4",
-                "model:",
-                "  backbone_type: hf_deberta_v2",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "  packing:",
-                "    max_seq_length: $variables.seq",
-                "optim:",
-                "  lr:",
-                "    base: $variables.lr",
-                "logging:",
-                "  run_name: run-{$variables.seq}",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    loaded = load_config(cfg)
-    assert int(loaded.data.packing.max_seq_length) == 256
-    assert float(loaded.train.learning_rate) == pytest.approx(5e-4)
-    assert loaded.train.run_name == "run-256"
-
-
-def test_load_yaml_variable_circular_reference_raises(tmp_path: Path):
-    pytest.importorskip("yaml")
-
-    cfg = tmp_path / "vars_cycle.yaml"
-    cfg.write_text(
-        "\n".join(
-            [
-                "variables:",
-                "  a: $variables.b",
-                "  b: $variables.a",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Circular variable reference"):
-        load_config(cfg)
 
 
 def test_load_json_nested_unknown_top_level_key_raises(tmp_path: Path):

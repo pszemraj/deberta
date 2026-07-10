@@ -6,34 +6,22 @@
 # FILE CONTRACT
 # - Accepted file types: YAML (.yaml/.yml) and JSON (.json).
 # - Runtime sections: model, data, train, optim, and logging. Unknown keys fail validation.
-# - The optional variables section is expanded and removed before runtime-schema validation.
 # - YAML booleans must be unquoted true/false. Quoted booleans are strings and are rejected.
 # - Numeric fields accept YAML numbers or numeric strings. null is accepted only for `| None` types.
-# - A config file is fully validated before presets or CLI overrides are applied. A broken file cannot
+# - A config file is fully validated before CLI overrides are applied. A broken file cannot
 #   be repaired by a later flag.
-#
-# VARIABLES
-# - `$variables.name` performs a type-preserving full-value replacement.
-# - `prefix_{$variables.name}` and `prefix_${variables.name}` interpolate into strings.
-# - Unknown and circular references fail validation.
 #
 # CLI AND PRECEDENCE
 # - Every leaf below is also a dotted flag: `model.backbone_type` becomes
 #   `--model.backbone_type VALUE`.
-# - Highest priority: dotted CLI flag > preset > config file > documented omission behavior.
+# - Highest priority: dotted CLI flag > config file > documented omission behavior.
 # - Dotted flags cannot express null; use YAML/JSON when a nullable field must be reset.
-# - The only preset is `deberta-v3-base`. With a config file it overrides only the model fields:
-#   hf_deberta_v2, microsoft/deberta-v3-base tokenizer, scratch mode, GDES, and dynamic eager kernel.
-#   Without a config file it also supplies FineWeb-Edu streaming data, 512-token packing,
-#   max_steps=500000, and disabled external logging.
 # - `deberta train CONFIG --dry-run` performs config/output/resume/tokenizer/dataset/collator/model
 #   preflight without optimization or checkpoint writes. It may use the network and populate caches.
 #
 # DEFAULTS
-# - `schema default` is the dataclass fallback and is checked mechanically against the code.
-# - `default` is what omission actually does. Five fields have backbone-computed defaults; explicitly
-#   copying their schema fallback disables that computation. This runnable file uses the recommended
-#   effective values for the default hf_deberta_v2 backbone.
+# - `schema default` is the dataclass fallback.
+# - `default` is what omission actually does. Backbone recipes state intentional deviations.
 # - All keys are optional unless `required` says otherwise. The dataset-source group is conditionally
 #   required: configure dataset_name, data_files, or load_from_disk.
 #
@@ -42,9 +30,6 @@
 # - A null logging output dir uses the resolved checkpoint output dir.
 # - The checkpoint dir receives model/data/train/optim/logging JSON snapshots and run_metadata.json.
 # - The logging dir receives config_original.yaml and config_resolved.yaml. W&B uploads those configs.
-
-variables:
-  output_dir: "runs/config-reference"
 
 model:
   # [model.backbone_type]
@@ -780,6 +765,27 @@ data:
     #   1 as on. Larger buffers improve mixing but use more host memory and delay startup.
     shuffle_buffer_size: 10000
 
+    # [data.source.retry_attempts]
+    # type: int
+    # schema default: 3
+    # default: literal 3
+    # required: optional
+    # values: integer >= 1
+    # contract: total attempts for transient dataset loading and streaming I/O failures. A resumed stream
+    #   is replayed to its last yielded example with the same epoch seed and shard, avoiding duplicates.
+    #   Schema, authentication, and other non-transient errors fail immediately.
+    retry_attempts: 3
+
+    # [data.source.retry_backoff_seconds]
+    # type: float
+    # schema default: 1.0
+    # default: literal 1.0
+    # required: optional
+    # values: finite number >= 0
+    # contract: initial delay before retrying a transient dataset failure. Delay doubles after each failure
+    #   and is capped at 60 seconds. Use 0 only for local tests; remote streams should keep a positive delay.
+    retry_backoff_seconds: 1.0
+
   packing:
     # [data.packing.enabled]
     # type: bool
@@ -997,8 +1003,8 @@ train:
 
     # [train.objective.mask_token_prob]
     # type: float
-    # schema default: 0.8
-    # default: computed on omission: 1.0 for hf_deberta_v2, 0.8 for rope; explicit values always win
+    # schema default: 1.0
+    # default: literal 1.0
     # required: optional
     # values: finite number >= 0; sum with random_token_prob must be <= 1
     # contract: conditional probability that a selected token becomes [MASK]. The remaining probability
@@ -1007,8 +1013,8 @@ train:
 
     # [train.objective.random_token_prob]
     # type: float
-    # schema default: 0.1
-    # default: computed on omission: 0.0 for hf_deberta_v2, 0.1 for rope; explicit values always win
+    # schema default: 0.0
+    # default: literal 0.0
     # required: optional
     # values: finite number >= 0; sum with mask_token_prob must be <= 1
     # contract: conditional probability that a selected token becomes a sampled random token. Special/control
@@ -1047,8 +1053,8 @@ train:
 
     # [train.objective.disc_loss_weight]
     # type: float
-    # schema default: 50.0
-    # default: computed on omission: 10.0 for hf_deberta_v2, 50.0 for rope; explicit values always win
+    # schema default: 10.0
+    # default: literal 10.0
     # required: optional
     # values: finite number >= 0; at least one objective weight must be > 0
     # contract: multiplies discriminator RTD loss. 0 disables discriminator optimization in decoupled mode.
@@ -1064,7 +1070,7 @@ train:
     # values: null or non-empty directory path
     # contract: checkpoint/run-metadata destination. Existing non-empty dirs fail unless overwrite is true or
     #   resume_from_checkpoint is set. logging.output_dir defaults to this resolved path.
-    output_dir: $variables.output_dir
+    output_dir: "runs/config-reference"
 
     # [train.checkpoint.overwrite_output_dir]
     # type: bool
@@ -1193,8 +1199,8 @@ optim:
 
     # [optim.adam.epsilon]
     # type: float
-    # schema default: 1e-8
-    # default: computed on omission: 1e-6 for hf_deberta_v2, 1e-8 for rope; explicit values always win
+    # schema default: 1e-6
+    # default: literal 1e-6
     # required: optional
     # values: finite number > 0
     # contract: Adam denominator epsilon. This file uses native parity value 1e-6. Copying 1e-8 explicitly
@@ -1216,8 +1222,8 @@ optim:
 
     # [optim.scheduler.warmup_steps]
     # type: int
-    # schema default: 1000
-    # default: computed on omission: 10000 for hf_deberta_v2, 1000 for rope; explicit values always win
+    # schema default: 10000
+    # default: literal 10000
     # required: optional
     # values: integer >= 0
     # contract: optimizer steps spent warming the learning rate. Ignored by scheduler.type=constant. This
@@ -1273,7 +1279,7 @@ logging:
   # values: null or non-empty directory path
   # contract: stores original/resolved YAML snapshots and local tracker files. Setting a different path
   #   separates logs from checkpoints; keep both locations together when preserving a run.
-  output_dir: $variables.output_dir
+  output_dir: "runs/config-reference"
 
   # [logging.logging_steps]
   # type: int

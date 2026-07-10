@@ -19,7 +19,6 @@ from deberta.config import (
     ModelConfig,
     OptimConfig,
     TrainConfig,
-    _sync_legacy_train_aliases,
 )
 from deberta.training.run_management import _sanitize_run_label
 from deberta.utils.io import dump_json
@@ -104,12 +103,6 @@ def _build_runtime_resolved_tracker_config(
     """
     resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
     resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=resolved_optim_cfg,
-        logging_cfg=resolved_logging_cfg,
-    )
-
     payload: dict[str, Any] = {
         "model": _coerce_dataclass_payload_types(model_cfg),
         "data": _coerce_dataclass_payload_types(data_cfg),

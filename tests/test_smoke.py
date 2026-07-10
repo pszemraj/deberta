@@ -306,6 +306,66 @@ def test_packed_streaming_epoch_changes_shuffle_seed():
     assert probe.last_seed == 10
 
 
+def test_streaming_retries_without_duplicating_examples() -> None:
+    class _FlakyDataset:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            yield {"text": "a"}
+            if self.iterations == 1:
+                raise OSError("temporary shard read failure")
+            yield {"text": "b"}
+            yield {"text": "c"}
+
+    source = _FlakyDataset()
+    dataset = PackedStreamingDataset(
+        hf_dataset=source,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            retry_attempts=2,
+            retry_backoff_seconds=0.0,
+        ),
+    )
+
+    assert list(dataset._iter_examples()) == [{"text": "a"}, {"text": "b"}, {"text": "c"}]
+    assert source.iterations == 2
+
+
+def test_streaming_does_not_retry_non_transient_errors() -> None:
+    class _InvalidDataset:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            raise ValueError("invalid dataset schema")
+            yield
+
+    source = _InvalidDataset()
+    dataset = PackedStreamingDataset(
+        hf_dataset=source,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            retry_attempts=3,
+            retry_backoff_seconds=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid dataset schema"):
+        list(dataset._iter_examples())
+    assert source.iterations == 1
+
+
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a b c d e f g h i"}]

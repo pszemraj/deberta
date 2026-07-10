@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from deberta.data.retry import is_transient_dataset_error, retry_delay_seconds
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,6 +25,8 @@ class PackedStreamingConfig:
     seed: int
     shuffle_buffer_size: int
     block_cross_document_attention: bool = False
+    retry_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
 
 
 class PackedStreamingDataset(torch.utils.data.IterableDataset):
@@ -77,12 +85,9 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 self._epoch.value = int(max(0, epoch))
         else:
             self._epoch = int(max(0, epoch))
-        # Some streaming datasets support set_epoch() for deterministic shuffling.
-        if hasattr(self.hf_dataset, "set_epoch"):
-            try:
-                self.hf_dataset.set_epoch(epoch)
-            except Exception:
-                pass
+        set_epoch = getattr(self.hf_dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
 
     def _current_epoch(self) -> int:
         """Read current epoch value.
@@ -115,8 +120,8 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
             ds = ds.shard(num_shards=total_shards, index=shard_id)
         return ds
 
-    def _iter_examples(self) -> Iterator[dict[str, Any]]:
-        """Build an iterator over shuffled and sharded examples.
+    def _new_example_iterator(self) -> Iterator[dict[str, Any]]:
+        """Build a fresh iterator over shuffled and sharded examples.
 
         :return Iterator[dict[str, Any]]: Example iterator.
         """
@@ -132,6 +137,42 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 ds = ds.shuffle(seed=shuffle_seed)
         ds = self._shard_dataset_for_worker(ds)
         return iter(ds)
+
+    def _iter_examples(self) -> Iterator[dict[str, Any]]:
+        """Iterate with bounded deterministic replay after transient I/O failure.
+
+        :return Iterator[dict[str, Any]]: Example iterator.
+        """
+        attempts = max(1, int(self.cfg.retry_attempts))
+        yielded = 0
+        for attempt in range(1, attempts + 1):
+            try:
+                iterator = self._new_example_iterator()
+                for _ in range(yielded):
+                    next(iterator)
+                for example in iterator:
+                    yielded += 1
+                    yield example
+                return
+            except Exception as exc:
+                if attempt >= attempts or not is_transient_dataset_error(exc):
+                    raise
+                delay = retry_delay_seconds(
+                    backoff_seconds=self.cfg.retry_backoff_seconds,
+                    failed_attempt=attempt,
+                )
+                logger.warning(
+                    "Dataset stream failed transiently at epoch %d after %d examples "
+                    "(attempt %d/%d, retry in %.1fs): %s",
+                    self._current_epoch(),
+                    yielded,
+                    attempt,
+                    attempts,
+                    delay,
+                    exc,
+                )
+                if delay > 0.0:
+                    time.sleep(delay)
 
     def _normalize_raw_text(self, ex: dict[str, Any]) -> str:
         """Extract and normalize one raw text example.

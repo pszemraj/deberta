@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -45,50 +44,9 @@ from deberta.export_cli import (
     run_export,
 )
 from deberta.training import run_pretraining, run_pretraining_dry_run
-from deberta.training.runtime import _apply_backbone_defaults_and_validate_training_configs
+from deberta.training.runtime import _validate_training_configs
 from deberta.utils.mapping import flatten_mapping
-from deberta.utils.types import FALSE_STRINGS, coerce_scalar, parse_bool, unwrap_optional_type
-
-# Nested canonical presets. With a config file, presets still only apply model overrides.
-_TRAIN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
-    "deberta-v3-base": {
-        "model": {
-            "backbone_type": "hf_deberta_v2",
-            "tokenizer": {
-                "name_or_path": "microsoft/deberta-v3-base",
-            },
-            "from_scratch": True,
-            "embedding_sharing": "gdes",
-            "hf": {
-                "attention_kernel": "dynamic",
-            },
-        },
-        "data": {
-            "source": {
-                "dataset_name": "HuggingFaceFW/fineweb-edu",
-                "dataset_config_name": "default",
-                "train_split": "train",
-                "streaming": True,
-                "text_column_name": "text",
-                "shuffle_buffer_size": 10_000,
-            },
-            "packing": {
-                "enabled": True,
-                "block_cross_document_attention": False,
-                "max_seq_length": 512,
-            },
-        },
-        "train": {
-            "max_steps": 500_000,
-        },
-        "logging": {
-            "backend": "none",
-            "wandb": {
-                "enabled": False,
-            },
-        },
-    }
-}
+from deberta.utils.types import coerce_scalar, parse_bool, unwrap_optional_type
 
 # Parse-time choices for dotted flags.
 _DOTFLAG_CHOICES: dict[str, tuple[str, ...]] = {
@@ -129,18 +87,6 @@ def _parse_bool(value: str) -> bool:
         return parse_bool(value, allow_numeric=False)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}") from exc
-
-
-def _should_fast_exit_after_train(*, explicit_argv: bool) -> bool:
-    """Decide whether train CLI should use os._exit(0) on success.
-
-    :param bool explicit_argv: True when main() was called with argv list.
-    :return bool: Whether to fast-exit.
-    """
-    if explicit_argv:
-        return False
-    raw = str(os.getenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")).strip().lower()
-    return raw not in FALSE_STRINGS
 
 
 def _argparse_type(field_type: Any) -> Any:
@@ -282,15 +228,6 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         help="Optional YAML/JSON config path. Dotflags override matching config keys.",
     )
     train.add_argument(
-        "--preset",
-        choices=tuple(sorted(_TRAIN_PRESETS.keys())),
-        default=None,
-        help=(
-            "Optional training preset. With a config file, presets only override model fields. "
-            "Without a config file, presets provide model+data+train+optim+logging defaults."
-        ),
-    )
-    train.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -330,30 +267,6 @@ def _build_main_parser() -> argparse.ArgumentParser:
     _build_export_parser(subparsers)
     parser._dotflag_map = dotflag_map  # type: ignore[attr-defined]
     return parser
-
-
-def _apply_preset(*, cfg: Config, preset_name: str, with_config_file: bool) -> tuple[Config, str]:
-    """Apply a named preset payload to Config.
-
-    :param Config cfg: Current config.
-    :param str preset_name: Preset name.
-    :param bool with_config_file: Whether a config file was loaded.
-    :return tuple[Config, str]: Updated config and mode label.
-    """
-    name = str(preset_name).strip().lower()
-    preset = _TRAIN_PRESETS.get(name)
-    if preset is None:
-        allowed = ", ".join(sorted(_TRAIN_PRESETS.keys()))
-        raise ValueError(f"Unknown train preset: {preset_name!r}. Available presets: {allowed}.")
-
-    sections = ["model"] if with_config_file else ["model", "data", "train", "optim", "logging"]
-    for section in sections:
-        for path, value in flatten_mapping(dict(preset.get(section, {})), prefix=section).items():
-            cfg = apply_dotted_override(cfg, f"{path}={_flag_value_to_override_text(value)}")
-
-    if with_config_file:
-        return cfg, "model-only overrides (config file provided)"
-    return cfg, "model+data+train+optim+logging defaults (no config file)"
 
 
 def _apply_dotflags(
@@ -447,20 +360,12 @@ def _run_train(
 
     reason_overrides: dict[str, str] = {}
 
-    if ns.preset:
-        cfg, preset_mode = _apply_preset(
-            cfg=cfg,
-            preset_name=str(ns.preset),
-            with_config_file=cfg_path is not None,
-        )
-        print(f"Applying train preset '{ns.preset}': {preset_mode}.")
-
     cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns, dotflag_map=dotflag_map)
     reason_overrides.update(cli_reasons)
 
     # Fail fast at the CLI boundary with the same defaulting/alias/validator
     # sequence the training entrypoint applies, so the two can never drift.
-    _apply_backbone_defaults_and_validate_training_configs(
+    _validate_training_configs(
         model_cfg=cfg.model,
         data_cfg=cfg.data,
         train_cfg=cfg.train,
@@ -512,7 +417,6 @@ def main(argv: list[str] | None = None) -> None:
 
     :param list[str] | None argv: Optional CLI argv (excluding program name).
     """
-    explicit_argv = argv is not None
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_main_parser()
     dotflag_map = dict(getattr(parser, "_dotflag_map", {}))
@@ -520,8 +424,6 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "train":
         _run_train(args, dotflag_map=dotflag_map)
-        if _should_fast_exit_after_train(explicit_argv=explicit_argv):
-            os._exit(0)
         return
 
     if args.command == "export":

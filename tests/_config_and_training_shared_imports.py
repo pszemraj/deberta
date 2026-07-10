@@ -44,7 +44,6 @@ from deberta.config import (
     _normalize_torch_compile_mode,
     _normalize_torch_compile_scope,
     _normalize_wandb_watch,
-    apply_backbone_defaults,
     apply_dotted_override,
     load_config,
     load_data_config_snapshot,
@@ -62,10 +61,7 @@ from deberta.export_cli import ExportArgumentDefaultsHelpFormatter, add_export_a
 from deberta.modeling.builder import build_backbone_configs
 from deberta.modeling.mask_utils import normalize_keep_mask
 from deberta.modeling.rtd import attention_mask_to_active_tokens
-from deberta.training.checkpointing import (
-    _normalize_resume_consumed_micro_batches,
-    _resolve_data_resume_policy,
-)
+from deberta.training.checkpointing import _resolve_data_resume_policy
 from deberta.training.compile import (
     _compile_backbones_for_scope,
     _resolve_compile_scope,

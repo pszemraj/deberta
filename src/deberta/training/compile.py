@@ -944,13 +944,13 @@ def _resolve_effective_compile_scope(
     :return tuple[str, str, str | None]: Requested scope, effective scope, and
         optional downgrade reason (effective == requested when compile is off).
     """
-    requested_scope = str(train_cfg.torch_compile_scope).strip().lower()
+    requested_scope = str(train_cfg.compile.scope).strip().lower()
     if not compile_enabled:
         return requested_scope, requested_scope, None
     scope, reason = _resolve_compile_scope(
         requested_scope=requested_scope,
         model_cfg=model_cfg,
-        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
     )
     return requested_scope, scope, reason
 

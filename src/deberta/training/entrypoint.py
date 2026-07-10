@@ -20,16 +20,11 @@ from deberta.config import (
     OptimConfig,
     TrainConfig,
     _normalize_torch_compile_mode,
-    _sync_legacy_train_aliases,
     resolve_effective_mixed_precision,
 )
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.training.checkpointing import (
-    _normalize_resume_consumed_micro_batches,
-    _resolve_data_resume_policy,
-    _save_periodic_checkpoint_if_due,
-)
+from deberta.training.checkpointing import _resolve_data_resume_policy, _save_periodic_checkpoint_if_due
 from deberta.training.compile import (
     _bf16_runtime_sanity_check,
     _compile_backbones_for_scope,
@@ -69,14 +64,13 @@ from deberta.training.run_management import (
     _save_training_checkpoint,
 )
 from deberta.training.runtime import (
-    _apply_backbone_defaults_and_validate_training_configs,
     _build_decoupled_optimizers,
     _build_optimizer,
     _build_scheduler,
     _build_train_dataset_and_collator,
     _cycle_dataloader,
     _optimizer_param_order_digest,
-    _resolve_section_cfg_compat,
+    _validate_training_configs,
 )
 from deberta.training.steps import (
     _NONFINITE_LR_MULT_RECOVERY,
@@ -137,18 +131,10 @@ def run_pretraining_dry_run(
     :raises RuntimeError: If a preflight stage fails.
     :return dict[str, Any]: Summary of resolved dry-run checks.
     """
-    resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
-        train_cfg=train_cfg,
-        optim_cfg=optim_cfg,
-        logging_cfg=logging_cfg,
-    )
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=resolved_optim_cfg,
-        logging_cfg=resolved_logging_cfg,
-    )
+    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
 
-    _apply_backbone_defaults_and_validate_training_configs(
+    _validate_training_configs(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
@@ -157,10 +143,10 @@ def run_pretraining_dry_run(
     )
 
     checkpoint_output_dir = _resolve_output_dir(
-        output_dir=train_cfg.output_dir,
-        project_name=train_cfg.project_name,
+        output_dir=train_cfg.checkpoint.output_dir,
+        project_name=resolved_logging_cfg.project_name,
         config_path=config_path,
-        run_name=train_cfg.run_name,
+        run_name=resolved_logging_cfg.run_name,
     )
     logging_output_dir = (
         Path(str(resolved_logging_cfg.output_dir))
@@ -168,16 +154,18 @@ def run_pretraining_dry_run(
         else checkpoint_output_dir
     )
     resume_hint = (
-        str(train_cfg.resume_from_checkpoint).strip() if train_cfg.resume_from_checkpoint is not None else ""
+        str(train_cfg.checkpoint.resume_from_checkpoint).strip()
+        if train_cfg.checkpoint.resume_from_checkpoint is not None
+        else ""
     )
-    if bool(train_cfg.overwrite_output_dir) and bool(resume_hint):
+    if bool(train_cfg.checkpoint.overwrite_output_dir) and bool(resume_hint):
         raise ValueError(
             "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
             "Overwrite would delete checkpoints before resume. Disable overwrite or unset resume."
         )
     validate_existing_output_dir(
         output_dir=checkpoint_output_dir,
-        allow_nonempty=bool(train_cfg.overwrite_output_dir) or bool(resume_hint),
+        allow_nonempty=bool(train_cfg.checkpoint.overwrite_output_dir) or bool(resume_hint),
         nonempty_error=(
             f"Output directory exists and is not empty: {checkpoint_output_dir}. "
             "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
@@ -186,7 +174,7 @@ def run_pretraining_dry_run(
     )
     ckpt = _resolve_resume_checkpoint(
         output_dir=checkpoint_output_dir,
-        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        resume_from_checkpoint=train_cfg.checkpoint.resume_from_checkpoint,
         is_main_process=True,
     )
 
@@ -194,7 +182,7 @@ def run_pretraining_dry_run(
         train_cfg.mixed_precision,
         bf16_sanity_check=_bf16_runtime_sanity_check,
     )
-    compile_enabled = bool(train_cfg.torch_compile)
+    compile_enabled = bool(train_cfg.compile.enabled)
     _, compile_scope, compile_scope_reason = _resolve_effective_compile_scope(
         train_cfg=train_cfg,
         model_cfg=model_cfg,
@@ -224,11 +212,11 @@ def run_pretraining_dry_run(
         raise RuntimeError("transformers is required for dry-run preflight.") from exc
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
     except Exception as exc:
         raise RuntimeError(
             "Failed to load tokenizer from model.tokenizer_name_or_path="
-            f"{model_cfg.tokenizer_name_or_path!r}."
+            f"{model_cfg.tokenizer.name_or_path!r}."
         ) from exc
     if tokenizer.pad_token_id is None:
         raise RuntimeError(
@@ -285,7 +273,7 @@ def run_pretraining_dry_run(
         disc_config, gen_config = build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=tokenizer,
-            max_position_embeddings=int(data_cfg.max_seq_length),
+            max_position_embeddings=int(data_cfg.packing.max_seq_length),
         )
     except Exception as exc:
         raise RuntimeError(
@@ -329,24 +317,21 @@ def run_pretraining(
     from accelerate import Accelerator, DistributedDataParallelKwargs
     from accelerate.utils import set_seed
 
-    resolved_optim_cfg, resolved_logging_cfg = _resolve_section_cfg_compat(
-        train_cfg=train_cfg,
-        optim_cfg=optim_cfg,
-        logging_cfg=logging_cfg,
-    )
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=resolved_optim_cfg,
-        logging_cfg=resolved_logging_cfg,
+    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
+    report_to = (
+        "wandb"
+        if bool(resolved_logging_cfg.wandb.enabled)
+        else str(resolved_logging_cfg.backend).strip().lower()
     )
 
-    log_with = None if train_cfg.report_to == "none" else train_cfg.report_to
+    log_with = None if report_to == "none" else report_to
     mixed_precision = resolve_effective_mixed_precision(
         train_cfg.mixed_precision,
         bf16_sanity_check=_bf16_runtime_sanity_check,
     )
-    compile_mode = _normalize_torch_compile_mode(train_cfg.torch_compile_mode)
-    compile_enabled = bool(train_cfg.torch_compile)
+    compile_mode = _normalize_torch_compile_mode(train_cfg.compile.mode)
+    compile_enabled = bool(train_cfg.compile.enabled)
     object.__setattr__(train_cfg, "mixed_precision", mixed_precision)
     accelerator_kwargs: dict[str, Any] = {
         "gradient_accumulation_steps": train_cfg.gradient_accumulation_steps,
@@ -362,14 +347,14 @@ def run_pretraining(
     )
 
     setup_process_logging(accelerator.is_main_process)
-    _apply_backbone_defaults_and_validate_training_configs(
+    _validate_training_configs(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
         optim_cfg=resolved_optim_cfg,
         logging_cfg=resolved_logging_cfg,
     )
-    compile_backend = str(train_cfg.torch_compile_backend).strip().lower()
+    compile_backend = str(train_cfg.compile.backend).strip().lower()
     compile_scope_requested, compile_scope, compile_scope_reason = _resolve_effective_compile_scope(
         train_cfg=train_cfg,
         model_cfg=model_cfg,
@@ -382,13 +367,13 @@ def run_pretraining(
     logger.info(f"Accelerate state: {accelerator.state}")
 
     # Resolve output dir before side effects and persist the concrete path in train_cfg.
-    configured_output_dir = train_cfg.output_dir
+    configured_output_dir = train_cfg.checkpoint.output_dir
     output_dir = _resolve_output_dir_for_accelerator(
         accelerator=accelerator,
-        output_dir=train_cfg.output_dir,
-        project_name=train_cfg.project_name,
+        output_dir=train_cfg.checkpoint.output_dir,
+        project_name=resolved_logging_cfg.project_name,
         config_path=config_path,
-        run_name=train_cfg.run_name,
+        run_name=resolved_logging_cfg.run_name,
     )
     object.__setattr__(train_cfg.checkpoint, "output_dir", str(output_dir))
     if resolved_logging_cfg.output_dir is None or not str(resolved_logging_cfg.output_dir).strip():
@@ -396,11 +381,6 @@ def run_pretraining(
     else:
         logging_output_dir = Path(str(resolved_logging_cfg.output_dir)).expanduser().resolve()
     object.__setattr__(resolved_logging_cfg, "output_dir", str(logging_output_dir))
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=resolved_optim_cfg,
-        logging_cfg=resolved_logging_cfg,
-    )
     if accelerator.is_main_process and (
         configured_output_dir is None or not str(configured_output_dir).strip()
     ):
@@ -415,8 +395,8 @@ def run_pretraining(
     # Make/validate output dir on main.
     _prepare_output_dir(
         output_dir=output_dir,
-        overwrite_output_dir=bool(train_cfg.overwrite_output_dir),
-        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        overwrite_output_dir=bool(train_cfg.checkpoint.overwrite_output_dir),
+        resume_from_checkpoint=train_cfg.checkpoint.resume_from_checkpoint,
         is_main_process=accelerator.is_main_process,
     )
     if accelerator.is_main_process:
@@ -425,7 +405,7 @@ def run_pretraining(
     ckpt = _resolve_resume_checkpoint_for_accelerator(
         accelerator=accelerator,
         output_dir=output_dir,
-        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        resume_from_checkpoint=train_cfg.checkpoint.resume_from_checkpoint,
     )
     _persist_or_validate_run_configs(
         output_dir=output_dir,
@@ -455,7 +435,7 @@ def run_pretraining(
     # Suppress repeated fast-tokenizer advisory logs that add noise in multi-worker runs.
     with suppress(Exception):
         logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
 
     # Sanity
     if tokenizer.pad_token_id is None:
@@ -475,13 +455,13 @@ def run_pretraining(
     )
 
     # Dataloader
-    num_workers = int(train_cfg.dataloader_num_workers)
+    num_workers = int(train_cfg.dataloader.num_workers)
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(train_cfg.per_device_train_batch_size),
         collate_fn=collator,
         num_workers=num_workers,
-        pin_memory=bool(train_cfg.dataloader_pin_memory),
+        pin_memory=bool(train_cfg.dataloader.pin_memory),
         # drop_last keeps the batch shape invariant across steps; flash
         # doc-block route hints depend on batch size, so a smaller final
         # batch would flip routes (and recompile) mid-epoch.
@@ -491,7 +471,7 @@ def run_pretraining(
 
     # Model
     disc_config, gen_config = build_backbone_configs(
-        model_cfg=model_cfg, tokenizer=tokenizer, max_position_embeddings=int(data_cfg.max_seq_length)
+        model_cfg=model_cfg, tokenizer=tokenizer, max_position_embeddings=int(data_cfg.packing.max_seq_length)
     )
 
     # Instantiate backbones
@@ -542,11 +522,13 @@ def run_pretraining(
     if effective_decoupled_training:
         gen_optimizer, disc_optimizer = _build_decoupled_optimizers(
             model,
-            train_cfg,
+            resolved_optim_cfg,
             mixed_precision=mixed_precision,
         )
-        gen_lr_scheduler = _build_scheduler(gen_optimizer, train_cfg)
-        disc_lr_scheduler = _build_scheduler(disc_optimizer, train_cfg)
+        gen_lr_scheduler = _build_scheduler(gen_optimizer, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
+        disc_lr_scheduler = _build_scheduler(
+            disc_optimizer, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg
+        )
         param_digest = {
             "generator": str(getattr(gen_optimizer, "_param_order_digest", "")),
             "discriminator": str(getattr(disc_optimizer, "_param_order_digest", "")),
@@ -559,11 +541,11 @@ def run_pretraining(
     else:
         optimizer = _build_optimizer(
             model,
-            train_cfg,
+            resolved_optim_cfg,
             mixed_precision=mixed_precision,
         )
         param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
-        lr_scheduler = _build_scheduler(optimizer, train_cfg)
+        lr_scheduler = _build_scheduler(optimizer, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
         model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
         _record_unscaled_lrs(optimizer, lr_scheduler)
 
@@ -589,7 +571,7 @@ def run_pretraining(
             if compile_scope_key in {"backbones", "encoder", "gen_encoder", "disc_encoder"}:
                 prefilled_rotary = _prefill_rotary_caches_for_compile(
                     model=unwrapped,
-                    seq_len=int(data_cfg.max_seq_length),
+                    seq_len=int(data_cfg.packing.max_seq_length),
                     device=torch.device(getattr(accelerator, "device", torch.device("cpu"))),
                     dtype=_dtype_for_mixed_precision(mixed_precision),
                 )
@@ -597,7 +579,7 @@ def run_pretraining(
                     logger.info(
                         "Prefilled rotary caches for %d module(s) at seq_len=%d before torch.compile.",
                         int(prefilled_rotary),
-                        int(data_cfg.max_seq_length),
+                        int(data_cfg.packing.max_seq_length),
                     )
             compiled_targets = _compile_backbones_for_scope(
                 unwrapped_model=unwrapped,
@@ -647,7 +629,7 @@ def run_pretraining(
     exit_code = 0
     train_started_at = time.perf_counter()
     metrics_path = logging_output_dir / "metrics.jsonl.gz"
-    debug_metrics_enabled = bool(train_cfg.debug_metrics)
+    debug_metrics_enabled = bool(resolved_logging_cfg.debug.metrics)
     wandb_run: Any | None = None
     max_tracker_step_logged = 0
     train_progress: Any | None = None
@@ -660,7 +642,7 @@ def run_pretraining(
         :return int: Effective step used for logging.
         """
         nonlocal max_tracker_step_logged
-        if train_cfg.report_to == "none":
+        if report_to == "none":
             return int(step)
 
         effective_step = int(step)
@@ -742,20 +724,20 @@ def run_pretraining(
 
     try:
         # Trackers
-        if train_cfg.report_to != "none":
+        if report_to != "none":
             tracker_cfg = dict(tracker_cfg_runtime)
-            if train_cfg.run_name is not None and str(train_cfg.run_name).strip():
-                tracker_run_name = str(train_cfg.run_name).strip()
+            if resolved_logging_cfg.run_name is not None and str(resolved_logging_cfg.run_name).strip():
+                tracker_run_name = str(resolved_logging_cfg.run_name).strip()
             else:
                 tracker_run_name = logging_output_dir.name
             _init_trackers(
                 accelerator=accelerator,
-                project_name=str(train_cfg.project_name).strip(),
+                project_name=str(resolved_logging_cfg.project_name).strip(),
                 tracker_cfg=tracker_cfg,
-                report_to=str(train_cfg.report_to),
+                report_to=str(report_to),
                 run_name=tracker_run_name,
             )
-            if str(train_cfg.report_to).lower() == "wandb":
+            if str(report_to).lower() == "wandb":
                 try:
                     wandb_run = accelerator.get_tracker("wandb", unwrap=True)
                 except Exception:
@@ -786,8 +768,8 @@ def run_pretraining(
                         accelerator=accelerator,
                         wandb_run=wandb_run,
                         model=model,
-                        watch_mode=train_cfg.wandb_watch,
-                        watch_log_freq=int(train_cfg.wandb_watch_log_freq),
+                        watch_mode=resolved_logging_cfg.wandb.watch,
+                        watch_log_freq=int(resolved_logging_cfg.wandb.watch_log_freq),
                     )
                 except Exception:
                     logger.exception("Failed to initialize W&B model watch.")
@@ -829,59 +811,32 @@ def run_pretraining(
                     "Resume from a different checkpoint created by this code version or start a new run."
                 )
             parsed_checkpoint_step = _parse_checkpoint_step(ckpt)
-            if saved_global_step is None:
-                global_step = int(parsed_checkpoint_step)
-            else:
-                global_step = int(max(0, saved_global_step))
-                if int(parsed_checkpoint_step) > 0 and int(parsed_checkpoint_step) != int(global_step):
-                    raise RuntimeError(
-                        "Checkpoint step mismatch on resume: "
-                        f"path step={int(parsed_checkpoint_step)} but data_state.json global_step={int(global_step)} "
-                        f"for checkpoint '{ckpt}'."
-                    )
+            if saved_global_step is None or saved_ga_steps is None or saved_digest is None:
+                raise RuntimeError(
+                    "Checkpoint resume requires current data_state.json metadata: global_step, "
+                    "gradient_accumulation_steps, and optimizer_param_digest. "
+                    f"Checkpoint '{ckpt}' was created by an unsupported code revision or is incomplete."
+                )
+            global_step = int(max(0, saved_global_step))
+            if int(parsed_checkpoint_step) > 0 and int(parsed_checkpoint_step) != int(global_step):
+                raise RuntimeError(
+                    "Checkpoint step mismatch on resume: "
+                    f"path step={int(parsed_checkpoint_step)} but data_state.json global_step={int(global_step)} "
+                    f"for checkpoint '{ckpt}'."
+                )
             last_saved_step = int(global_step)
-            normalization_ga_steps = (
-                int(saved_ga_steps) if saved_ga_steps is not None else int(max(1, int(ga_steps)))
-            )
-            if (
-                saved_ga_steps is not None
-                and int(saved_ga_steps) != int(ga_steps)
-                and accelerator.is_main_process
-            ):
+            if int(saved_ga_steps) != int(ga_steps) and accelerator.is_main_process:
                 logger.warning(
-                    "Resume checkpoint '%s' was saved with gradient_accumulation_steps=%d but current run uses %d; "
-                    "using save-time GA only for resume-progress normalization.",
+                    "Resume checkpoint '%s' was saved with gradient_accumulation_steps=%d but current run uses %d.",
                     ckpt,
                     int(saved_ga_steps),
                     int(ga_steps),
                 )
-            (
-                consumed_micro_batches,
-                consumed_normalize_reason,
-            ) = _normalize_resume_consumed_micro_batches(
-                consumed_micro_batches=int(restored),
-                global_step=int(global_step),
-                gradient_accumulation_steps=int(normalization_ga_steps),
-            )
-            if consumed_normalize_reason is not None and accelerator.is_main_process:
-                logger.warning(
-                    "Resume checkpoint '%s' had consumed_micro_batches=%d ahead of committed step boundary; "
-                    "clamped to %d (%s).",
-                    ckpt,
-                    int(restored),
-                    int(consumed_micro_batches),
-                    consumed_normalize_reason,
-                )
+            consumed_micro_batches = int(restored)
             consumed_micro_batches_committed = int(consumed_micro_batches)
             lr_mult = float(restored_lr_mult)
 
-            if saved_digest is None:
-                logger.warning(
-                    "Checkpoint '%s' has no optimizer_param_digest; skipping param-order "
-                    "validation. Future checkpoints will include the digest.",
-                    ckpt,
-                )
-            elif isinstance(saved_digest, dict):
+            if isinstance(saved_digest, dict):
                 if isinstance(param_digest, dict):
                     mismatch = {
                         key: (saved_digest.get(key), param_digest.get(key))
@@ -894,17 +849,14 @@ def run_pretraining(
                             f"Mismatched keys: {mismatch}. Start a new run or restore with matching code."
                         )
                 else:
-                    # Back-compat for transitioning from single optimizer to decoupled mode.
-                    logger.warning(
-                        "Checkpoint '%s' stores decoupled optimizer digests, but current run uses a single optimizer. "
-                        "Skipping strict digest validation.",
-                        ckpt,
+                    raise RuntimeError(
+                        f"Optimizer topology mismatch on resume from '{ckpt}': checkpoint stores "
+                        "decoupled optimizer digests but the current run uses one optimizer."
                     )
             elif isinstance(param_digest, dict):
-                logger.warning(
-                    "Checkpoint '%s' stores legacy single optimizer digest while current run uses decoupled mode. "
-                    "Skipping strict digest validation for this resume.",
-                    ckpt,
+                raise RuntimeError(
+                    f"Optimizer topology mismatch on resume from '{ckpt}': checkpoint stores one "
+                    "optimizer digest but the current run uses decoupled optimizers."
                 )
             elif saved_digest != param_digest:
                 raise RuntimeError(
@@ -1006,7 +958,9 @@ def run_pretraining(
             nonlocal last_log_started_at
             nonlocal zero_gen_window_since_log
             nonlocal zero_disc_window_since_log
-            if not train_cfg.logging_steps or (global_step % int(train_cfg.logging_steps) != 0):
+            if not resolved_logging_cfg.logging_steps or (
+                global_step % int(resolved_logging_cfg.logging_steps) != 0
+            ):
                 return
 
             log_now = time.perf_counter()
@@ -1056,8 +1010,8 @@ def run_pretraining(
             disc_pos_frac = (
                 global_disc_positive / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
             )
-            loss = float(train_cfg.gen_loss_weight) * float(gen_loss_window) + float(
-                train_cfg.disc_loss_weight
+            loss = float(train_cfg.objective.gen_loss_weight) * float(gen_loss_window) + float(
+                train_cfg.objective.disc_loss_weight
             ) * float(disc_loss_window)
             if loss_override is not None:
                 loss = float(loss_override)
@@ -1096,7 +1050,7 @@ def run_pretraining(
                         ]
                     )
                 )
-            if train_cfg.report_to != "none":
+            if report_to != "none":
                 _log_tracker_metrics({k: v for k, v in metrics.items() if k != "step"}, step=global_step)
             if debug_metrics_enabled and accelerator.is_main_process:
                 _append_metrics_jsonl_row(
@@ -1165,8 +1119,8 @@ def run_pretraining(
                 did_disc_optimizer_step = False
                 gen_phase_out: Any | None = None
                 disc_phase_out: Any | None = None
-                gen_loss_weight = float(train_cfg.gen_loss_weight)
-                disc_loss_weight = float(train_cfg.disc_loss_weight)
+                gen_loss_weight = float(train_cfg.objective.gen_loss_weight)
+                disc_loss_weight = float(train_cfg.objective.disc_loss_weight)
                 gen_phase_enabled = gen_loss_weight != 0.0
                 disc_phase_enabled = disc_loss_weight != 0.0
 
@@ -1203,7 +1157,7 @@ def run_pretraining(
                             labels=batch["labels"],
                             token_type_ids=batch.get("token_type_ids"),
                             position_ids=batch.get("position_ids"),
-                            sampling_temperature=train_cfg.sampling_temperature,
+                            sampling_temperature=train_cfg.objective.sampling_temperature,
                             phase="generator",
                             flash_meta=flash_meta,
                         )
@@ -1316,8 +1270,10 @@ def run_pretraining(
                             gen_optimizer.zero_grad(set_to_none=True)
                             disc_optimizer.zero_grad(set_to_none=True)
                             break
-                        if _should_clip_gradients(train_cfg.max_grad_norm):
-                            accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+                        if _should_clip_gradients(resolved_optim_cfg.max_grad_norm):
+                            accelerator.clip_grad_norm_(
+                                model.parameters(), float(resolved_optim_cfg.max_grad_norm)
+                            )
                         gen_optimizer.step()
                         gen_lr_scheduler.step()
                         _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
@@ -1476,9 +1432,9 @@ def run_pretraining(
                                 gen_optimizer.zero_grad(set_to_none=True)
                                 disc_optimizer.zero_grad(set_to_none=True)
                                 break
-                            if _should_clip_gradients(train_cfg.max_grad_norm):
+                            if _should_clip_gradients(resolved_optim_cfg.max_grad_norm):
                                 accelerator.clip_grad_norm_(
-                                    model.parameters(), float(train_cfg.max_grad_norm)
+                                    model.parameters(), float(resolved_optim_cfg.max_grad_norm)
                                 )
                             disc_optimizer.step()
                             disc_lr_scheduler.step()
@@ -1641,9 +1597,9 @@ def run_pretraining(
                         token_type_ids=batch.get("token_type_ids"),
                         position_ids=batch.get("position_ids"),
                         doc_context_index=batch.get("doc_context_index"),
-                        sampling_temperature=train_cfg.sampling_temperature,
-                        gen_loss_weight=train_cfg.gen_loss_weight,
-                        disc_loss_weight=train_cfg.disc_loss_weight,
+                        sampling_temperature=train_cfg.objective.sampling_temperature,
+                        gen_loss_weight=train_cfg.objective.gen_loss_weight,
+                        disc_loss_weight=train_cfg.objective.disc_loss_weight,
                         flash_meta=flash_meta,
                     )
 
@@ -1655,8 +1611,8 @@ def run_pretraining(
                             disc_count=disc_count,
                             gen_window_tokens_per_rank=gen_window_tokens_per_rank,
                             disc_window_tokens_per_rank=disc_window_tokens_per_rank,
-                            gen_loss_weight=float(train_cfg.gen_loss_weight),
-                            disc_loss_weight=float(train_cfg.disc_loss_weight),
+                            gen_loss_weight=float(train_cfg.objective.gen_loss_weight),
+                            disc_loss_weight=float(train_cfg.objective.disc_loss_weight),
                         )
                         loss = micro_obj
                         loss_for_metrics = loss_for_metrics + micro_obj.detach()
@@ -1774,8 +1730,10 @@ def run_pretraining(
                         optimizer.zero_grad(set_to_none=True)
                         break
 
-                    if _should_clip_gradients(train_cfg.max_grad_norm):
-                        accelerator.clip_grad_norm_(model.parameters(), float(train_cfg.max_grad_norm))
+                    if _should_clip_gradients(resolved_optim_cfg.max_grad_norm):
+                        accelerator.clip_grad_norm_(
+                            model.parameters(), float(resolved_optim_cfg.max_grad_norm)
+                        )
                         post_clip_grad_norm = _global_grad_l2_norm(model)
                         if _has_nonfinite_grad_norm_any_rank(
                             accelerator=accelerator,
@@ -1838,7 +1796,7 @@ def run_pretraining(
                     consumed_micro_batches_committed = int(consumed_micro_batches)
                     if train_progress is not None:
                         train_progress.update(1)
-                    if train_cfg.report_to != "none":
+                    if report_to != "none":
                         _log_tracker_metrics(
                             {
                                 "nonfinite_window_skipped": 1.0,
@@ -1936,7 +1894,7 @@ def run_pretraining(
                     checkpoint_dir=final_ckpt,
                     output_dir=output_dir,
                     consumed_micro_batches=consumed_micro_batches_committed,
-                    save_total_limit=int(train_cfg.save_total_limit),
+                    save_total_limit=int(train_cfg.checkpoint.save_total_limit),
                     log_label="final",
                     lr_mult=lr_mult,
                     optimizer_param_digest=param_digest,
@@ -1961,7 +1919,7 @@ def run_pretraining(
             )
 
         if (
-            bool(train_cfg.export_hf_final)
+            bool(train_cfg.checkpoint.export_hf_final)
             and crash_reason is None
             and bool(getattr(accelerator, "is_main_process", True))
         ):
@@ -1996,7 +1954,7 @@ def run_pretraining(
             if accelerator.is_main_process:
                 with suppress(Exception):
                     _append_metrics_jsonl_row(metrics_path, crash_row)
-                if train_cfg.report_to != "none":
+                if report_to != "none":
                     with suppress(Exception):
                         _log_tracker_metrics(
                             {k: v for k, v in crash_row.items() if k != "step"},
@@ -2013,7 +1971,7 @@ def run_pretraining(
                             step=int(crash_row["step"]),
                         )
 
-        if train_cfg.report_to != "none":
+        if report_to != "none":
             if wandb_run is not None:
                 with suppress(Exception):
                     if crash_reason is not None:

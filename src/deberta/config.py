@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import re
 import warnings
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -128,10 +127,6 @@ _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
 RUN_CONFIG_SCHEMA_VERSION = 7
-_VAR_FULL_RE = re.compile(r"^\$variables\.([A-Za-z0-9_.-]+)$")
-_VAR_INLINE_RE = re.compile(r"\{\$variables\.([A-Za-z0-9_.-]+)\}")
-_VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")
-_VAR_SUSPICIOUS_RE = re.compile(r"\$variables\.[A-Za-z0-9_.-]+")
 
 
 @dataclass(frozen=True)
@@ -525,6 +520,8 @@ class DataSourceConfig:
     text_column_name: str = field(default="text")
     streaming: bool = field(default=True)
     shuffle_buffer_size: int = field(default=10_000)
+    retry_attempts: int = field(default=3)
+    retry_backoff_seconds: float = field(default=1.0)
 
 
 @dataclass(frozen=True)
@@ -634,12 +631,12 @@ class TrainObjectiveConfig:
     """RTD/MLM objective controls."""
 
     mlm_probability: float = field(default=0.15)
-    mask_token_prob: float = field(default=0.8)
-    random_token_prob: float = field(default=0.1)
+    mask_token_prob: float = field(default=1.0)
+    random_token_prob: float = field(default=0.0)
     mlm_max_ngram: int = field(default=1)
     sampling_temperature: float = field(default=1.0)
     gen_loss_weight: float = field(default=1.0)
-    disc_loss_weight: float = field(default=50.0)
+    disc_loss_weight: float = field(default=10.0)
 
 
 @dataclass(frozen=True)
@@ -865,7 +862,7 @@ class OptimAdamConfig:
 
     beta1: float = field(default=0.9)
     beta2: float = field(default=0.999)
-    epsilon: float = field(default=1e-8)
+    epsilon: float = field(default=1e-6)
 
 
 @dataclass(frozen=True)
@@ -873,7 +870,7 @@ class OptimSchedulerConfig:
     """Scheduler controls."""
 
     type: str = field(default="linear")
-    warmup_steps: int = field(default=1_000)
+    warmup_steps: int = field(default=10_000)
 
 
 @dataclass(frozen=True)
@@ -1054,62 +1051,6 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-
-
-def _sync_legacy_train_aliases(
-    *, train_cfg: TrainConfig, optim_cfg: OptimConfig, logging_cfg: LoggingConfig
-) -> None:
-    """Attach dynamic legacy aliases on TrainConfig for runtime compatibility.
-
-    :param TrainConfig train_cfg: Train config instance.
-    :param OptimConfig optim_cfg: Optim config instance.
-    :param LoggingConfig logging_cfg: Logging config instance.
-    """
-    object.__setattr__(train_cfg, "learning_rate", float(optim_cfg.lr.base))
-    object.__setattr__(train_cfg, "generator_learning_rate", float(optim_cfg.lr.generator))
-    object.__setattr__(train_cfg, "discriminator_learning_rate", float(optim_cfg.lr.discriminator))
-    object.__setattr__(train_cfg, "weight_decay", float(optim_cfg.weight_decay))
-    object.__setattr__(train_cfg, "adam_beta1", float(optim_cfg.adam.beta1))
-    object.__setattr__(train_cfg, "adam_beta2", float(optim_cfg.adam.beta2))
-    object.__setattr__(train_cfg, "adam_epsilon", float(optim_cfg.adam.epsilon))
-    object.__setattr__(train_cfg, "warmup_steps", int(optim_cfg.scheduler.warmup_steps))
-    object.__setattr__(train_cfg, "lr_scheduler_type", str(optim_cfg.scheduler.type))
-    object.__setattr__(train_cfg, "max_grad_norm", float(optim_cfg.max_grad_norm))
-
-    report_to = "wandb" if bool(logging_cfg.wandb.enabled) else str(logging_cfg.backend).strip().lower()
-    object.__setattr__(train_cfg, "project_name", str(logging_cfg.project_name))
-    object.__setattr__(train_cfg, "run_name", logging_cfg.run_name)
-    object.__setattr__(train_cfg, "logging_output_dir", logging_cfg.output_dir)
-    object.__setattr__(train_cfg, "logging_steps", int(logging_cfg.logging_steps))
-    object.__setattr__(train_cfg, "report_to", str(report_to))
-    object.__setattr__(train_cfg, "wandb_watch", str(logging_cfg.wandb.watch))
-    object.__setattr__(train_cfg, "wandb_watch_log_freq", int(logging_cfg.wandb.watch_log_freq))
-    object.__setattr__(train_cfg, "debug_metrics", bool(logging_cfg.debug.metrics))
-
-
-def _explicit_fields(cfg_obj: Any) -> set[str]:
-    """Return explicitly provided field names attached to a config object.
-
-    :param Any cfg_obj: Config dataclass object.
-    :return set[str]: Explicitly provided field names.
-    """
-    raw = getattr(cfg_obj, "_explicit_fields", None)
-    if raw is None:
-        return set()
-    if isinstance(raw, set):
-        return {str(x) for x in raw}
-    if isinstance(raw, (list, tuple, frozenset)):
-        return {str(x) for x in raw}
-    return set()
-
-
-def _mark_explicit_fields(cfg_obj: Any, explicit_fields: set[str]) -> None:
-    """Attach explicit-field metadata to a config dataclass.
-
-    :param Any cfg_obj: Config dataclass object.
-    :param set[str] explicit_fields: Explicit field names.
-    """
-    object.__setattr__(cfg_obj, "_explicit_fields", set(str(x) for x in explicit_fields))
 
 
 def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
@@ -1695,6 +1636,10 @@ def validate_data_config(cfg: DataConfig) -> None:
         raise ValueError("data.packing.max_seq_length must be >= 8 for pretraining.")
     if int(src.shuffle_buffer_size) < 0:
         raise ValueError("data.source.shuffle_buffer_size must be >= 0.")
+    if int(src.retry_attempts) < 1:
+        raise ValueError("data.source.retry_attempts must be >= 1.")
+    if not math.isfinite(float(src.retry_backoff_seconds)) or float(src.retry_backoff_seconds) < 0.0:
+        raise ValueError("data.source.retry_backoff_seconds must be finite and >= 0.")
     if not bool(src.streaming) and int(src.shuffle_buffer_size) not in {0, 1}:
         raise ValueError(
             "data.source.shuffle_buffer_size must be 0 or 1 when data.source.streaming=false "
@@ -1952,55 +1897,6 @@ def validate_training_workflow_options(
             )
 
 
-def apply_backbone_defaults(
-    *,
-    model_cfg: ModelConfig,
-    train_cfg: TrainConfig,
-    optim_cfg: OptimConfig | None = None,
-) -> None:
-    """Apply backbone-specific defaults while preserving explicit values.
-
-    :param ModelConfig model_cfg: Model config to update in-place.
-    :param TrainConfig train_cfg: Train config to update in-place.
-    :param OptimConfig | None optim_cfg: Optim config to update in-place.
-    """
-    # Explicit-field metadata is populated from YAML + dotted CLI flags and is
-    # checked before equality comparisons so explicit values are preserved even
-    # when they match raw dataclass defaults.
-    explicit_train_fields = _explicit_fields(train_cfg)
-    explicit_optim_fields = _explicit_fields(optim_cfg) if optim_cfg is not None else set()
-
-    train_defaults = TrainConfig()
-    optim_defaults = OptimConfig()
-
-    if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
-        if "objective.mask_token_prob" not in explicit_train_fields and float(
-            train_cfg.objective.mask_token_prob
-        ) == float(train_defaults.objective.mask_token_prob):
-            _cfg_set(train_cfg.objective, "mask_token_prob", 1.0)
-        if "objective.random_token_prob" not in explicit_train_fields and float(
-            train_cfg.objective.random_token_prob
-        ) == float(train_defaults.objective.random_token_prob):
-            _cfg_set(train_cfg.objective, "random_token_prob", 0.0)
-        if "objective.disc_loss_weight" not in explicit_train_fields and float(
-            train_cfg.objective.disc_loss_weight
-        ) == float(train_defaults.objective.disc_loss_weight):
-            _cfg_set(train_cfg.objective, "disc_loss_weight", 10.0)
-        if optim_cfg is not None:
-            if "adam.epsilon" not in explicit_optim_fields and float(optim_cfg.adam.epsilon) == float(
-                optim_defaults.adam.epsilon
-            ):
-                _cfg_set(optim_cfg.adam, "epsilon", 1e-6)
-            if "scheduler.warmup_steps" not in explicit_optim_fields and int(
-                optim_cfg.scheduler.warmup_steps
-            ) == int(optim_defaults.scheduler.warmup_steps):
-                _cfg_set(optim_cfg.scheduler, "warmup_steps", 10_000)
-        if "token_weighted_gradient_accumulation" not in explicit_train_fields and bool(
-            train_cfg.token_weighted_gradient_accumulation
-        ) == bool(train_defaults.token_weighted_gradient_accumulation):
-            _cfg_set(train_cfg, "token_weighted_gradient_accumulation", True)
-
-
 def validate_run_metadata_schema(raw: dict[str, object], *, source: str) -> None:
     """Validate run-metadata schema compatibility.
 
@@ -2116,25 +2012,6 @@ def load_logging_config_snapshot(raw: dict[str, object], *, source: str) -> Logg
     return _load_snapshot_dataclass(raw, cls=LoggingConfig, source=source, config_name="logging_config.json")
 
 
-def _collect_leaf_paths(value: Any, *, prefix: str = "") -> set[str]:
-    """Collect dotted leaf paths from a nested mapping.
-
-    :param Any value: Nested mapping value.
-    :param str prefix: Prefix path.
-    :return set[str]: Dotted leaf paths.
-    """
-    if isinstance(value, dict):
-        out: set[str] = set()
-        for key, item in value.items():
-            key_s = str(key)
-            child = f"{prefix}.{key_s}" if prefix else key_s
-            out.update(_collect_leaf_paths(item, prefix=child))
-        return out
-    if prefix:
-        return {prefix}
-    return set()
-
-
 # Legacy train-section keys that migrated to *other* sections. Same-section
 # migrations derive from each config class's _LEGACY_MAP instead.
 _TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
@@ -2217,100 +2094,6 @@ def _load_raw_config_mapping(path: str | Path) -> tuple[dict[str, Any], str]:
         raise ValueError("Config file must parse to a dict.")
     format_name = "YAML" if suffix in {".yaml", ".yml"} else "JSON"
     return raw, format_name
-
-
-def _resolve_variables(data: dict[str, Any]) -> dict[str, Any]:
-    """Resolve `$variables.*` references in a config mapping.
-
-    :param dict[str, Any] data: Raw config mapping.
-    :raises ValueError: If a variable reference is missing or circular.
-    :return dict[str, Any]: Mapping with variables expanded and removed.
-    """
-    raw_vars = data.get("variables") or {}
-    if not isinstance(raw_vars, dict):
-        raise ValueError("variables must be a mapping if provided.")
-
-    resolved: dict[str, Any] = {}
-    resolving: set[str] = set()
-
-    def _lookup_var(path: str) -> Any:
-        """Resolve one variable path with cycle detection.
-
-        :param str path: Variable path under ``variables``.
-        :return Any: Resolved variable value.
-        """
-        if path in resolved:
-            return resolved[path]
-        if path in resolving:
-            cycle = " -> ".join(list(resolving) + [path])
-            raise ValueError(f"Circular variable reference: {cycle}")
-
-        cur: Any = raw_vars
-        for part in str(path).split("."):
-            if not isinstance(cur, dict) or part not in cur:
-                raise ValueError(f"Unknown variable reference: variables.{path}")
-            cur = cur[part]
-
-        resolving.add(path)
-        value = _resolve_value(cur)
-        resolving.remove(path)
-        resolved[path] = value
-        return value
-
-    def _sub_var(match: re.Match[str]) -> str:
-        """Render one regex variable match as string.
-
-        :param re.Match[str] match: Regex match object.
-        :return str: String replacement value.
-        """
-        return str(_lookup_var(match.group(1)))
-
-    def _resolve_value(value: Any) -> Any:
-        """Recursively resolve variable references inside nested values.
-
-        :param Any value: Raw nested value.
-        :return Any: Resolved nested value.
-        """
-        if isinstance(value, dict):
-            return {k: _resolve_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [_resolve_value(v) for v in value]
-        if isinstance(value, str):
-            full = _VAR_FULL_RE.fullmatch(value)
-            if full:
-                return _lookup_var(full.group(1))
-            out = _VAR_INLINE_RE.sub(_sub_var, value)
-            out = _VAR_BRACE_RE.sub(_sub_var, out)
-            remaining = _VAR_SUSPICIOUS_RE.findall(out)
-            if remaining:
-                warnings.warn(
-                    f"String contains unresolved variable-like patterns: {remaining}. "
-                    "Use {$variables.name} or ${variables.name} for inline substitution.",
-                    stacklevel=2,
-                )
-            return out
-        return value
-
-    def _collect_var_leaf_paths(prefix: str, value: Any) -> list[str]:
-        """Collect dotted variable leaf paths from a nested variable mapping.
-
-        :param str prefix: Current path prefix.
-        :param Any value: Nested mapping value.
-        :return list[str]: Dotted leaf paths.
-        """
-        if isinstance(value, dict):
-            out: list[str] = []
-            for key, item in value.items():
-                part = str(key).strip()
-                child = f"{prefix}.{part}" if prefix else part
-                out.extend(_collect_var_leaf_paths(child, item))
-            return out
-        return [prefix]
-
-    for var_path in _collect_var_leaf_paths("", raw_vars):
-        _lookup_var(var_path)
-
-    return {k: _resolve_value(v) for k, v in data.items() if k != "variables"}
 
 
 def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, dict[str, Any]]:
@@ -2477,12 +2260,6 @@ def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]])
         LoggingConfig(), section_maps.get("logging", {}), section_name="logging"
     )
 
-    _mark_explicit_fields(model_cfg, _collect_leaf_paths(section_maps.get("model", {})))
-    _mark_explicit_fields(data_cfg, _collect_leaf_paths(section_maps.get("data", {})))
-    _mark_explicit_fields(train_cfg, _collect_leaf_paths(section_maps.get("train", {})))
-    _mark_explicit_fields(optim_cfg, _collect_leaf_paths(section_maps.get("optim", {})))
-    _mark_explicit_fields(logging_cfg, _collect_leaf_paths(section_maps.get("logging", {})))
-
     cfg = Config(
         model=model_cfg,
         data=data_cfg,
@@ -2490,7 +2267,6 @@ def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]])
         optim=optim_cfg,
         logging=logging_cfg,
     )
-    _sync_legacy_train_aliases(train_cfg=cfg.train, optim_cfg=cfg.optim, logging_cfg=cfg.logging)
     return cfg
 
 
@@ -2555,16 +2331,7 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
     leaf_type = _resolve_override_leaf_type(root_obj, parts[1:], path)
     coerced_value = _coerce_override_value(raw_value, leaf_type)
     new_root = _replace_path(root_obj, parts[1:], coerced_value)
-    explicit_leaf_path = ".".join(parts[1:])
-    _mark_explicit_fields(new_root, _explicit_fields(root_obj) | {explicit_leaf_path})
     new_cfg = replace(cfg, **{root: new_root})
-
-    # keep runtime train alias mirror coherent.
-    _sync_legacy_train_aliases(
-        train_cfg=new_cfg.train,
-        optim_cfg=new_cfg.optim,
-        logging_cfg=new_cfg.logging,
-    )
 
     return new_cfg
 
@@ -2577,13 +2344,11 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     :return Config: Validated immutable config object.
     """
     raw, format_name = _load_raw_config_mapping(path)
-    resolved_raw = _resolve_variables(raw)
-    section_maps = _split_full_sections(resolved_raw, format_name=format_name)
+    section_maps = _split_full_sections(raw, format_name=format_name)
     cfg = _build_config_from_section_mappings(section_maps)
     if overrides:
         for expr in overrides:
             cfg = apply_dotted_override(cfg, expr)
-    apply_backbone_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
     validate_model_config(cfg.model)
     validate_data_config(cfg.data)
     validate_train_config(cfg.train)
@@ -2595,7 +2360,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         model_cfg=cfg.model,
         optim_cfg=cfg.optim,
     )
-    _sync_legacy_train_aliases(train_cfg=cfg.train, optim_cfg=cfg.optim, logging_cfg=cfg.logging)
     return cfg
 
 
@@ -2633,7 +2397,6 @@ __all__ = [
     "OptimConfig",
     "LoggingConfig",
     "apply_dotted_override",
-    "apply_backbone_defaults",
     "asdict_without_private",
     "iter_leaf_paths_for_dataclass",
     "load_config",

@@ -27,7 +27,19 @@ def mock_checkpoint(tmp_path: Path):
         if with_weights:
             (ckpt / "model.safetensors").write_bytes(b"weights")
         if with_data_state:
-            payload: dict[str, Any] = {"consumed_micro_batches": int(consumed_micro_batches)}
+            try:
+                global_step = int(str(name).rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                global_step = 0
+            payload: dict[str, Any] = {
+                "consumed_micro_batches": int(consumed_micro_batches),
+                "global_step": global_step,
+                "gradient_accumulation_steps": 1,
+                "optimizer_param_digest": {
+                    "generator": "c47801e52addb7bd",
+                    "discriminator": "97f96551c79936d2",
+                },
+            }
             if data_state_extra:
                 payload.update(dict(data_state_extra))
             (ckpt / "data_state.json").write_text(json.dumps(payload), encoding="utf-8")

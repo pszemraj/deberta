@@ -248,14 +248,14 @@ def _compile_model_if_enabled(
     compile_scope, compile_scope_reason = _resolve_compile_scope(
         requested_scope=compile_scope_requested,
         model_cfg=model_cfg,
-        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
     )
     if compile_scope_reason:
         print(f"[profile] compile_scope_reason={compile_scope_reason}")
 
     compile_kwargs: dict[str, Any] = {
-        "mode": str(train_cfg.torch_compile_mode),
-        "backend": str(train_cfg.torch_compile_backend),
+        "mode": str(train_cfg.compile.mode),
+        "backend": str(train_cfg.compile.backend),
     }
     try:
         compile_params = torch.compile.__wrapped__.__signature__.parameters  # type: ignore[attr-defined]
@@ -273,7 +273,7 @@ def _compile_model_if_enabled(
     if compile_scope_key in {"backbones", "encoder", "gen_encoder", "disc_encoder"}:
         prefilled_rotary = _prefill_rotary_caches_for_compile(
             model=model,
-            seq_len=int(data_cfg.max_seq_length),
+            seq_len=int(data_cfg.packing.max_seq_length),
             device=_resolve_device(),
             dtype=_dtype_for_mixed_precision(mixed_precision),
         )
@@ -633,7 +633,7 @@ def main() -> None:
         overrides,
         tool_name="flashdeberta_rtd_profile.py",
     )
-    model_cfg, data_cfg, train_cfg = cfg.model, cfg.data, cfg.train
+    model_cfg, data_cfg, train_cfg, optim_cfg = cfg.model, cfg.data, cfg.train, cfg.optim
     train_iter = iter(loader)
 
     model = bench.build_rtd_pretrainer(cfg=cfg, tokenizer=tokenizer, device=device, train_mode=False)
@@ -642,20 +642,20 @@ def main() -> None:
     if effective_decoupled_training:
         gen_optimizer, disc_optimizer = _build_decoupled_optimizers(
             model,
-            train_cfg,
+            optim_cfg,
             mixed_precision=mixed_precision,
         )
-        gen_lr_scheduler = _build_scheduler(gen_optimizer, train_cfg)
-        disc_lr_scheduler = _build_scheduler(disc_optimizer, train_cfg)
+        gen_lr_scheduler = _build_scheduler(gen_optimizer, train_cfg=train_cfg, optim_cfg=optim_cfg)
+        disc_lr_scheduler = _build_scheduler(disc_optimizer, train_cfg=train_cfg, optim_cfg=optim_cfg)
     else:
-        optimizer = _build_optimizer(model, train_cfg, mixed_precision=mixed_precision)
-        lr_scheduler = _build_scheduler(optimizer, train_cfg)
+        optimizer = _build_optimizer(model, optim_cfg, mixed_precision=mixed_precision)
+        lr_scheduler = _build_scheduler(optimizer, train_cfg=train_cfg, optim_cfg=optim_cfg)
 
-    compile_enabled = bool(train_cfg.torch_compile)
+    compile_enabled = bool(train_cfg.compile.enabled)
     compile_scope = _compile_model_if_enabled(
         model=model,
         compile_enabled=compile_enabled,
-        compile_scope_requested=str(train_cfg.torch_compile_scope).strip().lower(),
+        compile_scope_requested=str(train_cfg.compile.scope).strip().lower(),
         train_cfg=train_cfg,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
@@ -687,8 +687,8 @@ def main() -> None:
                 disc_lr_scheduler=disc_lr_scheduler,
                 phase_times_ms=defaultdict(list),
                 mixed_precision=mixed_precision,
-                sampling_temperature=float(train_cfg.sampling_temperature),
-                max_grad_norm=float(train_cfg.max_grad_norm),
+                sampling_temperature=float(train_cfg.objective.sampling_temperature),
+                max_grad_norm=float(optim_cfg.max_grad_norm),
             )
         else:
             _ = _run_coupled_window(
@@ -706,10 +706,10 @@ def main() -> None:
                 lr_scheduler=lr_scheduler,
                 phase_times_ms=defaultdict(list),
                 mixed_precision=mixed_precision,
-                gen_loss_weight=float(train_cfg.gen_loss_weight),
-                disc_loss_weight=float(train_cfg.disc_loss_weight),
-                sampling_temperature=float(train_cfg.sampling_temperature),
-                max_grad_norm=float(train_cfg.max_grad_norm),
+                gen_loss_weight=float(train_cfg.objective.gen_loss_weight),
+                disc_loss_weight=float(train_cfg.objective.disc_loss_weight),
+                sampling_temperature=float(train_cfg.objective.sampling_temperature),
+                max_grad_norm=float(optim_cfg.max_grad_norm),
             )
 
     def _run_measured_window() -> dict[str, float]:
@@ -733,8 +733,8 @@ def main() -> None:
                 disc_lr_scheduler=disc_lr_scheduler,
                 phase_times_ms=phase_times_ms,
                 mixed_precision=mixed_precision,
-                sampling_temperature=float(train_cfg.sampling_temperature),
-                max_grad_norm=float(train_cfg.max_grad_norm),
+                sampling_temperature=float(train_cfg.objective.sampling_temperature),
+                max_grad_norm=float(optim_cfg.max_grad_norm),
             )
         return _run_coupled_window(
             model=model,
@@ -751,10 +751,10 @@ def main() -> None:
             lr_scheduler=lr_scheduler,
             phase_times_ms=phase_times_ms,
             mixed_precision=mixed_precision,
-            gen_loss_weight=float(train_cfg.gen_loss_weight),
-            disc_loss_weight=float(train_cfg.disc_loss_weight),
-            sampling_temperature=float(train_cfg.sampling_temperature),
-            max_grad_norm=float(train_cfg.max_grad_norm),
+            gen_loss_weight=float(train_cfg.objective.gen_loss_weight),
+            disc_loss_weight=float(train_cfg.objective.disc_loss_weight),
+            sampling_temperature=float(train_cfg.objective.sampling_temperature),
+            max_grad_norm=float(optim_cfg.max_grad_norm),
         )
 
     metrics: list[dict[str, float]] = []
@@ -810,7 +810,7 @@ def main() -> None:
             "triton_version": _package_version("triton"),
             "flashdeberta_version": _package_version("flashdeberta"),
         },
-        "packing_enabled": bool(data_cfg.pack_sequences),
+        "packing_enabled": bool(data_cfg.packing.enabled),
         "compile_enabled": bool(compile_enabled),
         "compile_scope": str(compile_scope),
         "gradient_accumulation_steps": int(ga_steps),

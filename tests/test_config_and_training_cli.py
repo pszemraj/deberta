@@ -94,40 +94,6 @@ def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
     assert "train.max_steps: 5 -> 7 (CLI override (--train.max_steps))" in err
 
 
-def test_main_cli_train_reports_when_runtime_mutation_changes_loaded_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-    pytest.importorskip("yaml")
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    def _fake_apply_backbone_defaults(*, model_cfg, train_cfg, optim_cfg):
-        del model_cfg, optim_cfg
-        object.__setattr__(train_cfg, "max_steps", int(train_cfg.max_steps) + 1)
-
-    import deberta.training.runtime as runtime_mod
-
-    monkeypatch.setattr(runtime_mod, "apply_backbone_defaults", _fake_apply_backbone_defaults)
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(["train", str(cfg_path)])
-
-    assert int(seen["train_cfg"].max_steps) == 6
-    err = capsys.readouterr().err
-    assert "train.max_steps: 5 -> 6 (runtime normalization/defaulting)" in err
-
-
 def test_main_cli_train_supports_dotted_overrides_with_type_casting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -165,8 +131,8 @@ def test_main_cli_train_supports_dotted_overrides_with_type_casting(
     )
 
     assert int(seen["train_cfg"].max_steps) == 11
-    assert float(seen["train_cfg"].adam_epsilon) == pytest.approx(1e-5)
-    assert int(seen["model_cfg"].hf_max_position_embeddings) == 640
+    assert float(seen["optim_cfg"].adam.epsilon) == pytest.approx(1e-5)
+    assert int(seen["model_cfg"].hf.max_position_embeddings) == 640
     err = capsys.readouterr().err
     assert "train.max_steps: 5 -> 11 (CLI override (--train.max_steps))" in err
 
@@ -286,8 +252,8 @@ def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
         ]
     )
 
-    assert int(seen["train_cfg"].warmup_steps) == 333
-    assert seen["train_cfg"].wandb_watch == "all"
+    assert int(seen["optim_cfg"].scheduler.warmup_steps) == 333
+    assert seen["logging_cfg"].wandb.watch == "all"
 
 
 def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -307,51 +273,6 @@ def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypa
     monkeypatch.setattr(cli_mod, "run_pretraining", lambda **_: None)
     with pytest.raises(SystemExit):
         cli_mod.main(["train", str(cfg_path), "--train.no_such_field", "1"])
-
-
-def test_main_cli_train_with_config_and_preset_applies_model_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-    cfg_path = tmp_path / "train.json"
-    cfg_path.write_text(
-        json.dumps(
-            {
-                "model": {"backbone_type": "rope"},
-                "data": {"source": {"dataset_name": "demo-dataset"}, "packing": {"max_seq_length": 128}},
-                "train": {"max_steps": 11},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(["train", str(cfg_path), "--preset", "deberta-v3-base"])
-
-    assert "train_cfg" in seen
-    assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
-    assert seen["data_cfg"].source.dataset_name == "demo-dataset"
-    assert seen["data_cfg"].packing.max_seq_length == 128
-    assert seen["train_cfg"].max_steps == 11
-    assert seen["config_path"] == cfg_path
-    out = capsys.readouterr().out
-    assert "model-only overrides (config file provided)" in out
-
-
-def test_main_cli_train_preset_without_config_applies_defaults_and_cli_overrides(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(["train", "--preset", "deberta-v3-base", "--train.max_steps", "123"])
-
-    assert seen["config_path"] is None
-    assert seen["model_cfg"].backbone_type == "hf_deberta_v2"
-    assert seen["model_cfg"].embedding_sharing == "gdes"
-    assert seen["data_cfg"].source.dataset_name == "HuggingFaceFW/fineweb-edu"
-    assert seen["data_cfg"].source.dataset_config_name == "default"
-    assert seen["train_cfg"].max_steps == 123
-    assert seen["train_cfg"].report_to == "none"
-    out = capsys.readouterr().out
-    assert "model+data+train+optim+logging defaults (no config file)" in out
 
 
 def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: pytest.MonkeyPatch):
@@ -395,49 +316,6 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
     assert int(seen["train_cfg"].max_steps) == 5
 
 
-def test_main_cli_train_explicit_argv_skips_fast_exit(monkeypatch: pytest.MonkeyPatch):
-    seen: dict[str, Any] = {"ran": False, "exit_called": False}
-
-    def _fake_run_train(ns: argparse.Namespace, *, dotflag_map: dict[str, str]) -> None:
-        del ns, dotflag_map
-        seen["ran"] = True
-
-    def _fake_exit(code: int) -> None:
-        del code
-        seen["exit_called"] = True
-        raise AssertionError("os._exit should not be called when main(argv=...) is used.")
-
-    monkeypatch.setattr(cli_mod, "_run_train", _fake_run_train)
-    monkeypatch.setattr(cli_mod.os, "_exit", _fake_exit)
-
-    cli_mod.main(["train", "--dry-run"])
-
-    assert seen["ran"] is True
-    assert seen["exit_called"] is False
-
-
-def test_main_cli_train_implicit_argv_fast_exit_enabled(monkeypatch: pytest.MonkeyPatch):
-    seen: dict[str, Any] = {"ran": False}
-
-    def _fake_run_train(ns: argparse.Namespace, *, dotflag_map: dict[str, str]) -> None:
-        del ns, dotflag_map
-        seen["ran"] = True
-
-    def _fake_exit(code: int) -> None:
-        raise SystemExit(code)
-
-    monkeypatch.setattr(cli_mod, "_run_train", _fake_run_train)
-    monkeypatch.setattr(cli_mod.os, "_exit", _fake_exit)
-    monkeypatch.setenv("DEBERTA_FAST_EXIT_AFTER_TRAIN", "1")
-    monkeypatch.setattr(cli_mod.sys, "argv", ["deberta", "train", "--dry-run"])
-
-    with pytest.raises(SystemExit) as exc_info:
-        cli_mod.main()
-
-    assert int(exc_info.value.code) == 0
-    assert seen["ran"] is True
-
-
 def test_train_parser_accepts_dry_run_flag():
     parser = cli_mod._build_main_parser()
     ns = parser.parse_args(
@@ -451,14 +329,6 @@ def test_train_parser_accepts_dry_run_flag():
         ]
     )
     assert ns.command == "train"
-    assert ns.dry_run is True
-
-
-def test_train_parser_accepts_preset_flag():
-    parser = cli_mod._build_main_parser()
-    ns = parser.parse_args(["train", "--preset", "deberta-v3-base", "--dry-run"])
-    assert ns.command == "train"
-    assert ns.preset == "deberta-v3-base"
     assert ns.dry_run is True
 
 
@@ -549,108 +419,6 @@ def test_validate_train_config_normalizes_resume_hints(resume_hint: str, expecte
 def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
     cfg = ModelConfig()
     assert cfg.backbone_type == "hf_deberta_v2"
-
-
-def test_apply_backbone_defaults_applies_hf_deberta_defaults() -> None:
-    model_cfg = ModelConfig(backbone_type="hf_deberta_v2")
-    train_cfg = TrainConfig()
-    optim_cfg = OptimConfig()
-
-    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-
-    assert train_cfg.mask_token_prob == pytest.approx(1.0)
-    assert train_cfg.random_token_prob == pytest.approx(0.0)
-    assert train_cfg.disc_loss_weight == pytest.approx(10.0)
-    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
-    assert optim_cfg.scheduler.warmup_steps == 10_000
-    assert train_cfg.token_weighted_gradient_accumulation is True
-
-
-def test_apply_backbone_defaults_keeps_rope_defaults() -> None:
-    model_cfg = ModelConfig(backbone_type="rope")
-    train_cfg = TrainConfig()
-    optim_cfg = OptimConfig()
-
-    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-
-    assert train_cfg.mask_token_prob == pytest.approx(0.8)
-    assert train_cfg.random_token_prob == pytest.approx(0.1)
-    assert train_cfg.disc_loss_weight == pytest.approx(50.0)
-    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
-    assert optim_cfg.scheduler.warmup_steps == 1_000
-    assert train_cfg.token_weighted_gradient_accumulation is True
-
-
-def test_apply_backbone_defaults_keeps_explicit_non_default_values() -> None:
-    model_cfg = ModelConfig(
-        backbone_type="hf_deberta_v2",
-        embedding_sharing="none",
-        hf_attention_kernel="stable",
-    )
-    train_cfg = TrainConfig(
-        mask_token_prob=0.95,
-        random_token_prob=0.03,
-        mlm_max_ngram=2,
-        disc_loss_weight=12.5,
-        token_weighted_gradient_accumulation=False,
-    )
-    optim_cfg = OptimConfig(adam_epsilon=5e-6, warmup_steps=2_000)
-
-    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-
-    assert model_cfg.backbone_type == "hf_deberta_v2"
-    assert model_cfg.embedding_sharing == "none"
-    assert model_cfg.hf_attention_kernel == "stable"
-    assert train_cfg.mask_token_prob == pytest.approx(0.95)
-    assert train_cfg.random_token_prob == pytest.approx(0.03)
-    assert train_cfg.mlm_max_ngram == 2
-    assert train_cfg.disc_loss_weight == pytest.approx(12.5)
-    assert optim_cfg.adam.epsilon == pytest.approx(5e-6)
-    assert optim_cfg.scheduler.warmup_steps == 2_000
-    assert train_cfg.token_weighted_gradient_accumulation is False
-
-
-def test_apply_backbone_defaults_honors_explicit_fields_even_when_matching_raw_defaults() -> None:
-    model_cfg = ModelConfig(
-        backbone_type="hf_deberta_v2",
-        embedding_sharing="es",
-        hf_attention_kernel="auto",
-    )
-    train_cfg = TrainConfig(
-        mask_token_prob=0.8,
-        random_token_prob=0.1,
-        disc_loss_weight=50.0,
-        token_weighted_gradient_accumulation=True,
-    )
-    optim_cfg = OptimConfig(adam_epsilon=1e-8, warmup_steps=1_000)
-    object.__setattr__(
-        model_cfg,
-        "_explicit_fields",
-        {"backbone_type", "embedding_sharing", "hf.attention_kernel"},
-    )
-    object.__setattr__(
-        train_cfg,
-        "_explicit_fields",
-        {
-            "objective.mask_token_prob",
-            "objective.random_token_prob",
-            "objective.disc_loss_weight",
-            "token_weighted_gradient_accumulation",
-        },
-    )
-    object.__setattr__(optim_cfg, "_explicit_fields", {"adam.epsilon", "scheduler.warmup_steps"})
-
-    apply_backbone_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-
-    assert model_cfg.backbone_type == "hf_deberta_v2"
-    assert model_cfg.embedding_sharing == "es"
-    assert model_cfg.hf_attention_kernel == "auto"
-    assert train_cfg.mask_token_prob == pytest.approx(0.8)
-    assert train_cfg.random_token_prob == pytest.approx(0.1)
-    assert train_cfg.disc_loss_weight == pytest.approx(50.0)
-    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
-    assert optim_cfg.scheduler.warmup_steps == 1_000
-    assert train_cfg.token_weighted_gradient_accumulation is True
 
 
 def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
