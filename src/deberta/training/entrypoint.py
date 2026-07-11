@@ -107,6 +107,35 @@ def _flash_attention_enabled_for_runtime(model_cfg: ModelConfig) -> bool:
     return is_flash_attention_impl(getattr(hf_cfg, "attention_impl", "eager"))
 
 
+def _clip_gradients_and_find_nonfinite(
+    *,
+    accelerator: Any,
+    model: torch.nn.Module,
+    max_grad_norm: float,
+) -> tuple[str | None, float]:
+    """Validate gradients before and after optional clipping.
+
+    :param Any accelerator: Accelerator used for rank-wide checks and clipping.
+    :param torch.nn.Module model: Model whose gradients are inspected.
+    :param float max_grad_norm: Positive clipping threshold, or a disabled value.
+    :return tuple[str | None, float]: Failure reason and the inspected norm.
+    """
+
+    grad_norm = _global_grad_l2_norm(model)
+    if _has_nonfinite_grad_norm_any_rank(accelerator=accelerator, grad_norm=float(grad_norm)):
+        return "grad_norm", float(grad_norm)
+    if not _should_clip_gradients(max_grad_norm):
+        return None, float(grad_norm)
+    accelerator.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+    post_clip_grad_norm = _global_grad_l2_norm(model)
+    if _has_nonfinite_grad_norm_any_rank(
+        accelerator=accelerator,
+        grad_norm=float(post_clip_grad_norm),
+    ):
+        return "grad_norm_post_clip", float(post_clip_grad_norm)
+    return None, float(post_clip_grad_norm)
+
+
 def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
@@ -1261,22 +1290,19 @@ def run_pretraining(
                         if not gen_phase_enabled:
                             did_gen_optimizer_step = True
                             continue
-                        grad_norm_for_check = _global_grad_l2_norm(model)
-                        if _has_nonfinite_grad_norm_any_rank(
+                        grad_norm_reason, _ = _clip_gradients_and_find_nonfinite(
                             accelerator=accelerator,
-                            grad_norm=float(grad_norm_for_check),
-                        ):
+                            model=model,
+                            max_grad_norm=float(resolved_optim_cfg.max_grad_norm),
+                        )
+                        if grad_norm_reason is not None:
                             skipped_window_due_nonfinite = True
                             nonfinite_skip_total += 1
                             nonfinite_skip_streak += 1
-                            nonfinite_reason = "gen_grad_norm_nonfinite"
+                            nonfinite_reason = f"gen_{grad_norm_reason}_nonfinite"
                             gen_optimizer.zero_grad(set_to_none=True)
                             disc_optimizer.zero_grad(set_to_none=True)
                             break
-                        if _should_clip_gradients(resolved_optim_cfg.max_grad_norm):
-                            accelerator.clip_grad_norm_(
-                                model.parameters(), float(resolved_optim_cfg.max_grad_norm)
-                            )
                         gen_optimizer.step()
                         gen_lr_scheduler.step()
                         _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
@@ -1423,22 +1449,19 @@ def run_pretraining(
                             if not disc_phase_enabled:
                                 did_disc_optimizer_step = True
                                 continue
-                            grad_norm_for_check = _global_grad_l2_norm(model)
-                            if _has_nonfinite_grad_norm_any_rank(
+                            grad_norm_reason, _ = _clip_gradients_and_find_nonfinite(
                                 accelerator=accelerator,
-                                grad_norm=float(grad_norm_for_check),
-                            ):
+                                model=model,
+                                max_grad_norm=float(resolved_optim_cfg.max_grad_norm),
+                            )
+                            if grad_norm_reason is not None:
                                 skipped_window_due_nonfinite = True
                                 nonfinite_skip_total += 1
                                 nonfinite_skip_streak += 1
-                                nonfinite_reason = "disc_grad_norm_nonfinite"
+                                nonfinite_reason = f"disc_{grad_norm_reason}_nonfinite"
                                 gen_optimizer.zero_grad(set_to_none=True)
                                 disc_optimizer.zero_grad(set_to_none=True)
                                 break
-                            if _should_clip_gradients(resolved_optim_cfg.max_grad_norm):
-                                accelerator.clip_grad_norm_(
-                                    model.parameters(), float(resolved_optim_cfg.max_grad_norm)
-                                )
                             disc_optimizer.step()
                             disc_lr_scheduler.step()
                             _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
@@ -1519,7 +1542,13 @@ def run_pretraining(
                     last_saved_step=last_saved_step,
                 )
 
-        while global_step < int(train_cfg.max_steps):
+            if global_step < int(train_cfg.max_steps):
+                raise RuntimeError(
+                    "Decoupled training exited before reaching train.max_steps; "
+                    "refusing to fall through into joint-training semantics."
+                )
+
+        while not effective_decoupled_training and global_step < int(train_cfg.max_steps):
             (
                 window,
                 consumed_in_window,
@@ -1702,15 +1731,16 @@ def run_pretraining(
                     accelerator.backward(backward_loss)
 
                 if is_sync_step:
-                    grad_norm_for_check = _global_grad_l2_norm(model)
-                    if _has_nonfinite_grad_norm_any_rank(
+                    grad_norm_reason, grad_norm_for_check = _clip_gradients_and_find_nonfinite(
                         accelerator=accelerator,
-                        grad_norm=float(grad_norm_for_check),
-                    ):
+                        model=model,
+                        max_grad_norm=float(resolved_optim_cfg.max_grad_norm),
+                    )
+                    if grad_norm_reason is not None:
                         skipped_window_due_nonfinite = True
                         nonfinite_skip_total += 1
                         nonfinite_skip_streak += 1
-                        nonfinite_reason = f"grad_norm_skip_{int(nonfinite_skip_total)}"
+                        nonfinite_reason = f"{grad_norm_reason}_skip_{int(nonfinite_skip_total)}"
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_artifact(
                             micro_step_idx=int(step_idx),
@@ -1723,8 +1753,9 @@ def run_pretraining(
                             lr=lr_now,
                         )
                         logger.warning(
-                            "Skipping optimizer step due non-finite gradient norm "
+                            "Skipping optimizer step due non-finite %s "
                             "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
+                            str(grad_norm_reason).replace("_", " "),
                             int(global_step + 1),
                             int(nonfinite_skip_streak),
                             int(nonfinite_skip_total),
@@ -1732,41 +1763,6 @@ def run_pretraining(
                         )
                         optimizer.zero_grad(set_to_none=True)
                         break
-
-                    if _should_clip_gradients(resolved_optim_cfg.max_grad_norm):
-                        accelerator.clip_grad_norm_(
-                            model.parameters(), float(resolved_optim_cfg.max_grad_norm)
-                        )
-                        post_clip_grad_norm = _global_grad_l2_norm(model)
-                        if _has_nonfinite_grad_norm_any_rank(
-                            accelerator=accelerator,
-                            grad_norm=float(post_clip_grad_norm),
-                        ):
-                            skipped_window_due_nonfinite = True
-                            nonfinite_skip_total += 1
-                            nonfinite_skip_streak += 1
-                            nonfinite_reason = f"grad_norm_post_clip_skip_{int(nonfinite_skip_total)}"
-                            lr_now = _scheduler_current_lr(lr_scheduler)
-                            nonfinite_debug_path = _write_nonfinite_artifact(
-                                micro_step_idx=int(step_idx),
-                                offending=str(nonfinite_reason),
-                                gen_loss_raw=out.gen_loss_raw if out is not None else None,
-                                disc_loss_raw=out.disc_loss_raw if out is not None else None,
-                                forward_loss=out.loss if out is not None else None,
-                                backward_loss=None,
-                                grad_norm=float(post_clip_grad_norm),
-                                lr=lr_now,
-                            )
-                            logger.warning(
-                                "Skipping optimizer step due non-finite post-clip gradient norm "
-                                "(step=%d, streak=%d, total_skips=%d). Debug artifact: %s",
-                                int(global_step + 1),
-                                int(nonfinite_skip_streak),
-                                int(nonfinite_skip_total),
-                                nonfinite_debug_path,
-                            )
-                            optimizer.zero_grad(set_to_none=True)
-                            break
 
                     optimizer.step()
                     lr_scheduler.step()

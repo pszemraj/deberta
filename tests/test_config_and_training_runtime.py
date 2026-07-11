@@ -526,6 +526,29 @@ def test_should_clip_gradients_for_positive_threshold():
     assert _should_clip_gradients(max_grad_norm=1.0) is True
 
 
+def test_clip_gradients_rechecks_finiteness_after_clipping(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deberta.training.entrypoint as entrypoint_mod
+
+    checks = iter((False, True))
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "_has_nonfinite_grad_norm_any_rank",
+        lambda **_kwargs: next(checks),
+    )
+    monkeypatch.setattr(entrypoint_mod, "_global_grad_l2_norm", lambda _model: 2.0)
+    accelerator = FakeAccelerator()
+
+    reason, grad_norm = entrypoint_mod._clip_gradients_and_find_nonfinite(
+        accelerator=accelerator,
+        model=torch.nn.Linear(2, 2),
+        max_grad_norm=1.0,
+    )
+
+    assert reason == "grad_norm_post_clip"
+    assert grad_norm == pytest.approx(2.0)
+    assert accelerator.calls["clip_grad_norm_"] == [1.0]
+
+
 @pytest.mark.parametrize(
     ("grad_norm", "expected"),
     [(1.0, False), (float("inf"), True), (float("nan"), True), (-float("inf"), True)],
