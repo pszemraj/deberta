@@ -190,20 +190,20 @@ def split_pretrainer_state_dict(
     return disc, gen
 
 
-def load_intersection_state_dict(
+def load_export_state_dict(
     model: Any,
     state_dict: dict[str, torch.Tensor],
     *,
     strict: bool = False,
     context: str = "state_dict",
 ) -> Any:
-    """Load a state dict through PyTorch's native compatibility reporting.
+    """Load an export state dict with contextual compatibility errors.
 
     :param Any model: Target model/module exposing ``state_dict`` and ``load_state_dict``.
     :param dict[str, torch.Tensor] state_dict: Source state dict.
-    :param bool strict: When ``True``, fail on any missing/unexpected keys after overlap filtering.
+    :param bool strict: Whether PyTorch should reject missing or unexpected keys.
     :param str context: Human-readable context included in strict-mode failures.
-    :raises RuntimeError: If ``strict=True`` and the intersection load is partial.
+    :raises RuntimeError: If PyTorch rejects the state dict.
     :return Any: ``load_state_dict`` return value.
     """
     try:

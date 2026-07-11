@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Literal
 
 import torch
 
 from deberta.modeling.flashdeberta_op_utils import BoundedLRUCache
 
-_FLASH_TRUTHY = {"1", "true", "yes", "y", "on"}
 _INTEGER_DTYPES = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
 
 
@@ -154,64 +153,6 @@ def normalize_keep_mask(mask: torch.Tensor, *, name: str = "attention_mask") -> 
             "Floating-point masks are ambiguous (0/1 keep vs 0/-inf additive)."
         )
     return mask.ne(0)
-
-
-def _flash_cfg_get(flash_cfg: Any | None, name: str, default: Any) -> Any:
-    """Return one flash config value from a mapping/dataclass/object.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Field name.
-    :param Any default: Default value.
-    :return Any: Resolved value.
-    """
-
-    if flash_cfg is None:
-        return default
-    if isinstance(flash_cfg, dict):
-        return flash_cfg.get(name, default)
-    return getattr(flash_cfg, name, default)
-
-
-def _flash_cfg_bool(
-    flash_cfg: Any | None,
-    *,
-    name: str,
-    default: str,
-) -> bool:
-    """Resolve one boolean flash option from config or a declared default.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Config field name.
-    :param str default: Default text when config is absent.
-    :return bool: Resolved boolean value.
-    """
-
-    if flash_cfg is None:
-        return str(default).strip().lower() in _FLASH_TRUTHY
-    return bool(_flash_cfg_get(flash_cfg, name, False))
-
-
-def _flash_cfg_optional_int(
-    flash_cfg: Any | None,
-    *,
-    name: str,
-    default: int | None = None,
-) -> int | None:
-    """Resolve one optional integer flash option.
-
-    :param Any | None flash_cfg: Optional config source.
-    :param str name: Config field name.
-    :param int | None default: Default value when config is absent.
-    :return int | None: Resolved integer, or None when unset.
-    """
-
-    value = _flash_cfg_get(flash_cfg, name, default)
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except Exception:
-        return default
 
 
 def mask_to_2d_keep_mask(attention_mask: torch.Tensor, *, seq_len: int) -> torch.Tensor:
@@ -673,8 +614,6 @@ def doc_ids_from_segments(
 
 __all__ = [
     "FlashBatchMeta",
-    "_flash_cfg_bool",
-    "_flash_cfg_get",
     "build_validated_prefix_lengths",
     "build_doc_block_mask",
     "build_doc_segment_metadata",

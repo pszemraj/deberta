@@ -1013,6 +1013,41 @@ def _strides_or_zeros(tensor: torch.Tensor | None, count: int) -> tuple[int, ...
     return tuple(int(tensor.stride(i)) for i in range(int(count)))
 
 
+def _launch_bias_preprocess(
+    *,
+    out: torch.Tensor,
+    grad_out: torch.Tensor,
+    lse: torch.Tensor,
+    block_m: int,
+) -> torch.Tensor:
+    """Launch the shared bias-backward delta preprocessing kernel.
+
+    :param torch.Tensor out: Forward attention output.
+    :param torch.Tensor grad_out: Output gradient.
+    :param torch.Tensor lse: Forward log-sum-exp tensor used for output shape.
+    :param int block_m: Query tile size.
+    :return torch.Tensor: Preprocessed delta tensor.
+    """
+
+    batch_size, num_heads, query_len, head_dim = out.shape
+    grid = (-(-int(query_len) // int(block_m)), int(num_heads), int(batch_size))
+    delta = torch.empty_like(lse)
+    with torch.cuda.device(out.device.index):
+        _bwd_preprocess_bias_raw[grid](
+            out,
+            grad_out,
+            delta,
+            *out.stride(),
+            *grad_out.stride(),
+            *delta.stride(),
+            int(query_len),
+            BLOCK_M=int(block_m),
+            D_HEAD=int(head_dim),
+            DIVISIBLE_M=bool(int(query_len) % int(block_m) == 0),
+        )
+    return delta
+
+
 def _launch_docblock1024_backward(
     *,
     grad_out: torch.Tensor,
@@ -1066,34 +1101,12 @@ def _launch_docblock1024_backward(
     kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = kv_config
     q_block_m, q_block_n, q_num_stages, q_num_warps = q_config
 
-    preprocess_block_m = max(int(kv_block_m), int(q_block_m))
-    preprocess_grid = (
-        -(-int(query_len) // int(preprocess_block_m)),
-        int(num_heads),
-        int(batch_size),
+    delta = _launch_bias_preprocess(
+        out=out,
+        grad_out=grad_out,
+        lse=lse,
+        block_m=max(int(kv_block_m), int(q_block_m)),
     )
-    delta = torch.empty_like(lse)
-    with torch.cuda.device(q.device.index):
-        _bwd_preprocess_bias_raw[preprocess_grid](
-            out,
-            grad_out,
-            delta,
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-            grad_out.stride(0),
-            grad_out.stride(1),
-            grad_out.stride(2),
-            grad_out.stride(3),
-            delta.stride(0),
-            delta.stride(1),
-            delta.stride(2),
-            int(query_len),
-            BLOCK_M=int(preprocess_block_m),
-            D_HEAD=int(head_dim),
-            DIVISIBLE_M=bool(int(query_len) % int(preprocess_block_m) == 0),
-        )
 
     empty_float = torch.empty((0,), device=q.device, dtype=torch.float32)
     empty_int = torch.empty((0,), device=q.device, dtype=torch.int32)
@@ -1612,34 +1625,12 @@ def _bias_generic_backward_impl(
     if int(bias.shape[1]) != int(q.shape[1]) and int(bias.shape[1]) == 1:
         bias_heads_stride = 0
 
-    preprocess_block_m = max(int(kv_block_m), int(q_block_m))
-    preprocess_grid = (
-        -(-int(query_len) // int(preprocess_block_m)),
-        int(num_heads),
-        int(batch_size),
+    delta = _launch_bias_preprocess(
+        out=out,
+        grad_out=grad_out,
+        lse=lse,
+        block_m=max(int(kv_block_m), int(q_block_m)),
     )
-    delta = torch.empty_like(lse)
-    with torch.cuda.device(q.device.index):
-        _bwd_preprocess_bias_raw[preprocess_grid](
-            out,
-            grad_out,
-            delta,
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-            grad_out.stride(0),
-            grad_out.stride(1),
-            grad_out.stride(2),
-            grad_out.stride(3),
-            delta.stride(0),
-            delta.stride(1),
-            delta.stride(2),
-            int(query_len),
-            BLOCK_M=int(preprocess_block_m),
-            D_HEAD=int(head_dim),
-            DIVISIBLE_M=bool(int(query_len) % int(preprocess_block_m) == 0),
-        )
 
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)

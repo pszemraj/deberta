@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
+from deberta.data.batch_contract import FLASH_SCALAR_BATCH_KEYS, HostScalarBatchKey
 from deberta.modeling.mask_utils import (
     build_doc_segment_metadata,
     build_validated_prefix_lengths,
@@ -20,6 +20,19 @@ from deberta.modeling.mask_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _set_scalar_pair(batch: dict[str, Any], key: HostScalarBatchKey, value: int) -> None:
+    """Store one host integer and its CPU scalar-tensor mirror.
+
+    :param dict[str, Any] batch: Mutable collated batch.
+    :param HostScalarBatchKey key: Paired batch-key contract.
+    :param int value: Scalar value to publish.
+    """
+
+    normalized = int(value)
+    batch[key.host] = normalized
+    batch[key.scalar] = torch.tensor(normalized, dtype=torch.int32)
 
 
 @dataclass
@@ -245,12 +258,9 @@ class DebertaV3ElectraCollator:
             segment_lengths,
             active_tokens=int(active_tokens),
         )
-        batch["flash_active_tokens"] = int(active_tokens)
-        batch[CPU_SCALAR_BATCH_KEYS.active_tokens] = torch.tensor(int(active_tokens), dtype=torch.int32)
-        batch["flash_doc_num_segments"] = int(num_segments)
-        batch[CPU_SCALAR_BATCH_KEYS.doc_num_segments] = torch.tensor(int(num_segments), dtype=torch.int32)
-        batch["flash_doc_max_seqlen"] = int(max_segment_length)
-        batch[CPU_SCALAR_BATCH_KEYS.doc_max_seqlen] = torch.tensor(int(max_segment_length), dtype=torch.int32)
+        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.active_tokens, active_tokens)
+        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.doc_num_segments, num_segments)
+        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.doc_max_seqlen, max_segment_length)
         batch["flash_doc_segment_offsets"] = segment_offsets
         batch["flash_doc_segment_lengths"] = segment_lengths
         batch["flash_doc_cu_seqlens"] = cu_seqlens
@@ -337,8 +347,7 @@ class DebertaV3ElectraCollator:
             return
         active_tokens = int(seq_lengths.sum(dtype=torch.int32))
         batch["flash_seq_lengths"] = seq_lengths
-        batch["flash_active_tokens"] = active_tokens
-        batch[CPU_SCALAR_BATCH_KEYS.active_tokens] = torch.tensor(active_tokens, dtype=torch.int32)
+        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.active_tokens, active_tokens)
         batch["flash_mask_contract"] = "prefix"
         batch["flash_mask_contract_validated"] = True
 

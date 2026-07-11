@@ -230,6 +230,28 @@ def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_d
             )
 
 
+def _require_resume_config_match(*, label: str, saved: Any, current: Any) -> None:
+    """Reject one incompatible saved/current resume configuration pair.
+
+    :param str label: Snapshot filename used in the diagnostic.
+    :param Any saved: Normalized saved configuration value.
+    :param Any current: Normalized current configuration value.
+    :raises ValueError: If the values differ.
+    """
+
+    if saved != current:
+        kind = {
+            "model_config.json": "model",
+            "data_config.json": "data",
+            "optim_config.json": "optimizer",
+            "logging_config.json": "logging",
+        }[label]
+        raise ValueError(
+            f"Resume configuration mismatch for {label}. "
+            f"Refusing to overwrite run metadata with incompatible {kind} settings."
+        )
+
+
 def _persist_or_validate_run_configs(
     *,
     output_dir: Path,
@@ -240,7 +262,6 @@ def _persist_or_validate_run_configs(
     optim_cfg: OptimConfig | None = None,
     logging_cfg: LoggingConfig | None = None,
     resume_checkpoint: str | None,
-    resume_run_dir: Path | None = None,
     config_path: str | Path | None = None,
     is_main_process: bool,
     preflight_only: bool = False,
@@ -257,7 +278,6 @@ def _persist_or_validate_run_configs(
     :param OptimConfig optim_cfg: Current optim config.
     :param LoggingConfig logging_cfg: Current logging config.
     :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
-    :param Path | None resume_run_dir: Optional explicit source run directory for resume validation.
     :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
     :param bool preflight_only: When True, perform full validation without writing/updating files.
@@ -273,11 +293,7 @@ def _persist_or_validate_run_configs(
     source_run_dir: Path | None = None
     snapshot_dir = output_dir
     if resume_checkpoint is not None:
-        source_run_dir = (
-            resume_run_dir.expanduser().resolve()
-            if resume_run_dir is not None
-            else infer_run_dir_from_checkpoint(resume_checkpoint)
-        )
+        source_run_dir = infer_run_dir_from_checkpoint(resume_checkpoint)
         snapshot_dir = source_run_dir
 
     model_cfg_path = snapshot_dir / MODEL_CONFIG_FILENAME
@@ -341,30 +357,26 @@ def _persist_or_validate_run_configs(
         validate_optim_config(saved_optim_cfg)
         validate_logging_config(saved_logging_cfg)
 
-        if _effective_model_config_for_resume_compare(
-            saved_model_cfg
-        ) != _effective_model_config_for_resume_compare(model_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for model_config.json. "
-                "Refusing to overwrite run metadata with incompatible model settings."
-            )
-        if asdict_without_private(saved_data_cfg) != asdict_without_private(data_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for data_config.json. "
-                "Refusing to overwrite run metadata with incompatible data settings."
-            )
-        if asdict_without_private(saved_optim_cfg) != asdict_without_private(resolved_optim_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for optim_config.json. "
-                "Refusing to overwrite run metadata with incompatible optimizer settings."
-            )
-        if _effective_logging_config_for_resume_compare(
-            saved_logging_cfg
-        ) != _effective_logging_config_for_resume_compare(resolved_logging_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for logging_config.json. "
-                "Refusing to overwrite run metadata with incompatible logging settings."
-            )
+        _require_resume_config_match(
+            label="model_config.json",
+            saved=_effective_model_config_for_resume_compare(saved_model_cfg),
+            current=_effective_model_config_for_resume_compare(model_cfg),
+        )
+        _require_resume_config_match(
+            label="data_config.json",
+            saved=asdict_without_private(saved_data_cfg),
+            current=asdict_without_private(data_cfg),
+        )
+        _require_resume_config_match(
+            label="optim_config.json",
+            saved=asdict_without_private(saved_optim_cfg),
+            current=asdict_without_private(resolved_optim_cfg),
+        )
+        _require_resume_config_match(
+            label="logging_config.json",
+            saved=_effective_logging_config_for_resume_compare(saved_logging_cfg),
+            current=_effective_logging_config_for_resume_compare(resolved_logging_cfg),
+        )
 
         if source_run_dir is not None and source_run_dir != output_dir_abs:
             _validate_resume_output_snapshot_conflicts(

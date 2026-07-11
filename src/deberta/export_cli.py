@@ -25,7 +25,7 @@ from deberta.config import (
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import (
     clean_exported_config,
-    load_intersection_state_dict,
+    load_export_state_dict,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
     write_export_readme_and_license,
@@ -404,7 +404,7 @@ def _export_component(
             strict_export_load=bool(strict_export_load),
         )
 
-    incompatible = load_intersection_state_dict(
+    incompatible = load_export_state_dict(
         export_model,
         state_for_load,
         strict=bool(strict_export_load),

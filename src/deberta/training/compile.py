@@ -12,7 +12,8 @@ from typing import Any
 import torch
 
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
-from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
+from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS, FLASH_SCALAR_BATCH_KEYS
+from deberta.modeling.flash_config import flash_cfg_bool, flash_cfg_get, flash_cfg_optional_int
 from deberta.modeling.flashdeberta_kernel_tuning import (
     compute_capability_key,
     configure_flashdeberta_kernel_overrides,
@@ -24,9 +25,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
-    _flash_cfg_bool,
-    _flash_cfg_get,
-    _flash_cfg_optional_int,
     build_doc_block_mask,
     build_doc_segment_metadata,
     build_validated_prefix_lengths,
@@ -143,8 +141,8 @@ def _flash_route_hint_for_padding_batch(
         seq_len=int(seq_len),
         total_tokens=int(active_tokens),
         batch_size=int(batch_size),
-        force_varlen=_flash_cfg_bool(flash_cfg, name="force_varlen", default="0"),
-        varlen_min_seq_len=_flash_cfg_optional_int(flash_cfg, name="varlen_min_seq_len", default=None),
+        force_varlen=flash_cfg_bool(flash_cfg, name="force_varlen", default="0"),
+        varlen_min_seq_len=flash_cfg_optional_int(flash_cfg, name="varlen_min_seq_len", default=None),
         compute_capability=device_compute_capability(device) if device is not None else None,
     )
 
@@ -174,7 +172,7 @@ def _flash_route_hint_for_docblock_batch(
     :return str: Either ``docblock_bias`` or ``docblock``.
     """
 
-    override_bias_seq_len = _flash_cfg_optional_int(
+    override_bias_seq_len = flash_cfg_optional_int(
         flash_cfg,
         name="docblock_bias_seq_len",
         default=None,
@@ -292,7 +290,7 @@ def _notice_docblock_route_once(
         return
     _DOCBLOCK_ROUTE_NOTICED.add(key)
     if route_hint == "docblock_bias":
-        override_bias_seq_len = _flash_cfg_optional_int(flash_cfg, name="docblock_bias_seq_len", default=None)
+        override_bias_seq_len = flash_cfg_optional_int(flash_cfg, name="docblock_bias_seq_len", default=None)
         if override_bias_seq_len is not None:
             bounded_route = flash_route_choice(
                 policy="docblock",
@@ -346,7 +344,7 @@ def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
 
     if flash_cfg is None:
         return
-    value = _flash_cfg_get(flash_cfg, "kernel_overrides_path", None)
+    value = flash_cfg_get(flash_cfg, "kernel_overrides_path", None)
     configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
 
 
@@ -489,7 +487,7 @@ def _resolve_flash_seq_lengths_and_active_tokens(
 
     active_tokens, active_tokens_scalar = _reconcile_host_scalar_int(
         label="Flash active-token count",
-        host_value=_flash_active_tokens_host(batch.get("flash_active_tokens")),
+        host_value=_flash_active_tokens_host(batch.get(FLASH_SCALAR_BATCH_KEYS.active_tokens.host)),
         scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.active_tokens)),
         derived_value=_flash_active_tokens_from_seq_lengths(seq_lengths),
     )
@@ -503,8 +501,8 @@ def _flash_doc_segment_host_stats(batch: dict[str, Any]) -> tuple[int | None, in
     :return tuple[int | None, int | None]: Segment count and max segment length.
     """
 
-    num_segments = batch.get("flash_doc_num_segments")
-    max_seqlen = batch.get("flash_doc_max_seqlen")
+    num_segments = batch.get(FLASH_SCALAR_BATCH_KEYS.doc_num_segments.host)
+    max_seqlen = batch.get(FLASH_SCALAR_BATCH_KEYS.doc_max_seqlen.host)
     if num_segments is None and max_seqlen is None:
         return None, None
     if (
@@ -564,8 +562,8 @@ def _pop_flash_doc_segment_host_stats(batch: dict[str, Any]) -> None:
     :param dict[str, Any] batch: Batch mapping.
     """
 
-    batch.pop("flash_doc_num_segments", None)
-    batch.pop("flash_doc_max_seqlen", None)
+    batch.pop(FLASH_SCALAR_BATCH_KEYS.doc_num_segments.host, None)
+    batch.pop(FLASH_SCALAR_BATCH_KEYS.doc_max_seqlen.host, None)
     batch.pop(CPU_SCALAR_BATCH_KEYS.doc_num_segments, None)
     batch.pop(CPU_SCALAR_BATCH_KEYS.doc_max_seqlen, None)
 
@@ -576,7 +574,7 @@ def _pop_flash_active_token_stats(batch: dict[str, Any]) -> None:
     :param dict[str, Any] batch: Batch mapping.
     """
 
-    batch.pop("flash_active_tokens", None)
+    batch.pop(FLASH_SCALAR_BATCH_KEYS.active_tokens.host, None)
     batch.pop(CPU_SCALAR_BATCH_KEYS.active_tokens, None)
 
 
@@ -765,7 +763,7 @@ def prepare_flash_attention_batch_metadata(
         )
         active_tokens, active_tokens_scalar = _reconcile_host_scalar_int(
             label="Flash active-token count",
-            host_value=_flash_active_tokens_host(batch.get("flash_active_tokens")),
+            host_value=_flash_active_tokens_host(batch.get(FLASH_SCALAR_BATCH_KEYS.active_tokens.host)),
             scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.active_tokens)),
             derived_value=derived_active_tokens,
             required=True,
