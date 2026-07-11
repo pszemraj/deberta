@@ -34,6 +34,7 @@ import math
 import warnings
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -64,7 +65,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     flash_route_policy,
     flash_seq_bucket,
 )
-from deberta.modeling.flashdeberta_op_utils import BoundedLRUCache, device_compute_capability
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_padded,
@@ -82,9 +83,6 @@ from deberta.modeling.mask_utils import (
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
-_DENSE_BUCKET_INDEX_CACHE = BoundedLRUCache[tuple[int, int, int, str, int | None], torch.Tensor](
-    max_entries=8
-)
 
 
 @dataclass(frozen=True)
@@ -269,25 +267,7 @@ def _resolve_docblock_scalars(
     return active_tokens, num_segments, max_segment_length
 
 
-def _dense_bucket_index_cache_key(
-    *,
-    seq_len: int,
-    position_buckets: int,
-    max_relative_distance: int,
-    device: torch.device,
-) -> tuple[int, int, int, str, int | None]:
-    """Return the cache key for one dense bucket-index tensor.
-
-    :param int seq_len: Sequence length.
-    :param int position_buckets: Relative bucket count.
-    :param int max_relative_distance: Maximum relative distance.
-    :param torch.device device: Device for the cached tensor.
-    :return tuple[int, int, int, str, int | None]: Cache key.
-    """
-
-    return (int(seq_len), int(position_buckets), int(max_relative_distance), str(device.type), device.index)
-
-
+@lru_cache(maxsize=8)
 def _dense_bucket_index_tensor(
     *,
     seq_len: int,
@@ -313,17 +293,7 @@ def _dense_bucket_index_tensor(
     max_rel = int(max_relative_distance)
     if max_rel <= 0:
         max_rel = int(seq_len)
-    key = _dense_bucket_index_cache_key(
-        seq_len=seq_len,
-        position_buckets=position_buckets,
-        max_relative_distance=max_rel,
-        device=device,
-    )
-    cached = _DENSE_BUCKET_INDEX_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    bucket_index = (
+    return (
         _build_relative_position(
             int(seq_len),
             int(seq_len),
@@ -334,8 +304,6 @@ def _dense_bucket_index_tensor(
         .add_(int(position_buckets))
         .clamp_(0, 2 * int(position_buckets) - 1)
     )
-    _DENSE_BUCKET_INDEX_CACHE[key] = bucket_index
-    return bucket_index
 
 
 class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):

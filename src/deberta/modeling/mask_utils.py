@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Literal
 
 import torch
-
-from deberta.modeling.flashdeberta_op_utils import BoundedLRUCache
 
 _INTEGER_DTYPES = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
 
@@ -461,8 +460,26 @@ def reduce_keep_mask_to_2d(attention_mask: torch.Tensor, *, seq_len: int | None 
     return mask
 
 
-_DOC_BLOCK_EYE_CACHE = BoundedLRUCache[tuple[int, str, int | None], torch.Tensor](max_entries=8)
-_DOC_BLOCK_CLS_KEY_CACHE = BoundedLRUCache[tuple[int, str, int | None], torch.Tensor](max_entries=8)
+@lru_cache(maxsize=8)
+def _doc_block_static_masks(
+    seq_len: int,
+    device_type: str,
+    device_index: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached identity and fallback-CLS masks for one device shape.
+
+    :param int seq_len: Sequence length.
+    :param str device_type: Torch device type.
+    :param int | None device_index: Optional device index.
+    :return tuple[torch.Tensor, torch.Tensor]: Identity matrix and CLS key mask.
+    """
+
+    device = torch.device(device_type, device_index)
+    eye = torch.eye(int(seq_len), dtype=torch.bool, device=device)
+    cls_key = torch.zeros((int(seq_len),), dtype=torch.bool, device=device)
+    if int(seq_len) > 0:
+        cls_key[0] = True
+    return eye, cls_key
 
 
 def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
@@ -484,19 +501,10 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
     del batch_size
     cache_key = (seq_len, str(ids.device.type), ids.device.index)
-    eye = _DOC_BLOCK_EYE_CACHE.get(cache_key)
-    if eye is None:
-        eye = torch.eye(seq_len, dtype=torch.bool, device=ids.device)
-        _DOC_BLOCK_EYE_CACHE[cache_key] = eye
+    eye, cls_key = _doc_block_static_masks(*cache_key)
 
     keep = (keep & ~eye[None, :, :]) | (eye[None, :, :] & active[:, :, None])
 
-    cls_key = _DOC_BLOCK_CLS_KEY_CACHE.get(cache_key)
-    if cls_key is None:
-        cls_key = torch.zeros((seq_len,), dtype=torch.bool, device=ids.device)
-        if seq_len > 0:
-            cls_key[0] = True
-        _DOC_BLOCK_CLS_KEY_CACHE[cache_key] = cls_key
     keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
 
     return keep
