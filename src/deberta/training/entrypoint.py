@@ -1094,6 +1094,57 @@ def run_pretraining(
                     },
                 )
 
+        def _next_training_window(
+            *,
+            default_unweighted_token_count: float,
+        ) -> tuple[list[tuple[dict[str, torch.Tensor], float, float]], float, float]:
+            """Collect and account for one shared accumulation window.
+
+            :param float default_unweighted_token_count: Phase fallback count when token weighting is off.
+            :return tuple[list[tuple[dict[str, torch.Tensor], float, float]], float, float]:
+                Window batches plus generator/discriminator per-rank denominators.
+            """
+
+            nonlocal consumed_micro_batches
+            nonlocal local_input_tokens_seen, local_input_tokens_since_log
+            nonlocal zero_gen_window_total, zero_gen_window_since_log
+            nonlocal zero_disc_window_total, zero_disc_window_since_log
+
+            (
+                window,
+                consumed_in_window,
+                local_window_input_tokens,
+                local_gen_tokens,
+                local_disc_tokens,
+            ) = _collect_ga_window(
+                train_iter=train_iter,
+                ga_steps=ga_steps,
+                token_weighted_ga=token_weighted_ga,
+                default_unweighted_token_count=default_unweighted_token_count,
+            )
+            consumed_micro_batches += int(consumed_in_window)
+            local_input_tokens_seen += local_window_input_tokens
+            local_input_tokens_since_log += local_window_input_tokens
+            (
+                gen_window_tokens_per_rank,
+                disc_window_tokens_per_rank,
+                gen_window_zero_tokens,
+                disc_window_zero_tokens,
+            ) = _resolve_window_token_weights(
+                accelerator=accelerator,
+                token_weighted_ga=token_weighted_ga,
+                local_gen_tokens=local_gen_tokens,
+                local_disc_tokens=local_disc_tokens,
+                next_step=int(global_step + 1),
+            )
+            if gen_window_zero_tokens:
+                zero_gen_window_total += 1
+                zero_gen_window_since_log += 1
+            if disc_window_zero_tokens:
+                zero_disc_window_total += 1
+                zero_disc_window_since_log += 1
+            return window, gen_window_tokens_per_rank, disc_window_tokens_per_rank
+
         if effective_decoupled_training:
             if gen_optimizer is None or disc_optimizer is None:
                 raise RuntimeError("Decoupled training requires generator/discriminator optimizers.")
@@ -1103,38 +1154,11 @@ def run_pretraining(
             while global_step < int(train_cfg.max_steps):
                 (
                     window,
-                    consumed_in_window,
-                    local_window_input_tokens,
-                    local_gen_tokens,
-                    local_disc_tokens,
-                ) = _collect_ga_window(
-                    train_iter=train_iter,
-                    ga_steps=ga_steps,
-                    token_weighted_ga=token_weighted_ga,
-                    default_unweighted_token_count=1.0,
-                )
-                consumed_micro_batches += int(consumed_in_window)
-
-                local_input_tokens_seen += local_window_input_tokens
-                local_input_tokens_since_log += local_window_input_tokens
-                (
                     gen_window_tokens_per_rank,
                     disc_window_tokens_per_rank,
-                    gen_window_zero_tokens,
-                    disc_window_zero_tokens,
-                ) = _resolve_window_token_weights(
-                    accelerator=accelerator,
-                    token_weighted_ga=token_weighted_ga,
-                    local_gen_tokens=local_gen_tokens,
-                    local_disc_tokens=local_disc_tokens,
-                    next_step=int(global_step + 1),
+                ) = _next_training_window(
+                    default_unweighted_token_count=1.0,
                 )
-                if gen_window_zero_tokens:
-                    zero_gen_window_total += 1
-                    zero_gen_window_since_log += 1
-                if disc_window_zero_tokens:
-                    zero_disc_window_total += 1
-                    zero_disc_window_since_log += 1
 
                 disc_phase_inputs: list[dict[str, torch.Tensor | float | None]] = []
                 loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -1551,39 +1575,11 @@ def run_pretraining(
         while not effective_decoupled_training and global_step < int(train_cfg.max_steps):
             (
                 window,
-                consumed_in_window,
-                local_window_input_tokens,
-                local_gen_tokens,
-                local_disc_tokens,
-            ) = _collect_ga_window(
-                train_iter=train_iter,
-                ga_steps=ga_steps,
-                token_weighted_ga=token_weighted_ga,
-                default_unweighted_token_count=0.0,
-            )
-            consumed_micro_batches += int(consumed_in_window)
-
-            local_input_tokens_seen += local_window_input_tokens
-            local_input_tokens_since_log += local_window_input_tokens
-
-            (
                 gen_window_tokens_per_rank,
                 disc_window_tokens_per_rank,
-                gen_window_zero_tokens,
-                disc_window_zero_tokens,
-            ) = _resolve_window_token_weights(
-                accelerator=accelerator,
-                token_weighted_ga=token_weighted_ga,
-                local_gen_tokens=local_gen_tokens,
-                local_disc_tokens=local_disc_tokens,
-                next_step=int(global_step + 1),
+            ) = _next_training_window(
+                default_unweighted_token_count=0.0,
             )
-            if gen_window_zero_tokens:
-                zero_gen_window_total += 1
-                zero_gen_window_since_log += 1
-            if disc_window_zero_tokens:
-                zero_disc_window_total += 1
-                zero_disc_window_since_log += 1
 
             out = None
             loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
