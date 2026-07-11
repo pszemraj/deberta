@@ -315,56 +315,6 @@ class ModelConfig:
     rope: ModelRopeConfig = field(default_factory=ModelRopeConfig)
     dropout: ModelDropoutConfig = field(default_factory=ModelDropoutConfig)
 
-    _MOVED_KEYS = {
-        "tokenizer_name_or_path": "tokenizer.name_or_path",
-        "tokenizer_allow_vocab_resize": "tokenizer.allow_vocab_resize",
-        "tokenizer_vocab_target": "tokenizer.vocab_target",
-        "tokenizer_vocab_multiple": "tokenizer.vocab_multiple",
-        "hf_attention_kernel": "hf.attention_kernel",
-        "hf_attention_impl": "hf.attention_impl",
-        "hf_model_size": "hf.model_size",
-        "hf_max_position_embeddings": "hf.max_position_embeddings",
-        "pretrained_discriminator_path": "pretrained.discriminator_path",
-        "pretrained_generator_path": "pretrained.generator_path",
-        "generator_num_hidden_layers": "generator.num_hidden_layers",
-        "generator_hidden_size": "generator.hidden_size",
-        "generator_intermediate_size": "generator.intermediate_size",
-        "generator_num_attention_heads": "generator.num_attention_heads",
-        "hidden_size": "rope.hidden_size",
-        "num_hidden_layers": "rope.num_hidden_layers",
-        "num_attention_heads": "rope.num_attention_heads",
-        "intermediate_size": "rope.intermediate_size",
-        "hidden_act": "rope.hidden_act",
-        "rope_theta": "rope.rope_theta",
-        "rotary_pct": "rope.rotary_pct",
-        "use_absolute_position_embeddings": "rope.use_absolute_position_embeddings",
-        "max_position_embeddings": "rope.max_position_embeddings",
-        "type_vocab_size": "rope.type_vocab_size",
-        "norm_arch": "rope.norm_arch",
-        "norm_eps": "rope.norm_eps",
-        "keel_alpha_init": "rope.keel_alpha_init",
-        "keel_alpha_learnable": "rope.keel_alpha_learnable",
-        "attention_implementation": "rope.attention_implementation",
-        "ffn_type": "rope.ffn_type",
-        "use_bias": "rope.use_bias",
-        "swiglu_adjust_intermediate": "rope.swiglu_adjust_intermediate",
-        "initializer_range": "rope.initializer_range",
-        "pretrained_max_position_embeddings": "rope.pretrained.max_position_embeddings",
-        "pretrained_rope_theta": "rope.pretrained.rope_theta",
-        "pretrained_rotary_pct": "rope.pretrained.rotary_pct",
-        "pretrained_use_absolute_position_embeddings": "rope.pretrained.use_absolute_position_embeddings",
-        "pretrained_type_vocab_size": "rope.pretrained.type_vocab_size",
-        "pretrained_norm_arch": "rope.pretrained.norm_arch",
-        "pretrained_norm_eps": "rope.pretrained.norm_eps",
-        "pretrained_keel_alpha_init": "rope.pretrained.keel_alpha_init",
-        "pretrained_keel_alpha_learnable": "rope.pretrained.keel_alpha_learnable",
-        "pretrained_ffn_type": "rope.pretrained.ffn_type",
-        "pretrained_use_bias": "rope.pretrained.use_bias",
-        "pretrained_initializer_range": "rope.pretrained.initializer_range",
-        "hidden_dropout_prob": "dropout.hidden_prob",
-        "attention_probs_dropout_prob": "dropout.attention_probs_prob",
-    }
-
 
 @dataclass(frozen=True)
 class DataSourceConfig:
@@ -397,20 +347,6 @@ class DataConfig:
 
     source: DataSourceConfig = field(default_factory=DataSourceConfig)
     packing: DataPackingConfig = field(default_factory=DataPackingConfig)
-
-    _MOVED_KEYS = {
-        "dataset_name": "source.dataset_name",
-        "dataset_config_name": "source.dataset_config_name",
-        "data_files": "source.data_files",
-        "load_from_disk": "source.load_from_disk",
-        "train_split": "source.train_split",
-        "text_column_name": "source.text_column_name",
-        "streaming": "source.streaming",
-        "shuffle_buffer_size": "source.shuffle_buffer_size",
-        "pack_sequences": "packing.enabled",
-        "max_seq_length": "packing.max_seq_length",
-        "block_cross_document_attention": "packing.block_cross_document_attention",
-    }
 
 
 @dataclass(frozen=True)
@@ -475,30 +411,6 @@ class TrainConfig:
     compile: TrainCompileConfig = field(default_factory=TrainCompileConfig)
     objective: TrainObjectiveConfig = field(default_factory=TrainObjectiveConfig)
     checkpoint: TrainCheckpointConfig = field(default_factory=TrainCheckpointConfig)
-
-    _MOVED_KEYS = {
-        "dataloader_num_workers": "dataloader.num_workers",
-        "dataloader_pin_memory": "dataloader.pin_memory",
-        "torch_compile": "compile.enabled",
-        "torch_compile_mode": "compile.mode",
-        "torch_compile_scope": "compile.scope",
-        "torch_compile_backend": "compile.backend",
-        "mlm_probability": "objective.mlm_probability",
-        "mask_token_prob": "objective.mask_token_prob",
-        "random_token_prob": "objective.random_token_prob",
-        "mlm_max_ngram": "objective.mlm_max_ngram",
-        "sampling_temperature": "objective.sampling_temperature",
-        "gen_loss_weight": "objective.gen_loss_weight",
-        "disc_loss_weight": "objective.disc_loss_weight",
-        "output_dir": "checkpoint.output_dir",
-        "overwrite_output_dir": "checkpoint.overwrite_output_dir",
-        "save_steps": "checkpoint.save_steps",
-        "save_total_limit": "checkpoint.save_total_limit",
-        "resume_from_checkpoint": "checkpoint.resume_from_checkpoint",
-        "resume_data_strategy": "checkpoint.resume_data_strategy",
-        "resume_replay_max_micro_batches": "checkpoint.resume_replay_max_micro_batches",
-        "export_hf_final": "checkpoint.export_hf_final",
-    }
 
 
 @dataclass(frozen=True)
@@ -1638,8 +1550,7 @@ _TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
 def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
     """Return an actionable migration suggestion for an unknown key.
 
-    Same-section suggestions derive from each config class's moved-key table;
-    only cross-section train migrations need their own table.
+    Only cross-section train migrations and former root groups retain targeted hints.
 
     :param str section_name: Section path.
     :param str key: Unknown key.
@@ -1647,14 +1558,6 @@ def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
     """
     section = str(section_name)
     k = str(key)
-    section_maps: dict[str, dict[str, str]] = {
-        "model": ModelConfig._MOVED_KEYS,
-        "data": DataConfig._MOVED_KEYS,
-        "train": TrainConfig._MOVED_KEYS,
-    }
-    mapped = section_maps.get(section, {}).get(k)
-    if mapped is not None:
-        return f"{section}.{mapped}"
     if section == "train":
         return _TRAIN_CROSS_SECTION_SUGGESTIONS.get(k)
     if section == "root":
