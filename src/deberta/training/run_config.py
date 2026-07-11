@@ -18,10 +18,12 @@ from deberta.config import (
     load_logging_config_snapshot,
     load_model_config_snapshot,
     load_optim_config_snapshot,
+    load_train_config_snapshot,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
     validate_optim_config,
+    validate_train_config,
 )
 from deberta.run_layout import (
     DATA_CONFIG_FILENAME,
@@ -149,6 +151,12 @@ def _persist_config_yaml_snapshots(
         optim_cfg=optim_cfg,
         logging_cfg=logging_cfg,
     )
+    source_text: str | None = None
+    if config_path is not None:
+        source = Path(config_path).expanduser().resolve()
+        if source.exists():
+            source_text = source.read_text(encoding="utf-8")
+
     resolved_path = logging_output_dir / "config_resolved.yaml"
     _dump_yaml_mapping(resolved_payload, resolved_path)
 
@@ -157,9 +165,8 @@ def _persist_config_yaml_snapshots(
         _dump_yaml_mapping(resolved_payload, original_path)
         return
 
-    source = Path(config_path).expanduser().resolve()
-    if source.exists():
-        original_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    if source_text is not None:
+        original_path.write_text(source_text, encoding="utf-8")
         return
 
     # Backfill with resolved payload when source path is unavailable.
@@ -206,6 +213,32 @@ def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str
     return payload
 
 
+def _effective_train_config_for_resume_compare(cfg: TrainConfig) -> dict[str, Any]:
+    """Build a normalized train snapshot for resume compatibility checks.
+
+    Training semantics remain strict. Duration and run-local checkpoint/resume controls are
+    excluded because they do not change the restored model or optimizer update semantics.
+
+    :param TrainConfig cfg: Train config to canonicalize.
+    :return dict[str, Any]: Normalized dict payload suitable for equality checks.
+    """
+    payload = asdict_without_private(cfg)
+    defaults = asdict_without_private(TrainConfig())
+    payload["max_steps"] = defaults["max_steps"]
+    for field_name in (
+        "output_dir",
+        "overwrite_output_dir",
+        "save_steps",
+        "save_total_limit",
+        "resume_from_checkpoint",
+        "resume_data_strategy",
+        "resume_replay_max_micro_batches",
+        "export_hf_final",
+    ):
+        payload["checkpoint"][field_name] = defaults["checkpoint"][field_name]
+    return payload
+
+
 def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
     """Raise when output_dir contains conflicting copied snapshots for resume provenance.
 
@@ -243,6 +276,7 @@ def _require_resume_config_match(*, label: str, saved: Any, current: Any) -> Non
         kind = {
             "model_config.json": "model",
             "data_config.json": "data",
+            "train_config.json": "training",
             "optim_config.json": "optimizer",
             "logging_config.json": "logging",
         }[label]
@@ -298,6 +332,7 @@ def _persist_or_validate_run_configs(
 
     model_cfg_path = snapshot_dir / MODEL_CONFIG_FILENAME
     data_cfg_path = snapshot_dir / DATA_CONFIG_FILENAME
+    train_cfg_path = snapshot_dir / TRAIN_CONFIG_FILENAME
     optim_cfg_path = snapshot_dir / OPTIM_CONFIG_FILENAME
     logging_cfg_path = snapshot_dir / LOGGING_CONFIG_FILENAME
     run_meta_path = snapshot_dir / RUN_METADATA_FILENAME
@@ -317,13 +352,15 @@ def _persist_or_validate_run_configs(
     has_saved_required = (
         model_cfg_path.exists()
         and data_cfg_path.exists()
+        and train_cfg_path.exists()
         and optim_cfg_path.exists()
         and logging_cfg_path.exists()
     )
     if resume_checkpoint is not None and not has_saved_required:
         raise ValueError(
             "Resume checkpoint source run directory is missing required config snapshots. "
-            "Expected model_config.json, data_config.json, optim_config.json, and logging_config.json under "
+            "Expected model_config.json, data_config.json, train_config.json, optim_config.json, and "
+            "logging_config.json under "
             f"{snapshot_dir}."
         )
     if resume_checkpoint is not None and has_saved_required:
@@ -345,6 +382,9 @@ def _persist_or_validate_run_configs(
         saved_data_cfg = load_data_config_snapshot(
             load_json_mapping(data_cfg_path), source=str(data_cfg_path)
         )
+        saved_train_cfg = load_train_config_snapshot(
+            load_json_mapping(train_cfg_path), source=str(train_cfg_path)
+        )
         saved_optim_cfg = load_optim_config_snapshot(
             load_json_mapping(optim_cfg_path), source=str(optim_cfg_path)
         )
@@ -354,6 +394,7 @@ def _persist_or_validate_run_configs(
         )
         validate_model_config(saved_model_cfg)
         validate_data_config(saved_data_cfg)
+        validate_train_config(saved_train_cfg)
         validate_optim_config(saved_optim_cfg)
         validate_logging_config(saved_logging_cfg)
 
@@ -366,6 +407,11 @@ def _persist_or_validate_run_configs(
             label="data_config.json",
             saved=asdict_without_private(saved_data_cfg),
             current=asdict_without_private(data_cfg),
+        )
+        _require_resume_config_match(
+            label="train_config.json",
+            saved=_effective_train_config_for_resume_compare(saved_train_cfg),
+            current=_effective_train_config_for_resume_compare(train_cfg),
         )
         _require_resume_config_match(
             label="optim_config.json",
@@ -456,6 +502,7 @@ __all__ = [
     "_build_run_metadata",
     "_dump_yaml_mapping",
     "_effective_model_config_for_resume_compare",
+    "_effective_train_config_for_resume_compare",
     "_persist_config_yaml_snapshots",
     "_persist_or_validate_run_configs",
     "_resolved_config_payload",

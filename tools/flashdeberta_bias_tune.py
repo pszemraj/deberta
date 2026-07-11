@@ -53,7 +53,6 @@ def main() -> None:
         str(args.config),
         [
             "logging.wandb.enabled=false",
-            "logging.backend=none",
             "train.checkpoint.export_hf_final=false",
             "model.hf.attention_impl=flash",
             "data.packing.enabled=true",

@@ -4,6 +4,7 @@ import dataclasses
 import gzip
 import json
 import logging
+import random
 import re
 import sys
 import types
@@ -12,6 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from _config_factories import (
@@ -76,7 +78,11 @@ from deberta.training.compile import (
     _resolve_compile_scope,
     _stabilize_compile_attention_mask,
 )
-from deberta.training.entrypoint import run_pretraining_dry_run
+from deberta.training.entrypoint import (
+    _restore_checkpoint_rng_state_or_raise,
+    _resume_optimizer_lrs_are_all_zero,
+    run_pretraining_dry_run,
+)
 from deberta.training.export_helpers import _export_discriminator_hf_subprocess
 from deberta.training.loop_utils import (
     _count_input_tokens_for_batch,

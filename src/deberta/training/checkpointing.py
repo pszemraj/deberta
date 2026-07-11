@@ -62,7 +62,7 @@ def _save_periodic_checkpoint_if_due(
     gradient_accumulation_steps: int,
     last_saved_step: int,
 ) -> int:
-    """Persist a periodic checkpoint when ``global_step`` hits ``train.save_steps``.
+    """Persist a periodic checkpoint when ``global_step`` hits ``train.checkpoint.save_steps``.
 
     :param Any accelerator: Accelerator runtime.
     :param TrainConfig train_cfg: Training config.

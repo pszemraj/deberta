@@ -360,7 +360,6 @@ def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.Mon
     "argv",
     [
         ["train", "--model.rope.norm_arch", "invalid"],
-        ["train", "--logging.backend", "invalid"],
     ],
 )
 def test_train_cli_rejects_invalid_constrained_values_at_parse_time(argv: list[str]):
@@ -493,6 +492,17 @@ def test_validate_data_config_warns_on_long_context_dense_doc_blocking():
         )
 
 
+@pytest.mark.parametrize("seed", [-1, 2**32])
+def test_validate_train_config_rejects_seed_outside_accelerate_range(seed: int) -> None:
+    with pytest.raises(ValueError, match=r"train.seed must be between 0 and 2\*\*32 - 1"):
+        validate_train_config(make_train_config(seed=seed))
+
+
+@pytest.mark.parametrize("seed", [0, 2**32 - 1])
+def test_validate_train_config_accepts_seed_boundaries(seed: int) -> None:
+    validate_train_config(make_train_config(seed=seed))
+
+
 def test_validate_training_workflow_options_rejects_flash_with_packing():
     with pytest.raises(
         ValueError, match="train.sdpa_kernel=flash is not supported with data.packing.enabled=true"
@@ -549,6 +559,20 @@ def test_validate_training_workflow_options_allows_hf_backbone_doc_blocking_when
             ),
             train_cfg=make_train_config(sdpa_kernel="flash"),
             model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
+        )
+
+
+def test_validate_training_workflow_options_rejects_flashdeberta_without_bf16() -> None:
+    with pytest.raises(ValueError, match="attention_impl='flash'.*mixed_precision='bf16'"):
+        validate_training_workflow_options(
+            data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+            train_cfg=make_train_config(mixed_precision="no"),
+            model_cfg=make_model_config(
+                backbone_type="hf_deberta_v2",
+                hf_attention_impl="flash",
+                hidden_dropout_prob=0.0,
+                attention_probs_dropout_prob=0.0,
+            ),
         )
 
 
@@ -830,7 +854,7 @@ def test_validate_model_config_inert_param_warnings(cfg_kwargs, expect_warn):
         # 1D: compile=false + non-default backend → warn
         ({"torch_compile": False, "torch_compile_backend": "aot_eager"}, True),
         # 1D: report_to!=wandb + non-default watch mode → warn
-        ({"report_to": "tensorboard", "wandb_watch": "all"}, True),
+        ({"report_to": "none", "wandb_watch": "all"}, True),
         # 1D: report_to!=wandb + non-default watch freq → warn
         ({"report_to": "none", "wandb_watch_log_freq": 7}, True),
         # 1D: compile=false + auto scope → no warn

@@ -61,7 +61,7 @@ def _resolve_output_dir(
     :return Path: Concrete output directory path.
     """
     if output_dir is not None and str(output_dir).strip():
-        return Path(str(output_dir))
+        return Path(str(output_dir)).expanduser().resolve()
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name_hint = str(run_name).strip() if run_name is not None else ""
@@ -71,7 +71,7 @@ def _resolve_output_dir(
         name_hint = "run"
     run_name = _sanitize_run_label(name_hint)
     project = _sanitize_run_label(project_name)
-    return Path("runs") / project / f"{stamp}_{run_name}"
+    return (Path("runs") / project / f"{stamp}_{run_name}").resolve()
 
 
 def _broadcast_rank0_payload(
@@ -128,7 +128,7 @@ def _resolve_output_dir_for_accelerator(
     """
     explicit = output_dir is not None and str(output_dir).strip()
     if explicit:
-        return Path(str(output_dir))
+        return Path(str(output_dir)).expanduser().resolve()
 
     num_processes = int(getattr(accelerator, "num_processes", 1))
     if num_processes <= 1:
@@ -158,7 +158,7 @@ def _resolve_output_dir_for_accelerator(
     )
     if resolved is None or not str(resolved).strip():
         raise RuntimeError("Broadcasted output_dir is empty in distributed auto-output-dir resolution.")
-    return Path(str(resolved))
+    return Path(str(resolved)).expanduser().resolve()
 
 
 def _resolve_resume_checkpoint_for_accelerator(
@@ -390,12 +390,12 @@ def _resolve_resume_checkpoint(
         checkpoint_path = Path(resume_value).expanduser()
         if not checkpoint_path.exists():
             raise FileNotFoundError(
-                "train.resume_from_checkpoint was provided but the checkpoint path does not exist: "
+                "train.checkpoint.resume_from_checkpoint was provided but the checkpoint path does not exist: "
                 f"{checkpoint_path}"
             )
         if not checkpoint_path.is_dir():
             raise ValueError(
-                "train.resume_from_checkpoint must point to a checkpoint directory. "
+                "train.checkpoint.resume_from_checkpoint must point to a checkpoint directory. "
                 f"Got a non-directory path: {checkpoint_path}"
             )
         status = _classify_checkpoint(checkpoint_path)
@@ -424,7 +424,7 @@ def _resolve_resume_checkpoint(
             raise ValueError(
                 "resume_from_checkpoint=auto was requested but no checkpoint-* directories were found in "
                 f"non-empty output_dir={output_dir}. Clean the directory, enable "
-                "train.overwrite_output_dir=true, or provide an explicit checkpoint path."
+                "train.checkpoint.overwrite_output_dir=true, or provide an explicit checkpoint path."
             )
         if is_main_process:
             logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
@@ -656,7 +656,8 @@ def _prepare_output_dir(
         allow_nonempty=bool(overwrite_output_dir) or bool(resume_value),
         nonempty_error=(
             f"Output directory exists and is not empty: {output_dir}. "
-            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+            "Set train.checkpoint.overwrite_output_dir=true or set "
+            "train.checkpoint.resume_from_checkpoint."
         ),
         nondir_error=f"Output directory exists and is not a directory: {output_dir}",
     )

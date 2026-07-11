@@ -57,7 +57,8 @@ def load_hf_dataset(cfg: DataConfig) -> Any:
     if source.load_from_disk:
         if source.streaming:
             raise ValueError(
-                "--streaming true is not compatible with --load_from_disk. Set --streaming false."
+                "data.source.streaming=true is not compatible with data.source.load_from_disk. "
+                "Set data.source.streaming=false."
             )
         ds = call_with_dataset_retry(
             lambda: datasets.load_from_disk(source.load_from_disk),
@@ -107,6 +108,7 @@ def load_hf_dataset(cfg: DataConfig) -> Any:
         )
 
     raise ValueError(
-        "No dataset source provided. Specify one of: --load_from_disk, --dataset_name, --data_files. "
+        "No dataset source provided. Set one of data.source.load_from_disk, "
+        "data.source.dataset_name, or data.source.data_files. "
         f"Config was: {asdict(cfg)}"
     )

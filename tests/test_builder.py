@@ -940,7 +940,7 @@ def test_build_backbone_configs_scratch_rejects_vocab_growth_without_resize_perm
         tokenizer_allow_vocab_resize=False,
         tokenizer_vocab_target=640,
     )
-    with pytest.raises(ValueError, match="tokenizer_allow_vocab_resize=false"):
+    with pytest.raises(ValueError, match=r"model\.tokenizer\.allow_vocab_resize=false"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=DummyTokenizer(vocab_size=500),
@@ -985,7 +985,7 @@ def test_build_backbone_configs_pretrained_hf_rejects_vocab_multiple_if_it_excee
         tokenizer_allow_vocab_resize=True,
         tokenizer_vocab_multiple=128,
     )
-    with pytest.raises(ValueError, match="tokenizer_vocab_multiple"):
+    with pytest.raises(ValueError, match=r"model\.tokenizer\.vocab_multiple"):
         _ = builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=DummyTokenizer(vocab_size=489),

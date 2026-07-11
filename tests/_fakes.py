@@ -608,7 +608,15 @@ def setup_pretraining_mocks(
     fake_transformers.AutoTokenizer = AutoTokenizerStub
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
+    # Integration tests replace Accelerate's tracker with ``FakeAccelerator`` and must not
+    # require the optional W&B dependency merely to exercise W&B-enabled config paths.
+    fake_wandb = _types.ModuleType("wandb")
+    fake_wandb.run = None
+    fake_wandb.save = None
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
     monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
+    monkeypatch.setattr(entrypoint_mod, "_restore_checkpoint_rng_state_or_raise", lambda **_kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda _cfg: [{"text": "hello"}])

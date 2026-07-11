@@ -43,7 +43,6 @@ Documentation = "https://github.com/pszemraj/deberta/tree/main/docs"
 [project.optional-dependencies]
 # Logging
 wandb = ["wandb>=0.17.0"]
-tensorboard = ["tensorboard>=2.16.0"]
 flash = ["flashdeberta==0.0.7", "triton"]
 
 # Dev quality-of-life

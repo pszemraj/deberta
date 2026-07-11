@@ -3,18 +3,21 @@ from _config_and_training_shared_imports import *
 from _fakes import make_checkpoint_saver
 
 
-def _write_resume_source_snapshots(run_dir: Path) -> None:
+def _write_resume_source_snapshots(run_dir: Path, *, train_cfg: TrainConfig) -> None:
     """Write minimal config snapshots required for strict resume validation."""
     model_cfg = make_model_config()
     data_cfg = make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy")
-    train_cfg = make_train_config()
+    source_train_cfg = dataclasses.replace(
+        train_cfg,
+        checkpoint=dataclasses.replace(train_cfg.checkpoint, resume_from_checkpoint=None),
+    )
     optim_cfg = make_optim_config()
     logging_cfg = make_logging_config(output_dir=str(run_dir))
     _persist_or_validate_run_configs(
         output_dir=run_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
-        train_cfg=train_cfg,
+        train_cfg=source_train_cfg,
         optim_cfg=optim_cfg,
         logging_cfg=logging_cfg,
         resume_checkpoint=None,
@@ -26,7 +29,6 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
     checkpoint_dir = mock_checkpoint(root=tmp_path / "run", name="checkpoint-2", consumed_micro_batches=50)
-    _write_resume_source_snapshots(checkpoint_dir.parent)
 
     replay_calls = {"next": 0}
 
@@ -56,6 +58,7 @@ def test_run_pretraining_resume_at_max_steps_skips_data_replay(
         export_hf_final=False,
         resume_from_checkpoint=str(checkpoint_dir),
     )
+    _write_resume_source_snapshots(checkpoint_dir.parent, train_cfg=train_cfg)
 
     pretrain_mod.run_pretraining(
         model_cfg=make_model_config(),
@@ -69,7 +72,6 @@ def test_run_pretraining_resume_requires_data_state_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint
 ) -> None:
     checkpoint_dir = mock_checkpoint(root=tmp_path / "run", name="checkpoint-2", with_data_state=False)
-    _write_resume_source_snapshots(checkpoint_dir.parent)
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
     train_cfg = make_train_config(
@@ -86,6 +88,7 @@ def test_run_pretraining_resume_requires_data_state_json(
         export_hf_final=False,
         resume_from_checkpoint=str(checkpoint_dir),
     )
+    _write_resume_source_snapshots(checkpoint_dir.parent, train_cfg=train_cfg)
 
     with pytest.raises(ValueError, match="missing/invalid data_state.json"):
         pretrain_mod.run_pretraining(
@@ -104,7 +107,6 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
         consumed_micro_batches=2,
         data_state_extra={"global_step": 1},
     )
-    _write_resume_source_snapshots(checkpoint_dir.parent)
     pretrain_mod = setup_pretraining_mocks(monkeypatch)
 
     train_cfg = make_train_config(
@@ -121,6 +123,7 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
         export_hf_final=False,
         resume_from_checkpoint=str(checkpoint_dir),
     )
+    _write_resume_source_snapshots(checkpoint_dir.parent, train_cfg=train_cfg)
 
     with pytest.raises(RuntimeError, match="Checkpoint step mismatch on resume"):
         pretrain_mod.run_pretraining(
@@ -168,7 +171,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         model_cfg=make_model_config(),
         data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
-        logging_cfg=make_logging_config(backend="tensorboard", logging_steps=1),
+        logging_cfg=make_logging_config(report_to="wandb", wandb_watch="none", logging_steps=1),
     )
 
     accel = FakeAccelerator.last_instance
@@ -182,6 +185,37 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert "gen_token_count" not in metrics
     assert "disc_token_count" not in metrics
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
+
+
+def test_run_pretraining_keeps_resolved_yaml_roundtrippable_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pretrain_mod = setup_pretraining_mocks(monkeypatch, accelerator_cls=FakeAccelerator)
+    output_dir = tmp_path / "run"
+    model_cfg = make_model_config(backbone_type="rope", hidden_size=64, num_attention_heads=4)
+    data_cfg = make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy")
+    train_cfg = make_train_config(
+        output_dir=str(output_dir),
+        max_steps=1,
+        save_steps=0,
+        mixed_precision="no",
+        tf32=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        torch_compile=False,
+        export_hf_final=False,
+    )
+
+    pretrain_mod.run_pretraining(model_cfg=model_cfg, data_cfg=data_cfg, train_cfg=train_cfg)
+
+    resolved_cfg = load_config(output_dir / "config_resolved.yaml")
+    saved_model_cfg = load_model_config_snapshot(
+        json.loads((output_dir / "model_config.json").read_text(encoding="utf-8")),
+        source=str(output_dir / "model_config.json"),
+    )
+    assert dataclasses.asdict(resolved_cfg.model) == dataclasses.asdict(saved_model_cfg)
 
 
 @pytest.mark.parametrize(
@@ -352,7 +386,8 @@ def test_run_pretraining_decoupled_integration(
         data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
         logging_cfg=make_logging_config(
-            backend="tensorboard" if scenario == "steps_and_sync" else "none",
+            report_to="wandb" if scenario == "steps_and_sync" else "none",
+            **({"wandb_watch": "none"} if scenario == "steps_and_sync" else {}),
             logging_steps=1 if scenario == "steps_and_sync" else 0,
         ),
     )
@@ -671,7 +706,8 @@ def _run_zero_token_weighted_case(
         data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
         train_cfg=train_cfg,
         logging_cfg=make_logging_config(
-            backend="tensorboard",
+            report_to="wandb",
+            wandb_watch="none",
             logging_steps=1,
             debug={"metrics": bool(debug_metrics)},
         ),
@@ -1087,6 +1123,45 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
         )
 
 
+@pytest.mark.parametrize(
+    "changed_train",
+    [
+        make_train_config(seed=43),
+        make_train_config(per_device_train_batch_size=8),
+        make_train_config(mixed_precision="no"),
+        make_train_config(mlm_probability=0.2),
+        make_train_config(torch_compile=True),
+    ],
+)
+def test_persist_or_validate_run_configs_rejects_resume_training_semantic_mismatch(
+    tmp_path: Path,
+    changed_train: TrainConfig,
+) -> None:
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    base_train = make_train_config()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=base_train,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    with pytest.raises(ValueError, match="Resume configuration mismatch for train_config.json"):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=changed_train,
+            resume_checkpoint=str(out / "checkpoint-10"),
+            is_main_process=True,
+        )
+
+
 def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_resume(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -1354,6 +1429,29 @@ def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
     assert loaded_resolved.model.backbone_type == model_cfg.backbone_type
     assert loaded_resolved.data.source.dataset_name == data_cfg.source.dataset_name
     assert loaded_resolved.train.max_steps == train_cfg.max_steps
+
+
+def test_persist_or_validate_run_configs_preserves_source_when_source_is_resolved_path(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    resolved_path = out / "config_resolved.yaml"
+    source_text = "model:\n  backbone_type: rope\ntrain:\n  max_steps: 7\n"
+    resolved_path.write_text(source_text, encoding="utf-8")
+
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=make_model_config(backbone_type="rope"),
+        data_cfg=make_data_config(dataset_name="HuggingFaceFW/fineweb-edu"),
+        train_cfg=make_train_config(max_steps=9),
+        config_path=resolved_path,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    assert (out / "config_original.yaml").read_text(encoding="utf-8") == source_text
+    assert load_config(resolved_path).train.max_steps == 9
 
 
 def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matching_resume(tmp_path: Path):

@@ -89,7 +89,6 @@ logging:
   run_name: null
   output_dir: null
   logging_steps: 5
-  backend: none
   wandb:
     enabled: false
     watch: gradients

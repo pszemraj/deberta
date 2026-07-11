@@ -181,9 +181,31 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
 
 
 def test_config_reference_loads() -> None:
-    cfg = load_config(REPO_ROOT / "configs" / "config-reference.yaml")
+    cfg = load_config(REPO_ROOT / "configs" / "config_reference.yaml")
     assert cfg.model.backbone_type == "hf_deberta_v2"
     assert cfg.data.source.dataset_name == "HuggingFaceFW/fineweb-edu"
+
+
+def test_yaml_duplicate_keys_fail_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "duplicate.yaml"
+    config_path.write_text(
+        "data:\n  source:\n    dataset_name: text\n    dataset_name: other\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"duplicate key 'dataset_name'"):
+        load_config(config_path)
+
+
+def test_json_duplicate_keys_fail_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "duplicate.json"
+    config_path.write_text(
+        '{"data": {"source": {"dataset_name": "text", "dataset_name": "other"}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"Duplicate JSON key 'dataset_name'"):
+        load_config(config_path)
 
 
 @pytest.mark.parametrize(

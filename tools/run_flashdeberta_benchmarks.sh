@@ -159,7 +159,6 @@ train_case() {
         --train.checkpoint.output_dir "${output_dir}" \
         --train.checkpoint.overwrite_output_dir true \
         --logging.output_dir "${output_dir}" \
-        --logging.backend none \
         --logging.wandb.enabled false \
         --train.checkpoint.export_hf_final false \
         --train.checkpoint.save_steps 1000000 \

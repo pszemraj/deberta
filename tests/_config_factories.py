@@ -161,5 +161,6 @@ def make_logging_config(**overrides: Any) -> LoggingConfig:
     if report_to is None:
         return config
     target = str(report_to).lower()
-    config = _replace_path(config, "wandb.enabled", target == "wandb")
-    return replace(config, backend="none" if target == "wandb" else target)
+    if target not in {"none", "wandb"}:
+        raise ValueError(f"Unsupported test tracker target: {target}")
+    return _replace_path(config, "wandb.enabled", target == "wandb")

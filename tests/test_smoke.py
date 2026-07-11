@@ -65,6 +65,28 @@ def test_packed_streaming_marks_internal_sep_as_special():
             assert stm[i] == 1
 
 
+def test_packed_hf_streaming_single_shard_tolerates_extra_dataloader_workers() -> None:
+    datasets = pytest.importorskip("datasets")
+    raw = datasets.Dataset.from_dict(
+        {"text": ["one two three four five six seven eight"] * 8}
+    ).to_iterable_dataset(num_shards=1)
+    dataset = PackedStreamingDataset(
+        hf_dataset=raw,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+        ),
+    )
+
+    rows = list(torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2))
+
+    assert rows
+    assert all(len(row["input_ids"]) == 8 for row in rows)
+
+
 def test_docblock_streaming_gives_every_segment_its_own_cls() -> None:
     tok = DummyTokenizer(vocab_size=64)
     ds = PackedStreamingDataset(

@@ -7,7 +7,7 @@
 
 ## Guides
 
-- complete runnable YAML config contract: [Config reference](../configs/config-reference.yaml)
+- complete runnable YAML config contract: [Config reference](../configs/config_reference.yaml)
 - streaming packing, doc-block masking, and collator behavior: [Guides / Data Pipeline](guides/data-pipeline.md)
 - checkpoint consolidation and Hugging Face export: [Guides / Exporting Models](guides/exporting-models.md)
 

@@ -72,7 +72,7 @@ Per-call eager fallbacks preserve semantics:
 
 All route and override fields live under `model.hf.flash.*`. Their exact null, zero, and
 exact-length semantics are defined on each field in the
-[config reference](../../configs/config-reference.yaml).
+[config reference](../../configs/config_reference.yaml).
 
 An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to
 the dense memory cost. `kernel_overrides_path` is loaded at route lookup time, so a missing or

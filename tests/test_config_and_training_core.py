@@ -43,7 +43,6 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
                 "  scheduler:",
                 "    warmup_steps: 222",
                 "logging:",
-                "  backend: none",
                 "  wandb:",
                 "    enabled: true",
                 "    watch: all",
@@ -231,13 +230,65 @@ def test_resolve_output_dir_auto_prefers_run_name():
     assert re.fullmatch(r"\d{8}_\d{6}_my-run", out.name) is not None
 
 
-def test_resolve_output_dir_keeps_explicit_path():
+def test_resume_optimizer_lrs_are_all_zero_requires_active_all_zero_groups() -> None:
+    first = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=0.0)
+    second = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=0.0)
+    assert _resume_optimizer_lrs_are_all_zero((first, second)) is True
+
+    second.param_groups[0]["lr"] = 1e-4
+    assert _resume_optimizer_lrs_are_all_zero((first, second)) is False
+    assert _resume_optimizer_lrs_are_all_zero((first, None)) is True
+    assert _resume_optimizer_lrs_are_all_zero((None,)) is False
+
+
+def test_restore_checkpoint_rng_state_or_raise_restores_cpu_streams(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    python_rng = random.Random(17)
+    numpy_rng = np.random.RandomState(17)
+    torch_rng = torch.Generator().manual_seed(17)
+    torch.save(
+        {
+            "random_state": python_rng.getstate(),
+            "numpy_random_seed": numpy_rng.get_state(),
+            "torch_manual_seed": torch_rng.get_state(),
+        },
+        checkpoint / "random_states_0.pkl",
+    )
+    expected_python = python_rng.random()
+    expected_numpy = float(numpy_rng.random_sample())
+    expected_torch = float(torch.rand((), generator=torch_rng).item())
+
+    _restore_checkpoint_rng_state_or_raise(
+        checkpoint_dir=checkpoint,
+        process_index=0,
+        device=torch.device("cpu"),
+    )
+
+    assert random.random() == expected_python
+    assert float(np.random.random_sample()) == expected_numpy
+    assert float(torch.rand(()).item()) == expected_torch
+
+
+def test_restore_checkpoint_rng_state_or_raise_rejects_missing_state(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+
+    with pytest.raises(RuntimeError, match="Exact resume could not restore required RNG state"):
+        _restore_checkpoint_rng_state_or_raise(
+            checkpoint_dir=checkpoint,
+            process_index=0,
+            device=torch.device("cpu"),
+        )
+
+
+def test_resolve_output_dir_normalizes_explicit_path():
     out = _resolve_output_dir(
         output_dir="runs/custom/run-01",
         project_name="ignored",
         config_path="configs/pretrain_rope_fineweb_edu.yaml",
     )
-    assert out == Path("runs/custom/run-01")
+    assert out == Path("runs/custom/run-01").resolve()
 
 
 def _accel_stub(*, is_main_process: bool, num_processes: int) -> Any:
@@ -248,7 +299,7 @@ def _accel_stub(*, is_main_process: bool, num_processes: int) -> Any:
     )
 
 
-def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
+def test_resolve_output_dir_for_accelerator_normalizes_explicit_path():
     called = {"count": 0}
 
     def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
@@ -262,7 +313,7 @@ def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
         config_path="cfg.yaml",
         broadcast_fn=_fake_broadcast,
     )
-    assert out == Path("runs/custom/run-02")
+    assert out == Path("runs/custom/run-02").resolve()
     assert called["count"] == 0
 
 
@@ -278,7 +329,7 @@ def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
         config_path="cfg.yaml",
         broadcast_fn=_fake_broadcast,
     )
-    assert out == Path("runs/demo/20260101_010101_shared")
+    assert out == Path("runs/demo/20260101_010101_shared").resolve()
 
 
 def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tmp_path: Path):
@@ -883,7 +934,7 @@ def test_flush_loggers_suppresses_handler_flush_errors() -> None:
     assert bad_handler.flush_calls >= 1
 
 
-def test_init_trackers_passes_wandb_name_with_wrapped_signature() -> None:
+def test_init_trackers_passes_wandb_name_and_logging_dir_with_wrapped_signature(tmp_path: Path) -> None:
     class _WrappedAccelerator:
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
@@ -899,12 +950,16 @@ def test_init_trackers_passes_wandb_name_with_wrapped_signature() -> None:
         tracker_cfg={"a": 1},
         report_to="wandb",
         run_name="demo-run",
+        logging_dir=tmp_path,
     )
 
     assert accel.calls
     first = accel.calls[0]
     assert first["project_name"] == "demo-project"
     assert first["init_kwargs"]["wandb"]["name"] == "demo-run"
+    assert first["init_kwargs"]["wandb"]["dir"] == str(tmp_path.resolve())
+    assert first["init_kwargs"]["wandb"]["config"] == {"a": 1}
+    assert "config" not in first
 
 
 def test_setup_wandb_watch_calls_watch_with_mode_and_frequency() -> None:
@@ -1187,6 +1242,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     first_tracker_call = accel.tracker_init_calls[0]
     assert first_tracker_call["project_name"] == "deberta-train"
     assert first_tracker_call["init_kwargs"]["wandb"]["name"] == "run"
+    assert first_tracker_call["init_kwargs"]["wandb"]["config"]
     assert accel.ended is False
 
 

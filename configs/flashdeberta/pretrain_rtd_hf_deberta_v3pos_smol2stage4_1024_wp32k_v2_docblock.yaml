@@ -89,7 +89,6 @@ logging:
   run_name: hfv2-base-1024-gdes-50k-v2-docblock
   output_dir: null
   logging_steps: 50
-  backend: none
   wandb:
     enabled: true
     watch: gradients

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import inspect
 import logging
+import random
 import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -54,7 +56,7 @@ from deberta.training.metrics import (
     _flush_loggers,
     _write_nonfinite_debug_artifact,
 )
-from deberta.training.run_config import _dump_yaml_mapping, _persist_or_validate_run_configs
+from deberta.training.run_config import _persist_or_validate_run_configs
 from deberta.training.run_management import (
     _load_checkpoint_progress_metadata,
     _parse_checkpoint_step,
@@ -95,6 +97,65 @@ from deberta.utils.log import setup_process_logging
 from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _resume_optimizer_lrs_are_all_zero(
+    optimizers: tuple[torch.optim.Optimizer | None, ...],
+) -> bool:
+    """Return whether every active optimizer group has a zero learning rate.
+
+    :param tuple[torch.optim.Optimizer | None, ...] optimizers: Restored optimizers to inspect.
+    :return bool: True when at least one group exists and all group learning rates are zero.
+    """
+    learning_rates = [
+        float(group["lr"])
+        for optimizer in optimizers
+        if optimizer is not None
+        for group in optimizer.param_groups
+    ]
+    return bool(learning_rates) and all(lr == 0.0 for lr in learning_rates)
+
+
+def _restore_checkpoint_rng_state_or_raise(
+    *,
+    checkpoint_dir: str | Path,
+    process_index: int,
+    device: torch.device,
+) -> None:
+    """Restore required RNG streams from an Accelerate checkpoint or fail exact resume.
+
+    Accelerate 1.10 suppresses RNG-load exceptions after partially restoring state. Reapply the
+    checkpoint explicitly so exact resume cannot silently continue without a required RNG stream.
+
+    :param str | Path checkpoint_dir: Committed checkpoint directory.
+    :param int process_index: Distributed process index used in the RNG filename.
+    :param torch.device device: Active training device.
+    :raises RuntimeError: If required RNG state is missing or cannot be restored.
+    """
+    rng_path = Path(checkpoint_dir) / f"random_states_{int(process_index)}.pkl"
+    try:
+        from accelerate.utils import load
+
+        states = load(rng_path)
+        required = {"random_state", "numpy_random_seed", "torch_manual_seed"}
+        missing = sorted(required.difference(states))
+        if missing:
+            raise KeyError(f"missing keys: {missing}")
+        random.setstate(states["random_state"])
+        np.random.set_state(states["numpy_random_seed"])
+        torch.set_rng_state(states["torch_manual_seed"])
+        if device.type == "cuda":
+            cuda_states = states.get("torch_cuda_manual_seed")
+            if cuda_states is None:
+                raise KeyError("missing key: torch_cuda_manual_seed")
+            torch.cuda.set_rng_state_all(cuda_states)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Exact resume could not restore required RNG state from {rng_path}. "
+            "Use a complete checkpoint created for the same device topology."
+        ) from exc
+
+    logger.info("Restored and verified checkpoint RNG state: %s", rng_path)
 
 
 def _flash_attention_enabled_for_runtime(model_cfg: ModelConfig) -> bool:
@@ -197,7 +258,7 @@ def run_pretraining_dry_run(
     This validates configuration contracts and probes core runtime dependencies
     (tokenizer, dataset access, collator output, model config construction)
     without starting optimization/training loops. It may access network sources and populate
-    dependency caches; see ``configs/config-reference.yaml``.
+    dependency caches; see ``configs/config_reference.yaml``.
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
@@ -226,7 +287,7 @@ def run_pretraining_dry_run(
         run_name=resolved_logging_cfg.run_name,
     )
     logging_output_dir = (
-        Path(str(resolved_logging_cfg.output_dir))
+        Path(str(resolved_logging_cfg.output_dir)).expanduser().resolve()
         if resolved_logging_cfg.output_dir is not None and str(resolved_logging_cfg.output_dir).strip()
         else checkpoint_output_dir
     )
@@ -237,7 +298,8 @@ def run_pretraining_dry_run(
     )
     if bool(train_cfg.checkpoint.overwrite_output_dir) and bool(resume_hint):
         raise ValueError(
-            "train.overwrite_output_dir=true cannot be combined with train.resume_from_checkpoint. "
+            "train.checkpoint.overwrite_output_dir=true cannot be combined with "
+            "train.checkpoint.resume_from_checkpoint. "
             "Overwrite would delete checkpoints before resume. Disable overwrite or unset resume."
         )
     validate_existing_output_dir(
@@ -245,7 +307,8 @@ def run_pretraining_dry_run(
         allow_nonempty=bool(train_cfg.checkpoint.overwrite_output_dir) or bool(resume_hint),
         nonempty_error=(
             f"Output directory exists and is not empty: {checkpoint_output_dir}. "
-            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+            "Set train.checkpoint.overwrite_output_dir=true or set "
+            "train.checkpoint.resume_from_checkpoint."
         ),
         nondir_error=f"Output directory exists and is not a directory: {checkpoint_output_dir}",
     )
@@ -292,7 +355,7 @@ def run_pretraining_dry_run(
         tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
     except Exception as exc:
         raise RuntimeError(
-            "Failed to load tokenizer from model.tokenizer_name_or_path="
+            "Failed to load tokenizer from model.tokenizer.name_or_path="
             f"{model_cfg.tokenizer.name_or_path!r}."
         ) from exc
     if tokenizer.pad_token_id is None:
@@ -305,8 +368,9 @@ def run_pretraining_dry_run(
         raw_train = load_hf_dataset(data_cfg)
     except Exception as exc:
         raise RuntimeError(
-            "Failed to load dataset for dry-run preflight. Check data.dataset_name/data_files/load_from_disk, "
-            "split, and network/auth settings."
+            "Failed to load dataset for dry-run preflight. Check data.source.dataset_name, "
+            "data.source.data_files, data.source.load_from_disk, data.source.train_split, and "
+            "network/auth settings."
         ) from exc
 
     train_dataset, collator = _build_train_dataset_and_collator(
@@ -397,11 +461,15 @@ def run_pretraining(
 
     resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
     resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
-    report_to = (
-        "wandb"
-        if bool(resolved_logging_cfg.wandb.enabled)
-        else str(resolved_logging_cfg.backend).strip().lower()
-    )
+    report_to = "wandb" if bool(resolved_logging_cfg.wandb.enabled) else "none"
+    if report_to == "wandb":
+        try:
+            __import__("wandb")
+        except Exception as exc:
+            raise RuntimeError(
+                "logging.wandb.enabled=true requires the W&B dependency. "
+                "Install it with `pip install -e '.[wandb]'`."
+            ) from exc
 
     log_with = None if report_to == "none" else report_to
     mixed_precision = resolve_effective_mixed_precision(
@@ -462,7 +530,7 @@ def run_pretraining(
     if accelerator.is_main_process and (
         configured_output_dir is None or not str(configured_output_dir).strip()
     ):
-        logger.info("train.output_dir unset; auto-selected output_dir=%s", output_dir)
+        logger.info("train.checkpoint.output_dir unset; auto-selected output_dir=%s", output_dir)
     if accelerator.is_main_process and logging_output_dir != output_dir:
         logger.info(
             "logging.output_dir explicitly set to %s (checkpoint output_dir=%s)",
@@ -688,12 +756,6 @@ def run_pretraining(
         gen_config=gen_config,
         tokenizer=tokenizer,
     )
-    if accelerator.is_main_process:
-        try:
-            _dump_yaml_mapping(tracker_cfg_runtime, logging_output_dir / "config_resolved.yaml")
-        except Exception:
-            logger.exception("Failed to write runtime-resolved config snapshot.")
-
     global_step = 0
     consumed_micro_batches = 0
     consumed_micro_batches_committed = 0
@@ -815,6 +877,7 @@ def run_pretraining(
                 tracker_cfg=tracker_cfg,
                 report_to=str(report_to),
                 run_name=tracker_run_name,
+                logging_dir=logging_output_dir,
             )
             if str(report_to).lower() == "wandb":
                 try:
@@ -862,6 +925,11 @@ def run_pretraining(
                 checkpoint_dir=ckpt,
                 context="resume",
             )
+            _restore_checkpoint_rng_state_or_raise(
+                checkpoint_dir=ckpt,
+                process_index=int(accelerator.process_index),
+                device=accelerator.device,
+            )
             if effective_decoupled_training:
                 if gen_optimizer is not None and gen_lr_scheduler is not None:
                     _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
@@ -904,6 +972,23 @@ def run_pretraining(
                     f"for checkpoint '{ckpt}'."
                 )
             last_saved_step = int(global_step)
+            resume_optimizers = (
+                (
+                    gen_optimizer if float(train_cfg.objective.gen_loss_weight) > 0.0 else None,
+                    disc_optimizer if float(train_cfg.objective.disc_loss_weight) > 0.0 else None,
+                )
+                if effective_decoupled_training
+                else (optimizer,)
+            )
+            if int(global_step) < int(train_cfg.max_steps) and _resume_optimizer_lrs_are_all_zero(
+                resume_optimizers
+            ):
+                raise RuntimeError(
+                    "Resume restored zero learning rates for every optimizer while additional steps "
+                    "were requested. The source schedule has already reached a zero-LR terminal state, "
+                    "so continuing would advance metadata without updating model weights. Resume from an "
+                    "earlier nonterminal checkpoint or start a new run with a deliberate scheduler recipe."
+                )
             if int(saved_ga_steps) != int(ga_steps) and accelerator.is_main_process:
                 logger.warning(
                     "Resume checkpoint '%s' was saved with gradient_accumulation_steps=%d but current run uses %d.",

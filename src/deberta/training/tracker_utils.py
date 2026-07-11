@@ -22,6 +22,7 @@ def _init_trackers(
     tracker_cfg: dict[str, Any],
     report_to: str,
     run_name: str,
+    logging_dir: str | Path,
 ) -> None:
     """Initialize Accelerate trackers with tracker-specific kwargs when available.
 
@@ -30,17 +31,22 @@ def _init_trackers(
     :param dict[str, Any] tracker_cfg: Tracker configuration payload.
     :param str report_to: Selected tracker backend.
     :param str run_name: Effective run name.
+    :param str | Path logging_dir: Directory for tracker-local files.
     """
-    call_kwargs: dict[str, Any] = {
-        "project_name": project_name,
-        "config": tracker_cfg,
-    }
+    call_kwargs: dict[str, Any] = {"project_name": project_name}
 
     init_kwargs: dict[str, Any] = {}
     if str(report_to).strip().lower() == "wandb":
-        init_kwargs = {"wandb": {"name": run_name}}
+        init_kwargs = {
+            "wandb": {
+                "name": run_name,
+                "dir": str(Path(logging_dir).expanduser().resolve()),
+                "config": tracker_cfg,
+            }
+        }
 
     if not init_kwargs:
+        call_kwargs["config"] = tracker_cfg
         accelerator.init_trackers(**call_kwargs)
         return
 

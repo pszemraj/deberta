@@ -17,7 +17,6 @@ from deberta.config import (
     _HF_ATTN_KERNEL_ALIASES,
     _HF_ATTN_KERNEL_CHOICES,
     _HF_MODEL_SIZE_CHOICES,
-    _LOGGING_BACKEND_CHOICES,
     _LR_SCHEDULER_CHOICES,
     _NORM_ARCH_CHOICES,
     _RESUME_DATA_STRATEGY_CHOICES,
@@ -72,7 +71,6 @@ _DOTFLAG_CHOICES: dict[str, tuple[str, ...]] = {
     ),
     "train.checkpoint.resume_data_strategy": tuple(sorted(_RESUME_DATA_STRATEGY_CHOICES)),
     "optim.scheduler.type": tuple(sorted(_LR_SCHEDULER_CHOICES)),
-    "logging.backend": tuple(sorted(_LOGGING_BACKEND_CHOICES)),
     "logging.wandb.watch": tuple(sorted(_WANDB_WATCH_CHOICES | set(_WANDB_WATCH_ALIASES.keys()))),
 }
 

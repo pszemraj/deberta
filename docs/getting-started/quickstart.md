@@ -14,13 +14,12 @@ deberta train configs/tiny_cpu_smoke.yaml
 
 Use the provided small parity config and shorten the run with dotted overrides. Every accepted
 field and matching CLI flag is listed in the
-[config reference](../../configs/config-reference.yaml):
+[config reference](../../configs/config_reference.yaml):
 
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
   --train.max_steps 500 \
   --train.checkpoint.output_dir runs/quickstart_hfv2_small \
-  --logging.backend none \
   --logging.wandb.enabled false
 ```
 
@@ -53,4 +52,4 @@ override. For manual exports, other checkpoints, or both RTD components, see
 ## 4) Check run snapshots
 
 Snapshot files and output-directory behavior are documented in the
-[config reference](../../configs/config-reference.yaml).
+[config reference](../../configs/config_reference.yaml).

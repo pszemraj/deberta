@@ -127,7 +127,7 @@ def _resize_tokenizer_to_vocab_size(
     if not bool(allow_resize):
         raise ValueError(
             f"{component} tokenizer vocab ({current}) is smaller than required size ({target_size}), "
-            "but model.tokenizer_allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
+            "but model.tokenizer.allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
         )
 
     add_tokens = getattr(tokenizer, "add_tokens", None)
@@ -175,7 +175,7 @@ def _resolve_required_tokenizer_vocab_size(
     if requested_target is not None:
         if requested_target < int(current_size):
             raise ValueError(
-                f"model.tokenizer_vocab_target ({requested_target}) is smaller than tokenizer size "
+                f"model.tokenizer.vocab_target ({requested_target}) is smaller than tokenizer size "
                 f"({current_size}) for {component}; shrinking tokenizer vocab is not supported."
             )
         desired = max(desired, int(requested_target))
@@ -204,7 +204,7 @@ def _resolve_required_tokenizer_vocab_size(
         cfg_vocab = int(config_vocab_size)
         if desired > cfg_vocab:
             raise ValueError(
-                f"model.tokenizer_vocab_multiple={multiple} rounds {component} tokenizer size to {desired}, "
+                f"model.tokenizer.vocab_multiple={multiple} rounds {component} tokenizer size to {desired}, "
                 f"which exceeds checkpoint config vocab_size ({cfg_vocab})."
             )
     return int(desired)
@@ -447,7 +447,8 @@ def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
     if getattr(gen_cfg, "hidden_size", None) and getattr(gen_cfg, "num_attention_heads", None):
         if int(gen_cfg.hidden_size) % int(gen_cfg.num_attention_heads) != 0:
             raise ValueError(
-                "generator_hidden_size must be divisible by generator_num_attention_heads. "
+                "model.generator.hidden_size must be divisible by "
+                "model.generator.num_attention_heads. "
                 f"Got hidden_size={gen_cfg.hidden_size}, heads={gen_cfg.num_attention_heads}."
             )
 

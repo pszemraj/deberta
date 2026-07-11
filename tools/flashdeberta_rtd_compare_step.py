@@ -74,7 +74,6 @@ def _tensor_batch_clone(batch: dict[str, Any]) -> dict[str, Any]:
 def _model_overrides(*, attention_impl: str, docblock_bias_seq_len: int) -> list[str]:
     overrides = [
         "logging.wandb.enabled=false",
-        "logging.backend=none",
         "train.checkpoint.export_hf_final=false",
         f"model.hf.attention_impl={attention_impl}",
         "train.compile.enabled=false",

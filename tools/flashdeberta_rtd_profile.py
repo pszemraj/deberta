@@ -193,7 +193,6 @@ class _TimedPhase:
 def _maybe_override_config(args: argparse.Namespace) -> list[str]:
     overrides: list[str] = [
         "logging.wandb.enabled=false",
-        "logging.backend=none",
         "train.checkpoint.export_hf_final=false",
         f"model.hf.attention_impl={str(args.mode)}",
     ]

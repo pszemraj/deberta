@@ -20,7 +20,6 @@ _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
 _HF_ATTN_IMPL_CHOICES = {"eager", "flash"}
 _FFN_CHOICES = {"swiglu", "mlp"}
 _EMBED_SHARING_CHOICES = {"none", "es", "gdes"}
-_LOGGING_BACKEND_CHOICES = {"none", "tensorboard"}
 _WANDB_WATCH_CHOICES = {"none", "gradients", "parameters", "all"}
 _WANDB_WATCH_ALIASES = {
     "off": "none",
@@ -146,7 +145,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 7
+RUN_CONFIG_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -474,7 +473,6 @@ class LoggingConfig:
     run_name: str | None = field(default=None)
     output_dir: str | None = field(default=None)
     logging_steps: int = field(default=50)
-    backend: str = field(default="none")
     wandb: LoggingWandbConfig = field(default_factory=LoggingWandbConfig)
     debug: LoggingDebugConfig = field(default_factory=LoggingDebugConfig)
 
@@ -1208,8 +1206,9 @@ def validate_train_config(cfg: TrainConfig) -> None:
         ),
     )
 
-    if cfg.checkpoint.output_dir is not None and not str(cfg.checkpoint.output_dir).strip():
-        _cfg_set(cfg.checkpoint, "output_dir", None)
+    if cfg.checkpoint.output_dir is not None:
+        checkpoint_output_dir = str(cfg.checkpoint.output_dir).strip()
+        _cfg_set(cfg.checkpoint, "output_dir", checkpoint_output_dir or None)
     if cfg.checkpoint.resume_from_checkpoint is not None:
         resume_from_checkpoint = str(cfg.checkpoint.resume_from_checkpoint).strip()
         _cfg_set(
@@ -1236,6 +1235,10 @@ def validate_train_config(cfg: TrainConfig) -> None:
         val = _nested_get(cfg, _name)
         if int(val) < int(_min):
             raise ValueError(f"train.{_name} must be >= {_min}.")
+
+    seed = int(cfg.seed)
+    if seed < 0 or seed > (2**32 - 1):
+        raise ValueError("train.seed must be between 0 and 2**32 - 1 (inclusive).")
 
     mlm = float(cfg.objective.mlm_probability)
     if not math.isfinite(mlm) or mlm <= 0.0 or mlm >= 1.0:
@@ -1326,13 +1329,18 @@ def validate_logging_config(cfg: LoggingConfig) -> None:
 
     :param LoggingConfig cfg: Logging config.
     """
-    _cfg_set(cfg, "backend", _ensure_choice("logging.backend", cfg.backend, _LOGGING_BACKEND_CHOICES))
     _cfg_set(cfg.wandb, "watch", _normalize_wandb_watch(cfg.wandb.watch))
 
-    if not str(cfg.project_name).strip():
+    project_name = str(cfg.project_name).strip()
+    if not project_name:
         raise ValueError("logging.project_name must be non-empty.")
-    if cfg.output_dir is not None and not str(cfg.output_dir).strip():
-        _cfg_set(cfg, "output_dir", None)
+    _cfg_set(cfg, "project_name", project_name)
+    if cfg.run_name is not None:
+        run_name = str(cfg.run_name).strip()
+        _cfg_set(cfg, "run_name", run_name or None)
+    if cfg.output_dir is not None:
+        output_dir = str(cfg.output_dir).strip()
+        _cfg_set(cfg, "output_dir", output_dir or None)
     if int(cfg.logging_steps) < 0:
         raise ValueError("logging.logging_steps must be >= 0.")
     if int(cfg.wandb.watch_log_freq) < 1:
@@ -1387,6 +1395,16 @@ def validate_training_workflow_options(
     if model_cfg is not None:
         backbone_type = str(model_cfg.backbone_type).strip().lower()
         attn_impl = str(model_cfg.rope.attention_implementation).strip().lower()
+        hf_attention_impl = str(model_cfg.hf.attention_impl).strip().lower()
+        if (
+            backbone_type == "hf_deberta_v2"
+            and hf_attention_impl == "flash"
+            and str(train_cfg.mixed_precision).strip().lower() != "bf16"
+        ):
+            raise ValueError(
+                "model.hf.attention_impl='flash' requires train.mixed_precision='bf16'. "
+                "Full-precision tensors are unsupported by the configured FlashDeBERTa kernels."
+            )
         if backbone_type != "rope" and sdpa_policy != "auto":
             warnings.warn(
                 "train.sdpa_kernel has no effect when model.backbone_type='hf_deberta_v2'. "
@@ -1551,7 +1569,7 @@ def load_logging_config_snapshot(raw: dict[str, object], *, source: str) -> Logg
 _TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
     "project_name": "logging.project_name",
     "run_name": "logging.run_name",
-    "report_to": "logging.wandb.enabled + logging.backend",
+    "report_to": "logging.wandb.enabled",
     "logging_steps": "logging.logging_steps",
     "wandb_watch": "logging.wandb.watch",
     "wandb_watch_log_freq": "logging.wandb.watch_log_freq",
@@ -1609,7 +1627,47 @@ def _load_raw_config_mapping(path: str | Path) -> tuple[dict[str, Any], str]:
             raise RuntimeError(
                 "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
             ) from e
-        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+
+        class _UniqueKeySafeLoader(yaml.SafeLoader):
+            """Safe YAML loader that rejects duplicate mapping keys."""
+
+            def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+                """Construct one mapping while rejecting ambiguous duplicate keys.
+
+                :param Any node: YAML mapping node to construct.
+                :param bool deep: Whether to construct nested objects deeply.
+                :return dict[Any, Any]: Constructed unique-key mapping.
+                """
+
+                if not isinstance(node, yaml.MappingNode):
+                    return super().construct_mapping(node, deep=deep)
+                self.flatten_mapping(node)
+                mapping: dict[Any, Any] = {}
+                for key_node, value_node in node.value:
+                    key = self.construct_object(key_node, deep=deep)
+                    try:
+                        duplicate = key in mapping
+                    except TypeError as exc:
+                        raise yaml.constructor.ConstructorError(
+                            "while constructing a mapping",
+                            node.start_mark,
+                            "found an unhashable mapping key",
+                            key_node.start_mark,
+                        ) from exc
+                    if duplicate:
+                        raise yaml.constructor.ConstructorError(
+                            "while constructing a mapping",
+                            node.start_mark,
+                            f"found duplicate key {key!r}",
+                            key_node.start_mark,
+                        )
+                    mapping[key] = self.construct_object(value_node, deep=deep)
+                return mapping
+
+        try:
+            raw = yaml.load(cfg_path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML config at {cfg_path}: {exc}") from exc
     else:
         raw = load_json_mapping(cfg_path)
 

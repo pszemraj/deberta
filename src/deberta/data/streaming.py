@@ -97,26 +97,17 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
             return int(self._epoch.value)
         return int(self._epoch)
 
-    def _shard_dataset_for_worker(self, ds: Any) -> Any:
-        """Shard dataset across processes and dataloader workers.
+    def _shard_dataset_for_process(self, ds: Any) -> Any:
+        """Shard dataset across distributed processes.
 
         :param Any ds: Input dataset object.
         :return Any: Sharded dataset view.
         """
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            num_workers = 1
-            worker_id = 0
-        else:
-            num_workers = int(worker_info.num_workers)
-            worker_id = int(worker_info.id)
-
-        total_shards = self.num_processes * num_workers
-        shard_id = self.process_index * num_workers + worker_id
-
-        # HF IterableDataset shard selects every `total_shards`-th example.
-        if hasattr(ds, "shard"):
-            ds = ds.shard(num_shards=total_shards, index=shard_id)
+        # HF IterableDataset.__iter__ assigns its available data-source shards to DataLoader
+        # workers. Sharding by worker here would apply that split twice and can request an
+        # empty shard when num_workers exceeds the source's shard count.
+        if self.num_processes > 1 and hasattr(ds, "shard"):
+            ds = ds.shard(num_shards=self.num_processes, index=self.process_index)
         return ds
 
     def _new_example_iterator(self) -> Iterator[dict[str, Any]]:
@@ -134,7 +125,7 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
             except TypeError:
                 # Map-style Dataset.shuffle does not accept buffer_size.
                 ds = ds.shuffle(seed=shuffle_seed)
-        ds = self._shard_dataset_for_worker(ds)
+        ds = self._shard_dataset_for_process(ds)
         return iter(ds)
 
     def _iter_examples(self) -> Iterator[dict[str, Any]]:
