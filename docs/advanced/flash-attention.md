@@ -100,7 +100,7 @@ fallbacks are capability-scoped.
 1. Sample real batches with
    [`flashdeberta_varlen_tune.py`](../../tools/flashdeberta_varlen_tune.py) or
    [`flashdeberta_bias_tune.py`](../../tools/flashdeberta_bias_tune.py). Both write batch samples,
-   summaries, and winning candidates under `local-scratch/benchmarks/flashdeberta/` unless an
+   summaries, and `best_candidates.json` winner manifests under `local-scratch/benchmarks/flashdeberta/` unless an
    output directory is supplied.
 2. Put durable route or kernel winners in an override table and select it with
    `model.hf.flash.kernel_overrides_path`. Scope hardware-specific rows with

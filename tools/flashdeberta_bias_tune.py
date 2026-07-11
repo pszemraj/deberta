@@ -201,13 +201,13 @@ def main() -> None:
             )
 
     (out_dir / "summary.tsv").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
-    (out_dir / "best_configs.json").write_text(
+    (out_dir / "best_candidates.json").write_text(
         json.dumps(best_by_key, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     print(f"wrote_summary={out_dir / 'summary.tsv'}")
     print(f"wrote_batches={out_dir / 'batches.jsonl'}")
-    print(f"wrote_best={out_dir / 'best_configs.json'}")
+    print(f"wrote_best={out_dir / 'best_candidates.json'}")
 
 
 if __name__ == "__main__":
