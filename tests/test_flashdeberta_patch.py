@@ -1895,11 +1895,6 @@ def test_docblock_forward_pads_saved_aux_without_expanding_kernel_tokens(
         return q + 1.0, torch.zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
 
     monkeypatch.setattr(docblock_mod._varlen_mod, "_flash_attn_v2_fwd_dise_lowlevel", _fake_fwd)
-    monkeypatch.setattr(
-        docblock_mod._varlen_mod,
-        "_get_fwd_config_lowlevel",
-        lambda **kwargs: (16, 16, 1, 1),
-    )
 
     q = torch.arange(1 * 5 * 2 * 3, dtype=torch.float32).view(1, 5, 2, 3)
     pos = torch.arange(1 * 5 * 2 * 4, dtype=torch.float32).view(1, 5, 2, 4)
@@ -4558,11 +4553,10 @@ def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
     torch.testing.assert_close(flash_out, eager_out)
 
 
-def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_varlen_bwd_config_resolution_uses_conservative_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
     monkeypatch.setattr(varlen_mod, "_varlen_repo_tuned_bwd_config", lambda **kwargs: None)
-    monkeypatch.setattr(varlen_mod, "_get_bwd_config_varlen_lowlevel", lambda **kwargs: (16, 16, 1, 2))
 
     kv_config = varlen_mod._resolve_varlen_bwd_kernel_config(
         kind="kv",
@@ -4593,8 +4587,8 @@ def test_varlen_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest
         device=torch.device("cpu"),
     )
 
-    assert kv_config == (16, 16, 1, 2)
-    assert q_config == (16, 16, 1, 2)
+    assert kv_config == (16, 16, 1, 4)
+    assert q_config == (16, 16, 1, 4)
 
 
 def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4726,11 +4720,10 @@ def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.Mo
     )
 
 
-def test_bias_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bias_bwd_config_resolution_uses_conservative_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_bias_op as bias_mod
 
     monkeypatch.setattr(bias_mod, "_bias_repo_tuned_config", lambda **kwargs: None)
-    monkeypatch.setattr(bias_mod, "_get_bwd_config_bias_lowlevel", lambda *args, **kwargs: (16, 16, 1, 2))
 
     kv_config = bias_mod._resolve_bias_bwd_kernel_config(
         kind="kv",
@@ -4755,8 +4748,8 @@ def test_bias_bwd_config_resolution_falls_back_to_upstream(monkeypatch: pytest.M
         device=torch.device("cpu"),
     )
 
-    assert kv_config == (16, 16, 1, 2)
-    assert q_config == (16, 16, 1, 2)
+    assert kv_config == (16, 16, 1, 4)
+    assert q_config == (16, 16, 1, 4)
 
 
 def test_bias_repo_tuned_config_is_table_owned(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4983,12 +4976,6 @@ def test_docblock_varlen_backward_uses_docblock_tuning_namespace(monkeypatch: py
 
     monkeypatch.setattr(varlen_mod, "resolve_repo_tuned_config", _fake_resolve)
     monkeypatch.setattr(varlen_mod, "device_compute_capability", lambda _device: (12, 0))
-    monkeypatch.setattr(
-        varlen_mod,
-        "_get_bwd_config_varlen_lowlevel",
-        lambda **_kwargs: pytest.fail("docblock route should resolve through the tuning table"),
-    )
-
     assert varlen_mod._resolve_varlen_bwd_kernel_config(
         route="docblock",
         kind="kv",

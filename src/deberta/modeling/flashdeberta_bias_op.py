@@ -9,7 +9,6 @@ the upstream Python autograd wrapper.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -20,6 +19,7 @@ from deberta.modeling.flashdeberta_dense_bias_op import (
     _dense_bucket_reduce,
 )
 from deberta.modeling.flashdeberta_kernel_tuning import (
+    CONSERVATIVE_FLASH_KERNEL_CONFIG,
     FlashKernelContext,
     resolve_flash_kernel_config,
     resolve_repo_tuned_config,
@@ -67,12 +67,6 @@ try:
     from flashdeberta.ops.flash_attention_bias import (
         flash_attn_v2_fwd as _flash_attn_v2_fwd_bias_lowlevel,
     )
-    from flashdeberta.ops.flash_attention_bias import (
-        get_bwd_config as _get_bwd_config_bias_lowlevel,
-    )
-    from flashdeberta.ops.flash_attention_bias import (
-        get_fwd_config as _get_fwd_config_bias_lowlevel,
-    )
 
     _FLASH_BIAS_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
@@ -81,8 +75,6 @@ except Exception as exc:  # pragma: no cover - optional import
     _bwd_q_kernel_bias_raw = None
     _flash_attn_v2_bwd_bias_lowlevel = None
     _flash_attn_v2_fwd_bias_lowlevel = None
-    _get_bwd_config_bias_lowlevel = None
-    _get_fwd_config_bias_lowlevel = None
     _FLASH_BIAS_LOWLEVEL_IMPORT_ERROR = exc
 
 _BIAS_OP_NAMESPACE = "deberta"
@@ -173,8 +165,6 @@ def _bias_repo_tuned_config(
 def _bias_config(
     *,
     kind: str,
-    lowlevel_helper: Callable[[int, int, int, int, int, bool], tuple[int, int, int, int]] | None,
-    unavailable_message: str,
     batch_size: int,
     num_heads: int,
     query_len: int,
@@ -187,8 +177,6 @@ def _bias_config(
     """Resolve a dense-bias Triton tile config.
 
     :param str kind: Tuning kind name.
-    :param Callable | None lowlevel_helper: FlashDeBERTa fallback config helper.
-    :param str unavailable_message: Error raised when the fallback helper is unavailable.
     :param int batch_size: Batch size.
     :param int num_heads: Number of attention heads.
     :param int query_len: Query sequence length.
@@ -213,16 +201,7 @@ def _bias_config(
     )
     if tuned is not None:
         return tuned
-    if lowlevel_helper is None:
-        raise RuntimeError(unavailable_message)
-    return lowlevel_helper(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
-    )
+    return CONSERVATIVE_FLASH_KERNEL_CONFIG
 
 
 def _bias_forward_config(
@@ -251,8 +230,6 @@ def _bias_forward_config(
 
     return _bias_config(
         kind="fwd",
-        lowlevel_helper=_get_fwd_config_bias_lowlevel,
-        unavailable_message="FlashDeBERTa local-bias config helper is unavailable.",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,
@@ -290,8 +267,6 @@ def _bias_backward_config(
 
     return _bias_config(
         kind="bwd",
-        lowlevel_helper=_get_bwd_config_bias_lowlevel,
-        unavailable_message="FlashDeBERTa local-bias backward is unavailable.",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,

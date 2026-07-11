@@ -19,6 +19,7 @@ import torch
 
 import deberta.modeling.flashdeberta_varlen_op as _varlen_mod
 from deberta.modeling.flashdeberta_kernel_tuning import (
+    CONSERVATIVE_FLASH_KERNEL_CONFIG,
     FlashKernelContext,
     resolve_flash_kernel_config,
 )
@@ -321,10 +322,7 @@ def _docblock_forward_impl(
         max_segment_length=max_seqlen,
     )
 
-    if (
-        _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is not None
-        and _varlen_mod._get_fwd_config_lowlevel is not None
-    ):
+    if _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is not None:
         table_config = resolve_flash_kernel_config(
             FlashKernelContext(
                 compute_capability=device_compute_capability(query_layer.device),
@@ -343,15 +341,7 @@ def _docblock_forward_impl(
         if table_config is not None:
             block_m, block_n, num_stages, num_warps = table_config
         else:
-            block_m, block_n, num_stages, num_warps = _varlen_mod._get_fwd_config_lowlevel(
-                total_tokens=int(q_unpad.shape[0]),
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                D=int(query_layer.shape[-1]),
-                causal=bool(causal),
-                disentangled=True,
-                att_span=att_span,
-            )
+            block_m, block_n, num_stages, num_warps = CONSERVATIVE_FLASH_KERNEL_CONFIG
         out_unpad, lse_unpad = _varlen_mod._flash_attn_v2_fwd_dise_lowlevel(
             q_unpad,
             k_unpad,

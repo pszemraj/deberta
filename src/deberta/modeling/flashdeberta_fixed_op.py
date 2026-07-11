@@ -17,7 +17,10 @@ from typing import Any
 
 import torch
 
-from deberta.modeling.flashdeberta_kernel_tuning import resolve_repo_tuned_config
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    CONSERVATIVE_FLASH_KERNEL_CONFIG,
+    resolve_repo_tuned_config,
+)
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     lookup_existing_op_pair,
@@ -56,12 +59,6 @@ try:
     from flashdeberta.ops.flash_attention import (
         flash_attn_v2_fwd_dise as _flash_attn_v2_fwd_dise_lowlevel,
     )
-    from flashdeberta.ops.flash_attention import (
-        get_bwd_config as _get_bwd_config_lowlevel,
-    )
-    from flashdeberta.ops.flash_attention import (
-        get_fwd_config as _get_fwd_config_lowlevel,
-    )
 
     _FLASH_FIXED_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
@@ -71,8 +68,6 @@ except Exception as exc:  # pragma: no cover - optional import
     _fwd_kernel_dise_raw = None
     _flash_attn_v2_bwd_dise_lowlevel = None
     _flash_attn_v2_fwd_dise_lowlevel = None
-    _get_bwd_config_lowlevel = None
-    _get_fwd_config_lowlevel = None
     _FLASH_FIXED_LOWLEVEL_IMPORT_ERROR = exc
 
 _FIXED_OP_NAMESPACE = "deberta"
@@ -201,8 +196,6 @@ def _materialize_fixed_seq_lengths(
 
 def _fixed_forward_config(
     *,
-    batch_size: int,
-    num_heads: int,
     query_len: int,
     key_len: int,
     head_dim: int,
@@ -215,8 +208,6 @@ def _fixed_forward_config(
 ) -> tuple[int, int, int, int]:
     """Resolve the fixed forward Triton tile config.
 
-    :param int batch_size: Batch size.
-    :param int num_heads: Number of attention heads.
     :param int query_len: Query sequence length.
     :param int key_len: Key sequence length.
     :param int head_dim: Per-head hidden size.
@@ -243,24 +234,11 @@ def _fixed_forward_config(
     )
     if tuned is not None:
         return tuned
-    if _get_fwd_config_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa fixed forward config helper is unavailable.")
-    return _get_fwd_config_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
-        disentangled=bool(has_pos),
-        att_span=att_span,
-    )
+    return CONSERVATIVE_FLASH_KERNEL_CONFIG
 
 
 def _fixed_backward_config(
     *,
-    batch_size: int,
-    num_heads: int,
     query_len: int,
     key_len: int,
     head_dim: int,
@@ -273,8 +251,6 @@ def _fixed_backward_config(
 ) -> tuple[int, int, int, int]:
     """Resolve the fixed backward Triton tile config.
 
-    :param int batch_size: Batch size.
-    :param int num_heads: Number of attention heads.
     :param int query_len: Query sequence length.
     :param int key_len: Key sequence length.
     :param int head_dim: Per-head hidden size.
@@ -301,19 +277,7 @@ def _fixed_backward_config(
     )
     if tuned is not None:
         return tuned
-    if _get_bwd_config_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa fixed backward config helper is unavailable.")
-    return _get_bwd_config_lowlevel(
-        batch_size,
-        num_heads,
-        query_len,
-        key_len,
-        head_dim,
-        bool(causal),
-        disentangled=bool(has_pos),
-        att_span=att_span,
-        dtype=dtype,
-    )
+    return CONSERVATIVE_FLASH_KERNEL_CONFIG
 
 
 def _fixed_eager_forward_impl(
@@ -357,11 +321,9 @@ def _fixed_eager_forward_impl(
 
     batch_size, num_heads, query_len, head_dim = query_layer.shape
     key_len = int(key_layer.shape[-2])
-    if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
+    if _flash_attn_v2_fwd_dise_lowlevel is not None:
         att_span = _fixed_attention_span(position_buckets, max_relative_distance)
         block_m, block_n, num_stages, num_warps = _fixed_forward_config(
-            batch_size=batch_size,
-            num_heads=num_heads,
             query_len=query_len,
             key_len=key_len,
             head_dim=head_dim,
@@ -448,8 +410,6 @@ def _fixed_triton_forward_impl(
     head_dim = int(q.shape[3])
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
     block_m, block_n, num_stages, num_warps = _fixed_forward_config(
-        batch_size=batch_size,
-        num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
@@ -580,8 +540,6 @@ def _fixed_triton_backward_impl(
     head_dim = int(q.shape[3])
     att_span = _fixed_attention_span(position_buckets, max_relative_distance)
     block_m, block_n, num_stages, num_warps = _fixed_backward_config(
-        batch_size=batch_size,
-        num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,

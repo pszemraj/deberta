@@ -18,6 +18,12 @@ _ACTIVE_OVERRIDES_SIGNATURE: tuple[int, int] | None = None
 # otherwise accretes one permanent entry per distinct batch shape.
 _SHAPE_KEYED_CACHE_MAXSIZE = 4096
 
+# Safe launch used when no capability/shape row has been measured. Keep this
+# repo-owned and deterministic: upstream selectors also expose environment
+# variable overrides, which are deliberately not part of this project's
+# configuration contract.
+CONSERVATIVE_FLASH_KERNEL_CONFIG = (16, 16, 1, 4)
+
 
 @dataclass(frozen=True)
 class FlashKernelContext:

@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover - optional Triton dependency
     _TRITON_AVAILABLE = False
 
 from deberta.modeling.flashdeberta_kernel_tuning import (
+    CONSERVATIVE_FLASH_KERNEL_CONFIG,
     resolve_repo_tuned_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -91,12 +92,6 @@ try:
     from flashdeberta.ops.flash_attention_varlen import (
         flash_attn_v2_fwd_dise as _flash_attn_v2_fwd_dise_lowlevel,
     )
-    from flashdeberta.ops.flash_attention_varlen import (
-        get_bwd_config_varlen as _get_bwd_config_varlen_lowlevel,
-    )
-    from flashdeberta.ops.flash_attention_varlen import (
-        get_fwd_config as _get_fwd_config_lowlevel,
-    )
 
     _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
@@ -107,8 +102,6 @@ except Exception as exc:  # pragma: no cover - optional import
     _fwd_kernel_varlen_raw = None
     _flash_attn_v2_bwd_dise_varlen_lowlevel = None
     _flash_attn_v2_fwd_dise_lowlevel = None
-    _get_bwd_config_varlen_lowlevel = None
-    _get_fwd_config_lowlevel = None
     _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR = exc
 
 _VARLEN_OP_NAMESPACE = "deberta"
@@ -333,20 +326,7 @@ def _resolve_varlen_bwd_kernel_config(
     )
     if repo_tuned is not None:
         return repo_tuned
-
-    if _get_bwd_config_varlen_lowlevel is None:
-        raise RuntimeError("FlashDeBERTa varlen backward config helper is unavailable.")
-    return _get_bwd_config_varlen_lowlevel(
-        total_tokens_q=int(total_tokens_q),
-        total_tokens_k=int(total_tokens_k),
-        max_seqlen_q=int(max_seqlen_q),
-        max_seqlen_k=int(max_seqlen_k),
-        D=int(head_dim),
-        causal=bool(causal),
-        disentangled=bool(disentangled),
-        att_span=int(att_span),
-        dtype=dtype,
-    )
+    return CONSERVATIVE_FLASH_KERNEL_CONFIG
 
 
 def _build_unpad_metadata(
@@ -1193,7 +1173,7 @@ def _varlen_eager_forward_impl(
         total_tokens=total_tokens,
     )
 
-    if _flash_attn_v2_fwd_dise_lowlevel is not None and _get_fwd_config_lowlevel is not None:
+    if _flash_attn_v2_fwd_dise_lowlevel is not None:
         table_config = _varlen_repo_tuned_fwd_config(
             seq_len=max_seqlen,
             total_tokens=int(q_unpad.shape[0]),
@@ -1208,15 +1188,7 @@ def _varlen_eager_forward_impl(
         if table_config is not None:
             block_m, block_n, num_stages, num_warps = table_config
         else:
-            block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-                total_tokens=int(q_unpad.shape[0]),
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                D=int(query_layer.shape[-1]),
-                causal=bool(causal),
-                disentangled=True,
-                att_span=att_span,
-            )
+            block_m, block_n, num_stages, num_warps = CONSERVATIVE_FLASH_KERNEL_CONFIG
         out_unpad, lse_unpad = _flash_attn_v2_fwd_dise_lowlevel(
             q_unpad,
             k_unpad,
@@ -1316,7 +1288,7 @@ def _varlen_eager_backward_impl(
         Gradients in the same padded layouts as the forward inputs.
     """
 
-    if _flash_attn_v2_bwd_dise_varlen_lowlevel is None or _get_bwd_config_varlen_lowlevel is None:
+    if _flash_attn_v2_bwd_dise_varlen_lowlevel is None:
         detail = _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR
         raise RuntimeError(
             "Compiled FlashDeBERTa varlen backward is unavailable."
@@ -1892,17 +1864,7 @@ def _varlen_triton_forward_impl(
     if table_config is not None:
         block_m, block_n, num_stages, num_warps = table_config
     else:
-        if _get_fwd_config_lowlevel is None:
-            raise RuntimeError("FlashDeBERTa varlen forward config helper is unavailable.")
-        block_m, block_n, num_stages, num_warps = _get_fwd_config_lowlevel(
-            total_tokens=capacity_tokens,
-            max_seqlen_q=seq_len,
-            max_seqlen_k=seq_len,
-            D=head_dim,
-            causal=bool(causal),
-            disentangled=True,
-            att_span=att_span,
-        )
+        block_m, block_n, num_stages, num_warps = CONSERVATIVE_FLASH_KERNEL_CONFIG
 
     mid_batch, mid_start, tile_count = _build_dense_mid_tensors(
         cu_seqlens=cu_seqlens,
