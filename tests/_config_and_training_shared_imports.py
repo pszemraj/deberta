@@ -2,7 +2,6 @@
 import argparse
 import dataclasses
 import gzip
-import hashlib
 import json
 import logging
 import re
@@ -115,6 +114,7 @@ from deberta.training.runtime import (
     _build_optimizer,
     _build_training_collator,
     _cycle_dataloader,
+    _digest_param_name_order,
     _optimizer_param_order_digest,
     _partition_optimizer_params,
 )

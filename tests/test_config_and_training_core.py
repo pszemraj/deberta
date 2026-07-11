@@ -600,7 +600,7 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
     ordered_names: list[str] = []
     for group in opt.param_groups:
         ordered_names.extend(param_to_name[id(p)] for p in group["params"])
-    expected = hashlib.sha256("\n".join(ordered_names).encode()).hexdigest()[:16]
+    expected = _digest_param_name_order(ordered_names)
 
     assert _optimizer_param_order_digest(model) == expected
     assert str(opt._param_order_digest) == expected

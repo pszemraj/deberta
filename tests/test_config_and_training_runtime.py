@@ -2,6 +2,44 @@
 from _config_and_training_shared_imports import *
 
 
+class _TinyBackbone(torch.nn.Module):
+    def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.embeddings = EmbeddingsStub(vocab_size, hidden_size)
+
+    def _initialize_weights(self, module: torch.nn.Module) -> None:
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        return_dict: bool = True,
+    ) -> BackboneOutputStub:
+        del attention_mask, token_type_ids, return_dict
+        hidden = self.embeddings.word_embeddings(input_ids)
+        return BackboneOutputStub(last_hidden_state=hidden)
+
+
+def _tiny_rtd_config() -> BackboneConfigStub:
+    return BackboneConfigStub(
+        vocab_size=32,
+        hidden_size=8,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.0,
+        norm_eps=1e-6,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+
+
 def test_move_batch_to_device_keeps_shared_cpu_scalars_host_resident() -> None:
     from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
     from deberta.training.steps import _move_batch_to_device
@@ -103,40 +141,7 @@ def test_build_forbidden_token_mask_rejects_all_forbidden_vocab():
 def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -> None:
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    class _TinyBackbone(torch.nn.Module):
-        def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
-            super().__init__()
-            self.embeddings = EmbeddingsStub(vocab_size, hidden_size)
-
-        def _initialize_weights(self, module: torch.nn.Module) -> None:
-            if isinstance(module, torch.nn.Linear):
-                torch.nn.init.normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-
-        def forward(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-            return_dict: bool = True,
-        ) -> Any:
-            del attention_mask, token_type_ids, return_dict
-            hidden = self.embeddings.word_embeddings(input_ids)
-            return BackboneOutputStub(last_hidden_state=hidden)
-
-    cfg = BackboneConfigStub(
-        vocab_size=32,
-        hidden_size=8,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.0,
-        norm_eps=1e-6,
-        pad_token_id=0,
-        cls_token_id=1,
-        sep_token_id=2,
-        mask_token_id=3,
-    )
+    cfg = _tiny_rtd_config()
     model = DebertaV3RTDPretrainer(
         discriminator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
         generator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
@@ -155,40 +160,7 @@ def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -
 def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    class _TinyBackbone(torch.nn.Module):
-        def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
-            super().__init__()
-            self.embeddings = EmbeddingsStub(vocab_size, hidden_size)
-
-        def _initialize_weights(self, module: torch.nn.Module) -> None:
-            if isinstance(module, torch.nn.Linear):
-                torch.nn.init.normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-
-        def forward(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-            return_dict: bool = True,
-        ) -> Any:
-            del attention_mask, token_type_ids, return_dict
-            hidden = self.embeddings.word_embeddings(input_ids)
-            return BackboneOutputStub(last_hidden_state=hidden)
-
-    cfg = BackboneConfigStub(
-        vocab_size=32,
-        hidden_size=8,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.0,
-        norm_eps=1e-6,
-        pad_token_id=0,
-        cls_token_id=1,
-        sep_token_id=2,
-        mask_token_id=3,
-    )
+    cfg = _tiny_rtd_config()
     model = DebertaV3RTDPretrainer(
         discriminator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
         generator_backbone=_TinyBackbone(vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size),
