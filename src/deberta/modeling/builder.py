@@ -742,6 +742,33 @@ def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Conf
     )
 
 
+def _load_pretrained_config_or_raise(
+    config_cls: type,
+    source: str,
+    *,
+    component: _COMPONENT_KIND,
+    kind: str,
+    origin: str,
+) -> Any:
+    """Load one pretrained config with source-aware failure context.
+
+    :param type config_cls: Config class exposing ``from_pretrained``.
+    :param str source: Local path or model id.
+    :param str component: Discriminator or generator.
+    :param str kind: Config family used in diagnostics.
+    :param str origin: Config field from which the source resolved.
+    :raises RuntimeError: If config loading fails.
+    :return Any: Loaded config object.
+    """
+
+    try:
+        return config_cls.from_pretrained(source)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load {component} {kind} config from source '{source}' (resolved from {origin})."
+        ) from exc
+
+
 def _apply_rope_config_normalization(
     cfg: Any,
     *,
@@ -829,27 +856,25 @@ def build_backbone_configs(
         if resolved.discriminator.config_source is None:
             disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
         else:
-            try:
-                disc_cfg = DebertaV2Config.from_pretrained(resolved.discriminator.config_source)
-            except Exception as e:
-                raise RuntimeError(
-                    "Failed to load discriminator HF config from source "
-                    f"'{resolved.discriminator.config_source}' "
-                    f"(resolved from {resolved.discriminator.config_origin})."
-                ) from e
+            disc_cfg = _load_pretrained_config_or_raise(
+                DebertaV2Config,
+                resolved.discriminator.config_source,
+                component="discriminator",
+                kind="HF",
+                origin=resolved.discriminator.config_origin,
+            )
 
         generator_from_explicit_source = resolved.generator.config_source is not None
         if not generator_from_explicit_source:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
         else:
-            try:
-                gen_cfg = DebertaV2Config.from_pretrained(resolved.generator.config_source)
-            except Exception as e:
-                raise RuntimeError(
-                    "Failed to load generator HF config from source "
-                    f"'{resolved.generator.config_source}' "
-                    f"(resolved from {resolved.generator.config_origin})."
-                ) from e
+            gen_cfg = _load_pretrained_config_or_raise(
+                DebertaV2Config,
+                resolved.generator.config_source,
+                component="generator",
+                kind="HF",
+                origin=resolved.generator.config_origin,
+            )
 
         # RTD uses the objective-owned Enhanced Mask Decoder. Generic backbone
         # z_steps starts from a different query state and cannot replace it.
@@ -901,7 +926,13 @@ def build_backbone_configs(
             hidden_act=model_cfg.rope.hidden_act,
         )
     else:
-        disc_cfg = DebertaRoPEConfig.from_pretrained(resolved.discriminator.config_source)
+        disc_cfg = _load_pretrained_config_or_raise(
+            DebertaRoPEConfig,
+            resolved.discriminator.config_source,
+            component="discriminator",
+            kind="RoPE",
+            origin=resolved.discriminator.config_origin,
+        )
 
     _apply_rope_config_normalization(
         disc_cfg,
@@ -916,7 +947,13 @@ def build_backbone_configs(
     if resolved.generator.config_source is None:
         gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
     else:
-        gen_cfg = DebertaRoPEConfig.from_pretrained(resolved.generator.config_source)
+        gen_cfg = _load_pretrained_config_or_raise(
+            DebertaRoPEConfig,
+            resolved.generator.config_source,
+            component="generator",
+            kind="RoPE",
+            origin=resolved.generator.config_origin,
+        )
 
     _apply_rope_config_normalization(
         gen_cfg,
