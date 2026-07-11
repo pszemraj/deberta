@@ -448,7 +448,9 @@ def test_run_pretraining_nonfinite_all_reduce_only_on_sync_microstep(
 
 
 def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     scheduler_steps = {"gen": 0, "disc": 0}
 
@@ -497,14 +499,16 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
         decoupled_training=True,
     )
 
-    pretrain_mod.run_pretraining(
-        model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
-        data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
-        train_cfg=train_cfg,
-    )
+    with caplog.at_level(logging.WARNING):
+        pretrain_mod.run_pretraining(
+            model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            train_cfg=train_cfg,
+        )
 
     assert scheduler_steps["gen"] == 1
     assert scheduler_steps["disc"] == 0
+    assert "nonfinite_window_skipped=1" in caplog.text
 
 
 def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens(

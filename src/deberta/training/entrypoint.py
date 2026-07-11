@@ -1145,6 +1145,131 @@ def run_pretraining(
                 zero_disc_window_since_log += 1
             return window, gen_window_tokens_per_rank, disc_window_tokens_per_rank
 
+        def _prepare_training_batch(
+            batch: dict[str, torch.Tensor],
+        ) -> tuple[dict[str, torch.Tensor], Any | None]:
+            """Move one batch and attach compile-stable flash metadata.
+
+            :param dict[str, torch.Tensor] batch: Host-side collated training batch.
+            :return tuple[dict[str, torch.Tensor], Any | None]: Device batch and flash metadata.
+            """
+
+            prepared = _move_batch_to_device(batch, accelerator.device)
+            prepared = _stabilize_compile_attention_mask(
+                batch=prepared,
+                compile_enabled=compile_enabled,
+                compile_scope=compile_scope,
+                backbone_type=str(model_cfg.backbone_type),
+            )
+            prepared, flash_meta = prepare_flash_attention_batch_metadata(
+                batch=prepared,
+                backbone_type=str(model_cfg.backbone_type),
+                flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
+                flash_cfg=getattr(model_cfg.hf, "flash", None),
+            )
+            if compile_enabled:
+                _maybe_cudagraph_mark_step_begin()
+            return prepared, flash_meta
+
+        def _increment_nonfinite_skip() -> int:
+            """Increment shared nonfinite skip counters and return the total.
+
+            :return int: Updated run-wide skip total.
+            """
+
+            nonlocal nonfinite_skip_total, nonfinite_skip_streak
+            nonfinite_skip_total += 1
+            nonfinite_skip_streak += 1
+            return nonfinite_skip_total
+
+        def _commit_training_window() -> None:
+            """Commit one consumed accumulation window to visible progress.
+
+            :return None: None.
+            """
+
+            nonlocal global_step, consumed_micro_batches_committed
+            global_step += 1
+            consumed_micro_batches_committed = int(consumed_micro_batches)
+            if train_progress is not None:
+                train_progress.update(1)
+
+        def _record_successful_optimizer_window() -> None:
+            """Reset skip state and recover the learning-rate multiplier.
+
+            :return None: None.
+            """
+
+            nonlocal nonfinite_skip_streak, lr_mult
+            nonfinite_skip_streak = 0
+            if lr_mult < 1.0:
+                lr_mult = min(lr_mult * float(_NONFINITE_LR_MULT_RECOVERY), 1.0)
+
+        def _finalize_nonfinite_skip(
+            *,
+            optimizer_phases: list[tuple[Any, Any, bool]],
+            reason: str | None,
+            debug_path: Path | None,
+            last_saved_step: int,
+        ) -> int:
+            """Recover, report, and checkpoint one skipped accumulation window.
+
+            :param list[tuple[Any, Any, bool]] optimizer_phases: Optimizer, scheduler,
+                and whether that phase already stepped in this window.
+            :param str | None reason: Recorded nonfinite failure reason.
+            :param Path | None debug_path: Optional written debug artifact.
+            :param int last_saved_step: Most recent checkpoint step.
+            :return int: Updated most recent checkpoint step.
+            """
+
+            nonlocal lr_mult
+            for phase_optimizer, phase_scheduler, did_step in optimizer_phases:
+                if not did_step and _optimizer_has_stepped(phase_optimizer):
+                    with suppress(Exception):
+                        phase_scheduler.step()
+                _record_unscaled_lrs(phase_optimizer, phase_scheduler)
+
+            lr_mult, reset_state = _apply_nonfinite_recovery(
+                lr_mult=lr_mult,
+                skip_streak=int(nonfinite_skip_streak),
+            )
+            for phase_optimizer, _, _ in optimizer_phases:
+                _apply_lr_mult(phase_optimizer, lr_mult)
+                if reset_state:
+                    with suppress(Exception):
+                        phase_optimizer.state.clear()
+
+            _commit_training_window()
+            if report_to != "none":
+                _log_tracker_metrics(
+                    {
+                        "nonfinite_window_skipped": 1.0,
+                        "nonfinite_skip_total": float(nonfinite_skip_total),
+                        "nonfinite_skip_streak": float(nonfinite_skip_streak),
+                        "nonfinite_recovery_lr_mult": float(lr_mult),
+                        "nonfinite_recovery_optimizer_state_reset": 1.0 if reset_state else 0.0,
+                    },
+                    step=int(global_step),
+                )
+            if accelerator.is_main_process:
+                logger.warning(
+                    "step=%d | nonfinite_window_skipped=1 | reason=%s | streak=%d | total_skips=%d | "
+                    "lr_mult=%.4f | opt_state_reset=%s | debug=%s",
+                    int(global_step),
+                    str(reason or "unknown"),
+                    int(nonfinite_skip_streak),
+                    int(nonfinite_skip_total),
+                    float(lr_mult),
+                    bool(reset_state),
+                    str(debug_path) if debug_path is not None else "n/a",
+                )
+            return _save_checkpoint_if_due(
+                global_step=global_step,
+                consumed_micro_batches_committed=consumed_micro_batches_committed,
+                lr_mult=lr_mult,
+                last_saved_step=last_saved_step,
+            )
+
         if effective_decoupled_training:
             if gen_optimizer is None or disc_optimizer is None:
                 raise RuntimeError("Decoupled training requires generator/discriminator optimizers.")
@@ -1188,21 +1313,7 @@ def run_pretraining(
                 gen_first_nonfinite_reason_local: str | None = None
                 gen_first_nonfinite_micro_step: int | None = None
                 for step_idx, (batch, gen_count, disc_count) in enumerate(window):
-                    batch = _move_batch_to_device(batch, accelerator.device)
-                    batch = _stabilize_compile_attention_mask(
-                        batch=batch,
-                        compile_enabled=compile_enabled,
-                        compile_scope=compile_scope,
-                        backbone_type=str(model_cfg.backbone_type),
-                    )
-                    batch, flash_meta = prepare_flash_attention_batch_metadata(
-                        batch=batch,
-                        backbone_type=str(model_cfg.backbone_type),
-                        flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
-                        flash_cfg=getattr(model_cfg.hf, "flash", None),
-                    )
-                    if compile_enabled:
-                        _maybe_cudagraph_mark_step_begin()
+                    batch, flash_meta = _prepare_training_batch(batch)
 
                     is_sync_step = step_idx == (ga_steps - 1)
                     sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
@@ -1264,8 +1375,7 @@ def run_pretraining(
                                 else int(step_idx)
                             )
                             skipped_window_due_nonfinite = True
-                            nonfinite_skip_total += 1
-                            nonfinite_skip_streak += 1
+                            _increment_nonfinite_skip()
                             nonfinite_reason = str(offending_effective)
                             lr_now = _scheduler_current_lr(gen_lr_scheduler)
                             nonfinite_debug_path = _write_nonfinite_artifact(
@@ -1321,8 +1431,7 @@ def run_pretraining(
                         )
                         if grad_norm_reason is not None:
                             skipped_window_due_nonfinite = True
-                            nonfinite_skip_total += 1
-                            nonfinite_skip_streak += 1
+                            _increment_nonfinite_skip()
                             nonfinite_reason = f"gen_{grad_norm_reason}_nonfinite"
                             gen_optimizer.zero_grad(set_to_none=True)
                             disc_optimizer.zero_grad(set_to_none=True)
@@ -1429,8 +1538,7 @@ def run_pretraining(
                                     else int(step_idx)
                                 )
                                 skipped_window_due_nonfinite = True
-                                nonfinite_skip_total += 1
-                                nonfinite_skip_streak += 1
+                                _increment_nonfinite_skip()
                                 nonfinite_reason = str(offending_effective)
                                 lr_now = _scheduler_current_lr(disc_lr_scheduler)
                                 nonfinite_debug_path = _write_nonfinite_artifact(
@@ -1480,8 +1588,7 @@ def run_pretraining(
                             )
                             if grad_norm_reason is not None:
                                 skipped_window_due_nonfinite = True
-                                nonfinite_skip_total += 1
-                                nonfinite_skip_streak += 1
+                                _increment_nonfinite_skip()
                                 nonfinite_reason = f"disc_{grad_norm_reason}_nonfinite"
                                 gen_optimizer.zero_grad(set_to_none=True)
                                 disc_optimizer.zero_grad(set_to_none=True)
@@ -1504,35 +1611,13 @@ def run_pretraining(
                 did_optimizer_step = bool(did_gen_optimizer_step and did_disc_optimizer_step)
                 if not did_optimizer_step:
                     if skipped_window_due_nonfinite:
-                        # Keep scheduler state moving on skipped windows only for phases that
-                        # did not already step in this accumulation window.
-                        if (not did_gen_optimizer_step) and _optimizer_has_stepped(gen_optimizer):
-                            with suppress(Exception):
-                                gen_lr_scheduler.step()
-                        if (not did_disc_optimizer_step) and _optimizer_has_stepped(disc_optimizer):
-                            with suppress(Exception):
-                                disc_lr_scheduler.step()
-                        _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
-                        _record_unscaled_lrs(disc_optimizer, disc_lr_scheduler)
-                        lr_mult, reset_state = _apply_nonfinite_recovery(
-                            lr_mult=lr_mult,
-                            skip_streak=int(nonfinite_skip_streak),
-                        )
-                        _apply_lr_mult(gen_optimizer, lr_mult)
-                        _apply_lr_mult(disc_optimizer, lr_mult)
-                        if reset_state:
-                            with suppress(Exception):
-                                gen_optimizer.state.clear()
-                            with suppress(Exception):
-                                disc_optimizer.state.clear()
-                        global_step += 1
-                        consumed_micro_batches_committed = int(consumed_micro_batches)
-                        if train_progress is not None:
-                            train_progress.update(1)
-                        last_saved_step = _save_checkpoint_if_due(
-                            global_step=global_step,
-                            consumed_micro_batches_committed=consumed_micro_batches_committed,
-                            lr_mult=lr_mult,
+                        last_saved_step = _finalize_nonfinite_skip(
+                            optimizer_phases=[
+                                (gen_optimizer, gen_lr_scheduler, did_gen_optimizer_step),
+                                (disc_optimizer, disc_lr_scheduler, did_disc_optimizer_step),
+                            ],
+                            reason=nonfinite_reason,
+                            debug_path=nonfinite_debug_path,
                             last_saved_step=last_saved_step,
                         )
                         continue
@@ -1540,14 +1625,8 @@ def run_pretraining(
                         "Decoupled accumulation window produced no synchronized optimization step."
                     )
 
-                nonfinite_skip_streak = 0
-                if lr_mult < 1.0:
-                    lr_mult = min(lr_mult * float(_NONFINITE_LR_MULT_RECOVERY), 1.0)
-
-                global_step += 1
-                consumed_micro_batches_committed = int(consumed_micro_batches)
-                if train_progress is not None:
-                    train_progress.update(1)
+                _record_successful_optimizer_window()
+                _commit_training_window()
 
                 _maybe_log_training_metrics(
                     lr_scheduler=disc_lr_scheduler,
@@ -1598,21 +1677,7 @@ def run_pretraining(
             first_nonfinite_micro_step: int | None = None
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
-                batch = _move_batch_to_device(batch, accelerator.device)
-                batch = _stabilize_compile_attention_mask(
-                    batch=batch,
-                    compile_enabled=compile_enabled,
-                    compile_scope=compile_scope,
-                    backbone_type=str(model_cfg.backbone_type),
-                )
-                batch, flash_meta = prepare_flash_attention_batch_metadata(
-                    batch=batch,
-                    backbone_type=str(model_cfg.backbone_type),
-                    flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
-                    flash_cfg=getattr(model_cfg.hf, "flash", None),
-                )
-                if compile_enabled:
-                    _maybe_cudagraph_mark_step_begin()
+                batch, flash_meta = _prepare_training_batch(batch)
 
                 is_sync_step = step_idx == (ga_steps - 1)
                 sync_ctx = nullcontext() if is_sync_step else accelerator.no_sync(model)
@@ -1686,8 +1751,7 @@ def run_pretraining(
                             else int(step_idx)
                         )
                         skipped_window_due_nonfinite = True
-                        nonfinite_skip_total += 1
-                        nonfinite_skip_streak += 1
+                        _increment_nonfinite_skip()
                         nonfinite_reason = str(offending_effective)
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_artifact(
@@ -1734,8 +1798,7 @@ def run_pretraining(
                     )
                     if grad_norm_reason is not None:
                         skipped_window_due_nonfinite = True
-                        nonfinite_skip_total += 1
-                        nonfinite_skip_streak += 1
+                        _increment_nonfinite_skip()
                         nonfinite_reason = f"{grad_norm_reason}_skip_{int(nonfinite_skip_total)}"
                         lr_now = _scheduler_current_lr(lr_scheduler)
                         nonfinite_debug_path = _write_nonfinite_artifact(
@@ -1767,59 +1830,16 @@ def run_pretraining(
                         _apply_lr_mult(optimizer, lr_mult)
                     optimizer.zero_grad(set_to_none=True)
                     did_optimizer_step = True
-                    nonfinite_skip_streak = 0
-                    if lr_mult < 1.0:
-                        lr_mult = min(lr_mult * float(_NONFINITE_LR_MULT_RECOVERY), 1.0)
+                    _record_successful_optimizer_window()
 
                     _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
-                    if _optimizer_has_stepped(optimizer):
-                        with suppress(Exception):
-                            lr_scheduler.step()
-                    _record_unscaled_lrs(optimizer, lr_scheduler)
-                    lr_mult, reset_state = _apply_nonfinite_recovery(
-                        lr_mult=lr_mult,
-                        skip_streak=int(nonfinite_skip_streak),
-                    )
-                    _apply_lr_mult(optimizer, lr_mult)
-                    if reset_state:
-                        with suppress(Exception):
-                            optimizer.state.clear()
-                    global_step += 1
-                    consumed_micro_batches_committed = int(consumed_micro_batches)
-                    if train_progress is not None:
-                        train_progress.update(1)
-                    if report_to != "none":
-                        _log_tracker_metrics(
-                            {
-                                "nonfinite_window_skipped": 1.0,
-                                "nonfinite_skip_total": float(nonfinite_skip_total),
-                                "nonfinite_skip_streak": float(nonfinite_skip_streak),
-                                "nonfinite_recovery_lr_mult": float(lr_mult),
-                                "nonfinite_recovery_optimizer_state_reset": 1.0 if reset_state else 0.0,
-                            },
-                            step=int(global_step),
-                        )
-
-                    if accelerator.is_main_process:
-                        logger.warning(
-                            "step=%d | nonfinite_window_skipped=1 | reason=%s | streak=%d | total_skips=%d | "
-                            "lr_mult=%.4f | opt_state_reset=%s | debug=%s",
-                            int(global_step),
-                            str(nonfinite_reason or "unknown"),
-                            int(nonfinite_skip_streak),
-                            int(nonfinite_skip_total),
-                            float(lr_mult),
-                            bool(reset_state),
-                            str(nonfinite_debug_path) if nonfinite_debug_path is not None else "n/a",
-                        )
-
-                    last_saved_step = _save_checkpoint_if_due(
-                        global_step=global_step,
-                        consumed_micro_batches_committed=consumed_micro_batches_committed,
-                        lr_mult=lr_mult,
+                    last_saved_step = _finalize_nonfinite_skip(
+                        optimizer_phases=[(optimizer, lr_scheduler, False)],
+                        reason=nonfinite_reason,
+                        debug_path=nonfinite_debug_path,
                         last_saved_step=last_saved_step,
                     )
                     continue
@@ -1834,10 +1854,7 @@ def run_pretraining(
             if did_optimizer_step:
                 if out is None:
                     raise RuntimeError("Accumulation window produced no forward pass outputs.")
-                global_step += 1
-                consumed_micro_batches_committed = int(consumed_micro_batches)
-                if train_progress is not None:
-                    train_progress.update(1)
+                _commit_training_window()
 
                 _maybe_log_training_metrics(
                     lr_scheduler=lr_scheduler,
