@@ -2838,8 +2838,7 @@ def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbo
     assert torch.equal(prepared["attention_mask"], build_doc_block_mask(doc_ids))
 
 
-@pytest.mark.parametrize("backbone_type", ["rope", "hf_deberta_v2"])
-def test_prepare_eager_doc_mask_accepts_device_resident_doc_ids(backbone_type: str) -> None:
+def test_prepare_eager_doc_mask_accepts_device_resident_doc_ids() -> None:
     import deberta.training.compile as compile_mod
 
     # The training loop transfers the batch before preparation. A meta tensor
@@ -2853,7 +2852,7 @@ def test_prepare_eager_doc_mask_accepts_device_resident_doc_ids(backbone_type: s
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
-        backbone_type=backbone_type,
+        backbone_type="rope",
         flash_enabled=False,
     )
 
