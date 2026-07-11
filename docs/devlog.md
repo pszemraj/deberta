@@ -905,7 +905,7 @@ follow-ups with exact names.
   warnings are (correctly) dead inside compiled graphs and the batch-prep
   non-prefix-mask eager downgrade logged nothing. Batch prep (host-side,
   outside graphs) now warns once per process; docs corrected -
-  `FLASHDEBERTA_WARN_FALLBACKS` defaults on, not off.
+  `model.hf.flash.warn_fallbacks` defaults on, not off.
 - Dense doc-block routing had no batch-size guard: the saved `(B,H,S,S)`
   bias costs ~4.5 GiB per batch element at 4096, so bumping batch size on a
   shipped packed config OOM'd at step 1 with no route linkage. Policy rows
@@ -957,7 +957,7 @@ silent behavior changes without the signal to see them.
 ### Fixed (one commit each, regression tests verified failing pre-fix)
 
 - Dense-vs-ragged doc-block routing was invisible in compiled training: the
-  per-layer `FLASHDEBERTA_DEBUG_STATS` counters are hard no-ops under
+  per-layer `model.hf.flash.debug_stats` counters are hard no-ops under
   `torch.compile` and batch prep recorded nothing, so a batch-size bump
   crossing a new `max_batch_size` bound silently cost the ~1.3x speedup.
   Batch prep now logs the chosen route once per `(route, S, B)` and warns

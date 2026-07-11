@@ -3,14 +3,13 @@
 
 from __future__ import annotations
 
-import os
-from dataclasses import asdict, dataclass
+import argparse
+from dataclasses import dataclass
 from typing import Any
 
 import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
 
-from deberta.config import ModelHFFlashConfig  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.modeling.mask_utils import (  # noqa: E402
     FlashBatchMeta,
@@ -33,33 +32,55 @@ class ParityCase:
     strict_ratio: bool = False
 
 
+_PARITY_CASE_NAMES = (
+    "dense",
+    "fixed_padded",
+    "varlen",
+    "local_bias",
+    "docblock",
+    "docblock_1024",
+    "docblock_2048",
+    "docblock_4096",
+    "docblock_bias",
+    "docbias_1024_b4",
+    "docbias_1024",
+    "docbias_2048",
+    "docbias_4096",
+)
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse explicit parity-suite controls."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=_PARITY_CASE_NAMES,
+        default=[],
+        help="Run only this case; repeat to select multiple cases.",
+    )
+    parser.add_argument(
+        "--include-docblock-bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include memory-intensive dense doc-block bias cases.",
+    )
+    return parser.parse_args()
+
+
 def _build_tiny_config(*, seq_len: int, flash: bool) -> DebertaV2Config:
     """Build a small DeBERTa config suitable for parity testing."""
 
-    cfg = DebertaV2Config(
+    return _bench_common.build_synthetic_backbone_config(
+        mode="flash" if bool(flash) else "eager",
+        seq_len=seq_len,
         vocab_size=128,
         hidden_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
+        num_layers=2,
+        num_heads=4,
         intermediate_size=128,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-        max_position_embeddings=seq_len,
-        type_vocab_size=0,
-        layer_norm_eps=1e-7,
-        relative_attention=True,
-        position_buckets=32,
-        max_relative_positions=seq_len,
-        pos_att_type=["c2p", "p2c"],
-        pad_token_id=0,
-        position_biased_input=False,
     )
-    cfg.hf_attention_impl = "flash" if bool(flash) else "eager"
-    # Derive the flash dict from the canonical config schema so the parity
-    # harness cannot drift from the keys the training builder materializes.
-    cfg.hf_flash = asdict(ModelHFFlashConfig())
-    return cfg
 
 
 @torch.no_grad()
@@ -364,6 +385,7 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
 def main() -> None:
     """Run forward/backward parity checks on a CUDA device."""
 
+    args = _parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for tools/flashdeberta_parity_test.py.")
 
@@ -402,14 +424,7 @@ def main() -> None:
             strict_ratio=True,
         ),
     ]
-    include_docblock_bias = str(
-        os.environ.get("FLASHDEBERTA_SKIP_DOCBLOCK_BIAS", "")
-    ).strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-    }
-    if include_docblock_bias:
+    if bool(args.include_docblock_bias):
         cases.append(
             ParityCase("docblock_bias", seq_len=1024, batch_size=2, route_hint="docblock_bias", docblock=True)
         )
@@ -452,16 +467,9 @@ def main() -> None:
                 ),
             ]
         )
-    requested_cases = {
-        item.strip()
-        for item in str(os.environ.get("FLASHDEBERTA_PARITY_CASES", "")).split(",")
-        if item.strip()
-    }
+    requested_cases = set(args.case)
     if requested_cases:
         cases = [case for case in cases if case.name in requested_cases]
-        missing = requested_cases.difference(case.name for case in cases)
-        if missing:
-            raise ValueError(f"Unknown parity cases requested: {sorted(missing)}")
     for case in cases:
         _run_case(case, device=device)
     print("OK")

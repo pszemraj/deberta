@@ -37,7 +37,8 @@ def _parse_args() -> argparse.Namespace:
         "--candidate",
         action="append",
         default=[],
-        help="Candidate env bundle as 'name:key=value,key=value'. Use 'default' for no overrides.",
+        metavar="NAME=JSON_PATH",
+        help="Named model.hf.flash.kernel_overrides_path candidate; use 'default' for the shipped table.",
     )
     parser.add_argument("--packing-enabled", choices=("true", "false"), default="false")
     parser.add_argument("--out-dir", type=Path, default=None)
@@ -127,8 +128,9 @@ def main() -> None:
     ]
     best_by_key: dict[str, dict[str, Any]] = {}
 
-    for candidate_name, env_map in candidates:
-        with bench.candidate_env(env_map):
+    restore_path = cfg.model.hf.flash.kernel_overrides_path
+    for candidate_name, candidate_path in candidates:
+        with bench.candidate_kernel_overrides(candidate_path, restore_path=restore_path):
             for route in routes:
                 sample0 = samples[0]
                 density_buckets = {sample.density_bucket for sample in samples}
@@ -187,7 +189,7 @@ def main() -> None:
                             "candidate": candidate_name,
                             "route": route,
                             "mean_ms": sample_mean_ms,
-                            "env": env_map,
+                            "kernel_overrides_path": candidate_path,
                             "density_bucket": sample.density_bucket,
                         }
                 summary_lines.append(

@@ -253,8 +253,8 @@ def _notice_non_prefix_padding_fallback_once() -> None:
     logger.warning(
         "FlashDeBERTa batch preparation saw a padding mask with holes or left "
         "padding; such batches run eager attention (throughput drops for them). "
-        "This is logged once per process - set FLASHDEBERTA_DEBUG_STATS=1 in an "
-        "uncompiled run to count occurrences."
+        "This is logged once per process; set model.hf.flash.debug_stats=true in "
+        "an uncompiled run to count occurrences."
     )
 
 
@@ -275,7 +275,7 @@ def _notice_docblock_route_once(
     sequence length) can silently flip dense ``docblock_bias`` to ragged
     ``docblock`` and cost the measured speedup. Batch preparation runs
     host-side outside compiled graphs, so this signal survives compiled
-    training where the per-layer ``FLASHDEBERTA_DEBUG_STATS`` counters are
+    training where the per-layer ``model.hf.flash.debug_stats`` counters are
     no-ops.
 
     :param str route_hint: Selected doc-block route for this shape.

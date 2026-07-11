@@ -239,6 +239,31 @@ model:
       #   replace shipped ones. Missing/malformed files fail on first route lookup.
       kernel_overrides_path: null
 
+      # [model.hf.flash.debug_stats]
+      # type: bool
+      # schema default: false
+      # default: literal false (route counters disabled)
+      # required: optional
+      # values: true | false
+      # status: experimental; only used when model.hf.attention_impl=flash
+      # contract: enables process-local counters for flash routes and eager fallback reasons. Counters are
+      #   hard-disabled inside torch.compile graphs, are intended for uncompiled diagnostics/benchmarks rather
+      #   than training metrics, and can be read through flashdeberta_stats_snapshot. Recommend false for normal
+      #   training and true only while diagnosing routing with train.compile.enabled=false.
+      debug_stats: false
+
+      # [model.hf.flash.warn_fallbacks]
+      # type: bool
+      # schema default: true
+      # default: literal true (warn once for each eager-fallback reason)
+      # required: optional
+      # values: true | false
+      # status: experimental; only used when model.hf.attention_impl=flash
+      # contract: controls per-process eager-fallback warnings emitted outside torch.compile graphs. Compiled
+      #   forwards cannot emit these warnings; host-side batch-preparation warnings remain independent. Keep true
+      #   unless a diagnostic or benchmark deliberately needs quiet output, because false can hide throughput loss.
+      warn_fallbacks: true
+
     # [model.hf.max_position_embeddings]
     # type: int | None
     # schema default: null

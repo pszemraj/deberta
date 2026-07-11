@@ -106,9 +106,7 @@ def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -
     class _TinyBackbone(torch.nn.Module):
         def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
             super().__init__()
-            self.embeddings = types.SimpleNamespace(
-                word_embeddings=torch.nn.Embedding(vocab_size, hidden_size),
-            )
+            self.embeddings = EmbeddingsStub(vocab_size, hidden_size)
 
         def _initialize_weights(self, module: torch.nn.Module) -> None:
             if isinstance(module, torch.nn.Linear):
@@ -126,9 +124,9 @@ def test_pretrainer_additional_forbidden_token_ids_extend_config_special_set() -
         ) -> Any:
             del attention_mask, token_type_ids, return_dict
             hidden = self.embeddings.word_embeddings(input_ids)
-            return types.SimpleNamespace(last_hidden_state=hidden)
+            return BackboneOutputStub(last_hidden_state=hidden)
 
-    cfg = types.SimpleNamespace(
+    cfg = BackboneConfigStub(
         vocab_size=32,
         hidden_size=8,
         hidden_act="gelu",
@@ -160,9 +158,7 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
     class _TinyBackbone(torch.nn.Module):
         def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
             super().__init__()
-            self.embeddings = types.SimpleNamespace(
-                word_embeddings=torch.nn.Embedding(vocab_size, hidden_size),
-            )
+            self.embeddings = EmbeddingsStub(vocab_size, hidden_size)
 
         def _initialize_weights(self, module: torch.nn.Module) -> None:
             if isinstance(module, torch.nn.Linear):
@@ -180,9 +176,9 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
         ) -> Any:
             del attention_mask, token_type_ids, return_dict
             hidden = self.embeddings.word_embeddings(input_ids)
-            return types.SimpleNamespace(last_hidden_state=hidden)
+            return BackboneOutputStub(last_hidden_state=hidden)
 
-    cfg = types.SimpleNamespace(
+    cfg = BackboneConfigStub(
         vocab_size=32,
         hidden_size=8,
         hidden_act="gelu",

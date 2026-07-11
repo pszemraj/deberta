@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import types
 from pathlib import Path
 
 from _config_factories import make_data_config, make_model_config, make_train_config
+from _fakes import BackboneConfigStub
 
 from deberta.modeling.export_utils import write_export_readme_and_license
 
@@ -51,7 +51,7 @@ def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_pa
     out_dir = tmp_path / "hf-export-effective-config"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    export_cfg = types.SimpleNamespace(
+    export_cfg = BackboneConfigStub(
         hidden_size=768,
         num_hidden_layers=6,
         num_attention_heads=12,

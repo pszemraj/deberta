@@ -178,6 +178,8 @@ class ModelHFFlashConfig:
     local_bias_max_batch_size: int | None = field(default=None)
     eager_dense_max_seq_len: int = field(default=0)
     kernel_overrides_path: str | None = field(default=None)
+    debug_stats: bool = field(default=False)
+    warn_fallbacks: bool = field(default=True)
 
 
 @dataclass(frozen=True)

@@ -10,12 +10,97 @@ import sys
 import types as _types
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from deberta.modeling.rtd import RTDDiscriminatorPhaseOutput, RTDGeneratorPhaseOutput, RTDOutput
+
+
+@dataclass
+class AcceleratorStateStub:
+    """Typed accelerator state used by unit tests."""
+
+    is_main_process: bool = True
+    num_processes: int = 1
+
+
+@dataclass
+class BackboneConfigStub:
+    """Explicit small backbone-config surface used by unit tests."""
+
+    vocab_size: int = 128
+    hidden_size: int = 32
+    embedding_size: int | None = None
+    intermediate_size: int = 64
+    num_hidden_layers: int = 1
+    num_attention_heads: int = 4
+    hidden_act: str = "gelu"
+    hidden_dropout_prob: float = 0.0
+    attention_probs_dropout_prob: float = 0.0
+    max_position_embeddings: int = 512
+    layer_norm_eps: float = 1e-6
+    norm_eps: float = 1e-6
+    use_rmsnorm_heads: bool = False
+    position_biased_input: bool = True
+    pad_token_id: int = 0
+    cls_token_id: int = 1
+    sep_token_id: int = 2
+    mask_token_id: int = 3
+    payload: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.embedding_size is None:
+            self.embedding_size = int(self.hidden_size)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return an explicit serialization payload for tracker tests."""
+
+        if self.payload is not None:
+            return dict(self.payload)
+        return {
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+        }
+
+
+@dataclass
+class BackboneOutputStub:
+    """Typed backbone output used by RTD tests."""
+
+    last_hidden_state: torch.Tensor
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+
+
+class EmbeddingsStub(torch.nn.Module):
+    """Embedding container matching the backbone attribute contract."""
+
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.word_embeddings = torch.nn.Embedding(vocab_size, hidden_size)
+
+
+class AutoTokenizerStub:
+    """Transformers-style tokenizer factory for import fakes."""
+
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any) -> DummyTokenizer:
+        """Return the shared dummy tokenizer."""
+
+        del args, kwargs
+        return DummyTokenizer()
+
+
+class DistributedDataParallelKwargsStub:
+    """Accept and retain Accelerate DDP keyword-handler values."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = dict(kwargs)
 
 
 class DummyTokenizer:
@@ -311,7 +396,7 @@ class SimpleRTD(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(1))
         self.generator = torch.nn.Linear(2, 2)
         self.discriminator = torch.nn.Linear(2, 2)
-        self.disc_config = _types.SimpleNamespace(pad_token_id=0)
+        self.disc_config = BackboneConfigStub(pad_token_id=0)
         self.calls: dict[str, list[Any]] = defaultdict(list)
         self._forward_calls = 0
         self._generator_phase_calls = 0
@@ -513,16 +598,14 @@ def setup_pretraining_mocks(
 
     fake_accelerate = _types.ModuleType("accelerate")
     fake_accelerate.Accelerator = accelerator_cls
-    fake_accelerate.DistributedDataParallelKwargs = _types.SimpleNamespace
+    fake_accelerate.DistributedDataParallelKwargs = DistributedDataParallelKwargsStub
     fake_accelerate_utils = _types.ModuleType("accelerate.utils")
     fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
     fake_transformers = _types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = _types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
+    fake_transformers.AutoTokenizer = AutoTokenizerStub
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
@@ -537,7 +620,7 @@ def setup_pretraining_mocks(
     monkeypatch.setattr(
         entrypoint_mod,
         "build_backbone_configs",
-        lambda **kwargs: (_types.SimpleNamespace(pad_token_id=0), _types.SimpleNamespace()),
+        lambda **kwargs: (BackboneConfigStub(pad_token_id=0), BackboneConfigStub()),
     )
     monkeypatch.setattr(entrypoint_mod, "build_backbones", build_backbones_fn)
     monkeypatch.setattr(entrypoint_mod, "DebertaV3RTDPretrainer", rtd_cls)

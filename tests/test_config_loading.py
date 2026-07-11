@@ -158,6 +158,8 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
                 "      docblock_bias_seq_len: 0",
                 "      local_bias_seq_len: 1024",
                 "      local_bias_max_batch_size: 2",
+                "      debug_stats: true",
+                "      warn_fallbacks: false",
                 "data:",
                 "  source:",
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
@@ -174,6 +176,8 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
     assert cfg.model.hf.flash.local_bias_seq_len == 1024
     assert cfg.model.hf.flash.local_bias_max_batch_size == 2
+    assert cfg.model.hf.flash.debug_stats is True
+    assert cfg.model.hf.flash.warn_fallbacks is False
 
 
 def test_config_reference_loads() -> None:

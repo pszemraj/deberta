@@ -12,11 +12,31 @@ from typing import Any
 import pytest
 import torch
 from _config_factories import make_data_config, make_model_config
-from _fakes import DummyTokenizer, FakeAccelerator
+from _fakes import AutoTokenizerStub, FakeAccelerator
 
 import deberta.export_cli as export_cli
 from deberta.config import RUN_CONFIG_SCHEMA_VERSION
 from deberta.run_layout import validate_run_metadata_file
+
+
+class _DistributedTypeStub:
+    FSDP = "FSDP"
+
+
+class _StateDictTypeStub:
+    FULL_STATE_DICT = "FULL_STATE_DICT"
+
+
+class _EmptyPretrainerStub:
+    pass
+
+
+class _StateDictPretrainerStub:
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {
+            "discriminator.weight": torch.tensor(1.0),
+            "generator.weight": torch.tensor(2.0),
+        }
 
 
 class _FakeExportBackbone(torch.nn.Module):
@@ -99,7 +119,7 @@ def _install_export_fakes(
     load_state_orig_mod_mismatch: bool = False,
 ) -> None:
     fake_utils = types.ModuleType("accelerate.utils")
-    fake_utils.DistributedType = types.SimpleNamespace(FSDP="FSDP")
+    fake_utils.DistributedType = _DistributedTypeStub
 
     if provide_torch_state_dict_api:
 
@@ -122,9 +142,7 @@ def _install_export_fakes(
         monkeypatch.setitem(sys.modules, "torch.distributed.checkpoint.state_dict", fake_torch_state_dict)
 
     fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
+    fake_transformers.AutoTokenizer = AutoTokenizerStub
     fake_accelerate = types.ModuleType("accelerate")
 
     def _accelerator_factory(**kwargs: Any) -> FakeAccelerator:
@@ -173,7 +191,7 @@ def _install_export_fakes(
         return object(), object()
 
     monkeypatch.setattr(export_cli, "build_backbones", _fake_build_backbones)
-    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: types.SimpleNamespace())
+    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _EmptyPretrainerStub())
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
@@ -351,7 +369,7 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
 
     fake_fsdp_mod = types.ModuleType("torch.distributed.fsdp")
     fake_fsdp_mod.FullStateDictConfig = _FakeFullStateDictConfig
-    fake_fsdp_mod.StateDictType = types.SimpleNamespace(FULL_STATE_DICT="FULL_STATE_DICT")
+    fake_fsdp_mod.StateDictType = _StateDictTypeStub
     fake_fsdp_mod.FullyShardedDataParallel = _FakeFSDP
     monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp_mod)
     monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _FakeFSDPModel())
@@ -635,7 +653,7 @@ def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
 def test_namespace_to_export_config_maps_allow_partial_export() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
-        ns = types.SimpleNamespace(
+        ns = argparse.Namespace(
             checkpoint_dir=str(root / "checkpoint-1"),
             output_dir=str(root / "exported"),
             run_dir=str(root / "run"),
@@ -693,12 +711,7 @@ def test_run_export_warns_when_fsdp_only_flags_are_ignored_on_non_fsdp(
     monkeypatch.setattr(
         export_cli,
         "DebertaV3RTDPretrainer",
-        lambda *args, **kwargs: types.SimpleNamespace(
-            state_dict=lambda: {
-                "discriminator.weight": torch.tensor(1.0),
-                "generator.weight": torch.tensor(2.0),
-            }
-        ),
+        lambda *args, **kwargs: _StateDictPretrainerStub(),
     )
 
     with caplog.at_level("WARNING"):

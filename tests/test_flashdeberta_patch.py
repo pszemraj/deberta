@@ -916,13 +916,13 @@ def test_flash_padding_route_shared_resolver_precedence() -> None:
     )
 
 
-def _small_deberta_config():
+def _small_deberta_config(*, debug_stats: bool = False, warn_fallbacks: bool = True):
     """Build a small config for native DeBERTa patch tests."""
 
     pytest.importorskip("transformers")
     from deberta.modeling.deberta_v2_native import DebertaV2Config
 
-    return DebertaV2Config(
+    cfg = DebertaV2Config(
         vocab_size=64,
         hidden_size=32,
         num_hidden_layers=1,
@@ -939,6 +939,11 @@ def _small_deberta_config():
         pad_token_id=0,
         position_biased_input=False,
     )
+    cfg.hf_flash = {
+        "debug_stats": bool(debug_stats),
+        "warn_fallbacks": bool(warn_fallbacks),
+    }
+    return cfg
 
 
 def _docblock_attention_config(*, seq_len: int):
@@ -981,9 +986,12 @@ def _stats_attention_harness(
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
     cfg = cfg if cfg is not None else _small_deberta_config()
+    cfg.hf_flash = {
+        **getattr(cfg, "hf_flash", {}),
+        "debug_stats": True,
+        "warn_fallbacks": False,
+    }
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
     monkeypatch.setattr(attention, "_fallback_reason", lambda **kwargs: None)
     monkeypatch.setattr(attention, "_projected_qkv_fallback_reason", lambda **kwargs: None)
     return attention_mod, attention, cfg
@@ -1071,8 +1079,9 @@ def test_native_model_flash_output_attentions_returns_prob_tensors(
 def test_flash_attention_pairwise_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
-    cfg = _small_deberta_config()
-    cfg.hf_flash = {"force_varlen": True, "varlen_min_seq_len": 2048, "eager_dense_max_seq_len": 0}
+    attention_mod.reset_flashdeberta_stats()
+    cfg = _small_deberta_config(debug_stats=True, warn_fallbacks=False)
+    cfg.hf_flash.update({"force_varlen": True, "varlen_min_seq_len": 2048, "eager_dense_max_seq_len": 0})
     attention = attention_mod.FlashDisentangledSelfAttention(cfg)
 
     rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
@@ -1111,6 +1120,7 @@ def test_flash_attention_pairwise_mask_falls_back_to_eager(monkeypatch: pytest.M
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
     assert "kwargs" in seen
     assert seen["kwargs"]["attention_mask"] is pairwise_mask
+    assert attention_mod.flashdeberta_stats_snapshot()["fallback_pairwise_mask"] == 1
 
 
 def test_flash_attention_output_attentions_falls_back_to_eager_contract(
@@ -1118,12 +1128,9 @@ def test_flash_attention_output_attentions_falls_back_to_eager_contract(
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
-    cfg = _small_deberta_config()
-    cfg.hf_flash = {"eager_dense_max_seq_len": 0}
+    cfg = _small_deberta_config(debug_stats=True, warn_fallbacks=False)
+    cfg.hf_flash["eager_dense_max_seq_len"] = 0
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
 
     monkeypatch.setattr(
@@ -1165,14 +1172,11 @@ def test_flash_attention_explicit_relative_pos_falls_back_and_preserves_tensor(
 
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
     from deberta.modeling.deberta_v2_native import build_relative_position
 
-    cfg = _small_deberta_config()
-    cfg.hf_flash = {"eager_dense_max_seq_len": 0}
+    cfg = _small_deberta_config(debug_stats=True, warn_fallbacks=False)
+    cfg.hf_flash["eager_dense_max_seq_len"] = 0
     torch.manual_seed(0)
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
     reference = attention_mod._EagerDisentangledSelfAttention(cfg).eval()
@@ -1242,12 +1246,9 @@ def test_non_prefix_padding_mask_falls_back_to_eager(monkeypatch: pytest.MonkeyP
 
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
-    cfg = _small_deberta_config()
-    cfg.hf_flash = {"eager_dense_max_seq_len": 0}
+    cfg = _small_deberta_config(debug_stats=True, warn_fallbacks=False)
+    cfg.hf_flash["eager_dense_max_seq_len"] = 0
     torch.manual_seed(0)
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
     reference = attention_mod._EagerDisentangledSelfAttention(cfg).eval()
@@ -2111,8 +2112,6 @@ def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.Mon
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
 
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "1")
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
     attention_mod.reset_flashdeberta_stats()
 
     attention_mod._record_stat("forward_calls")
@@ -2125,7 +2124,9 @@ def test_flash_attention_debug_stats_skip_during_compile(monkeypatch: pytest.Mon
 
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
-        attention_mod.FlashDisentangledSelfAttention._warn_once(
+        cfg = _small_deberta_config(debug_stats=True, warn_fallbacks=True)
+        attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+        attention._warn_once(
             reason="compile_skip",
             message="should not warn while compiling",
         )
@@ -2139,10 +2140,8 @@ def test_flash_dispatch_is_fullgraph_without_mask_scalar_extraction(
     """The real attention dispatcher must compile with a static mask attestation."""
 
     _install_fake_flashdeberta(monkeypatch)
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "0")
-    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
     attention_mod = _reload_flash_modules()
-    cfg = _small_deberta_config()
+    cfg = _small_deberta_config(warn_fallbacks=False)
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
     hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
     attention_mask = torch.tensor([True, True, False, False]).view(1, 1, 1, 4)
@@ -2174,10 +2173,8 @@ def test_flash_dispatch_profiler_has_no_local_scalar_dense(
     """Validated CUDA dispatch must not synchronize mask data into Python."""
 
     _install_fake_flashdeberta(monkeypatch)
-    monkeypatch.setenv("FLASHDEBERTA_DEBUG_STATS", "0")
-    monkeypatch.setenv("FLASHDEBERTA_WARN_FALLBACKS", "0")
     attention_mod = _reload_flash_modules()
-    cfg = _small_deberta_config()
+    cfg = _small_deberta_config(warn_fallbacks=False)
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(
         device="cuda",
         dtype=torch.bfloat16,
@@ -2231,7 +2228,6 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
 
     monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: True)
-    attention_mod.refresh_flashdeberta_runtime_config_from_env()
 
     assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=1024) is False
     assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=2048) is True
@@ -4396,8 +4392,6 @@ def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str
     re-imports a clean real-kernel tree and restores the prior modules after.
     """
 
-    import dataclasses
-
     affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
     saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
     for name in saved:
@@ -4406,11 +4400,6 @@ def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         if attention_mod.flashdeberta_fixed_import_error() is not None:
             pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
-        # The fresh module instance is discarded in the finally block, so
-        # mutating its runtime config does not need monkeypatch cleanup.
-        attention_mod._RUNTIME_CONFIG = dataclasses.replace(
-            attention_mod._RUNTIME_CONFIG, enable_debug_stats=True
-        )
         _run_docblock_real_kernel_leak_check(attention_mod=attention_mod, route=route)
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
@@ -4446,6 +4435,7 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
         pad_token_id=0,
         position_biased_input=False,
     )
+    cfg.hf_flash = {"debug_stats": True, "warn_fallbacks": False}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
 
     doc_ids = torch.cat(
@@ -4518,8 +4508,6 @@ def test_docblock_bias_dense_route_matches_eager_on_padded_batch() -> None:
     positions. Compares the whole output tensor, padding rows included.
     """
 
-    import dataclasses
-
     affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
     saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
     for name in saved:
@@ -4528,9 +4516,6 @@ def test_docblock_bias_dense_route_matches_eager_on_padded_batch() -> None:
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         if attention_mod.flashdeberta_fixed_import_error() is not None:
             pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
-        attention_mod._RUNTIME_CONFIG = dataclasses.replace(
-            attention_mod._RUNTIME_CONFIG, enable_debug_stats=True
-        )
         _run_docblock_bias_padded_parity_check(attention_mod=attention_mod)
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
@@ -4562,6 +4547,7 @@ def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
         pad_token_id=0,
         position_biased_input=False,
     )
+    cfg.hf_flash = {"debug_stats": True, "warn_fallbacks": False}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
     reference = attention_mod._EagerDisentangledSelfAttention(cfg)
     reference.load_state_dict(attention.state_dict())
@@ -4623,8 +4609,6 @@ def test_non_prefix_padding_mask_matches_eager_on_cuda() -> None:
     lengths, silently attending the wrong key positions for masks with holes.
     """
 
-    import dataclasses
-
     affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
     saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
     for name in saved:
@@ -4633,9 +4617,6 @@ def test_non_prefix_padding_mask_matches_eager_on_cuda() -> None:
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         if attention_mod.flashdeberta_fixed_import_error() is not None:
             pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
-        attention_mod._RUNTIME_CONFIG = dataclasses.replace(
-            attention_mod._RUNTIME_CONFIG, enable_debug_stats=True
-        )
         _run_non_prefix_padding_parity_check(attention_mod=attention_mod)
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
@@ -4665,6 +4646,7 @@ def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
         pad_token_id=0,
         position_biased_input=False,
     )
+    cfg.hf_flash = {"debug_stats": True, "warn_fallbacks": False}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
     reference = attention_mod._EagerDisentangledSelfAttention(cfg)
     reference.load_state_dict(attention.state_dict())

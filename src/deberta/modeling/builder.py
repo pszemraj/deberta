@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from deberta.config import ModelConfig, validate_model_config
-from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+from deberta.modeling.deberta_v2_native import (
+    DebertaV2Config,
+    DebertaV2Model,
+    _normalize_pos_att_type,
+)
 from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
@@ -630,6 +634,8 @@ def _apply_hf_config_normalization(
         "local_bias_max_batch_size": _optional_flash_int(flash_cfg.local_bias_max_batch_size),
         "eager_dense_max_seq_len": int(flash_cfg.eager_dense_max_seq_len),
         "kernel_overrides_path": flash_cfg.kernel_overrides_path,
+        "debug_stats": bool(flash_cfg.debug_stats),
+        "warn_fallbacks": bool(flash_cfg.warn_fallbacks),
     }
     cfg.use_rmsnorm_heads = False
 
@@ -644,13 +650,6 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
 
     if not is_flash_attention_impl(getattr(cfg, "hf_attention_impl", "eager")):
         return
-    hidden_dropout = float(getattr(cfg, "hidden_dropout_prob", 0.0))
-    attention_dropout = float(getattr(cfg, "attention_probs_dropout_prob", 0.0))
-    if hidden_dropout > 0.0 or attention_dropout > 0.0:
-        raise ValueError(
-            f"{component} flash attention requires dropout disabled; got "
-            f"hidden_dropout_prob={hidden_dropout}, attention_probs_dropout_prob={attention_dropout}."
-        )
     if not bool(getattr(cfg, "relative_attention", False)):
         raise ValueError(f"{component} flash attention requires relative_attention=true.")
     if int(getattr(cfg, "position_buckets", 0)) <= 0:
@@ -676,12 +675,7 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
             f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
             "to -1 (span follows max_position_embeddings) or use attention_impl=eager."
         )
-    pos_att_type = getattr(cfg, "pos_att_type", "")
-    if isinstance(pos_att_type, str):
-        pos_parts = {part.strip().lower() for part in pos_att_type.split("|") if part.strip()}
-    else:
-        pos_parts = {str(part).strip().lower() for part in pos_att_type if str(part).strip()}
-    if "p2p" in pos_parts:
+    if "p2p" in _normalize_pos_att_type(getattr(cfg, "pos_att_type", "")):
         raise ValueError(f"{component} flash attention does not support pos_att_type containing 'p2p'.")
 
 

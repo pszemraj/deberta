@@ -5,7 +5,7 @@ import math
 
 import pytest
 import torch
-from _fakes import DummyTokenizer
+from _fakes import BackboneConfigStub, BackboneOutputStub, DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
@@ -751,6 +751,10 @@ def test_mask_utils_reduce_and_expand_helpers_cover_all_ranks():
     assert torch.equal(expand_keep_mask_to_4d(mask_2d, pairwise_2d=True), pairwise[:, None])
     assert torch.equal(expand_keep_mask_to_4d(pairwise), pairwise[:, None])
 
+    per_head = pairwise[:, None].expand(-1, 2, -1, -1)
+    assert torch.equal(expand_keep_mask_to_4d(per_head), pairwise[:, None])
+    assert torch.equal(expand_keep_mask_to_4d(per_head, collapse_heads=False), per_head)
+
 
 def test_collator_build_drops_document_mask_when_not_packed():
     tok = DummyTokenizer(vocab_size=128)
@@ -1495,8 +1499,6 @@ def test_rope_pretrainer_ignores_flash_metadata_boundary():
 def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_backbone():
     """RTD should not pass flash metadata to backbones that do not declare it."""
 
-    from types import SimpleNamespace
-
     from deberta.modeling.mask_utils import FlashBatchMeta
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -1506,7 +1508,7 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
             self.word_embeddings = torch.nn.Embedding(vocab_size, hidden_size)
 
     class _BaseSignatureBackbone(torch.nn.Module):
-        def __init__(self, cfg: SimpleNamespace) -> None:
+        def __init__(self, cfg: BackboneConfigStub) -> None:
             super().__init__()
             self.cfg = cfg
             self.embeddings = _Embeddings(cfg.vocab_size, cfg.hidden_size)
@@ -1526,13 +1528,13 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
             token_type_ids: torch.Tensor | None = None,
             return_dict: bool = True,
             output_hidden_states: bool = False,
-        ) -> SimpleNamespace:
+        ) -> BackboneOutputStub:
             del attention_mask, token_type_ids, return_dict
             hidden = self.proj(self.embeddings.word_embeddings(input_ids))
             hidden_states = (hidden,) if output_hidden_states else None
-            return SimpleNamespace(last_hidden_state=hidden, hidden_states=hidden_states)
+            return BackboneOutputStub(last_hidden_state=hidden, hidden_states=hidden_states)
 
-    cfg = SimpleNamespace(
+    cfg = BackboneConfigStub(
         vocab_size=32,
         hidden_size=16,
         embedding_size=16,

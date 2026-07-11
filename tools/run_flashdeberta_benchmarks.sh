@@ -2,22 +2,63 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="${1:-configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2.yaml}"
-DOCBLOCK_CONFIG_PATH="${FLASHDEBERTA_DOCBLOCK_CONFIG_PATH:-configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 DEFAULT_OUT_DIR="${ROOT_DIR}/local-scratch/benchmarks/flashdeberta/flashdeberta_bench_${STAMP}"
-OUT_DIR="${FLASHDEBERTA_BENCH_OUT_DIR:-${DEFAULT_OUT_DIR}}"
+CONFIG_PATH="configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2.yaml"
+DOCBLOCK_CONFIG_PATH="configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml"
+OUT_DIR="${DEFAULT_OUT_DIR}"
+MICRO_WARMUP=10
+MICRO_STEPS=30
+PACKED_MAX_STEPS=100
+UNPACKED_MAX_STEPS=100
+DOCBLOCK_MAX_STEPS=100
+LOGGING_STEPS=10
+AVG_FROM_STEP=20
+INCLUDE_DOCBLOCK=0
+RETRY_ATTEMPTS=3
+RETRY_BACKOFF_SECONDS=5
 
-MICRO_WARMUP="${FLASHDEBERTA_MICRO_WARMUP:-10}"
-MICRO_STEPS="${FLASHDEBERTA_MICRO_STEPS:-30}"
-PACKED_MAX_STEPS="${FLASHDEBERTA_PACKED_MAX_STEPS:-100}"
-UNPACKED_MAX_STEPS="${FLASHDEBERTA_UNPACKED_MAX_STEPS:-100}"
-DOCBLOCK_MAX_STEPS="${FLASHDEBERTA_DOCBLOCK_MAX_STEPS:-100}"
-LOGGING_STEPS="${FLASHDEBERTA_LOGGING_STEPS:-10}"
-AVG_FROM_STEP="${FLASHDEBERTA_AVG_FROM_STEP:-20}"
-INCLUDE_DOCBLOCK="${FLASHDEBERTA_INCLUDE_DOCBLOCK:-0}"
-RETRY_ATTEMPTS="${FLASHDEBERTA_BENCH_RETRY_ATTEMPTS:-3}"
-RETRY_BACKOFF_SECONDS="${FLASHDEBERTA_BENCH_RETRY_BACKOFF_SECONDS:-5}"
+usage() {
+    cat <<'EOF'
+Run the FlashDeBERTa benchmark matrix.
+
+Options:
+  --config PATH                    Base training YAML.
+  --docblock-config PATH           Doc-block training YAML.
+  --out-dir PATH                   Output directory (default: timestamped local-scratch path).
+  --micro-warmup N                 Microbenchmark warmup iterations (default: 10).
+  --micro-steps N                  Microbenchmark measured iterations (default: 30).
+  --packed-max-steps N             Packed training steps (default: 100).
+  --unpacked-max-steps N           Unpacked training steps (default: 100).
+  --docblock-max-steps N           Doc-block training steps (default: 100).
+  --logging-steps N                Training logging interval (default: 10).
+  --avg-from-step N                First step included in throughput average (default: 20).
+  --include-docblock               Run doc-block training cases.
+  --retry-attempts N               Attempts for transient data/network failures (default: 3).
+  --retry-backoff-seconds N        Initial exponential retry delay (default: 5).
+  -h, --help                       Show this help.
+EOF
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --config) CONFIG_PATH="$2"; shift 2 ;;
+        --docblock-config) DOCBLOCK_CONFIG_PATH="$2"; shift 2 ;;
+        --out-dir) OUT_DIR="$2"; shift 2 ;;
+        --micro-warmup) MICRO_WARMUP="$2"; shift 2 ;;
+        --micro-steps) MICRO_STEPS="$2"; shift 2 ;;
+        --packed-max-steps) PACKED_MAX_STEPS="$2"; shift 2 ;;
+        --unpacked-max-steps) UNPACKED_MAX_STEPS="$2"; shift 2 ;;
+        --docblock-max-steps) DOCBLOCK_MAX_STEPS="$2"; shift 2 ;;
+        --logging-steps) LOGGING_STEPS="$2"; shift 2 ;;
+        --avg-from-step) AVG_FROM_STEP="$2"; shift 2 ;;
+        --include-docblock) INCLUDE_DOCBLOCK=1; shift ;;
+        --retry-attempts) RETRY_ATTEMPTS="$2"; shift 2 ;;
+        --retry-backoff-seconds) RETRY_BACKOFF_SECONDS="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
 
 mkdir -p "${OUT_DIR}"
 

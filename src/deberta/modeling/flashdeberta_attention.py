@@ -24,20 +24,13 @@ Important behavior
 
 Runtime controls
 ----------------
-Use ``model.hf.attention_impl=flash`` and ``model.hf.flash.*`` for routing and
-kernel policy. Set these optional instrumentation environment variables before
-importing this module:
-
-- ``FLASHDEBERTA_DEBUG_STATS`` (default: ``0``)
-    Enable eager/debug-only path counters for benchmark scripts.
-- ``FLASHDEBERTA_WARN_FALLBACKS`` (default: ``1``)
-    Emit one warning per fallback reason outside compiled graphs.
+Use ``model.hf.attention_impl=flash`` and ``model.hf.flash.*`` for routing,
+kernel policy, fallback warnings, and optional debug counters.
 """
 
 from __future__ import annotations
 
 import math
-import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
@@ -81,15 +74,14 @@ from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     build_doc_block_mask,
     doc_ids_from_segments,
+    expand_keep_mask_to_4d,
     is_pairwise_mask,
     is_torch_compiling,
     mask_to_2d_keep_mask,
-    normalize_keep_mask,
 )
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _FLASH_STATS: Counter[str] = Counter()
-_TRUTHY = {"1", "true", "yes", "y", "on"}
 _DENSE_BUCKET_INDEX_CACHE = BoundedLRUCache[tuple[int, int, int, str, int | None], torch.Tensor](
     max_entries=8
 )
@@ -114,17 +106,6 @@ class FlashDebertaRuntimeConfig:
     warn_fallbacks: bool = True
 
 
-def _truthy_env(name: str, default: str = "0") -> bool:
-    """Parse a boolean-ish environment variable.
-
-    :param str name: Environment variable name.
-    :param str default: Default string to parse when the variable is unset.
-    :return bool: Whether the value matches the repo's truthy set.
-    """
-
-    return os.environ.get(name, default).strip().lower() in _TRUTHY
-
-
 def _optional_int(value: Any, *, default: int | None = None) -> int | None:
     """Return an integer override or None when unset.
 
@@ -139,39 +120,6 @@ def _optional_int(value: Any, *, default: int | None = None) -> int | None:
         return int(value)
     except Exception:
         return default
-
-
-def _read_runtime_config_from_env() -> FlashDebertaRuntimeConfig:
-    """Load debug instrumentation toggles from environment variables.
-
-    :return FlashDebertaRuntimeConfig: Default runtime policy plus debug toggles.
-    """
-
-    return FlashDebertaRuntimeConfig(
-        force_varlen=False,
-        varlen_min_seq_len=None,
-        docblock_bias_seq_len=None,
-        local_bias_seq_len=None,
-        local_bias_max_batch_size=None,
-        eager_dense_max_seq_len=0,
-        kernel_overrides_path=None,
-        enable_debug_stats=_truthy_env("FLASHDEBERTA_DEBUG_STATS", default="0"),
-        warn_fallbacks=_truthy_env("FLASHDEBERTA_WARN_FALLBACKS", default="1"),
-    )
-
-
-_RUNTIME_CONFIG = _read_runtime_config_from_env()
-
-
-def refresh_flashdeberta_runtime_config_from_env() -> None:
-    """Reload debug instrumentation toggles from environment variables.
-
-    This exists primarily for tests or benchmark scripts that intentionally
-    mutate ``os.environ`` after the module was imported.
-    """
-
-    global _RUNTIME_CONFIG
-    _RUNTIME_CONFIG = _read_runtime_config_from_env()
 
 
 def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRuntimeConfig:
@@ -204,8 +152,8 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
         local_bias_max_batch_size=_optional_int(getter("local_bias_max_batch_size", None)),
         eager_dense_max_seq_len=max(0, int(getter("eager_dense_max_seq_len", 0))),
         kernel_overrides_path=getter("kernel_overrides_path", None),
-        enable_debug_stats=bool(_RUNTIME_CONFIG.enable_debug_stats),
-        warn_fallbacks=bool(_RUNTIME_CONFIG.warn_fallbacks),
+        enable_debug_stats=bool(getter("debug_stats", False)),
+        warn_fallbacks=bool(getter("warn_fallbacks", True)),
     )
 
 
@@ -236,42 +184,9 @@ def _record_stat(name: str, value: int = 1) -> None:
     :param int value: Increment amount, defaults to ``1``.
     """
 
-    if not _RUNTIME_CONFIG.enable_debug_stats:
-        return
     if is_torch_compiling():
         return
     _FLASH_STATS[name] += int(value)
-
-
-def _pairwise_mask_to_4d_keep_mask(
-    attention_mask: torch.Tensor,
-    *,
-    query_len: int,
-    key_len: int,
-) -> torch.Tensor:
-    """Extract a canonical pairwise keep mask ``(B,1,Q,K)`` or ``(B,H,Q,K)``.
-
-    :param torch.Tensor attention_mask: Pairwise keep-mask tensor.
-    :param int query_len: Expected query length.
-    :param int key_len: Expected key length.
-    :raises ValueError: If the mask is not pairwise.
-    :return torch.Tensor: Boolean keep mask with shape ``(B, 1, Q, K)``, or
-        ``(B, H, Q, K)`` when a per-head mask is supplied.
-    """
-
-    mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 3:
-        pairwise = mask.unsqueeze(1)
-    elif mask.ndim == 4:
-        pairwise = mask
-    else:
-        raise ValueError("FlashDeBERTa pairwise masks must be shaped (B,Q,K) or (B,1,Q,K).")
-    if tuple(pairwise.shape[-2:]) != (int(query_len), int(key_len)):
-        raise ValueError(
-            "FlashDeBERTa pairwise masks must match the attention shape; "
-            f"got mask={tuple(pairwise.shape)} expected=(*,{int(query_len)},{int(key_len)})."
-        )
-    return pairwise.to(dtype=torch.bool)
 
 
 def _should_use_varlen(
@@ -308,7 +223,7 @@ def _should_use_varlen(
     if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
         return False
 
-    cfg = runtime_config or _RUNTIME_CONFIG
+    cfg = runtime_config or FlashDebertaRuntimeConfig()
     return (
         flash_padding_route(
             seq_len=int(seq_len),
@@ -441,8 +356,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         configure_flashdeberta_kernel_overrides(self._runtime_config.kernel_overrides_path)
         super().__init__(*args, **kwargs)
 
-    @classmethod
-    def _warn_once(cls, *, reason: str, message: str) -> None:
+    def _warn_once(self, *, reason: str, message: str) -> None:
         """Emit one warning per process for a fallback reason.
 
         Warnings are skipped while executing inside compiled graphs.
@@ -451,13 +365,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param str message: Warning text to emit.
         """
 
-        if not _RUNTIME_CONFIG.warn_fallbacks:
+        if not self._runtime_config.warn_fallbacks:
             return
         if is_torch_compiling():
             return
-        if reason in cls._warned_reasons:
+        if reason in self._warned_reasons:
             return
-        cls._warned_reasons.add(reason)
+        self._warned_reasons.add(reason)
         warnings.warn(message, stacklevel=2)
 
     def _fallback_reason(
@@ -633,7 +547,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat("flash_fixed_calls")
         return flashdeberta_fixed(
             query_layer=query_layer,
@@ -738,7 +652,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat(stat)
         output = flashdeberta_bias_from_positions(
             query_layer=query_layer,
@@ -825,7 +739,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             causal=False,
         )
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat("flash_varlen_calls")
         return out
 
@@ -884,7 +798,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             total_tokens=active_tokens,
             causal=False,
         )
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat("flash_docblock_calls")
         return out
 
@@ -913,11 +827,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_len = int(query_layer.shape[-2])
-        keep_mask = _pairwise_mask_to_4d_keep_mask(
-            attention_mask,
-            query_len=seq_len,
-            key_len=int(key_layer.shape[-2]),
-        )
+        key_len = int(key_layer.shape[-2])
+        if not is_pairwise_mask(attention_mask, query_len=seq_len, key_len=key_len):
+            raise ValueError(
+                "FlashDeBERTa pairwise masks must match the attention shape; "
+                f"got mask={tuple(attention_mask.shape)} expected=(*,{seq_len},{key_len})."
+            )
+        keep_mask = expand_keep_mask_to_4d(attention_mask, collapse_heads=False)
         return self._flash_dense_bias(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -1058,7 +974,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :return tuple[torch.Tensor, torch.Tensor | None]: Eager attention output and optional probs.
         """
 
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat("fallback_calls")
             _record_stat(f"fallback_{reason}")
         self._warn_once(reason=reason, message=message)
@@ -1099,7 +1015,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         if query_states is None:
             query_states = hidden_states
 
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat("forward_calls")
 
         if relative_pos is not None:
@@ -1343,7 +1259,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             scale_factor += 1
         sm_scale = 1.0 / math.sqrt(float(self.attention_head_size * scale_factor))
 
-        if _RUNTIME_CONFIG.enable_debug_stats:
+        if self._runtime_config.enable_debug_stats:
             _record_stat("flash_eligible_calls")
         if use_docblock_bias:
             output = self._flash_docblock_bias(
@@ -1418,6 +1334,5 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 __all__ = [
     "FlashDisentangledSelfAttention",
     "flashdeberta_stats_snapshot",
-    "refresh_flashdeberta_runtime_config_from_env",
     "reset_flashdeberta_stats",
 ]

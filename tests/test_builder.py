@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 from _config_factories import make_model_config
-from _fakes import DummyTokenizer
+from _fakes import BackboneConfigStub, DummyTokenizer
 
 from deberta.config import ModelConfig, load_config
 from deberta.modeling import builder as builder_mod
@@ -315,7 +314,7 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
 
 
 def test_derive_generator_config_uses_half_depth_for_hf_backbone():
-    base_cfg = types.SimpleNamespace(num_hidden_layers=12)
+    base_cfg = BackboneConfigStub(num_hidden_layers=12)
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         generator_num_hidden_layers=None,
@@ -326,7 +325,7 @@ def test_derive_generator_config_uses_half_depth_for_hf_backbone():
 
 
 def test_derive_generator_config_keeps_third_depth_default_for_non_hf_backbone():
-    base_cfg = types.SimpleNamespace(num_hidden_layers=12)
+    base_cfg = BackboneConfigStub(num_hidden_layers=12)
     model_cfg = make_model_config(
         backbone_type="rope",
         generator_num_hidden_layers=None,
@@ -471,6 +470,8 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
                 "local_bias_seq_len": 1024,
                 "local_bias_max_batch_size": 2,
                 "eager_dense_max_seq_len": 512,
+                "debug_stats": True,
+                "warn_fallbacks": False,
             },
         },
     )
@@ -490,6 +491,8 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         assert built_cfg.hf_flash["local_bias_seq_len"] == 1024
         assert built_cfg.hf_flash["local_bias_max_batch_size"] == 2
         assert built_cfg.hf_flash["eager_dense_max_seq_len"] == 512
+        assert built_cfg.hf_flash["debug_stats"] is True
+        assert built_cfg.hf_flash["warn_fallbacks"] is False
 
 
 def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
@@ -515,6 +518,7 @@ def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
         ({"relative_attention": False}, "relative_attention=true"),
         ({"position_buckets": 0}, "position_buckets > 0"),
         ({"pos_att_type": "p2c|p2p"}, "does not support pos_att_type"),
+        ({"pos_att_type": "p2c,p2p"}, "does not support pos_att_type"),
         # External checkpoints may pin a short explicit span; eager clamps
         # relative positions to it before bucketing while the flash kernels
         # do not, so flash must refuse rather than silently diverge.
@@ -1066,8 +1070,8 @@ def test_build_backbones_uses_resolved_hf_weight_sources(monkeypatch: pytest.Mon
         pretrained_discriminator_path="disc_weights",
         pretrained_generator_path="gen_weights",
     )
-    disc_cfg = types.SimpleNamespace(hidden_size=768)
-    gen_cfg = types.SimpleNamespace(hidden_size=384)
+    disc_cfg = BackboneConfigStub(hidden_size=768)
+    gen_cfg = BackboneConfigStub(hidden_size=384)
     _ = builder_mod.build_backbones(model_cfg=model_cfg, disc_config=disc_cfg, gen_config=gen_cfg)
 
     assert called == [("disc_weights", disc_cfg), ("gen_weights", gen_cfg)]
@@ -1111,8 +1115,8 @@ def test_build_backbones_pretrained_hf_does_not_fetch_external_config(monkeypatc
         pretrained_discriminator_path="disc_weights",
         pretrained_generator_path="gen_weights",
     )
-    disc_cfg = types.SimpleNamespace(hidden_size=768, vocab_size=128100)
-    gen_cfg = types.SimpleNamespace(hidden_size=384, vocab_size=128100)
+    disc_cfg = BackboneConfigStub(hidden_size=768, vocab_size=128100)
+    gen_cfg = BackboneConfigStub(hidden_size=384, vocab_size=128100)
     _ = builder_mod.build_backbones(model_cfg=model_cfg, disc_config=disc_cfg, gen_config=gen_cfg)
 
     assert model_calls == ["disc_weights", "gen_weights"]
@@ -1174,8 +1178,8 @@ def test_build_backbones_uses_discriminator_fallback_for_derived_pretrained_hf(
         pretrained_discriminator_path="disc_weights",
         pretrained_generator_path=None,
     )
-    disc_cfg = types.SimpleNamespace(hidden_size=768)
-    gen_cfg = types.SimpleNamespace(hidden_size=384)
+    disc_cfg = BackboneConfigStub(hidden_size=768)
+    gen_cfg = BackboneConfigStub(hidden_size=384)
     _ = builder_mod.build_backbones(model_cfg=model_cfg, disc_config=disc_cfg, gen_config=gen_cfg)
 
     assert called == ["disc_weights", "disc_weights"]

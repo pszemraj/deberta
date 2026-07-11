@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import re
-import shlex
 import sys
 import types
 import warnings
@@ -24,7 +23,11 @@ from _config_factories import (
     make_train_config,
 )
 from _fakes import (
+    AcceleratorStateStub,
+    BackboneConfigStub,
+    BackboneOutputStub,
     DummyTokenizer,
+    EmbeddingsStub,
     FakeAccelerator,
     FakeWandbRun,
     SimpleRTD,

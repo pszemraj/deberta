@@ -455,16 +455,23 @@ def is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: i
     return False
 
 
-def expand_keep_mask_to_4d(attention_mask: torch.Tensor, *, pairwise_2d: bool = False) -> torch.Tensor:
+def expand_keep_mask_to_4d(
+    attention_mask: torch.Tensor,
+    *,
+    pairwise_2d: bool = False,
+    collapse_heads: bool = True,
+) -> torch.Tensor:
     """Expand a rank-2/3/4 keep mask to the canonical 4D attention layout.
 
     2D key-padding masks become broadcast ``(B,1,1,S)`` by default, or a full
     outer-product ``(B,1,S,S)`` pairwise mask when ``pairwise_2d`` is set (the
     original DeBERTa EMD convention). 3D pairwise masks gain a head axis and 4D
-    masks are head-reduced to ``(B,1,*,S)``.
+    masks are head-reduced to ``(B,1,*,S)`` by default. Callers that support
+    genuine per-head constraints can preserve the head axis explicitly.
 
     :param torch.Tensor attention_mask: Keep mask in rank-2/3/4 layout.
     :param bool pairwise_2d: Whether 2D masks expand via outer product.
+    :param bool collapse_heads: Whether multi-head 4D masks are OR-reduced.
     :raises ValueError: If the mask rank is unsupported.
     :return torch.Tensor: Boolean keep mask in ``(B,1,1,S)`` or ``(B,1,S,S)`` layout.
     """
@@ -478,7 +485,7 @@ def expand_keep_mask_to_4d(attention_mask: torch.Tensor, *, pairwise_2d: bool = 
     if mask.ndim == 3:
         return mask[:, None, :, :]
     if mask.ndim == 4:
-        if mask.shape[1] == 1:
+        if mask.shape[1] == 1 or not collapse_heads:
             return mask
         return mask.any(dim=1, keepdim=True)
     raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")

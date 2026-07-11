@@ -4,14 +4,13 @@
 Every real-batch tool in ``tools/`` needs the same scaffolding: put ``src/``
 on ``sys.path``, build the repo tokenizer/dataset/collator/loader from a
 config, resolve bf16/tf32 policy, construct backbones, and (for the kernel
-tuners) sample flash-routed batches and time candidate env bundles. This
+tuners) sample flash-routed batches and time candidate override tables. This
 module owns that scaffolding once; the tools keep only their CLI surface and
 report schemas.
 """
 
 from __future__ import annotations
 
-import os
 import statistics
 import sys
 import time
@@ -40,12 +39,18 @@ import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
-from deberta.config import load_config, resolve_effective_mixed_precision  # noqa: E402
+from deberta.config import (  # noqa: E402
+    DataConfig,
+    ModelConfig,
+    load_config,
+    resolve_effective_mixed_precision,
+)
 from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
 from deberta.modeling.flashdeberta_kernel_tuning import (  # noqa: E402
     compute_capability_key,
+    configure_flashdeberta_kernel_overrides,
     flash_seq_bucket,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability  # noqa: E402
@@ -119,57 +124,52 @@ def resolve_out_dir(path: Path | None, *, default_prefix: str) -> Path:
     return path.resolve()
 
 
-def parse_candidate_specs(values: list[str]) -> list[tuple[str, dict[str, str]]]:
-    """Parse ``name:key=value,...`` candidate env-bundle specs.
+def parse_candidate_specs(values: list[str]) -> list[tuple[str, str | None]]:
+    """Parse named kernel-override table candidates.
 
-    :param list[str] values: Raw candidate specs (``default`` means no overrides).
+    :param list[str] values: ``name=path.json`` candidates; ``default`` selects the shipped table.
     :raises ValueError: If a spec is malformed.
-    :return list[tuple[str, dict[str, str]]]: ``(name, env_map)`` pairs.
+    :return list[tuple[str, str | None]]: Candidate names and override-table paths.
     """
 
     if not values:
-        return [("default", {})]
-    out: list[tuple[str, dict[str, str]]] = []
+        return [("default", None)]
+    out: list[tuple[str, str | None]] = []
     for raw in values:
         text = str(raw).strip()
         if not text or text == "default":
-            out.append(("default", {}))
+            out.append(("default", None))
             continue
-        if ":" not in text:
-            raise ValueError(f"Candidate must be 'name:key=value,...'; got {text!r}")
-        name, env_text = text.split(":", 1)
-        env_map: dict[str, str] = {}
-        for item in env_text.split(","):
-            if not item.strip():
-                continue
-            if "=" not in item:
-                raise ValueError(f"Candidate env override must be KEY=VALUE; got {item!r}")
-            key, value = item.split("=", 1)
-            env_map[key.strip()] = value.strip()
-        out.append((name.strip(), env_map))
+        if "=" not in text:
+            raise ValueError(f"Candidate must be 'name=path/to/overrides.json'; got {text!r}")
+        name, path_text = text.split("=", 1)
+        path = Path(path_text).expanduser()
+        if not name.strip() or not path_text.strip():
+            raise ValueError(f"Candidate must include both a name and JSON path; got {text!r}")
+        if not path.is_file():
+            raise ValueError(f"Candidate override table does not exist: {path}")
+        out.append((name.strip(), str(path.resolve())))
     return out
 
 
 @contextmanager
-def candidate_env(env_map: dict[str, str]) -> Iterator[None]:
-    """Apply candidate env overrides for the duration of one sweep.
+def candidate_kernel_overrides(
+    path: str | None,
+    *,
+    restore_path: str | None,
+) -> Iterator[None]:
+    """Apply one kernel override table for the duration of a tuning sweep.
 
-    :param dict[str, str] env_map: Environment overrides to apply.
+    :param str | None path: Candidate override JSON, or None for the shipped table.
+    :param str | None restore_path: Override path to restore afterward.
     :return Iterator[None]: Context that restores prior values on exit.
     """
 
-    saved: dict[str, str | None] = {}
-    for key, value in env_map.items():
-        saved[key] = os.environ.get(key)
-        os.environ[key] = str(value)
+    configure_flashdeberta_kernel_overrides(path)
     try:
         yield
     finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        configure_flashdeberta_kernel_overrides(restore_path)
 
 
 def load_tool_config_and_loader(
@@ -254,6 +254,71 @@ def build_branch_backbone_config(
         else int(backbone_config.max_relative_positions)
     )
     return backbone_config, head_dim, att_span
+
+
+class _SyntheticTokenizer:
+    """Minimal tokenizer contract for synthetic benchmark configs."""
+
+    def __init__(self, vocab_size: int) -> None:
+        self.vocab_size = int(vocab_size)
+        self.pad_token_id = 0
+        self.cls_token_id = 1
+        self.sep_token_id = 2
+        self.mask_token_id = 3
+        self.bos_token_id = 4
+        self.eos_token_id = 5
+
+    def __len__(self) -> int:
+        """Return the synthetic vocabulary size."""
+
+        return self.vocab_size
+
+
+def build_synthetic_backbone_config(
+    *,
+    mode: str,
+    seq_len: int,
+    vocab_size: int,
+    hidden_size: int,
+    num_layers: int,
+    num_heads: int,
+    intermediate_size: int,
+    debug_stats: bool = False,
+) -> Any:
+    """Build a synthetic benchmark shape through the production config builder.
+
+    :param str mode: Attention implementation, ``eager`` or ``flash``.
+    :param int seq_len: Maximum sequence length.
+    :param int vocab_size: Synthetic vocabulary size.
+    :param int hidden_size: Backbone hidden width.
+    :param int num_layers: Backbone depth.
+    :param int num_heads: Attention-head count.
+    :param int intermediate_size: MLP intermediate width.
+    :param bool debug_stats: Whether to enable FlashDeBERTa route counters.
+    :return Any: Materialized native DeBERTa config.
+    """
+
+    model_cfg = ModelConfig(
+        hf={
+            "attention_impl": str(mode),
+            "max_position_embeddings": int(seq_len),
+            "flash": {"debug_stats": bool(debug_stats)},
+        },
+        generator={
+            "hidden_size": int(hidden_size),
+            "num_hidden_layers": int(num_layers),
+            "num_attention_heads": int(num_heads),
+            "intermediate_size": int(intermediate_size),
+        },
+    )
+    data_cfg = DataConfig(packing={"max_seq_length": int(seq_len)})
+    backbone_config, _, _ = build_branch_backbone_config(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        tokenizer=_SyntheticTokenizer(vocab_size),
+        branch="generator",
+    )
+    return backbone_config
 
 
 def build_bf16_backbone(backbone_config: Any, *, device: torch.device) -> DebertaV2Model:

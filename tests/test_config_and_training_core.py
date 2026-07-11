@@ -242,7 +242,10 @@ def test_resolve_output_dir_keeps_explicit_path():
 
 def _accel_stub(*, is_main_process: bool, num_processes: int) -> Any:
     """Return a minimal accelerator-like object for broadcast helper tests."""
-    return types.SimpleNamespace(is_main_process=bool(is_main_process), num_processes=int(num_processes))
+    return AcceleratorStateStub(
+        is_main_process=bool(is_main_process),
+        num_processes=int(num_processes),
+    )
 
 
 def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
@@ -933,7 +936,7 @@ def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Pa
 
     run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=types.SimpleNamespace(is_main_process=True),
+        accelerator=AcceleratorStateStub(is_main_process=True),
         wandb_run=run,
         config_original_path=src,
         run_name="demo-run",
@@ -956,7 +959,7 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
 
     run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=types.SimpleNamespace(is_main_process=True),
+        accelerator=AcceleratorStateStub(is_main_process=True),
         wandb_run=run,
         config_original_path=src_original,
         config_resolved_path=src_resolved,
@@ -999,24 +1002,24 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
         learning_rate=5e-4, generator_learning_rate=-1.0, discriminator_learning_rate=-1.0
     )
     logging_cfg = make_logging_config()
-    disc_cfg = types.SimpleNamespace(
+    disc_cfg = BackboneConfigStub(
         num_hidden_layers=12,
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         max_position_embeddings=1024,
-        to_dict=lambda: {
+        payload={
             "num_hidden_layers": 12,
             "hidden_dropout_prob": 0.1,
             "attention_probs_dropout_prob": 0.1,
             "max_position_embeddings": 1024,
         },
     )
-    gen_cfg = types.SimpleNamespace(
+    gen_cfg = BackboneConfigStub(
         num_hidden_layers=6,
         hidden_size=384,
         intermediate_size=1536,
         num_attention_heads=6,
-        to_dict=lambda: {
+        payload={
             "num_hidden_layers": 6,
             "hidden_size": 384,
             "intermediate_size": 1536,
@@ -1070,16 +1073,16 @@ def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None
         adam_epsilon="1e-6",  # type: ignore[arg-type]
         warmup_steps="1000",  # type: ignore[arg-type]
     )
-    disc_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
+    disc_cfg = BackboneConfigStub(
+        payload={
             "num_hidden_layers": 12,
             "hidden_dropout_prob": 0.0,
             "attention_probs_dropout_prob": 0.0,
             "max_position_embeddings": 1024,
         },
     )
-    gen_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
+    gen_cfg = BackboneConfigStub(
+        payload={
             "num_hidden_layers": 6,
             "hidden_size": 768,
             "intermediate_size": 3072,

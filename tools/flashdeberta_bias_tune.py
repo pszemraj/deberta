@@ -34,7 +34,8 @@ def _parse_args() -> argparse.Namespace:
         "--candidate",
         action="append",
         default=[],
-        help="Candidate env bundle as 'name:key=value,key=value'. Use 'default' for no overrides.",
+        metavar="NAME=JSON_PATH",
+        help="Named model.hf.flash.kernel_overrides_path candidate; use 'default' for the shipped table.",
     )
     parser.add_argument("--out-dir", type=Path, default=None)
     return parser.parse_args()
@@ -80,7 +81,7 @@ def main() -> None:
         with_pair_density=True,
         empty_error="Failed to sample any dense doc-block flash batches.",
     )
-    # Build once and reuse across candidates: env candidates only change kernel
+    # Build once and reuse across candidates: override tables only change kernel
     # selection, and per-candidate rebuilds gave each sweep a different random
     # init (a drift from the varlen tuner) for pure GPU alloc/cast overhead.
     model = bench.build_bf16_backbone(backbone_config, device=device)
@@ -112,8 +113,9 @@ def main() -> None:
     ]
     best_by_key: dict[str, dict[str, Any]] = {}
 
-    for candidate_name, env_map in candidates:
-        with bench.candidate_env(env_map):
+    restore_path = cfg.model.hf.flash.kernel_overrides_path
+    for candidate_name, candidate_path in candidates:
+        with bench.candidate_kernel_overrides(candidate_path, restore_path=restore_path):
             sample0 = samples[0]
             try:
                 timing = bench.run_timed_candidate(
@@ -174,7 +176,7 @@ def main() -> None:
                     best_by_key[key] = {
                         "candidate": candidate_name,
                         "mean_ms": sample_mean_ms,
-                        "env": env_map,
+                        "kernel_overrides_path": candidate_path,
                         "pair_density": sample.pair_density,
                     }
 

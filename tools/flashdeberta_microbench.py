@@ -21,30 +21,25 @@ Longer padded regime with varlen enabled:
 from __future__ import annotations
 
 import argparse
-import os
 import statistics
 import time
 from contextlib import nullcontext
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
 
-from deberta.config import ModelHFFlashConfig  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.training.compile import prepare_flash_attention_batch_metadata  # noqa: E402
 
 try:  # noqa: E402
     from deberta.modeling.flashdeberta_attention import (  # type: ignore
         flashdeberta_stats_snapshot,
-        refresh_flashdeberta_runtime_config_from_env,
         reset_flashdeberta_stats,
     )
 except Exception:  # pragma: no cover
     flashdeberta_stats_snapshot = None
-    refresh_flashdeberta_runtime_config_from_env = None
     reset_flashdeberta_stats = None
 
 
@@ -62,35 +57,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=12)
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--drop-all-ones-mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--debug-stats", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--profile-dir", type=Path, default=None)
     return parser.parse_args()
 
 
 def _build_config(args: argparse.Namespace) -> DebertaV2Config:
-    cfg = DebertaV2Config(
+    return _bench_common.build_synthetic_backbone_config(
+        mode=str(args.mode),
+        seq_len=int(args.seq_len),
         vocab_size=int(args.vocab_size),
         hidden_size=int(args.hidden_size),
-        num_hidden_layers=int(args.num_layers),
-        num_attention_heads=int(args.num_heads),
+        num_layers=int(args.num_layers),
+        num_heads=int(args.num_heads),
         intermediate_size=int(args.intermediate_size),
-        hidden_act="gelu",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-        max_position_embeddings=int(args.seq_len),
-        type_vocab_size=0,
-        layer_norm_eps=1e-7,
-        relative_attention=True,
-        position_buckets=256,
-        max_relative_positions=int(args.seq_len),
-        pos_att_type=["c2p", "p2c"],
-        pad_token_id=0,
-        position_biased_input=False,
+        debug_stats=bool(args.debug_stats) and str(args.mode) == "flash",
     )
-    cfg.hf_attention_impl = str(args.mode)
-    # Derive the flash dict from the canonical config schema so the benchmark
-    # cannot drift from the keys the training builder materializes.
-    cfg.hf_flash = asdict(ModelHFFlashConfig())
-    return cfg
 
 
 def _build_batch(args: argparse.Namespace, *, device: torch.device, pad_token_id: int) -> dict[str, Any]:
@@ -138,11 +120,6 @@ def main() -> None:
     dtype = torch.bfloat16
     torch.manual_seed(0)
     torch.cuda.reset_peak_memory_stats(device)
-
-    if str(args.mode) == "flash":
-        os.environ.setdefault("FLASHDEBERTA_DEBUG_STATS", "1")
-        if callable(refresh_flashdeberta_runtime_config_from_env):
-            refresh_flashdeberta_runtime_config_from_env()
 
     cfg = _build_config(args)
     model = DebertaV2Model(cfg).to(device=device, dtype=dtype)
