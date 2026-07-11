@@ -89,13 +89,7 @@ Defaults live in
 - `kernels` selects Triton launch configurations by route, operation, shape bucket, and compute
   capability.
 
-Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, and
-`bias_docblock_specialized`. Without a matching capability row, fixed and varlen kernels can use
-the repo-owned conservative `(16, 16, 1, 4)` launch tile, dense-bias kernels use their generic
-tile, and specialized doc-block backward kernels remain disabled. This deterministic fallback
-deliberately ignores the upstream package's environment-variable tuning surface; use
-`model.hf.flash.kernel_overrides_path` for auditable per-hardware choices. [GPU
-support](gpu-support.md) explains why measured overrides are capability-scoped.
+Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, and `bias_docblock_specialized`. Without a matching capability row, fixed and varlen kernels use the repo-owned conservative `(16, 16, 1, 4)` launch tile, dense-bias kernels use their generic tile, and specialized doc-block backward kernels remain disabled. This deterministic fallback deliberately ignores the upstream package's environment-variable tuning surface; use `model.hf.flash.kernel_overrides_path` for auditable per-hardware choices. [GPU support](gpu-support.md) explains why measured overrides are capability-scoped.
 
 ### Retuning
 
