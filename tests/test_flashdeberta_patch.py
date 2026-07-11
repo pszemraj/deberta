@@ -9,6 +9,8 @@ import logging
 import sys
 import types
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -202,6 +204,20 @@ def _restore_saved_flash_modules(
             parent = sys.modules.get(parent_name)
             if parent is not None:
                 setattr(parent, child, mod)
+
+
+@contextmanager
+def _isolated_flash_modules() -> Iterator[None]:
+    """Temporarily remove and then fully restore the imported flash module tree."""
+
+    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
+    for name in saved:
+        sys.modules.pop(name, None)
+    try:
+        yield
+    finally:
+        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def test_flashdeberta_version_guard_accepts_pinned_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2561,14 +2577,10 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
     # (fixed_op, upstream flashdeberta) under the poisoned triton. Snapshot the
     # whole affected namespace and restore the original healthy module objects
     # afterwards so later tests never see import state cached under triton=None.
-    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
-    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
-    for name in saved:
-        sys.modules.pop(name, None)
     monkeypatch.setitem(sys.modules, "triton", None)
     monkeypatch.setitem(sys.modules, "triton.language", None)
 
-    try:
+    with _isolated_flash_modules():
         prefix_mod = importlib.import_module("deberta.modeling.flashdeberta_prefix_pack")
         segment_mod = importlib.import_module("deberta.modeling.flashdeberta_segment_pack")
         varlen_mod = importlib.import_module("deberta.modeling.flashdeberta_varlen_op")
@@ -2585,8 +2597,6 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         # under test is import safety: the calls must not raise.
         assert isinstance(docblock_mod.flashdeberta_compiled_docblock_available(), bool)
         assert isinstance(bias_mod.flashdeberta_compiled_position_bias_available(), bool)
-    finally:
-        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded() -> None:
@@ -3970,11 +3980,7 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
 def test_fixed_and_varlen_kernels_match_canonical_unit_scale_p2c(route: str) -> None:
     """Pinned kernels must use the canonical signed P2C bucket in forward/backward."""
 
-    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
-    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
-    for name in saved:
-        sys.modules.pop(name, None)
-    try:
+    with _isolated_flash_modules():
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         fixed_mod = importlib.import_module("deberta.modeling.flashdeberta_fixed_op")
         varlen_mod = importlib.import_module("deberta.modeling.flashdeberta_varlen_op")
@@ -3988,8 +3994,6 @@ def test_fixed_and_varlen_kernels_match_canonical_unit_scale_p2c(route: str) -> 
             fixed_mod=fixed_mod,
             varlen_mod=varlen_mod,
         )
-    finally:
-        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def _run_fixed_or_varlen_canonical_p2c_check(*, route, attention_mod, fixed_mod, varlen_mod) -> None:
@@ -4229,11 +4233,7 @@ def test_specialized_docblock_backward_honors_per_head_keep_mask() -> None:
     and restores the prior modules after.
     """
 
-    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
-    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
-    for name in saved:
-        sys.modules.pop(name, None)
-    try:
+    with _isolated_flash_modules():
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         bias_mod = importlib.import_module("deberta.modeling.flashdeberta_bias_op")
         dense_bias_mod = importlib.import_module("deberta.modeling.flashdeberta_dense_bias_op")
@@ -4244,8 +4244,6 @@ def test_specialized_docblock_backward_honors_per_head_keep_mask() -> None:
             bias_mod=bias_mod,
             dense_bias_mod=dense_bias_mod,
         )
-    finally:
-        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod, dense_bias_mod) -> None:
@@ -4391,17 +4389,11 @@ def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str
     re-imports a clean real-kernel tree and restores the prior modules after.
     """
 
-    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
-    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
-    for name in saved:
-        sys.modules.pop(name, None)
-    try:
+    with _isolated_flash_modules():
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         if attention_mod.flashdeberta_fixed_import_error() is not None:
             pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
         _run_docblock_real_kernel_leak_check(attention_mod=attention_mod, route=route)
-    finally:
-        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
@@ -4507,17 +4499,11 @@ def test_docblock_bias_dense_route_matches_eager_on_padded_batch() -> None:
     positions. Compares the whole output tensor, padding rows included.
     """
 
-    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
-    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
-    for name in saved:
-        sys.modules.pop(name, None)
-    try:
+    with _isolated_flash_modules():
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         if attention_mod.flashdeberta_fixed_import_error() is not None:
             pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
         _run_docblock_bias_padded_parity_check(attention_mod=attention_mod)
-    finally:
-        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
@@ -4608,17 +4594,11 @@ def test_non_prefix_padding_mask_matches_eager_on_cuda() -> None:
     lengths, silently attending the wrong key positions for masks with holes.
     """
 
-    affected_prefixes = ("deberta.modeling.flashdeberta_", "flashdeberta")
-    saved = {name: mod for name, mod in sys.modules.items() if name.startswith(affected_prefixes)}
-    for name in saved:
-        sys.modules.pop(name, None)
-    try:
+    with _isolated_flash_modules():
         attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
         if attention_mod.flashdeberta_fixed_import_error() is not None:
             pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
         _run_non_prefix_padding_parity_check(attention_mod=attention_mod)
-    finally:
-        _restore_saved_flash_modules(saved, affected_prefixes)
 
 
 def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
