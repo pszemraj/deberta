@@ -34,7 +34,7 @@ import math
 import warnings
 from collections import Counter
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 import torch
@@ -982,6 +982,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         if query_states is None:
             query_states = hidden_states
+        fallback_to_eager = partial(
+            self._fallback_to_eager,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            query_states=query_states,
+            relative_pos=relative_pos,
+            rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
+        )
 
         if self._runtime_config.enable_debug_stats:
             _record_stat("forward_calls")
@@ -990,35 +1000,21 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             # The flash kernels compute default relative positions on device and
             # cannot honor an arbitrary caller-provided tensor; only eager
             # attention preserves the native relative_pos contract.
-            return self._fallback_to_eager(
+            return fallback_to_eager(
                 reason="explicit_relative_pos",
                 message=(
                     "FlashDeBERTa kernels compute default relative positions internally; "
                     "using eager attention because an explicit relative_pos tensor was supplied."
                 ),
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                query_states=query_states,
-                relative_pos=relative_pos,
-                rel_embeddings=rel_embeddings,
-                flash_meta=flash_meta,
             )
 
         if output_attentions:
-            return self._fallback_to_eager(
+            return fallback_to_eager(
                 reason="output_attentions",
                 message=(
                     "FlashDeBERTa kernels do not materialize attention probabilities; "
                     "using eager attention for output_attentions=True."
                 ),
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                output_attentions=True,
-                query_states=query_states,
-                relative_pos=relative_pos,
-                rel_embeddings=rel_embeddings,
-                flash_meta=flash_meta,
             )
 
         reason = self._fallback_reason(
@@ -1033,16 +1029,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             # The encoder-level get_rel_pos patch suppresses the shared (S,S)
             # allocation globally. Unsupported correctness fallbacks rebuild
             # relative-position bias inside eager attention instead.
-            return self._fallback_to_eager(
+            return fallback_to_eager(
                 reason=key,
                 message=message,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                query_states=query_states,
-                relative_pos=relative_pos,
-                rel_embeddings=rel_embeddings,
-                flash_meta=flash_meta,
             )
 
         model_dtype = hidden_states.dtype
@@ -1071,48 +1060,27 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 query_len=query_len,
                 key_len=int(hidden_states.shape[-2]),
             ):
-                return self._fallback_to_eager(
+                return fallback_to_eager(
                     reason="docblock_bias_mask",
                     message=(
                         "FlashDeBERTa dense doc-block bias routing requires a pairwise keep mask; "
                         "attempting eager attention, which runs only if a safe pairwise doc-block mask "
                         "can be reused or reconstructed."
                     ),
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
                 )
             bias_import_error = flashdeberta_bias_import_error()
             if bias_import_error is not None:
-                return self._fallback_to_eager(
+                return fallback_to_eager(
                     reason="docblock_bias_missing",
                     message="FlashDeBERTa dense doc-block bias path is unavailable; using eager attention.",
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
                 )
             if is_torch_compiling() and not flashdeberta_compiled_position_bias_available():
-                return self._fallback_to_eager(
+                return fallback_to_eager(
                     reason="docblock_bias_compile",
                     message=(
                         "FlashDeBERTa dense doc-block bias path is not compile-visible on this build; "
                         "using eager attention."
                     ),
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
                 )
 
         if use_docblock:
@@ -1128,48 +1096,27 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 or docblock_num_segments is None
                 or docblock_max_segment is None
             ):
-                return self._fallback_to_eager(
+                return fallback_to_eager(
                     reason="docblock_metadata_missing",
                     message=(
                         "FlashDeBERTa doc-block routing requires precomputed segment metadata and host stats; "
                         "attempting eager attention, which runs only if a safe pairwise doc-block mask "
                         "can be reused or reconstructed."
                     ),
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
                 )
             docblock_import_error = flashdeberta_docblock_import_error()
             if docblock_import_error is not None:
-                return self._fallback_to_eager(
+                return fallback_to_eager(
                     reason="docblock_missing",
                     message="FlashDeBERTa doc-block flash path is unavailable; using eager attention.",
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
                 )
             if is_torch_compiling() and not flashdeberta_compiled_docblock_available():
-                return self._fallback_to_eager(
+                return fallback_to_eager(
                     reason="docblock_compile",
                     message=(
                         "FlashDeBERTa doc-block flash path is not compile-visible on this build; "
                         "using eager attention."
                     ),
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
-                    flash_meta=flash_meta,
                 )
 
         if use_varlen:
@@ -1190,16 +1137,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             key, message = projected_reason
             # Keep the same eager fallback contract here for dtype/layout
             # mismatches instead of reviving the encoder-wide relative_pos tensor.
-            return self._fallback_to_eager(
+            return fallback_to_eager(
                 reason=key,
                 message=message,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                query_states=query_states,
-                relative_pos=relative_pos,
-                rel_embeddings=rel_embeddings,
-                flash_meta=flash_meta,
             )
 
         pos_key: torch.Tensor | None = None
