@@ -289,13 +289,15 @@ def _notice_docblock_route_once(
     if key in _DOCBLOCK_ROUTE_NOTICED:
         return
     _DOCBLOCK_ROUTE_NOTICED.add(key)
+    seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
+    compute_capability = device_compute_capability(device) if device is not None else None
     if route_hint == "docblock_bias":
         override_bias_seq_len = flash_cfg_optional_int(flash_cfg, name="docblock_bias_seq_len", default=None)
         if override_bias_seq_len is not None:
             bounded_route = flash_route_choice(
                 policy="docblock",
-                seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
-                compute_capability=device_compute_capability(device) if device is not None else None,
+                seq_bucket=seq_bucket,
+                compute_capability=compute_capability,
                 seq_len=int(seq_len),
                 batch_size=int(batch_size),
             )
@@ -313,8 +315,8 @@ def _notice_docblock_route_once(
     if route_hint != "docblock_bias":
         unbounded_route = flash_route_choice(
             policy="docblock",
-            seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
-            compute_capability=device_compute_capability(device) if device is not None else None,
+            seq_bucket=seq_bucket,
+            compute_capability=compute_capability,
         )
         if unbounded_route == "docblock_bias":
             logger.warning(
@@ -440,33 +442,6 @@ def _flash_meta_with_route(
     return dataclasses.replace(flash_meta, route_hint=route)
 
 
-def _flash_active_tokens_from_seq_lengths(seq_lengths: torch.Tensor) -> int | None:
-    """Return active tokens from CPU sequence lengths without touching GPU state.
-
-    :param torch.Tensor seq_lengths: Per-example active lengths.
-    :return int | None: Host integer for CPU tensors, otherwise ``None``.
-    """
-
-    if seq_lengths.device.type != "cpu":
-        return None
-    return int(seq_lengths.sum(dtype=torch.int32))
-
-
-def _flash_existing_seq_lengths(batch: dict[str, Any]) -> torch.Tensor | None:
-    """Return precomputed flash sequence lengths when present.
-
-    :param dict[str, Any] batch: Batch mapping.
-    :return torch.Tensor | None: Precomputed ``(B,)`` int32 sequence lengths.
-    """
-
-    value = batch.get("flash_seq_lengths")
-    if value is None:
-        return None
-    if not isinstance(value, torch.Tensor) or value.ndim != 1:
-        raise ValueError("flash_seq_lengths shape disagrees with its required rank-1 contract.")
-    return value
-
-
 def _resolve_flash_seq_lengths_and_active_tokens(
     batch: dict[str, Any],
     seq_lengths: torch.Tensor,
@@ -489,7 +464,7 @@ def _resolve_flash_seq_lengths_and_active_tokens(
         label="Flash active-token count",
         host_value=_flash_active_tokens_host(batch.get(FLASH_SCALAR_BATCH_KEYS.active_tokens.host)),
         scalar_tensor=_flash_scalar_tensor(batch.get(CPU_SCALAR_BATCH_KEYS.active_tokens)),
-        derived_value=_flash_active_tokens_from_seq_lengths(seq_lengths),
+        derived_value=(int(seq_lengths.sum(dtype=torch.int32)) if seq_lengths.device.type == "cpu" else None),
     )
     return seq_lengths, active_tokens, active_tokens_scalar
 
@@ -556,39 +531,6 @@ def _resolve_flash_doc_segment_stats(
     return int(num_segments), int(max_seqlen), num_scalar, max_scalar
 
 
-def _pop_flash_doc_segment_host_stats(batch: dict[str, Any]) -> None:
-    """Remove doc-segment host stats from a batch.
-
-    :param dict[str, Any] batch: Batch mapping.
-    """
-
-    batch.pop(FLASH_SCALAR_BATCH_KEYS.doc_num_segments.host, None)
-    batch.pop(FLASH_SCALAR_BATCH_KEYS.doc_max_seqlen.host, None)
-    batch.pop(CPU_SCALAR_BATCH_KEYS.doc_num_segments, None)
-    batch.pop(CPU_SCALAR_BATCH_KEYS.doc_max_seqlen, None)
-
-
-def _pop_flash_active_token_stats(batch: dict[str, Any]) -> None:
-    """Remove active-token host stats from a batch.
-
-    :param dict[str, Any] batch: Batch mapping.
-    """
-
-    batch.pop(FLASH_SCALAR_BATCH_KEYS.active_tokens.host, None)
-    batch.pop(CPU_SCALAR_BATCH_KEYS.active_tokens, None)
-
-
-def _pop_flash_doc_segment_tensors(batch: dict[str, Any]) -> None:
-    """Remove doc-segment descriptor tensors from a batch.
-
-    :param dict[str, Any] batch: Batch mapping.
-    """
-
-    batch.pop("flash_doc_segment_offsets", None)
-    batch.pop("flash_doc_segment_lengths", None)
-    batch.pop("flash_doc_cu_seqlens", None)
-
-
 def _clear_flash_batch_metadata(batch: dict[str, Any]) -> None:
     """Remove every collator-attached flash metadata key from a batch.
 
@@ -601,9 +543,18 @@ def _clear_flash_batch_metadata(batch: dict[str, Any]) -> None:
     batch.pop("flash_seq_lengths", None)
     batch.pop("flash_mask_contract", None)
     batch.pop("flash_mask_contract_validated", None)
-    _pop_flash_active_token_stats(batch)
-    _pop_flash_doc_segment_tensors(batch)
-    _pop_flash_doc_segment_host_stats(batch)
+    for key in (
+        FLASH_SCALAR_BATCH_KEYS.active_tokens.host,
+        CPU_SCALAR_BATCH_KEYS.active_tokens,
+        "flash_doc_segment_offsets",
+        "flash_doc_segment_lengths",
+        "flash_doc_cu_seqlens",
+        FLASH_SCALAR_BATCH_KEYS.doc_num_segments.host,
+        FLASH_SCALAR_BATCH_KEYS.doc_max_seqlen.host,
+        CPU_SCALAR_BATCH_KEYS.doc_num_segments,
+        CPU_SCALAR_BATCH_KEYS.doc_max_seqlen,
+    ):
+        batch.pop(key, None)
 
 
 def _take_flash_mask_attestation(batch: dict[str, Any]) -> str | None:
@@ -838,7 +789,11 @@ def prepare_flash_attention_batch_metadata(
         _clear_flash_batch_metadata(batch)
         return batch, None
 
-    supplied_seq_lengths = _flash_existing_seq_lengths(batch)
+    supplied_seq_lengths = batch.get("flash_seq_lengths")
+    if supplied_seq_lengths is not None and (
+        not isinstance(supplied_seq_lengths, torch.Tensor) or supplied_seq_lengths.ndim != 1
+    ):
+        raise ValueError("flash_seq_lengths shape disagrees with its required rank-1 contract.")
     if validated_contract is not None:
         if validated_contract != "prefix":
             raise ValueError(f"Padding batch carried mask_contract={validated_contract!r}.")
