@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import json
 import statistics
 from pathlib import Path
 from typing import Any
@@ -87,127 +86,109 @@ def main() -> None:
     model = bench.build_bf16_backbone(backbone_config, device=device)
     candidates = bench.parse_candidate_specs(list(args.candidate))
 
-    (out_dir / "batches.jsonl").write_text(
-        "\n".join(
-            json.dumps(
-                {
-                    "index": sample.index,
-                    "seq_len": sample.seq_len,
-                    "batch_size": sample.batch_size,
-                    "active_tokens": sample.active_tokens,
-                    "slot_tokens": sample.slot_tokens,
-                    "head_dim": sample.head_dim,
-                    "att_span": sample.att_span,
-                    "device_capability": sample.device_capability,
-                    "pair_density": sample.pair_density,
-                }
-            )
-            for sample in samples
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    batch_rows = [
+        {
+            "index": sample.index,
+            "seq_len": sample.seq_len,
+            "batch_size": sample.batch_size,
+            "active_tokens": sample.active_tokens,
+            "slot_tokens": sample.slot_tokens,
+            "head_dim": sample.head_dim,
+            "att_span": sample.att_span,
+            "device_capability": sample.device_capability,
+            "pair_density": sample.pair_density,
+        }
+        for sample in samples
+    ]
 
     summary_lines = [
         "candidate\tstatus\tmean_ms\tslot_tok_per_s\tmax_memory_gib\tseq_len\tbatch_size\ttotal_tokens\thead_dim\tatt_span\tdevice_capability\tpair_density\terror"
     ]
     best_by_key: dict[str, dict[str, Any]] = {}
 
-    restore_path = cfg.model.hf.flash.kernel_overrides_path
-    for candidate_name, candidate_path in candidates:
-        with bench.candidate_kernel_overrides(candidate_path, restore_path=restore_path):
-            sample0 = samples[0]
-            try:
-                timing = bench.run_timed_candidate(
-                    model=model,
-                    samples=samples,
-                    meta_fn=lambda sample: (
-                        dataclasses.replace(
-                            sample.flash_meta,
-                            route_hint="docblock_bias",
-                        )
-                        if sample.flash_meta is not None
-                        else None
-                    ),
-                    warmup=int(args.warmup),
-                    steps=int(args.steps),
-                )
-            except Exception as exc:
-                error_text = " ".join(str(exc).split())
-                summary_lines.append(
-                    "\t".join(
-                        [
-                            candidate_name,
-                            "failed",
-                            "",
-                            "",
-                            "",
-                            str(sample0.seq_len),
-                            str(sample0.batch_size),
-                            str(sum(sample.slot_tokens for sample in samples)),
-                            str(sample0.head_dim),
-                            str(sample0.att_span),
-                            sample0.device_capability,
-                            f"{statistics.mean(sample.pair_density for sample in samples):.6f}",
-                            error_text,
-                        ]
-                    )
-                )
-                print(f"candidate_failed name={candidate_name} error={error_text}")
-                model.zero_grad(set_to_none=True)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-
-            for sample in samples:
-                key = json.dumps(
-                    {
-                        "seq_len": sample.seq_len,
-                        "batch_size": sample.batch_size,
-                        "head_dim": sample.head_dim,
-                        "att_span": sample.att_span,
-                        "device_capability": sample.device_capability,
-                    },
-                    sort_keys=True,
-                )
-                existing = best_by_key.get(key)
-                sample_mean_ms = float(timing.per_sample_mean_ms.get(int(sample.index), timing.mean_ms))
-                if existing is None or sample_mean_ms < float(existing["mean_ms"]):
-                    best_by_key[key] = {
-                        "candidate": candidate_name,
-                        "mean_ms": sample_mean_ms,
-                        "kernel_overrides_path": candidate_path,
-                        "pair_density": sample.pair_density,
-                    }
-
+    results = bench.run_candidate_sweep(
+        model=model,
+        samples=samples,
+        candidates=candidates,
+        routes=["docblock_bias"],
+        restore_path=cfg.model.hf.flash.kernel_overrides_path,
+        meta_fn=lambda sample, route: (
+            dataclasses.replace(sample.flash_meta, route_hint=route)
+            if sample.flash_meta is not None
+            else None
+        ),
+        warmup=int(args.warmup),
+        steps=int(args.steps),
+    )
+    sample0 = samples[0]
+    mean_pair_density = statistics.mean(sample.pair_density for sample in samples)
+    total_slot_tokens = sum(sample.slot_tokens for sample in samples)
+    for result in results:
+        if result.timing is None:
             summary_lines.append(
                 "\t".join(
                     [
-                        candidate_name,
-                        "ok",
-                        f"{timing.mean_ms:.4f}",
-                        f"{timing.slot_tok_per_s:.2f}",
-                        f"{timing.max_memory_gib:.3f}",
+                        result.candidate_name,
+                        "failed",
+                        "",
+                        "",
+                        "",
                         str(sample0.seq_len),
                         str(sample0.batch_size),
-                        str(sum(sample.slot_tokens for sample in samples)),
+                        str(total_slot_tokens),
                         str(sample0.head_dim),
                         str(sample0.att_span),
                         sample0.device_capability,
-                        f"{statistics.mean(sample.pair_density for sample in samples):.6f}",
-                        "",
+                        f"{mean_pair_density:.6f}",
+                        result.error or "",
                     ]
                 )
             )
+            print(f"candidate_failed name={result.candidate_name} error={result.error}")
+            continue
 
-    (out_dir / "summary.tsv").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
-    (out_dir / "best_candidates.json").write_text(
-        json.dumps(best_by_key, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        timing = result.timing
+        for sample in samples:
+            bench.update_best_candidate(
+                best_by_key,
+                key_fields={
+                    "seq_len": sample.seq_len,
+                    "batch_size": sample.batch_size,
+                    "head_dim": sample.head_dim,
+                    "att_span": sample.att_span,
+                    "device_capability": sample.device_capability,
+                },
+                candidate_name=result.candidate_name,
+                candidate_path=result.candidate_path,
+                mean_ms=timing.per_sample_mean_ms.get(int(sample.index), timing.mean_ms),
+                details={"pair_density": sample.pair_density},
+            )
+        summary_lines.append(
+            "\t".join(
+                [
+                    result.candidate_name,
+                    "ok",
+                    f"{timing.mean_ms:.4f}",
+                    f"{timing.slot_tok_per_s:.2f}",
+                    f"{timing.max_memory_gib:.3f}",
+                    str(sample0.seq_len),
+                    str(sample0.batch_size),
+                    str(total_slot_tokens),
+                    str(sample0.head_dim),
+                    str(sample0.att_span),
+                    sample0.device_capability,
+                    f"{mean_pair_density:.6f}",
+                    "",
+                ]
+            )
+        )
+
+    bench.write_tuning_outputs(
+        out_dir=out_dir,
+        batch_rows=batch_rows,
+        summary_lines=summary_lines,
+        best_by_key=best_by_key,
     )
-    print(f"wrote_summary={out_dir / 'summary.tsv'}")
-    print(f"wrote_batches={out_dir / 'batches.jsonl'}")
-    print(f"wrote_best={out_dir / 'best_candidates.json'}")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import json
 from pathlib import Path
 from typing import Any
 
@@ -102,125 +101,109 @@ def main() -> None:
     routes = ["fixed", "varlen"] if str(args.route) == "both" else [str(args.route)]
     candidates = bench.parse_candidate_specs(list(args.candidate))
 
-    (out_dir / "batches.jsonl").write_text(
-        "\n".join(
-            json.dumps(
-                {
-                    "index": sample.index,
-                    "seq_len": sample.seq_len,
-                    "batch_size": sample.batch_size,
-                    "active_tokens": sample.active_tokens,
-                    "slot_tokens": sample.slot_tokens,
-                    "density_bucket": sample.density_bucket,
-                    "head_dim": sample.head_dim,
-                    "att_span": sample.att_span,
-                    "device_capability": sample.device_capability,
-                }
-            )
-            for sample in samples
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    batch_rows = [
+        {
+            "index": sample.index,
+            "seq_len": sample.seq_len,
+            "batch_size": sample.batch_size,
+            "active_tokens": sample.active_tokens,
+            "slot_tokens": sample.slot_tokens,
+            "density_bucket": sample.density_bucket,
+            "head_dim": sample.head_dim,
+            "att_span": sample.att_span,
+            "device_capability": sample.device_capability,
+        }
+        for sample in samples
+    ]
 
     summary_lines = [
         "candidate\troute\tstatus\tmean_ms\tactive_tok_per_s\tslot_tok_per_s\tmax_memory_gib\tseq_len\ttotal_tokens\thead_dim\tatt_span\tdevice_capability\tdensity_bucket\terror"
     ]
     best_by_key: dict[str, dict[str, Any]] = {}
 
-    restore_path = cfg.model.hf.flash.kernel_overrides_path
-    for candidate_name, candidate_path in candidates:
-        with bench.candidate_kernel_overrides(candidate_path, restore_path=restore_path):
-            for route in routes:
-                sample0 = samples[0]
-                density_buckets = {sample.density_bucket for sample in samples}
-                density_bucket = next(iter(density_buckets)) if len(density_buckets) == 1 else "mixed"
-                try:
-                    timing = bench.run_timed_candidate(
-                        model=model,
-                        samples=samples,
-                        meta_fn=lambda sample, route=route: _route_meta(sample, route),
-                        warmup=int(args.warmup),
-                        steps=int(args.steps),
-                    )
-                except Exception as exc:
-                    error_text = " ".join(str(exc).split())
-                    summary_lines.append(
-                        "\t".join(
-                            [
-                                candidate_name,
-                                route,
-                                "failed",
-                                "",
-                                "",
-                                "",
-                                "",
-                                str(sample0.seq_len),
-                                str(sum(sample.active_tokens for sample in samples)),
-                                str(sample0.head_dim),
-                                str(sample0.att_span),
-                                sample0.device_capability,
-                                density_bucket,
-                                error_text,
-                            ]
-                        )
-                    )
-                    print(f"candidate_failed name={candidate_name} route={route} error={error_text}")
-                    model.zero_grad(set_to_none=True)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-                for sample in samples:
-                    key = json.dumps(
-                        {
-                            "seq_len": sample.seq_len,
-                            "total_tokens": sample.active_tokens,
-                            "head_dim": sample.head_dim,
-                            "att_span": sample.att_span,
-                            "device_capability": sample.device_capability,
-                            "route": route,
-                        },
-                        sort_keys=True,
-                    )
-                    existing = best_by_key.get(key)
-                    sample_mean_ms = float(timing.per_sample_mean_ms.get(int(sample.index), timing.mean_ms))
-                    if existing is None or sample_mean_ms < float(existing["mean_ms"]):
-                        best_by_key[key] = {
-                            "candidate": candidate_name,
-                            "route": route,
-                            "mean_ms": sample_mean_ms,
-                            "kernel_overrides_path": candidate_path,
-                            "density_bucket": sample.density_bucket,
-                        }
-                summary_lines.append(
-                    "\t".join(
-                        [
-                            candidate_name,
-                            route,
-                            "ok",
-                            f"{timing.mean_ms:.4f}",
-                            f"{timing.active_tok_per_s:.2f}",
-                            f"{timing.slot_tok_per_s:.2f}",
-                            f"{timing.max_memory_gib:.3f}",
-                            str(sample0.seq_len),
-                            str(sum(sample.active_tokens for sample in samples)),
-                            str(sample0.head_dim),
-                            str(sample0.att_span),
-                            sample0.device_capability,
-                            density_bucket,
-                            "",
-                        ]
-                    )
-                )
-
-    (out_dir / "summary.tsv").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
-    (out_dir / "best_candidates.json").write_text(
-        json.dumps(best_by_key, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    results = bench.run_candidate_sweep(
+        model=model,
+        samples=samples,
+        candidates=candidates,
+        routes=routes,
+        restore_path=cfg.model.hf.flash.kernel_overrides_path,
+        meta_fn=_route_meta,
+        warmup=int(args.warmup),
+        steps=int(args.steps),
     )
-    print(f"wrote_summary={out_dir / 'summary.tsv'}")
-    print(f"wrote_batches={out_dir / 'batches.jsonl'}")
-    print(f"wrote_best={out_dir / 'best_candidates.json'}")
+    sample0 = samples[0]
+    density_buckets = {sample.density_bucket for sample in samples}
+    density_bucket = next(iter(density_buckets)) if len(density_buckets) == 1 else "mixed"
+    total_active_tokens = sum(sample.active_tokens for sample in samples)
+    for result in results:
+        if result.timing is None:
+            summary_lines.append(
+                "\t".join(
+                    [
+                        result.candidate_name,
+                        result.route,
+                        "failed",
+                        "",
+                        "",
+                        "",
+                        "",
+                        str(sample0.seq_len),
+                        str(total_active_tokens),
+                        str(sample0.head_dim),
+                        str(sample0.att_span),
+                        sample0.device_capability,
+                        density_bucket,
+                        result.error or "",
+                    ]
+                )
+            )
+            print(f"candidate_failed name={result.candidate_name} route={result.route} error={result.error}")
+            continue
+
+        timing = result.timing
+        for sample in samples:
+            bench.update_best_candidate(
+                best_by_key,
+                key_fields={
+                    "seq_len": sample.seq_len,
+                    "total_tokens": sample.active_tokens,
+                    "head_dim": sample.head_dim,
+                    "att_span": sample.att_span,
+                    "device_capability": sample.device_capability,
+                    "route": result.route,
+                },
+                candidate_name=result.candidate_name,
+                candidate_path=result.candidate_path,
+                mean_ms=timing.per_sample_mean_ms.get(int(sample.index), timing.mean_ms),
+                details={"route": result.route, "density_bucket": sample.density_bucket},
+            )
+        summary_lines.append(
+            "\t".join(
+                [
+                    result.candidate_name,
+                    result.route,
+                    "ok",
+                    f"{timing.mean_ms:.4f}",
+                    f"{timing.active_tok_per_s:.2f}",
+                    f"{timing.slot_tok_per_s:.2f}",
+                    f"{timing.max_memory_gib:.3f}",
+                    str(sample0.seq_len),
+                    str(total_active_tokens),
+                    str(sample0.head_dim),
+                    str(sample0.att_span),
+                    sample0.device_capability,
+                    density_bucket,
+                    "",
+                ]
+            )
+        )
+
+    bench.write_tuning_outputs(
+        out_dir=out_dir,
+        batch_rows=batch_rows,
+        summary_lines=summary_lines,
+        best_by_key=best_by_key,
+    )
 
 
 if __name__ == "__main__":

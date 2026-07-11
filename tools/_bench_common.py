@@ -11,6 +11,7 @@ report schemas.
 
 from __future__ import annotations
 
+import json
 import statistics
 import sys
 import time
@@ -511,6 +512,17 @@ class CandidateTiming:
     per_sample_mean_ms: dict[int, float]
 
 
+@dataclass(frozen=True)
+class CandidateSweepResult:
+    """Outcome of one candidate and route timing run."""
+
+    candidate_name: str
+    candidate_path: str | None
+    route: str
+    timing: CandidateTiming | None
+    error: str | None
+
+
 def run_timed_candidate(
     *,
     model: DebertaV2Model,
@@ -571,3 +583,124 @@ def run_timed_candidate(
             sample_idx: statistics.mean(values) for sample_idx, values in per_sample_times.items() if values
         },
     )
+
+
+def run_candidate_sweep(
+    *,
+    model: DebertaV2Model,
+    samples: list[BatchSample],
+    candidates: list[tuple[str, str | None]],
+    routes: list[str],
+    restore_path: str | None,
+    meta_fn: Callable[[BatchSample, str], FlashBatchMeta | None],
+    warmup: int,
+    steps: int,
+) -> list[CandidateSweepResult]:
+    """Time every candidate/route pair with isolated kernel overrides.
+
+    :param DebertaV2Model model: Backbone model under test.
+    :param list[BatchSample] samples: Sampled real batches.
+    :param list[tuple[str, str | None]] candidates: Named override-table candidates.
+    :param list[str] routes: Explicit route names to benchmark.
+    :param str | None restore_path: Configured override path restored after each candidate.
+    :param Callable meta_fn: Metadata builder receiving one sample and route.
+    :param int warmup: Warmup sweeps per candidate/route pair.
+    :param int steps: Timed sweeps per candidate/route pair.
+    :return list[CandidateSweepResult]: Successful timings and normalized failures.
+    """
+
+    results: list[CandidateSweepResult] = []
+    for candidate_name, candidate_path in candidates:
+        with candidate_kernel_overrides(candidate_path, restore_path=restore_path):
+            for route in routes:
+                try:
+                    timing = run_timed_candidate(
+                        model=model,
+                        samples=samples,
+                        meta_fn=lambda sample, route=route: meta_fn(sample, route),
+                        warmup=warmup,
+                        steps=steps,
+                    )
+                except Exception as exc:
+                    results.append(
+                        CandidateSweepResult(
+                            candidate_name=candidate_name,
+                            candidate_path=candidate_path,
+                            route=route,
+                            timing=None,
+                            error=" ".join(str(exc).split()),
+                        )
+                    )
+                    model.zero_grad(set_to_none=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                results.append(
+                    CandidateSweepResult(
+                        candidate_name=candidate_name,
+                        candidate_path=candidate_path,
+                        route=route,
+                        timing=timing,
+                        error=None,
+                    )
+                )
+    return results
+
+
+def update_best_candidate(
+    best_by_key: dict[str, dict[str, Any]],
+    *,
+    key_fields: dict[str, Any],
+    candidate_name: str,
+    candidate_path: str | None,
+    mean_ms: float,
+    details: dict[str, Any],
+) -> None:
+    """Record a candidate when it beats the current result for one shape key.
+
+    :param dict[str, dict[str, Any]] best_by_key: Mutable best-result mapping.
+    :param dict[str, Any] key_fields: Stable shape fields identifying the result.
+    :param str candidate_name: Candidate display name.
+    :param str | None candidate_path: Candidate override-table path.
+    :param float mean_ms: Per-shape mean latency.
+    :param dict[str, Any] details: Route-specific result fields.
+    :return None: None.
+    """
+
+    key = json.dumps(key_fields, sort_keys=True)
+    existing = best_by_key.get(key)
+    if existing is not None and mean_ms >= float(existing["mean_ms"]):
+        return
+    best_by_key[key] = {
+        "candidate": candidate_name,
+        "mean_ms": float(mean_ms),
+        "kernel_overrides_path": candidate_path,
+        **details,
+    }
+
+
+def write_tuning_outputs(
+    *,
+    out_dir: Path,
+    batch_rows: list[dict[str, Any]],
+    summary_lines: list[str],
+    best_by_key: dict[str, dict[str, Any]],
+) -> None:
+    """Write the common tuner JSONL, TSV, and winner-manifest outputs.
+
+    :param Path out_dir: Existing tuner output directory.
+    :param list[dict[str, Any]] batch_rows: Sample metadata rows.
+    :param list[str] summary_lines: Header plus candidate summary rows.
+    :param dict[str, dict[str, Any]] best_by_key: Best candidate per shape key.
+    :return None: None.
+    """
+
+    batches_path = out_dir / "batches.jsonl"
+    summary_path = out_dir / "summary.tsv"
+    best_path = out_dir / "best_candidates.json"
+    batches_path.write_text("\n".join(json.dumps(row) for row in batch_rows) + "\n", encoding="utf-8")
+    summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    best_path.write_text(json.dumps(best_by_key, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"wrote_summary={summary_path}")
+    print(f"wrote_batches={batches_path}")
+    print(f"wrote_best={best_path}")
