@@ -10,6 +10,11 @@ It is intentionally single-process and profiler-first:
 - optionally enables FlashDeBERTa and backbone-only ``torch.compile``
 - runs warmup steps, then captures a short profile window
 - exports a Chrome trace, profiler tables, and a small phase-timing summary
+
+Its compact step loop is intentionally not a second training implementation:
+it omits distributed ``no_sync`` coordination and nonfinite-window recovery
+because either behavior would distort the local phase timings. Use
+``deberta train`` for correctness or convergence runs.
 """
 
 from __future__ import annotations

@@ -100,6 +100,10 @@ class FlashBatchMeta:
     ) -> FlashBatchMeta:
         """Move kernel-consumed metadata tensors while keeping host scalars on CPU.
 
+        Production training constructs metadata after moving each batch, so
+        this transfer helper primarily serves standalone tools that prepare
+        metadata before selecting their execution device.
+
         :param torch.device | str device: Destination device.
         :param bool non_blocking: Whether tensor copies may proceed asynchronously.
         :return FlashBatchMeta: Metadata bundle for the destination device.
