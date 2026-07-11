@@ -410,6 +410,25 @@ def test_flashdeberta_shape_keyed_tuning_caches_are_bounded() -> None:
     assert tuning.flash_seq_bucket.cache_info().currsize <= maxsize
 
 
+def test_repo_tuned_config_guard_precedes_device_capability_lookup() -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import resolve_repo_tuned_config
+
+    def _unexpected_capability_lookup() -> tuple[int, int]:
+        raise AssertionError("guarded tuning lookup touched the CUDA device")
+
+    assert (
+        resolve_repo_tuned_config(
+            guard=lambda: False,
+            compute_capability=_unexpected_capability_lookup,
+            route="dense_bias",
+            kind="fwd",
+            seq_len=128,
+            head_dim=0,
+        )
+        is None
+    )
+
+
 def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
@@ -5087,12 +5106,13 @@ def test_docblock_varlen_backward_uses_docblock_tuning_namespace(monkeypatch: py
 
     seen: dict[str, str] = {}
 
-    def _fake_resolve(context):
-        seen["route"] = context.route
-        seen["kind"] = context.kind
+    def _fake_resolve(**context):
+        assert context["guard"]()
+        seen["route"] = context["route"]
+        seen["kind"] = context["kind"]
         return (16, 32, 1, 4)
 
-    monkeypatch.setattr(varlen_mod, "resolve_flash_kernel_config", _fake_resolve)
+    monkeypatch.setattr(varlen_mod, "resolve_repo_tuned_config", _fake_resolve)
     monkeypatch.setattr(varlen_mod, "device_compute_capability", lambda _device: (12, 0))
     monkeypatch.setattr(
         varlen_mod,

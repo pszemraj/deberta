@@ -12,6 +12,7 @@ around the tuned varlen kernels, exposed as an opaque CUDA custom op so
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import torch
@@ -28,11 +29,14 @@ from deberta.modeling.flashdeberta_op_utils import (
 from deberta.modeling.flashdeberta_op_utils import (
     kernel_dtype_name as _kernel_dtype_name,
 )
+from deberta.modeling.flashdeberta_packed_backward import (
+    PackedBackwardInputs,
+    run_packed_backward,
+)
 from deberta.modeling.flashdeberta_segment_pack import (
     segment_pack_grad_and_delta_from_padded,
     segment_pack_optional_pair,
     segment_pack_padded_rows,
-    segment_pack_padded_rows_pair,
     segment_pack_padded_rows_triple,
     segment_unpack_optional_pair,
     segment_unpack_padded_rows,
@@ -515,132 +519,101 @@ def _docblock_backward_impl(
         dpos_query = torch.zeros_like(pos_query).contiguous() if pos_query is not None else None
         return dq, dk, dv, dpos_key, dpos_query
 
-    if q_unpad is None or k_unpad is None or v_unpad is None:
-        q_unpad, k_unpad, v_unpad = segment_pack_padded_rows_triple(
-            query_layer,
-            key_layer,
-            value_layer,
+    pack_kwargs = {
+        "segment_offsets": active_segment_offsets,
+        "segment_lengths": active_segment_lengths,
+        "cu_seqlens": active_cu_seqlens,
+        "total_tokens": total_tokens,
+        "max_segment_length": max_seqlen,
+    }
+    unpack_kwargs = {
+        "segment_offsets": active_segment_offsets,
+        "segment_lengths": active_segment_lengths,
+        "cu_seqlens": active_cu_seqlens,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "max_segment_length": max_seqlen,
+    }
+
+    def _pack_grad(grad: torch.Tensor, packed_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack the segmented output gradient and compute its softmax delta.
+
+        :param torch.Tensor grad: Padded output gradient.
+        :param torch.Tensor packed_output: Active packed forward output.
+        :return tuple[torch.Tensor, torch.Tensor]: Packed gradient and fp32 delta.
+        """
+
+        return segment_pack_grad_and_delta_from_padded(
+            grad_output=grad,
+            out_unpad=packed_output,
             segment_offsets=active_segment_offsets,
             segment_lengths=active_segment_lengths,
             cu_seqlens=active_cu_seqlens,
             total_tokens=total_tokens,
             max_segment_length=max_seqlen,
         )
-    q_unpad = _active_packed_prefix(q_unpad, total_tokens=total_tokens)
-    k_unpad = _active_packed_prefix(k_unpad, total_tokens=total_tokens)
-    v_unpad = _active_packed_prefix(v_unpad, total_tokens=total_tokens)
-    if q_unpad is None or k_unpad is None or v_unpad is None:
-        raise RuntimeError("Doc-block backward expected packed q/k/v auxiliaries.")
-    if out_unpad is None:
-        out_unpad = segment_pack_padded_rows(
-            output_padded,
-            segment_offsets=active_segment_offsets,
-            segment_lengths=active_segment_lengths,
+
+    def _launch(
+        packed: PackedBackwardInputs,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Launch raw varlen backward with the doc-block tuning namespace.
+
+        :param PackedBackwardInputs packed: Packed backward inputs.
+        :return tuple: Packed q/k/v and optional positional gradients.
+        """
+
+        return _varlen_mod._varlen_backward_raw_impl(
+            q_unpad=packed.query,
+            k_unpad=packed.key,
+            v_unpad=packed.value,
+            out_unpad=packed.output,
+            grad_unpad=packed.grad_output,
+            lse_unpad=packed.lse,
+            delta=packed.delta,
+            pos_key_unpad=packed.pos_key,
+            pos_query_unpad=packed.pos_query,
             cu_seqlens=active_cu_seqlens,
-            total_tokens=total_tokens,
-            max_segment_length=max_seqlen,
+            batch_size=num_segments,
+            seq_bound=max_seqlen,
+            token_capacity=total_tokens,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            dense_mid_tensors=False,
+            route="docblock",
         )
-    out_unpad = _active_packed_prefix(out_unpad, total_tokens=total_tokens)
-    if out_unpad is None:
-        raise RuntimeError("Doc-block backward expected packed output auxiliary.")
-    grad_unpad, delta = segment_pack_grad_and_delta_from_padded(
+
+    dq, dk, dv, dpos_key, dpos_query = run_packed_backward(
         grad_output=grad_output,
-        out_unpad=out_unpad,
-        segment_offsets=active_segment_offsets,
-        segment_lengths=active_segment_lengths,
-        cu_seqlens=active_cu_seqlens,
-        total_tokens=total_tokens,
-        max_segment_length=max_seqlen,
-    )
-    if lse_unpad is None:
-        lse_unpad = segment_pack_padded_rows(
-            lse_padded,
-            segment_offsets=active_segment_offsets,
-            segment_lengths=active_segment_lengths,
-            cu_seqlens=active_cu_seqlens,
-            total_tokens=total_tokens,
-            max_segment_length=max_seqlen,
-        )
-    lse_unpad = _active_packed_prefix(lse_unpad, total_tokens=total_tokens)
-    if lse_unpad is None:
-        raise RuntimeError("Doc-block backward expected packed LSE auxiliary.")
-    if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
-        pos_key_unpad, pos_query_unpad = segment_pack_padded_rows_pair(
-            pos_key,
-            pos_query,
-            segment_offsets=active_segment_offsets,
-            segment_lengths=active_segment_lengths,
-            cu_seqlens=active_cu_seqlens,
-            total_tokens=total_tokens,
-            max_segment_length=max_seqlen,
-        )
-    else:
-        if pos_key is not None and pos_key_unpad is None:
-            pos_key_unpad = segment_pack_padded_rows(
-                pos_key,
-                segment_offsets=active_segment_offsets,
-                segment_lengths=active_segment_lengths,
-                cu_seqlens=active_cu_seqlens,
-                total_tokens=total_tokens,
-                max_segment_length=max_seqlen,
-            )
-        if pos_query is not None and pos_query_unpad is None:
-            pos_query_unpad = segment_pack_padded_rows(
-                pos_query,
-                segment_offsets=active_segment_offsets,
-                segment_lengths=active_segment_lengths,
-                cu_seqlens=active_cu_seqlens,
-                total_tokens=total_tokens,
-                max_segment_length=max_seqlen,
-            )
-
-    if pos_key is not None:
-        pos_key_unpad = _active_packed_prefix(pos_key_unpad, total_tokens=total_tokens)
-    if pos_query is not None:
-        pos_query_unpad = _active_packed_prefix(pos_query_unpad, total_tokens=total_tokens)
-
-    dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad = _varlen_mod._varlen_backward_raw_impl(
-        q_unpad=q_unpad,
-        k_unpad=k_unpad,
-        v_unpad=v_unpad,
-        out_unpad=out_unpad,
-        grad_unpad=grad_unpad,
-        lse_unpad=lse_unpad,
-        delta=delta,
-        pos_key_unpad=pos_key_unpad,
-        pos_query_unpad=pos_query_unpad,
-        cu_seqlens=active_cu_seqlens,
-        batch_size=num_segments,
-        seq_bound=max_seqlen,
-        token_capacity=total_tokens,
-        sm_scale=sm_scale,
-        position_buckets=position_buckets,
-        max_relative_distance=max_relative_distance,
-        causal=causal,
-        dense_mid_tensors=False,
-        route="docblock",
-    )
-
-    dq, dk, dv = segment_unpack_padded_rows_triple(
-        dq_unpad,
-        dk_unpad,
-        dv_unpad,
-        segment_offsets=active_segment_offsets,
-        segment_lengths=active_segment_lengths,
-        cu_seqlens=active_cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        max_segment_length=max_seqlen,
-    )
-    dpos_key, dpos_query = segment_unpack_optional_pair(
-        dpos_key_unpad,
-        dpos_query_unpad,
-        segment_offsets=active_segment_offsets,
-        segment_lengths=active_segment_lengths,
-        cu_seqlens=active_cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        max_segment_length=max_seqlen,
+        query=query_layer,
+        key=key_layer,
+        value=value_layer,
+        output=output_padded,
+        lse=lse_padded,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        query_packed=q_unpad,
+        key_packed=k_unpad,
+        value_packed=v_unpad,
+        output_packed=out_unpad,
+        lse_packed=lse_unpad,
+        pos_key_packed=pos_key_unpad,
+        pos_query_packed=pos_query_unpad,
+        pack_rows=partial(segment_pack_padded_rows, **pack_kwargs),
+        pack_triple=partial(segment_pack_padded_rows_triple, **pack_kwargs),
+        pack_optional_pair=partial(segment_pack_optional_pair, **pack_kwargs),
+        pack_grad_and_delta=_pack_grad,
+        launch_backward=_launch,
+        unpack_triple=partial(segment_unpack_padded_rows_triple, **unpack_kwargs),
+        unpack_optional_pair=partial(segment_unpack_optional_pair, **unpack_kwargs),
+        normalize_packed=lambda tensor: _active_packed_prefix(tensor, total_tokens=total_tokens),
     )
     return (
         dq.contiguous(),

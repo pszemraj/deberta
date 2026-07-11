@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -31,8 +32,7 @@ except Exception:  # pragma: no cover - optional Triton dependency
     _TRITON_AVAILABLE = False
 
 from deberta.modeling.flashdeberta_kernel_tuning import (
-    FlashKernelContext,
-    resolve_flash_kernel_config,
+    resolve_repo_tuned_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     BoundedLRUCache,
@@ -44,6 +44,10 @@ from deberta.modeling.flashdeberta_op_utils import (
 )
 from deberta.modeling.flashdeberta_op_utils import (
     optional_triton_jit as _optional_triton_jit,
+)
+from deberta.modeling.flashdeberta_packed_backward import (
+    PackedBackwardInputs,
+    run_packed_backward,
 )
 from deberta.modeling.flashdeberta_prefix_pack import (
     prefix_pack_optional_pair,
@@ -221,23 +225,19 @@ def _varlen_repo_tuned_bwd_config(
     """
 
     normalized_kind = str(kind).strip().lower()
-    if normalized_kind not in {"kv", "q"}:
-        return None
-    capability = device_compute_capability(device)
-    return resolve_flash_kernel_config(
-        FlashKernelContext(
-            compute_capability=capability,
-            route=str(route),
-            kind=f"bwd_{normalized_kind}",
-            seq_len=int(seq_len),
-            total_tokens=int(total_tokens),
-            batch_size=int(batch_size),
-            head_dim=int(head_dim),
-            dtype=_kernel_dtype_name(dtype),
-            causal=bool(causal),
-            disentangled=bool(disentangled),
-            att_span=int(att_span),
-        )
+    return resolve_repo_tuned_config(
+        guard=lambda: normalized_kind in {"kv", "q"},
+        compute_capability=lambda: device_compute_capability(device),
+        route=route,
+        kind=f"bwd_{normalized_kind}",
+        seq_len=seq_len,
+        total_tokens=total_tokens,
+        batch_size=batch_size,
+        head_dim=head_dim,
+        dtype=_kernel_dtype_name(dtype),
+        causal=causal,
+        disentangled=disentangled,
+        att_span=att_span,
     )
 
 
@@ -267,20 +267,19 @@ def _varlen_repo_tuned_fwd_config(
     :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    return resolve_flash_kernel_config(
-        FlashKernelContext(
-            compute_capability=device_compute_capability(device),
-            route="varlen",
-            kind="fwd",
-            seq_len=int(seq_len),
-            total_tokens=int(total_tokens),
-            batch_size=int(batch_size),
-            head_dim=int(head_dim),
-            dtype=_kernel_dtype_name(dtype),
-            causal=bool(causal),
-            disentangled=bool(disentangled),
-            att_span=int(att_span),
-        )
+    return resolve_repo_tuned_config(
+        guard=lambda: True,
+        compute_capability=lambda: device_compute_capability(device),
+        route="varlen",
+        kind="fwd",
+        seq_len=seq_len,
+        total_tokens=total_tokens,
+        batch_size=batch_size,
+        head_dim=head_dim,
+        dtype=_kernel_dtype_name(dtype),
+        causal=causal,
+        disentangled=disentangled,
+        att_span=att_span,
     )
 
 
@@ -1383,6 +1382,7 @@ def _varlen_eager_backward_cached_impl(
     lse_unpad: torch.Tensor | None,
     pos_key_unpad: torch.Tensor | None,
     pos_query_unpad: torch.Tensor | None,
+    dense_mid_tensors: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run padded varlen backward, optionally reusing forward-side unpadded tensors.
 
@@ -1409,6 +1409,7 @@ def _varlen_eager_backward_cached_impl(
     :param torch.Tensor | None lse_unpad: Optional cached unpadded LSE tensor.
     :param torch.Tensor | None pos_key_unpad: Optional cached unpadded c2p tensor.
     :param torch.Tensor | None pos_query_unpad: Optional cached unpadded p2c tensor.
+    :param bool dense_mid_tensors: Build fixed-capacity midpoint metadata for compile-visible launches.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Gradients in the same padded layouts as the forward inputs.
     """
@@ -1424,107 +1425,98 @@ def _varlen_eager_backward_cached_impl(
         dpos_query = torch.zeros_like(pos_query) if pos_query is not None else None
         return dq, dk, dv, dpos_key, dpos_query
 
-    if q_unpad is None or k_unpad is None or v_unpad is None:
-        q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
-            query_layer,
-            key_layer,
-            value_layer,
+    pack_kwargs = {
+        "seqlens": seqlens,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+        "total_tokens": total_tokens,
+    }
+    unpack_kwargs = {
+        "seqlens": seqlens,
+        "cu_seqlens": cu_seqlens,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+    }
+
+    def _pack_grad(grad: torch.Tensor, packed_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack the output gradient and compute its softmax delta.
+
+        :param torch.Tensor grad: Padded output gradient.
+        :param torch.Tensor packed_output: Packed forward output.
+        :return tuple[torch.Tensor, torch.Tensor]: Packed gradient and fp32 delta.
+        """
+
+        _, packed_grad, delta = _pack_grad_and_delta_from_padded(
+            grad_output=grad,
+            output_padded=output_padded,
+            out_unpad=packed_output,
             seqlens=seqlens,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             total_tokens=total_tokens,
         )
-    if out_unpad is None:
-        out_unpad = prefix_pack_padded_rows(
-            output_padded,
-            seqlens=seqlens,
+        return packed_grad, delta
+
+    def _launch(
+        packed: PackedBackwardInputs,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Launch the shared raw varlen backward implementation.
+
+        :param PackedBackwardInputs packed: Packed backward inputs.
+        :return tuple: Packed q/k/v and optional positional gradients.
+        """
+
+        return _varlen_backward_raw_impl(
+            q_unpad=packed.query,
+            k_unpad=packed.key,
+            v_unpad=packed.value,
+            out_unpad=packed.output,
+            grad_unpad=packed.grad_output,
+            lse_unpad=packed.lse,
+            delta=packed.delta,
+            pos_key_unpad=packed.pos_key,
+            pos_query_unpad=packed.pos_query,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
+            batch_size=batch_size,
+            seq_bound=max_seqlen,
+            token_capacity=total_tokens,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            dense_mid_tensors=dense_mid_tensors,
         )
-    out_unpad, grad_unpad, delta = _pack_grad_and_delta_from_padded(
+
+    return run_packed_backward(
         grad_output=grad_output,
-        output_padded=output_padded,
-        out_unpad=out_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        total_tokens=total_tokens,
+        query=query_layer,
+        key=key_layer,
+        value=value_layer,
+        output=output_padded,
+        lse=lse_padded,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        query_packed=q_unpad,
+        key_packed=k_unpad,
+        value_packed=v_unpad,
+        output_packed=out_unpad,
+        lse_packed=lse_unpad,
+        pos_key_packed=pos_key_unpad,
+        pos_query_packed=pos_query_unpad,
+        pack_rows=partial(prefix_pack_padded_rows, **pack_kwargs),
+        pack_triple=partial(prefix_pack_padded_rows_triple, **pack_kwargs),
+        pack_optional_pair=partial(prefix_pack_optional_pair, **pack_kwargs),
+        pack_grad_and_delta=_pack_grad,
+        launch_backward=_launch,
+        unpack_triple=partial(prefix_unpack_padded_rows_triple, **unpack_kwargs),
+        unpack_optional_pair=partial(prefix_unpack_optional_pair, **unpack_kwargs),
     )
-    if lse_unpad is None:
-        lse_unpad = prefix_pack_padded_rows(
-            lse_padded,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-    if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
-        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
-            pos_key,
-            pos_query,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            total_tokens=total_tokens,
-        )
-    else:
-        if pos_key is not None and pos_key_unpad is None:
-            pos_key_unpad = prefix_pack_padded_rows(
-                pos_key,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                total_tokens=total_tokens,
-            )
-        if pos_query is not None and pos_query_unpad is None:
-            pos_query_unpad = prefix_pack_padded_rows(
-                pos_query,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                total_tokens=total_tokens,
-            )
-
-    dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad = _varlen_backward_raw_impl(
-        q_unpad=q_unpad,
-        k_unpad=k_unpad,
-        v_unpad=v_unpad,
-        out_unpad=out_unpad,
-        grad_unpad=grad_unpad,
-        lse_unpad=lse_unpad,
-        delta=delta,
-        pos_key_unpad=pos_key_unpad,
-        pos_query_unpad=pos_query_unpad,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_bound=max_seqlen,
-        token_capacity=total_tokens,
-        sm_scale=sm_scale,
-        position_buckets=position_buckets,
-        max_relative_distance=max_relative_distance,
-        causal=causal,
-        dense_mid_tensors=False,
-    )
-
-    dq, dk, dv = prefix_unpack_padded_rows_triple(
-        dq_unpad,
-        dk_unpad,
-        dv_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-    dpos_key, dpos_query = prefix_unpack_optional_pair(
-        dpos_key_unpad,
-        dpos_query_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-    return dq, dk, dv, dpos_key, dpos_query
 
 
 def _build_varlen_custom_ops() -> tuple[Any | None, Any | None]:
@@ -2077,107 +2069,32 @@ def _varlen_triton_backward_impl(
     else:
         seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
 
-    if q_unpad is None or k_unpad is None or v_unpad is None:
-        q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
-            q,
-            k,
-            v,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    if out_unpad is None:
-        out_unpad = prefix_pack_padded_rows(
-            out,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    out_unpad, grad_unpad, delta = _pack_grad_and_delta_from_padded(
+    return _varlen_eager_backward_cached_impl(
         grad_output=grad_out,
+        query_layer=q,
+        key_layer=k,
+        value_layer=v,
         output_padded=out,
-        out_unpad=out_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=seq_len,
-        total_tokens=capacity_tokens,
-    )
-    if lse_unpad is None:
-        lse_unpad = prefix_pack_padded_rows(
-            lse,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    if pos_key is not None and pos_query is not None and (pos_key_unpad is None or pos_query_unpad is None):
-        pos_key_unpad, pos_query_unpad = prefix_pack_padded_rows_pair(
-            pos_key,
-            pos_query,
-            seqlens=seqlens,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=seq_len,
-            total_tokens=capacity_tokens,
-        )
-    else:
-        if pos_key is not None and pos_key_unpad is None:
-            pos_key_unpad = prefix_pack_padded_rows(
-                pos_key,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=seq_len,
-                total_tokens=capacity_tokens,
-            )
-        if pos_query is not None and pos_query_unpad is None:
-            pos_query_unpad = prefix_pack_padded_rows(
-                pos_query,
-                seqlens=seqlens,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=seq_len,
-                total_tokens=capacity_tokens,
-            )
-
-    dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad = _varlen_backward_raw_impl(
-        q_unpad=q_unpad,
-        k_unpad=k_unpad,
-        v_unpad=v_unpad,
-        out_unpad=out_unpad,
-        grad_unpad=grad_unpad,
-        lse_unpad=lse_unpad,
-        delta=delta,
-        pos_key_unpad=pos_key_unpad,
-        pos_query_unpad=pos_query_unpad,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_bound=seq_len,
-        token_capacity=capacity_tokens,
+        lse_padded=lse,
+        pos_key=pos_key,
+        pos_query=pos_query,
         sm_scale=sm_scale,
         position_buckets=position_buckets,
         max_relative_distance=max_relative_distance,
         causal=causal,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=seq_len,
+        total_tokens=capacity_tokens,
+        q_unpad=q_unpad,
+        k_unpad=k_unpad,
+        v_unpad=v_unpad,
+        out_unpad=out_unpad,
+        lse_unpad=lse_unpad,
+        pos_key_unpad=pos_key_unpad,
+        pos_query_unpad=pos_query_unpad,
         dense_mid_tensors=True,
     )
-
-    dq, dk, dv = prefix_unpack_padded_rows_triple(
-        dq_unpad,
-        dk_unpad,
-        dv_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-    dpos_key, dpos_query = prefix_unpack_optional_pair(
-        dpos_key_unpad,
-        dpos_query_unpad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-    return dq, dk, dv, dpos_key, dpos_query
 
 
 def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:

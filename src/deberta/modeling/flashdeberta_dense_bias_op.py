@@ -19,8 +19,7 @@ import weakref
 import torch
 
 from deberta.modeling.flashdeberta_kernel_tuning import (
-    FlashKernelContext,
-    resolve_flash_kernel_config,
+    resolve_repo_tuned_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     BoundedLRUCache,
@@ -68,21 +67,17 @@ def _dense_bias_repo_tuned_config(
         or ``None`` when no measured config is promoted.
     """
 
-    if device.type != "cuda" or dtype not in {torch.float16, torch.bfloat16}:
-        return None
-    capability = device_compute_capability(device)
-    return resolve_flash_kernel_config(
-        FlashKernelContext(
-            compute_capability=capability,
-            route="dense_bias",
-            kind="fwd",
-            seq_len=int(seq_len),
-            batch_size=int(batch_size),
-            num_heads=int(num_heads),
-            head_dim=0,
-            dtype=_kernel_dtype_name(dtype),
-            has_mask=bool(has_mask),
-        )
+    return resolve_repo_tuned_config(
+        guard=lambda: device.type == "cuda" and dtype in {torch.float16, torch.bfloat16},
+        compute_capability=lambda: device_compute_capability(device),
+        route="dense_bias",
+        kind="fwd",
+        seq_len=seq_len,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        head_dim=0,
+        dtype=_kernel_dtype_name(dtype),
+        has_mask=has_mask,
     )
 
 

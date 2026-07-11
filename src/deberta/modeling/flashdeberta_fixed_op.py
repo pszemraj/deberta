@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from deberta.modeling.flashdeberta_kernel_tuning import FlashKernelContext, resolve_flash_kernel_config
+from deberta.modeling.flashdeberta_kernel_tuning import resolve_repo_tuned_config
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     lookup_existing_op_pair,
@@ -144,22 +144,19 @@ def _fixed_repo_tuned_config(
     """
 
     normalized_kind = str(kind).strip().lower()
-    if normalized_kind not in {"fwd", "bwd"}:
-        return None
-    return resolve_flash_kernel_config(
-        FlashKernelContext(
-            compute_capability=device_compute_capability(device),
-            route="fixed",
-            kind=normalized_kind,
-            seq_len=max(int(query_len), int(key_len)),
-            query_len=int(query_len),
-            key_len=int(key_len),
-            head_dim=int(head_dim),
-            dtype=_kernel_dtype_name(dtype),
-            causal=bool(causal),
-            disentangled=bool(disentangled),
-            att_span=int(att_span),
-        )
+    return resolve_repo_tuned_config(
+        guard=lambda: normalized_kind in {"fwd", "bwd"},
+        compute_capability=lambda: device_compute_capability(device),
+        route="fixed",
+        kind=normalized_kind,
+        seq_len=max(query_len, key_len),
+        query_len=query_len,
+        key_len=key_len,
+        head_dim=head_dim,
+        dtype=_kernel_dtype_name(dtype),
+        causal=causal,
+        disentangled=disentangled,
+        att_span=att_span,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
@@ -524,3 +525,66 @@ def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, 
 
 
 resolve_flash_kernel_config = lru_cache(maxsize=_SHAPE_KEYED_CACHE_MAXSIZE)(resolve_flash_kernel_config)
+
+
+def resolve_repo_tuned_config(
+    *,
+    guard: Callable[[], bool],
+    compute_capability: Callable[[], tuple[int, int]],
+    route: str,
+    kind: str,
+    seq_len: int,
+    head_dim: int,
+    total_tokens: int | None = None,
+    batch_size: int | None = None,
+    query_len: int | None = None,
+    key_len: int | None = None,
+    num_heads: int | None = None,
+    dtype: str | None = None,
+    causal: bool | None = None,
+    disentangled: bool | None = None,
+    att_span: int | None = None,
+    has_mask: bool | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Resolve a tuning row after one route applies its explicit safety guard.
+
+    :param Callable guard: Route-specific launch safety guard.
+    :param Callable compute_capability: Deferred CUDA compute-capability resolver.
+    :param str route: Tuning-table route namespace.
+    :param str kind: Kernel kind within the route.
+    :param int seq_len: Representative sequence length.
+    :param int head_dim: Attention head dimension.
+    :param int | None total_tokens: Active or capacity token count, defaults to None.
+    :param int | None batch_size: Batch size, defaults to None.
+    :param int | None query_len: Query length, defaults to None.
+    :param int | None key_len: Key length, defaults to None.
+    :param int | None num_heads: Attention head count, defaults to None.
+    :param str | None dtype: Normalized kernel dtype, defaults to None.
+    :param bool | None causal: Causal-attention flag, defaults to None.
+    :param bool | None disentangled: Disentangled-attention flag, defaults to None.
+    :param int | None att_span: Relative-position span, defaults to None.
+    :param bool | None has_mask: Dense-mask presence flag, defaults to None.
+    :return tuple[int, int, int, int] | None: Tuned launch tuple, or None when guarded or unmatched.
+    """
+
+    if not guard():
+        return None
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=compute_capability(),
+            route=str(route),
+            kind=str(kind),
+            seq_len=int(seq_len),
+            head_dim=int(head_dim),
+            total_tokens=int(total_tokens) if total_tokens is not None else None,
+            batch_size=int(batch_size) if batch_size is not None else None,
+            query_len=int(query_len) if query_len is not None else None,
+            key_len=int(key_len) if key_len is not None else None,
+            num_heads=int(num_heads) if num_heads is not None else None,
+            dtype=str(dtype) if dtype is not None else None,
+            causal=bool(causal) if causal is not None else None,
+            disentangled=bool(disentangled) if disentangled is not None else None,
+            att_span=int(att_span) if att_span is not None else None,
+            has_mask=bool(has_mask) if has_mask is not None else None,
+        )
+    )
