@@ -1,6 +1,6 @@
 # ruff: noqa: F403,F405
 from _config_and_training_shared_imports import *
-from _fakes import checkpoint_saving_accelerator
+from _fakes import checkpoint_saving_accelerator, make_checkpoint_saver
 
 
 def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
@@ -606,12 +606,20 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
     assert str(opt._param_order_digest) == expected
 
 
-def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
+@pytest.mark.parametrize(
+    ("discriminator_lr", "expected_discriminator_lr"),
+    [(None, 5.0e-4), (2.0e-4, 2.0e-4)],
+    ids=["base_discriminator_lr", "explicit_discriminator_lr"],
+)
+def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests(
+    discriminator_lr: float | None,
+    expected_discriminator_lr: float,
+) -> None:
     model = TinyRTDLikeModel()
-    cfg = make_optim_config(
-        lr={"base": 5.0e-4, "generator": 2.5e-4},
-        weight_decay=0.01,
-    )
+    lr = {"base": 5.0e-4, "generator": 2.5e-4}
+    if discriminator_lr is not None:
+        lr["discriminator"] = discriminator_lr
+    cfg = make_optim_config(lr=lr, weight_decay=0.01)
     gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
 
     assert gen_opt.param_groups
@@ -619,7 +627,7 @@ def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None
     for group in gen_opt.param_groups:
         assert float(group["lr"]) == pytest.approx(2.5e-4)
     for group in disc_opt.param_groups:
-        assert float(group["lr"]) == pytest.approx(5.0e-4)
+        assert float(group["lr"]) == pytest.approx(expected_discriminator_lr)
 
     assert isinstance(getattr(gen_opt, "_param_order_digest", ""), str)
     assert isinstance(getattr(disc_opt, "_param_order_digest", ""), str)
@@ -1116,23 +1124,10 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     saved_checkpoints: list[tuple[str, int, str]] = []
 
-    def _fake_save_checkpoint(
-        *,
-        accelerator,
-        checkpoint_dir,
-        output_dir,
-        consumed_micro_batches,
-        save_total_limit,
-        log_label,
-        **kwargs,
-    ):
-        del accelerator, output_dir, save_total_limit, kwargs
-        saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         accelerator_cls=FakeAccelerator,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        save_checkpoint_fn=make_checkpoint_saver(calls=saved_checkpoints),
     )
 
     # Override cycle to interrupt after first batch.
@@ -1200,23 +1195,9 @@ def test_run_pretraining_logs_crash_save_failure(
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
-    def _fake_save_checkpoint(
-        *,
-        accelerator,
-        checkpoint_dir,
-        output_dir,
-        consumed_micro_batches,
-        save_total_limit,
-        log_label,
-        **kwargs,
-    ):
-        del accelerator, checkpoint_dir, output_dir, consumed_micro_batches, save_total_limit, kwargs
-        if str(log_label) == "final":
-            raise RuntimeError("disk full")
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        save_checkpoint_fn=make_checkpoint_saver(fail_label="final", failure_message="disk full"),
     )
 
     def _interrupt_cycle(_loader, *, start_epoch: int = 0):
@@ -1257,22 +1238,9 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
 
     saved_checkpoints: list[tuple[str, int, str]] = []
 
-    def _fake_save_checkpoint(
-        *,
-        accelerator,
-        checkpoint_dir,
-        output_dir,
-        consumed_micro_batches,
-        save_total_limit,
-        log_label,
-        **kwargs,
-    ):
-        del accelerator, output_dir, save_total_limit, kwargs
-        saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        save_checkpoint_fn=make_checkpoint_saver(calls=saved_checkpoints),
     )
 
     # Complete one accumulation window (2 micro-batches), then interrupt in the next

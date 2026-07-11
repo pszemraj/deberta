@@ -1,5 +1,6 @@
 # ruff: noqa: F403,F405
 from _config_and_training_shared_imports import *
+from _fakes import make_checkpoint_saver
 
 
 def _write_resume_source_snapshots(run_dir: Path) -> None:
@@ -597,22 +598,9 @@ def test_run_pretraining_final_export_uses_subprocess_helper(
     def _fake_export_subprocess(*, checkpoint_dir: Path, output_dir: Path) -> None:
         export_calls.append((str(checkpoint_dir), str(output_dir)))
 
-    def _fake_save_checkpoint(
-        *,
-        accelerator: Any,
-        checkpoint_dir: Path,
-        output_dir: Path,
-        consumed_micro_batches: int,
-        save_total_limit: int,
-        log_label: str,
-        **kwargs: Any,
-    ) -> None:
-        del accelerator, output_dir, consumed_micro_batches, save_total_limit, log_label, kwargs
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        save_checkpoint_fn=make_checkpoint_saver(create_checkpoint_dir=True),
         extra_patches={"_export_discriminator_hf_subprocess": _fake_export_subprocess},
     )
     train_cfg = make_train_config(

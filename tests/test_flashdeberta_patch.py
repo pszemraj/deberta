@@ -11,6 +11,7 @@ import types
 import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -218,6 +219,32 @@ def _isolated_flash_modules() -> Iterator[None]:
         yield
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
+
+
+@contextmanager
+def _kernel_tuning_overrides(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    *,
+    filename: str = "flash_overrides.json",
+) -> Iterator[Path]:
+    """Write and activate one temporary kernel-tuning override table.
+
+    :param Path tmp_path: Pytest temporary directory.
+    :param dict[str, Any] payload: Override-table JSON payload.
+    :param str filename: Temporary JSON filename.
+    :return Iterator[Path]: Active override path, restored on context exit.
+    """
+
+    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+
+    override_path = tmp_path / filename
+    override_path.write_text(json.dumps(payload), encoding="utf-8")
+    configure_flashdeberta_kernel_overrides(str(override_path))
+    try:
+        yield override_path
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flashdeberta_version_guard_accepts_pinned_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,30 +459,7 @@ def test_repo_tuned_config_guard_precedes_device_capability_lookup() -> None:
 def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
-        configure_flashdeberta_kernel_overrides,
         resolve_flash_kernel_config,
-    )
-
-    override_path = tmp_path / "flash_tuning.json"
-    override_path.write_text(
-        """
-{
-  "kernels": [
-    {
-      "compute_capability": "sm_120",
-      "route": "varlen",
-      "kind": "bwd_kv",
-      "seq_bucket": "2048_medium",
-      "head_dim": 64,
-      "block_m": 16,
-      "block_n": 32,
-      "num_stages": 1,
-      "num_warps": 2
-    }
-  ]
-}
-""",
-        encoding="utf-8",
     )
 
     context = FlashKernelContext(
@@ -467,48 +471,39 @@ def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
         batch_size=2,
         head_dim=64,
     )
-    configure_flashdeberta_kernel_overrides(None)
     shipped = resolve_flash_kernel_config(context)
     assert shipped == (64, 32, 2, 4)
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "kernels": [
+                {
+                    "compute_capability": "sm_120",
+                    "route": "varlen",
+                    "kind": "bwd_kv",
+                    "seq_bucket": "2048_medium",
+                    "head_dim": 64,
+                    "block_m": 16,
+                    "block_n": 32,
+                    "num_stages": 1,
+                    "num_warps": 2,
+                }
+            ]
+        },
+    ):
         assert resolve_flash_kernel_config(context) == (16, 32, 1, 2)
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
     assert resolve_flash_kernel_config(context) == shipped
 
 
 def test_flash_kernel_config_capability_precedence_and_override_append(tmp_path) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
-        configure_flashdeberta_kernel_overrides,
         resolve_flash_kernel_config,
     )
 
     # An appended hardware-agnostic kernels row (the documented override
     # workflow for giving several untuned GPUs a conservative tile) must not
     # outrank the shipped exact sm_120 row on sm_120 itself.
-    wildcard_path = tmp_path / "flash_kernels_wildcard.json"
-    wildcard_path.write_text(
-        json.dumps(
-            {
-                "kernels": [
-                    {
-                        "route": "varlen",
-                        "kind": "bwd_kv",
-                        "seq_bucket": "2048_medium",
-                        "head_dim": "*",
-                        "block_m": 16,
-                        "block_n": 16,
-                        "num_stages": 1,
-                        "num_warps": 2,
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
     def _context(capability: tuple[int, int]) -> FlashKernelContext:
         return FlashKernelContext(
             compute_capability=capability,
@@ -520,99 +515,81 @@ def test_flash_kernel_config_capability_precedence_and_override_append(tmp_path)
             head_dim=64,
         )
 
-    try:
-        configure_flashdeberta_kernel_overrides(str(wildcard_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "kernels": [
+                {
+                    "route": "varlen",
+                    "kind": "bwd_kv",
+                    "seq_bucket": "2048_medium",
+                    "head_dim": "*",
+                    "block_m": 16,
+                    "block_n": 16,
+                    "num_stages": 1,
+                    "num_warps": 2,
+                }
+            ]
+        },
+    ):
         assert resolve_flash_kernel_config(_context((12, 0))) == (64, 32, 2, 4)
         # Untuned hardware picks up the appended wildcard row.
         assert resolve_flash_kernel_config(_context((9, 0))) == (16, 16, 1, 2)
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
     from deberta.training.compile import (
         _flash_route_hint_for_docblock_batch,
         _flash_route_hint_for_padding_batch,
     )
 
-    override_path = tmp_path / "flash_routes.json"
-    override_path.write_text(
-        """
-{
-  "route_policies": {
-    "padding": [
-      {
-        "seq_bucket": "2048_medium",
-        "choice": "fixed"
-      }
-    ],
-    "docblock": [
-      {
-        "seq_bucket": "1024_exact",
-        "choice": "docblock"
-      }
-    ]
-  }
-}
-""",
-        encoding="utf-8",
-    )
-
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "route_policies": {
+                "padding": [{"seq_bucket": "2048_medium", "choice": "fixed"}],
+                "docblock": [{"seq_bucket": "1024_exact", "choice": "docblock"}],
+            }
+        },
+    ):
         assert _flash_route_hint_for_padding_batch(seq_len=2048, active_tokens=4096, batch_size=2) == "fixed"
         assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flash_padding_route_honors_policy_row_seq_len_bounds(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import (
-        configure_flashdeberta_kernel_overrides,
-        flash_padding_route,
-    )
+    from deberta.modeling.flashdeberta_kernel_tuning import flash_padding_route
 
-    override_path = tmp_path / "flash_routes.json"
-    override_path.write_text(
-        '{"route_policies": {"padding": '
-        '[{"seq_bucket": "under_2048", "choice": "varlen", "max_seq_len": 1024}]}}',
-        encoding="utf-8",
-    )
-
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "route_policies": {
+                "padding": [{"seq_bucket": "under_2048", "choice": "varlen", "max_seq_len": 1024}]
+            }
+        },
+    ):
         # Both lengths resolve to the under_2048 bucket (1024 itself would
         # match 1024_exact); only the in-bound length may take the row.
         assert flash_padding_route(seq_len=512, total_tokens=512, batch_size=1) == "varlen"
         # Beyond the row's own bound the row must not apply; the resolver
         # falls back to the conservative default instead.
         assert flash_padding_route(seq_len=1500, total_tokens=1500, batch_size=1) == "fixed"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flash_padding_route_honors_policy_row_batch_size_bounds(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import (
-        configure_flashdeberta_kernel_overrides,
-        flash_padding_route,
-    )
+    from deberta.modeling.flashdeberta_kernel_tuning import flash_padding_route
 
-    override_path = tmp_path / "flash_routes.json"
-    override_path.write_text(
-        '{"route_policies": {"padding": '
-        '[{"seq_bucket": "under_2048", "choice": "varlen", "max_batch_size": 2}]}}',
-        encoding="utf-8",
-    )
-
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "route_policies": {
+                "padding": [{"seq_bucket": "under_2048", "choice": "varlen", "max_batch_size": 2}]
+            }
+        },
+    ):
         assert flash_padding_route(seq_len=512, total_tokens=1024, batch_size=2) == "varlen"
         # Past the row's batch bound the row must not apply, mirroring the
         # seq_len bound semantics above.
         assert flash_padding_route(seq_len=512, total_tokens=2048, batch_size=4) == "fixed"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flashdeberta_kernel_overrides_reload_when_same_path_content_changes(tmp_path) -> None:
@@ -621,14 +598,10 @@ def test_flashdeberta_kernel_overrides_reload_when_same_path_content_changes(tmp
         flash_route_choice,
     )
 
-    override_path = tmp_path / "flash_routes.json"
-    override_path.write_text(
-        '{"route_policies": {"padding": [{"seq_bucket": "under_2048", "choice": "varlen"}]}}',
-        encoding="utf-8",
-    )
-
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {"route_policies": {"padding": [{"seq_bucket": "under_2048", "choice": "varlen"}]}},
+    ) as override_path:
         assert flash_route_choice(policy="padding", seq_bucket="under_2048") == "varlen"
         # Tuning sweeps rewrite one path between candidates; reconfiguring the
         # same path must pick up the new content, not serve the stale table.
@@ -638,34 +611,15 @@ def test_flashdeberta_kernel_overrides_reload_when_same_path_content_changes(tmp
         )
         configure_flashdeberta_kernel_overrides(str(override_path))
         assert flash_route_choice(policy="padding", seq_bucket="under_2048") == "fixed"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import (
-        configure_flashdeberta_kernel_overrides,
-        flash_seq_bucket,
-    )
+    from deberta.modeling.flashdeberta_kernel_tuning import flash_seq_bucket
 
-    override_path = tmp_path / "flash_buckets.json"
-    override_path.write_text(
-        """
-{
-  "seq_buckets": [
-    {
-      "name": "exact_3000",
-      "min_seq_len": 3000,
-      "max_seq_len": 3000
-    }
-  ]
-}
-""",
-        encoding="utf-8",
-    )
-
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {"seq_buckets": [{"name": "exact_3000", "min_seq_len": 3000, "max_seq_len": 3000}]},
+    ):
         # The shipped buckets cover every length, so the override bucket is
         # only reachable if override rows are consulted first.
         assert flash_seq_bucket(seq_len=3000) == "exact_3000"
@@ -673,42 +627,21 @@ def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
         # does not claim: 1024 must keep matching 1024_exact, not under_2048.
         assert flash_seq_bucket(seq_len=1024) == "1024_exact"
         assert flash_seq_bucket(seq_len=4096) == "4096_plus"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_flashdeberta_same_name_seq_bucket_override_replaces_shipped_row(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import (
-        configure_flashdeberta_kernel_overrides,
-        flash_seq_bucket,
-    )
+    from deberta.modeling.flashdeberta_kernel_tuning import flash_seq_bucket
 
-    override_path = tmp_path / "flash_buckets.json"
-    override_path.write_text(
-        """
-{
-  "seq_buckets": [
-    {
-      "name": "4096_plus",
-      "min_seq_len": 4096,
-      "max_seq_len": 8192
-    }
-  ]
-}
-""",
-        encoding="utf-8",
-    )
-
-    try:
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {"seq_buckets": [{"name": "4096_plus", "min_seq_len": 4096, "max_seq_len": 8192}]},
+    ):
         # In-range lengths keep resolving to the (narrowed) bucket.
         assert flash_seq_bucket(seq_len=4096) == "4096_plus"
         assert flash_seq_bucket(seq_len=8192) == "4096_plus"
         # A narrowing override must actually narrow: lengths past the new
         # max_seq_len must not fall through to the shipped unbounded row.
         assert flash_seq_bucket(seq_len=10000) == "default"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_docblock_bias_route_uses_table_with_ragged_override(
@@ -787,32 +720,25 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
 
 
 def test_flash_route_policy_capability_precedence_and_override_append(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import (
-        configure_flashdeberta_kernel_overrides,
-        flash_route_choice,
-    )
+    from deberta.modeling.flashdeberta_kernel_tuning import flash_route_choice
 
     # A user override table can promote the dense route for new hardware by
     # appending a capability-scoped row.
-    promote_path = tmp_path / "flash_routes_sm90.json"
-    promote_path.write_text(
-        json.dumps(
-            {
-                "route_policies": {
-                    "docblock": [
-                        {
-                            "seq_bucket": "1024_exact",
-                            "choice": "docblock_bias",
-                            "compute_capability": "sm_90",
-                        }
-                    ]
-                }
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "route_policies": {
+                "docblock": [
+                    {
+                        "seq_bucket": "1024_exact",
+                        "choice": "docblock_bias",
+                        "compute_capability": "sm_90",
+                    }
+                ]
             }
-        ),
-        encoding="utf-8",
-    )
-    try:
-        configure_flashdeberta_kernel_overrides(str(promote_path))
+        },
+        filename="flash_routes_sm90.json",
+    ):
         assert (
             flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(9, 0))
             == "docblock_bias"
@@ -826,30 +752,18 @@ def test_flash_route_policy_capability_precedence_and_override_append(tmp_path) 
             flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(8, 0))
             == "docblock"
         )
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
     # An appended wildcard row must not outrank the shipped exact sm_120 row.
-    wildcard_path = tmp_path / "flash_routes_wildcard.json"
-    wildcard_path.write_text(
-        json.dumps(
-            {
-                "route_policies": {
-                    "docblock": [{"seq_bucket": "1024_exact", "choice": "docblock"}],
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    try:
-        configure_flashdeberta_kernel_overrides(str(wildcard_path))
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {"route_policies": {"docblock": [{"seq_bucket": "1024_exact", "choice": "docblock"}]}},
+        filename="flash_routes_wildcard.json",
+    ):
         assert (
             flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(12, 0))
             == "docblock_bias"
         )
         assert flash_route_choice(policy="docblock", seq_bucket="1024_exact") == "docblock"
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_untuned_flash_hardware_notice_logs_once(
@@ -951,7 +865,17 @@ def test_flash_padding_route_shared_resolver_precedence() -> None:
     )
 
 
-def _small_deberta_config(*, debug_stats: bool = False, warn_fallbacks: bool = True):
+def _small_deberta_config(
+    *,
+    debug_stats: bool = False,
+    warn_fallbacks: bool = True,
+    hidden_size: int = 32,
+    num_attention_heads: int = 4,
+    intermediate_size: int = 64,
+    max_position_embeddings: int = 16,
+    position_buckets: int = 8,
+    max_relative_positions: int = 16,
+):
     """Build a small config for native DeBERTa patch tests."""
 
     pytest.importorskip("transformers")
@@ -959,15 +883,15 @@ def _small_deberta_config(*, debug_stats: bool = False, warn_fallbacks: bool = T
 
     cfg = DebertaV2Config(
         vocab_size=64,
-        hidden_size=32,
+        hidden_size=int(hidden_size),
         num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
+        num_attention_heads=int(num_attention_heads),
+        intermediate_size=int(intermediate_size),
+        max_position_embeddings=int(max_position_embeddings),
         type_vocab_size=0,
         relative_attention=True,
-        position_buckets=8,
-        max_relative_positions=16,
+        position_buckets=int(position_buckets),
+        max_relative_positions=int(max_relative_positions),
         pos_att_type=["c2p", "p2c"],
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
@@ -984,25 +908,13 @@ def _small_deberta_config(*, debug_stats: bool = False, warn_fallbacks: bool = T
 def _docblock_attention_config(*, seq_len: int):
     """Build a tiny native DeBERTa config for doc-block attention tests."""
 
-    pytest.importorskip("transformers")
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
-
-    return DebertaV2Config(
-        vocab_size=64,
+    return _small_deberta_config(
         hidden_size=8,
-        num_hidden_layers=1,
         num_attention_heads=1,
         intermediate_size=16,
         max_position_embeddings=int(seq_len),
-        type_vocab_size=0,
-        relative_attention=True,
         position_buckets=4,
         max_relative_positions=8,
-        pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-        pad_token_id=0,
-        position_biased_input=False,
     )
 
 
@@ -2407,6 +2319,29 @@ def test_varlen_mid_tensor_cache_reuses_registered_cu_seqlens() -> None:
     varlen_mod._clear_unpad_metadata_cache()
 
 
+def _prefix_pack_reference(tensor: torch.Tensor, seqlens: torch.Tensor) -> torch.Tensor:
+    """Pack active prefixes with simple host-side indexing."""
+
+    pieces = [tensor[index, :length] for index, length in enumerate(seqlens.tolist()) if length > 0]
+    return torch.cat(pieces, dim=0) if pieces else tensor.new_empty((0, *tensor.shape[2:]))
+
+
+def _prefix_unpack_reference(
+    packed: torch.Tensor,
+    seqlens: torch.Tensor,
+    *,
+    seq_len: int,
+) -> torch.Tensor:
+    """Scatter packed prefixes with simple host-side indexing."""
+
+    output = packed.new_zeros((int(seqlens.numel()), int(seq_len), *packed.shape[1:]))
+    cursor = 0
+    for index, length in enumerate(seqlens.tolist()):
+        output[index, :length] = packed[cursor : cursor + length]
+        cursor += length
+    return output
+
+
 def test_prefix_pack_round_trips_with_prefix_padding_contract() -> None:
     import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
 
@@ -2428,10 +2363,8 @@ def test_prefix_pack_round_trips_with_prefix_padding_contract() -> None:
         seq_len=4,
     )
 
-    expected_packed = torch.cat((tensor[0, :2], tensor[1, :3]), dim=0)
-    expected_unpacked = torch.zeros_like(tensor)
-    expected_unpacked[0, :2] = tensor[0, :2]
-    expected_unpacked[1, :3] = tensor[1, :3]
+    expected_packed = _prefix_pack_reference(tensor, seqlens)
+    expected_unpacked = _prefix_unpack_reference(expected_packed, seqlens, seq_len=4)
 
     assert torch.equal(packed, expected_packed)
     assert torch.equal(unpacked, expected_unpacked)
@@ -2460,7 +2393,7 @@ def test_prefix_pack_explicit_total_tokens_avoids_tensor_item(monkeypatch: pytes
     finally:
         monkeypatch.setattr(torch.Tensor, "item", original_item)
 
-    expected = torch.cat((tensor[0, :2], tensor[1, :3]), dim=0)
+    expected = _prefix_pack_reference(tensor, seqlens)
     assert torch.equal(packed, expected)
 
 
@@ -2510,27 +2443,9 @@ def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
         seq_len=4,
     )
 
-    expected_a = prefix_mod.prefix_unpack_padded_rows(
-        packed_a,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=2,
-        seq_len=4,
-    )
-    expected_b = prefix_mod.prefix_unpack_padded_rows(
-        packed_b,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=2,
-        seq_len=4,
-    )
-    expected_c = prefix_mod.prefix_unpack_padded_rows(
-        packed_c,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=2,
-        seq_len=4,
-    )
+    expected_a = _prefix_unpack_reference(packed_a, seqlens, seq_len=4)
+    expected_b = _prefix_unpack_reference(packed_b, seqlens, seq_len=4)
+    expected_c = _prefix_unpack_reference(packed_c, seqlens, seq_len=4)
 
     assert torch.equal(unpacked_pair_a, expected_a)
     assert torch.equal(unpacked_pair_b, expected_b)
@@ -2540,7 +2455,6 @@ def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
 
 
 def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
-    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
     output = torch.arange(2 * 4 * 2 * 3, dtype=torch.float32).view(2, 4, 2, 3).contiguous()
@@ -2548,18 +2462,8 @@ def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
     seqlens = torch.tensor([2, 3], dtype=torch.int32)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
 
-    expected_out = prefix_mod.prefix_pack_padded_rows(
-        output,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=3,
-    )
-    expected_grad = prefix_mod.prefix_pack_padded_rows(
-        grad,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=3,
-    )
+    expected_out = _prefix_pack_reference(output, seqlens)
+    expected_grad = _prefix_pack_reference(grad, seqlens)
     expected_delta = (expected_out.to(dtype=torch.float32) * expected_grad.to(dtype=torch.float32)).sum(
         dim=-1
     )
@@ -2947,6 +2851,17 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
         torch.tensor([0, 2, 4, 5, 7], dtype=torch.int32),
     )
     assert torch.count_nonzero(meta.doc_segment_lengths[4:]).item() == 0
+    assert meta.doc_num_segments_host == 4
+    assert meta.doc_max_segment_length_host == 2
+    for scalar, expected in (
+        (meta.active_tokens_scalar, 7),
+        (meta.doc_num_segments_scalar, 4),
+        (meta.doc_max_segment_length_scalar, 2),
+    ):
+        assert scalar is not None
+        assert scalar.device.type == "cpu"
+        assert scalar.ndim == 0
+        assert int(scalar) == expected
 
 
 def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_pairwise_mask() -> None:
@@ -3205,45 +3120,6 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock_bias() -> None:
     assert not any(key.startswith("flash_") for key in prepared)
     assert meta.seq_lengths is None
     assert meta.active_tokens_host == 7
-
-
-def test_prepare_flash_attention_batch_metadata_docblock_host_stats() -> None:
-    import deberta.training.compile as compile_mod
-
-    batch = {
-        "input_ids": torch.zeros((2, 5), dtype=torch.long),
-        "doc_ids": torch.tensor(
-            [
-                [1, 1, 2, 2, 0],
-                [1, 2, 2, 0, 0],
-            ],
-            dtype=torch.long,
-        ),
-    }
-    batch["attention_mask"] = batch["doc_ids"].ne(0)
-
-    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
-        batch=batch,
-        backbone_type="hf_deberta_v2",
-        flash_enabled=True,
-    )
-
-    assert not any(key.startswith("flash_") for key in prepared)
-    assert meta is not None
-    assert meta.doc_num_segments_host == 4
-    assert meta.doc_max_segment_length_host == 2
-    assert meta.active_tokens_scalar is not None
-    assert meta.active_tokens_scalar.device.type == "cpu"
-    assert meta.active_tokens_scalar.ndim == 0
-    assert int(meta.active_tokens_scalar) == 7
-    assert meta.doc_num_segments_scalar is not None
-    assert meta.doc_num_segments_scalar.device.type == "cpu"
-    assert meta.doc_num_segments_scalar.ndim == 0
-    assert int(meta.doc_num_segments_scalar) == 4
-    assert meta.doc_max_segment_length_scalar is not None
-    assert meta.doc_max_segment_length_scalar.device.type == "cpu"
-    assert meta.doc_max_segment_length_scalar.ndim == 0
-    assert int(meta.doc_max_segment_length_scalar) == 2
 
 
 def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
@@ -5012,42 +4888,35 @@ def test_specialized_docblock_bias_backward_enables_new_seq_len_from_table(tmp_p
         bias = torch.zeros((1, 2, seq_len, seq_len), dtype=torch.bfloat16, device="cuda")
         return bias_mod._should_use_specialized_docblock_bias_backward(q=q, k=q, v=q, bias=bias, causal=False)
 
-    override_path = tmp_path / "flash_specialized_512.json"
-    override_path.write_text(
-        json.dumps(
-            {
-                "kernels": [
-                    {
-                        "route": "bias_docblock_specialized",
-                        "kind": "bwd",
-                        "seq_bucket": "under_2048",
-                        "query_len": 512,
-                        "key_len": 512,
-                        "head_dim": 64,
-                        "dtype": "bfloat16",
-                        "causal": False,
-                        "has_mask": True,
-                        "block_m": 32,
-                        "block_n": 32,
-                        "num_stages": 1,
-                        "num_warps": 2,
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
     configure_flashdeberta_kernel_overrides(None)
-    try:
-        # The shipped table has no 512 row, so the gate stays closed.
-        assert not _gate(512)
-        # Adding a tuning-table row is sufficient to open the gate: shape
-        # enablement must live in data, not in a hardcoded seq-len set in src.
-        configure_flashdeberta_kernel_overrides(str(override_path))
+    # The shipped table has no 512 row, so the gate stays closed.
+    assert not _gate(512)
+    # Adding a tuning-table row is sufficient to open the gate: shape
+    # enablement must live in data, not in a hardcoded seq-len set in src.
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "kernels": [
+                {
+                    "route": "bias_docblock_specialized",
+                    "kind": "bwd",
+                    "seq_bucket": "under_2048",
+                    "query_len": 512,
+                    "key_len": 512,
+                    "head_dim": 64,
+                    "dtype": "bfloat16",
+                    "causal": False,
+                    "has_mask": True,
+                    "block_m": 32,
+                    "block_n": 32,
+                    "num_stages": 1,
+                    "num_warps": 2,
+                }
+            ]
+        },
+        filename="flash_specialized_512.json",
+    ):
         assert _gate(512)
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: pytest.MonkeyPatch) -> None:

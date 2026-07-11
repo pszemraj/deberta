@@ -682,6 +682,45 @@ def checkpoint_saving_accelerator(
     return accel
 
 
+def make_checkpoint_saver(
+    *,
+    calls: list[tuple[str, int, str]] | None = None,
+    create_checkpoint_dir: bool = False,
+    fail_label: str | None = None,
+    failure_message: str = "checkpoint save failed",
+) -> Any:
+    """Build a checkpoint-save fake with optional recording and failure behavior.
+
+    :param list[tuple[str, int, str]] | None calls: Optional call-record destination.
+    :param bool create_checkpoint_dir: Whether to materialize the checkpoint directory.
+    :param str | None fail_label: Log label that should raise, defaults to None.
+    :param str failure_message: Raised error message when ``fail_label`` matches.
+    :return Any: Callable matching ``_save_training_checkpoint``.
+    """
+
+    def _save_checkpoint(
+        *,
+        accelerator: Any,
+        checkpoint_dir: Path,
+        output_dir: Path,
+        consumed_micro_batches: int,
+        save_total_limit: int,
+        log_label: str,
+        **kwargs: Any,
+    ) -> None:
+        """Record or emulate one checkpoint save."""
+
+        del accelerator, output_dir, save_total_limit, kwargs
+        if calls is not None:
+            calls.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
+        if fail_label is not None and str(log_label) == str(fail_label):
+            raise RuntimeError(str(failure_message))
+        if create_checkpoint_dir:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    return _save_checkpoint
+
+
 def capture_run_pretraining_kwargs(monkeypatch: Any, cli_module: Any) -> dict[str, Any]:
     """Monkeypatch the CLI's run_pretraining with a kwargs recorder.
 

@@ -253,22 +253,6 @@ def test_build_optimizer_supports_branch_specific_lrs(
     assert wds == {0.0, 0.1}
 
 
-def test_build_decoupled_optimizers_support_discriminator_specific_lr():
-    model = TinyRTDLikeModel()
-    cfg = make_optim_config(
-        lr={"base": 1.0e-3, "generator": 5.0e-4, "discriminator": 2.0e-4},
-        weight_decay=0.1,
-    )
-    gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
-
-    assert gen_opt.param_groups
-    assert disc_opt.param_groups
-    for group in gen_opt.param_groups:
-        assert float(group["lr"]) == pytest.approx(5.0e-4)
-    for group in disc_opt.param_groups:
-        assert float(group["lr"]) == pytest.approx(2.0e-4)
-
-
 def test_build_optimizer_keeps_fused_in_bf16_mode(monkeypatch: pytest.MonkeyPatch):
     import deberta.training.runtime as runtime_mod
 

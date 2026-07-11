@@ -338,17 +338,22 @@ def test_streaming_retries_without_duplicating_examples() -> None:
     assert source.iterations == 2
 
 
-def test_streaming_does_not_retry_non_transient_errors() -> None:
-    class _InvalidDataset:
+@pytest.mark.parametrize(
+    ("error", "expected_iterations"),
+    [(ValueError("invalid dataset schema"), 1), (OSError("shard unavailable"), 3)],
+    ids=["non_transient", "transient_exhausted"],
+)
+def test_streaming_retry_failure_policy(error: Exception, expected_iterations: int) -> None:
+    class _FailingDataset:
         def __init__(self) -> None:
             self.iterations = 0
 
         def __iter__(self):
             self.iterations += 1
-            raise ValueError("invalid dataset schema")
+            raise error
             yield
 
-    source = _InvalidDataset()
+    source = _FailingDataset()
     dataset = PackedStreamingDataset(
         hf_dataset=source,
         tokenizer=DummyTokenizer(vocab_size=64),
@@ -362,38 +367,9 @@ def test_streaming_does_not_retry_non_transient_errors() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="invalid dataset schema"):
+    with pytest.raises(type(error), match=str(error)):
         list(dataset._iter_examples())
-    assert source.iterations == 1
-
-
-def test_streaming_stops_after_retry_budget_is_exhausted() -> None:
-    class _UnavailableDataset:
-        def __init__(self) -> None:
-            self.iterations = 0
-
-        def __iter__(self):
-            self.iterations += 1
-            raise OSError("shard unavailable")
-            yield
-
-    source = _UnavailableDataset()
-    dataset = PackedStreamingDataset(
-        hf_dataset=source,
-        tokenizer=DummyTokenizer(vocab_size=64),
-        cfg=PackedStreamingConfig(
-            text_column_name="text",
-            max_seq_length=8,
-            seed=0,
-            shuffle_buffer_size=0,
-            retry_attempts=3,
-            retry_backoff_seconds=0.0,
-        ),
-    )
-
-    with pytest.raises(OSError, match="shard unavailable"):
-        list(dataset._iter_examples())
-    assert source.iterations == 3
+    assert source.iterations == expected_iterations
 
 
 def test_call_with_dataset_retry_retries_transient_failure() -> None:
@@ -1029,39 +1005,29 @@ def test_collator_drops_all_ones_attention_mask():
     assert "attention_mask" not in batch
 
 
-def test_collator_keeps_attention_mask_when_padding_present():
+@pytest.mark.parametrize(
+    "include_attention_mask",
+    [True, False],
+    ids=["provided", "generated"],
+)
+def test_collator_keeps_attention_mask_when_padding_present(include_attention_mask: bool):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
 
     features = [
         {
             "input_ids": [tok.cls_token_id, 11, tok.sep_token_id],
-            "attention_mask": [1, 1, 1],
             "special_tokens_mask": [1, 0, 1],
         },
         {
             "input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id],
-            "attention_mask": [1, 1, 1, 1],
             "special_tokens_mask": [1, 0, 0, 1],
         },
     ]
+    if include_attention_mask:
+        for feature in features:
+            feature["attention_mask"] = [1] * len(feature["input_ids"])
     batch = coll(features)
-    assert "attention_mask" in batch
-    assert batch["attention_mask"].shape == batch["input_ids"].shape
-    assert (batch["attention_mask"] == 0).any()
-
-
-def test_collator_generates_attention_mask_for_variable_length_inputs():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
-
-    # No attention_mask in features; tokenizer padding is required.
-    features = [
-        {"input_ids": [tok.cls_token_id, 11, tok.sep_token_id], "special_tokens_mask": [1, 0, 1]},
-        {"input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-    ]
-    batch = coll(features)
-
     assert "attention_mask" in batch
     assert batch["attention_mask"].shape == batch["input_ids"].shape
     assert (batch["attention_mask"] == 0).any()
