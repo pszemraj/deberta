@@ -8,6 +8,7 @@ import torch
 from _fakes import BackboneConfigStub, BackboneOutputStub, DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
+from deberta.data.retry import call_with_dataset_retry
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
 from deberta.modeling.mask_utils import build_doc_block_mask
 
@@ -393,6 +394,42 @@ def test_streaming_stops_after_retry_budget_is_exhausted() -> None:
     with pytest.raises(OSError, match="shard unavailable"):
         list(dataset._iter_examples())
     assert source.iterations == 3
+
+
+def test_call_with_dataset_retry_retries_transient_failure() -> None:
+    calls = 0
+    retries: list[tuple[int, float, str]] = []
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("temporary")
+        return "ok"
+
+    result = call_with_dataset_retry(
+        operation,
+        attempts=2,
+        backoff_seconds=0.0,
+        on_retry=lambda attempt, delay, exc: retries.append((attempt, delay, str(exc))),
+    )
+
+    assert result == "ok"
+    assert calls == 2
+    assert retries == [(1, 0.0, "temporary")]
+
+
+def test_call_with_dataset_retry_does_not_retry_non_transient_failure() -> None:
+    def operation() -> None:
+        raise ValueError("invalid")
+
+    with pytest.raises(ValueError, match="invalid"):
+        call_with_dataset_retry(
+            operation,
+            attempts=3,
+            backoff_seconds=0.0,
+            on_retry=lambda *_args: pytest.fail("non-transient failure retried"),
+        )
 
 
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():

@@ -50,6 +50,33 @@ def retry_delay_seconds(*, backoff_seconds: float, failed_attempt: int) -> float
     return min(max(0.0, float(backoff_seconds)) * (2 ** max(0, int(failed_attempt) - 1)), 60.0)
 
 
+def handle_dataset_retry_failure(
+    exc: BaseException,
+    *,
+    attempt: int,
+    attempts: int,
+    backoff_seconds: float,
+    on_retry: Callable[[int, float, BaseException], None],
+) -> None:
+    """Raise a terminal dataset failure or notify and wait before retrying.
+
+    :param BaseException exc: Failure from the current attempt.
+    :param int attempt: One-based current attempt.
+    :param int attempts: Total attempt budget.
+    :param float backoff_seconds: Initial exponential-backoff delay.
+    :param Callable[[int, float, BaseException], None] on_retry: Retry notification callback.
+    :raises BaseException: If the failure is non-transient or the budget is exhausted.
+    """
+
+    limit = max(1, int(attempts))
+    if int(attempt) >= limit or not is_transient_dataset_error(exc):
+        raise exc
+    delay = retry_delay_seconds(backoff_seconds=backoff_seconds, failed_attempt=attempt)
+    on_retry(int(attempt), delay, exc)
+    if delay > 0.0:
+        time.sleep(delay)
+
+
 def call_with_dataset_retry(
     operation: Callable[[], T],
     *,
@@ -70,10 +97,11 @@ def call_with_dataset_retry(
         try:
             return operation()
         except Exception as exc:
-            if attempt >= limit or not is_transient_dataset_error(exc):
-                raise
-            delay = retry_delay_seconds(backoff_seconds=backoff_seconds, failed_attempt=attempt)
-            on_retry(attempt, delay, exc)
-            if delay > 0.0:
-                time.sleep(delay)
+            handle_dataset_retry_failure(
+                exc,
+                attempt=attempt,
+                attempts=limit,
+                backoff_seconds=backoff_seconds,
+                on_retry=on_retry,
+            )
     raise RuntimeError("unreachable retry state")

@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from deberta.data.retry import is_transient_dataset_error, retry_delay_seconds
+from deberta.data.retry import handle_dataset_retry_failure
 
 logger = logging.getLogger(__name__)
 
@@ -155,24 +154,22 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                     yield example
                 return
             except Exception as exc:
-                if attempt >= attempts or not is_transient_dataset_error(exc):
-                    raise
-                delay = retry_delay_seconds(
-                    backoff_seconds=self.cfg.retry_backoff_seconds,
-                    failed_attempt=attempt,
-                )
-                logger.warning(
-                    "Dataset stream failed transiently at epoch %d after %d examples "
-                    "(attempt %d/%d, retry in %.1fs): %s",
-                    self._current_epoch(),
-                    yielded,
-                    attempt,
-                    attempts,
-                    delay,
+                handle_dataset_retry_failure(
                     exc,
+                    attempt=attempt,
+                    attempts=attempts,
+                    backoff_seconds=self.cfg.retry_backoff_seconds,
+                    on_retry=lambda failed_attempt, delay, failure, yielded=yielded: logger.warning(
+                        "Dataset stream failed transiently at epoch %d after %d examples "
+                        "(attempt %d/%d, retry in %.1fs): %s",
+                        self._current_epoch(),
+                        yielded,
+                        failed_attempt,
+                        attempts,
+                        delay,
+                        failure,
+                    ),
                 )
-                if delay > 0.0:
-                    time.sleep(delay)
 
     def _normalize_raw_text(self, ex: dict[str, Any]) -> str:
         """Extract and normalize one raw text example.
