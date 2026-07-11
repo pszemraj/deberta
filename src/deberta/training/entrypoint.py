@@ -6,6 +6,7 @@ import inspect
 import logging
 import time
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,52 @@ def _clip_gradients_and_find_nonfinite(
     ):
         return "grad_norm_post_clip", float(post_clip_grad_norm)
     return None, float(post_clip_grad_norm)
+
+
+@dataclass
+class _NonfiniteWindowObservation:
+    """First local nonfinite observation for one accumulation phase."""
+
+    detected: bool = False
+    reason: str | None = None
+    micro_step: int | None = None
+
+    def record(self, reason: str | None, *, micro_step: int) -> None:
+        """Record the first local nonfinite reason in the phase.
+
+        :param str | None reason: Current micro-step failure reason.
+        :param int micro_step: Current micro-step index.
+        :return None: None.
+        """
+
+        if reason is None:
+            return
+        self.detected = True
+        if self.reason is None:
+            self.reason = str(reason)
+            self.micro_step = int(micro_step)
+
+    def synchronized_failure(
+        self,
+        *,
+        accelerator: Any,
+        is_sync_step: bool,
+        current_micro_step: int,
+    ) -> tuple[str, int] | None:
+        """Resolve the rank-wide failure at the accumulation sync point.
+
+        :param Any accelerator: Accelerator used for rank-wide flag reduction.
+        :param bool is_sync_step: Whether this is the phase's synchronization step.
+        :param int current_micro_step: Current micro-step fallback index.
+        :return tuple[str, int] | None: Effective reason and first failing step, if any.
+        """
+
+        if not is_sync_step or not _any_rank_flag_true(accelerator=accelerator, flag=self.detected):
+            return None
+        return (
+            self.reason if self.reason is not None else "other_rank_nonfinite",
+            self.micro_step if self.micro_step is not None else int(current_micro_step),
+        )
 
 
 def run_pretraining_dry_run(
@@ -1309,9 +1356,7 @@ def run_pretraining(
                 disc_optimizer.zero_grad(set_to_none=True)
 
                 # Phase 1: generator update + corruption target construction.
-                gen_window_nonfinite_local = False
-                gen_first_nonfinite_reason_local: str | None = None
-                gen_first_nonfinite_micro_step: int | None = None
+                gen_nonfinite = _NonfiniteWindowObservation()
                 for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                     batch, flash_meta = _prepare_training_batch(batch)
 
@@ -1352,28 +1397,17 @@ def run_pretraining(
                             if not torch.isfinite(backward_loss.detach()).all():
                                 offending = "gen_backward_loss"
 
-                        if offending is not None:
-                            gen_window_nonfinite_local = True
-                            if gen_first_nonfinite_reason_local is None:
-                                gen_first_nonfinite_reason_local = str(offending)
-                                gen_first_nonfinite_micro_step = int(step_idx)
+                        gen_nonfinite.record(offending, micro_step=step_idx)
 
                         # Keep non-finite coordination out of non-sync microsteps to preserve
                         # no_sync accumulation performance characteristics.
-                        if is_sync_step and _any_rank_flag_true(
+                        synchronized_failure = gen_nonfinite.synchronized_failure(
                             accelerator=accelerator,
-                            flag=gen_window_nonfinite_local,
-                        ):
-                            offending_effective = (
-                                str(gen_first_nonfinite_reason_local)
-                                if gen_first_nonfinite_reason_local is not None
-                                else "other_rank_nonfinite"
-                            )
-                            offending_micro_step = (
-                                int(gen_first_nonfinite_micro_step)
-                                if gen_first_nonfinite_micro_step is not None
-                                else int(step_idx)
-                            )
+                            is_sync_step=is_sync_step,
+                            current_micro_step=step_idx,
+                        )
+                        if synchronized_failure is not None:
+                            offending_effective, offending_micro_step = synchronized_failure
                             skipped_window_due_nonfinite = True
                             _increment_nonfinite_skip()
                             nonfinite_reason = str(offending_effective)
@@ -1469,9 +1503,7 @@ def run_pretraining(
                     and bool(window_has_global_disc_targets)
                 ):
                     disc_phase_steps = len(disc_phase_inputs)
-                    disc_window_nonfinite_local = False
-                    disc_first_nonfinite_reason_local: str | None = None
-                    disc_first_nonfinite_micro_step: int | None = None
+                    disc_nonfinite = _NonfiniteWindowObservation()
                     for step_idx, payload in enumerate(disc_phase_inputs):
                         if compile_enabled:
                             _maybe_cudagraph_mark_step_begin()
@@ -1515,28 +1547,17 @@ def run_pretraining(
                                 if not torch.isfinite(backward_loss.detach()).all():
                                     offending = "disc_backward_loss"
 
-                            if offending is not None:
-                                disc_window_nonfinite_local = True
-                                if disc_first_nonfinite_reason_local is None:
-                                    disc_first_nonfinite_reason_local = str(offending)
-                                    disc_first_nonfinite_micro_step = int(step_idx)
+                            disc_nonfinite.record(offending, micro_step=step_idx)
 
                             # Keep non-finite coordination out of non-sync microsteps to preserve
                             # no_sync accumulation performance characteristics.
-                            if is_sync_step and _any_rank_flag_true(
+                            synchronized_failure = disc_nonfinite.synchronized_failure(
                                 accelerator=accelerator,
-                                flag=disc_window_nonfinite_local,
-                            ):
-                                offending_effective = (
-                                    str(disc_first_nonfinite_reason_local)
-                                    if disc_first_nonfinite_reason_local is not None
-                                    else "other_rank_nonfinite"
-                                )
-                                offending_micro_step = (
-                                    int(disc_first_nonfinite_micro_step)
-                                    if disc_first_nonfinite_micro_step is not None
-                                    else int(step_idx)
-                                )
+                                is_sync_step=is_sync_step,
+                                current_micro_step=step_idx,
+                            )
+                            if synchronized_failure is not None:
+                                offending_effective, offending_micro_step = synchronized_failure
                                 skipped_window_due_nonfinite = True
                                 _increment_nonfinite_skip()
                                 nonfinite_reason = str(offending_effective)
@@ -1672,9 +1693,7 @@ def run_pretraining(
             skipped_window_due_nonfinite = False
             nonfinite_reason: str | None = None
             nonfinite_debug_path: Path | None = None
-            window_nonfinite_local = False
-            first_nonfinite_reason_local: str | None = None
-            first_nonfinite_micro_step: int | None = None
+            window_nonfinite = _NonfiniteWindowObservation()
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch, flash_meta = _prepare_training_batch(batch)
@@ -1728,28 +1747,17 @@ def run_pretraining(
                     elif not torch.isfinite(backward_loss.detach()).all():
                         offending = "backward_loss"
 
-                    if offending is not None:
-                        window_nonfinite_local = True
-                        if first_nonfinite_reason_local is None:
-                            first_nonfinite_reason_local = str(offending)
-                            first_nonfinite_micro_step = int(step_idx)
+                    window_nonfinite.record(offending, micro_step=step_idx)
 
                     # Keep non-finite coordination out of non-sync microsteps to preserve
                     # no_sync accumulation performance characteristics.
-                    if is_sync_step and _any_rank_flag_true(
+                    synchronized_failure = window_nonfinite.synchronized_failure(
                         accelerator=accelerator,
-                        flag=window_nonfinite_local,
-                    ):
-                        offending_effective = (
-                            str(first_nonfinite_reason_local)
-                            if first_nonfinite_reason_local is not None
-                            else "other_rank_nonfinite"
-                        )
-                        offending_micro_step = (
-                            int(first_nonfinite_micro_step)
-                            if first_nonfinite_micro_step is not None
-                            else int(step_idx)
-                        )
+                        is_sync_step=is_sync_step,
+                        current_micro_step=step_idx,
+                    )
+                    if synchronized_failure is not None:
+                        offending_effective, offending_micro_step = synchronized_failure
                         skipped_window_due_nonfinite = True
                         _increment_nonfinite_skip()
                         nonfinite_reason = str(offending_effective)
