@@ -787,6 +787,53 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     )
 
 
+def _apply_backbone_option_severity_policy(cfg: ModelConfig, defaults: ModelConfig) -> None:
+    """Apply the explicit error/warning policy for inactive backbone options.
+
+    :param ModelConfig cfg: Model configuration under validation.
+    :param ModelConfig defaults: Default model configuration for change detection.
+    :raises ValueError: If an inactive option group has error severity.
+    :return None: None.
+    """
+
+    if cfg.backbone_type == "hf_deberta_v2":
+        rules = [
+            (
+                asdict(cfg.rope) != asdict(defaults.rope),
+                "error",
+                "These options are only valid when model.backbone_type='rope': model.rope.*",
+            )
+        ]
+    else:
+        rules = [
+            (
+                cfg.hf.attention_kernel != defaults.hf.attention_kernel,
+                "warning",
+                "model.hf.attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf.attention_kernel!r}) has no effect on the rope backbone.",
+            ),
+            (
+                cfg.hf.max_position_embeddings is not None,
+                "warning",
+                "model.hf.max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf.max_position_embeddings!r}) has no effect on the rope backbone.",
+            ),
+            (
+                cfg.hf.model_size != defaults.hf.model_size,
+                "warning",
+                "model.hf.model_size only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf.model_size!r}) has no effect on the rope backbone.",
+            ),
+        ]
+
+    for active, severity, message in rules:
+        if not active:
+            continue
+        if severity == "error":
+            raise ValueError(message)
+        warnings.warn(message, UserWarning, stacklevel=3)
+
+
 def validate_model_config(cfg: ModelConfig) -> None:
     """Validate model config semantics and normalize constrained values.
 
@@ -938,32 +985,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "model.hf.max_position_embeddings is only supported when model.from_scratch=true "
                 "for hf_deberta_v2 runs."
             )
-
-        rope_changed = asdict(cfg.rope) != asdict(defaults.rope)
-        if rope_changed:
-            raise ValueError("These options are only valid when model.backbone_type='rope': model.rope.*")
-    else:
-        if cfg.hf.attention_kernel != defaults.hf.attention_kernel:
-            warnings.warn(
-                "model.hf.attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Current value ({cfg.hf.attention_kernel!r}) has no effect on the rope backbone.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if cfg.hf.max_position_embeddings is not None:
-            warnings.warn(
-                "model.hf.max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Current value ({cfg.hf.max_position_embeddings!r}) has no effect on the rope backbone.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if cfg.hf.model_size != defaults.hf.model_size:
-            warnings.warn(
-                "model.hf.model_size only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Current value ({cfg.hf.model_size!r}) has no effect on the rope backbone.",
-                UserWarning,
-                stacklevel=2,
-            )
+    _apply_backbone_option_severity_policy(cfg, defaults)
 
     if cfg.backbone_type == "rope" and bool(cfg.from_scratch):
         pretrained_changed = asdict(cfg.rope.pretrained) != asdict(defaults.rope.pretrained)
