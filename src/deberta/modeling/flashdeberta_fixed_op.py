@@ -21,6 +21,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import resolve_repo_tuned_confi
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     lookup_existing_op_pair,
+    strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     kernel_dtype_name as _kernel_dtype_name,
@@ -474,14 +475,8 @@ def _fixed_triton_forward_impl(
         output = torch.zeros_like(q)
         lse = torch.zeros((batch_size, num_heads, query_len), device=q.device, dtype=torch.float32)
 
-    if pos_key is not None:
-        stride_pk0, stride_pk1, stride_pk2, stride_pk3 = pos_key.stride()
-    else:
-        stride_pk0 = stride_pk1 = stride_pk2 = stride_pk3 = 0
-    if pos_query is not None:
-        stride_pq0, stride_pq1, stride_pq2, stride_pq3 = pos_query.stride()
-    else:
-        stride_pq0 = stride_pq1 = stride_pq2 = stride_pq3 = 0
+    stride_pk0, stride_pk1, stride_pk2, stride_pk3 = strides_or_zeros(pos_key, 4)
+    stride_pq0, stride_pq1, stride_pq2, stride_pq3 = strides_or_zeros(pos_query, 4)
 
     grid = (_cdiv(query_len, block_m), num_heads, batch_size)
     torch.library.wrap_triton(_fwd_kernel_dise_raw)[grid](
@@ -618,14 +613,8 @@ def _fixed_triton_backward_impl(
     dk_pos = torch.zeros_like(pos_key) if pos_key is not None else None
     dq_pos = torch.zeros_like(pos_query) if pos_query is not None else None
 
-    if pos_key is not None:
-        stride_pk0, stride_pk1, stride_pk2, stride_pk3 = pos_key.stride()
-    else:
-        stride_pk0 = stride_pk1 = stride_pk2 = stride_pk3 = 0
-    if pos_query is not None:
-        stride_pq0, stride_pq1, stride_pq2, stride_pq3 = pos_query.stride()
-    else:
-        stride_pq0 = stride_pq1 = stride_pq2 = stride_pq3 = 0
+    stride_pk0, stride_pk1, stride_pk2, stride_pk3 = strides_or_zeros(pos_key, 4)
+    stride_pq0, stride_pq1, stride_pq2, stride_pq3 = strides_or_zeros(pos_query, 4)
 
     grid_delta = (_cdiv(query_len, block_m), num_heads, batch_size)
     torch.library.wrap_triton(_bwd_preprocess_raw)[grid_delta](

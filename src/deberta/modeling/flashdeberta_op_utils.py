@@ -114,6 +114,19 @@ def kernel_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def strides_or_zeros(tensor: torch.Tensor | None, count: int) -> tuple[int, ...]:
+    """Return leading tensor strides or zeros for an absent optional tensor.
+
+    :param torch.Tensor | None tensor: Optional tensor.
+    :param int count: Number of leading strides to return.
+    :return tuple[int, ...]: Tensor strides or a same-length zero tuple.
+    """
+
+    if tensor is None:
+        return (0,) * int(count)
+    return tuple(int(tensor.stride(index)) for index in range(int(count)))
+
+
 def is_flash_attention_impl(value: object) -> bool:
     """Return whether an attention-implementation value selects FlashDeBERTa.
 

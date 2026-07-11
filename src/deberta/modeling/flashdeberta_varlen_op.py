@@ -38,6 +38,7 @@ from deberta.modeling.flashdeberta_op_utils import (
     BoundedLRUCache,
     device_compute_capability,
     lookup_existing_op_pair,
+    strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     kernel_dtype_name as _kernel_dtype_name,
@@ -939,14 +940,8 @@ def _varlen_backward_raw_impl(
     dpos_key_unpad = torch.zeros_like(pos_key_unpad) if pos_key_unpad is not None else None
     dpos_query_unpad = torch.zeros_like(pos_query_unpad) if pos_query_unpad is not None else None
 
-    if pos_key_unpad is not None:
-        stride_pk0, stride_pk1, stride_pk2 = pos_key_unpad.stride()
-    else:
-        stride_pk0 = stride_pk1 = stride_pk2 = 0
-    if pos_query_unpad is not None:
-        stride_pq0, stride_pq1, stride_pq2 = pos_query_unpad.stride()
-    else:
-        stride_pq0 = stride_pq1 = stride_pq2 = 0
+    stride_pk0, stride_pk1, stride_pk2 = strides_or_zeros(pos_key_unpad, 3)
+    stride_pq0, stride_pq1, stride_pq2 = strides_or_zeros(pos_query_unpad, 3)
 
     grid_kv = (n_tile_count, int(q_unpad.shape[1]))
     torch.library.wrap_triton(_bwd_kv_dise_kernel_varlen_raw)[grid_kv](
@@ -1918,14 +1913,8 @@ def _varlen_triton_forward_impl(
     out_unpad = torch.empty_like(q_unpad)
     lse_unpad = torch.empty((capacity_tokens, num_heads), device=q.device, dtype=torch.float32)
 
-    if pos_key_unpad is not None:
-        stride_pk0, stride_pk1, stride_pk2 = pos_key_unpad.stride()
-    else:
-        stride_pk0 = stride_pk1 = stride_pk2 = 0
-    if pos_query_unpad is not None:
-        stride_pq0, stride_pq1, stride_pq2 = pos_query_unpad.stride()
-    else:
-        stride_pq0 = stride_pq1 = stride_pq2 = 0
+    stride_pk0, stride_pk1, stride_pk2 = strides_or_zeros(pos_key_unpad, 3)
+    stride_pq0, stride_pq1, stride_pq2 = strides_or_zeros(pos_query_unpad, 3)
 
     grid = (tile_count, num_heads)
     torch.library.wrap_triton(_fwd_kernel_varlen_raw)[grid](

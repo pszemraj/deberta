@@ -25,6 +25,7 @@ from deberta.modeling.flashdeberta_op_utils import (
     BoundedLRUCache,
     device_compute_capability,
     keep_mask_head_stride,
+    strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     kernel_dtype_name as _kernel_dtype_name,
@@ -531,6 +532,7 @@ def _dense_bias_forward_cuda(
         device=reference.device,
         has_mask=keep_mask is not None,
     )
+    mask_stride_b, _, mask_stride_s, mask_stride_n = strides_or_zeros(keep_mask, 4)
 
     grid = (triton.cdiv(seq_len, block_m), triton.cdiv(seq_len, block_n), batch_size * num_heads)
     with torch.cuda.device(reference.device.index):
@@ -540,20 +542,14 @@ def _dense_bias_forward_cuda(
             bucket_index,
             keep_mask_tensor,
             output,
-            pos_key_tensor.stride(0) if pos_key is not None else 0,
-            pos_key_tensor.stride(1) if pos_key is not None else 0,
-            pos_key_tensor.stride(2) if pos_key is not None else 0,
-            pos_key_tensor.stride(3) if pos_key is not None else 0,
-            pos_query_tensor.stride(0) if pos_query is not None else 0,
-            pos_query_tensor.stride(1) if pos_query is not None else 0,
-            pos_query_tensor.stride(2) if pos_query is not None else 0,
-            pos_query_tensor.stride(3) if pos_query is not None else 0,
+            *strides_or_zeros(pos_key, 4),
+            *strides_or_zeros(pos_query, 4),
             bucket_index.stride(0),
             bucket_index.stride(1),
-            keep_mask_tensor.stride(0) if keep_mask is not None else 0,
+            mask_stride_b,
             keep_mask_head_stride(keep_mask, num_heads=num_heads),
-            keep_mask_tensor.stride(2) if keep_mask is not None else 0,
-            keep_mask_tensor.stride(3) if keep_mask is not None else 0,
+            mask_stride_s,
+            mask_stride_n,
             output.stride(0),
             output.stride(1),
             output.stride(2),

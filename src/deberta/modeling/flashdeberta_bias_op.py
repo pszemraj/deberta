@@ -28,6 +28,7 @@ from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     keep_mask_head_stride,
     lookup_existing_op_pair,
+    strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     kernel_dtype_name as _kernel_dtype_name,
@@ -996,19 +997,6 @@ def _resolve_docblock1024_bwd_configs(
     return kv_config, q_config
 
 
-def _strides_or_zeros(tensor: torch.Tensor | None, count: int) -> tuple[int, ...]:
-    """Return the first ``count`` strides of a tensor, or zeros when absent.
-
-    :param torch.Tensor | None tensor: Optional tensor.
-    :param int count: Number of leading strides to report.
-    :return tuple[int, ...]: Strides, or all zeros for ``None``/sentinel slots.
-    """
-
-    if tensor is None:
-        return (0,) * int(count)
-    return tuple(int(tensor.stride(i)) for i in range(int(count)))
-
-
 def _launch_bias_preprocess(
     *,
     out: torch.Tensor,
@@ -1112,7 +1100,7 @@ def _launch_docblock1024_backward(
     dpos_query_tensor = dpos_query_accum if dpos_query_accum is not None else empty_float
     bucket_tensor = bucket_index if bucket_index is not None else empty_int
     keep_mask_tensor = keep_mask if keep_mask is not None else empty_bool
-    raw_mask_strides = _strides_or_zeros(keep_mask, 4)
+    raw_mask_strides = strides_or_zeros(keep_mask, 4)
     keep_mask_strides = (
         raw_mask_strides[0],
         keep_mask_head_stride(keep_mask, num_heads=int(num_heads)),
@@ -1171,8 +1159,8 @@ def _launch_docblock1024_backward(
             dv.stride(1),
             dv.stride(2),
             dv.stride(3),
-            *_strides_or_zeros(dpos_key_accum, 4),
-            *_strides_or_zeros(bucket_index, 2),
+            *strides_or_zeros(dpos_key_accum, 4),
+            *strides_or_zeros(bucket_index, 2),
             *keep_mask_strides,
             int(num_heads),
             int(query_len),
@@ -1233,8 +1221,8 @@ def _launch_docblock1024_backward(
             dq.stride(1),
             dq.stride(2),
             dq.stride(3),
-            *_strides_or_zeros(dpos_query_accum, 4),
-            *_strides_or_zeros(bucket_index, 2),
+            *strides_or_zeros(dpos_query_accum, 4),
+            *strides_or_zeros(bucket_index, 2),
             *keep_mask_strides,
             int(num_heads),
             int(query_len),
