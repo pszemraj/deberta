@@ -15,6 +15,7 @@
 # - For the RoPE omission profile, delete the pinned values at train.objective.mask_token_prob, train.objective.random_token_prob, train.objective.disc_loss_weight, optim.adam.epsilon, and optim.scheduler.warmup_steps.
 # - Alternatively, set all five profile-sensitive values deliberately; leaving this reference's native values active does not invoke RoPE defaults.
 # - Fresh initialization from pretrained weights: set model.from_scratch=false and model.pretrained.discriminator_path. This starts at optimizer step 0 with a new optimizer; it is not an exact training resume.
+# - Short smoke or learning-signal proof: use scheduler.type="constant" or "constant_with_warmup", or set warmup_steps meaningfully below train.max_steps. The native omission default is 10000 warmup steps, so a 10-step proof that omits scheduler settings measures only the extreme start of warmup and may show no learning trend.
 # - Exact training resume starts from the source run's config_resolved.yaml.
 # - Same-directory continuation sets train.checkpoint.resume_from_checkpoint="auto" and keeps both output directories unchanged.
 # - Continuation into a new run sets an explicit committed checkpoint and changes both train.checkpoint.output_dir and logging.output_dir to the new destination; changing only the checkpoint output would reuse and overwrite the source run's logging snapshots.
@@ -1329,7 +1330,8 @@ optim:
     # values: integer >= 0
     # contract: optimizer steps spent warming the learning rate; ignored by scheduler.type=constant.
     # precedence: explicit values are never replaced by the backbone profile.
-    # recommendation: keep warmup meaningfully smaller than train.max_steps; this file uses 1000 of 50000 steps.
+    # warning: the native omission default is 10000; a short run with train.max_steps<=10000 can remain entirely in warmup and provide no useful learning-signal test.
+    # recommendation: keep warmup meaningfully smaller than train.max_steps; for a 10-step smoke proof use constant or constant_with_warmup with warmup_steps=1. This file uses 1000 of 50000 steps.
     warmup_steps: 1000
 
   # [optim.weight_decay]
