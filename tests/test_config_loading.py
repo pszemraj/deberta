@@ -181,6 +181,9 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
 
 
 def test_config_reference_loads() -> None:
+    # Keep this as an end-to-end loader contract. The reference is deliberately
+    # hand-authored; schema-enumeration tests would turn its prose into generated
+    # scaffolding and cannot verify the field-level guidance that matters here.
     cfg = load_config(REPO_ROOT / "configs" / "config_reference.yaml")
     assert cfg.model.backbone_type == "hf_deberta_v2"
     assert cfg.data.source.dataset_name == "HuggingFaceFW/fineweb-edu"

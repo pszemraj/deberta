@@ -122,8 +122,7 @@ Packed benchmark configs are under [`configs/flashdeberta/`](../../configs/flash
 
 ## Runtime caveats
 
-- Dense doc-block position gradients use atomic accumulation, so flash runs are not bitwise
-  reproducible. Resume and drift checks must use numeric tolerances.
+- Dense doc-block position gradients use atomic accumulation, so flash runs are not bitwise reproducible. Any manual or external comparison of resumed and uninterrupted runs must use numeric tolerances; the trainer does not run a separate numerical-drift detector.
 - Dense flash-with-bias routes trade memory for recomputation by saving `(B,H,S,S)` bias tensors
   for backward. Table bounds keep unmeasured shapes on ragged routes unless explicitly bypassed.
 - Python route counters are disabled during `torch.compile`. Host-side batch preparation still

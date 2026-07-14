@@ -1011,3 +1011,13 @@ stale references.
 Gates: full suite 581 passed / 12 skipped, `audit_contracts` 14/14 PASS,
 GPU notice validation plus a 2-step compiled flash RTD profile probe
 (6.73 GiB peak, step metrics consistent with the recorded baseline).
+
+## 2026-07-14 - Reproducible Pre-Merge Evidence
+
+The July 8 parity evidence remains a result for its recorded HEAD `610148e`, but it ceased to be reproducible at later heads after `5930e0e` removed flat-config mapping coercion. The synthetic benchmark builder still passed plain mappings into nested config fields, so `tools/flashdeberta_parity_test.py` crashed during startup before running any parity case.
+
+- `05980e6` restored the harness by constructing the nested model, generator, flash, and data-packing dataclasses explicitly.
+- `6210134` added the authoritative pre-merge gate and passed it cleanly: lint and docstrings passed, pytest reported `636 passed / 4 skipped`, and all 13 CUDA parity cases passed.
+- The complete log is `local-scratch/premerge/premerge_20260714_021913_6210134.log`. Future parity claims can be reproduced through the same one-command gate and tied to its recorded commit and dirty-tree state.
+
+Historical entries above that mention `tools/audit_contracts.py`, `tools/generate_config_reference.py`, or `docs/guides/config-reference.md` describe artifacts that existed during those dated campaigns. Those files were intentionally removed later and are not current commands or documentation; the maintained configuration reference is `configs/config_reference.yaml`.
