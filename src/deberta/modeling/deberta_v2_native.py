@@ -807,7 +807,7 @@ class DebertaV2Embeddings(nn.Module):
 
         embeddings = inputs_embeds
 
-        if self.position_embeddings is not None and self.position_biased_input:
+        if self.position_biased_input:
             embeddings = embeddings + self.position_embeddings(position_ids.long())
 
         if self.token_type_embeddings is not None:
@@ -1233,15 +1233,15 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
                 raise RuntimeError("z_steps>1 requires encoder hidden states.")
             z_base_states = hidden_states[-2]
             z_query_states = hidden_states[-1]
-            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            last_layer = self.encoder.layer[-1]
             rel_embeddings = self.encoder.get_rel_embedding()
             attn_mask = (
                 self.encoder.get_attention_mask(attention_mask) if attention_mask is not None else None
             )
             rel_pos = self.encoder.get_rel_pos(embedding_output)
             z_extras: list[torch.Tensor] = []
-            for layer in layers[1:]:
-                z_query_states, _ = layer(
+            for _ in range(int(self.z_steps) - 1):
+                z_query_states, _ = last_layer(
                     z_base_states,
                     attn_mask,
                     output_attentions=False,
