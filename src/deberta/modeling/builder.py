@@ -31,7 +31,6 @@ _EXTRA_TOKEN_TEMPLATE = "<|deberta_extra_token_{idx}|>"
 class _ResolvedComponentSources:
     """Resolved config/weight sources for one backbone component.
 
-    :param str component: Component name (discriminator/generator).
     :param str | None config_source: Source used to load the component config, or None for synthetic/derived.
     :param str config_origin: Human-readable config-origin label.
     :param str | None weight_source: Source used to load pretrained weights, or None for scratch init.
@@ -39,7 +38,6 @@ class _ResolvedComponentSources:
     :param bool derived_from_discriminator: Whether this component derives from discriminator config/weights.
     """
 
-    component: _COMPONENT_KIND
     config_source: str | None
     config_origin: str
     weight_source: str | None
@@ -65,7 +63,6 @@ def _resolve_generator_sources(model_cfg: ModelConfig) -> _ResolvedComponentSour
     explicit = model_cfg.pretrained.generator_path or None
     from_scratch = bool(model_cfg.from_scratch)
     return _ResolvedComponentSources(
-        component="generator",
         config_source=explicit,
         config_origin=("pretrained_generator_path" if explicit else "derived_from_discriminator_config"),
         weight_source=(None if from_scratch else explicit or model_cfg.pretrained.discriminator_path),
@@ -222,7 +219,6 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     if bt == "hf_deberta_v2":
         disc_cfg_source = None if from_scratch else model_cfg.pretrained.discriminator_path
         discriminator = _ResolvedComponentSources(
-            component="discriminator",
             config_source=disc_cfg_source,
             config_origin=(
                 "repo_hf_defaults" if disc_cfg_source is None else "pretrained_discriminator_path"
@@ -239,7 +235,6 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     disc_cfg_source = model_cfg.pretrained.discriminator_path
     if bt == "rope" and from_scratch:
         discriminator = _ResolvedComponentSources(
-            component="discriminator",
             config_source=None,
             config_origin="synthetic_from_model_cfg",
             weight_source=None,
@@ -248,7 +243,6 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
         )
     else:
         discriminator = _ResolvedComponentSources(
-            component="discriminator",
             config_source=disc_cfg_source,
             config_origin="pretrained_discriminator_path",
             weight_source=(None if from_scratch else model_cfg.pretrained.discriminator_path),
@@ -483,7 +477,6 @@ def _apply_rope_scratch_arch_overrides(
     *,
     model_cfg: ModelConfig,
     max_position_embeddings: int,
-    include_arch_from_model_cfg: bool,
     adjust_swiglu_intermediate: bool,
 ) -> None:
     """Apply scratch-only RoPE architecture overrides.
@@ -491,15 +484,13 @@ def _apply_rope_scratch_arch_overrides(
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     :param int max_position_embeddings: Sequence length budget.
-    :param bool include_arch_from_model_cfg: Whether to apply hidden/layer/head/intermediate overrides.
     :param bool adjust_swiglu_intermediate: Whether to apply 2/3 intermediate-size scaling for SwiGLU.
     """
-    if include_arch_from_model_cfg:
-        cfg.hidden_size = int(model_cfg.rope.hidden_size)
-        cfg.num_hidden_layers = int(model_cfg.rope.num_hidden_layers)
-        cfg.num_attention_heads = int(model_cfg.rope.num_attention_heads)
-        cfg.intermediate_size = int(model_cfg.rope.intermediate_size)
-        cfg.hidden_act = str(model_cfg.rope.hidden_act)
+    cfg.hidden_size = int(model_cfg.rope.hidden_size)
+    cfg.num_hidden_layers = int(model_cfg.rope.num_hidden_layers)
+    cfg.num_attention_heads = int(model_cfg.rope.num_attention_heads)
+    cfg.intermediate_size = int(model_cfg.rope.intermediate_size)
+    cfg.hidden_act = str(model_cfg.rope.hidden_act)
 
     cfg.max_position_embeddings = int(model_cfg.rope.max_position_embeddings or max_position_embeddings)
     cfg.rope_theta = float(model_cfg.rope.rope_theta)
@@ -701,30 +692,32 @@ def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Conf
     )
 
 
-def _load_pretrained_config_or_raise(
-    config_cls: type,
+def _load_pretrained_or_raise(
+    target_cls: type,
     source: str,
     *,
     component: _COMPONENT_KIND,
-    kind: str,
+    artifact: str,
     origin: str,
+    loader_kwargs: dict[str, Any] | None = None,
 ) -> Any:
-    """Load one pretrained config with source-aware failure context.
+    """Load one pretrained artifact with source-aware failure context.
 
-    :param type config_cls: Config class exposing ``from_pretrained``.
+    :param type target_cls: Config or model class exposing ``from_pretrained``.
     :param str source: Local path or model id.
     :param str component: Discriminator or generator.
-    :param str kind: Config family used in diagnostics.
+    :param str artifact: Artifact description used in diagnostics.
     :param str origin: Config field from which the source resolved.
-    :raises RuntimeError: If config loading fails.
-    :return Any: Loaded config object.
+    :param dict[str, Any] | None loader_kwargs: Optional ``from_pretrained`` keyword arguments.
+    :raises RuntimeError: If artifact loading fails.
+    :return Any: Loaded config or model object.
     """
 
     try:
-        return config_cls.from_pretrained(source)
+        return target_cls.from_pretrained(source, **(loader_kwargs or {}))
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to load {component} {kind} config from source '{source}' (resolved from {origin})."
+            f"Failed to load {component} {artifact} from source '{source}' (resolved from {origin})."
         ) from exc
 
 
@@ -768,7 +761,6 @@ def _apply_rope_config_normalization(
                 cfg,
                 model_cfg=model_cfg,
                 max_position_embeddings=max_position_embeddings,
-                include_arch_from_model_cfg=True,
                 adjust_swiglu_intermediate=should_adjust_swiglu,
             )
     else:
@@ -815,11 +807,11 @@ def build_backbone_configs(
         if resolved.discriminator.config_source is None:
             disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
         else:
-            disc_cfg = _load_pretrained_config_or_raise(
+            disc_cfg = _load_pretrained_or_raise(
                 DebertaV2Config,
                 resolved.discriminator.config_source,
                 component="discriminator",
-                kind="HF",
+                artifact="HF config",
                 origin=resolved.discriminator.config_origin,
             )
 
@@ -827,11 +819,11 @@ def build_backbone_configs(
         if not generator_from_explicit_source:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
         else:
-            gen_cfg = _load_pretrained_config_or_raise(
+            gen_cfg = _load_pretrained_or_raise(
                 DebertaV2Config,
                 resolved.generator.config_source,
                 component="generator",
-                kind="HF",
+                artifact="HF config",
                 origin=resolved.generator.config_origin,
             )
 
@@ -885,11 +877,11 @@ def build_backbone_configs(
             hidden_act=model_cfg.rope.hidden_act,
         )
     else:
-        disc_cfg = _load_pretrained_config_or_raise(
+        disc_cfg = _load_pretrained_or_raise(
             DebertaRoPEConfig,
             resolved.discriminator.config_source,
             component="discriminator",
-            kind="RoPE",
+            artifact="RoPE config",
             origin=resolved.discriminator.config_origin,
         )
 
@@ -906,11 +898,11 @@ def build_backbone_configs(
     if resolved.generator.config_source is None:
         gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
     else:
-        gen_cfg = _load_pretrained_config_or_raise(
+        gen_cfg = _load_pretrained_or_raise(
             DebertaRoPEConfig,
             resolved.generator.config_source,
             component="generator",
-            kind="RoPE",
+            artifact="RoPE config",
             origin=resolved.generator.config_origin,
         )
 
@@ -925,35 +917,6 @@ def build_backbone_configs(
     )
 
     return disc_cfg, gen_cfg
-
-
-def _load_pretrained_backbone_or_raise(
-    model_cls: type,
-    source: str,
-    *,
-    config: Any,
-    component: str,
-    kind: str,
-    origin: str,
-) -> Any:
-    """Load one pretrained backbone, raising a descriptive error on failure.
-
-    :param type model_cls: Backbone model class exposing ``from_pretrained``.
-    :param str source: Resolved weight source (local path or model id).
-    :param Any config: Backbone config instance.
-    :param str component: Component name for error text (discriminator/generator).
-    :param str kind: Backbone kind for error text (HF backbone/RoPE checkpoint).
-    :param str origin: Human-readable weight-origin description.
-    :raises RuntimeError: If loading fails.
-    :return Any: Loaded backbone model.
-    """
-
-    try:
-        return model_cls.from_pretrained(source, config=config)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load {component} {kind} from source '{source}' (resolved from {origin})."
-        ) from e
 
 
 def build_backbones(
@@ -987,20 +950,20 @@ def build_backbones(
     if disc_src is None or gen_src is None:
         raise RuntimeError(f"Resolved pretrained {kind} weight source is missing.")
 
-    disc = _load_pretrained_backbone_or_raise(
+    disc = _load_pretrained_or_raise(
         model_cls,
         disc_src,
-        config=disc_config,
         component="discriminator",
-        kind=kind,
+        artifact=kind,
         origin=resolved.discriminator.weight_origin,
+        loader_kwargs={"config": disc_config},
     )
-    gen = _load_pretrained_backbone_or_raise(
+    gen = _load_pretrained_or_raise(
         model_cls,
         gen_src,
-        config=gen_config,
         component="generator",
-        kind=kind,
+        artifact=kind,
         origin=resolved.generator.weight_origin,
+        loader_kwargs={"config": gen_config},
     )
     return disc, gen
