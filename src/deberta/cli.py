@@ -43,7 +43,6 @@ from deberta.export_cli import (
     run_export,
 )
 from deberta.training import run_pretraining, run_pretraining_dry_run
-from deberta.training.runtime import _validate_training_configs
 from deberta.utils.mapping import flatten_mapping
 from deberta.utils.types import coerce_scalar, parse_bool, unwrap_optional_type
 
@@ -348,16 +347,6 @@ def _run_train(ns: argparse.Namespace) -> None:
 
     cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns)
     reason_overrides.update(cli_reasons)
-
-    # Fail fast at the CLI boundary with the same defaulting/alias/validator
-    # sequence the training entrypoint applies, so the two can never drift.
-    _validate_training_configs(
-        model_cfg=cfg.model,
-        data_cfg=cfg.data,
-        train_cfg=cfg.train,
-        optim_cfg=cfg.optim,
-        logging_cfg=cfg.logging,
-    )
 
     _emit_config_mutation_warnings(
         cfg_path=cfg_path,
