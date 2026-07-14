@@ -119,4 +119,3 @@ def call_with_dataset_retry(
                 backoff_seconds=backoff_seconds,
                 on_retry=on_retry,
             )
-    raise RuntimeError("unreachable retry state")

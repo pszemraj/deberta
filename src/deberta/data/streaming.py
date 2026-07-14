@@ -201,6 +201,16 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         ids = tokenized.get("input_ids", [])
         return [int(x) for x in ids]
 
+    def _iter_tokenized_documents(self) -> Iterator[list[int]]:
+        """Yield nonempty tokenized documents from the source stream.
+
+        :return Iterator[list[int]]: Token IDs for each nonempty document.
+        """
+        for example in self._iter_examples():
+            token_ids = self._tokenize_text(self._normalize_raw_text(example))
+            if token_ids:
+                yield token_ids
+
     def _build_example_from_chunk(self, *, chunk: list[int], max_seq: int) -> dict[str, Any]:
         """Build one fixed-length packed example from a token chunk.
 
@@ -288,8 +298,7 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         row_segments: list[list[int]] = []
         row_length = 0
 
-        for example in self._iter_examples():
-            token_ids = self._tokenize_text(self._normalize_raw_text(example))
+        for token_ids in self._iter_tokenized_documents():
             for start in range(0, len(token_ids), max_content):
                 segment = token_ids[start : start + max_content]
                 if not segment:
@@ -336,12 +345,7 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 buffer = buffer[buffer_start:]
                 buffer_start = 0
 
-        for ex in self._iter_examples():
-            raw = self._normalize_raw_text(ex)
-            ids = self._tokenize_text(raw)
-            if not ids:
-                continue
-
+        for ids in self._iter_tokenized_documents():
             buffer.extend(ids)
             # Explicit doc separator to reduce cross-doc leakage.
             buffer.append(sep_id)
@@ -393,12 +397,7 @@ class SequentialStreamingDataset(PackedStreamingDataset):
             raise ValueError("max_seq_length is too small for pretraining.")
         block_len = max_seq - 2
 
-        for ex in self._iter_examples():
-            raw = self._normalize_raw_text(ex)
-            ids = self._tokenize_text(raw)
-            if not ids:
-                continue
-
+        for ids in self._iter_tokenized_documents():
             # Split long documents into consecutive one-document chunks.
             for i in range(0, len(ids), block_len):
                 chunk = ids[i : i + block_len]
