@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -20,6 +21,18 @@ _TRANSIENT_ERROR_NAMES = {
     "Timeout",
     "TimeoutError",
 }
+_TRANSIENT_OS_ERRNOS = {
+    errno.EAGAIN,
+    errno.ECONNABORTED,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+    errno.EHOSTUNREACH,
+    errno.EINTR,
+    errno.ENETDOWN,
+    errno.ENETRESET,
+    errno.ENETUNREACH,
+    errno.ETIMEDOUT,
+}
 
 
 def is_transient_dataset_error(exc: BaseException) -> bool:
@@ -32,7 +45,9 @@ def is_transient_dataset_error(exc: BaseException) -> bool:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, (ConnectionError, OSError, TimeoutError)):
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+        if isinstance(current, OSError) and current.errno in _TRANSIENT_OS_ERRNOS:
             return True
         if type(current).__name__ in _TRANSIENT_ERROR_NAMES:
             return True

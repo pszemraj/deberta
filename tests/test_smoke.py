@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import logging
 import math
+import re
 
 import pytest
 import torch
@@ -338,7 +340,7 @@ def test_streaming_retries_without_duplicating_examples() -> None:
             self.iterations += 1
             yield {"text": "a"}
             if self.iterations == 1:
-                raise OSError("temporary shard read failure")
+                raise OSError(errno.ECONNRESET, "temporary shard read failure")
             yield {"text": "b"}
             yield {"text": "c"}
 
@@ -362,8 +364,12 @@ def test_streaming_retries_without_duplicating_examples() -> None:
 
 @pytest.mark.parametrize(
     ("error", "expected_iterations"),
-    [(ValueError("invalid dataset schema"), 1), (OSError("shard unavailable"), 3)],
-    ids=["non_transient", "transient_exhausted"],
+    [
+        (ValueError("invalid dataset schema"), 1),
+        (OSError(errno.ETIMEDOUT, "shard unavailable"), 3),
+        (FileNotFoundError(errno.ENOENT, "missing shard path"), 1),
+    ],
+    ids=["non_transient", "transient_exhausted", "permanent_os_error"],
 )
 def test_streaming_retry_failure_policy(error: Exception, expected_iterations: int) -> None:
     class _FailingDataset:
@@ -389,7 +395,7 @@ def test_streaming_retry_failure_policy(error: Exception, expected_iterations: i
         ),
     )
 
-    with pytest.raises(type(error), match=str(error)):
+    with pytest.raises(type(error), match=re.escape(str(error))):
         list(dataset._iter_examples())
     assert source.iterations == expected_iterations
 

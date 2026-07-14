@@ -138,6 +138,10 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         for attempt in range(1, attempts + 1):
             try:
                 iterator = self._new_example_iterator()
+                # Arbitrary shuffled iterables expose no exact seek contract.
+                # Replaying the consumed prefix is therefore the only generic
+                # way to resume without duplicates; the retry-attempt budget
+                # bounds how many full-prefix replays one failure can trigger.
                 for _ in range(yielded):
                     next(iterator)
                 for example in iterator:
