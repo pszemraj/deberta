@@ -1117,6 +1117,57 @@ def test_compile_backbones_for_scope_compiles_generic_backbone_forwards(
     assert wrapper.generator() == ("generator",)
 
 
+def test_stable_backbone_compile_dispatch_preserves_flash_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deberta.modeling.mask_utils import FlashBatchMeta
+    from deberta.training.compile import _install_stable_backbone_compile_dispatch
+
+    _fake_compile, compile_calls = fake_torch_compile()
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    class _StableBackbone(torch.nn.Module):
+        def _resolve_forward_options(self, **kwargs):
+            return False, bool(kwargs["output_hidden_states"]), True
+
+        def _forward_dense_hs0(self, **_kwargs):
+            return "dense_hs0"
+
+        def _forward_dense_hs1(self, **_kwargs):
+            return "dense_hs1"
+
+        def _forward_masked_hs0(self, **kwargs):
+            return "masked_hs0", kwargs["flash_meta"].normalized_route_hint()
+
+        def _forward_masked_hs1(self, **kwargs):
+            return "masked_hs1", kwargs["flash_meta"].normalized_route_hint()
+
+        def _forward_resolved(self, **_kwargs):
+            raise AssertionError("standard training options must use a compiled entrypoint")
+
+    backbone = _StableBackbone()
+    targets: list[str] = []
+    assert _install_stable_backbone_compile_dispatch(
+        module=backbone,
+        compile_kwargs={"mode": "default", "backend": "inductor", "dynamic": False},
+        target="backbone",
+        compiled_targets=targets,
+    )
+
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    for route in ("fixed", "varlen", "docblock", "docblock_bias"):
+        for hidden_states in (False, True):
+            result = backbone(
+                attention_mask=mask,
+                output_hidden_states=hidden_states,
+                flash_meta=FlashBatchMeta(route_hint=route),
+            )
+            assert result == (f"masked_hs{int(hidden_states)}", route)
+
+    assert len(compile_calls) == 12
+    assert len(targets) == 12
+
+
 def test_stabilize_compile_attention_mask_rope_doc_blocking():
     # Stabilizer is now a no-op for RoPE — mask shape churn is handled by
     # _resolve_compile_scope auto-downgrading to FFN instead.
