@@ -368,7 +368,7 @@ def _persist_or_validate_run_configs(
         )
     if resume_checkpoint is not None and has_saved_required:
         if run_meta_path.exists():
-            validate_run_metadata_file(snapshot_dir, required=False)
+            validate_run_metadata_file(snapshot_dir)
             if is_main_process and effective_compile_scope is not None:
                 saved_meta = load_json_mapping(run_meta_path)
                 saved_scope = saved_meta.get("effective_compile_scope")

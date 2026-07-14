@@ -34,17 +34,14 @@ def infer_run_dir_from_checkpoint(checkpoint_dir: str | Path) -> Path:
     return checkpoint_path.parent
 
 
-def validate_run_metadata_file(run_dir: Path, *, required: bool) -> None:
+def validate_run_metadata_file(run_dir: Path) -> None:
     """Validate run metadata schema when present.
 
     :param Path run_dir: Run directory path.
-    :param bool required: Whether a missing metadata file is an error.
-    :raises ValueError: If metadata is missing when required, or schema-invalid.
+    :raises ValueError: If present metadata is schema-invalid.
     """
     meta_path = Path(run_dir) / RUN_METADATA_FILENAME
     if not meta_path.exists():
-        if required:
-            raise ValueError(f"Missing required run metadata file: {meta_path}")
         return
 
     raw = load_json_mapping(meta_path)

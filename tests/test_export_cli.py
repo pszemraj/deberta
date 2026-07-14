@@ -682,12 +682,6 @@ def test_run_export_both_targets_save_into_component_subdirectories(
     assert (out_dir / "generator" / "README.md").exists()
 
 
-def test_validate_run_metadata_file_accepts_missing_metadata(tmp_path: Path):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    validate_run_metadata_file(run_dir, required=False)
-
-
 def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -696,7 +690,7 @@ def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unsupported run metadata schema"):
-        validate_run_metadata_file(run_dir, required=False)
+        validate_run_metadata_file(run_dir)
 
 
 def test_namespace_to_export_config_maps_allow_partial_export() -> None:

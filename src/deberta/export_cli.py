@@ -481,7 +481,7 @@ def run_export(cfg: ExportConfig) -> None:
         raise FileNotFoundError(f"Expected {model_cfg_path} (produced during training)")
     if not data_cfg_path.exists():
         raise FileNotFoundError(f"Expected {data_cfg_path} (produced during training)")
-    validate_run_metadata_file(run_dir, required=False)
+    validate_run_metadata_file(run_dir)
     train_cfg = _load_optional_train_config(run_dir)
 
     # Pre-stable policy: export does not coerce legacy snapshot keys.
