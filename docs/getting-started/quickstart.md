@@ -47,4 +47,4 @@ The supplied config enables `train.checkpoint.export_hf_final`. The first comman
 attempts to write the discriminator to `runs/quickstart_hfv2_small/final_hf`; the distributed
 examples use the config's `runs/hf_deberta_v2_parity_small/final_hf` unless given the same output
 override. For manual exports, other checkpoints, or both RTD components, see
-[Exporting models](../guides/exporting-models.md).
+[Exporting models](../guides/exporting-models.md), including the distinction between automatic partial export and strict manual export.

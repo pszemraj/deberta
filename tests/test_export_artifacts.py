@@ -44,6 +44,9 @@ def test_write_export_readme_uses_backbone_specific_loading_snippet(
     text = (out_dir / "README.md").read_text(encoding="utf-8")
     assert required in text
     assert forbidden not in text
+    assert 'from_pretrained("path/to/model/dir")' in text
+    assert 'AutoTokenizer.from_pretrained("path/to/export/root")' in text
+    assert "With `--what both`" in text
     if extra_required is not None:
         assert extra_required in text
     assert f"| Max sequence length | {max_seq_length} |" in text

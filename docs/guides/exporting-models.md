@@ -33,11 +33,13 @@ Default output path is `<run_dir>/exported_hf` and must be empty if it already e
 
 ## Output layout
 
-- `--what discriminator` or `--what generator`: writes a single HF model in a flat directory at `--output-dir`.
-- `--what both`: writes `--output-dir/discriminator/` and `--output-dir/generator/` (each a standalone HF model dir).
+- `--what discriminator` or `--what generator`: writes the model, tokenizer, `export_meta.json`, and supporting files in a flat directory at `--output-dir`.
+- `--what both`: writes model weights, config, README, and license under `--output-dir/discriminator/` and `--output-dir/generator/`; tokenizer files and `export_meta.json` remain at the shared `--output-dir` root. Load the selected model from its component directory and the tokenizer from the root.
 
 Native `hf_deberta_v2` exports load through stock Hugging Face `AutoModel` APIs. RoPE exports are
 standalone artifacts but require this package's `DebertaRoPEModel` implementation.
+
+Training-only keys are removed from exported model configs, and export metadata uses run/checkpoint directory names rather than machine-local absolute paths. Safetensors output is enabled by default; use `--no-safe-serialization` only when a consumer requires PyTorch serialization.
 
 ## Shared embedding export
 
@@ -50,13 +52,4 @@ token-type embeddings:
 
 ## Partial export mode
 
-By default export is strict on state-dict compatibility. Use `--allow-partial-export` only for recovery/debug cases.
-
-## Config/tokenizer artifacts
-
-Export writes tokenizer files, cleaned `config.json`, `README.md`, `LICENSE`, and
-`export_meta.json`. Training-internal keys are removed from model configs, and export metadata uses
-run/checkpoint directory names rather than machine-local absolute paths.
-
-Safetensors output is enabled by default. Use `--no-safe-serialization` only when a consumer
-requires PyTorch serialization.
+Manual `deberta export` is strict on state-dict compatibility by default. Use `--allow-partial-export` only for recovery or debugging. The automatic `train.checkpoint.export_hf_final` subprocess deliberately allows partial loading so a completed training run is not failed by an export-only mismatch; run the manual command afterward when strict verification is required.

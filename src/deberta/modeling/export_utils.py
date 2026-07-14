@@ -97,8 +97,8 @@ def write_export_readme_and_license(
         usage_snippet = """from transformers import AutoTokenizer
 from deberta.modeling.rope_encoder import DebertaRoPEModel
 
-model = DebertaRoPEModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+model = DebertaRoPEModel.from_pretrained("path/to/model/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/export/root")
 """
         compatibility_note = (
             "Note: RoPE exports use a custom `model_type` (`deberta-rope`) and are not currently "
@@ -108,8 +108,8 @@ tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
         arch_desc = "DeBERTa-v2 (disentangled attention, LayerNorm)"
         usage_snippet = """from transformers import AutoModel, AutoTokenizer
 
-model = AutoModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+model = AutoModel.from_pretrained("path/to/model/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/export/root")
 """
         compatibility_note = ""
 
@@ -147,6 +147,8 @@ Pretrained with replaced-token detection (RTD / ELECTRA-style) using
 ```python
 {usage_snippet}
 ```
+
+Single-component exports use the same directory for both paths. With `--what both`, use the selected component subdirectory for the model and its parent export directory for the tokenizer.
 {compatibility_note}
 """
     (output_dir / "README.md").write_text(readme, encoding="utf-8")
