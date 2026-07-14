@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Iterator
 from contextlib import suppress
 from typing import Any
@@ -47,17 +46,6 @@ def _global_grad_l2_norm(model: torch.nn.Module) -> float:
         return 0.0
     total = torch.stack(sq_norms).sum()
     return float(total.sqrt().item())
-
-
-def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> bool:
-    """Return whether any rank observed a non-finite gradient norm.
-
-    :param Any accelerator: Accelerator-like runtime object.
-    :param float grad_norm: Local gradient L2 norm.
-    :return bool: True when at least one rank reports non-finite norm.
-    """
-    local_flag = not math.isfinite(float(grad_norm))
-    return _any_rank_flag_true(accelerator=accelerator, flag=local_flag)
 
 
 def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:

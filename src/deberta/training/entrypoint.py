@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import random
 import time
 from contextlib import nullcontext, suppress
@@ -83,7 +84,6 @@ from deberta.training.steps import (
     _apply_nonfinite_recovery,
     _collect_ga_window,
     _global_grad_l2_norm,
-    _has_nonfinite_grad_norm_any_rank,
     _move_batch_to_device,
     _optimizer_has_stepped,
     _record_unscaled_lrs,
@@ -184,15 +184,15 @@ def _clip_gradients_and_find_nonfinite(
     """
 
     grad_norm = _global_grad_l2_norm(model)
-    if _has_nonfinite_grad_norm_any_rank(accelerator=accelerator, grad_norm=float(grad_norm)):
+    if _any_rank_flag_true(accelerator=accelerator, flag=not math.isfinite(float(grad_norm))):
         return "grad_norm", float(grad_norm)
     if not _should_clip_gradients(max_grad_norm):
         return None, float(grad_norm)
     accelerator.clip_grad_norm_(model.parameters(), float(max_grad_norm))
     post_clip_grad_norm = _global_grad_l2_norm(model)
-    if _has_nonfinite_grad_norm_any_rank(
+    if _any_rank_flag_true(
         accelerator=accelerator,
-        grad_norm=float(post_clip_grad_norm),
+        flag=not math.isfinite(float(post_clip_grad_norm)),
     ):
         return "grad_norm_post_clip", float(post_clip_grad_norm)
     return None, float(post_clip_grad_norm)
@@ -685,7 +685,10 @@ def run_pretraining(
             resolved_optim_cfg,
             mixed_precision=mixed_precision,
         )
-        param_digest = str(getattr(optimizer, "_param_order_digest", _optimizer_param_order_digest(model)))
+        param_digest = getattr(optimizer, "_param_order_digest", None)
+        if param_digest is None:
+            param_digest = _optimizer_param_order_digest(model)
+        param_digest = str(param_digest)
         lr_scheduler = _build_scheduler(optimizer, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
         model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
         _record_unscaled_lrs(optimizer, lr_scheduler)
