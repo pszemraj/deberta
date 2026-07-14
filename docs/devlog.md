@@ -1020,4 +1020,18 @@ The July 8 parity evidence remains a result for its recorded HEAD `610148e`, but
 - `6210134` added the authoritative pre-merge gate and passed it cleanly: lint and docstrings passed, pytest reported `636 passed / 4 skipped`, and all 13 CUDA parity cases passed.
 - The complete log is `local-scratch/premerge/premerge_20260714_021913_6210134.log`. Future parity claims can be reproduced through the same one-command gate and tied to its recorded commit and dirty-tree state.
 
-Historical entries above that mention `tools/audit_contracts.py`, `tools/generate_config_reference.py`, or `docs/guides/config-reference.md` describe artifacts that existed during those dated campaigns. Those files were intentionally removed later and are not current commands or documentation; the maintained configuration reference is `configs/config_reference.yaml`.
+Historical entries above that mention `tools/audit_contracts.py`, `tools/generate_api_docs.py`, `tools/generate_config_reference.py`, or `docs/guides/config-reference.md` describe artifacts that existed during those dated campaigns. Those files were intentionally removed later and are not current commands or documentation; the API pages and `configs/config_reference.yaml` are maintained manually.
+
+## 2026-07-14 - Review Remediation and Cross-Codebase Consolidation
+
+The post-gate review items were resolved before consolidation:
+
+- `5581778` preflights the selected varlen route, including compiled availability, before dispatch.
+- `19c1332` reconstructs export backbones with eager attention so Flash-trained checkpoints export without the optional Flash package.
+- `19f30ef` labels persisted Flash settings as requested configuration rather than resolved runtime behavior.
+- `3cf2d57` synchronizes CUDA phase timers, and `2c7fa74` adds compiled route-dispatch coverage.
+- `d184166` adds the mid-tile document-boundary gradient-isolation case and hardens override validation, kernel guards, and runtime policy.
+
+A subsequent 20-commit consolidation removed obsolete adapters, merged repeated validation and streaming paths, shared Flash packing and tuning helpers, reduced test shadow infrastructure, and changed the RTD compare tool to observe the production generator/discriminator phase methods. Across 40 files, it removed 2,451 lines and added 1,374, for a net reduction of 1,077 tracked Python and shell lines. An attempted runtime-preparation abstraction was reverted because it added 59 lines while hiding intentionally different train, dry-run, and tool policies.
+
+The full pre-merge gate passed at `00a73ac`: lint and docstrings passed, pytest reported `647 passed / 4 warnings`, and all CUDA parity cases remained within limits. The log is `local-scratch/premerge/premerge_20260714_035751_00a73ac.log`.
