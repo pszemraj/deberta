@@ -502,12 +502,9 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     same_doc = ids[:, :, None].eq(ids[:, None, :])
     keep = same_doc & active[:, :, None] & active[:, None, :]
 
-    batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
-    del batch_size
+    seq_len = int(ids.shape[1])
     cache_key = (seq_len, str(ids.device.type), ids.device.index)
-    eye, cls_key = _doc_block_static_masks(*cache_key)
-
-    keep = (keep & ~eye[None, :, :]) | (eye[None, :, :] & active[:, :, None])
+    _, cls_key = _doc_block_static_masks(*cache_key)
 
     keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
 

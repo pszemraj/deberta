@@ -347,7 +347,10 @@ def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
     if flash_cfg is None:
         return
     value = flash_cfg_get(flash_cfg, "kernel_overrides_path", None)
-    configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
+    configure_flashdeberta_kernel_overrides(
+        str(value).strip() if value is not None else None,
+        reload_if_changed=False,
+    )
 
 
 def _flash_active_tokens_host(value: Any) -> int | None:
@@ -829,6 +832,9 @@ def prepare_flash_attention_batch_metadata(
         batch, seq_lengths
     )
     route_active_tokens = int(active_tokens) if active_tokens is not None else int(seq_len) * batch_size
+    # Per-rank padding density may select different kernels, but every route
+    # stays inside the same attention module and preserves parameter traversal
+    # and distributed collective order.
     route_hint = _flash_route_hint_for_padding_batch(
         seq_len=seq_len,
         active_tokens=route_active_tokens,

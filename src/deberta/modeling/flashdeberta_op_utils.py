@@ -137,6 +137,17 @@ def is_flash_attention_impl(value: object) -> bool:
     return str(value).strip().lower() == "flash"
 
 
+def disentangled_attention_span(position_buckets: int, max_relative_distance: int) -> int:
+    """Return the relative-position span used by disentangled-attention kernels.
+
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :return int: Effective relative-position span.
+    """
+
+    return int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
+
+
 def optional_triton_jit(fn: object) -> object:
     """Apply ``triton.jit`` only when Triton imported successfully.
 

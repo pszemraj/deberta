@@ -170,11 +170,11 @@ def candidate_kernel_overrides(
     :return Iterator[None]: Context that restores prior values on exit.
     """
 
-    configure_flashdeberta_kernel_overrides(path)
+    configure_flashdeberta_kernel_overrides(path, reload_if_changed=True)
     try:
         yield
     finally:
-        configure_flashdeberta_kernel_overrides(restore_path)
+        configure_flashdeberta_kernel_overrides(restore_path, reload_if_changed=True)
 
 
 def load_tool_config_and_loader(

@@ -43,6 +43,7 @@ Documentation = "https://github.com/pszemraj/deberta/tree/main/docs"
 [project.optional-dependencies]
 # Logging
 wandb = ["wandb>=0.17.0"]
+# Triton follows the exact compatibility pin selected by the installed Torch wheel; duplicating that pin here would conflict with future supported Torch releases.
 flash = ["flashdeberta==0.0.7", "triton"]
 
 # Dev quality-of-life

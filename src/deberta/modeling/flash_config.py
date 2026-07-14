@@ -23,18 +23,19 @@ def flash_cfg_get(flash_cfg: Any | None, name: str, default: Any) -> Any:
     return getattr(flash_cfg, name, default)
 
 
-def flash_cfg_bool(flash_cfg: Any | None, *, name: str, default: str) -> bool:
+def flash_cfg_bool(flash_cfg: Any | None, *, name: str, default: bool | str) -> bool:
     """Resolve one boolean flash option from config or a declared default.
 
     :param Any | None flash_cfg: Optional config source.
     :param str name: Config field name.
-    :param str default: Default text when config is absent.
+    :param bool | str default: Default value when the field is absent.
     :return bool: Resolved boolean value.
     """
 
-    if flash_cfg is None:
-        return str(default).strip().lower() in _TRUTHY
-    return bool(flash_cfg_get(flash_cfg, name, False))
+    value = flash_cfg_get(flash_cfg, name, default)
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY
+    return bool(value)
 
 
 def flash_cfg_optional_int(

@@ -8,6 +8,10 @@ into a ragged batch of per-document segments.
 This module provides small row-major Triton copy kernels, plus eager fallbacks,
 for packing contiguous token ranges out of padded ``(B, S, ...)`` tensors and for
 scattering packed outputs/gradients back to the original padded layout.
+
+The public one/two/three-tensor wrappers remain explicit so their return types
+and compile-visible arity stay stable. Their CUDA copy implementation is shared
+through ``launch_triton_row_copy`` rather than duplicated per wrapper.
 """
 
 from __future__ import annotations
@@ -611,7 +615,17 @@ def segment_pack_grad_and_delta_from_padded(
         return grad_unpad, _segment_delta_fallback(out_unpad=out_unpad, grad_unpad=grad_unpad)
 
     head_dim = int(grad_output.shape[-1])
-    block_dmodel = min(256, max(16, triton.next_power_of_2(head_dim)))
+    if head_dim > 256:
+        grad_unpad = segment_pack_padded_rows(
+            grad_output,
+            segment_offsets=segment_offsets,
+            segment_lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            total_tokens=total,
+            max_segment_length=max_segment_length,
+        )
+        return grad_unpad, _segment_delta_fallback(out_unpad=out_unpad, grad_unpad=grad_unpad)
+    block_dmodel = max(16, triton.next_power_of_2(head_dim))
     delta = torch.empty((total, int(grad_output.shape[2])), device=grad_output.device, dtype=torch.float32)
     max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
     grid = (

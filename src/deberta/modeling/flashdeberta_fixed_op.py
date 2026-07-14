@@ -23,6 +23,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
+    disentangled_attention_span,
     lookup_existing_op_pair,
     strides_or_zeros,
 )
@@ -99,17 +100,6 @@ def _cdiv(a: int, b: int) -> int:
     """
 
     return (int(a) + int(b) - 1) // int(b)
-
-
-def _fixed_attention_span(position_buckets: int, max_relative_distance: int) -> int:
-    """Return the relative-position span used by the fixed kernels.
-
-    :param int position_buckets: Relative-position bucket count.
-    :param int max_relative_distance: Maximum relative distance.
-    :return int: Effective relative-position span.
-    """
-
-    return int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
 
 
 def _fixed_repo_tuned_config(
@@ -220,7 +210,7 @@ def _fixed_forward_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     tuned = _fixed_repo_tuned_config(
         kind="fwd",
         query_len=query_len,
@@ -263,7 +253,7 @@ def _fixed_backward_config(
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     tuned = _fixed_repo_tuned_config(
         kind="bwd",
         query_len=query_len,
@@ -322,7 +312,7 @@ def _fixed_eager_forward_impl(
     batch_size, num_heads, query_len, head_dim = query_layer.shape
     key_len = int(key_layer.shape[-2])
     if _flash_attn_v2_fwd_dise_lowlevel is not None:
-        att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+        att_span = disentangled_attention_span(position_buckets, max_relative_distance)
         block_m, block_n, num_stages, num_warps = _fixed_forward_config(
             query_len=query_len,
             key_len=key_len,
@@ -408,7 +398,7 @@ def _fixed_triton_forward_impl(
     query_len = int(q.shape[2])
     key_len = int(k.shape[2])
     head_dim = int(q.shape[3])
-    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     block_m, block_n, num_stages, num_warps = _fixed_forward_config(
         query_len=query_len,
         key_len=key_len,
@@ -538,7 +528,7 @@ def _fixed_triton_backward_impl(
     query_len = int(q.shape[2])
     key_len = int(k.shape[2])
     head_dim = int(q.shape[3])
-    att_span = _fixed_attention_span(position_buckets, max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     block_m, block_n, num_stages, num_warps = _fixed_backward_config(
         query_len=query_len,
         key_len=key_len,

@@ -38,6 +38,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import (
     BoundedLRUCache,
     device_compute_capability,
+    disentangled_attention_span,
     lookup_existing_op_pair,
     strides_or_zeros,
 )
@@ -766,7 +767,22 @@ def _pack_grad_and_delta_from_padded(
         return out_unpad, grad_unpad, delta
 
     head_dim = int(grad_output.shape[-1])
-    block_dmodel = min(256, max(16, triton.next_power_of_2(head_dim)))
+    if head_dim > 256:
+        grad_unpad = prefix_pack_padded_rows(
+            grad_output,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+        delta = _packed_delta_fallback(
+            out_unpad=out_unpad,
+            grad_unpad=grad_unpad,
+            total_tokens=total_tokens,
+            cu_seqlens=cu_seqlens,
+        )
+        return out_unpad, grad_unpad, delta
+    block_dmodel = max(16, triton.next_power_of_2(head_dim))
     grad_unpad = torch.empty(
         (total_tokens, int(grad_output.shape[2]), head_dim),
         device=grad_output.device,
@@ -857,7 +873,7 @@ def _varlen_backward_raw_impl(
         Packed gradients for q/k/v and optional positional tensors.
     """
 
-    att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_varlen_bwd_kernel_config(
         route=route,
         kind="kv",
@@ -1137,7 +1153,7 @@ def _varlen_eager_forward_impl(
 
     batch_size = int(query_layer.shape[0])
     seq_len = int(query_layer.shape[1])
-    att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
 
     metadata = _get_unpad_metadata_entry(attention_mask_2d)
     seqlens = metadata.seqlens
@@ -1827,7 +1843,7 @@ def _varlen_triton_forward_impl(
     num_heads = int(q.shape[2])
     head_dim = int(q.shape[3])
     capacity_tokens = int(batch_size * seq_len)
-    att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
 
     seqlens = mask.sum(dim=-1, dtype=torch.int32)
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))

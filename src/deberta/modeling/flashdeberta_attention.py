@@ -8,7 +8,7 @@ What changed versus the earlier adapter
    a Python ``Counter`` inside the attention forward path, which is exactly the
    kind of Python/global state that TorchDynamo may guard on and recompile.
 2. Runtime policy is read from the resolved DeBERTa config at construction time;
-   environment variables are limited to debug instrumentation.
+   FlashDeBERTa environment-variable controls are not used.
 3. Dense-vs-varlen routing no longer inspects attention-mask contents inside the
    compiled forward path. In this repository's training loop, dense batches already
    arrive as ``attention_mask=None`` because the collator drops all-ones masks.
@@ -409,6 +409,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 "FlashDeBERTa attention does not support pos_att_type='p2p'; using eager attention.",
             )
         if self.training and dropout_p > 0.0:
+            # Validated repo configs reject positive dropout with flash. Keep
+            # this fallback for direct/custom module construction.
             return (
                 "attention_dropout",
                 "FlashDeBERTa attention requires attention_probs_dropout_prob=0.0 during training; using eager attention.",

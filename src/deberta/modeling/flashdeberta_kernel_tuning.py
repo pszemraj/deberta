@@ -60,29 +60,57 @@ def _overrides_file_signature(path: str) -> tuple[int, int] | None:
     return (stat.st_mtime_ns, stat.st_size)
 
 
-def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
+def configure_flashdeberta_kernel_overrides(
+    path: str | None,
+    *,
+    reload_if_changed: bool = True,
+) -> None:
     """Set the process-local FlashDeBERTa kernel override table.
 
-    Reapplying the already-active path is a no-op only while the file content
-    is unchanged (checked via mtime/size), so hot-path callers such as
-    per-step batch preparation keep the cached tuning table, while tuning
-    tools that rewrite one path between candidates get fresh routing.
+    Runtime hot-path callers should pass ``reload_if_changed=False`` so reapplying the
+    configured path is a string comparison rather than a filesystem operation.
+    Tuning tools that intentionally rewrite one path can request an mtime/size
+    check explicitly.
 
     :param str | None path: JSON table path, or None to use only the package default.
+    :param bool reload_if_changed: Whether to stat and reload an already-active
+        path when its content signature changed, defaults to True.
     """
 
     global _ACTIVE_OVERRIDES_PATH, _ACTIVE_OVERRIDES_SIGNATURE
     normalized = str(path).strip() if path is not None else ""
     resolved = normalized or None
-    signature = _overrides_file_signature(resolved) if resolved is not None else None
-    if resolved == _ACTIVE_OVERRIDES_PATH and signature == _ACTIVE_OVERRIDES_SIGNATURE:
-        return
+    if resolved == _ACTIVE_OVERRIDES_PATH:
+        if not reload_if_changed:
+            return
+        signature = _overrides_file_signature(resolved) if resolved is not None else None
+        if signature == _ACTIVE_OVERRIDES_SIGNATURE:
+            return
+    else:
+        signature = (
+            _overrides_file_signature(resolved) if resolved is not None and reload_if_changed else None
+        )
+
+    previous_path = _ACTIVE_OVERRIDES_PATH
+    previous_signature = _ACTIVE_OVERRIDES_SIGNATURE
     _ACTIVE_OVERRIDES_PATH = resolved
     _ACTIVE_OVERRIDES_SIGNATURE = signature
     _load_tuning_payload.cache_clear()
     flash_seq_bucket.cache_clear()
     flash_route_policy.cache_clear()
     resolve_flash_kernel_config.cache_clear()
+    try:
+        # Load eagerly so malformed override tables fail at configuration time
+        # with their filename and row path, not later inside route selection.
+        _load_tuning_payload()
+    except Exception:
+        _ACTIVE_OVERRIDES_PATH = previous_path
+        _ACTIVE_OVERRIDES_SIGNATURE = previous_signature
+        _load_tuning_payload.cache_clear()
+        flash_seq_bucket.cache_clear()
+        flash_route_policy.cache_clear()
+        resolve_flash_kernel_config.cache_clear()
+        raise
 
 
 def compute_capability_key(capability: tuple[int, int]) -> str:
@@ -104,10 +132,220 @@ def _read_json(path: Path) -> dict[str, Any]:
     :return dict[str, Any]: Parsed mapping.
     """
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid FlashDeBERTa tuning JSON {path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
     if not isinstance(payload, dict):
         raise ValueError(f"FlashDeBERTa tuning table must be a JSON object: {path}")
     return payload
+
+
+def _override_error(path: Path, location: str, message: str) -> ValueError:
+    """Build a contextual override-table validation error.
+
+    :param Path path: Override table path.
+    :param str location: JSON-style section or row path.
+    :param str message: Validation failure detail.
+    :return ValueError: Contextual validation exception.
+    """
+
+    return ValueError(f"Invalid FlashDeBERTa tuning override {path} at {location}: {message}")
+
+
+def _validate_override_row_mapping(*, path: Path, location: str, row: Any) -> dict[str, Any]:
+    """Return one override row after requiring a JSON object.
+
+    :param Path path: Override table path.
+    :param str location: JSON-style row path.
+    :param Any row: Candidate row.
+    :raises ValueError: If the row is not a mapping.
+    :return dict[str, Any]: Validated row mapping.
+    """
+
+    if not isinstance(row, dict):
+        raise _override_error(path, location, "expected a JSON object")
+    return row
+
+
+def _validate_override_text(
+    row: dict[str, Any],
+    *,
+    key: str,
+    path: Path,
+    location: str,
+) -> str:
+    """Return one required non-empty string override field.
+
+    :param dict[str, Any] row: Override row.
+    :param str key: Required field name.
+    :param Path path: Override table path.
+    :param str location: JSON-style row path.
+    :raises ValueError: If the field is absent or empty.
+    :return str: Validated text.
+    """
+
+    value = row.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise _override_error(path, f"{location}.{key}", "expected a non-empty string")
+    return value.strip()
+
+
+def _validate_override_int_fields(
+    row: dict[str, Any],
+    *,
+    keys: tuple[str, ...],
+    path: Path,
+    location: str,
+    minimum: int = 0,
+) -> None:
+    """Validate present integer fields in one override row.
+
+    :param dict[str, Any] row: Override row.
+    :param tuple[str, ...] keys: Integer field names.
+    :param Path path: Override table path.
+    :param str location: JSON-style row path.
+    :param int minimum: Minimum accepted value, defaults to 0.
+    :raises ValueError: If a present field is not an integer in range.
+    """
+
+    for key in keys:
+        if key not in row:
+            continue
+        value = row[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < int(minimum):
+            raise _override_error(path, f"{location}.{key}", f"expected an integer >= {minimum}")
+
+
+def _validate_override_payload(payload: dict[str, Any], *, path: Path) -> None:
+    """Validate user-supplied tuning sections before merging shipped defaults.
+
+    :param dict[str, Any] payload: Override-only JSON payload.
+    :param Path path: Override table path.
+    :raises ValueError: If a supported section or row is malformed.
+    """
+
+    allowed_sections = {"version", "seq_buckets", "route_policies", "kernels"}
+    unknown_sections = sorted(set(payload) - allowed_sections)
+    if unknown_sections:
+        raise _override_error(path, "$", f"unknown section(s): {', '.join(unknown_sections)}")
+
+    if "version" in payload:
+        version = payload["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise _override_error(path, "version", "expected an integer")
+
+    if "seq_buckets" in payload:
+        buckets = payload["seq_buckets"]
+        if not isinstance(buckets, list):
+            raise _override_error(path, "seq_buckets", "expected a list of row objects")
+        for index, raw in enumerate(buckets):
+            location = f"seq_buckets[{index}]"
+            row = _validate_override_row_mapping(path=path, location=location, row=raw)
+            _validate_override_text(row, key="name", path=path, location=location)
+            _validate_override_int_fields(
+                row,
+                keys=("min_seq_len", "max_seq_len"),
+                path=path,
+                location=location,
+            )
+            for key in ("min_density", "max_density", "max_density_exclusive"):
+                if key not in row:
+                    continue
+                value = row[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise _override_error(path, f"{location}.{key}", "expected a number")
+
+    if "route_policies" in payload:
+        policies = payload["route_policies"]
+        if not isinstance(policies, dict):
+            raise _override_error(path, "route_policies", "expected an object of policy row lists")
+        allowed_choices = {
+            "padding": {"fixed", "varlen"},
+            "docblock": {"docblock", "docblock_bias"},
+            "local_bias": {"local_bias"},
+        }
+        for namespace, rows in policies.items():
+            namespace_location = f"route_policies.{namespace}"
+            if namespace not in allowed_choices:
+                raise _override_error(path, namespace_location, "unknown route-policy namespace")
+            if not isinstance(rows, list):
+                raise _override_error(path, namespace_location, "expected a list of row objects")
+            for index, raw in enumerate(rows):
+                location = f"{namespace_location}[{index}]"
+                row = _validate_override_row_mapping(path=path, location=location, row=raw)
+                _validate_override_text(row, key="seq_bucket", path=path, location=location)
+                choice = _validate_override_text(row, key="choice", path=path, location=location)
+                if choice not in allowed_choices[namespace]:
+                    expected = ", ".join(sorted(allowed_choices[namespace]))
+                    raise _override_error(
+                        path,
+                        f"{location}.choice",
+                        f"expected one of: {expected}; got {choice!r}",
+                    )
+                _validate_override_int_fields(
+                    row,
+                    keys=("min_seq_len", "max_seq_len", "max_batch_size"),
+                    path=path,
+                    location=location,
+                )
+
+    if "kernels" in payload:
+        kernels = payload["kernels"]
+        if not isinstance(kernels, list):
+            raise _override_error(path, "kernels", "expected a list of row objects")
+        launch_fields = ("block_m", "block_n", "num_stages", "num_warps")
+        integer_fields = (
+            "batch_size",
+            "query_len",
+            "key_len",
+            "num_heads",
+            "min_batch_size",
+            "max_batch_size",
+            "min_query_len",
+            "max_query_len",
+            "min_key_len",
+            "max_key_len",
+            "min_num_heads",
+            "max_num_heads",
+            "att_span_min",
+        )
+        for index, raw in enumerate(kernels):
+            location = f"kernels[{index}]"
+            row = _validate_override_row_mapping(path=path, location=location, row=raw)
+            for key in ("route", "kind", "seq_bucket"):
+                _validate_override_text(row, key=key, path=path, location=location)
+            missing_launch = [key for key in launch_fields if key not in row]
+            if missing_launch:
+                raise _override_error(
+                    path,
+                    location,
+                    f"incomplete kernel launch tuple; missing: {', '.join(missing_launch)}",
+                )
+            _validate_override_int_fields(
+                row,
+                keys=launch_fields,
+                path=path,
+                location=location,
+                minimum=1,
+            )
+            _validate_override_int_fields(
+                row,
+                keys=integer_fields,
+                path=path,
+                location=location,
+            )
+            head_dim = row.get("head_dim", "*")
+            if head_dim != "*" and (
+                isinstance(head_dim, bool) or not isinstance(head_dim, int) or head_dim <= 0
+            ):
+                raise _override_error(
+                    path,
+                    f"{location}.head_dim",
+                    "expected '*' or an integer >= 1",
+                )
 
 
 def _load_tuning_payload() -> dict[str, Any]:
@@ -128,7 +366,9 @@ def _load_tuning_payload() -> dict[str, Any]:
     if override_path is None:
         return payload
 
-    overrides = _read_json(Path(override_path).expanduser())
+    expanded_override_path = Path(override_path).expanduser()
+    overrides = _read_json(expanded_override_path)
+    _validate_override_payload(overrides, path=expanded_override_path)
     merged: dict[str, Any] = dict(payload)
     for key in ("seq_buckets", "route_policies", "kernels"):
         base_value = payload.get(key)

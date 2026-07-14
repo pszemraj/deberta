@@ -25,6 +25,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
+    disentangled_attention_span,
     lookup_existing_op_pair,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -264,7 +265,7 @@ def _docblock_forward_impl(
         max_seqlen=max_seqlen,
         total_tokens=total_tokens,
     )
-    att_span = int(position_buckets) if int(position_buckets) > 0 else int(max_relative_distance)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     packed_capacity = max(0, int(total_tokens))
     if aux_capacity is not None:
         packed_capacity = max(packed_capacity, int(aux_capacity))
@@ -1278,6 +1279,9 @@ def flashdeberta_docblock(
         )
         return output
 
+    # With the supported torch and pinned FlashDeBERTa versions, CUDA low-level
+    # imports and autograd custom-op registration are all-or-nothing. This raw
+    # path remains only for non-CUDA and directly exercised test plumbing.
     output, *_ = _docblock_forward_impl(
         query_layer=query_layer,
         key_layer=key_layer,

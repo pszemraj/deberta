@@ -258,6 +258,30 @@ def test_flashdeberta_version_guard_accepts_pinned_version(monkeypatch: pytest.M
     assert version_mod.flashdeberta_runtime_version() == "0.0.7"
 
 
+@pytest.mark.parametrize("installed", [None, "0.0.6"])
+def test_flashdeberta_version_guard_rejects_missing_or_mismatched_distribution(
+    monkeypatch: pytest.MonkeyPatch, installed: str | None
+) -> None:
+    import deberta.modeling.flashdeberta_version as version_mod
+
+    def _distribution_version(_name: str) -> str:
+        if installed is None:
+            raise importlib_metadata.PackageNotFoundError("flashdeberta")
+        return installed
+
+    monkeypatch.setattr(version_mod.metadata, "version", _distribution_version)
+    expected = "metadata was not found" if installed is None else "Unsupported flashdeberta version"
+    with pytest.raises(RuntimeError, match=expected):
+        version_mod.require_flashdeberta_version()
+
+
+def test_flash_cfg_bool_honors_missing_defaults_and_string_values() -> None:
+    from deberta.modeling.flash_config import flash_cfg_bool
+
+    assert flash_cfg_bool({}, name="missing", default="1") is True
+    assert flash_cfg_bool({"enabled": "false"}, name="enabled", default="1") is False
+
+
 def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
@@ -611,6 +635,86 @@ def test_flashdeberta_kernel_overrides_reload_when_same_path_content_changes(tmp
         )
         configure_flashdeberta_kernel_overrides(str(override_path))
         assert flash_route_choice(policy="padding", seq_bucket="under_2048") == "fixed"
+
+
+def test_flash_batch_preparation_does_not_poll_kernel_override_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import deberta.modeling.flashdeberta_kernel_tuning as tuning
+    import deberta.training.compile as compile_mod
+
+    override_path = tmp_path / "runtime_overrides.json"
+    override_path.write_text("{}", encoding="utf-8")
+    tuning.configure_flashdeberta_kernel_overrides(None)
+    monkeypatch.setattr(
+        tuning,
+        "_overrides_file_signature",
+        lambda _path: pytest.fail("runtime batch preparation polled the override file"),
+    )
+
+    try:
+        for _ in range(2):
+            prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+                batch={"input_ids": torch.zeros((1, 8), dtype=torch.long)},
+                backbone_type="hf_deberta_v2",
+                flash_enabled=True,
+                flash_cfg={"kernel_overrides_path": str(override_path)},
+            )
+            assert prepared["input_ids"].shape == (1, 8)
+            assert meta is not None
+    finally:
+        tuning.configure_flashdeberta_kernel_overrides(None, reload_if_changed=False)
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_path", "detail"),
+    [
+        (
+            {"route_policies": {"padding": [{"seq_bucket": "under_2048", "choice": "typo"}]}},
+            r"route_policies\.padding\[0\]\.choice",
+            "expected one of",
+        ),
+        (
+            {
+                "route_policies": {
+                    "padding": [{"seq_bucket": "under_2048", "choice": "varlen", "max_seq_len": "oops"}]
+                }
+            },
+            r"route_policies\.padding\[0\]\.max_seq_len",
+            "expected an integer",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "under_2048",
+                        "block_m": 16,
+                    }
+                ]
+            },
+            r"kernels\[0\]",
+            "incomplete kernel launch tuple",
+        ),
+    ],
+    ids=["route_choice", "numeric_bound", "kernel_launch"],
+)
+def test_flashdeberta_kernel_override_validation_reports_file_and_row(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    error_path: str,
+    detail: str,
+) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+
+    override_path = tmp_path / "bad_overrides.json"
+    override_path.write_text(json.dumps(payload), encoding="utf-8")
+    configure_flashdeberta_kernel_overrides(None)
+
+    with pytest.raises(ValueError, match=rf"bad_overrides\.json.*{error_path}.*{detail}"):
+        configure_flashdeberta_kernel_overrides(str(override_path))
 
 
 def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
@@ -2180,7 +2284,13 @@ def test_flash_dispatch_profiler_has_no_local_scalar_dense(
 
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
-    cfg = _small_deberta_config(warn_fallbacks=False)
+    # Use a real-kernel-compatible head dimension when an earlier CUDA test has
+    # already registered the process-global fixed custom op.
+    cfg = _small_deberta_config(
+        warn_fallbacks=False,
+        hidden_size=64,
+        intermediate_size=128,
+    )
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(
         device="cuda",
         dtype=torch.bfloat16,
@@ -2552,6 +2662,56 @@ def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
     assert torch.equal(cached_out, expected_out)
     assert torch.equal(cached_grad, expected_grad)
     assert torch.equal(cached_delta, expected_delta)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for wide-head fallback coverage.")
+def test_wide_head_grad_delta_pack_falls_back_without_truncation() -> None:
+    import deberta.modeling.flashdeberta_segment_pack as segment_mod
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    device = torch.device("cuda")
+    head_dim = 264
+
+    prefix_grad = torch.randn((2, 4, 2, head_dim), device=device)
+    prefix_lengths = torch.tensor([3, 2], dtype=torch.int32, device=device)
+    prefix_cu = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
+    prefix_out = torch.randn((5, 2, head_dim), device=device)
+    _, prefix_packed_grad, prefix_delta = varlen_mod._pack_grad_and_delta_from_padded(
+        grad_output=prefix_grad,
+        output_padded=torch.empty_like(prefix_grad),
+        out_unpad=prefix_out,
+        seqlens=prefix_lengths,
+        cu_seqlens=prefix_cu,
+        max_seqlen=3,
+        total_tokens=5,
+    )
+    expected_prefix_grad = torch.cat((prefix_grad[0, :3], prefix_grad[1, :2]), dim=0)
+    torch.testing.assert_close(prefix_packed_grad, expected_prefix_grad)
+    torch.testing.assert_close(
+        prefix_delta,
+        (prefix_out.float() * expected_prefix_grad.float()).sum(dim=-1),
+    )
+
+    segment_grad = torch.randn((1, 6, 2, head_dim), device=device)
+    segment_offsets = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    segment_lengths = torch.tensor([2, 3], dtype=torch.int32, device=device)
+    segment_cu = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
+    segment_out = torch.randn((5, 2, head_dim), device=device)
+    segment_packed_grad, segment_delta = segment_mod.segment_pack_grad_and_delta_from_padded(
+        grad_output=segment_grad,
+        out_unpad=segment_out,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=segment_cu,
+        total_tokens=5,
+        max_segment_length=3,
+    )
+    expected_segment_grad = torch.cat((segment_grad[0, :2], segment_grad[0, 3:6]), dim=0)
+    torch.testing.assert_close(segment_packed_grad, expected_segment_grad)
+    torch.testing.assert_close(
+        segment_delta,
+        (segment_out.float() * expected_segment_grad.float()).sum(dim=-1),
+    )
 
 
 def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3769,11 +3929,12 @@ def test_position_bias_dense_grad_reduction_matches_autograd(
 
     actual_key, actual_query = bias_mod._position_bias_backward_from_dense_grad(
         d_bias=d_bias,
-        pos_key=pos_key,
-        pos_query=pos_query,
+        pos_key_num_buckets=num_buckets if pos_key is not None else 0,
+        pos_query_num_buckets=num_buckets if pos_query is not None else 0,
         bucket_index=bucket_index,
         keep_mask=keep_mask,
         scale=scale,
+        output_dtype=d_bias.dtype,
     )
 
     if use_pos_key:
@@ -3804,8 +3965,6 @@ def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
         out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
         lse = torch.empty((2, 4, 3), device="cuda", dtype=torch.float32)
         bias = torch.empty((2, 4, 3, 3), device="cuda", dtype=torch.bfloat16)
-        pos_key = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
-        pos_query = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
         bucket_index = torch.empty((3, 3), device="cuda", dtype=torch.int64)
         keep_mask = torch.empty((2, 1, 3, 3), device="cuda", dtype=torch.bool)
 
@@ -3814,8 +3973,6 @@ def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
             q,
             k,
             v,
-            pos_key,
-            pos_query,
             bucket_index,
             keep_mask,
             bias,
@@ -3824,16 +3981,16 @@ def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
             0.5,
             0.5,
             False,
-            True,
-            True,
+            7,
+            7,
             True,
         )
 
     assert tuple(dq.shape) == tuple(q.shape)
     assert tuple(dk.shape) == tuple(k.shape)
     assert tuple(dv.shape) == tuple(v.shape)
-    assert tuple(dpos_key.shape) == tuple(pos_key.shape)
-    assert tuple(dpos_query.shape) == tuple(pos_query.shape)
+    assert tuple(dpos_key.shape) == (2, 4, 3, 7)
+    assert tuple(dpos_query.shape) == (2, 4, 3, 7)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused position-bias parity.")
@@ -4111,6 +4268,7 @@ def test_position_bias_attention_cuda_saves_dense_bias_aux_tensor() -> None:
         out.float().sum().backward()
 
     assert (batch_size, num_heads, seq_len, seq_len) in saved_shapes
+    assert (batch_size, num_heads, seq_len, num_buckets) not in saved_shapes
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for dense-bias kernel checks.")
@@ -4266,8 +4424,8 @@ def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod
         bias=bias,
         out=out,
         lse=lse,
-        pos_key=pos_key,
-        pos_query=pos_query,
+        pos_key_num_buckets=num_buckets,
+        pos_query_num_buckets=num_buckets,
         bucket_index=bucket_index,
         keep_mask=per_head_mask,
         bias_scale=bias_scale,
@@ -4287,11 +4445,12 @@ def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod
     )
     ref_dpos_key, ref_dpos_query = bias_mod._position_bias_backward_from_dense_grad(
         d_bias=ref_d_bias,
-        pos_key=pos_key,
-        pos_query=pos_query,
+        pos_key_num_buckets=num_buckets,
+        pos_query_num_buckets=num_buckets,
         bucket_index=bucket_index,
         keep_mask=per_head_mask,
         scale=bias_scale,
+        output_dtype=dtype,
     )
     torch.testing.assert_close(dq, ref_dq, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(dk, ref_dk, atol=5e-2, rtol=5e-2)
@@ -4313,8 +4472,8 @@ def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod
             bias=bias[:, sl].contiguous(),
             out=out[:, sl].contiguous(),
             lse=lse[:, sl].contiguous(),
-            pos_key=pos_key[:, sl].contiguous(),
-            pos_query=pos_query[:, sl].contiguous(),
+            pos_key_num_buckets=num_buckets,
+            pos_query_num_buckets=num_buckets,
             bucket_index=bucket_index,
             keep_mask=per_head_mask[:, sl].contiguous(),
             bias_scale=bias_scale,
@@ -4362,7 +4521,8 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
     device = torch.device("cuda")
     dtype = torch.bfloat16
     seq_len = 1024
-    boundary = seq_len // 2
+    # Cross the 64/128-token kernel tile boundaries to exercise ragged tails.
+    boundary = 517
     cfg = DebertaV2Config(
         vocab_size=64,
         hidden_size=64,

@@ -680,6 +680,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         self._generator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.generator)
         self._discriminator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.discriminator)
 
+        # Builder validation gives config-loaded runs an early error; keep this
+        # constructor invariant for callers that assemble backbones directly.
         pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
         z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
         if not pos_biased and z_steps > 1:
