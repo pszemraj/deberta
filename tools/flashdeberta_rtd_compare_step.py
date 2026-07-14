@@ -17,7 +17,6 @@ from typing import Any
 
 import _bench_common as bench  # noqa: E402  (inserts src/ on sys.path at import)
 import torch
-import torch.nn.functional as F
 
 from deberta.config import load_config  # noqa: E402
 from deberta.modeling import DebertaV3RTDPretrainer  # noqa: E402
@@ -117,93 +116,77 @@ def _prepare_batch(
     return batch, flash_meta
 
 
-def _masked_generator_logits(
+def _observed_generator_phase(
     *,
     model: DebertaV3RTDPretrainer,
     batch: dict[str, Any],
     flash_meta: Any | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    labels = batch["labels"]
-    masked_positions = labels.ne(-100)
-    masked_idx = torch.nonzero(masked_positions.view(-1), as_tuple=False).squeeze(-1)
+    sampling_temperature: float,
+) -> tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the production generator phase while observing hidden states and logits."""
 
-    gen_forward_kwargs: dict[str, Any] = {
-        "input_ids": batch["input_ids"],
-        "attention_mask": batch.get("attention_mask"),
-        "token_type_ids": batch.get("token_type_ids"),
-        "return_dict": True,
-    }
-    if batch.get("position_ids") is not None:
-        gen_forward_kwargs["position_ids"] = batch["position_ids"]
-    pos_biased = bool(getattr(model.gen_config, "position_biased_input", True))
-    use_emd = not pos_biased
-    if use_emd:
-        gen_forward_kwargs["output_hidden_states"] = True
-    if flash_meta is not None and getattr(model, "_generator_accepts_flash_kwargs", False):
-        gen_forward_kwargs["flash_meta"] = flash_meta
-
-    gen_out = model.generator(**gen_forward_kwargs)
-    hidden = gen_out.last_hidden_state
-
-    if masked_idx.numel() == 0:
-        empty_logits = hidden.new_zeros((0, model.generator_lm_head.bias.numel()))
-        empty_labels = labels.new_zeros((0,))
-        return hidden, empty_logits, empty_labels, masked_positions
-
-    if use_emd:
-        gen_masked_hidden = model.enhanced_mask_decoder(
-            encoder_hidden_states=gen_out.hidden_states,
-            masked_positions=masked_positions,
+    observed: dict[str, torch.Tensor] = {}
+    handles = [
+        model.generator.register_forward_hook(
+            lambda _module, _args, output: observed.__setitem__("hidden", output.last_hidden_state)
+        ),
+        model.generator_lm_head.register_forward_hook(
+            lambda _module, _args, output: observed.__setitem__("logits", output)
+        ),
+    ]
+    try:
+        phase = model.forward_generator_phase(
+            input_ids=batch["input_ids"],
             attention_mask=batch.get("attention_mask"),
-            embeddings=model.generator.embeddings,
-            encoder=model.generator.encoder,
+            labels=batch["labels"],
+            token_type_ids=batch.get("token_type_ids"),
             position_ids=batch.get("position_ids"),
-            flash_meta=flash_meta if getattr(model, "_generator_accepts_flash_kwargs", False) else None,
+            sampling_temperature=sampling_temperature,
+            flash_meta=flash_meta,
         )
-    else:
-        hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-        gen_masked_hidden = hidden_flat.index_select(0, masked_idx)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if "hidden" not in observed or "logits" not in observed:
+        raise RuntimeError("Generator observation hooks did not capture hidden states and masked logits.")
+    masked_labels = batch["labels"].masked_select(batch["labels"].ne(-100))
+    return phase, observed["hidden"], observed["logits"], masked_labels
 
-    masked_labels = labels.view(-1).index_select(0, masked_idx)
-    word_w = model._get_generator_word_embedding_weight()
-    logits = model.generator_lm_head(gen_masked_hidden, word_embedding_weight=word_w)
-    return hidden, logits, masked_labels, masked_positions
 
-
-def _discriminator_logits_and_loss(
+def _observed_discriminator_phase(
     *,
     model: DebertaV3RTDPretrainer,
     batch: dict[str, Any],
     flash_meta: Any | None,
     corrupted_input_ids: torch.Tensor,
     disc_labels: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    disc_forward_kwargs: dict[str, Any] = {
-        "input_ids": corrupted_input_ids,
-        "attention_mask": batch.get("attention_mask"),
-        "token_type_ids": batch.get("token_type_ids"),
-        "return_dict": True,
-    }
-    if batch.get("position_ids") is not None:
-        disc_forward_kwargs["position_ids"] = batch["position_ids"]
-    if flash_meta is not None and getattr(model, "_discriminator_accepts_flash_kwargs", False):
-        disc_forward_kwargs["flash_meta"] = flash_meta
-    disc_out = model.discriminator(**disc_forward_kwargs)
-    logits = model.discriminator_head(
-        disc_out.last_hidden_state,
-        attention_mask=batch.get("attention_mask"),
-        doc_context_index=batch.get("doc_context_index"),
-        flash_meta=flash_meta,
+) -> tuple[Any, torch.Tensor, torch.Tensor]:
+    """Run the production discriminator phase while observing its logits."""
+
+    observed: dict[str, torch.Tensor] = {}
+    handle = model.discriminator_head.register_forward_hook(
+        lambda _module, _args, output: observed.__setitem__("logits", output)
     )
+    try:
+        phase = model.forward_discriminator_phase(
+            input_ids=batch["input_ids"],
+            corrupted_input_ids=corrupted_input_ids,
+            disc_labels=disc_labels,
+            attention_mask=batch.get("attention_mask"),
+            token_type_ids=batch.get("token_type_ids"),
+            position_ids=batch.get("position_ids"),
+            doc_context_index=batch.get("doc_context_index"),
+            flash_meta=flash_meta,
+        )
+    finally:
+        handle.remove()
+    if "logits" not in observed:
+        raise RuntimeError("Discriminator observation hook did not capture logits.")
     active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
         attention_mask=batch.get("attention_mask"),
     )
-    active_f = active.to(dtype=torch.float32)
-    loss = (
-        F.binary_cross_entropy_with_logits(logits.float(), disc_labels.float(), reduction="none") * active_f
-    ).sum() / active_f.sum().clamp_min(1.0)
-    return logits, loss, active
+    return phase, observed["logits"], active
 
 
 def _masked_tensor_values(tensor: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -336,16 +319,16 @@ def main() -> None:
     torch.manual_seed(int(args.seed))
     torch.cuda.manual_seed_all(int(args.seed))
 
-    eager_cfg, mixed_precision, tokenizer, loader = bench.load_tool_config_and_loader(
+    flash_cfg, mixed_precision, tokenizer, loader = bench.load_tool_config_and_loader(
         str(args.config),
-        _model_overrides(attention_impl="eager", docblock_bias_seq_len=int(args.docblock_bias_seq_len)),
+        _model_overrides(attention_impl="flash", docblock_bias_seq_len=int(args.docblock_bias_seq_len)),
         tool_name="flashdeberta_rtd_compare_step.py",
         deterministic_loader=True,
     )
-    flash_cfg = load_config(
+    eager_cfg = load_config(
         args.config,
         overrides=_model_overrides(
-            attention_impl="flash", docblock_bias_seq_len=int(args.docblock_bias_seq_len)
+            attention_impl="eager", docblock_bias_seq_len=int(args.docblock_bias_seq_len)
         ),
     )
     batch_cpu = _first_batch(loader, batch_index=int(args.batch_index))
@@ -392,66 +375,44 @@ def main() -> None:
         "flash_meta": _metadata_summary(flash_meta),
     }
 
+    _zero_grad(eager_model, flash_model)
+    torch.manual_seed(int(args.sample_seed))
+    torch.cuda.manual_seed_all(int(args.sample_seed))
     with bench.autocast_context(str(mixed_precision)):
-        eager_hidden, eager_gen_logits, eager_masked_labels, masked_positions = _masked_generator_logits(
+        eager_gen_phase, eager_hidden, eager_gen_logits, eager_masked_labels = _observed_generator_phase(
             model=eager_model,
             batch=eager_batch,
             flash_meta=eager_meta,
+            sampling_temperature=float(eager_cfg.train.objective.sampling_temperature),
         )
-        flash_hidden, flash_gen_logits, flash_masked_labels, _ = _masked_generator_logits(
+    torch.manual_seed(int(args.sample_seed))
+    torch.cuda.manual_seed_all(int(args.sample_seed))
+    with bench.autocast_context(str(mixed_precision)):
+        flash_gen_phase, flash_hidden, flash_gen_logits, flash_masked_labels = _observed_generator_phase(
             model=flash_model,
             batch=flash_batch,
             flash_meta=flash_meta,
+            sampling_temperature=float(flash_cfg.train.objective.sampling_temperature),
         )
-        eager_gen_loss = F.cross_entropy(eager_gen_logits.float(), eager_masked_labels)
-        flash_gen_loss = F.cross_entropy(flash_gen_logits.float(), flash_masked_labels)
 
     report["generator_forward"] = {
         "hidden_active": _compare_tensors(eager_hidden, flash_hidden, mask=active),
         "masked_logits": _compare_tensors(eager_gen_logits, flash_gen_logits),
-        "loss": _compare_scalar(eager_gen_loss.detach(), flash_gen_loss.detach()),
-        "eager_loss": float(eager_gen_loss.detach().float().item()),
-        "flash_loss": float(flash_gen_loss.detach().float().item()),
+        "loss": _compare_scalar(eager_gen_phase.gen_loss_raw.detach(), flash_gen_phase.gen_loss_raw.detach()),
+        "eager_loss": float(eager_gen_phase.gen_loss_raw.detach().float().item()),
+        "flash_loss": float(flash_gen_phase.gen_loss_raw.detach().float().item()),
     }
     if not torch.equal(eager_masked_labels, flash_masked_labels):
         raise RuntimeError("Masked labels differ between eager and flash batches.")
 
-    _zero_grad(eager_model, flash_model)
-    eager_gen_loss.backward()
-    flash_gen_loss.backward()
+    eager_gen_phase.gen_loss_raw.backward()
+    flash_gen_phase.gen_loss_raw.backward()
     report["generator_gradients"] = _grad_report(
         _named_grads(eager_model),
         _named_grads(flash_model),
         max_rows=int(args.max_grad_report),
     )
 
-    _zero_grad(eager_model, flash_model)
-    torch.manual_seed(int(args.sample_seed))
-    torch.cuda.manual_seed_all(int(args.sample_seed))
-    with bench.autocast_context(str(mixed_precision)):
-        eager_gen_phase = eager_model(
-            input_ids=eager_batch["input_ids"],
-            attention_mask=eager_batch.get("attention_mask"),
-            labels=eager_batch["labels"],
-            token_type_ids=eager_batch.get("token_type_ids"),
-            position_ids=eager_batch.get("position_ids"),
-            sampling_temperature=float(eager_cfg.train.objective.sampling_temperature),
-            phase="generator",
-            flash_meta=eager_meta,
-        )
-    torch.manual_seed(int(args.sample_seed))
-    torch.cuda.manual_seed_all(int(args.sample_seed))
-    with bench.autocast_context(str(mixed_precision)):
-        flash_gen_phase = flash_model(
-            input_ids=flash_batch["input_ids"],
-            attention_mask=flash_batch.get("attention_mask"),
-            labels=flash_batch["labels"],
-            token_type_ids=flash_batch.get("token_type_ids"),
-            position_ids=flash_batch.get("position_ids"),
-            sampling_temperature=float(flash_cfg.train.objective.sampling_temperature),
-            phase="generator",
-            flash_meta=flash_meta,
-        )
     sample_mismatch = eager_gen_phase.corrupted_input_ids.ne(flash_gen_phase.corrupted_input_ids)
     label_mismatch = eager_gen_phase.disc_labels.ne(flash_gen_phase.disc_labels)
     report["generator_phase_sampling"] = {
@@ -480,14 +441,14 @@ def main() -> None:
     disc_labels = eager_gen_phase.disc_labels.detach()
     _zero_grad(eager_model, flash_model)
     with bench.autocast_context(str(mixed_precision)):
-        eager_disc_logits, eager_disc_loss, eager_disc_active = _discriminator_logits_and_loss(
+        eager_disc_phase, eager_disc_logits, eager_disc_active = _observed_discriminator_phase(
             model=eager_model,
             batch=eager_batch,
             flash_meta=eager_meta,
             corrupted_input_ids=corrupted,
             disc_labels=disc_labels,
         )
-        flash_disc_logits, flash_disc_loss, flash_disc_active = _discriminator_logits_and_loss(
+        flash_disc_phase, flash_disc_logits, flash_disc_active = _observed_discriminator_phase(
             model=flash_model,
             batch=flash_batch,
             flash_meta=flash_meta,
@@ -498,12 +459,14 @@ def main() -> None:
         raise RuntimeError("Discriminator active masks differ between eager and flash.")
     report["discriminator_forward_same_targets"] = {
         "logits_active": _compare_tensors(eager_disc_logits, flash_disc_logits, mask=eager_disc_active),
-        "loss": _compare_scalar(eager_disc_loss.detach(), flash_disc_loss.detach()),
-        "eager_loss": float(eager_disc_loss.detach().float().item()),
-        "flash_loss": float(flash_disc_loss.detach().float().item()),
+        "loss": _compare_scalar(
+            eager_disc_phase.disc_loss_raw.detach(), flash_disc_phase.disc_loss_raw.detach()
+        ),
+        "eager_loss": float(eager_disc_phase.disc_loss_raw.detach().float().item()),
+        "flash_loss": float(flash_disc_phase.disc_loss_raw.detach().float().item()),
     }
-    eager_disc_loss.backward()
-    flash_disc_loss.backward()
+    eager_disc_phase.disc_loss_raw.backward()
+    flash_disc_phase.disc_loss_raw.backward()
     report["discriminator_gradients_same_targets"] = _grad_report(
         _named_grads(eager_model),
         _named_grads(flash_model),
