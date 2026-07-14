@@ -72,8 +72,11 @@ def _build_run_metadata(
         )
 
         meta["flash_attention"] = {
-            "attention_impl": str(model_cfg.hf.attention_impl),
-            "flash": asdict_without_private(model_cfg.hf.flash),
+            # Routing and eager fallbacks are per batch/call, so this artifact
+            # records the requested policy rather than claiming one resolved
+            # runtime implementation for the whole run.
+            "requested_attention_impl": str(model_cfg.hf.attention_impl),
+            "requested_flash_config": asdict_without_private(model_cfg.hf.flash),
             "flashdeberta_version": flashdeberta_runtime_version(),
             "flashdeberta_distribution_version": flashdeberta_distribution_version(),
         }

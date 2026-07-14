@@ -982,8 +982,8 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
 
     meta = _build_run_metadata(model_cfg=model_cfg)
 
-    assert meta["flash_attention"]["attention_impl"] == "flash"
-    assert meta["flash_attention"]["flash"]["force_varlen"] is True
+    assert meta["flash_attention"]["requested_attention_impl"] == "flash"
+    assert meta["flash_attention"]["requested_flash_config"]["force_varlen"] is True
     assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
     assert meta["flash_attention"]["flashdeberta_distribution_version"] == "0.0.7"
 
