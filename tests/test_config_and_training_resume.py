@@ -1564,7 +1564,7 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     staged = Path(str(accel.calls["save_state"][0]))
     assert staged.parent == out
     assert staged.name.startswith(f".{ckpt.name}.tmp-")
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 42
     assert lr_mult == 1.0
     assert digest is None  # no digest passed

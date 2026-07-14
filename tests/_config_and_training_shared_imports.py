@@ -105,7 +105,6 @@ from deberta.training.run_config import (
 )
 from deberta.training.run_management import (
     _find_latest_checkpoint,
-    _load_checkpoint_data_progress,
     _load_checkpoint_progress_metadata,
     _prepare_output_dir,
     _resolve_output_dir,

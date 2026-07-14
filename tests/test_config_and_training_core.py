@@ -509,13 +509,13 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert consumed is None
     assert lr_mult == 1.0
     assert digest is None
 
     _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123, lr_mult=0.25)
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 123
     assert abs(lr_mult - 0.25) < 1e-9
     assert digest is None  # no digest was saved
@@ -529,7 +529,7 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
         global_step=17,
         gradient_accumulation_steps=4,
     )
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 200
     assert abs(lr_mult - 0.5) < 1e-9
     assert digest == "abc123deadbeef00"
@@ -552,7 +552,7 @@ def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path:
         gradient_accumulation_steps=3,
     )
 
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 77
     assert lr_mult == pytest.approx(0.75)
     assert isinstance(digest, dict)
@@ -565,7 +565,7 @@ def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path:
     assert saved_ga == 3
 
 
-def test_load_checkpoint_data_progress_warns_on_invalid_json(
+def test_load_checkpoint_progress_metadata_warns_on_invalid_json(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     ckpt = tmp_path / "checkpoint-7"
@@ -573,7 +573,7 @@ def test_load_checkpoint_data_progress_warns_on_invalid_json(
     (ckpt / "data_state.json").write_text('{"consumed_micro_batches": ', encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+        consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
 
     assert consumed is None
     assert lr_mult == 1.0
@@ -728,7 +728,7 @@ def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
         log_label="test",
         optimizer_param_digest="deadbeef12345678",
     )
-    _, _, digest = _load_checkpoint_data_progress(ckpt)
+    _, _, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert digest == "deadbeef12345678"
 
 
@@ -748,7 +748,7 @@ def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path)
         log_label="test",
         optimizer_param_digest=dual_digest,
     )
-    _, _, digest = _load_checkpoint_data_progress(ckpt)
+    _, _, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
     assert isinstance(digest, dict)
     assert digest == dual_digest
 

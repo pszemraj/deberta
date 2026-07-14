@@ -333,7 +333,7 @@ def _classify_checkpoint(checkpoint_dir: Path) -> _CheckpointStatus:
     :param Path checkpoint_dir: Checkpoint directory.
     :return _CheckpointStatus: Marker, progress, and model-weight status.
     """
-    consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
+    consumed, _, _, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
     return _CheckpointStatus(
         committed=_is_checkpoint_committed(checkpoint_dir),
         has_progress=consumed is not None,
@@ -494,19 +494,6 @@ def _load_checkpoint_progress_metadata(
         return None, 1.0, None, None, None
 
 
-def _load_checkpoint_data_progress(
-    checkpoint_dir: Path,
-) -> tuple[int | None, float, str | dict[str, str] | None]:
-    """Load persisted data progress, LR multiplier, and optimizer param digest.
-
-    :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float, str | dict[str, str] | None]:
-        ``(consumed_micro_batches, lr_mult, optimizer_param_digest)``.
-    """
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
-    return consumed, lr_mult, digest
-
-
 def _save_checkpoint_data_progress(
     *,
     checkpoint_dir: Path,
@@ -597,7 +584,7 @@ def _save_training_checkpoint(
                 global_step=global_step,
                 gradient_accumulation_steps=gradient_accumulation_steps,
             )
-            progress_ok = _load_checkpoint_data_progress(staging_dir)[0] is not None
+            progress_ok = _load_checkpoint_progress_metadata(staging_dir)[0] is not None
             weights_ok = _checkpoint_weights_appear_valid(staging_dir)
             if not (progress_ok and weights_ok):
                 raise RuntimeError(
@@ -707,7 +694,6 @@ def _list_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
 
 __all__ = [
     "_find_latest_checkpoint",
-    "_load_checkpoint_data_progress",
     "_load_checkpoint_progress_metadata",
     "_parse_checkpoint_step",
     "_prepare_output_dir",
