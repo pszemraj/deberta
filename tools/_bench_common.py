@@ -527,6 +527,36 @@ class CandidateSweepResult:
     error: str | None
 
 
+def run_timed_backbone_step(
+    *,
+    model: DebertaV2Model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    flash_meta: FlashBatchMeta | None,
+) -> float:
+    """Run and time one synchronized backbone forward/backward step.
+
+    :param DebertaV2Model model: Backbone model under test.
+    :param torch.Tensor input_ids: Input token ids.
+    :param torch.Tensor | None attention_mask: Optional attention mask.
+    :param FlashBatchMeta | None flash_meta: Optional explicit flash metadata.
+    :return float: Synchronized elapsed time in milliseconds.
+    """
+
+    device = next(model.parameters()).device
+    model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize(device)
+    start = time.perf_counter()
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        flash_meta=flash_meta,
+    ).last_hidden_state
+    out.float().pow(2).mean().backward()
+    torch.cuda.synchronize(device)
+    return (time.perf_counter() - start) * 1000.0
+
+
 def run_timed_candidate(
     *,
     model: DebertaV2Model,
@@ -552,18 +582,12 @@ def run_timed_candidate(
     per_sample_times: dict[int, list[float]] = {int(sample.index): [] for sample in samples}
 
     def _run_one(sample: BatchSample) -> float:
-        model.zero_grad(set_to_none=True)
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        out = model(
+        return run_timed_backbone_step(
+            model=model,
             input_ids=sample.input_ids,
             attention_mask=sample.attention_mask,
             flash_meta=meta_fn(sample),
-        ).last_hidden_state
-        loss = out.float().pow(2).mean()
-        loss.backward()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - start) * 1000.0
+        )
 
     for _ in range(int(warmup)):
         for sample in samples:

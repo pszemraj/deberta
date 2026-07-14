@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import statistics
-import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -150,16 +149,12 @@ def main() -> None:
     measured_steps = int(args.steps)
 
     for _ in range(total_warmup):
-        model.zero_grad(set_to_none=True)
-        torch.cuda.synchronize(device)
-        out = model(
+        _bench_common.run_timed_backbone_step(
+            model=model,
             input_ids=input_ids,
             attention_mask=attention_mask,
             flash_meta=flash_meta,
-        ).last_hidden_state
-        loss = out.float().pow(2).mean()
-        loss.backward()
-        torch.cuda.synchronize(device)
+        )
 
     profiler_ctx: Any
     if args.profile_dir is not None:
@@ -174,21 +169,14 @@ def main() -> None:
 
     with profiler_ctx as profiler:
         for _ in range(measured_steps):
-            model.zero_grad(set_to_none=True)
-            torch.cuda.synchronize(device)
-            start = time.perf_counter()
-
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                flash_meta=flash_meta,
-            ).last_hidden_state
-            loss = out.float().pow(2).mean()
-            loss.backward()
-
-            torch.cuda.synchronize(device)
-            end = time.perf_counter()
-            times_ms.append((end - start) * 1000.0)
+            times_ms.append(
+                _bench_common.run_timed_backbone_step(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    flash_meta=flash_meta,
+                )
+            )
 
             if profiler is not None:
                 profiler.step()
