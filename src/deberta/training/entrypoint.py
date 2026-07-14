@@ -296,12 +296,6 @@ def run_pretraining_dry_run(
         if train_cfg.checkpoint.resume_from_checkpoint is not None
         else ""
     )
-    if bool(train_cfg.checkpoint.overwrite_output_dir) and bool(resume_hint):
-        raise ValueError(
-            "train.checkpoint.overwrite_output_dir=true cannot be combined with "
-            "train.checkpoint.resume_from_checkpoint. "
-            "Overwrite would delete checkpoints before resume. Disable overwrite or unset resume."
-        )
     validate_existing_output_dir(
         output_dir=checkpoint_output_dir,
         allow_nonempty=bool(train_cfg.checkpoint.overwrite_output_dir) or bool(resume_hint),
