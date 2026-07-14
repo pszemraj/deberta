@@ -14,7 +14,7 @@
 ## Advanced
 
 - `hf_deberta_v2` vs `rope` architecture behavior: [Advanced / Architectures](advanced/architectures.md)
-- accelerate/FSDP usage, resume behavior, and token-weighted GA: [Advanced / Distributed Training](advanced/distributed-training.md)
+- Accelerate and FSDP2 launch behavior: [Advanced / Distributed Training](advanced/distributed-training.md)
 - compile scopes and graph-stability guidance: [Advanced / torch.compile](advanced/torch-compile.md)
 - flash routes, kernel tuning, and caveats: [Advanced / FlashDeBERTa attention](advanced/flash-attention.md)
 - per-GPU expectations and tuning for non-`sm_120` hardware: [Advanced / GPU support](advanced/gpu-support.md)

@@ -102,35 +102,9 @@ whose bounds exclude the batch length resolves to the ragged fallback instead:
 }
 ```
 
-Before promoting a route on new hardware:
+Dense `docblock_bias` saves a quadratic bias for backward, so use `max_seq_len` and `max_batch_size` bounds that reflect the target GPU's VRAM rather than copying the shipped 32 GiB limits. A same-capability card with more VRAM can raise those bounds with a same-key override row, which outranks the shipped row. Batch preparation warns when a bound keeps a measured capability on the ragged route.
 
-1. Run [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) on the target GPU -
-   correctness is hardware-independent in design, but verify it.
-2. Compare eager and flash on the same real config using distinct output directories:
-
-   ```bash
-   python tools/flashdeberta_rtd_profile.py \
-     configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
-     --mode eager --profile-dir local-scratch/profiles/eager
-   python tools/flashdeberta_rtd_profile.py \
-     configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_1024_wp32k_v2_docblock.yaml \
-     --mode flash --profile-dir local-scratch/profiles/flash
-   ```
-
-   Keep the route that wins without violating the memory budget.
-3. Mind memory: dense `docblock_bias` saves the `(B,H,S,S)` bias for backward. On cards with
-   less VRAM than the 32 GiB benchmark GPU, try the ragged default first at `4096`. The cut
-   works the other way too: the shipped `max_batch_size` bounds on the dense rows encode that
-   one card's memory, not a capability fact, so a same-capability card with more VRAM (for
-   example a 96 GiB `sm_120` workstation part) is deliberately underfed by the defaults. Raise
-   the bound with an override row for your own capability key - same-key rows appended via
-   `kernel_overrides_path` outrank the shipped ones, so a single row like
-   `{"seq_bucket": "2048_plus", "choice": "docblock_bias", "compute_capability": "sm_120",
-   "max_batch_size": 8}` is enough. Batch prep logs a warning when bounds (rather than missing
-   measurements) keep a shape ragged, so the underfed case is visible in training logs.
-
-Kernel tile tuning is optional on top of route promotion; the workflow is described in
-[FlashDeBERTa attention](flash-attention.md#retuning).
+Validate route changes and kernel tiles with the [retuning workflow](flash-attention.md#retuning).
 Durable results can be added as capability-scoped rows in the shipped table. Triton launch
 configurations depend on shared memory, scheduling, and SM count; applying one GPU's tiles globally
 can fail at launch or regress throughput on another architecture.

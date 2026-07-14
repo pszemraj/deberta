@@ -30,8 +30,7 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 - native generators with `position_biased_input=false` use Enhanced Mask Decoding with raw learned
   position states, penultimate-layer KV, and two shared applications of the last layer
 - generic backbone `z_steps` is not an EMD substitute; RTD generators require `z_steps=0`
-- document-blocked packing preserves standalone objective semantics with one CLS and local
-  `position_ids` per segment
+- Document-blocked packing preserves standalone objective semantics as described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking).
 
 ## Parity divergences
 

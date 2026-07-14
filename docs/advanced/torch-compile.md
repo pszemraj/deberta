@@ -52,22 +52,14 @@ attention primitive rather than upstream Python autograd wrappers, config caches
 In particular, the `bias_docblock_specialized` backward stays behind the same op boundary -
 specialization changes which kernels launch, not what Dynamo sees.
 
-Two metadata contracts matter for graph stability:
+The data pipeline defines the [attention and objective metadata contract](../guides/data-pipeline.md#cross-document-attention-blocking). Two properties keep it compile-stable:
 
 - Padded fixed/varlen batches carry mask-derived lengths plus a static prefix attestation. Route
   dispatch reads only that Python-level contract; it does not call `torch.equal`, `.item()`, or
   `bool(tensor)` in each layer. Device masks without an attestation take the eager route.
-- Ragged doc-block batches keep the 2D keep mask plus fixed-shape segment descriptors sized to
-  `B*S`. The opaque doc-block op slices the active segment prefix, repacks those document spans
-  into a ragged batch, runs the disentangled varlen kernels, and scatters results back into the
-  packed layout. The fixed-shape descriptors keep the compiled `masked_docblock_*` entrypoints
-  from recompiling when the number of documents per packed batch changes.
-- Packed objective metadata is also fixed-shape: `position_ids (B,S)` passes through the compiled
-  backbone, while `doc_context_index (B,S)` is consumed by the eager RTD head outside the compiled
-  scope. Document count changes do not change either tensor's shape.
-- Dense (unpadded) batches route through a fast path that takes no flash metadata at all;
-  dense-route metadata is semantically empty by contract, so nothing dynamic threads through the
-  Dynamo guards.
+- Ragged doc-block descriptors and objective metadata have fixed shapes. Document-count changes therefore do not recompile the `masked_docblock_*` entrypoints, and the eager RTD head consumes its document context outside the compiled scope.
+
+Dense, unpadded batches take a fast path with no Flash metadata, so no dynamic metadata threads through Dynamo guards.
 
 The padded-varlen custom op uses a `B,S,H,D` internal layout and repo-local prefix-pack Triton
 kernels. Because repo masks use standard prefix padding, active tokens pack and repad directly

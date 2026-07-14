@@ -53,13 +53,7 @@ preparation reconciles any supplied lengths and counters, then carries a static 
 the model. Unattested device masks use eager attention without a tensor-to-Python layout check in
 each layer.
 
-Packed doc-block batches use a two-stage collator and batch-preparation contract described in the
-[Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking). Dense doc-block
-attention consumes a pairwise keep mask. Ragged doc-block attention consumes the two-dimensional
-keep mask plus fixed-capacity segment descriptors. Before transfer, validation proves that segments
-do not overlap, stay inside their batch rows, exactly cover active positions, match document
-boundaries, and agree with cumulative lengths. The doc-block routes do not use
-`FlashBatchMeta.seq_lengths`; only the validated metadata object reaches the model.
+Packed doc-block batches accept only metadata prepared through the contract described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking).
 
 Per-call eager fallbacks preserve semantics:
 
@@ -123,10 +117,6 @@ Packed benchmark configs are under [`configs/flashdeberta/`](../../configs/flash
 ## Runtime caveats
 
 - Dense doc-block position gradients use atomic accumulation, so flash runs are not bitwise reproducible. Any manual or external comparison of resumed and uninterrupted runs must use numeric tolerances; the trainer does not run a separate numerical-drift detector.
-- Dense flash-with-bias routes trade memory for recomputation by saving `(B,H,S,S)` bias tensors
-  for backward. Table bounds keep unmeasured shapes on ragged routes unless explicitly bypassed.
-- Python route counters are disabled during `torch.compile`. Host-side batch preparation still
-  reports non-prefix eager fallbacks and doc-block route choices once per shape on rank zero.
 - Training uses `drop_last=True` because doc-block route choice depends on batch shape; allowing a
   smaller final batch could change routes and trigger recompilation mid-epoch.
 - FSDP2, `torch.compile`, and flash work through compatible wrapping boundaries, but the combined
