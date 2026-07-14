@@ -184,8 +184,9 @@ def _materialize_fixed_seq_lengths(
     return torch.full((batch_size,), int(query_len), dtype=torch.int32, device=device)
 
 
-def _fixed_forward_config(
+def _fixed_config(
     *,
+    kind: str,
     query_len: int,
     key_len: int,
     head_dim: int,
@@ -196,8 +197,9 @@ def _fixed_forward_config(
     device: torch.device,
     has_pos: bool,
 ) -> tuple[int, int, int, int]:
-    """Resolve the fixed forward Triton tile config.
+    """Resolve a fixed forward or backward Triton tile config.
 
+    :param str kind: Either ``"fwd"`` or ``"bwd"``.
     :param int query_len: Query sequence length.
     :param int key_len: Key sequence length.
     :param int head_dim: Per-head hidden size.
@@ -212,50 +214,7 @@ def _fixed_forward_config(
 
     att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     tuned = _fixed_repo_tuned_config(
-        kind="fwd",
-        query_len=query_len,
-        key_len=key_len,
-        head_dim=head_dim,
-        causal=bool(causal),
-        disentangled=bool(has_pos),
-        att_span=att_span,
-        dtype=dtype,
-        device=device,
-    )
-    if tuned is not None:
-        return tuned
-    return CONSERVATIVE_FLASH_KERNEL_CONFIG
-
-
-def _fixed_backward_config(
-    *,
-    query_len: int,
-    key_len: int,
-    head_dim: int,
-    causal: bool,
-    position_buckets: int,
-    max_relative_distance: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    has_pos: bool,
-) -> tuple[int, int, int, int]:
-    """Resolve the fixed backward Triton tile config.
-
-    :param int query_len: Query sequence length.
-    :param int key_len: Key sequence length.
-    :param int head_dim: Per-head hidden size.
-    :param bool causal: Whether causal masking is enabled.
-    :param int position_buckets: Relative-position bucket count.
-    :param int max_relative_distance: Maximum relative distance.
-    :param torch.dtype dtype: Activation dtype.
-    :param torch.device device: CUDA device.
-    :param bool has_pos: Whether any disentangled positional term is active.
-    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
-    """
-
-    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
-    tuned = _fixed_repo_tuned_config(
-        kind="bwd",
+        kind=kind,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
@@ -313,7 +272,8 @@ def _fixed_eager_forward_impl(
     key_len = int(key_layer.shape[-2])
     if _flash_attn_v2_fwd_dise_lowlevel is not None:
         att_span = disentangled_attention_span(position_buckets, max_relative_distance)
-        block_m, block_n, num_stages, num_warps = _fixed_forward_config(
+        block_m, block_n, num_stages, num_warps = _fixed_config(
+            kind="fwd",
             query_len=query_len,
             key_len=key_len,
             head_dim=head_dim,
@@ -399,7 +359,8 @@ def _fixed_triton_forward_impl(
     key_len = int(k.shape[2])
     head_dim = int(q.shape[3])
     att_span = disentangled_attention_span(position_buckets, max_relative_distance)
-    block_m, block_n, num_stages, num_warps = _fixed_forward_config(
+    block_m, block_n, num_stages, num_warps = _fixed_config(
+        kind="fwd",
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
@@ -529,7 +490,8 @@ def _fixed_triton_backward_impl(
     key_len = int(k.shape[2])
     head_dim = int(q.shape[3])
     att_span = disentangled_attention_span(position_buckets, max_relative_distance)
-    block_m, block_n, num_stages, num_warps = _fixed_backward_config(
+    block_m, block_n, num_stages, num_warps = _fixed_config(
+        kind="bwd",
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,

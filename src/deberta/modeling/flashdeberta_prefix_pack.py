@@ -8,22 +8,14 @@ from typing import Any
 import torch
 
 from deberta.modeling.flashdeberta_segment_pack import (
-    flashdeberta_segment_pack_available,
     segment_pack_optional_pair,
     segment_pack_padded_rows,
     segment_pack_padded_rows_pair,
     segment_pack_padded_rows_triple,
     segment_unpack_optional_pair,
     segment_unpack_padded_rows,
-    segment_unpack_padded_rows_pair,
     segment_unpack_padded_rows_triple,
 )
-
-
-def flashdeberta_prefix_pack_available() -> bool:
-    """Return whether the unified Triton row-copy primitives are available."""
-
-    return flashdeberta_segment_pack_available()
 
 
 def _prefix_segment_metadata(
@@ -239,37 +231,6 @@ def prefix_unpack_padded_rows(
     )
 
 
-def prefix_unpack_padded_rows_pair(
-    packed_a: torch.Tensor,
-    packed_b: torch.Tensor,
-    *,
-    seqlens: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    batch_size: int,
-    seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scatter two packed tensors into prefix-padded layout.
-
-    :param torch.Tensor packed_a: First packed tensor.
-    :param torch.Tensor packed_b: Second packed tensor.
-    :param torch.Tensor seqlens: Per-example prefix lengths.
-    :param torch.Tensor cu_seqlens: Packed cumulative lengths.
-    :param int batch_size: Padded batch size.
-    :param int seq_len: Padded sequence length.
-    :return tuple[torch.Tensor, torch.Tensor]: Padded tensors.
-    """
-
-    return _unpack(
-        segment_unpack_padded_rows_pair,
-        packed_a,
-        packed_b,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=batch_size,
-        seq_len=seq_len,
-    )
-
-
 def prefix_unpack_padded_rows_triple(
     packed_a: torch.Tensor,
     packed_b: torch.Tensor,
@@ -375,13 +336,11 @@ def prefix_unpack_optional_pair(
 
 
 __all__ = [
-    "flashdeberta_prefix_pack_available",
     "prefix_pack_optional_pair",
     "prefix_pack_padded_rows",
     "prefix_pack_padded_rows_pair",
     "prefix_pack_padded_rows_triple",
     "prefix_unpack_optional_pair",
     "prefix_unpack_padded_rows",
-    "prefix_unpack_padded_rows_pair",
     "prefix_unpack_padded_rows_triple",
 ]

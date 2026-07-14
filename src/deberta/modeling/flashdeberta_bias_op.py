@@ -204,80 +204,6 @@ def _bias_config(
     return CONSERVATIVE_FLASH_KERNEL_CONFIG
 
 
-def _bias_forward_config(
-    *,
-    batch_size: int,
-    num_heads: int,
-    query_len: int,
-    key_len: int,
-    head_dim: int,
-    causal: bool,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[int, int, int, int]:
-    """Resolve the dense-bias forward Triton tile config.
-
-    :param int batch_size: Batch size.
-    :param int num_heads: Number of attention heads.
-    :param int query_len: Query sequence length.
-    :param int key_len: Key sequence length.
-    :param int head_dim: Per-head hidden size.
-    :param bool causal: Whether causal masking is enabled.
-    :param torch.dtype dtype: Activation dtype.
-    :param torch.device device: CUDA device.
-    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
-    """
-
-    return _bias_config(
-        kind="fwd",
-        batch_size=batch_size,
-        num_heads=num_heads,
-        query_len=query_len,
-        key_len=key_len,
-        head_dim=head_dim,
-        causal=bool(causal),
-        dtype=dtype,
-        device=device,
-    )
-
-
-def _bias_backward_config(
-    *,
-    batch_size: int,
-    num_heads: int,
-    query_len: int,
-    key_len: int,
-    head_dim: int,
-    causal: bool,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[int, int, int, int]:
-    """Resolve the dense-bias backward Triton tile config.
-
-    :param int batch_size: Batch size.
-    :param int num_heads: Number of attention heads.
-    :param int query_len: Query sequence length.
-    :param int key_len: Key sequence length.
-    :param int head_dim: Per-head hidden size.
-    :param bool causal: Whether causal masking is enabled.
-    :param torch.dtype dtype: Activation dtype.
-    :param torch.device device: CUDA device.
-    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
-    """
-
-    return _bias_config(
-        kind="bwd",
-        batch_size=batch_size,
-        num_heads=num_heads,
-        query_len=query_len,
-        key_len=key_len,
-        head_dim=head_dim,
-        causal=causal,
-        dtype=dtype,
-        device=device,
-    )
-
-
 def _resolve_bias_bwd_kernel_config(
     *,
     kind: str,
@@ -327,7 +253,8 @@ def _resolve_bias_bwd_kernel_config(
     if repo_tuned is not None:
         return repo_tuned
 
-    return _bias_backward_config(
+    return _bias_config(
+        kind="bwd",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,
@@ -1467,7 +1394,8 @@ def _bias_eager_forward_impl(
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
-    block_m, block_n, num_stages, num_warps = _bias_forward_config(
+    block_m, block_n, num_stages, num_warps = _bias_config(
+        kind="fwd",
         batch_size=batch_size,
         num_heads=num_heads,
         query_len=query_len,
@@ -1524,7 +1452,8 @@ def _bias_generic_backward_impl(
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
     if _bwd_preprocess_bias_raw is None or _bwd_kv_kernel_bias_raw is None or _bwd_q_kernel_bias_raw is None:
-        block_m, block_n, num_stages, num_warps = _bias_backward_config(
+        block_m, block_n, num_stages, num_warps = _bias_config(
+            kind="bwd",
             batch_size=batch_size,
             num_heads=num_heads,
             query_len=query_len,

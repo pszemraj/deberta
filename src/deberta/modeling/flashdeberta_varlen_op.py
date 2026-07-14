@@ -238,6 +238,7 @@ def _varlen_repo_tuned_bwd_config(
 
 def _varlen_repo_tuned_fwd_config(
     *,
+    route: str = "varlen",
     seq_len: int,
     total_tokens: int,
     batch_size: int,
@@ -250,6 +251,7 @@ def _varlen_repo_tuned_fwd_config(
 ) -> tuple[int, int, int, int] | None:
     """Return a table-driven varlen forward-kernel config, if one matches.
 
+    :param str route: Tuning-table route namespace.
     :param int seq_len: Padded sequence length.
     :param int total_tokens: Active token count.
     :param int batch_size: Batch size.
@@ -265,7 +267,7 @@ def _varlen_repo_tuned_fwd_config(
     return resolve_repo_tuned_config(
         guard=lambda: True,
         compute_capability=lambda: device_compute_capability(device),
-        route="varlen",
+        route=route,
         kind="fwd",
         seq_len=seq_len,
         total_tokens=total_tokens,
@@ -275,6 +277,106 @@ def _varlen_repo_tuned_fwd_config(
         causal=causal,
         disentangled=disentangled,
         att_span=att_span,
+    )
+
+
+def _run_packed_varlen_forward(
+    *,
+    route: str,
+    q_unpad: torch.Tensor,
+    k_unpad: torch.Tensor,
+    v_unpad: torch.Tensor,
+    pos_key_unpad: torch.Tensor | None,
+    pos_query_unpad: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    batch_size: int,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    att_span: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run one already-packed varlen forward pass.
+
+    :param str route: Tuning-table route namespace.
+    :param torch.Tensor q_unpad: Packed queries.
+    :param torch.Tensor k_unpad: Packed keys.
+    :param torch.Tensor v_unpad: Packed values.
+    :param torch.Tensor | None pos_key_unpad: Optional packed c2p tensor.
+    :param torch.Tensor | None pos_query_unpad: Optional packed p2c tensor.
+    :param torch.Tensor cu_seqlens: Packed cumulative sequence lengths.
+    :param int max_seqlen: Maximum packed sequence length.
+    :param int batch_size: Number of packed sequences used for tuning.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param int att_span: Effective relative-position span.
+    :raises RuntimeError: If neither upstream varlen forward implementation is available.
+    :return tuple[torch.Tensor, torch.Tensor | None]: Packed output and optional packed LSE.
+    """
+
+    if _flash_attn_v2_fwd_dise_lowlevel is not None:
+        table_config = _varlen_repo_tuned_fwd_config(
+            route=route,
+            seq_len=max_seqlen,
+            total_tokens=int(q_unpad.shape[0]),
+            batch_size=batch_size,
+            head_dim=int(q_unpad.shape[-1]),
+            causal=bool(causal),
+            disentangled=True,
+            att_span=att_span,
+            dtype=q_unpad.dtype,
+            device=q_unpad.device,
+        )
+        block_m, block_n, num_stages, num_warps = (
+            table_config if table_config is not None else CONSERVATIVE_FLASH_KERNEL_CONFIG
+        )
+        return _flash_attn_v2_fwd_dise_lowlevel(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            bool(causal),
+            float(sm_scale),
+            block_m,
+            block_n,
+            int(position_buckets),
+            int(max_relative_distance),
+            num_warps,
+            num_stages,
+            att_span,
+        )
+
+    if _flash_attention_with_disentangled_varlen_highlevel is not None:
+        output = _flash_attention_with_disentangled_varlen_highlevel(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            bool(causal),
+            float(sm_scale),
+            int(position_buckets),
+            int(max_relative_distance),
+        )
+        return output, None
+
+    detail = flashdeberta_varlen_import_error()
+    raise RuntimeError(
+        "FlashDeBERTa varlen attention is unavailable."
+        if detail is None
+        else f"FlashDeBERTa varlen attention is unavailable ({detail})."
     )
 
 
@@ -390,26 +492,6 @@ def _mask_metadata_cache_key(
         str(mask_2d.device),
         _mask_version(mask_2d),
     )
-
-
-def _clear_unpad_metadata_cache() -> None:
-    """Clear cached unpadding metadata.
-
-    This exists primarily for tests.
-    """
-
-    _MASK_METADATA_CACHE.clear()
-    _CU_SEQLENS_HOST_CACHE.clear()
-    _MID_TENSOR_CACHE.clear()
-
-
-def _clear_mid_tensor_cache() -> None:
-    """Clear cached varlen mid tensors.
-
-    This exists primarily for tests.
-    """
-
-    _MID_TENSOR_CACHE.clear()
 
 
 def _register_cu_seqlens_host_tuple(
@@ -1189,59 +1271,22 @@ def _varlen_eager_forward_impl(
         total_tokens=total_tokens,
     )
 
-    if _flash_attn_v2_fwd_dise_lowlevel is not None:
-        table_config = _varlen_repo_tuned_fwd_config(
-            seq_len=max_seqlen,
-            total_tokens=int(q_unpad.shape[0]),
-            batch_size=int(query_layer.shape[0]),
-            head_dim=int(query_layer.shape[-1]),
-            causal=bool(causal),
-            disentangled=True,
-            att_span=att_span,
-            dtype=query_layer.dtype,
-            device=query_layer.device,
-        )
-        if table_config is not None:
-            block_m, block_n, num_stages, num_warps = table_config
-        else:
-            block_m, block_n, num_stages, num_warps = CONSERVATIVE_FLASH_KERNEL_CONFIG
-        out_unpad, lse_unpad = _flash_attn_v2_fwd_dise_lowlevel(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            pos_key_unpad,
-            pos_query_unpad,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            bool(causal),
-            float(sm_scale),
-            block_m,
-            block_n,
-            int(position_buckets),
-            int(max_relative_distance),
-            num_warps,
-            num_stages,
-            att_span,
-        )
-    else:
-        out_unpad = _flash_attention_with_disentangled_varlen_highlevel(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            pos_key_unpad,
-            pos_query_unpad,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            bool(causal),
-            float(sm_scale),
-            int(position_buckets),
-            int(max_relative_distance),
-        )
-        lse_unpad = None
+    out_unpad, lse_unpad = _run_packed_varlen_forward(
+        route="varlen",
+        q_unpad=q_unpad,
+        k_unpad=k_unpad,
+        v_unpad=v_unpad,
+        pos_key_unpad=pos_key_unpad,
+        pos_query_unpad=pos_query_unpad,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        batch_size=batch_size,
+        sm_scale=sm_scale,
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        causal=causal,
+        att_span=att_span,
+    )
 
     out_padded = prefix_unpack_padded_rows(
         out_unpad,

@@ -18,18 +18,9 @@ from typing import Any
 import torch
 
 import deberta.modeling.flashdeberta_varlen_op as _varlen_mod
-from deberta.modeling.flashdeberta_kernel_tuning import (
-    CONSERVATIVE_FLASH_KERNEL_CONFIG,
-    FlashKernelContext,
-    resolve_flash_kernel_config,
-)
 from deberta.modeling.flashdeberta_op_utils import (
-    device_compute_capability,
     disentangled_attention_span,
     lookup_existing_op_pair,
-)
-from deberta.modeling.flashdeberta_op_utils import (
-    kernel_dtype_name as _kernel_dtype_name,
 )
 from deberta.modeling.flashdeberta_packed_backward import (
     PackedBackwardInputs,
@@ -323,63 +314,22 @@ def _docblock_forward_impl(
         max_segment_length=max_seqlen,
     )
 
-    if _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is not None:
-        table_config = resolve_flash_kernel_config(
-            FlashKernelContext(
-                compute_capability=device_compute_capability(query_layer.device),
-                route="docblock",
-                kind="fwd",
-                seq_len=int(max_seqlen),
-                total_tokens=int(q_unpad.shape[0]),
-                batch_size=int(num_segments),
-                head_dim=int(query_layer.shape[-1]),
-                dtype=_kernel_dtype_name(query_layer.dtype),
-                causal=bool(causal),
-                disentangled=True,
-                att_span=int(att_span),
-            )
-        )
-        if table_config is not None:
-            block_m, block_n, num_stages, num_warps = table_config
-        else:
-            block_m, block_n, num_stages, num_warps = CONSERVATIVE_FLASH_KERNEL_CONFIG
-        out_unpad, lse_unpad = _varlen_mod._flash_attn_v2_fwd_dise_lowlevel(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            pos_key_unpad,
-            pos_query_unpad,
-            active_cu_seqlens,
-            active_cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            bool(causal),
-            float(sm_scale),
-            block_m,
-            block_n,
-            int(position_buckets),
-            int(max_relative_distance),
-            num_warps,
-            num_stages,
-            att_span,
-        )
-    else:
-        out_unpad = _varlen_mod._flash_attention_with_disentangled_varlen_highlevel(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            pos_key_unpad,
-            pos_query_unpad,
-            active_cu_seqlens,
-            active_cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            bool(causal),
-            float(sm_scale),
-            int(position_buckets),
-            int(max_relative_distance),
-        )
-        lse_unpad = None
+    out_unpad, lse_unpad = _varlen_mod._run_packed_varlen_forward(
+        route="docblock",
+        q_unpad=q_unpad,
+        k_unpad=k_unpad,
+        v_unpad=v_unpad,
+        pos_key_unpad=pos_key_unpad,
+        pos_query_unpad=pos_query_unpad,
+        cu_seqlens=active_cu_seqlens,
+        max_seqlen=max_seqlen,
+        batch_size=num_segments,
+        sm_scale=sm_scale,
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        causal=causal,
+        att_span=att_span,
+    )
 
     out_padded = segment_unpack_padded_rows(
         out_unpad,

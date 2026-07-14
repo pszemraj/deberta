@@ -227,6 +227,118 @@ def _pack_segment_grad_and_delta_kernel(
     tl.store(delta_ptrs, delta, mask=mask_rows)
 
 
+def _segment_pack_padded_rows(
+    tensors: tuple[torch.Tensor, ...],
+    *,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    max_segment_length: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Pack one or more padded tensors with shared segment metadata.
+
+    :param tuple[torch.Tensor, ...] tensors: Input tensors with shape ``(B, S, ...)``.
+    :param torch.Tensor segment_offsets: Flat ``(B*S)`` source row offsets per segment.
+    :param torch.Tensor segment_lengths: Per-segment lengths.
+    :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
+    :param int total_tokens: Total packed token count.
+    :param int | None max_segment_length: Host-side maximum segment length.
+    :return tuple[torch.Tensor, ...]: Packed tensors with shape ``(NNZ, ...)``.
+    """
+
+    if not tensors:
+        raise ValueError("Segment-pack requires at least one input tensor")
+    if len(tensors) == 1:
+        shape = tuple(int(dim) for dim in tensors[0].shape)
+        if len(shape) < 2:
+            raise ValueError(f"Segment-pack tensor must have rank >= 2, got shape {shape}")
+    else:
+        shape = require_matching_tensor_layout(
+            *tensors,
+            context="Segment-pack padded tensors",
+            minimum_rank=2,
+        )
+    trailing_shape = shape[2:]
+    total = max(0, int(total_tokens))
+    outputs = tuple(tensor.new_empty((total,) + trailing_shape) for tensor in tensors)
+    if total == 0:
+        return outputs
+    output_flats = tuple(output.view(total, -1) for output in outputs)
+    row_size = int(output_flats[0].shape[1])
+    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
+
+    if _can_use_triton_segment_rank4_pack(
+        tensors,
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+    ) and any(not tensor.is_contiguous() for tensor in tensors):
+        num_heads = int(shape[2])
+        feature_size = int(shape[3])
+        launch_triton_row_copy(
+            tensors,
+            output_flats,
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
+            seq_len=int(shape[1]),
+            row_size=row_size,
+            max_rows=max_len,
+            num_heads=num_heads,
+            feature_size=feature_size,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
+            num_warps=_SEGMENT_NUM_WARPS,
+            num_stages=_SEGMENT_NUM_STAGES,
+        )
+        return outputs
+
+    contiguous_tensors = tuple(
+        tensor if tensor.is_contiguous() else tensor.contiguous() for tensor in tensors
+    )
+    flattened = tuple(_flatten_rows(tensor)[0] for tensor in contiguous_tensors)
+    seq_len = int(shape[1])
+
+    if _can_use_triton_segment_pack(
+        tensor=contiguous_tensors[0],
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+    ):
+        launch_triton_row_copy(
+            flattened,
+            output_flats,
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
+            seq_len=seq_len,
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
+            num_warps=_SEGMENT_NUM_WARPS,
+            num_stages=_SEGMENT_NUM_STAGES,
+        )
+        return outputs
+
+    offsets_host = _tensor_host_tuple(segment_offsets)
+    lengths_host = _tensor_host_tuple(segment_lengths)
+    cu_host = _tensor_host_tuple(cu_seqlens)
+    for idx, src_base in enumerate(offsets_host):
+        seg_len = int(lengths_host[idx])
+        if seg_len <= 0:
+            continue
+        dst_base = int(cu_host[idx])
+        src_slice = slice(src_base, src_base + seg_len)
+        dst_slice = slice(dst_base, dst_base + seg_len)
+        for output_flat, flat in zip(output_flats, flattened, strict=True):
+            output_flat[dst_slice].copy_(flat[src_slice])
+    return outputs
+
+
 def segment_pack_padded_rows(
     tensor: torch.Tensor,
     *,
@@ -247,82 +359,14 @@ def segment_pack_padded_rows(
     :return torch.Tensor: Packed tensor with shape ``(NNZ, ...)``.
     """
 
-    trailing_shape = tuple(int(dim) for dim in tensor.shape[2:])
-    total = max(0, int(total_tokens))
-    output = tensor.new_empty((total,) + trailing_shape)
-    if total == 0:
-        return output
-    out_flat = output.view(total, -1)
-    row_size = int(out_flat.shape[1])
-    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
-
-    if (
-        _can_use_triton_segment_rank4_pack(
-            (tensor,),
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-        )
-        and not tensor.is_contiguous()
-    ):
-        num_heads = int(tensor.shape[2])
-        feature_size = int(tensor.shape[3])
-        launch_triton_row_copy(
-            (tensor,),
-            (out_flat,),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
-            seq_len=int(tensor.shape[1]),
-            row_size=row_size,
-            max_rows=max_len,
-            num_heads=num_heads,
-            feature_size=feature_size,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return output
-
-    if not tensor.is_contiguous():
-        tensor = tensor.contiguous()
-    flat, _, _batch_size, seq_len = _flatten_rows(tensor)
-
-    if _can_use_triton_segment_pack(
-        tensor=tensor,
+    return _segment_pack_padded_rows(
+        (tensor,),
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
-    ):
-        launch_triton_row_copy(
-            (flat,),
-            (out_flat,),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
-            seq_len=seq_len,
-            row_size=row_size,
-            max_rows=max_len,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return output
-
-    offsets_host = _tensor_host_tuple(segment_offsets)
-    lengths_host = _tensor_host_tuple(segment_lengths)
-    cu_host = _tensor_host_tuple(cu_seqlens)
-    for idx, src_base in enumerate(offsets_host):
-        seg_len = int(lengths_host[idx])
-        if seg_len <= 0:
-            continue
-        dst_base = int(cu_host[idx])
-        out_flat[dst_base : dst_base + seg_len].copy_(flat[src_base : src_base + seg_len])
-    return output
+        total_tokens=total_tokens,
+        max_segment_length=max_segment_length,
+    )[0]
 
 
 def segment_pack_padded_rows_pair(
@@ -347,89 +391,14 @@ def segment_pack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
-    shape = require_matching_tensor_layout(
-        tensor_a, tensor_b, context="Segment-pack padded tensors", minimum_rank=2
-    )
-    trailing_shape = shape[2:]
-    total = max(0, int(total_tokens))
-    out_a = tensor_a.new_empty((total,) + trailing_shape)
-    out_b = tensor_b.new_empty((total,) + trailing_shape)
-    if total == 0:
-        return out_a, out_b
-    out_flat_a = out_a.view(total, -1)
-    out_flat_b = out_b.view(total, -1)
-    row_size = int(out_flat_a.shape[1])
-    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
-
-    if _can_use_triton_segment_rank4_pack(
+    out_a, out_b = _segment_pack_padded_rows(
         (tensor_a, tensor_b),
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
-    ) and (not tensor_a.is_contiguous() or not tensor_b.is_contiguous()):
-        num_heads = int(tensor_a.shape[2])
-        feature_size = int(tensor_a.shape[3])
-        launch_triton_row_copy(
-            (tensor_a, tensor_b),
-            (out_flat_a, out_flat_b),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
-            seq_len=int(shape[1]),
-            row_size=row_size,
-            max_rows=max_len,
-            num_heads=num_heads,
-            feature_size=feature_size,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return out_a, out_b
-
-    if not tensor_a.is_contiguous():
-        tensor_a = tensor_a.contiguous()
-    if not tensor_b.is_contiguous():
-        tensor_b = tensor_b.contiguous()
-    flat_a, _, _batch_size, seq_len = _flatten_rows(tensor_a)
-    flat_b, _, _, _ = _flatten_rows(tensor_b)
-
-    if _can_use_triton_segment_pack(
-        tensor=tensor_a,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
-    ):
-        launch_triton_row_copy(
-            (flat_a, flat_b),
-            (out_flat_a, out_flat_b),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
-            seq_len=seq_len,
-            row_size=row_size,
-            max_rows=max_len,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return out_a, out_b
-
-    offsets_host = _tensor_host_tuple(segment_offsets)
-    lengths_host = _tensor_host_tuple(segment_lengths)
-    cu_host = _tensor_host_tuple(cu_seqlens)
-    for idx, src_base in enumerate(offsets_host):
-        seg_len = int(lengths_host[idx])
-        if seg_len <= 0:
-            continue
-        dst_base = int(cu_host[idx])
-        src_slice = slice(src_base, src_base + seg_len)
-        dst_slice = slice(dst_base, dst_base + seg_len)
-        out_flat_a[dst_slice].copy_(flat_a[src_slice])
-        out_flat_b[dst_slice].copy_(flat_b[src_slice])
+        total_tokens=total_tokens,
+        max_segment_length=max_segment_length,
+    )
     return out_a, out_b
 
 
@@ -457,99 +426,14 @@ def segment_pack_padded_rows_triple(
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Packed tensors ``(NNZ, ...)``.
     """
 
-    shape = require_matching_tensor_layout(
-        tensor_a,
-        tensor_b,
-        tensor_c,
-        context="Segment-pack padded tensors",
-        minimum_rank=2,
-    )
-    trailing_shape = shape[2:]
-    total = max(0, int(total_tokens))
-    out_a = tensor_a.new_empty((total,) + trailing_shape)
-    out_b = tensor_b.new_empty((total,) + trailing_shape)
-    out_c = tensor_c.new_empty((total,) + trailing_shape)
-    if total == 0:
-        return out_a, out_b, out_c
-    out_flat_a = out_a.view(total, -1)
-    out_flat_b = out_b.view(total, -1)
-    out_flat_c = out_c.view(total, -1)
-    row_size = int(out_flat_a.shape[1])
-    max_len = max(1, int(max_segment_length if max_segment_length is not None else total))
-
-    if _can_use_triton_segment_rank4_pack(
+    out_a, out_b, out_c = _segment_pack_padded_rows(
         (tensor_a, tensor_b, tensor_c),
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
-    ) and (not tensor_a.is_contiguous() or not tensor_b.is_contiguous() or not tensor_c.is_contiguous()):
-        num_heads = int(tensor_a.shape[2])
-        feature_size = int(tensor_a.shape[3])
-        launch_triton_row_copy(
-            (tensor_a, tensor_b, tensor_c),
-            (out_flat_a, out_flat_b, out_flat_c),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
-            seq_len=int(shape[1]),
-            row_size=row_size,
-            max_rows=max_len,
-            num_heads=num_heads,
-            feature_size=feature_size,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return out_a, out_b, out_c
-
-    if not tensor_a.is_contiguous():
-        tensor_a = tensor_a.contiguous()
-    if not tensor_b.is_contiguous():
-        tensor_b = tensor_b.contiguous()
-    if not tensor_c.is_contiguous():
-        tensor_c = tensor_c.contiguous()
-    flat_a, _, _batch_size, seq_len = _flatten_rows(tensor_a)
-    flat_b, _, _, _ = _flatten_rows(tensor_b)
-    flat_c, _, _, _ = _flatten_rows(tensor_c)
-
-    if _can_use_triton_segment_pack(
-        tensor=tensor_a,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
-    ):
-        launch_triton_row_copy(
-            (flat_a, flat_b, flat_c),
-            (out_flat_a, out_flat_b, out_flat_c),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_PACK,
-            seq_len=seq_len,
-            row_size=row_size,
-            max_rows=max_len,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return out_a, out_b, out_c
-
-    offsets_host = _tensor_host_tuple(segment_offsets)
-    lengths_host = _tensor_host_tuple(segment_lengths)
-    cu_host = _tensor_host_tuple(cu_seqlens)
-    for idx, src_base in enumerate(offsets_host):
-        seg_len = int(lengths_host[idx])
-        if seg_len <= 0:
-            continue
-        dst_base = int(cu_host[idx])
-        src_slice = slice(src_base, src_base + seg_len)
-        dst_slice = slice(dst_base, dst_base + seg_len)
-        out_flat_a[dst_slice].copy_(flat_a[src_slice])
-        out_flat_b[dst_slice].copy_(flat_b[src_slice])
-        out_flat_c[dst_slice].copy_(flat_c[src_slice])
+        total_tokens=total_tokens,
+        max_segment_length=max_segment_length,
+    )
     return out_a, out_b, out_c
 
 
@@ -663,6 +547,89 @@ def segment_pack_grad_and_delta_from_padded(
     return grad_unpad, delta
 
 
+def _segment_unpack_padded_rows(
+    packed_tensors: tuple[torch.Tensor, ...],
+    *,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    max_segment_length: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Scatter one or more packed tensors with shared segment metadata.
+
+    :param tuple[torch.Tensor, ...] packed_tensors: Packed tensors with shape ``(NNZ, ...)``.
+    :param torch.Tensor segment_offsets: Flat padded row offsets per segment.
+    :param torch.Tensor segment_lengths: Per-segment lengths.
+    :param torch.Tensor cu_seqlens: Cumulative packed offsets per segment.
+    :param int batch_size: Output batch size.
+    :param int seq_len: Output padded sequence length.
+    :param int | None max_segment_length: Host-side maximum segment length.
+    :return tuple[torch.Tensor, ...]: Padded tensors with shape ``(B, S, ...)``.
+    """
+
+    if not packed_tensors:
+        raise ValueError("Segment-unpack requires at least one packed tensor")
+    if len(packed_tensors) == 1:
+        shape = tuple(int(dim) for dim in packed_tensors[0].shape)
+        if not shape:
+            raise ValueError("Segment-pack packed tensor must have rank >= 1")
+    else:
+        shape = require_matching_tensor_layout(
+            *packed_tensors,
+            context="Segment-pack packed tensors",
+        )
+    total = int(shape[0])
+    trailing_shape = shape[1:]
+    flattened = tuple(packed.contiguous().view(total, -1) for packed in packed_tensors)
+    outputs = tuple(
+        packed.new_zeros((int(batch_size), int(seq_len)) + trailing_shape) for packed in packed_tensors
+    )
+    if total == 0:
+        return outputs
+    output_flats = tuple(output.view(int(batch_size) * int(seq_len), -1) for output in outputs)
+    row_size = int(flattened[0].shape[1])
+
+    if _can_use_triton_segment_pack(
+        tensor=outputs[0],
+        segment_offsets=segment_offsets,
+        segment_lengths=segment_lengths,
+        cu_seqlens=cu_seqlens,
+    ):
+        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
+        launch_triton_row_copy(
+            flattened,
+            output_flats,
+            offsets=segment_offsets,
+            lengths=segment_lengths,
+            cu_seqlens=cu_seqlens,
+            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
+            seq_len=int(seq_len),
+            row_size=row_size,
+            max_rows=max_len,
+            block_rows=_SEGMENT_BLOCK_ROWS,
+            block_cols=_SEGMENT_BLOCK_COLS,
+            num_warps=_SEGMENT_NUM_WARPS,
+            num_stages=_SEGMENT_NUM_STAGES,
+        )
+        return outputs
+
+    offsets_host = _tensor_host_tuple(segment_offsets)
+    lengths_host = _tensor_host_tuple(segment_lengths)
+    cu_host = _tensor_host_tuple(cu_seqlens)
+    for idx, dst_base in enumerate(offsets_host):
+        seg_len = int(lengths_host[idx])
+        if seg_len <= 0:
+            continue
+        src_base = int(cu_host[idx])
+        src_slice = slice(src_base, src_base + seg_len)
+        dst_slice = slice(dst_base, dst_base + seg_len)
+        for output_flat, flat in zip(output_flats, flattened, strict=True):
+            output_flat[dst_slice].copy_(flat[src_slice])
+    return outputs
+
+
 def segment_unpack_padded_rows(
     packed: torch.Tensor,
     *,
@@ -685,51 +652,15 @@ def segment_unpack_padded_rows(
     :return torch.Tensor: Padded tensor with shape ``(B, S, ...)``.
     """
 
-    total = int(packed.shape[0])
-    trailing_shape = tuple(int(dim) for dim in packed.shape[1:])
-    flat = packed.contiguous().view(total, -1)
-    output = packed.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
-    if total == 0:
-        return output
-    out_flat = output.view(int(batch_size) * int(seq_len), -1)
-    row_size = int(flat.shape[1])
-
-    if _can_use_triton_segment_pack(
-        tensor=output,
+    return _segment_unpack_padded_rows(
+        (packed,),
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
-    ):
-        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
-        launch_triton_row_copy(
-            (flat,),
-            (out_flat,),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
-            seq_len=int(seq_len),
-            row_size=row_size,
-            max_rows=max_len,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return output
-
-    offsets_host = _tensor_host_tuple(segment_offsets)
-    lengths_host = _tensor_host_tuple(segment_lengths)
-    cu_host = _tensor_host_tuple(cu_seqlens)
-    for idx, dst_base in enumerate(offsets_host):
-        seg_len = int(lengths_host[idx])
-        if seg_len <= 0:
-            continue
-        src_base = int(cu_host[idx])
-        src_slice = slice(src_base, src_base + seg_len)
-        dst_slice = slice(dst_base, dst_base + seg_len)
-        out_flat[dst_slice].copy_(flat[src_slice])
-    return output
+        batch_size=batch_size,
+        seq_len=seq_len,
+        max_segment_length=max_segment_length,
+    )[0]
 
 
 def segment_unpack_padded_rows_pair(
@@ -756,55 +687,15 @@ def segment_unpack_padded_rows_pair(
     :return tuple[torch.Tensor, torch.Tensor]: Padded tensors ``(B, S, ...)``.
     """
 
-    shape = require_matching_tensor_layout(packed_a, packed_b, context="Segment-pack packed tensors")
-    total = int(shape[0])
-    trailing_shape = shape[1:]
-    flat_a = packed_a.contiguous().view(total, -1)
-    flat_b = packed_b.contiguous().view(total, -1)
-    output_a = packed_a.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
-    output_b = packed_b.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
-    if total == 0:
-        return output_a, output_b
-    out_flat_a = output_a.view(int(batch_size) * int(seq_len), -1)
-    out_flat_b = output_b.view(int(batch_size) * int(seq_len), -1)
-    row_size = int(flat_a.shape[1])
-
-    if _can_use_triton_segment_pack(
-        tensor=output_a,
+    output_a, output_b = _segment_unpack_padded_rows(
+        (packed_a, packed_b),
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
-    ):
-        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
-        launch_triton_row_copy(
-            (flat_a, flat_b),
-            (out_flat_a, out_flat_b),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
-            seq_len=int(seq_len),
-            row_size=row_size,
-            max_rows=max_len,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return output_a, output_b
-
-    offsets_host = _tensor_host_tuple(segment_offsets)
-    lengths_host = _tensor_host_tuple(segment_lengths)
-    cu_host = _tensor_host_tuple(cu_seqlens)
-    for idx, dst_base in enumerate(offsets_host):
-        seg_len = int(lengths_host[idx])
-        if seg_len <= 0:
-            continue
-        src_base = int(cu_host[idx])
-        src_slice = slice(src_base, src_base + seg_len)
-        dst_slice = slice(dst_base, dst_base + seg_len)
-        out_flat_a[dst_slice].copy_(flat_a[src_slice])
-        out_flat_b[dst_slice].copy_(flat_b[src_slice])
+        batch_size=batch_size,
+        seq_len=seq_len,
+        max_segment_length=max_segment_length,
+    )
     return output_a, output_b
 
 
@@ -834,64 +725,15 @@ def segment_unpack_padded_rows_triple(
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Padded tensors ``(B, S, ...)``.
     """
 
-    shape = require_matching_tensor_layout(
-        packed_a,
-        packed_b,
-        packed_c,
-        context="Segment-pack packed tensors",
-    )
-    total = int(shape[0])
-    trailing_shape = shape[1:]
-    flat_a = packed_a.contiguous().view(total, -1)
-    flat_b = packed_b.contiguous().view(total, -1)
-    flat_c = packed_c.contiguous().view(total, -1)
-    output_a = packed_a.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
-    output_b = packed_b.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
-    output_c = packed_c.new_zeros((int(batch_size), int(seq_len)) + trailing_shape)
-    if total == 0:
-        return output_a, output_b, output_c
-    out_flat_a = output_a.view(int(batch_size) * int(seq_len), -1)
-    out_flat_b = output_b.view(int(batch_size) * int(seq_len), -1)
-    out_flat_c = output_c.view(int(batch_size) * int(seq_len), -1)
-    row_size = int(flat_a.shape[1])
-
-    if _can_use_triton_segment_pack(
-        tensor=output_a,
+    output_a, output_b, output_c = _segment_unpack_padded_rows(
+        (packed_a, packed_b, packed_c),
         segment_offsets=segment_offsets,
         segment_lengths=segment_lengths,
         cu_seqlens=cu_seqlens,
-    ):
-        max_len = max(1, int(max_segment_length if max_segment_length is not None else int(seq_len)))
-        launch_triton_row_copy(
-            (flat_a, flat_b, flat_c),
-            (out_flat_a, out_flat_b, out_flat_c),
-            offsets=segment_offsets,
-            lengths=segment_lengths,
-            cu_seqlens=cu_seqlens,
-            address_mode=TRITON_ROW_COPY_SEGMENT_UNPACK,
-            seq_len=int(seq_len),
-            row_size=row_size,
-            max_rows=max_len,
-            block_rows=_SEGMENT_BLOCK_ROWS,
-            block_cols=_SEGMENT_BLOCK_COLS,
-            num_warps=_SEGMENT_NUM_WARPS,
-            num_stages=_SEGMENT_NUM_STAGES,
-        )
-        return output_a, output_b, output_c
-
-    offsets_host = _tensor_host_tuple(segment_offsets)
-    lengths_host = _tensor_host_tuple(segment_lengths)
-    cu_host = _tensor_host_tuple(cu_seqlens)
-    for idx, dst_base in enumerate(offsets_host):
-        seg_len = int(lengths_host[idx])
-        if seg_len <= 0:
-            continue
-        src_base = int(cu_host[idx])
-        src_slice = slice(src_base, src_base + seg_len)
-        dst_slice = slice(dst_base, dst_base + seg_len)
-        out_flat_a[dst_slice].copy_(flat_a[src_slice])
-        out_flat_b[dst_slice].copy_(flat_b[src_slice])
-        out_flat_c[dst_slice].copy_(flat_c[src_slice])
+        batch_size=batch_size,
+        seq_len=seq_len,
+        max_segment_length=max_segment_length,
+    )
     return output_a, output_b, output_c
 
 

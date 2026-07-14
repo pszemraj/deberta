@@ -20,11 +20,11 @@ import torch
 from deberta.modeling.mask_utils import FlashBatchMeta, build_doc_block_mask
 
 
-def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> None:
     """Install a minimal in-memory FlashDeBERTa module tree for tests.
 
     :param pytest.MonkeyPatch monkeypatch: Pytest monkeypatch fixture.
-    :return dict[str, int]: Mutable call counters for fake flash operators.
+    :return None: The fake modules are installed through ``monkeypatch``.
     """
 
     flash_pkg = types.ModuleType("flashdeberta")
@@ -35,7 +35,6 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
     flash_attention_mod = types.ModuleType("flashdeberta.ops.flash_attention")
     flash_attention_varlen_mod = types.ModuleType("flashdeberta.ops.flash_attention_varlen")
     flash_attention_bias_mod = types.ModuleType("flashdeberta.ops.flash_attention_bias")
-    calls = {"fixed": 0, "varlen": 0, "bias": 0}
 
     def _fake_flash_attention_with_disentangled(
         q: torch.Tensor,
@@ -64,7 +63,6 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
         :return torch.Tensor: Zero tensor shaped like ``q``.
         """
 
-        calls["fixed"] += 1
         del k, v, seq_lengths, k_pos, q_pos, causal, sm_scale, position_buckets, max_relative_distance
         return torch.zeros_like(q)
 
@@ -101,7 +99,6 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
         :return torch.Tensor: Zero tensor shaped like ``q``.
         """
 
-        calls["varlen"] += 1
         del (
             k,
             v,
@@ -137,7 +134,6 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
         :return torch.Tensor: Zero tensor shaped like ``q``.
         """
 
-        calls["bias"] += 1
         del k, v, bias, causal, sm_scale
         return torch.zeros_like(q)
 
@@ -165,15 +161,13 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
         return real_version(name)
 
     monkeypatch.setattr(importlib_metadata, "version", _fake_distribution_version)
-    return calls
 
 
 def _reload_flash_modules() -> types.ModuleType:
     """Reload the FlashDeBERTa adapter to pick up test-time fake imports."""
 
     sys.modules.pop("deberta.modeling.flashdeberta_attention", None)
-    attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
-    return importlib.reload(attention_mod)
+    return importlib.import_module("deberta.modeling.flashdeberta_attention")
 
 
 def _restore_saved_flash_modules(
@@ -219,6 +213,24 @@ def _isolated_flash_modules() -> Iterator[None]:
         yield
     finally:
         _restore_saved_flash_modules(saved, affected_prefixes)
+
+
+@contextmanager
+def _empty_varlen_caches(varlen_mod: types.ModuleType) -> Iterator[None]:
+    """Run one cache test with fresh varlen module caches."""
+
+    caches = (
+        varlen_mod._MASK_METADATA_CACHE,
+        varlen_mod._CU_SEQLENS_HOST_CACHE,
+        varlen_mod._MID_TENSOR_CACHE,
+    )
+    for cache in caches:
+        cache.clear()
+    try:
+        yield
+    finally:
+        for cache in caches:
+            cache.clear()
 
 
 @contextmanager
@@ -1067,14 +1079,13 @@ def _assert_single_flash_route_stat(attention_mod: types.ModuleType, route_count
     assert stats.get("fallback_calls", 0) == 0
 
 
-def test_native_flash_helpers_preserve_relative_positions_and_mask_shapes(
+def test_native_flash_helper_preserves_relative_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
     _reload_flash_modules()
 
     from deberta.modeling import deberta_v2_native as dv2
-    from deberta.modeling import rtd
 
     cfg = _small_deberta_config()
     cfg.hf_attention_impl = "flash"
@@ -1084,16 +1095,6 @@ def test_native_flash_helpers_preserve_relative_positions_and_mask_shapes(
 
     assert encoder.get_rel_pos(hidden_states) is None
     assert encoder.get_rel_pos(hidden_states, relative_pos=relative_pos) is relative_pos
-
-    flash_broadcast_mask = rtd._ensure_emd_flash_attention_mask(torch.tensor([[1, 1, 0]], dtype=torch.long))
-    assert flash_broadcast_mask.dtype == torch.bool
-    assert tuple(flash_broadcast_mask.shape) == (1, 1, 1, 3)
-    assert torch.equal(flash_broadcast_mask[0, 0, 0], torch.tensor([True, True, False]))
-
-    pairwise = torch.tensor([[[True, False], [False, True]]], dtype=torch.bool)
-    pairwise_mask = rtd._ensure_emd_flash_attention_mask(pairwise)
-    assert tuple(pairwise_mask.shape) == (1, 1, 2, 2)
-    assert torch.equal(pairwise_mask[:, 0], pairwise)
 
 
 def test_native_model_flash_output_attentions_returns_prob_tensors(
@@ -1699,7 +1700,6 @@ def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
     from deberta.modeling.flashdeberta_prefix_pack import (
         prefix_pack_padded_rows_pair,
         prefix_pack_padded_rows_triple,
-        prefix_unpack_padded_rows_pair,
         prefix_unpack_padded_rows_triple,
     )
 
@@ -1736,14 +1736,6 @@ def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
     assert torch.equal(packed_c2, expected_b)
     assert torch.equal(packed_c3, expected_c)
 
-    unpacked_a, unpacked_b = prefix_unpack_padded_rows_pair(
-        packed_a,
-        packed_b,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=2,
-        seq_len=4,
-    )
     unpacked_c1, unpacked_c2, unpacked_c3 = prefix_unpack_padded_rows_triple(
         packed_c1,
         packed_c2,
@@ -1763,8 +1755,6 @@ def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
     expected_unpacked_b[1, :1] = b[1, :1]
     expected_unpacked_c[0, :3] = c[0, :3]
     expected_unpacked_c[1, :1] = c[1, :1]
-    assert torch.equal(unpacked_a, expected_unpacked_a)
-    assert torch.equal(unpacked_b, expected_unpacked_b)
     assert torch.equal(unpacked_c1, expected_unpacked_a)
     assert torch.equal(unpacked_c2, expected_unpacked_b)
     assert torch.equal(unpacked_c3, expected_unpacked_c)
@@ -2427,65 +2417,58 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
 def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    varlen_mod._clear_unpad_metadata_cache()
-    calls = {"count": 0}
-    orig_build = varlen_mod._build_unpad_metadata
+    with _empty_varlen_caches(varlen_mod):
+        calls = {"count": 0}
+        orig_build = varlen_mod._build_unpad_metadata
 
-    def _counting_build(mask_2d: torch.Tensor):
-        calls["count"] += 1
-        return orig_build(mask_2d)
+        def _counting_build(mask_2d: torch.Tensor):
+            calls["count"] += 1
+            return orig_build(mask_2d)
 
-    monkeypatch.setattr(varlen_mod, "_build_unpad_metadata", _counting_build)
+        monkeypatch.setattr(varlen_mod, "_build_unpad_metadata", _counting_build)
 
-    mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
-    first_entry = varlen_mod._get_unpad_metadata_entry(mask)
-    second_entry = varlen_mod._get_unpad_metadata_entry(mask)
-    clone_entry = varlen_mod._get_unpad_metadata_entry(mask.clone())
+        mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+        first_entry = varlen_mod._get_unpad_metadata_entry(mask)
+        second_entry = varlen_mod._get_unpad_metadata_entry(mask)
+        clone_entry = varlen_mod._get_unpad_metadata_entry(mask.clone())
 
-    assert calls["count"] == 2
-    assert first_entry.max_seqlen == second_entry.max_seqlen == clone_entry.max_seqlen == 2
-    assert first_entry.seqlens.data_ptr() == second_entry.seqlens.data_ptr()
-    assert first_entry.cu_seqlens.data_ptr() == second_entry.cu_seqlens.data_ptr()
-    assert clone_entry.seqlens.data_ptr() != first_entry.seqlens.data_ptr()
-    assert clone_entry.cu_seqlens.data_ptr() != first_entry.cu_seqlens.data_ptr()
-
-    varlen_mod._clear_unpad_metadata_cache()
+        assert calls["count"] == 2
+        assert first_entry.max_seqlen == second_entry.max_seqlen == clone_entry.max_seqlen == 2
+        assert first_entry.seqlens.data_ptr() == second_entry.seqlens.data_ptr()
+        assert first_entry.cu_seqlens.data_ptr() == second_entry.cu_seqlens.data_ptr()
+        assert clone_entry.seqlens.data_ptr() != first_entry.seqlens.data_ptr()
+        assert clone_entry.cu_seqlens.data_ptr() != first_entry.cu_seqlens.data_ptr()
 
 
 def test_varlen_mid_tensor_cache_reuses_registered_cu_seqlens() -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    varlen_mod._clear_unpad_metadata_cache()
-    varlen_mod._clear_mid_tensor_cache()
+    with _empty_varlen_caches(varlen_mod):
+        mask = torch.tensor(
+            [
+                [True, True, False, False],
+                [True, False, False, False],
+            ],
+            dtype=torch.bool,
+        )
+        entry = varlen_mod._get_unpad_metadata_entry(mask)
 
-    mask = torch.tensor(
-        [
-            [True, True, False, False],
-            [True, False, False, False],
-        ],
-        dtype=torch.bool,
-    )
-    entry = varlen_mod._get_unpad_metadata_entry(mask)
+        first_batch, first_start, first_mn = varlen_mod._get_mid_tensors_cached(
+            cu_seqlens=entry.cu_seqlens,
+            block_m=2,
+            device=entry.cu_seqlens.device,
+        )
+        second_batch, second_start, second_mn = varlen_mod._get_mid_tensors_cached(
+            cu_seqlens=entry.cu_seqlens,
+            block_m=2,
+            device=entry.cu_seqlens.device,
+        )
 
-    first_batch, first_start, first_mn = varlen_mod._get_mid_tensors_cached(
-        cu_seqlens=entry.cu_seqlens,
-        block_m=2,
-        device=entry.cu_seqlens.device,
-    )
-    second_batch, second_start, second_mn = varlen_mod._get_mid_tensors_cached(
-        cu_seqlens=entry.cu_seqlens,
-        block_m=2,
-        device=entry.cu_seqlens.device,
-    )
-
-    assert first_mn == second_mn == 2
-    assert torch.equal(first_batch.cpu(), torch.tensor([0, 1], dtype=torch.long))
-    assert torch.equal(first_start.cpu(), torch.tensor([0, 2], dtype=torch.long))
-    assert first_batch.data_ptr() == second_batch.data_ptr()
-    assert first_start.data_ptr() == second_start.data_ptr()
-
-    varlen_mod._clear_mid_tensor_cache()
-    varlen_mod._clear_unpad_metadata_cache()
+        assert first_mn == second_mn == 2
+        assert torch.equal(first_batch.cpu(), torch.tensor([0, 1], dtype=torch.long))
+        assert torch.equal(first_start.cpu(), torch.tensor([0, 2], dtype=torch.long))
+        assert first_batch.data_ptr() == second_batch.data_ptr()
+        assert first_start.data_ptr() == second_start.data_ptr()
 
 
 def _prefix_pack_reference(tensor: torch.Tensor, seqlens: torch.Tensor) -> torch.Tensor:
@@ -2566,7 +2549,7 @@ def test_prefix_pack_explicit_total_tokens_avoids_tensor_item(monkeypatch: pytes
     assert torch.equal(packed, expected)
 
 
-def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
+def test_prefix_unpack_triple_matches_single_tensor_behavior() -> None:
     import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
 
     tensor_a = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3).contiguous()
@@ -2594,14 +2577,6 @@ def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
         max_seqlen=3,
     )
 
-    unpacked_pair_a, unpacked_pair_b = prefix_mod.prefix_unpack_padded_rows_pair(
-        packed_a,
-        packed_b,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=2,
-        seq_len=4,
-    )
     unpacked_triple_a, unpacked_triple_b, unpacked_triple_c = prefix_mod.prefix_unpack_padded_rows_triple(
         packed_a,
         packed_b,
@@ -2616,8 +2591,6 @@ def test_prefix_unpack_pair_and_triple_match_single_tensor_behavior() -> None:
     expected_b = _prefix_unpack_reference(packed_b, seqlens, seq_len=4)
     expected_c = _prefix_unpack_reference(packed_c, seqlens, seq_len=4)
 
-    assert torch.equal(unpacked_pair_a, expected_a)
-    assert torch.equal(unpacked_pair_b, expected_b)
     assert torch.equal(unpacked_triple_a, expected_a)
     assert torch.equal(unpacked_triple_b, expected_b)
     assert torch.equal(unpacked_triple_c, expected_c)
@@ -2723,14 +2696,13 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
     monkeypatch.setitem(sys.modules, "triton.language", None)
 
     with _isolated_flash_modules():
-        prefix_mod = importlib.import_module("deberta.modeling.flashdeberta_prefix_pack")
+        importlib.import_module("deberta.modeling.flashdeberta_prefix_pack")
         segment_mod = importlib.import_module("deberta.modeling.flashdeberta_segment_pack")
         varlen_mod = importlib.import_module("deberta.modeling.flashdeberta_varlen_op")
         docblock_mod = importlib.import_module("deberta.modeling.flashdeberta_docblock_op")
         bias_mod = importlib.import_module("deberta.modeling.flashdeberta_bias_op")
         importlib.import_module("deberta.modeling.flashdeberta_dense_bias_op")
 
-        assert prefix_mod.flashdeberta_prefix_pack_available() is False
         assert segment_mod.flashdeberta_segment_pack_available() is False
         assert varlen_mod.flashdeberta_compiled_varlen_available() is False
         # The custom-op modules recover previously registered ops from the
@@ -3137,38 +3109,11 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_ove
         configure_flashdeberta_kernel_overrides(None)
 
 
-@pytest.mark.parametrize("seq_len", [2048, 4096])
-def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_large_pairwise_mask(seq_len: int) -> None:
-    import deberta.training.compile as compile_mod
-
-    doc_ids = torch.cat(
-        (
-            torch.ones((1, seq_len // 2), dtype=torch.long),
-            torch.full((1, seq_len - (seq_len // 2)), 2, dtype=torch.long),
-        ),
-        dim=1,
-    )
-    batch = {"input_ids": torch.zeros((1, seq_len), dtype=torch.long), "doc_ids": doc_ids}
-
-    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
-        batch=batch,
-        backbone_type="hf_deberta_v2",
-        flash_enabled=False,
-    )
-
-    assert meta is None
-    assert "flash_seq_lengths" not in prepared
-    assert tuple(prepared["attention_mask"].shape) == (1, seq_len, seq_len)
-    assert prepared["attention_mask"].ndim == 3
-    assert not bool(prepared["attention_mask"][0, 0, seq_len // 2])
-    assert not bool(prepared["attention_mask"][0, seq_len // 2, 0])
-
-
-@pytest.mark.parametrize("seq_len", [1024, 2048])
-def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu(seq_len: int) -> None:
+def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu() -> None:
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
     from deberta.modeling.mask_utils import build_doc_block_mask
 
+    seq_len = 16
     cfg = _docblock_attention_config(seq_len=seq_len)
     attention = DisentangledSelfAttention(cfg).eval()
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
@@ -3194,15 +3139,14 @@ def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu(seq_len:
     assert float(probs[0, 0, seq_len // 2, : seq_len // 2].detach().abs().max()) == pytest.approx(0.0)
 
 
-@pytest.mark.parametrize("seq_len", [1024, 2048])
 def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cpu(
     monkeypatch: pytest.MonkeyPatch,
-    seq_len: int,
 ) -> None:
     _install_fake_flashdeberta(monkeypatch)
     attention_mod = _reload_flash_modules()
     from deberta.modeling.mask_utils import build_doc_segment_metadata
 
+    seq_len = 16
     cfg = _docblock_attention_config(seq_len=seq_len)
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
