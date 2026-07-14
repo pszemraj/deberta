@@ -282,6 +282,41 @@ def test_run_export_fsdp_state_dict_paths(
     assert called["load_state_calls"] == [{}]
 
 
+def test_run_export_rebuilds_flash_checkpoint_with_eager_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    """Checkpoint consolidation must not require the optional flash package."""
+
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    flash_model_cfg = make_model_config(
+        tokenizer_name_or_path="dummy-tokenizer",
+        embedding_sharing="none",
+        hf_attention_impl="flash",
+    )
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(flash_model_cfg)),
+        encoding="utf-8",
+    )
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(tmp_path / "exported"),
+        )
+    )
+
+    build_call = list(called["build_backbones_calls"])[0]
+    assert build_call["model_cfg"].hf.attention_impl == "eager"
+
+
 def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:

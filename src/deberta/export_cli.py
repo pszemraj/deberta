@@ -7,7 +7,7 @@ import json
 import logging
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -497,16 +497,24 @@ def run_export(cfg: ExportConfig) -> None:
     # Tokenizer (needed for configs, and we also export it)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
 
-    # Rebuild configs (must match training!)
+    # Flash attention adds no parameters, so export rebuilds the checkpoint
+    # container with eager attention. This keeps consolidation independent of
+    # the optional FlashDeBERTa runtime while preserving the training shapes.
+    export_model_cfg = replace(
+        model_cfg,
+        hf=replace(model_cfg.hf, attention_impl="eager"),
+    )
+
+    # Rebuild configs (must match training shapes and parameter names).
     disc_config, gen_config = build_backbone_configs(
-        model_cfg=model_cfg,
+        model_cfg=export_model_cfg,
         tokenizer=tokenizer,
         max_position_embeddings=int(data_cfg.packing.max_seq_length),
     )
 
     # Build backbones + pretrainer container so accelerate.load_state can restore the exact structure.
     disc_backbone, gen_backbone = build_backbones(
-        model_cfg=model_cfg,
+        model_cfg=export_model_cfg,
         disc_config=disc_config,
         gen_config=gen_config,
         load_pretrained_weights=False,
