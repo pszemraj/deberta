@@ -824,7 +824,8 @@ data:
     # default: literal true
     # required: optional
     # values: true | false
-    # contract: true uses Hugging Face IterableDataset streaming and is recommended for large remote corpora.
+    # true behavior: uses Hugging Face IterableDataset streaming and is recommended for large remote corpora.
+    # false behavior: loads a Hugging Face map-style Dataset and is required by load_from_disk.
     # interaction: load_from_disk requires false; when false, shuffle_buffer_size must be 0 or 1.
     streaming: true
 
@@ -1005,8 +1006,9 @@ train:
     # default: literal 2
     # required: optional
     # values: integer >= 0
-    # contract: workers per process; streaming sources are sharded across ranks and workers.
-    # source limit: workers beyond the source's available shard count remain idle with a warning and do not improve throughput.
+    # contract: worker subprocesses per distributed process; 0 consumes data in the training process.
+    # sharding: map-style sources are explicitly partitioned across the combined rank-worker space; HF IterableDataset sources receive rank sharding from the wrapper and assign their available source shards to workers natively.
+    # iterable source limit: workers beyond an iterable source's available shard count remain idle with a warning and do not improve throughput.
     # recommendation: use 0 for deterministic debugging and clearer exceptions, then increase only after measuring throughput.
     num_workers: 2
 

@@ -422,7 +422,7 @@ def _build_train_dataset_and_collator(
     num_processes: int,
     flash_enabled: bool = False,
 ) -> tuple[Any, Any]:
-    """Build streaming train dataset and collator.
+    """Build the training dataset wrapper and collator.
 
     :param Any raw_train: Loaded HF dataset split.
     :param Any tokenizer: Runtime tokenizer.

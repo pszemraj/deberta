@@ -94,10 +94,12 @@ PackedStreamingDataset(
 )
 ```
 
-Pack streaming text into fixed-length blocks across ranks and DataLoader workers.
+Pack source text into fixed-length blocks across ranks and DataLoader workers.
 
 See [Data pipeline](../guides/data-pipeline.md#packed-streaming-path) for sample construction
 and output fields.
+
+The wrapper accepts HF map-style and iterable datasets. Their distinct worker-sharding behavior is documented under [dataset source selection](../guides/data-pipeline.md#dataset-source-selection).
 
 ### Members
 

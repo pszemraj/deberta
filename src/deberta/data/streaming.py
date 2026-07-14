@@ -1,4 +1,4 @@
-"""Streaming dataset packing utilities for fixed-length RTD inputs."""
+"""Dataset packing utilities for fixed-length RTD inputs."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class PackedStreamingConfig:
 
 
 class PackedStreamingDataset(torch.utils.data.IterableDataset):
-    """Pack streaming text into fixed-length blocks across ranks and DataLoader workers.
+    """Pack source text into fixed-length blocks across ranks and DataLoader workers.
 
     See [Data pipeline](../guides/data-pipeline.md#packed-streaming-path) for sample construction
     and output fields.
@@ -44,9 +44,9 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
         process_index: int = 0,
         num_processes: int = 1,
     ) -> None:
-        """Create a streaming packer dataset.
+        """Create a source-text packer dataset.
 
-        :param Any hf_dataset: Source HF dataset (usually iterable).
+        :param Any hf_dataset: Source HF map-style or iterable dataset.
         :param Any tokenizer: Tokenizer with cls/sep/pad token ids.
         :param PackedStreamingConfig cfg: Packing configuration.
         :param int process_index: Current distributed rank index.
