@@ -8,19 +8,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutput
 
 from deberta.modeling.activations import get_act_fn
 from deberta.modeling.mask_utils import normalize_keep_mask
-from deberta.modeling.norm import RMSNorm
 from deberta.modeling.rope import RotaryEmbedding
-
-try:
-    from transformers import PretrainedConfig, PreTrainedModel
-    from transformers.modeling_outputs import BaseModelOutput
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "transformers is required for the RoPE backbone (PreTrainedModel/PretrainedConfig)."
-    ) from e
 
 
 class DebertaRoPEConfig(PretrainedConfig):
@@ -141,7 +134,7 @@ class DebertaRoPEEmbeddings(nn.Module):
         else:
             self.position_embeddings = None
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
@@ -231,7 +224,7 @@ class DebertaRoPESelfAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope.apply(q, k)
 
-        use_sdpa = self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention")
+        use_sdpa = self.attn_impl == "sdpa"
         sdpa_attn_mask = None
         eager_attn_mask = None
         query_keep: torch.Tensor | None = None
@@ -402,15 +395,15 @@ class DebertaRoPELayer(nn.Module):
         self.mlp = DebertaRoPEMLP(config)
 
         if self.norm_arch == "post":
-            self.norm1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.norm2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
         else:
             # KEEL: inner norm + outer norm per sublayer
-            self.inner_norm1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.outer_norm1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.inner_norm2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.outer_norm2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.inner_norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.outer_norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.inner_norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.outer_norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
             self.alpha1 = _KEELAlpha(alpha_init, learnable=config.keel_alpha_learnable)
@@ -510,7 +503,7 @@ class DebertaRoPEPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, RMSNorm):
+        elif isinstance(module, nn.RMSNorm):
             if getattr(module, "weight", None) is not None:
                 module.weight.data.fill_(1.0)
 

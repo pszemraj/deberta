@@ -17,12 +17,7 @@ def is_torch_compiling() -> bool:
     :return bool: True when inside compiled/traced execution.
     """
 
-    if not hasattr(torch, "compiler") or not hasattr(torch.compiler, "is_compiling"):
-        return False
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
+    return bool(torch.compiler.is_compiling())
 
 
 @dataclass(frozen=True)
@@ -465,25 +460,24 @@ def reduce_keep_mask_to_2d(attention_mask: torch.Tensor, *, seq_len: int | None 
 
 
 @lru_cache(maxsize=8)
-def _doc_block_static_masks(
+def _doc_block_cls_key(
     seq_len: int,
     device_type: str,
     device_index: int | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return cached identity and fallback-CLS masks for one device shape.
+) -> torch.Tensor:
+    """Return the cached fallback-CLS mask for one device shape.
 
     :param int seq_len: Sequence length.
     :param str device_type: Torch device type.
     :param int | None device_index: Optional device index.
-    :return tuple[torch.Tensor, torch.Tensor]: Identity matrix and CLS key mask.
+    :return torch.Tensor: CLS key mask.
     """
 
     device = torch.device(device_type, device_index)
-    eye = torch.eye(int(seq_len), dtype=torch.bool, device=device)
     cls_key = torch.zeros((int(seq_len),), dtype=torch.bool, device=device)
     if int(seq_len) > 0:
         cls_key[0] = True
-    return eye, cls_key
+    return cls_key
 
 
 def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
@@ -504,7 +498,7 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
 
     seq_len = int(ids.shape[1])
     cache_key = (seq_len, str(ids.device.type), ids.device.index)
-    _, cls_key = _doc_block_static_masks(*cache_key)
+    cls_key = _doc_block_cls_key(*cache_key)
 
     keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
 

@@ -1332,11 +1332,7 @@ def test_mlp_has_no_internal_residual_dropout():
 
 
 def test_self_attention_sdpa_matches_eager_with_padding_mask():
-    import torch.nn.functional as F
-
     pytest.importorskip("transformers")
-    if not hasattr(F, "scaled_dot_product_attention"):
-        pytest.skip("torch.nn.functional.scaled_dot_product_attention is not available")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
 
@@ -2668,10 +2664,6 @@ def test_synced_buffer_embedding_tracks_sync_updates():
 
 
 def test_synced_buffer_embedding_sync_updates_compiled_module():
-
-    if not hasattr(torch, "compile"):
-        pytest.skip("torch.compile not available")
-
     from deberta.modeling.rtd import _SyncedBufferEmbedding
 
     init_weight = torch.randn((16, 8), dtype=torch.float32)
@@ -3532,8 +3524,6 @@ def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
 def test_native_hf_deberta_v2_stable_compile_step_is_finite():
 
     pytest.importorskip("transformers")
-    if not hasattr(torch, "compile"):
-        pytest.skip("torch.compile not available")
 
     from transformers import DebertaV2Config
 
@@ -4073,19 +4063,3 @@ def test_rotary_embedding_uses_full_head_dim_for_partial_rope_pct():
     dim = torch.arange(0, 16, 2).float()
     expected = 1.0 / (10000.0 ** (dim / 32))
     torch.testing.assert_close(rope.inv_freq, expected)
-
-
-def test_rmsnorm_matches_reference_division_form():
-    from deberta.modeling.norm import RMSNorm
-
-    torch.manual_seed(0)
-    x = torch.randn((3, 5, 16), dtype=torch.float32)
-    layer = RMSNorm(hidden_size=16, eps=1e-6, elementwise_affine=True).eval()
-
-    with torch.no_grad():
-        out = layer(x)
-        x_float = x.float()
-        rms = x_float.pow(2).mean(dim=-1, keepdim=True).add(layer.eps).sqrt()
-        ref = (x_float / rms).to(dtype=x.dtype) * layer.weight.to(dtype=x.dtype)
-
-    torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-7)

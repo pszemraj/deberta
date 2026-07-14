@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import DebertaV2Config, PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutput
 
 from deberta.config import _normalize_hf_attention_kernel
 from deberta.modeling.activations import get_act_fn
@@ -24,12 +26,6 @@ from deberta.modeling.mask_utils import (
     normalize_keep_mask,
     reduce_keep_mask_to_2d,
 )
-
-try:
-    from transformers import DebertaV2Config, PreTrainedModel
-    from transformers.modeling_outputs import BaseModelOutput
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("transformers is required for the hf_deberta_v2 backbone.") from e
 
 
 def _normalize_pos_att_type(raw: Any) -> list[str]:
@@ -1107,30 +1103,6 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
 
         self.embeddings.word_embeddings = new_embeddings  # type: ignore[assignment]
 
-    def _default_output_attentions(self) -> bool:
-        """Return configured default for ``output_attentions``.
-
-        :return bool: Default flag.
-        """
-
-        return bool(getattr(self.config, "output_attentions", False))
-
-    def _default_output_hidden_states(self) -> bool:
-        """Return configured default for ``output_hidden_states``.
-
-        :return bool: Default flag.
-        """
-
-        return bool(getattr(self.config, "output_hidden_states", False))
-
-    def _default_return_dict(self) -> bool:
-        """Return configured default for ``return_dict``.
-
-        :return bool: Default flag.
-        """
-
-        return bool(getattr(self.config, "use_return_dict", True))
-
     def _resolve_forward_options(
         self,
         *,
@@ -1149,15 +1121,19 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :return tuple[bool, bool, bool]: Resolved ``(output_attentions, output_hidden_states, return_dict)``.
         """
 
-        resolved_attentions = (
-            self._default_output_attentions() if output_attentions is None else bool(output_attentions)
+        resolved_attentions = bool(
+            getattr(self.config, "output_attentions", False)
+            if output_attentions is None
+            else output_attentions
         )
         resolved_hidden_states = (
-            self._default_output_hidden_states()
+            bool(getattr(self.config, "output_hidden_states", False))
             if output_hidden_states is None
             else bool(output_hidden_states)
         )
-        resolved_return_dict = self._default_return_dict() if return_dict is None else bool(return_dict)
+        resolved_return_dict = bool(
+            getattr(self.config, "use_return_dict", True) if return_dict is None else return_dict
+        )
         return resolved_attentions, resolved_hidden_states, resolved_return_dict
 
     def _resolve_forward_inputs(
@@ -1166,14 +1142,14 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         input_ids: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
         token_type_ids: torch.Tensor | None,
-    ) -> tuple[torch.Size, torch.device, torch.Tensor]:
+    ) -> torch.Tensor:
         """Validate mutually exclusive inputs and materialize token-type ids.
 
         :param torch.Tensor | None input_ids: Optional input token ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
-        :return tuple[torch.Size, torch.device, torch.Tensor]: Input shape, runtime device, and token-type ids.
+        :return torch.Tensor: Supplied or materialized token-type ids.
         """
 
         if input_ids is not None and inputs_embeds is not None:
@@ -1191,7 +1167,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
-        return input_shape, device, token_type_ids
+        return token_type_ids
 
     def _forward_resolved(
         self,
@@ -1225,7 +1201,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         output_hidden_states = bool(output_hidden_states)
         return_dict = bool(return_dict)
 
-        _input_shape, _device, token_type_ids = self._resolve_forward_inputs(
+        token_type_ids = self._resolve_forward_inputs(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             token_type_ids=token_type_ids,

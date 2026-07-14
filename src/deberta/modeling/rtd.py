@@ -42,10 +42,9 @@ from deberta.modeling.activations import get_act_fn
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     expand_keep_mask_to_4d,
-    normalize_keep_mask,
+    is_pairwise_mask,
     reduce_keep_mask_to_2d,
 )
-from deberta.modeling.norm import RMSNorm
 
 try:
     from torch.distributed.tensor import DTensor as _TorchDTensor
@@ -97,33 +96,7 @@ def attention_mask_to_active_tokens(
     if attention_mask is None:
         return torch.ones_like(input_ids, dtype=torch.bool)
 
-    mask = normalize_keep_mask(attention_mask)
-    return reduce_keep_mask_to_2d(mask)
-
-
-def _ensure_emd_pairwise_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Convert mask to a DeBERTa-style pairwise keep mask (B,1,S,S).
-
-    The original DeBERTa EMD code expands 2D input masks to a full pairwise mask
-    via an outer product. This is *not* strictly necessary with our attention
-    implementation (which supports broadcast masks), but keeping this conversion
-    improves parity.
-
-    :param torch.Tensor attention_mask: Input keep mask in rank-2/3/4 layout.
-    :return torch.Tensor: Pairwise keep mask with shape ``(B,1,S,S)``.
-    """
-
-    return expand_keep_mask_to_4d(attention_mask, pairwise_2d=True)
-
-
-def _ensure_emd_flash_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Convert mask to a flash-compatible EMD keep mask.
-
-    :param torch.Tensor attention_mask: Input keep mask in rank-2/3/4 layout.
-    :return torch.Tensor: Broadcast or pairwise keep mask.
-    """
-
-    return expand_keep_mask_to_4d(attention_mask)
+    return reduce_keep_mask_to_2d(attention_mask)
 
 
 def _is_sharded_dtensor(tensor: torch.Tensor) -> bool:
@@ -237,7 +210,7 @@ class MLMTransform(nn.Module):
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", False)):
             # RMSNorm is a modernization option. For strict DeBERTa parity, keep this False.
-            self.norm = RMSNorm(embedding_size, eps=eps)
+            self.norm = nn.RMSNorm(embedding_size, eps=eps)
         else:
             self.norm = nn.LayerNorm(embedding_size, eps=eps)
 
@@ -435,9 +408,10 @@ class EnhancedMaskDecoder(nn.Module):
             # all-True (B,1,S,S) keep mask is equivalent but needlessly O(S^2).
             attn = None
         elif flash_meta is not None:
-            attn = _ensure_emd_flash_attention_mask(attention_mask)
+            attn = expand_keep_mask_to_4d(attention_mask)
         else:
-            attn = _ensure_emd_pairwise_attention_mask(attention_mask)
+            # Match the original DeBERTa EMD outer-product convention.
+            attn = expand_keep_mask_to_4d(attention_mask, pairwise_2d=True)
 
         # Position ids default: 0..S-1.
         if position_ids is None:
@@ -526,7 +500,7 @@ class RTDHead(nn.Module):
 
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", False)):
-            self.norm = RMSNorm(hidden_size, eps=eps)
+            self.norm = nn.RMSNorm(hidden_size, eps=eps)
         else:
             self.norm = nn.LayerNorm(hidden_size, eps=eps)
 
@@ -550,11 +524,8 @@ class RTDHead(nn.Module):
             return True
         if attention_mask is None:
             return False
-
-        mask = attention_mask
-        if mask.ndim == 4:
-            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        return bool(mask.ndim == 3 and mask.shape[-2] != 1)
+        seq_len = int(attention_mask.shape[-1])
+        return is_pairwise_mask(attention_mask, query_len=seq_len, key_len=seq_len)
 
     def forward(
         self,
