@@ -1342,6 +1342,70 @@ def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPat
     _assert_single_flash_route_stat(attention_mod, "flash_varlen_calls")
 
 
+@pytest.mark.parametrize(
+    ("import_error", "compiling", "expected_reason"),
+    [
+        (ImportError("varlen-only Triton API missing"), False, "varlen_missing"),
+        (None, True, "varlen_compile"),
+    ],
+)
+def test_flash_attention_varlen_unavailability_falls_back_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    import_error: Exception | None,
+    compiling: bool,
+    expected_reason: str,
+) -> None:
+    """A healthy fixed import must not hide an unavailable selected varlen route."""
+
+    cfg = _small_deberta_config()
+    cfg.hf_flash = {"debug_stats": True, "warn_fallbacks": False}
+    attention_mod, attention, cfg = _stats_attention_harness(monkeypatch, cfg=cfg)
+    fallback_reasons: list[str] = []
+    eager_fallback = attention._fallback_to_eager
+
+    def _record_fallback_reason(**kwargs):
+        fallback_reasons.append(str(kwargs["reason"]))
+        return eager_fallback(**kwargs)
+
+    monkeypatch.setattr(attention, "_fallback_to_eager", _record_fallback_reason)
+    monkeypatch.setattr(attention_mod, "flashdeberta_varlen_import_error", lambda: import_error)
+    monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: compiling)
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: False)
+    monkeypatch.setattr(
+        attention_mod,
+        "flashdeberta_varlen_padded",
+        lambda **kwargs: pytest.fail("unavailable varlen route must fall back before dispatch"),
+    )
+
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.tensor([True, True, False, False]).view(1, 1, 1, 4)
+    flash_meta = FlashBatchMeta(
+        seq_lengths=torch.tensor([2], dtype=torch.int32),
+        mask_contract="prefix",
+        mask_contract_validated=True,
+        route_hint="varlen",
+    )
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
+
+    attention_mod.reset_flashdeberta_stats()
+    output, probs = attention(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        output_attentions=False,
+        rel_embeddings=rel_embeddings,
+        flash_meta=flash_meta,
+    )
+
+    assert tuple(output.shape) == (1, 4, cfg.hidden_size)
+    assert probs is None
+    assert fallback_reasons == [expected_reason]
+    stats = attention_mod.flashdeberta_stats_snapshot()
+    if not compiling:
+        assert stats["fallback_calls"] == 1
+        assert stats[f"fallback_{expected_reason}"] == 1
+    assert stats.get("flash_varlen_calls", 0) == 0
+
+
 def test_flash_attention_fixed_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
     attention_mod, attention, cfg = _stats_attention_harness(monkeypatch)
     seen: dict[str, object] = {}

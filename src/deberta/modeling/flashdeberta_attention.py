@@ -68,6 +68,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
+    flashdeberta_varlen_import_error,
     flashdeberta_varlen_padded,
 )
 from deberta.modeling.flashdeberta_version import require_flashdeberta_version
@@ -1115,6 +1116,25 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                     reason="docblock_compile",
                     message=(
                         "FlashDeBERTa doc-block flash path is not compile-visible on this build; "
+                        "using eager attention."
+                    ),
+                )
+
+        if use_varlen and not use_docblock:
+            varlen_import_error = flashdeberta_varlen_import_error()
+            if varlen_import_error is not None:
+                return fallback_to_eager(
+                    reason="varlen_missing",
+                    message=(
+                        "FlashDeBERTa variable-length attention is unavailable "
+                        f"({varlen_import_error}); using eager attention."
+                    ),
+                )
+            if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
+                return fallback_to_eager(
+                    reason="varlen_compile",
+                    message=(
+                        "FlashDeBERTa variable-length attention is not compile-visible on this build; "
                         "using eager attention."
                     ),
                 )
