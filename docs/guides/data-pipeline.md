@@ -10,6 +10,8 @@
 
 If none are provided, config validation fails.
 
+Map-style sources are partitioned across the combined distributed-rank and DataLoader-worker space. HF iterable sources retain their native DataLoader worker partitioning and receive only distributed-rank sharding from the dataset wrapper.
+
 Dataset loading and streaming use bounded retry for transient I/O failures. `data.source.retry_attempts` sets the total attempt count, and `data.source.retry_backoff_seconds` sets the initial exponential-backoff delay; exact failure and replay semantics are defined in the [config reference](../../configs/config_reference.yaml).
 
 ## Packed streaming path

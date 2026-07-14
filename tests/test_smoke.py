@@ -89,6 +89,30 @@ def test_packed_hf_streaming_single_shard_tolerates_extra_dataloader_workers() -
     assert all(len(row["input_ids"]) == 8 for row in rows)
 
 
+def test_hf_map_style_source_shards_across_dataloader_workers() -> None:
+    import datasets
+
+    tokens_per_document = 6
+    raw = datasets.Dataset.from_dict(
+        {"text": [" ".join([f"document-{index}"] * tokens_per_document) for index in range(8)]}
+    )
+    dataset = PackedStreamingDataset(
+        hf_dataset=raw,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+        ),
+    )
+
+    rows = list(torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2))
+
+    lexical_tokens = sum(sum(is_special == 0 for is_special in row["special_tokens_mask"]) for row in rows)
+    assert lexical_tokens == len(raw) * tokens_per_document
+
+
 def test_docblock_streaming_gives_every_segment_its_own_cls() -> None:
     tok = DummyTokenizer(vocab_size=64)
     ds = PackedStreamingDataset(
