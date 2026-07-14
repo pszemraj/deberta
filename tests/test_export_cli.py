@@ -73,15 +73,12 @@ class _FakeExportBackbone(torch.nn.Module):
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    model_cfg = make_model_config(
-        tokenizer_name_or_path="dummy-tokenizer",
-        embedding_sharing="none",
-    )
+    model_cfg = make_model_config(tokenizer={"name_or_path": "dummy-tokenizer"}, embedding_sharing="none")
     (run_dir / "model_config.json").write_text(
         json.dumps(asdict(model_cfg)),
         encoding="utf-8",
     )
-    data_cfg = make_data_config(dataset_name="dummy-dataset", max_seq_length=32)
+    data_cfg = make_data_config(source={"dataset_name": "dummy-dataset"}, packing={"max_seq_length": 32})
     (run_dir / "data_config.json").write_text(
         json.dumps(asdict(data_cfg)),
         encoding="utf-8",
@@ -303,9 +300,9 @@ def test_run_export_rebuilds_flash_checkpoint_with_eager_attention(
 
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     flash_model_cfg = make_model_config(
-        tokenizer_name_or_path="dummy-tokenizer",
+        tokenizer={"name_or_path": "dummy-tokenizer"},
         embedding_sharing="none",
-        hf_attention_impl="flash",
+        hf={"attention_impl": "flash"},
     )
     (run_dir / "model_config.json").write_text(
         json.dumps(asdict(flash_model_cfg)),

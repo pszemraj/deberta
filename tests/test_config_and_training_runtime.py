@@ -1,5 +1,66 @@
-# ruff: noqa: F403,F405
-from _config_and_training_shared_imports import *
+import sys
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+from _config_factories import (
+    make_data_config,
+    make_logging_config,
+    make_model_config,
+    make_optim_config,
+    make_train_config,
+)
+from _fakes import (
+    BackboneConfigStub,
+    BackboneOutputStub,
+    DummyTokenizer,
+    EmbeddingsStub,
+    FakeAccelerator,
+    TinyRTDLikeModel,
+    fake_torch_compile,
+)
+
+from deberta.config import (
+    _normalize_hf_attention_kernel,
+    _normalize_sdpa_kernel,
+    _normalize_torch_compile_backend,
+    _normalize_torch_compile_mode,
+    _normalize_torch_compile_scope,
+    _normalize_wandb_watch,
+    normalize_mixed_precision,
+    resolve_effective_mixed_precision,
+    validate_logging_config,
+    validate_train_config,
+)
+from deberta.modeling.mask_utils import normalize_keep_mask
+from deberta.modeling.rtd import attention_mask_to_active_tokens
+from deberta.training.checkpointing import _resolve_data_resume_policy
+from deberta.training.compile import (
+    _compile_backbones_for_scope,
+    _resolve_compile_scope,
+    _stabilize_compile_attention_mask,
+)
+from deberta.training.export_helpers import _export_discriminator_hf_subprocess
+from deberta.training.loop_utils import (
+    _count_input_tokens_for_batch,
+    _count_rtd_tokens_for_batch,
+    _finalize_window_metric_loss,
+    _resolve_window_token_denominators,
+    _scale_loss_for_backward,
+    _should_clip_gradients,
+    _token_weighted_micro_objective,
+)
+from deberta.training.runtime import (
+    _build_optimizer,
+    _build_training_collator,
+    _cycle_dataloader,
+)
+from deberta.training.steps import (
+    _any_rank_flag_true,
+    _sync_discriminator_embeddings_if_available,
+)
 
 
 class _TinyBackbone(torch.nn.Module):
@@ -83,7 +144,9 @@ def test_cycle_dataloader_advances_dataset_epoch_each_pass(start_epoch: int, cou
 
 
 def test_resolve_data_resume_policy_auto_replays_when_small():
-    cfg = make_train_config(resume_data_strategy="auto", resume_replay_max_micro_batches=100)
+    cfg = make_train_config(
+        checkpoint={"resume_data_strategy": "auto", "resume_replay_max_micro_batches": 100}
+    )
     start_epoch, do_replay, reason = _resolve_data_resume_policy(
         train_cfg=cfg,
         consumed_micro_batches=42,
@@ -95,7 +158,9 @@ def test_resolve_data_resume_policy_auto_replays_when_small():
 
 
 def test_resolve_data_resume_policy_auto_restarts_epoch_when_large():
-    cfg = make_train_config(resume_data_strategy="auto", resume_replay_max_micro_batches=10)
+    cfg = make_train_config(
+        checkpoint={"resume_data_strategy": "auto", "resume_replay_max_micro_batches": 10}
+    )
     start_epoch, do_replay, reason = _resolve_data_resume_policy(
         train_cfg=cfg,
         consumed_micro_batches=42,
@@ -107,7 +172,9 @@ def test_resolve_data_resume_policy_auto_restarts_epoch_when_large():
 
 
 def test_resolve_data_resume_policy_respects_explicit_strategy():
-    replay_cfg = make_train_config(resume_data_strategy="replay", resume_replay_max_micro_batches=0)
+    replay_cfg = make_train_config(
+        checkpoint={"resume_data_strategy": "replay", "resume_replay_max_micro_batches": 0}
+    )
     start_epoch_replay, do_replay_replay, _ = _resolve_data_resume_policy(
         train_cfg=replay_cfg,
         consumed_micro_batches=999,
@@ -117,7 +184,7 @@ def test_resolve_data_resume_policy_respects_explicit_strategy():
     assert do_replay_replay is True
 
     restart_cfg = make_train_config(
-        resume_data_strategy="restart_epoch", resume_replay_max_micro_batches=1_000_000
+        checkpoint={"resume_data_strategy": "restart_epoch", "resume_replay_max_micro_batches": 1_000_000}
     )
     start_epoch_restart, do_replay_restart, _ = _resolve_data_resume_policy(
         train_cfg=restart_cfg,
@@ -328,31 +395,27 @@ def test_validate_train_config_rejects_invalid_mixed_precision():
 
 
 def test_validate_train_config_normalizes_compile_scope_and_backend_aliases():
-    cfg = make_train_config(
-        torch_compile=True,
-        torch_compile_scope="generator_ffn",
-        torch_compile_backend="aot-eager",
-    )
+    cfg = make_train_config(compile={"enabled": True, "scope": "generator_ffn", "backend": "aot-eager"})
     validate_train_config(cfg)
     assert cfg.compile.scope == "gen_ffn"
     assert cfg.compile.backend == "aot_eager"
 
 
 def test_validate_train_config_normalizes_wandb_watch_aliases():
-    cfg = make_logging_config(report_to="wandb", wandb_watch="weights", wandb_watch_log_freq=25)
+    cfg = make_logging_config(wandb={"enabled": True, "watch": "weights", "watch_log_freq": 25})
     validate_logging_config(cfg)
     assert cfg.wandb.watch == "parameters"
     assert cfg.wandb.watch_log_freq == 25
 
 
 def test_validate_train_config_rejects_invalid_wandb_watch_mode():
-    cfg = make_logging_config(wandb_watch="histogram")
+    cfg = make_logging_config(wandb={"watch": "histogram"})
     with pytest.raises(ValueError, match="logging.wandb.watch must be one of"):
         validate_logging_config(cfg)
 
 
 def test_validate_train_config_rejects_non_positive_wandb_watch_log_freq():
-    cfg = make_logging_config(wandb_watch_log_freq=0)
+    cfg = make_logging_config(wandb={"watch_log_freq": 0})
     with pytest.raises(ValueError, match="logging.wandb.watch_log_freq must be >= 1"):
         validate_logging_config(cfg)
 
@@ -463,7 +526,7 @@ def test_scale_loss_for_backward_cancels_accelerate_ga_division_for_token_weight
 
 def test_build_training_collator_propagates_packed_sequences_flag():
     tokenizer = DummyTokenizer(vocab_size=64)
-    train_cfg = make_train_config(mlm_probability=0.2, mlm_max_ngram=2)
+    train_cfg = make_train_config(objective={"mlm_probability": 0.2, "mlm_max_ngram": 2})
     collator = _build_training_collator(
         tokenizer=tokenizer,
         train_cfg=train_cfg,

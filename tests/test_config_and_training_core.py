@@ -1,10 +1,85 @@
-# ruff: noqa: F403,F405
-from _config_and_training_shared_imports import *
-from _fakes import checkpoint_saving_accelerator, make_checkpoint_saver
+import dataclasses
+import gzip
+import json
+import logging
+import random
+import re
+import warnings
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+import torch
+from _config_factories import (
+    make_data_config,
+    make_logging_config,
+    make_model_config,
+    make_optim_config,
+    make_train_config,
+)
+from _fakes import (
+    AcceleratorStateStub,
+    BackboneConfigStub,
+    DummyTokenizer,
+    FakeAccelerator,
+    FakeWandbRun,
+    TinyRTDLikeModel,
+    checkpoint_saving_accelerator,
+    make_checkpoint_saver,
+    setup_pretraining_mocks,
+)
+
+from deberta.config import (
+    Config,
+    apply_dotted_override,
+    load_config,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
+)
+from deberta.training.entrypoint import (
+    _restore_checkpoint_rng_state_or_raise,
+    _resume_optimizer_lrs_are_all_zero,
+)
+from deberta.training.metrics import (
+    _append_metrics_jsonl_row,
+    _build_runtime_resolved_tracker_config,
+    _coerce_dataclass_payload_types,
+    _flush_loggers,
+)
+from deberta.training.run_management import (
+    _find_latest_checkpoint,
+    _load_checkpoint_progress_metadata,
+    _prepare_output_dir,
+    _resolve_output_dir,
+    _resolve_output_dir_for_accelerator,
+    _resolve_resume_checkpoint,
+    _resolve_resume_checkpoint_for_accelerator,
+    _save_checkpoint_data_progress,
+    _save_training_checkpoint,
+)
+from deberta.training.runtime import (
+    _build_decoupled_optimizers,
+    _build_optimizer,
+    _digest_param_name_order,
+    _optimizer_param_order_digest,
+    _partition_optimizer_params,
+)
+from deberta.training.tracker_utils import (
+    _init_trackers,
+    _setup_wandb_watch,
+    _upload_wandb_original_config,
+)
+from deberta.utils.checkpoint import (
+    canonical_compile_state_key,
+    load_checkpoint_model_state_dict,
+    load_model_state_with_compile_key_remap,
+    load_state_with_compile_fallback,
+)
 
 
 def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
-    pytest.importorskip("yaml")
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(
         "\n".join(
@@ -27,7 +102,6 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
 
 
 def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
-    pytest.importorskip("yaml")
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(
         "\n".join(
@@ -61,7 +135,6 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
 
 
 def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -> None:
-    pytest.importorskip("yaml")
     cfg_path = tmp_path / "bad_bool.yaml"
     cfg_path.write_text(
         "\n".join(
@@ -81,7 +154,6 @@ def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -
 
 
 def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumulation(tmp_path: Path) -> None:
-    pytest.importorskip("yaml")
     cfg_path = tmp_path / "bad_bool_train.yaml"
     cfg_path.write_text(
         "\n".join(
@@ -1053,17 +1125,14 @@ def test_coerce_dataclass_payload_types_accepts_mapping_inputs() -> None:
 def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        pretrained_discriminator_path="microsoft/deberta-v3-base",
-        generator_num_hidden_layers=None,
-        hidden_dropout_prob=None,
-        attention_probs_dropout_prob=None,
-        tokenizer_vocab_target=None,
+        pretrained={"discriminator_path": "microsoft/deberta-v3-base"},
+        generator={"num_hidden_layers": None},
+        dropout={"hidden_prob": None, "attention_probs_prob": None},
+        tokenizer={"vocab_target": None},
     )
-    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu")
+    data_cfg = make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})
     train_cfg = make_train_config()
-    optim_cfg = make_optim_config(
-        learning_rate=5e-4, generator_learning_rate=-1.0, discriminator_learning_rate=-1.0
-    )
+    optim_cfg = make_optim_config(lr={"base": 5e-4, "generator": -1.0, "discriminator": -1.0})
     logging_cfg = make_logging_config()
     disc_cfg = BackboneConfigStub(
         num_hidden_layers=12,
@@ -1120,21 +1189,28 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
 def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None:
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        hidden_size="768",  # type: ignore[arg-type]
-        num_hidden_layers="12",  # type: ignore[arg-type]
-        num_attention_heads="12",  # type: ignore[arg-type]
-        intermediate_size="3072",  # type: ignore[arg-type]
-        hidden_dropout_prob="0.0",  # type: ignore[arg-type]
-        attention_probs_dropout_prob="0.0",  # type: ignore[arg-type]
+        rope={
+            "hidden_size": "768",
+            "num_hidden_layers": "12",
+            "num_attention_heads": "12",
+            "intermediate_size": "3072",
+        },  # type: ignore[dict-item]
+        dropout={
+            "hidden_prob": "0.0",
+            "attention_probs_prob": "0.0",
+        },  # type: ignore[dict-item]
     )
-    data_cfg = make_data_config(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
+    data_cfg = make_data_config(
+        source={"dataset_name": "HuggingFaceFW/fineweb-edu"},
+        packing={"max_seq_length": "1024"},  # type: ignore[dict-item]
+    )
     train_cfg = make_train_config(
         token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
     )
     optim_cfg = make_optim_config(
-        learning_rate="5e-4",  # type: ignore[arg-type]
-        adam_epsilon="1e-6",  # type: ignore[arg-type]
-        warmup_steps="1000",  # type: ignore[arg-type]
+        lr={"base": "5e-4"},  # type: ignore[dict-item]
+        adam={"epsilon": "1e-6"},  # type: ignore[dict-item]
+        scheduler={"warmup_steps": "1000"},  # type: ignore[dict-item]
     )
     disc_cfg = BackboneConfigStub(
         payload={
@@ -1194,22 +1270,20 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
     train_cfg = make_train_config(
-        output_dir=str(tmp_path / "run"),
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
         max_steps=2,
-        save_steps=0,
         mixed_precision="no",
         tf32=False,
-        dataloader_num_workers=0,
+        dataloader={"num_workers": 0},
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
-        torch_compile=False,
-        export_hf_final=False,
+        compile={"enabled": False},
     )
 
     with pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
             model_cfg=make_model_config(),
-            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
             train_cfg=train_cfg,
             logging_cfg=make_logging_config(wandb={"enabled": True}),
         )
@@ -1264,23 +1338,23 @@ def test_run_pretraining_logs_crash_save_failure(
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
     train_cfg = make_train_config(
-        output_dir=str(tmp_path / "run"),
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
         max_steps=2,
-        save_steps=0,
         mixed_precision="no",
         tf32=False,
-        dataloader_num_workers=0,
+        dataloader={"num_workers": 0},
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
-        torch_compile=False,
-        export_hf_final=False,
+        compile={"enabled": False},
     )
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises(KeyboardInterrupt):
             pretrain_mod.run_pretraining(
                 model_cfg=make_model_config(),
-                data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+                data_cfg=make_data_config(
+                    source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}
+                ),
                 train_cfg=train_cfg,
             )
 
@@ -1312,22 +1386,20 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
     train_cfg = make_train_config(
-        output_dir=str(tmp_path / "run"),
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
         max_steps=3,
-        save_steps=0,
         mixed_precision="no",
         tf32=False,
-        dataloader_num_workers=0,
+        dataloader={"num_workers": 0},
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
-        torch_compile=False,
-        export_hf_final=False,
+        compile={"enabled": False},
     )
 
     with pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
             model_cfg=make_model_config(),
-            data_cfg=make_data_config(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
             train_cfg=train_cfg,
         )
 

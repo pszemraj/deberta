@@ -18,7 +18,6 @@ from deberta.modeling.mask_utils import build_doc_block_mask
 @pytest.fixture
 def tiny_rope_config_factory():
     """Return a helper that builds tiny DebertaRoPEConfig instances for attention tests."""
-    pytest.importorskip("transformers")
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
 
     base = dict(
@@ -68,7 +67,8 @@ def test_packed_streaming_marks_internal_sep_as_special():
 
 
 def test_packed_hf_streaming_single_shard_tolerates_extra_dataloader_workers() -> None:
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     raw = datasets.Dataset.from_dict(
         {"text": ["one two three four five six seven eight"] * 8}
     ).to_iterable_dataset(num_shards=1)
@@ -1301,8 +1301,6 @@ def test_self_attention_uses_pairwise_diagonal_for_query_activity(tiny_rope_conf
 
 def test_mlp_has_no_internal_residual_dropout():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP
 
     torch.manual_seed(0)
@@ -1332,7 +1330,6 @@ def test_mlp_has_no_internal_residual_dropout():
 
 
 def test_self_attention_sdpa_matches_eager_with_padding_mask():
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
 
@@ -1377,8 +1374,6 @@ def test_self_attention_sdpa_matches_eager_with_padding_mask():
 
 def test_rope_projections_respect_use_bias_config():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP, DebertaRoPESelfAttention
 
     base_kwargs = dict(
@@ -1412,8 +1407,6 @@ def test_rope_projections_respect_use_bias_config():
 
 def test_pretrainer_forward_smoke():
     """Requires transformers; skipped automatically if not installed."""
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1478,8 +1471,6 @@ def test_pretrainer_forward_smoke():
 
 def test_rope_pretrainer_ignores_flash_metadata_boundary():
     """RoPE RTD should run when flash metadata is present at the RTD boundary."""
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.mask_utils import FlashBatchMeta
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
@@ -1600,8 +1591,6 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
 
 def test_pretrainer_sampler_avoids_configured_special_ids():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -1648,7 +1637,6 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
 
 
 def test_pretrainer_rejects_z_steps_as_enhanced_mask_decoder_substitute() -> None:
-    pytest.importorskip("transformers")
 
     from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1723,8 +1711,6 @@ def _make_emd_harness(
 
 def test_enhanced_mask_decoder_adds_raw_position_states_without_embedding_norm():
 
-    pytest.importorskip("transformers")
-
     class _ForbiddenNorm(torch.nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             del x
@@ -1785,8 +1771,6 @@ def test_enhanced_mask_decoder_adds_raw_position_states_without_embedding_norm()
 
 def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
 
-    pytest.importorskip("transformers")
-
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -1823,8 +1807,6 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
 
 
 def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.mask_utils import FlashBatchMeta
 
@@ -1894,8 +1876,6 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
 
 def test_masked_lm_head_has_only_tied_projection_bias():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import MaskedLMHead
 
@@ -1915,7 +1895,6 @@ def test_masked_lm_head_has_only_tied_projection_bias():
 
 @pytest.mark.parametrize("backbone_type", ["native", "rope"])
 def test_pretrainer_initializes_only_new_heads_from_backbone_contract(backbone_type: str) -> None:
-    pytest.importorskip("transformers")
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
     initializer_range = 0.005
@@ -1983,8 +1962,6 @@ def test_pretrainer_initializes_only_new_heads_from_backbone_contract(backbone_t
 
 def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rtd import MLMTransform, RTDHead
 
     class _Cfg:
@@ -2001,8 +1978,6 @@ def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
 
 
 def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import MaskedLMHead
@@ -2029,8 +2004,6 @@ def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
 
 
 def test_rtd_head_does_not_apply_dropout_in_parity_path():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import RTDHead
@@ -2065,8 +2038,6 @@ def test_rtd_head_does_not_apply_dropout_in_parity_path():
 
 
 def test_rtd_head_applies_cls_conditioning_before_dense_projection():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import RTDHead
@@ -2112,8 +2083,6 @@ def test_rtd_head_applies_cls_conditioning_before_dense_projection():
 
 
 def test_rtd_head_gathers_per_document_cls_for_pairwise_attention_masks():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import RTDHead
@@ -2182,8 +2151,6 @@ def test_rtd_head_requires_per_document_cls_for_docblock_flash_meta():
     the first document only, so adding it globally would leak document 1 into
     every other document in the row (regression for the P1 review finding).
     """
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.mask_utils import FlashBatchMeta
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
@@ -2263,7 +2230,6 @@ def test_rtd_head_requires_per_document_cls_for_docblock_flash_meta():
 def test_packed_rtd_matches_standalone_documents_with_local_positions_and_cls() -> None:
     """Packing must preserve generator and discriminator objective semantics."""
 
-    pytest.importorskip("transformers")
     from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -2472,7 +2438,6 @@ def test_packed_rtd_matches_standalone_documents_with_local_positions_and_cls() 
 def test_packed_rope_rtd_accepts_local_positions_and_matches_standalone() -> None:
     """RoPE packed training must preserve optional learned absolute positions."""
 
-    pytest.importorskip("transformers")
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -2589,8 +2554,6 @@ def test_flash_batch_meta_is_cross_document_predicate():
 
 
 def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -2720,8 +2683,6 @@ def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
 
 def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -2774,8 +2735,6 @@ def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
 
 def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
     torch.manual_seed(0)
@@ -2827,8 +2786,6 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
 def test_native_hf_deberta_v2_forward_smoke():
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
@@ -2863,8 +2820,6 @@ def test_native_hf_deberta_v2_forward_smoke():
     ids=["c2p_p2c", "with_p2p"],
 )
 def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_type: str, seed: int):
-
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -2916,7 +2871,6 @@ def test_native_disentangled_signed_bucket_forward_and_gradients_match_definitio
 ) -> None:
     """Each positional term must use the same canonical signed q-k bucket."""
 
-    pytest.importorskip("transformers")
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
@@ -2998,7 +2952,6 @@ def test_native_disentangled_signed_bucket_forward_and_gradients_match_definitio
 def test_native_attention_matches_transformers_reference_on_active_tokens() -> None:
     """Corrected native attention must match the independent HF implementation."""
 
-    pytest.importorskip("transformers")
     from transformers import DebertaV2Config
     from transformers.models.deberta_v2.modeling_deberta_v2 import (
         DisentangledSelfAttention as TransformersDisentangledSelfAttention,
@@ -3048,7 +3001,6 @@ def test_native_attention_matches_transformers_reference_on_active_tokens() -> N
 
 @pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])
 def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: str):
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3100,8 +3052,6 @@ def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: s
 def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3164,8 +3114,6 @@ def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
@@ -3225,8 +3173,6 @@ def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
 
 def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
@@ -3264,8 +3210,6 @@ def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
 
 def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
     import math
-
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3316,7 +3260,6 @@ def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
 
 @pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])
 def test_native_hf_deberta_v2_c2p_p2c_bias_respects_scale_factor(kernel: str):
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3386,8 +3329,6 @@ def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
 
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
@@ -3408,8 +3349,6 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
 
 
 def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
-
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3442,8 +3381,6 @@ def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
 
 def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
@@ -3474,7 +3411,6 @@ def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
 
 
 def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3523,8 +3459,6 @@ def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
 
 def test_native_hf_deberta_v2_stable_compile_step_is_finite():
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
@@ -3560,8 +3494,6 @@ def test_native_hf_deberta_v2_stable_compile_step_is_finite():
 @pytest.mark.parametrize("relative_attention", [False, True], ids=["plain", "disentangled"])
 def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_attention: bool):
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
@@ -3593,8 +3525,6 @@ def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_a
 
 
 def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
-
-    pytest.importorskip("transformers")
 
     from transformers import DebertaV2Config
 
@@ -3636,8 +3566,6 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
 
 def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
 
-    pytest.importorskip("transformers")
-
     from transformers import DebertaV2Config
 
     from deberta.modeling.deberta_v2_native import DebertaV2Model
@@ -3657,8 +3585,6 @@ def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
 
 
 def test_rope_model_accepts_positional_input_ids_call():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
@@ -3688,8 +3614,6 @@ def test_rope_model_accepts_positional_input_ids_call():
 
 def test_rope_keel_default_alpha_matches_paper_contract():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEEncoder
 
     cfg = DebertaRoPEConfig(
@@ -3717,8 +3641,6 @@ def test_rope_keel_default_alpha_matches_paper_contract():
 
 
 def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPELayer
 
@@ -3766,8 +3688,6 @@ def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
 
 def test_rope_model_supports_output_hidden_states():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
     cfg = DebertaRoPEConfig(
@@ -3796,8 +3716,6 @@ def test_rope_model_supports_output_hidden_states():
 
 
 def test_pretrainer_missing_attention_mask_means_all_tokens_are_active():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -3879,8 +3797,6 @@ def test_pretrainer_missing_attention_mask_means_all_tokens_are_active():
 
 def test_pretrainer_disc_loss_supervises_all_tokens_without_attention_mask():
 
-    pytest.importorskip("transformers")
-
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
@@ -3931,8 +3847,6 @@ def test_pretrainer_disc_loss_supervises_all_tokens_without_attention_mask():
 
 
 def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_special(monkeypatch):
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -3990,8 +3904,6 @@ def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_spe
 
 
 def test_rope_config_rejects_unknown_ffn_type():
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
 

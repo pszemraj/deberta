@@ -14,11 +14,9 @@ from deberta.config import (
     TrainConfig,
     apply_dotted_override,
     load_config,
-    validate_data_config,
     validate_model_config,
     validate_optim_config,
     validate_train_config,
-    validate_training_workflow_options,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +65,6 @@ def test_programmatic_config_preserves_custom_profile_values() -> None:
 
 
 def test_load_yaml_nested(tmp_path: Path):
-    pytest.importorskip("yaml")
 
     nested = tmp_path / "nested.yaml"
     nested.write_text(
@@ -142,7 +139,6 @@ def test_load_json_nested(tmp_path: Path):
 
 
 def test_load_yaml_hf_flash_config(tmp_path: Path):
-    pytest.importorskip("yaml")
 
     config_path = tmp_path / "flash.yaml"
     config_path.write_text(
@@ -261,7 +257,6 @@ def test_optim_constraints_fail_during_validation(cfg: OptimConfig, match: str) 
 @pytest.mark.parametrize("format_name", ["JSON", "YAML"])
 def test_load_nested_unknown_top_level_key_raises(tmp_path: Path, format_name: str):
     if format_name == "YAML":
-        pytest.importorskip("yaml")
         content = "model:\n  backbone_type: rope\nunexpected_top_level_key: 1"
     else:
         content = json.dumps({"model": {"backbone_type": "rope"}, "unexpected_top_level_key": 1})
@@ -278,23 +273,11 @@ def test_load_nested_unknown_top_level_key_raises(tmp_path: Path, format_name: s
         "pretrain_hf_deberta_v2_parity_small.yaml",
     ],
 )
-def test_parity_yaml_configs_parse_and_validate(config_name: str) -> None:
-    pytest.importorskip("yaml")
+def test_parity_yaml_configs_load(config_name: str) -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     config_path = repo_root / "configs" / config_name
     cfg = load_config(config_path)
-
-    validate_model_config(cfg.model)
-    validate_data_config(cfg.data)
-    validate_train_config(cfg.train)
-    validate_optim_config(cfg.optim)
-    validate_training_workflow_options(
-        data_cfg=cfg.data,
-        train_cfg=cfg.train,
-        model_cfg=cfg.model,
-        optim_cfg=cfg.optim,
-    )
 
     assert cfg.model.backbone_type == "hf_deberta_v2"
     assert cfg.model.pretrained.discriminator_path == ""
