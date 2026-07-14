@@ -38,13 +38,10 @@ def _is_no_decay_param(*, name: str, param: torch.Tensor) -> bool:
     :return bool: True when parameter belongs to no-decay groups.
     """
     lname = str(name).lower()
-    # Keep vector/scalar biases in no-decay; high-rank "bias" tensors (for example
-    # GDES embedding deltas) should follow standard weight-decay behavior.
-    if lname.endswith(".bias") and param.dim() <= 1:
-        return True
     if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
         return True
-    # Scalars and 1D params are typically excluded from decay.
+    # Scalars and 1D params, including conventional biases, skip decay. High-rank
+    # "bias" tensors (for example GDES embedding deltas) retain standard decay.
     if param.dim() <= 1:
         return True
     return False
