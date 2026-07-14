@@ -180,11 +180,13 @@ class _TimedPhase:
         self._record = torch.profiler.record_function(self.name)
 
     def __enter__(self) -> None:
+        torch.cuda.synchronize()
         self._record.__enter__()
         self._start = time.perf_counter()
         return None
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - self._start) * 1000.0
         self.phase_times_ms[self.name].append(elapsed_ms)
         return self._record.__exit__(exc_type, exc, tb)
