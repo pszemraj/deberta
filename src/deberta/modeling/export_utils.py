@@ -29,10 +29,11 @@ def clean_exported_config(config_path: Path) -> None:
     """Remove training-internal keys from exported HF ``config.json`` files.
 
     :param Path config_path: Path to exported ``config.json``.
+    :raises FileNotFoundError: If the export did not produce a config file.
     :raises ValueError: If ``config_path`` contains malformed JSON.
     """
     if not config_path.exists():
-        return
+        raise FileNotFoundError(f"Export did not produce required config JSON at {config_path}.")
     try:
         raw = load_json_mapping(config_path)
     except Exception as exc:
@@ -229,15 +230,16 @@ def merge_embeddings_into_export_backbone(
     if mode not in {"es", "gdes"}:
         return
 
-    if not hasattr(export_model, "embeddings"):
-        return
+    embeddings = getattr(export_model, "embeddings", None)
+    if embeddings is None:
+        raise RuntimeError(f"Cannot merge {mode} embeddings: export backbone has no `.embeddings` module.")
 
     def merge_attr(attr: str) -> None:
         """Merge one embedding attribute into the export model.
 
         :param str attr: Embedding attribute name.
         """
-        if not hasattr(export_model.embeddings, attr):
+        if not hasattr(embeddings, attr):
             return
         gen_w = gen_sd.get(f"embeddings.{attr}.weight")
         if gen_w is None:
@@ -251,7 +253,7 @@ def merge_embeddings_into_export_backbone(
                 raise RuntimeError(f"Missing discriminator bias for embeddings.{attr}.bias (gdes)")
             merged = gen_w.detach().float() + bias.detach().float()
 
-        emb_mod = getattr(export_model.embeddings, attr)
+        emb_mod = getattr(embeddings, attr)
         if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
             emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
 

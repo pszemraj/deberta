@@ -62,11 +62,10 @@ class _FakeExportBackbone(torch.nn.Module):
     def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
-        if self._write_config_payload:
-            (target / "config.json").write_text(
-                json.dumps(self._write_config_payload),
-                encoding="utf-8",
-            )
+        (target / "config.json").write_text(
+            json.dumps(self._write_config_payload),
+            encoding="utf-8",
+        )
         del safe_serialization
         return None
 
@@ -95,6 +94,21 @@ def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> 
             root=tmp_path, name="checkpoint-10", with_data_state=False, with_complete=False
         )
     return run_dir, checkpoint_dir
+
+
+def test_clean_exported_config_requires_save_pretrained_config(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="did not produce required config JSON"):
+        export_cli.clean_exported_config(tmp_path / "config.json")
+
+
+def test_embedding_merge_rejects_backbone_without_embeddings() -> None:
+    with pytest.raises(RuntimeError, match="export backbone has no `.embeddings` module"):
+        export_cli.merge_embeddings_into_export_backbone(
+            export_model=torch.nn.Linear(2, 2),
+            disc_sd={},
+            gen_sd={},
+            mode="es",
+        )
 
 
 def _new_export_call_counters() -> dict[str, object]:
