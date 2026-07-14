@@ -270,7 +270,7 @@ model:
       # launch values: kernel rows also require positive block_m, block_n, num_stages, and num_warps values.
       # kernel matching: optional predicates are compute_capability, head_dim, exact/min/max batch_size|query_len|key_len|num_heads, causal, disentangled, has_mask, dtype, and att_span_min.
       # precedence: later equally specific policy/kernel rows win; override buckets match before shipped buckets and replace same-name buckets.
-      # warning: missing files and invalid JSON/object roots fail when first consulted, but row semantics are permissive; unusable rows may be ignored and invalid launch values can fail only when selected.
+      # warning: missing files, invalid JSON/object roots, unknown sections, malformed rows, and invalid launch values fail when the Flash attention module is constructed, with file and row context where applicable.
       # recommendation: keep null unless using tuning-tool output that has passed parity and smoke training on the target GPU.
       kernel_overrides_path: null
 

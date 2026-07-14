@@ -48,7 +48,7 @@ Run preflight checks for `deberta train`.
 This validates configuration contracts and probes core runtime dependencies
 (tokenizer, dataset access, collator output, model config construction)
 without starting optimization/training loops. It may access network sources and populate
-dependency caches; see ``configs/config_reference.yaml``.
+dependency caches; see the [config reference](../../configs/config_reference.yaml).
 
 ### Parameters
 

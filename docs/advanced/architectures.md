@@ -7,7 +7,7 @@
 | Setting | `hf_deberta_v2` | `rope` |
 |---|---|---|
 | Attention | DeBERTa disentangled attention (C2C/C2P/P2C/P2P) | standard QKV + RoPE |
-| Position | relative-position buckets/embeddings | rotary embeddings |
+| Position | relative-position buckets/embeddings | rotary; optional learned absolute input embeddings |
 | Norm | LayerNorm | RMSNorm |
 | FFN | MLP | MLP or SwiGLU |
 | Primary use | DeBERTa-v2/v3 parity path | experimental modernized path |
@@ -48,9 +48,4 @@ tooling, caveats, and open follow-ups: [Advanced / FlashDeBERTa attention](flash
 
 ## RoPE-specific controls
 
-`rope` adds controls not used by `hf_deberta_v2`:
-
-- `norm_arch`: `post` or `keel`
-- `ffn_type`: `mlp` or `swiglu`
-- `rope_theta`, `rotary_pct`
-- `use_bias`, `keel_alpha_init`, `keel_alpha_learnable`
+`rope` adds controls for rotary geometry, optional learned absolute input embeddings, MLP/SwiGLU selection, RMSNorm placement, attention implementation, and KEEL residual scaling. Exact fields and interactions are listed under `model.rope.*` in the [config reference](../../configs/config_reference.yaml).

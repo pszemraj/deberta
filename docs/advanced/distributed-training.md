@@ -16,3 +16,7 @@ command.
 The provided configs target FSDP2 (`fsdp_version: 2`).
 
 FSDP1 is not maintained as a first-class path in this repo; use FSDP2 configs for supported behavior.
+
+## FlashDeBERTa with compile
+
+FSDP2, `torch.compile`, and FlashDeBERTa use compatible wrapping boundaries, but the combined multi-GPU path does not yet have an end-to-end regression test. Run the target distributed configuration before relying on this combination for a long job. Route and kernel behavior are described in [FlashDeBERTa attention](flash-attention.md).

@@ -12,8 +12,10 @@ set `model.hf.attention_impl: flash` or pass `--model.hf.attention_impl flash`.
 The flash path has these constraints:
 
 - `model.backbone_type` must be `hf_deberta_v2`.
+- `train.mixed_precision` must be `bf16`, and the CUDA device must support bf16.
 - Hidden and attention-probability dropout must both be explicitly `0.0`; `null` may preserve
   nonzero backbone/checkpoint dropout and is rejected for flash.
+- The materialized native config must use relative attention with positive position buckets and must not include the unsupported P2P attention term.
 - `max_relative_positions` must cover `max_position_embeddings`. The default `-1` derives a
   compatible span. A shorter explicit span is rejected because eager and flash bucket distant
   positions differently.
@@ -68,10 +70,7 @@ All route and override fields live under `model.hf.flash.*`. Their exact null, z
 exact-length semantics are defined on each field in the
 [config reference](../../configs/config_reference.yaml).
 
-An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to
-the dense memory cost. `kernel_overrides_path` is loaded at route lookup time, so a missing or
-malformed file fails when the first flash batch resolves its route rather than during config
-parsing.
+An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to the dense memory cost. `kernel_overrides_path` is loaded and validated when Flash attention modules are constructed, so a missing or malformed table fails before the first batch.
 
 ## Tuning table
 
@@ -83,7 +82,7 @@ Defaults live in
 - `kernels` selects Triton launch configurations by route, operation, shape bucket, and compute
   capability.
 
-Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, and `bias_docblock_specialized`. Without a matching capability row, fixed and varlen kernels use the repo-owned conservative `(16, 16, 1, 4)` launch tile, dense-bias kernels use their generic tile, and specialized doc-block backward kernels remain disabled. This deterministic fallback deliberately ignores the upstream package's environment-variable tuning surface; use `model.hf.flash.kernel_overrides_path` for auditable per-hardware choices. [GPU support](gpu-support.md) explains why measured overrides are capability-scoped.
+Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, and `bias_docblock_specialized`. Without a matching row, fixed, varlen, doc-block, and generic bias kernels use the repo-owned conservative `(16, 16, 1, 4)` launch tile; the dense-bias builder uses `(64, 64, 2, 4)`; and specialized doc-block backward kernels remain disabled. These deterministic fallbacks ignore the upstream package's environment-variable tuning surface. Use `model.hf.flash.kernel_overrides_path` for auditable per-hardware choices; [GPU support](gpu-support.md) explains why measured overrides are capability-scoped.
 
 ### Retuning
 
@@ -105,8 +104,7 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
   on synthetic dense and padded shapes.
 - [`flashdeberta_rtd_profile.py`](../../tools/flashdeberta_rtd_profile.py) profiles complete RTD
   optimizer steps for one config.
-- [`flashdeberta_rtd_compare_step.py`](../../tools/flashdeberta_rtd_compare_step.py) compares one
-  identical batch and initial state through eager and flash arms.
+- [`flashdeberta_rtd_compare_step.py`](../../tools/flashdeberta_rtd_compare_step.py) compares one identical batch and initial state through the production generator and discriminator phase methods, with observation hooks that do not replace phase logic.
 - [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and
   selected gradients against eager attention.
 - [`run_flashdeberta_benchmarks.sh`](../../tools/run_flashdeberta_benchmarks.sh) runs the tracked
@@ -114,11 +112,11 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
 
 Packed benchmark configs are under [`configs/flashdeberta/`](../../configs/flashdeberta/).
 
+Before merging Flash changes, run `bash tools/premerge.sh`. It records the commit and dirty-tree state under `local-scratch/premerge/` while running lint, docstring checks, the full test suite, and CUDA parity.
+
 ## Runtime caveats
 
-- Dense doc-block position gradients use atomic accumulation, so flash runs are not bitwise reproducible. Any manual or external comparison of resumed and uninterrupted runs must use numeric tolerances; the trainer does not run a separate numerical-drift detector.
+- The shipped `sm_120` specialized dense doc-block backward atomically accumulates position gradients and is not bitwise reproducible. Comparisons involving that route must use numeric tolerances; the trainer does not run a separate numerical-drift detector.
 - Training uses `drop_last=True` because doc-block route choice depends on batch shape; allowing a
   smaller final batch could change routes and trigger recompilation mid-epoch.
-- FSDP2, `torch.compile`, and flash work through compatible wrapping boundaries, but the combined
-  multi-GPU path does not yet have an end-to-end test. See
-  [Distributed training](distributed-training.md).
+- Multi-GPU validation status is tracked in [Distributed training](distributed-training.md#flashdeberta-with-compile).

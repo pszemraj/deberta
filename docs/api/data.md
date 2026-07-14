@@ -7,35 +7,36 @@ Data utilities for DeBERTaV3 pretraining.
 ## `DebertaV3ElectraCollator`
 
 ```python
-class DebertaV3ElectraCollator(
+DebertaV3ElectraCollator(
     *,
     tokenizer: 'Any',
     cfg: 'MLMConfig',
     packed_sequences: 'bool' = False,
     block_cross_document_attention: 'bool' = True,
+    emit_flash_metadata: 'bool' = True,
     pad_to_multiple_of: 'int | None' = None,
-) -> 'None'
+)
 ```
 
 Dynamic MLM masking collator suitable for RTD/ELECTRA-style pretraining.
 
 Produces masked ``input_ids``, MLM ``labels``, and optional attention/token-type tensors.
-Packed doc-block batches also carry ``doc_ids`` and ``flash_*`` metadata. See
+Packed doc-block batches carry ``doc_ids``; ``emit_flash_metadata=True`` additionally emits the attested ``flash_*`` fields. See
 [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
 batch-preparation contract.
 
 Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
-those raw helper defaults for the selected backbone; see ``configs/config_reference.yaml``.
+those raw helper defaults for the selected backbone; see the [config reference](../../configs/config_reference.yaml).
 
 ## `MLMConfig`
 
 ```python
-class MLMConfig(
+MLMConfig(
     mlm_probability: 'float',
     mask_token_prob: 'float' = 0.8,
     random_token_prob: 'float' = 0.1,
     max_ngram: 'int' = 1,
-) -> None
+)
 ```
 
 Masking configuration.
@@ -65,28 +66,32 @@ Source selection is described in [Data pipeline](../guides/data-pipeline.md#data
 ## `PackedStreamingConfig`
 
 ```python
-class PackedStreamingConfig(
+PackedStreamingConfig(
     text_column_name: 'str',
     max_seq_length: 'int',
     seed: 'int',
     shuffle_buffer_size: 'int',
     block_cross_document_attention: 'bool' = False,
-) -> None
+    retry_attempts: 'int' = 3,
+    retry_backoff_seconds: 'float' = 1.0,
+)
 ```
 
 Configuration for packing raw text into fixed-length token blocks.
 
+The retry fields bound recovery from transient streaming failures; their attempt-count, backoff, and replay semantics are defined under `data.source.*` in the [config reference](../../configs/config_reference.yaml).
+
 ## `PackedStreamingDataset`
 
 ```python
-class PackedStreamingDataset(
+PackedStreamingDataset(
     *,
     hf_dataset: 'Any',
     tokenizer: 'Any',
     cfg: 'PackedStreamingConfig',
     process_index: 'int' = 0,
     num_processes: 'int' = 1,
-) -> 'None'
+)
 ```
 
 Pack streaming text into fixed-length blocks across ranks and DataLoader workers.
@@ -113,14 +118,14 @@ Forward epoch to underlying dataset when supported.
 ## `SequentialStreamingDataset`
 
 ```python
-class SequentialStreamingDataset(
+SequentialStreamingDataset(
     *,
     hf_dataset: 'Any',
     tokenizer: 'Any',
     cfg: 'PackedStreamingConfig',
     process_index: 'int' = 0,
     num_processes: 'int' = 1,
-) -> 'None'
+)
 ```
 
 One-document-per-sequence dataset (reference mode without cross-document packing).

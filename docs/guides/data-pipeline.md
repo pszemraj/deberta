@@ -10,6 +10,8 @@
 
 If none are provided, config validation fails.
 
+Dataset loading and streaming use bounded retry for transient I/O failures. `data.source.retry_attempts` sets the total attempt count, and `data.source.retry_backoff_seconds` sets the initial exponential-backoff delay; exact failure and replay semantics are defined in the [config reference](../../configs/config_reference.yaml).
+
 ## Packed streaming path
 
 `PackedStreamingDataset` (default when `data.packing.enabled=true`) tokenizes documents without
@@ -34,10 +36,7 @@ Outputs:
 boundaries. It is only valid with `data.packing.enabled=true`.
 
 - `false`: packed samples attend across document boundaries; no document mask is built
-- `true`: the collator emits compact `doc_ids (B,S)` and precomputes fixed-capacity segment
-  descriptors plus host statistics before device transfer. It validates exact, non-overlapping
-  segment coverage against `attention_mask` before attesting the metadata. Every segment begins
-  with its own CLS token.
+- `true`: the collator emits compact `doc_ids (B,S)`. Every segment begins with its own CLS token.
 
 The collator also emits two fixed-shape objective tensors for blocked rows:
 
@@ -46,6 +45,8 @@ The collator also emits two fixed-shape objective tensors for blocked rows:
 - `doc_context_index (B,S)` maps each token to its document's CLS position. The RTD classifier
   gathers that context before LayerNorm, preserving the standalone `LayerNorm(token + CLS)`
   architecture for every packed document.
+
+When FlashDeBERTa is enabled, the collator additionally precomputes fixed-capacity segment descriptors and host statistics before device transfer. It validates exact, non-overlapping segment coverage against `attention_mask` before attesting that metadata. Eager training does not emit the Flash-only fields.
 
 What consumes `doc_ids` depends on the attention path:
 

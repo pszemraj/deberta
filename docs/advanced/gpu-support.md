@@ -1,9 +1,6 @@
 # GPU support
 
-FlashDeBERTa routing and kernel tuning are keyed by CUDA compute capability. The shipped
-measurements come from one GPU class, `sm_120`; every other CUDA GPU still runs flash end to end
-with conservative defaults and user knobs to opt into the faster routes. This page covers what to
-expect on your hardware and how to tune it.
+FlashDeBERTa routing and kernel tuning are keyed by CUDA compute capability. The shipped measurements come from one GPU class, `sm_120`; every other supported CUDA GPU runs Flash attention with conservative defaults and user knobs for measured routes.
 
 Check your capability:
 
@@ -28,13 +25,9 @@ Pre-Ampere GPUs are untested and unsupported for `attention_impl=flash`; use `ea
 
 ## What you get out of the box
 
-On `sm_120`, everything is measured: dense `docblock_bias` for packed doc-block batches, the
-small-batch `local_bias` route, and tuned Triton tiles for every kernel family.
+On `sm_120`, the shipped table enables measured dense `docblock_bias` and small-batch `local_bias` policies plus tuned rows for promoted hot paths. Kernel families without a matching row still use the deterministic fallbacks documented in [FlashDeBERTa attention](flash-attention.md#tuning-table).
 
-On any other CUDA GPU, `model.hf.attention_impl=flash` still runs flash attention - **there is no
-eager fallback based on GPU type**. Eager fallbacks happen only for unsupported regimes (p2p
-attention terms, dropout enabled, unexpected mask shapes), never because your capability key is
-missing from the table. What changes off `sm_120`:
+On any other supported CUDA GPU, `model.hf.attention_impl=flash` still runs Flash attention: a missing capability row does not trigger eager attention. Per-call input contracts such as attention-output requests or unsupported mask layouts can still select eager attention. What changes off `sm_120`:
 
 - **Padded routing is identical**: `fixed` below `2048`, `varlen` at `2048+`.
 - **Packed doc-block batches default to the ragged `docblock` route** instead of dense
@@ -43,13 +36,9 @@ missing from the table. What changes off `sm_120`:
   a dense `(B,H,S,S)` bias for backward. Ragged is the memory-light, specialization-free default.
 - **The `local_bias` route stays off** (its only shipped policy row is `sm_120`-scoped); plain
   dense batches use the `fixed` route.
-- **Kernel launch configs come from upstream FlashDeBERTa heuristics** (the repo-local dense-bias
-  builder uses a conservative built-in tile), because the shipped tile entries are all
-  `sm_120`-scoped and Triton tiles do not transfer across GPU generations - a tile sized for one
-  chip's shared memory can fail to launch or run slowly on another.
+- **Unmatched kernel launch configs use repo-owned deterministic fallbacks**, not upstream FlashDeBERTa heuristics. Capability-specific tuning is still recommended because a conservative tile may run slowly on another architecture.
 
-At startup, the first flash batch on a GPU without measured rows logs a one-time warning naming
-the detected capability and pointing here.
+When the first Flash batch is prepared, a GPU without measured rows logs a one-time warning naming the detected capability and pointing here.
 
 ## Opting into the dense routes on other hardware
 

@@ -7,7 +7,7 @@ Model components for DeBERTaV3 RTD pretraining.
 ## `DebertaV3RTDPretrainer`
 
 ```python
-class DebertaV3RTDPretrainer(
+DebertaV3RTDPretrainer(
     *,
     discriminator_backbone: 'nn.Module',
     generator_backbone: 'nn.Module',
@@ -15,10 +15,12 @@ class DebertaV3RTDPretrainer(
     gen_config: 'Any',
     embedding_sharing: 'str' = 'gdes',
     additional_forbidden_token_ids: 'Iterable[int] | None' = None,
-) -> 'None'
+)
 ```
 
 Generator + discriminator pretraining module (DeBERTaV3 / ELECTRA objective).
+
+Phase results are dataclasses in `deberta.modeling.rtd`: `RTDGeneratorPhaseOutput` carries generator loss, token count, corrupted ids, discriminator labels, and the masked-target flag; `RTDDiscriminatorPhaseOutput` carries discriminator loss, accuracy, token count, and positive count; `RTDOutput` combines weighted and raw losses with both phases' counts and discriminator accuracy.
 
 ### Members
 
@@ -207,7 +209,7 @@ Instantiate discriminator + generator backbones.
 ## `DebertaV2Config`
 
 ```python
-class DebertaV2Config(
+DebertaV2Config(
     vocab_size=128100,
     hidden_size=1536,
     num_hidden_layers=24,
@@ -239,7 +241,7 @@ In this package it configures the repo-native `DebertaV2Model`.
 ## `DebertaV2Model`
 
 ```python
-class DebertaV2Model(config: 'DebertaV2Config') -> 'None'
+DebertaV2Model(config: 'DebertaV2Config')
 ```
 
 Native encoder-only DeBERTa-v2 model returning ``BaseModelOutput``.
@@ -318,7 +320,7 @@ Run DeBERTa-v2 encoder forward pass.
 ## `DebertaRoPEConfig`
 
 ```python
-class DebertaRoPEConfig(
+DebertaRoPEConfig(
     *,
     vocab_size: 'int' = 50265,
     hidden_size: 'int' = 768,
@@ -343,7 +345,7 @@ class DebertaRoPEConfig(
     attention_implementation: 'str' = 'sdpa',
     initializer_range: 'float' = 0.02,
     **kwargs: 'Any',
-) -> 'None'
+)
 ```
 
 Config for the modernized RoPE encoder backbone.
@@ -351,7 +353,7 @@ Config for the modernized RoPE encoder backbone.
 ## `DebertaRoPEModel`
 
 ```python
-class DebertaRoPEModel(config: 'DebertaRoPEConfig') -> 'None'
+DebertaRoPEModel(config: 'DebertaRoPEConfig')
 ```
 
 Encoder-only model with HF-style ``BaseModelOutput`` support.
@@ -422,7 +424,7 @@ Run encoder forward pass.
 ## `DebertaRoPELayer`
 
 ```python
-class DebertaRoPELayer(config: 'DebertaRoPEConfig', *, alpha_init: 'float') -> 'None'
+DebertaRoPELayer(config: 'DebertaRoPEConfig', *, alpha_init: 'float')
 ```
 
 One encoder layer with attention + MLP.
