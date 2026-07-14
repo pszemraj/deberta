@@ -42,7 +42,11 @@ from transformers import AutoTokenizer  # noqa: E402
 
 from deberta.config import (  # noqa: E402
     DataConfig,
+    DataPackingConfig,
     ModelConfig,
+    ModelGeneratorConfig,
+    ModelHFConfig,
+    ModelHFFlashConfig,
     load_config,
     resolve_effective_mixed_precision,
 )
@@ -300,19 +304,19 @@ def build_synthetic_backbone_config(
     """
 
     model_cfg = ModelConfig(
-        hf={
-            "attention_impl": str(mode),
-            "max_position_embeddings": int(seq_len),
-            "flash": {"debug_stats": bool(debug_stats)},
-        },
-        generator={
-            "hidden_size": int(hidden_size),
-            "num_hidden_layers": int(num_layers),
-            "num_attention_heads": int(num_heads),
-            "intermediate_size": int(intermediate_size),
-        },
+        hf=ModelHFConfig(
+            attention_impl=str(mode),
+            max_position_embeddings=int(seq_len),
+            flash=ModelHFFlashConfig(debug_stats=bool(debug_stats)),
+        ),
+        generator=ModelGeneratorConfig(
+            hidden_size=int(hidden_size),
+            num_hidden_layers=int(num_layers),
+            num_attention_heads=int(num_heads),
+            intermediate_size=int(intermediate_size),
+        ),
     )
-    data_cfg = DataConfig(packing={"max_seq_length": int(seq_len)})
+    data_cfg = DataConfig(packing=DataPackingConfig(max_seq_length=int(seq_len)))
     backbone_config, _, _ = build_branch_backbone_config(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
