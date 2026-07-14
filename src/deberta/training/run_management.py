@@ -255,18 +255,24 @@ def _parse_checkpoint_step(path: str) -> int:
     return 0
 
 
+def _select_latest_checkpoint(checkpoints: list[tuple[int, Path]]) -> Path | None:
+    """Select the highest-step checkpoint from precomputed candidates.
+
+    :param list[tuple[int, Path]] checkpoints: ``(step, checkpoint_dir)`` pairs.
+    :return Path | None: Latest checkpoint path, or ``None`` if absent.
+    """
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=lambda item: item[0])[1]
+
+
 def _find_latest_checkpoint(output_dir: Path) -> Path | None:
-    """Return latest ``checkpoint-*`` directory under ``output_dir``.
+    """Find the highest-step ``checkpoint-*`` directory under ``output_dir``.
 
     :param Path output_dir: Training output directory.
     :return Path | None: Latest checkpoint path, or ``None`` if absent.
     """
-    checkpoints = _list_checkpoints(output_dir)
-    if not checkpoints:
-        return None
-
-    checkpoints.sort(key=lambda x: x[0])
-    return checkpoints[-1][1]
+    return _select_latest_checkpoint(_list_checkpoints(output_dir))
 
 
 def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
@@ -279,9 +285,6 @@ def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
     :return bool: ``True`` when model-weight files appear present and non-empty.
     """
     root_patterns = (
-        "model.safetensors",
-        "pytorch_model.bin",
-        "model.bin",
         "*model*.safetensors",
         "*model*.bin",
     )
@@ -338,21 +341,16 @@ def _classify_checkpoint(checkpoint_dir: Path) -> _CheckpointStatus:
     )
 
 
-def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
+def _find_latest_resumable_checkpoint(checkpoints: list[tuple[int, Path]]) -> Path | None:
     """Return the latest checkpoint directory that can be resumed safely.
 
     Transactional checkpoints are preferred and identified by a ``.complete``
     marker written only after checkpoint metadata persistence.
 
-    :param Path output_dir: Training output directory.
+    :param list[tuple[int, Path]] checkpoints: Precomputed ``(step, checkpoint_dir)`` pairs.
     :return Path | None: Latest resumable checkpoint path, or ``None`` if absent.
     """
-    checkpoints = _list_checkpoints(output_dir)
-    if not checkpoints:
-        return None
-
-    checkpoints.sort(key=lambda x: x[0], reverse=True)
-    for _, checkpoint_dir in checkpoints:
+    for _, checkpoint_dir in sorted(checkpoints, key=lambda item: item[0], reverse=True):
         status = _classify_checkpoint(checkpoint_dir)
         if not status.resumable:
             if status.has_progress and not status.has_weights:
@@ -417,7 +415,8 @@ def _resolve_resume_checkpoint(
             )
         return str(checkpoint_path.resolve())
 
-    latest_any = _find_latest_checkpoint(output_dir)
+    checkpoints = _list_checkpoints(output_dir)
+    latest_any = _select_latest_checkpoint(checkpoints)
     if latest_any is None:
         has_existing_contents = output_dir.exists() and any(output_dir.iterdir())
         if has_existing_contents:
@@ -430,7 +429,7 @@ def _resolve_resume_checkpoint(
             logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
         return None
 
-    latest_resumable = _find_latest_resumable_checkpoint(output_dir)
+    latest_resumable = _find_latest_resumable_checkpoint(checkpoints)
     if latest_resumable is None:
         raise ValueError(
             "resume_from_checkpoint=auto found checkpoint-* directories but none are resumable "
