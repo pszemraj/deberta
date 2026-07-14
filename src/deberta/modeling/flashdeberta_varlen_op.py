@@ -188,7 +188,7 @@ def _varlen_use_triton_op() -> bool:
     )
 
 
-def _varlen_repo_tuned_bwd_config(
+def _varlen_repo_tuned_config(
     *,
     route: str = "varlen",
     kind: str,
@@ -202,10 +202,10 @@ def _varlen_repo_tuned_bwd_config(
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[int, int, int, int] | None:
-    """Return repo-local backward-kernel heuristics for measured hot paths.
+    """Return a table-driven varlen kernel config, if one matches.
 
     :param str route: Tuning-table route namespace.
-    :param str kind: Either ``"kv"`` or ``"q"``.
+    :param str kind: One of ``"fwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
     :param int seq_len: Padded sequence length.
     :param int total_tokens: Total active tokens in the packed batch.
     :param int batch_size: Batch size.
@@ -216,59 +216,15 @@ def _varlen_repo_tuned_bwd_config(
     :param torch.dtype dtype: Kernel dtype.
     :param torch.device device: Launch device.
     :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
-        or ``None`` when no repo-local override applies.
+        or ``None`` when no table row applies.
     """
 
     normalized_kind = str(kind).strip().lower()
     return resolve_repo_tuned_config(
-        guard=lambda: normalized_kind in {"kv", "q"},
+        guard=lambda: normalized_kind in {"fwd", "bwd_kv", "bwd_q"},
         compute_capability=lambda: device_compute_capability(device),
         route=route,
-        kind=f"bwd_{normalized_kind}",
-        seq_len=seq_len,
-        total_tokens=total_tokens,
-        batch_size=batch_size,
-        head_dim=head_dim,
-        dtype=_kernel_dtype_name(dtype),
-        causal=causal,
-        disentangled=disentangled,
-        att_span=att_span,
-    )
-
-
-def _varlen_repo_tuned_fwd_config(
-    *,
-    route: str = "varlen",
-    seq_len: int,
-    total_tokens: int,
-    batch_size: int,
-    head_dim: int,
-    causal: bool,
-    disentangled: bool,
-    att_span: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[int, int, int, int] | None:
-    """Return a table-driven varlen forward-kernel config, if one matches.
-
-    :param str route: Tuning-table route namespace.
-    :param int seq_len: Padded sequence length.
-    :param int total_tokens: Active token count.
-    :param int batch_size: Batch size.
-    :param int head_dim: Per-head hidden size.
-    :param bool causal: Whether causal masking is enabled.
-    :param bool disentangled: Whether c2p/p2c position terms are active.
-    :param int att_span: Effective relative-position span.
-    :param torch.dtype dtype: Kernel dtype.
-    :param torch.device device: Launch device.
-    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``.
-    """
-
-    return resolve_repo_tuned_config(
-        guard=lambda: True,
-        compute_capability=lambda: device_compute_capability(device),
-        route=route,
-        kind="fwd",
+        kind=normalized_kind,
         seq_len=seq_len,
         total_tokens=total_tokens,
         batch_size=batch_size,
@@ -318,8 +274,9 @@ def _run_packed_varlen_forward(
     """
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None:
-        table_config = _varlen_repo_tuned_fwd_config(
+        table_config = _varlen_repo_tuned_config(
             route=route,
+            kind="fwd",
             seq_len=max_seqlen,
             total_tokens=int(q_unpad.shape[0]),
             batch_size=batch_size,
@@ -414,9 +371,9 @@ def _resolve_varlen_bwd_kernel_config(
     :return tuple[int, int, int, int]: Resolved ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    repo_tuned = _varlen_repo_tuned_bwd_config(
+    repo_tuned = _varlen_repo_tuned_config(
         route=route,
-        kind=kind,
+        kind=f"bwd_{kind}",
         seq_len=max(max_seqlen_q, max_seqlen_k),
         total_tokens=max(total_tokens_q, total_tokens_k),
         batch_size=batch_size,
@@ -1911,7 +1868,8 @@ def _varlen_triton_forward_impl(
         total_tokens=capacity_tokens,
     )
 
-    table_config = _varlen_repo_tuned_fwd_config(
+    table_config = _varlen_repo_tuned_config(
+        kind="fwd",
         seq_len=seq_len,
         total_tokens=capacity_tokens,
         batch_size=batch_size,

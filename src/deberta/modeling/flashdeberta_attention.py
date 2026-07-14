@@ -45,6 +45,7 @@ from deberta.modeling.deberta_v2_native import (
 from deberta.modeling.deberta_v2_native import (
     build_relative_position as _build_relative_position,
 )
+from deberta.modeling.flash_config import flash_cfg_bool, flash_cfg_get, flash_cfg_optional_int
 from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_from_positions,
     flashdeberta_bias_import_error,
@@ -105,22 +106,6 @@ class FlashDebertaRuntimeConfig:
     warn_fallbacks: bool = True
 
 
-def _optional_int(value: Any, *, default: int | None = None) -> int | None:
-    """Return an integer override or None when unset.
-
-    :param Any value: Raw config value.
-    :param int | None default: Fallback value for invalid input.
-    :return int | None: Parsed integer, or None.
-    """
-
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
 def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRuntimeConfig:
     """Resolve flash runtime policy from a native DeBERTa config object.
 
@@ -129,30 +114,16 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
     """
 
     raw = getattr(config, "hf_flash", None) if config is not None else None
-    if isinstance(raw, dict):
-        getter = raw.get
-    else:
-
-        def getter(key: str, default: Any = None) -> Any:
-            """Read one attribute-style config value.
-
-            :param str key: Attribute name.
-            :param Any default: Default value.
-            :return Any: Resolved value.
-            """
-
-            return getattr(raw, key, default) if raw is not None else default
-
     return FlashDebertaRuntimeConfig(
-        force_varlen=bool(getter("force_varlen", False)),
-        varlen_min_seq_len=_optional_int(getter("varlen_min_seq_len", None)),
-        docblock_bias_seq_len=_optional_int(getter("docblock_bias_seq_len", None)),
-        local_bias_seq_len=_optional_int(getter("local_bias_seq_len", None)),
-        local_bias_max_batch_size=_optional_int(getter("local_bias_max_batch_size", None)),
-        eager_dense_max_seq_len=max(0, int(getter("eager_dense_max_seq_len", 0))),
-        kernel_overrides_path=getter("kernel_overrides_path", None),
-        enable_debug_stats=bool(getter("debug_stats", False)),
-        warn_fallbacks=bool(getter("warn_fallbacks", True)),
+        force_varlen=flash_cfg_bool(raw, name="force_varlen", default=False),
+        varlen_min_seq_len=flash_cfg_optional_int(raw, name="varlen_min_seq_len"),
+        docblock_bias_seq_len=flash_cfg_optional_int(raw, name="docblock_bias_seq_len"),
+        local_bias_seq_len=flash_cfg_optional_int(raw, name="local_bias_seq_len"),
+        local_bias_max_batch_size=flash_cfg_optional_int(raw, name="local_bias_max_batch_size"),
+        eager_dense_max_seq_len=max(0, int(flash_cfg_get(raw, "eager_dense_max_seq_len", 0))),
+        kernel_overrides_path=flash_cfg_get(raw, "kernel_overrides_path", None),
+        enable_debug_stats=flash_cfg_bool(raw, name="debug_stats", default=False),
+        warn_fallbacks=flash_cfg_bool(raw, name="warn_fallbacks", default=True),
     )
 
 
@@ -743,15 +714,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :return torch.Tensor: Flash output in ``(B, S, H, D)`` layout.
         """
 
-        if (
-            flash_meta.doc_segment_offsets is None
-            or flash_meta.doc_segment_lengths is None
-            or flash_meta.doc_cu_seqlens is None
-            or active_tokens is None
-            or doc_num_segments is None
-            or doc_max_segment_length is None
-        ):
-            raise RuntimeError("Doc-block flash route requires complete FlashBatchMeta.")
         out = flashdeberta_docblock(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -797,13 +759,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             inactive query rows zeroed to match eager attention.
         """
 
-        seq_len = int(query_layer.shape[-2])
-        key_len = int(key_layer.shape[-2])
-        if not is_pairwise_mask(attention_mask, query_len=seq_len, key_len=key_len):
-            raise ValueError(
-                "FlashDeBERTa pairwise masks must match the attention shape; "
-                f"got mask={tuple(attention_mask.shape)} expected=(*,{seq_len},{key_len})."
-            )
         keep_mask = expand_keep_mask_to_4d(attention_mask, collapse_heads=False)
         return self._flash_dense_bias(
             query_layer=query_layer,

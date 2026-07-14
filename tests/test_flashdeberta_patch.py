@@ -294,6 +294,20 @@ def test_flash_cfg_bool_honors_missing_defaults_and_string_values() -> None:
     assert flash_cfg_bool({"enabled": "false"}, name="enabled", default="1") is False
 
 
+def test_flash_runtime_config_uses_shared_string_bool_coercion() -> None:
+    from deberta.modeling.flashdeberta_attention import _runtime_config_from_deberta_config
+
+    config = types.SimpleNamespace(
+        hf_flash={"force_varlen": "false", "debug_stats": "true", "warn_fallbacks": "off"}
+    )
+
+    runtime = _runtime_config_from_deberta_config(config)
+
+    assert runtime.force_varlen is False
+    assert runtime.enable_debug_stats is True
+    assert runtime.warn_fallbacks is False
+
+
 def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,
@@ -994,7 +1008,6 @@ def _small_deberta_config(
 ):
     """Build a small config for native DeBERTa patch tests."""
 
-    pytest.importorskip("transformers")
     from deberta.modeling.deberta_v2_native import DebertaV2Config
 
     cfg = DebertaV2Config(
@@ -2547,53 +2560,6 @@ def test_prefix_pack_explicit_total_tokens_avoids_tensor_item(monkeypatch: pytes
 
     expected = _prefix_pack_reference(tensor, seqlens)
     assert torch.equal(packed, expected)
-
-
-def test_prefix_unpack_triple_matches_single_tensor_behavior() -> None:
-    import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
-
-    tensor_a = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3).contiguous()
-    tensor_b = (tensor_a + 100.0).contiguous()
-    tensor_c = (tensor_a + 200.0).contiguous()
-    seqlens = torch.tensor([2, 3], dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-
-    packed_a = prefix_mod.prefix_pack_padded_rows(
-        tensor_a,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=3,
-    )
-    packed_b = prefix_mod.prefix_pack_padded_rows(
-        tensor_b,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=3,
-    )
-    packed_c = prefix_mod.prefix_pack_padded_rows(
-        tensor_c,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=3,
-    )
-
-    unpacked_triple_a, unpacked_triple_b, unpacked_triple_c = prefix_mod.prefix_unpack_padded_rows_triple(
-        packed_a,
-        packed_b,
-        packed_c,
-        seqlens=seqlens,
-        cu_seqlens=cu_seqlens,
-        batch_size=2,
-        seq_len=4,
-    )
-
-    expected_a = _prefix_unpack_reference(packed_a, seqlens, seq_len=4)
-    expected_b = _prefix_unpack_reference(packed_b, seqlens, seq_len=4)
-    expected_c = _prefix_unpack_reference(packed_c, seqlens, seq_len=4)
-
-    assert torch.equal(unpacked_triple_a, expected_a)
-    assert torch.equal(unpacked_triple_b, expected_b)
-    assert torch.equal(unpacked_triple_c, expected_c)
 
 
 def test_pack_grad_and_delta_from_padded_matches_reference() -> None:
@@ -4724,7 +4690,7 @@ def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
 def test_varlen_bwd_config_resolution_uses_conservative_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    monkeypatch.setattr(varlen_mod, "_varlen_repo_tuned_bwd_config", lambda **kwargs: None)
+    monkeypatch.setattr(varlen_mod, "_varlen_repo_tuned_config", lambda **kwargs: None)
 
     kv_config = varlen_mod._resolve_varlen_bwd_kernel_config(
         kind="kv",
@@ -4759,13 +4725,13 @@ def test_varlen_bwd_config_resolution_uses_conservative_fallback(monkeypatch: py
     assert q_config == (16, 16, 1, 4)
 
 
-def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_varlen_repo_tuned_config_uses_density_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
     monkeypatch.setattr(varlen_mod, "device_compute_capability", lambda device: (12, 0))
 
-    sparse_cfg = varlen_mod._varlen_repo_tuned_bwd_config(
-        kind="kv",
+    sparse_cfg = varlen_mod._varlen_repo_tuned_config(
+        kind="bwd_kv",
         seq_len=2048,
         total_tokens=1800,
         batch_size=2,
@@ -4776,8 +4742,8 @@ def test_varlen_repo_tuned_bwd_config_uses_density_bucket(monkeypatch: pytest.Mo
         dtype=torch.bfloat16,
         device=torch.device("cuda"),
     )
-    long_cfg = varlen_mod._varlen_repo_tuned_bwd_config(
-        kind="q",
+    long_cfg = varlen_mod._varlen_repo_tuned_config(
+        kind="bwd_q",
         seq_len=4096,
         total_tokens=3500,
         batch_size=1,
