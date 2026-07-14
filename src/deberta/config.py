@@ -191,12 +191,6 @@ class ModelHFConfig:
     flash: ModelHFFlashConfig = field(default_factory=ModelHFFlashConfig)
     max_position_embeddings: int | None = field(default=None)
 
-    def __post_init__(self) -> None:
-        """Coerce direct mapping construction for nested flash settings."""
-
-        if isinstance(self.flash, dict):
-            object.__setattr__(self, "flash", ModelHFFlashConfig(**self.flash))
-
 
 @dataclass(frozen=True)
 class ModelPretrainedConfig:

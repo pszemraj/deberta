@@ -160,11 +160,10 @@ def _flatten_cfg(cfg: Config) -> dict[str, Any]:
     return flatten_mapping(asdict_without_private(cfg))
 
 
-def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
+def _add_dotflags(parser: argparse.ArgumentParser) -> None:
     """Register direct dotted flags for all config leaves.
 
     :param argparse.ArgumentParser parser: Target parser.
-    :return dict[str, str]: Mapping of dotted path to argparse destination.
     """
 
     def _choices_for_path(path: str, field_type: Any) -> tuple[Any, ...] | None:
@@ -187,12 +186,10 @@ def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
             return base
         return tuple(base) + (None,)
 
-    dest_by_path: dict[str, str] = {}
     group = parser.add_argument_group("Config Dotflags")
 
     for path, field_type in iter_leaf_paths_for_dataclass(Config):
         dest = _dest_for_path(path)
-        dest_by_path[str(path)] = dest
         group.add_argument(
             f"--{path}",
             dest=dest,
@@ -201,14 +198,12 @@ def _add_dotflags(parser: argparse.ArgumentParser) -> dict[str, str]:
             choices=_choices_for_path(str(path), field_type),
             help=f"Set {path}",
         )
-    return dest_by_path
 
 
-def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> dict[str, str]:
+def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     """Create `deberta train` parser.
 
     :param argparse._SubParsersAction[argparse.ArgumentParser] subparsers: Parent subparsers action.
-    :return dict[str, str]: Dotted path to argparse destination mapping.
     """
     train = subparsers.add_parser(
         "train",
@@ -234,7 +229,7 @@ def _build_train_parser(subparsers: argparse._SubParsersAction[argparse.Argument
             "training/checkpoint writes. May still access network and populate tokenizer/dataset caches."
         ),
     )
-    return _add_dotflags(train)
+    _add_dotflags(train)
 
 
 def _build_export_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -261,9 +256,8 @@ def _build_main_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
-    dotflag_map = _build_train_parser(subparsers)
+    _build_train_parser(subparsers)
     _build_export_parser(subparsers)
-    parser._dotflag_map = dotflag_map  # type: ignore[attr-defined]
     return parser
 
 
@@ -271,17 +265,16 @@ def _apply_dotflags(
     *,
     cfg: Config,
     ns: argparse.Namespace,
-    dotflag_map: dict[str, str],
 ) -> tuple[Config, dict[str, str]]:
     """Apply provided dotted flags onto config.
 
     :param Config cfg: Current config.
     :param argparse.Namespace ns: Parsed namespace.
-    :param dict[str, str] dotflag_map: Path -> argparse destination map.
     :return tuple[Config, dict[str, str]]: Updated config and reason mapping.
     """
     reasons: dict[str, str] = {}
-    for path, dest in dotflag_map.items():
+    for path, _ in iter_leaf_paths_for_dataclass(Config):
+        dest = _dest_for_path(path)
         if not hasattr(ns, dest):
             continue
         value = getattr(ns, dest)
@@ -332,15 +325,10 @@ def _emit_config_mutation_warnings(
         )
 
 
-def _run_train(
-    ns: argparse.Namespace,
-    *,
-    dotflag_map: dict[str, str],
-) -> None:
+def _run_train(ns: argparse.Namespace) -> None:
     """Run train flow from parsed namespace.
 
     :param argparse.Namespace ns: Parsed train args.
-    :param dict[str, str] dotflag_map: Dotted path -> argparse destination mapping.
     """
     cfg_path: Path | None = None
     if ns.config is not None:
@@ -358,7 +346,7 @@ def _run_train(
 
     reason_overrides: dict[str, str] = {}
 
-    cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns, dotflag_map=dotflag_map)
+    cfg, cli_reasons = _apply_dotflags(cfg=cfg, ns=ns)
     reason_overrides.update(cli_reasons)
 
     # Fail fast at the CLI boundary with the same defaulting/alias/validator
@@ -417,11 +405,10 @@ def main(argv: list[str] | None = None) -> None:
     """
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_main_parser()
-    dotflag_map = dict(getattr(parser, "_dotflag_map", {}))
     args = parser.parse_args(argv)
 
     if args.command == "train":
-        _run_train(args, dotflag_map=dotflag_map)
+        _run_train(args)
         return
 
     if args.command == "export":
