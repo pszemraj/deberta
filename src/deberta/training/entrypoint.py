@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from deberta.config import (
+    Config,
     DataConfig,
     LoggingConfig,
     ModelConfig,
@@ -97,6 +98,31 @@ from deberta.utils.log import setup_process_logging
 from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_entrypoint_profile_sections(
+    *,
+    model_cfg: ModelConfig,
+    train_cfg: TrainConfig | None,
+    optim_cfg: OptimConfig | None,
+) -> tuple[TrainConfig, OptimConfig]:
+    """Resolve omitted training sections against the selected backbone profile.
+
+    Supplied sections are returned unchanged because the section-only entrypoint API cannot
+    distinguish a field omitted by its caller from an explicitly supplied value equal to the
+    dataclass default. Passing None is the unambiguous request for profile defaults.
+
+    :param ModelConfig model_cfg: Model configuration selecting the backbone profile.
+    :param TrainConfig | None train_cfg: Optional explicit training configuration.
+    :param OptimConfig | None optim_cfg: Optional explicit optimizer configuration.
+    :return tuple[TrainConfig, OptimConfig]: Explicit sections or profile-resolved defaults.
+    """
+
+    defaults = Config(model=model_cfg)
+    return (
+        train_cfg if train_cfg is not None else defaults.train,
+        optim_cfg if optim_cfg is not None else defaults.optim,
+    )
 
 
 def _resume_optimizer_lrs_are_all_zero(
@@ -248,7 +274,7 @@ def run_pretraining_dry_run(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
-    train_cfg: TrainConfig,
+    train_cfg: TrainConfig | None = None,
     optim_cfg: OptimConfig | None = None,
     logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
@@ -262,14 +288,20 @@ def run_pretraining_dry_run(
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
-    :param TrainConfig train_cfg: Training configuration.
-    :param OptimConfig | None optim_cfg: Optional optimizer configuration.
+    :param TrainConfig | None train_cfg: Explicit training configuration, or None to use the
+        selected backbone profile defaults.
+    :param OptimConfig | None optim_cfg: Explicit optimizer configuration, or None to use the
+        selected backbone profile defaults.
     :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path.
     :raises RuntimeError: If a preflight stage fails.
     :return dict[str, Any]: Summary of resolved dry-run checks.
     """
-    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    train_cfg, resolved_optim_cfg = _resolve_entrypoint_profile_sections(
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+    )
     resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
 
     _validate_training_configs(
@@ -436,7 +468,7 @@ def run_pretraining(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
-    train_cfg: TrainConfig,
+    train_cfg: TrainConfig | None = None,
     optim_cfg: OptimConfig | None = None,
     logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
@@ -445,15 +477,21 @@ def run_pretraining(
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.
-    :param TrainConfig train_cfg: Training configuration.
-    :param OptimConfig | None optim_cfg: Optional optimizer configuration.
+    :param TrainConfig | None train_cfg: Explicit training configuration, or None to use the
+        selected backbone profile defaults.
+    :param OptimConfig | None optim_cfg: Explicit optimizer configuration, or None to use the
+        selected backbone profile defaults.
     :param LoggingConfig | None logging_cfg: Optional logging configuration.
     :param str | Path | None config_path: Optional source config path for auto output-dir naming.
     """
     from accelerate import Accelerator, DistributedDataParallelKwargs
     from accelerate.utils import set_seed
 
-    resolved_optim_cfg = optim_cfg if optim_cfg is not None else OptimConfig()
+    train_cfg, resolved_optim_cfg = _resolve_entrypoint_profile_sections(
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+    )
     resolved_logging_cfg = logging_cfg if logging_cfg is not None else LoggingConfig()
     report_to = "wandb" if bool(resolved_logging_cfg.wandb.enabled) else "none"
     if report_to == "wandb":

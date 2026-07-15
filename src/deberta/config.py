@@ -471,7 +471,7 @@ class LoggingConfig:
     debug: LoggingDebugConfig = field(default_factory=LoggingDebugConfig)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Config:
     """Top-level training config bundle."""
 
@@ -482,20 +482,50 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     _explicit_fields: InitVar[frozenset[str] | None] = None
 
+    def __init__(
+        self,
+        model: ModelConfig | None = None,
+        data: DataConfig | None = None,
+        train: TrainConfig | None = None,
+        optim: OptimConfig | None = None,
+        logging: LoggingConfig | None = None,
+        _explicit_fields: frozenset[str] | None = None,
+    ) -> None:
+        """Initialize a config bundle while preserving supplied section values.
+
+        A programmatically supplied ``train`` or ``optim`` section is explicit,
+        including values equal to the literal schema defaults. Omitted sections
+        remain eligible for backbone-profile defaults. File loaders pass exact
+        dotted-field provenance through ``_explicit_fields``.
+
+        :param ModelConfig | None model: Model configuration, defaults to the schema value.
+        :param DataConfig | None data: Data configuration, defaults to the schema value.
+        :param TrainConfig | None train: Explicit training configuration, defaults to omission.
+        :param OptimConfig | None optim: Explicit optimizer configuration, defaults to omission.
+        :param LoggingConfig | None logging: Logging configuration, defaults to the schema value.
+        :param frozenset[str] | None _explicit_fields: Exact loader-owned dotted-field provenance.
+        """
+        object.__setattr__(self, "model", model if model is not None else ModelConfig())
+        object.__setattr__(self, "data", data if data is not None else DataConfig())
+        object.__setattr__(self, "train", train if train is not None else TrainConfig())
+        object.__setattr__(self, "optim", optim if optim is not None else OptimConfig())
+        object.__setattr__(self, "logging", logging if logging is not None else LoggingConfig())
+
+        explicit = set(_explicit_fields or ())
+        if _explicit_fields is None:
+            schema_profile = _BACKBONE_PROFILE_DEFAULTS["hf_deberta_v2"]
+            if train is not None:
+                explicit.update(path for path in schema_profile if path.startswith("train."))
+            if optim is not None:
+                explicit.update(path for path in schema_profile if path.startswith("optim."))
+        self.__post_init__(frozenset(explicit))
+
     def __post_init__(self, _explicit_fields: frozenset[str] | None) -> None:
         """Resolve omitted fields against the selected backbone profile.
 
-        :param frozenset[str] | None _explicit_fields: Dotted input paths, or None for programmatic inference.
+        :param frozenset[str] | None _explicit_fields: Dotted paths treated as explicit.
         """
-        if _explicit_fields is None:
-            schema_profile = _BACKBONE_PROFILE_DEFAULTS["hf_deberta_v2"]
-            explicit = frozenset(
-                path
-                for path, schema_default in schema_profile.items()
-                if _nested_get(self, path) != schema_default
-            )
-        else:
-            explicit = frozenset(_explicit_fields)
+        explicit = frozenset(_explicit_fields or ())
         object.__setattr__(self, "_explicit_field_paths", explicit)
 
         profile = _BACKBONE_PROFILE_DEFAULTS.get(str(self.model.backbone_type).strip().lower())
@@ -1470,6 +1500,55 @@ _SnapshotConfigT = TypeVar(
 )
 
 
+def _validate_snapshot_mapping_shape(
+    mapping: dict[str, object],
+    *,
+    template: object,
+    source: str,
+    config_name: str,
+    location: str,
+) -> None:
+    """Require every current nested dataclass field in a persisted snapshot.
+
+    :param dict[str, object] mapping: Snapshot mapping at the current nesting level.
+    :param object template: Current-schema dataclass instance for this level.
+    :param str source: Snapshot source path for errors.
+    :param str config_name: Human label used in error messages.
+    :param str location: Dotted snapshot location for contextual failures.
+    :raises ValueError: If keys are missing, unknown, or structurally invalid.
+    """
+    expected = {f.name for f in fields(type(template))}
+    unknown = sorted(set(mapping) - expected)
+    if unknown:
+        raise ValueError(
+            f"Unsupported {config_name} keys at {location} in {source}: {', '.join(unknown)}. "
+            "This snapshot was produced by an older pre-release schema; "
+            "backward resume/export compatibility is not guaranteed before stable release."
+        )
+    missing = sorted(expected - set(mapping))
+    if missing:
+        raise ValueError(
+            f"Missing required {config_name} keys at {location} in {source}: {', '.join(missing)}. "
+            "This snapshot does not match the current config schema."
+        )
+
+    for key in sorted(expected):
+        current = getattr(template, key)
+        if not dataclasses.is_dataclass(current):
+            continue
+        nested = mapping[key]
+        nested_location = f"{location}.{key}"
+        if not isinstance(nested, dict):
+            raise ValueError(f"Expected a mapping at {nested_location} in {source}.")
+        _validate_snapshot_mapping_shape(
+            nested,
+            template=current,
+            source=source,
+            config_name=config_name,
+            location=nested_location,
+        )
+
+
 def _load_snapshot_dataclass(
     raw: dict[str, object], *, cls: type[_SnapshotConfigT], source: str, config_name: str
 ) -> _SnapshotConfigT:
@@ -1482,25 +1561,17 @@ def _load_snapshot_dataclass(
     :raises ValueError: If unknown keys are present or dataclass construction fails.
     :return _SnapshotConfigT: Parsed dataclass instance.
     """
-    expected_keys = {f.name for f in fields(cls)}
-    unknown = sorted(set(raw) - expected_keys)
-    if unknown:
-        unknown_str = ", ".join(unknown)
-        raise ValueError(
-            f"Unsupported {config_name} keys in {source}: {unknown_str}. "
-            "This snapshot was produced by an older pre-release schema; "
-            "backward resume/export compatibility is not guaranteed before stable release."
-        )
-    missing = sorted(expected_keys - set(raw))
-    if missing:
-        missing_str = ", ".join(missing)
-        raise ValueError(
-            f"Missing required {config_name} keys in {source}: {missing_str}. "
-            "This snapshot does not match the current config schema."
-        )
+    template = cls()
+    _validate_snapshot_mapping_shape(
+        raw,
+        template=template,
+        source=source,
+        config_name=config_name,
+        location=config_name,
+    )
 
     try:
-        return _replace_from_mapping_recursive(cls(), dict(raw), section_name=config_name)
+        return _replace_from_mapping_recursive(template, dict(raw), section_name=config_name)
     except (TypeError, ValueError) as e:
         raise ValueError(
             f"Failed to parse {config_name} at {source}. "

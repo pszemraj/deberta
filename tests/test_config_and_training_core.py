@@ -37,8 +37,10 @@ from deberta.config import (
     load_config,
     load_data_config_snapshot,
     load_model_config_snapshot,
+    load_train_config_snapshot,
 )
 from deberta.training.entrypoint import (
+    _resolve_entrypoint_profile_sections,
     _restore_checkpoint_rng_state_or_raise,
     _resume_optimizer_lrs_are_all_zero,
 )
@@ -99,6 +101,48 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
         cfg.train = make_train_config(max_steps=2)  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
+
+
+def test_entrypoint_resolves_omitted_sections_from_rope_profile() -> None:
+    train_cfg, optim_cfg = _resolve_entrypoint_profile_sections(
+        model_cfg=make_model_config(backbone_type="rope"),
+        train_cfg=None,
+        optim_cfg=None,
+    )
+
+    assert train_cfg.objective.mask_token_prob == pytest.approx(0.8)
+    assert train_cfg.objective.random_token_prob == pytest.approx(0.1)
+    assert train_cfg.objective.disc_loss_weight == pytest.approx(50.0)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
+    assert optim_cfg.scheduler.warmup_steps == 1_000
+
+
+def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
+    explicit_train = make_train_config(
+        objective={
+            "mask_token_prob": 1.0,
+            "random_token_prob": 0.0,
+            "disc_loss_weight": 10.0,
+        }
+    )
+    explicit_optim = make_optim_config(
+        adam={"epsilon": 1e-6},
+        scheduler={"warmup_steps": 10_000},
+    )
+
+    train_cfg, optim_cfg = _resolve_entrypoint_profile_sections(
+        model_cfg=make_model_config(backbone_type="rope"),
+        train_cfg=explicit_train,
+        optim_cfg=explicit_optim,
+    )
+
+    assert train_cfg is explicit_train
+    assert optim_cfg is explicit_optim
+    assert train_cfg.objective.mask_token_prob == pytest.approx(1.0)
+    assert train_cfg.objective.random_token_prob == pytest.approx(0.0)
+    assert train_cfg.objective.disc_loss_weight == pytest.approx(10.0)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
+    assert optim_cfg.scheduler.warmup_steps == 10_000
 
 
 def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
@@ -173,9 +217,9 @@ def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumula
 
 
 def test_apply_dotted_override_supports_nested_section_paths() -> None:
-    cfg = Config(
-        data=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
-        train=make_train_config(max_steps=1),
+    cfg = apply_dotted_override(
+        Config(data=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})),
+        "train.max_steps=1",
     )
     cfg2 = apply_dotted_override(cfg, "model.backbone_type=rope")
     assert cfg2.train.objective.mask_token_prob == pytest.approx(0.8)
@@ -227,6 +271,42 @@ def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
     data_raw.pop("source")
     with pytest.raises(ValueError, match="Missing required data_config.json keys"):
         load_data_config_snapshot(data_raw, source="data_config.json")
+
+
+@pytest.mark.parametrize(
+    ("loader", "raw", "nested_path", "missing_key", "expected_location"),
+    [
+        (
+            load_model_config_snapshot,
+            asdict(make_model_config()),
+            ("hf", "flash"),
+            "warn_fallbacks",
+            "model_config.json.hf.flash",
+        ),
+        (
+            load_train_config_snapshot,
+            asdict(make_train_config()),
+            ("checkpoint",),
+            "save_steps",
+            "train_config.json.checkpoint",
+        ),
+    ],
+    ids=["model_flash", "train_checkpoint"],
+)
+def test_snapshot_loaders_reject_missing_nested_keys(
+    loader: Any,
+    raw: dict[str, Any],
+    nested_path: tuple[str, ...],
+    missing_key: str,
+    expected_location: str,
+) -> None:
+    nested: dict[str, Any] = raw
+    for key in nested_path:
+        nested = nested[key]
+    nested.pop(missing_key)
+
+    with pytest.raises(ValueError, match=rf"Missing required .* keys at {re.escape(expected_location)}"):
+        loader(raw, source="snapshot.json")
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):

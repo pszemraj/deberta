@@ -64,6 +64,20 @@ def test_programmatic_config_preserves_custom_profile_values() -> None:
     assert cfg.optim.scheduler.warmup_steps == 77
 
 
+def test_programmatic_config_preserves_explicit_schema_default_profile_values() -> None:
+    cfg = Config(
+        model=ModelConfig(backbone_type="rope"),
+        train=TrainConfig(),
+        optim=OptimConfig(),
+    )
+
+    assert cfg.train.objective.mask_token_prob == pytest.approx(1.0)
+    assert cfg.train.objective.random_token_prob == pytest.approx(0.0)
+    assert cfg.train.objective.disc_loss_weight == pytest.approx(10.0)
+    assert cfg.optim.adam.epsilon == pytest.approx(1e-6)
+    assert cfg.optim.scheduler.warmup_steps == 10_000
+
+
 def test_load_yaml_nested(tmp_path: Path):
 
     nested = tmp_path / "nested.yaml"

@@ -11,7 +11,7 @@ run_pretraining(
     *,
     model_cfg: 'ModelConfig',
     data_cfg: 'DataConfig',
-    train_cfg: 'TrainConfig',
+    train_cfg: 'TrainConfig | None' = None,
     optim_cfg: 'OptimConfig | None' = None,
     logging_cfg: 'LoggingConfig | None' = None,
     config_path: 'str | Path | None' = None,
@@ -24,8 +24,8 @@ Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
 
 - `model_cfg` (`ModelConfig`): Model configuration.
 - `data_cfg` (`DataConfig`): Data configuration.
-- `train_cfg` (`TrainConfig`): Training configuration.
-- `optim_cfg` (`OptimConfig | None`): Optional optimizer configuration.
+- `train_cfg` (`TrainConfig | None`): Explicit training configuration, or `None` to use the selected backbone profile defaults.
+- `optim_cfg` (`OptimConfig | None`): Explicit optimizer configuration, or `None` to use the selected backbone profile defaults.
 - `logging_cfg` (`LoggingConfig | None`): Optional logging configuration.
 - `config_path` (`str | Path | None`): Optional source config path for auto output-dir naming.
 
@@ -36,7 +36,7 @@ run_pretraining_dry_run(
     *,
     model_cfg: 'ModelConfig',
     data_cfg: 'DataConfig',
-    train_cfg: 'TrainConfig',
+    train_cfg: 'TrainConfig | None' = None,
     optim_cfg: 'OptimConfig | None' = None,
     logging_cfg: 'LoggingConfig | None' = None,
     config_path: 'str | Path | None' = None,
@@ -54,8 +54,8 @@ dependency caches; see the [config reference](../../configs/config_reference.yam
 
 - `model_cfg` (`ModelConfig`): Model configuration.
 - `data_cfg` (`DataConfig`): Data configuration.
-- `train_cfg` (`TrainConfig`): Training configuration.
-- `optim_cfg` (`OptimConfig | None`): Optional optimizer configuration.
+- `train_cfg` (`TrainConfig | None`): Explicit training configuration, or `None` to use the selected backbone profile defaults.
+- `optim_cfg` (`OptimConfig | None`): Explicit optimizer configuration, or `None` to use the selected backbone profile defaults.
 - `logging_cfg` (`LoggingConfig | None`): Optional logging configuration.
 - `config_path` (`str | Path | None`): Optional source config path.
 

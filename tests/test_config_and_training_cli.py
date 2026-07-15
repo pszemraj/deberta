@@ -353,6 +353,14 @@ def test_train_parser_accepts_dry_run_flag():
     assert ns.dry_run is True
 
 
+@pytest.mark.parametrize("scope", ["generator-encoder", "gen-encoder", "disc-ffn"])
+def test_train_parser_accepts_hyphenated_compile_scope_aliases(scope: str) -> None:
+    parser = cli_mod._build_main_parser()
+    ns = parser.parse_args(["train", "--train.compile.scope", scope])
+
+    assert vars(ns)["dot__train__compile__scope"] == scope
+
+
 def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.MonkeyPatch):
     seen: dict[str, Any] = {}
 

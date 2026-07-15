@@ -46,6 +46,9 @@ from deberta.training import run_pretraining, run_pretraining_dry_run
 from deberta.utils.mapping import flatten_mapping
 from deberta.utils.types import coerce_scalar, parse_bool, unwrap_optional_type
 
+_COMPILE_SCOPE_DOTFLAG_CHOICES = _TORCH_COMPILE_SCOPE_CHOICES | set(_TORCH_COMPILE_SCOPE_ALIASES)
+_COMPILE_SCOPE_DOTFLAG_CHOICES |= {value.replace("_", "-") for value in _COMPILE_SCOPE_DOTFLAG_CHOICES}
+
 # Parse-time choices for dotted flags.
 _DOTFLAG_CHOICES: dict[str, tuple[str, ...]] = {
     "model.backbone_type": tuple(sorted(_BACKBONE_CHOICES)),
@@ -62,9 +65,7 @@ _DOTFLAG_CHOICES: dict[str, tuple[str, ...]] = {
     "train.compile.mode": tuple(
         sorted(_TORCH_COMPILE_MODE_CHOICES | set(_TORCH_COMPILE_MODE_ALIASES.keys()))
     ),
-    "train.compile.scope": tuple(
-        sorted(_TORCH_COMPILE_SCOPE_CHOICES | set(_TORCH_COMPILE_SCOPE_ALIASES.keys()))
-    ),
+    "train.compile.scope": tuple(sorted(_COMPILE_SCOPE_DOTFLAG_CHOICES)),
     "train.compile.backend": tuple(
         sorted(_TORCH_COMPILE_BACKEND_CHOICES | set(_TORCH_COMPILE_BACKEND_ALIASES.keys()))
     ),
