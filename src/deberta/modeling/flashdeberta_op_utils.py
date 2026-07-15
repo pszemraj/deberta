@@ -10,10 +10,10 @@ import torch
 
 try:  # pragma: no cover - optional Triton dependency
     import triton as _triton
-    import triton.language as _tl
+    import triton.language as tl
 except Exception:  # pragma: no cover - optional Triton dependency
     _triton = None
-    _tl = None
+    tl = None
 
 _KeyT = TypeVar("_KeyT")
 _ValueT = TypeVar("_ValueT")
@@ -203,10 +203,10 @@ def _triton_row_copy_kernel(
     num_heads: int,
     feature_size: int,
     col_tiles: int,
-    ARITY: _tl.constexpr,
-    ADDRESS_MODE: _tl.constexpr,
-    BLOCK_ROWS: _tl.constexpr,
-    BLOCK_COLS: _tl.constexpr,
+    ARITY: tl.constexpr,
+    ADDRESS_MODE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
 ) -> None:
     """Copy one to three tensors between padded and ragged row layouts.
 
@@ -243,26 +243,26 @@ def _triton_row_copy_kernel(
     :return None: This Triton kernel writes directly to destination pointers.
     """
 
-    record_idx = _tl.program_id(0)
-    tile_row = _tl.program_id(1)
-    tile_col_or_hf = _tl.program_id(2)
-    row_offsets = tile_row * BLOCK_ROWS + _tl.arange(0, BLOCK_ROWS)
+    record_idx = tl.program_id(0)
+    tile_row = tl.program_id(1)
+    tile_col_or_hf = tl.program_id(2)
+    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
 
     is_prefix = ADDRESS_MODE <= 2
     is_pack = ADDRESS_MODE == 0 or ADDRESS_MODE == 1 or ADDRESS_MODE == 3 or ADDRESS_MODE == 4
     is_strided = ADDRESS_MODE == 1 or ADDRESS_MODE == 4
 
-    length = _tl.load(lengths_ptr + record_idx)
-    packed_base = _tl.load(cu_seqlens_ptr + record_idx)
+    length = tl.load(lengths_ptr + record_idx)
+    packed_base = tl.load(cu_seqlens_ptr + record_idx)
     if is_prefix:
         padded_base = record_idx * seq_len
     else:
-        padded_base = _tl.load(offsets_ptr + record_idx)
+        padded_base = tl.load(offsets_ptr + record_idx)
 
     if is_strided:
         head_idx = tile_col_or_hf // col_tiles
         tile_col = tile_col_or_hf % col_tiles
-        col_offsets = tile_col * BLOCK_COLS + _tl.arange(0, BLOCK_COLS)
+        col_offsets = tile_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
         padded_rows = padded_base + row_offsets
         batch_idx = padded_rows // seq_len
         seq_idx = padded_rows % seq_len
@@ -280,8 +280,8 @@ def _triton_row_copy_kernel(
             + col_offsets[None, :] * stride_a_f
         )
         dst_a_ptrs = output_a_ptr + packed_rows[:, None] * row_size + packed_cols[None, :]
-        values_a = _tl.load(src_a_ptrs, mask=copy_mask, other=0)
-        _tl.store(dst_a_ptrs, values_a, mask=copy_mask)
+        values_a = tl.load(src_a_ptrs, mask=copy_mask, other=0)
+        tl.store(dst_a_ptrs, values_a, mask=copy_mask)
         if ARITY >= 2:
             src_b_ptrs = (
                 input_b_ptr
@@ -291,8 +291,8 @@ def _triton_row_copy_kernel(
                 + col_offsets[None, :] * stride_b_f
             )
             dst_b_ptrs = output_b_ptr + packed_rows[:, None] * row_size + packed_cols[None, :]
-            values_b = _tl.load(src_b_ptrs, mask=copy_mask, other=0)
-            _tl.store(dst_b_ptrs, values_b, mask=copy_mask)
+            values_b = tl.load(src_b_ptrs, mask=copy_mask, other=0)
+            tl.store(dst_b_ptrs, values_b, mask=copy_mask)
         if ARITY >= 3:
             src_c_ptrs = (
                 input_c_ptr
@@ -302,11 +302,11 @@ def _triton_row_copy_kernel(
                 + col_offsets[None, :] * stride_c_f
             )
             dst_c_ptrs = output_c_ptr + packed_rows[:, None] * row_size + packed_cols[None, :]
-            values_c = _tl.load(src_c_ptrs, mask=copy_mask, other=0)
-            _tl.store(dst_c_ptrs, values_c, mask=copy_mask)
+            values_c = tl.load(src_c_ptrs, mask=copy_mask, other=0)
+            tl.store(dst_c_ptrs, values_c, mask=copy_mask)
         return
 
-    col_offsets = tile_col_or_hf * BLOCK_COLS + _tl.arange(0, BLOCK_COLS)
+    col_offsets = tile_col_or_hf * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
     padded_rows = padded_base + row_offsets
     packed_rows = packed_base + row_offsets
     active_mask = (row_offsets[:, None] < length) & (col_offsets[None, :] < row_size)
@@ -324,18 +324,18 @@ def _triton_row_copy_kernel(
 
     src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
     dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-    values_a = _tl.load(src_a_ptrs, mask=active_mask, other=0)
-    _tl.store(dst_a_ptrs, values_a, mask=store_mask)
+    values_a = tl.load(src_a_ptrs, mask=active_mask, other=0)
+    tl.store(dst_a_ptrs, values_a, mask=store_mask)
     if ARITY >= 2:
         src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
         dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-        values_b = _tl.load(src_b_ptrs, mask=active_mask, other=0)
-        _tl.store(dst_b_ptrs, values_b, mask=store_mask)
+        values_b = tl.load(src_b_ptrs, mask=active_mask, other=0)
+        tl.store(dst_b_ptrs, values_b, mask=store_mask)
     if ARITY >= 3:
         src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
         dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
-        values_c = _tl.load(src_c_ptrs, mask=active_mask, other=0)
-        _tl.store(dst_c_ptrs, values_c, mask=store_mask)
+        values_c = tl.load(src_c_ptrs, mask=active_mask, other=0)
+        tl.store(dst_c_ptrs, values_c, mask=store_mask)
 
 
 def launch_triton_row_copy(

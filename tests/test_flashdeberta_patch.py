@@ -724,8 +724,42 @@ def test_flash_batch_preparation_does_not_poll_kernel_override_file(
             r"kernels\[0\]",
             "incomplete kernel launch tuple",
         ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "typo",
+                        "kind": "fwd",
+                        "seq_bucket": "under_2048",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 4,
+                    }
+                ]
+            },
+            r"kernels\[0\]\.route",
+            "expected one of",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "bwd_q",
+                        "seq_bucket": "under_2048",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 4,
+                    }
+                ]
+            },
+            r"kernels\[0\]\.kind",
+            "expected one of for route 'fixed'",
+        ),
     ],
-    ids=["route_choice", "numeric_bound", "kernel_launch"],
+    ids=["route_choice", "numeric_bound", "kernel_launch", "kernel_route", "kernel_kind"],
 )
 def test_flashdeberta_kernel_override_validation_reports_file_and_row(
     tmp_path: Path,
@@ -2425,6 +2459,55 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
     assert output.dtype == q.dtype
     assert output.device.type == q.device.type
     assert calls == {"triton": 1, "custom": 0}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Inductor varlen coverage.")
+def test_varlen_triton_op_compiles_with_inductor_and_backpropagates() -> None:
+    pytest.importorskip("triton")
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    if not varlen_mod.flashdeberta_compiled_varlen_available():
+        pytest.skip("Compile-visible FlashDeBERTa varlen kernels are unavailable.")
+
+    def _forward(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the real compile-visible padded-varlen wrapper."""
+
+        return varlen_mod.flashdeberta_varlen_padded(
+            query_layer=q,
+            key_layer=k,
+            value_layer=v,
+            attention_mask_2d=mask,
+            pos_key=None,
+            pos_query=None,
+            sm_scale=0.25,
+            position_buckets=32,
+            max_relative_distance=128,
+            causal=False,
+        )
+
+    torch.manual_seed(0)
+    shape = (2, 32, 2, 16)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mask = torch.ones((2, 32), device="cuda", dtype=torch.bool)
+    mask[1, 24:] = False
+
+    compiled = torch.compile(_forward, backend="inductor", fullgraph=True, dynamic=False)
+    output = compiled(q, k, v, mask)
+    output.float().square().mean().backward()
+    torch.cuda.synchronize()
+
+    assert output.shape == q.shape
+    assert torch.isfinite(output).all()
+    for tensor in (q, k, v):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
 
 
 def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.MonkeyPatch) -> None:

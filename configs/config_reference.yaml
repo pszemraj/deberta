@@ -266,7 +266,7 @@ model:
       # policy matching: optional fields are compute_capability="*"|"sm_<major><minor>", min_seq_len, max_seq_len, and max_batch_size.
       # kernel rows: require seq_bucket and one supported route/kind pair.
       # bias pairs: bias:{fwd,bwd,bwd_q,bwd_kv}; bias_docblock_specialized:{bwd,bwd_q,bwd_kv}; dense_bias:{fwd}.
-      # packed pairs: docblock:{bwd_q,bwd_kv}; fixed:{fwd,bwd}; varlen:{bwd_q,bwd_kv}.
+      # packed pairs: docblock:{fwd,bwd_q,bwd_kv}; fixed:{fwd,bwd}; varlen:{fwd,bwd_q,bwd_kv}.
       # launch values: kernel rows also require positive block_m, block_n, num_stages, and num_warps values.
       # kernel matching: optional predicates are compute_capability, head_dim, exact/min/max batch_size|query_len|key_len|num_heads, causal, disentangled, has_mask, dtype, and att_span_min.
       # precedence: later equally specific policy/kernel rows win; override buckets match before shipped buckets and replace same-name buckets.

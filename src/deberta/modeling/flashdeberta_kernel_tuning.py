@@ -24,6 +24,15 @@ _SHAPE_KEYED_CACHE_MAXSIZE = 4096
 # configuration contract.
 CONSERVATIVE_FLASH_KERNEL_CONFIG = (16, 16, 1, 4)
 
+_SUPPORTED_KERNEL_KINDS = {
+    "bias": frozenset({"fwd", "bwd", "bwd_q", "bwd_kv"}),
+    "bias_docblock_specialized": frozenset({"bwd", "bwd_q", "bwd_kv"}),
+    "dense_bias": frozenset({"fwd"}),
+    "docblock": frozenset({"fwd", "bwd_q", "bwd_kv"}),
+    "fixed": frozenset({"fwd", "bwd"}),
+    "varlen": frozenset({"fwd", "bwd_q", "bwd_kv"}),
+}
+
 
 @dataclass(frozen=True)
 class FlashKernelContext:
@@ -315,8 +324,24 @@ def _validate_override_payload(payload: dict[str, Any], *, path: Path) -> None:
         for index, raw in enumerate(kernels):
             location = f"kernels[{index}]"
             row = _validate_override_row_mapping(path=path, location=location, row=raw)
-            for key in ("route", "kind", "seq_bucket"):
-                _validate_override_text(row, key=key, path=path, location=location)
+            route = _validate_override_text(row, key="route", path=path, location=location).lower()
+            kind = _validate_override_text(row, key="kind", path=path, location=location).lower()
+            _validate_override_text(row, key="seq_bucket", path=path, location=location)
+            allowed_kinds = _SUPPORTED_KERNEL_KINDS.get(route)
+            if allowed_kinds is None:
+                expected = ", ".join(sorted(_SUPPORTED_KERNEL_KINDS))
+                raise _override_error(
+                    path,
+                    f"{location}.route",
+                    f"expected one of: {expected}; got {route!r}",
+                )
+            if kind not in allowed_kinds:
+                expected = ", ".join(sorted(allowed_kinds))
+                raise _override_error(
+                    path,
+                    f"{location}.kind",
+                    f"expected one of for route {route!r}: {expected}; got {kind!r}",
+                )
             missing_launch = [key for key in launch_fields if key not in row]
             if missing_launch:
                 raise _override_error(
