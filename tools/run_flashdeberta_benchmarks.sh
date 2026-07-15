@@ -68,7 +68,7 @@ run_case() {
 
     local log_path="${OUT_DIR}/${name}.log"
     local meta_path="${OUT_DIR}/${name}.meta"
-    local start_ts end_ts elapsed_s attempt attempts_run delay status
+    local start_ts end_ts elapsed_s attempt attempts_run delay status attempt_log_path
 
     echo "==> ${name}"
     echo "    log: ${log_path}"
@@ -79,23 +79,29 @@ run_case() {
     attempts_run=0
     for ((attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++)); do
         attempts_run="${attempt}"
-        printf '\n== attempt %d/%d ==\n' "${attempt}" "${RETRY_ATTEMPTS}" >>"${log_path}"
+        attempt_log_path="${OUT_DIR}/${name}.attempt-${attempt}.log"
+        printf '== attempt %d/%d ==\n' "${attempt}" "${RETRY_ATTEMPTS}" >"${attempt_log_path}"
         if (
             cd "${ROOT_DIR}"
             "$@"
-        ) >>"${log_path}" 2>&1; then
+        ) >>"${attempt_log_path}" 2>&1; then
+            cp "${attempt_log_path}" "${log_path}"
             status="success"
             break
         fi
         if ! grep -Eiq \
-            'timeout|connection(reset|error|aborted)?|temporar(il)?y unavailable|remote.*disconnect|incomplete(read| download)|chunkedencoding|http[^0-9]*5[0-9][0-9]|shard.*(unavailable|failed)' \
-            "${log_path}"; then
+            'timeout|connection(reset|error|aborted)?|temporar(il)?y unavailable|remote.*disconnect|incomplete(read| download)|chunkedencoding|too many requests|rate.?limit|http[^0-9]*(429|5[0-9][0-9])|shard.*(unavailable|failed)' \
+            "${attempt_log_path}"; then
+            cp "${attempt_log_path}" "${log_path}"
             break
         fi
         if ((attempt < RETRY_ATTEMPTS)); then
             delay="$((RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))))"
-            printf 'Transient failure; retrying in %ss.\n' "${delay}" | tee -a "${log_path}"
+            printf 'Transient failure; retrying in %ss.\n' "${delay}" | tee -a "${attempt_log_path}"
+            cp "${attempt_log_path}" "${log_path}"
             sleep "${delay}"
+        else
+            cp "${attempt_log_path}" "${log_path}"
         fi
     done
     end_ts="$(date +%s)"
