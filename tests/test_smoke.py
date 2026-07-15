@@ -10,7 +10,7 @@ import torch
 from _fakes import BackboneConfigStub, BackboneOutputStub, DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
-from deberta.data.retry import call_with_dataset_retry
+from deberta.data.retry import call_with_dataset_retry, is_transient_dataset_error
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
 from deberta.modeling.mask_utils import build_doc_block_mask
 
@@ -458,6 +458,53 @@ def test_call_with_dataset_retry_does_not_retry_non_transient_failure() -> None:
             backoff_seconds=0.0,
             on_retry=lambda *_args: pytest.fail("non-transient failure retried"),
         )
+
+
+@pytest.mark.parametrize("exception_name", ["HTTPError", "HfHubHTTPError", "HTTPStatusError"])
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (429, True),
+        (500, True),
+        (502, True),
+        (503, True),
+        (504, True),
+        (400, False),
+        (404, False),
+        (501, False),
+        (505, False),
+    ],
+)
+def test_dataset_retry_classifies_duck_typed_http_status_errors(
+    exception_name: str,
+    status_code: int,
+    expected: bool,
+) -> None:
+    response = type("Response", (), {"status_code": status_code})()
+    error_type = type(exception_name, (Exception,), {})
+    error = error_type(f"HTTP {status_code}")
+    error.response = response
+
+    assert is_transient_dataset_error(error) is expected
+
+
+def test_dataset_retry_finds_nested_http_status_error() -> None:
+    response = type("Response", (), {"status_code": 502})()
+    status_error = type("HTTPStatusError", (Exception,), {})("HTTP 502")
+    status_error.response = response
+    wrapper = RuntimeError("dataset read failed")
+    wrapper.__cause__ = status_error
+
+    assert is_transient_dataset_error(wrapper) is True
+
+
+def test_dataset_retry_does_not_retry_4xx_with_transient_nested_cause() -> None:
+    response = type("Response", (), {"status_code": 404})()
+    status_error = type("HTTPError", (Exception,), {})("HTTP 404")
+    status_error.response = response
+    status_error.__cause__ = TimeoutError("connection timed out while reading error response")
+
+    assert is_transient_dataset_error(status_error) is False
 
 
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():

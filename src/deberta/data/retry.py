@@ -33,6 +33,29 @@ _TRANSIENT_OS_ERRNOS = {
     errno.ENETUNREACH,
     errno.ETIMEDOUT,
 }
+_TRANSIENT_HTTP_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _http_status_code(exc: BaseException) -> int | None:
+    """Return a duck-typed HTTP response status code when available.
+
+    ``requests``/Hugging Face and ``httpx`` status exceptions both expose the
+    originating response through ``exc.response``. Avoid importing either
+    optional client here so dataset retry remains dependency-neutral.
+
+    :param BaseException exc: Candidate HTTP status exception.
+    :return int | None: Response status code, or None when unavailable.
+    """
+    response = getattr(exc, "response", None)
+    raw_status = getattr(response, "status_code", None) if response is not None else None
+    if raw_status is None:
+        raw_status = getattr(exc, "status_code", None)
+    if raw_status is None:
+        return None
+    try:
+        return int(raw_status)
+    except (TypeError, ValueError):
+        return None
 
 
 def is_transient_dataset_error(exc: BaseException) -> bool:
@@ -45,6 +68,9 @@ def is_transient_dataset_error(exc: BaseException) -> bool:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        status_code = _http_status_code(current)
+        if status_code is not None:
+            return status_code in _TRANSIENT_HTTP_STATUS_CODES
         if isinstance(current, (ConnectionError, TimeoutError)):
             return True
         if isinstance(current, OSError) and current.errno in _TRANSIENT_OS_ERRNOS:
