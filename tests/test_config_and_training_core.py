@@ -2,14 +2,12 @@ import dataclasses
 import gzip
 import json
 import logging
-import random
 import re
 import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pytest
 import torch
 from _config_factories import (
@@ -39,11 +37,7 @@ from deberta.config import (
     load_model_config_snapshot,
     load_train_config_snapshot,
 )
-from deberta.training.entrypoint import (
-    _resolve_entrypoint_profile_sections,
-    _restore_checkpoint_rng_state_or_raise,
-    _resume_optimizer_lrs_are_all_zero,
-)
+from deberta.training.entrypoint import _resolve_entrypoint_profile_sections
 from deberta.training.metrics import (
     _append_metrics_jsonl_row,
     _build_runtime_resolved_tracker_config,
@@ -380,58 +374,6 @@ def test_resolve_output_dir_auto_prefers_run_name():
     )
     assert out.parent.name == "deberta-train"
     assert re.fullmatch(r"\d{8}_\d{6}_my-run", out.name) is not None
-
-
-def test_resume_optimizer_lrs_are_all_zero_requires_active_all_zero_groups() -> None:
-    first = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=0.0)
-    second = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=0.0)
-    assert _resume_optimizer_lrs_are_all_zero((first, second)) is True
-
-    second.param_groups[0]["lr"] = 1e-4
-    assert _resume_optimizer_lrs_are_all_zero((first, second)) is False
-    assert _resume_optimizer_lrs_are_all_zero((first, None)) is True
-    assert _resume_optimizer_lrs_are_all_zero((None,)) is False
-
-
-def test_restore_checkpoint_rng_state_or_raise_restores_cpu_streams(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "checkpoint-1"
-    checkpoint.mkdir()
-    python_rng = random.Random(17)
-    numpy_rng = np.random.RandomState(17)
-    torch_rng = torch.Generator().manual_seed(17)
-    torch.save(
-        {
-            "random_state": python_rng.getstate(),
-            "numpy_random_seed": numpy_rng.get_state(),
-            "torch_manual_seed": torch_rng.get_state(),
-        },
-        checkpoint / "random_states_0.pkl",
-    )
-    expected_python = python_rng.random()
-    expected_numpy = float(numpy_rng.random_sample())
-    expected_torch = float(torch.rand((), generator=torch_rng).item())
-
-    _restore_checkpoint_rng_state_or_raise(
-        checkpoint_dir=checkpoint,
-        process_index=0,
-        device=torch.device("cpu"),
-    )
-
-    assert random.random() == expected_python
-    assert float(np.random.random_sample()) == expected_numpy
-    assert float(torch.rand(()).item()) == expected_torch
-
-
-def test_restore_checkpoint_rng_state_or_raise_rejects_missing_state(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "checkpoint-1"
-    checkpoint.mkdir()
-
-    with pytest.raises(RuntimeError, match="Exact resume could not restore required RNG state"):
-        _restore_checkpoint_rng_state_or_raise(
-            checkpoint_dir=checkpoint,
-            process_index=0,
-            device=torch.device("cpu"),
-        )
 
 
 def test_resolve_output_dir_normalizes_explicit_path():

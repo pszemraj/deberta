@@ -840,8 +840,6 @@ train:
   # contract: optimizer-step budget and the only duration control; there is no num_epochs alternative.
   # interaction: gradient accumulation changes micro-batches per step, not this count.
   # resume behavior: values above saved global_step request more steps and values <= saved global_step perform no optimization.
-  # resume warning: extending from a checkpoint whose decay schedule already reached zero LR is rejected because it would advance metadata without updating weights.
-  # recovery: resume an earlier nonterminal checkpoint or start a new run with a deliberate scheduler recipe.
   max_steps: 50000
 
   # [train.per_device_train_batch_size]
@@ -1124,14 +1122,12 @@ train:
     # default: literal null (fresh run)
     # required: optional
     # values: null | empty/whitespace-only string (normalized to null) | "auto" | existing committed checkpoint directory
-    # restoration: exact resume restores model, optimizer, scheduler, per-process RNG, global step, and data-progress state; it is distinct from model.from_scratch=false.
-    # source requirements: the directory must contain .complete, valid data_state.json progress, non-empty model weights, per-process random_states files, and source-run model/data/train/optim/logging snapshots.
-    # failure behavior: missing or incompatible RNG state is a hard error; resume never silently continues with a newly seeded stream.
+    # restoration: resume asks Accelerate to restore model, optimizer, scheduler, and RNG state, then restores this repo's global step and data-progress state; it is distinct from model.from_scratch=false.
+    # source requirements: the directory must contain .complete, valid data_state.json progress, non-empty model weights, and source-run model/data/train/optim/logging snapshots.
     # path: explicit relative paths resolve from the process working directory and `~` is expanded.
     # compatibility: model, data, optim, logging, and all training-semantic train fields must match the source snapshots after documented inactive-field normalization.
     # allowed changes: train.max_steps plus checkpoint output, overwrite, save cadence/retention, resume strategy/replay cap, and final-export controls may change; logging.output_dir may also change.
     # warning: changing batch size, gradient accumulation, precision, TF32, seed, compile/SDPA policy, dataloader behavior, objectives, decoupled topology, model, data, optimizer, or other logging settings is rejected.
-    # scheduler warning: requesting more steps from a checkpoint where all restored optimizer learning rates are zero is rejected; use an earlier nonterminal checkpoint or begin a new schedule in a new run.
     # interaction: mutually exclusive with overwrite_output_dir=true.
     # auto behavior: "auto" scans output_dir, skips incomplete newer checkpoints when an older committed checkpoint exists, and starts fresh when output_dir is empty.
     # auto failure: "auto" errors when a non-empty output has no checkpoint-* directories or none are resumable; use an explicit path when resume is mandatory.

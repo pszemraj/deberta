@@ -5,14 +5,12 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import random
 import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -123,65 +121,6 @@ def _resolve_entrypoint_profile_sections(
         train_cfg if train_cfg is not None else defaults.train,
         optim_cfg if optim_cfg is not None else defaults.optim,
     )
-
-
-def _resume_optimizer_lrs_are_all_zero(
-    optimizers: tuple[torch.optim.Optimizer | None, ...],
-) -> bool:
-    """Return whether every active optimizer group has a zero learning rate.
-
-    :param tuple[torch.optim.Optimizer | None, ...] optimizers: Restored optimizers to inspect.
-    :return bool: True when at least one group exists and all group learning rates are zero.
-    """
-    learning_rates = [
-        float(group["lr"])
-        for optimizer in optimizers
-        if optimizer is not None
-        for group in optimizer.param_groups
-    ]
-    return bool(learning_rates) and all(lr == 0.0 for lr in learning_rates)
-
-
-def _restore_checkpoint_rng_state_or_raise(
-    *,
-    checkpoint_dir: str | Path,
-    process_index: int,
-    device: torch.device,
-) -> None:
-    """Restore required RNG streams from an Accelerate checkpoint or fail exact resume.
-
-    Accelerate 1.10 suppresses RNG-load exceptions after partially restoring state. Reapply the
-    checkpoint explicitly so exact resume cannot silently continue without a required RNG stream.
-
-    :param str | Path checkpoint_dir: Committed checkpoint directory.
-    :param int process_index: Distributed process index used in the RNG filename.
-    :param torch.device device: Active training device.
-    :raises RuntimeError: If required RNG state is missing or cannot be restored.
-    """
-    rng_path = Path(checkpoint_dir) / f"random_states_{int(process_index)}.pkl"
-    try:
-        from accelerate.utils import load
-
-        states = load(rng_path)
-        required = {"random_state", "numpy_random_seed", "torch_manual_seed"}
-        missing = sorted(required.difference(states))
-        if missing:
-            raise KeyError(f"missing keys: {missing}")
-        random.setstate(states["random_state"])
-        np.random.set_state(states["numpy_random_seed"])
-        torch.set_rng_state(states["torch_manual_seed"])
-        if device.type == "cuda":
-            cuda_states = states.get("torch_cuda_manual_seed")
-            if cuda_states is None:
-                raise KeyError("missing key: torch_cuda_manual_seed")
-            torch.cuda.set_rng_state_all(cuda_states)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Exact resume could not restore required RNG state from {rng_path}. "
-            "Use a complete checkpoint created for the same device topology."
-        ) from exc
-
-    logger.info("Restored and verified checkpoint RNG state: %s", rng_path)
 
 
 def _flash_attention_enabled_for_runtime(model_cfg: ModelConfig) -> bool:
@@ -960,11 +899,6 @@ def run_pretraining(
                 checkpoint_dir=ckpt,
                 context="resume",
             )
-            _restore_checkpoint_rng_state_or_raise(
-                checkpoint_dir=ckpt,
-                process_index=int(accelerator.process_index),
-                device=accelerator.device,
-            )
             if effective_decoupled_training:
                 if gen_optimizer is not None and gen_lr_scheduler is not None:
                     _record_unscaled_lrs(gen_optimizer, gen_lr_scheduler)
@@ -1007,23 +941,6 @@ def run_pretraining(
                     f"for checkpoint '{ckpt}'."
                 )
             last_saved_step = int(global_step)
-            resume_optimizers = (
-                (
-                    gen_optimizer if float(train_cfg.objective.gen_loss_weight) > 0.0 else None,
-                    disc_optimizer if float(train_cfg.objective.disc_loss_weight) > 0.0 else None,
-                )
-                if effective_decoupled_training
-                else (optimizer,)
-            )
-            if int(global_step) < int(train_cfg.max_steps) and _resume_optimizer_lrs_are_all_zero(
-                resume_optimizers
-            ):
-                raise RuntimeError(
-                    "Resume restored zero learning rates for every optimizer while additional steps "
-                    "were requested. The source schedule has already reached a zero-LR terminal state, "
-                    "so continuing would advance metadata without updating model weights. Resume from an "
-                    "earlier nonterminal checkpoint or start a new run with a deliberate scheduler recipe."
-                )
             if int(saved_ga_steps) != int(ga_steps) and accelerator.is_main_process:
                 logger.warning(
                     "Resume checkpoint '%s' was saved with gradient_accumulation_steps=%d but current run uses %d.",

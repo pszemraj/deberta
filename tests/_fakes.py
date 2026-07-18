@@ -616,7 +616,6 @@ def setup_pretraining_mocks(
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
     monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
-    monkeypatch.setattr(entrypoint_mod, "_restore_checkpoint_rng_state_or_raise", lambda **_kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda _cfg: [{"text": "hello"}])
