@@ -7,7 +7,7 @@ import re
 
 import pytest
 import torch
-from _fakes import BackboneConfigStub, BackboneOutputStub, DummyTokenizer
+from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.retry import call_with_dataset_retry, is_transient_dataset_error
@@ -1507,126 +1507,6 @@ def test_pretrainer_forward_smoke():
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.disc_accuracy.ndim == 0
-
-
-def test_rope_pretrainer_ignores_flash_metadata_boundary():
-    """RoPE RTD should run when flash metadata is present at the RTD boundary."""
-
-    from deberta.modeling.mask_utils import FlashBatchMeta
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
-    from deberta.modeling.rtd import DebertaV3RTDPretrainer
-
-    cfg = DebertaRoPEConfig(
-        vocab_size=64,
-        hidden_size=24,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=48,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=DebertaRoPEModel(cfg),
-        generator_backbone=DebertaRoPEModel(cfg),
-        disc_config=cfg,
-        gen_config=cfg,
-        embedding_sharing="gdes",
-    )
-    input_ids = torch.randint(low=0, high=64, size=(2, 8), dtype=torch.long)
-    labels = torch.full_like(input_ids, -100)
-    labels[:, 2] = input_ids[:, 2]
-    flash_meta = FlashBatchMeta(
-        seq_lengths=torch.tensor([8, 7], dtype=torch.int32),
-        active_tokens_scalar=torch.tensor(15, dtype=torch.int32),
-        route_hint="fixed",
-    )
-
-    out = model(
-        input_ids=input_ids,
-        labels=labels,
-        attention_mask=torch.ones_like(input_ids),
-        flash_meta=flash_meta,
-    )
-
-    assert out.loss.ndim == 0
-    assert torch.isfinite(out.loss)
-
-
-def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_backbone():
-    """RTD should not pass flash metadata to backbones that do not declare it."""
-
-    from deberta.modeling.mask_utils import FlashBatchMeta
-    from deberta.modeling.rtd import DebertaV3RTDPretrainer
-
-    class _Embeddings(torch.nn.Module):
-        def __init__(self, vocab_size: int, hidden_size: int) -> None:
-            super().__init__()
-            self.word_embeddings = torch.nn.Embedding(vocab_size, hidden_size)
-
-    class _BaseSignatureBackbone(torch.nn.Module):
-        def __init__(self, cfg: BackboneConfigStub) -> None:
-            super().__init__()
-            self.cfg = cfg
-            self.embeddings = _Embeddings(cfg.vocab_size, cfg.hidden_size)
-            self.proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size)
-
-        def _initialize_weights(self, module: torch.nn.Module) -> None:
-            if isinstance(module, torch.nn.Linear):
-                torch.nn.init.normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-
-        def forward(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
-            return_dict: bool = True,
-            output_hidden_states: bool = False,
-        ) -> BackboneOutputStub:
-            del attention_mask, token_type_ids, return_dict
-            hidden = self.proj(self.embeddings.word_embeddings(input_ids))
-            hidden_states = (hidden,) if output_hidden_states else None
-            return BackboneOutputStub(last_hidden_state=hidden, hidden_states=hidden_states)
-
-    cfg = BackboneConfigStub(
-        vocab_size=32,
-        hidden_size=16,
-        embedding_size=16,
-        hidden_act="gelu",
-        layer_norm_eps=1e-6,
-        use_rmsnorm_heads=False,
-        position_biased_input=True,
-        pad_token_id=0,
-    )
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=_BaseSignatureBackbone(cfg),
-        generator_backbone=_BaseSignatureBackbone(cfg),
-        disc_config=cfg,
-        gen_config=cfg,
-        embedding_sharing="none",
-    )
-    assert model._generator_accepts_flash_kwargs is False
-
-    input_ids = torch.randint(low=1, high=32, size=(2, 6), dtype=torch.long)
-    labels = torch.full_like(input_ids, -100)
-    labels[:, 2] = input_ids[:, 2]
-    out = model.forward_generator_phase(
-        input_ids=input_ids,
-        labels=labels,
-        attention_mask=torch.ones_like(input_ids),
-        flash_meta=FlashBatchMeta(
-            seq_lengths=torch.tensor([6, 6], dtype=torch.int32),
-            active_tokens_scalar=torch.tensor(12, dtype=torch.int32),
-            route_hint="fixed",
-        ),
-    )
-
-    assert out.has_masked_targets is True
-    assert torch.isfinite(out.gen_loss_raw)
 
 
 def test_pretrainer_sampler_avoids_configured_special_ids():

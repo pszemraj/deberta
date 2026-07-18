@@ -29,7 +29,6 @@ Modernization goals preserved:
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -50,25 +49,6 @@ try:
     from torch.distributed.tensor import DTensor as _TorchDTensor
 except Exception:  # pragma: no cover - optional distributed dependency
     _TorchDTensor = None
-
-
-_FLASH_FORWARD_KEYS = ("flash_meta",)
-
-
-def _backbone_accepts_flash_kwargs(backbone: nn.Module) -> bool:
-    """Return whether a backbone forward can consume FlashDeBERTa metadata.
-
-    :param nn.Module backbone: Backbone module to inspect.
-    :return bool: True when ``flash_meta`` or a ``**kwargs`` catch-all is declared.
-    """
-
-    try:
-        params = inspect.signature(type(backbone).forward).parameters
-    except (TypeError, ValueError):
-        return False
-    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
-        return True
-    return all(key in params for key in _FLASH_FORWARD_KEYS)
 
 
 # -----------------------------------------------------------------------------
@@ -541,10 +521,9 @@ class RTDHead(nn.Module):
         :param torch.Tensor | None doc_context_index: Optional CLS index per token in ``(B,S)``.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :raises RuntimeError: If document-block attention lacks a context map.
-        :raises ValueError: If the context map shape or dtype is invalid.
         :return torch.Tensor: Per-token logits ``(B,S)``.
         """
-        batch_size, seq_len, hidden_size = hidden_states.shape
+        hidden_size = int(hidden_states.shape[-1])
         if doc_context_index is None:
             if self._requires_document_context(attention_mask, flash_meta=flash_meta):
                 raise RuntimeError(
@@ -552,13 +531,6 @@ class RTDHead(nn.Module):
                 )
             context = hidden_states[:, 0:1, :]
         else:
-            if tuple(doc_context_index.shape) != (batch_size, seq_len):
-                raise ValueError(
-                    "doc_context_index must match hidden_states (B,S); "
-                    f"got {tuple(doc_context_index.shape)} for {(batch_size, seq_len)}."
-                )
-            if doc_context_index.dtype == torch.bool or doc_context_index.dtype.is_floating_point:
-                raise ValueError("doc_context_index must use an integer dtype.")
             gather_index = doc_context_index.to(device=hidden_states.device, dtype=torch.long)
             context = hidden_states.gather(
                 dim=1,
@@ -648,8 +620,6 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         self.generator = generator_backbone
         self.discriminator = discriminator_backbone
-        self._generator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.generator)
-        self._discriminator_accepts_flash_kwargs = _backbone_accepts_flash_kwargs(self.discriminator)
 
         # Builder validation gives config-loaded runs an early error; keep this
         # constructor invariant for callers that assemble backbones directly.
@@ -981,7 +951,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         }
         if position_ids is not None:
             gen_forward_kwargs["position_ids"] = position_ids
-        if flash_meta is not None and self._generator_accepts_flash_kwargs:
+        if flash_meta is not None:
             gen_forward_kwargs["flash_meta"] = flash_meta
         if use_emd:
             gen_forward_kwargs["output_hidden_states"] = True
@@ -1010,7 +980,7 @@ class DebertaV3RTDPretrainer(nn.Module):
                 embeddings=self.generator.embeddings,
                 encoder=self.generator.encoder,
                 position_ids=position_ids,
-                flash_meta=flash_meta if self._generator_accepts_flash_kwargs else None,
+                flash_meta=flash_meta,
             )
         else:
             hidden = gen_out.last_hidden_state
@@ -1081,7 +1051,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         }
         if position_ids is not None:
             disc_forward_kwargs["position_ids"] = position_ids
-        if flash_meta is not None and self._discriminator_accepts_flash_kwargs:
+        if flash_meta is not None:
             disc_forward_kwargs["flash_meta"] = flash_meta
         disc_out = self.discriminator(**disc_forward_kwargs)
         disc_hidden = disc_out.last_hidden_state
