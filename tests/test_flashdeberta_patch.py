@@ -131,19 +131,6 @@ def _kernel_tuning_overrides(
         configure_flashdeberta_kernel_overrides(None)
 
 
-def test_flash_runtime_config_reads_supported_options() -> None:
-    from deberta.modeling.flashdeberta_attention import _runtime_config_from_deberta_config
-
-    config = types.SimpleNamespace(
-        hf_flash={"docblock_bias_seq_len": 1024, "kernel_overrides_path": "custom.json"}
-    )
-
-    runtime = _runtime_config_from_deberta_config(config)
-
-    assert runtime.docblock_bias_seq_len == 1024
-    assert runtime.kernel_overrides_path == "custom.json"
-
-
 def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import (
         FlashKernelContext,

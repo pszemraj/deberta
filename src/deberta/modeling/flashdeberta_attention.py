@@ -19,7 +19,6 @@ kernel policy.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import Any
 
@@ -67,33 +66,6 @@ from deberta.modeling.mask_utils import (
 )
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
-
-
-@dataclass(frozen=True)
-class FlashDebertaRuntimeConfig:
-    """Static runtime policy for the flash adapter.
-
-    Values are intentionally read once per process to reduce Python work and
-    guard surface inside compiled attention forwards.
-    """
-
-    docblock_bias_seq_len: int | None = None
-    kernel_overrides_path: str | None = None
-
-
-def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRuntimeConfig:
-    """Resolve flash runtime policy from a native DeBERTa config object.
-
-    :param Any | None config: Optional backbone config object.
-    :return FlashDebertaRuntimeConfig: Instance-local runtime policy.
-    """
-
-    raw = getattr(config, "hf_flash", {}) if config is not None else {}
-    docblock_bias_seq_len = raw.get("docblock_bias_seq_len")
-    return FlashDebertaRuntimeConfig(
-        docblock_bias_seq_len=(None if docblock_bias_seq_len is None else int(docblock_bias_seq_len)),
-        kernel_overrides_path=raw.get("kernel_overrides_path"),
-    )
 
 
 def _should_use_varlen(
@@ -206,8 +178,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         config = args[0] if args else kwargs.get("config")
-        self._runtime_config = _runtime_config_from_deberta_config(config)
-        configure_flashdeberta_kernel_overrides(self._runtime_config.kernel_overrides_path)
+        flash_config = getattr(config, "hf_flash", {}) if config is not None else {}
+        configure_flashdeberta_kernel_overrides(flash_config.get("kernel_overrides_path"))
         super().__init__(*args, **kwargs)
 
     def _requires_eager_fallback(
