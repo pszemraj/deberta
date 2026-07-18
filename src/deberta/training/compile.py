@@ -109,30 +109,6 @@ def _bf16_runtime_sanity_check() -> bool:
         return False
 
 
-def _flash_route_hint_for_padding_batch(
-    *,
-    seq_len: int,
-    active_tokens: int,
-    batch_size: int,
-    device: torch.device | None = None,
-) -> str:
-    """Select a fixed-vs-varlen route for one standard padded batch.
-
-    :param int seq_len: Padded sequence length.
-    :param int active_tokens: Total active tokens across the batch.
-    :param int batch_size: Batch size.
-    :param torch.device | None device: Batch device for capability-scoped table rows.
-    :return str: Either ``fixed`` or ``varlen``.
-    """
-
-    return flash_padding_route(
-        seq_len=int(seq_len),
-        total_tokens=int(active_tokens),
-        batch_size=int(batch_size),
-        compute_capability=device_compute_capability(device) if device is not None else None,
-    )
-
-
 def _flash_route_hint_for_docblock_batch(
     *,
     seq_len: int,
@@ -175,18 +151,6 @@ def _flash_route_hint_for_docblock_batch(
     if table_route in {"docblock", "docblock_bias"}:
         return table_route
     return "docblock"
-
-
-def _configure_flash_kernel_overrides_from_cfg(flash_cfg: ModelHFFlashConfig | None) -> None:
-    """Apply config-driven FlashDeBERTa kernel override tables for route helpers.
-
-    :param ModelHFFlashConfig | None flash_cfg: Optional flash config.
-    """
-
-    if flash_cfg is None:
-        return
-    value = flash_cfg.kernel_overrides_path
-    configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
 
 
 def _flash_meta_with_route(
@@ -238,8 +202,8 @@ def prepare_flash_attention_batch_metadata(
     batch_size = int(input_ids.shape[0])
     routing_device = route_device if route_device is not None else input_ids.device
     flash_enabled = bool(flash_enabled)
-    if flash_enabled and btype == "hf_deberta_v2":
-        _configure_flash_kernel_overrides_from_cfg(flash_cfg)
+    if flash_enabled and btype == "hf_deberta_v2" and flash_cfg is not None:
+        configure_flashdeberta_kernel_overrides(flash_cfg.kernel_overrides_path)
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
@@ -273,11 +237,11 @@ def prepare_flash_attention_batch_metadata(
     if flash_meta is None or flash_meta.seq_lengths is None or flash_meta.active_tokens_scalar is None:
         return batch, None
 
-    route_hint = _flash_route_hint_for_padding_batch(
+    route_hint = flash_padding_route(
         seq_len=seq_len,
-        active_tokens=int(flash_meta.active_tokens_scalar),
+        total_tokens=int(flash_meta.active_tokens_scalar),
         batch_size=batch_size,
-        device=routing_device,
+        compute_capability=device_compute_capability(routing_device),
     )
     return batch, dataclasses.replace(flash_meta, route_hint=route_hint)
 

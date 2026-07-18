@@ -389,21 +389,16 @@ def test_flash_kernel_config_capability_precedence_and_override_append(tmp_path)
 
 
 def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> None:
-    from deberta.training.compile import (
-        _flash_route_hint_for_docblock_batch,
-        _flash_route_hint_for_padding_batch,
-    )
+    from deberta.training.compile import _flash_route_hint_for_docblock_batch
 
     with _kernel_tuning_overrides(
         tmp_path,
         {
             "route_policies": {
-                "padding": [{"seq_bucket": "2048_plus", "choice": "fixed"}],
                 "docblock": [{"seq_bucket": "1024_exact", "choice": "docblock"}],
             }
         },
     ):
-        assert _flash_route_hint_for_padding_batch(seq_len=2048, active_tokens=4096, batch_size=2) == "fixed"
         assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
 
 
