@@ -627,8 +627,6 @@ def flash_padding_route(
     seq_len: int,
     total_tokens: int | None = None,
     batch_size: int | None = None,
-    force_varlen: bool = False,
-    varlen_min_seq_len: int | None = None,
     compute_capability: tuple[int, int] | None = None,
 ) -> str:
     """Resolve the fixed-vs-varlen route for one padded batch shape.
@@ -641,18 +639,11 @@ def flash_padding_route(
     :param int seq_len: Padded sequence length.
     :param int | None total_tokens: Active token count, when known.
     :param int | None batch_size: Batch size, when known.
-    :param bool force_varlen: Config override that forces the varlen route.
-    :param int | None varlen_min_seq_len: Optional config threshold overriding the table.
     :param tuple[int, int] | None compute_capability: Device capability for
         capability-scoped table rows; None matches only hardware-agnostic rows.
     :return str: Either ``"fixed"`` or ``"varlen"``.
     """
 
-    if force_varlen:
-        return "varlen"
-    if varlen_min_seq_len is not None:
-        threshold = max(1, int(varlen_min_seq_len))
-        return "varlen" if int(seq_len) >= threshold else "fixed"
     seq_bucket = flash_seq_bucket(
         seq_len=int(seq_len),
         total_tokens=total_tokens,

@@ -469,14 +469,8 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
         hf={
             "attention_impl": "flash",
             "flash": {
-                "force_varlen": True,
-                "varlen_min_seq_len": 4096,
                 "docblock_bias_seq_len": 0,
-                "local_bias_seq_len": 1024,
-                "local_bias_max_batch_size": 2,
-                "eager_dense_max_seq_len": 512,
-                "debug_stats": True,
-                "warn_fallbacks": False,
+                "kernel_overrides_path": "custom.json",
             },
         },
     )
@@ -490,14 +484,8 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
 
     for built_cfg in (disc_cfg, gen_cfg):
         assert built_cfg.hf_attention_impl == "flash"
-        assert built_cfg.hf_flash["force_varlen"] is True
-        assert built_cfg.hf_flash["varlen_min_seq_len"] == 4096
         assert built_cfg.hf_flash["docblock_bias_seq_len"] == 0
-        assert built_cfg.hf_flash["local_bias_seq_len"] == 1024
-        assert built_cfg.hf_flash["local_bias_max_batch_size"] == 2
-        assert built_cfg.hf_flash["eager_dense_max_seq_len"] == 512
-        assert built_cfg.hf_flash["debug_stats"] is True
-        assert built_cfg.hf_flash["warn_fallbacks"] is False
+        assert built_cfg.hf_flash["kernel_overrides_path"] == "custom.json"
 
 
 def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:

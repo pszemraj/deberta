@@ -37,24 +37,20 @@ On any other supported CUDA GPU, `model.hf.attention_impl=flash` still runs Flas
 
 ## Opting into the dense routes on other hardware
 
-The measured routes work on any supported GPU; they are just not the default until measured. Two
-ways to enable them:
+The measured routes work on any supported GPU; they are just not the default until measured.
 
-Per-run knobs (no table needed):
+The dense document-block route can be selected for one packed length without a table:
 
 ```yaml
 model:
   hf:
     attention_impl: flash
     flash:
-      # Force dense doc-block at your packed length:
       docblock_bias_seq_len: 1024
-      # Enable the small-batch local-bias route (both knobs required off-table):
-      local_bias_seq_len: 1024
-      local_bias_max_batch_size: 4
 ```
 
-Or a capability-scoped override table, selected with `model.hf.flash.kernel_overrides_path`.
+A capability-scoped override table, selected with `model.hf.flash.kernel_overrides_path`, can also
+enable the dense document-block or local-bias route.
 Override rows append to the shipped table, and an exact-capability row outranks the wildcard
 defaults, so promoting one route for your GPU takes one row per bucket. Buckets like
 `4096_plus` are open-ended, so bound dense rows with `max_seq_len` at the longest length you

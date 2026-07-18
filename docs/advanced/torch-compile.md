@@ -41,10 +41,6 @@ Route selection, kernel tuning, and route-level caveats are covered in
 [Advanced / FlashDeBERTa attention](flash-attention.md). This section covers only how the flash
 paths stay compile-stable.
 
-FlashDeBERTa path counters are debug-only and disabled by default. Normal compiled training does
-not mutate Python stats or emit per-call warnings from inside attention forward; use the
-benchmark/probe tooling for path visibility instead.
-
 Flash CUDA routes cross opaque `torch.library` custom-op boundaries: fixed and varlen attention,
 flash-with-bias attention, ragged doc-block attention, and fused position-bias attention. Dense
 bias assembly is private Triton work inside those production paths, so Dynamo sees a stable

@@ -166,19 +166,11 @@ class ModelHFFlashConfig:
     sequence length on any GPU, bypassing the tuning table's
     ``max_batch_size``/``max_seq_len`` safety bounds entirely - the dense
     route saves a ``(B,H,S,S)`` bias for backward, so a forgotten knob plus a
-    larger batch can OOM. Training warns once when the knob forces dense past
-    the table bounds.
+    larger batch can OOM.
     """
 
-    force_varlen: bool = field(default=False)
-    varlen_min_seq_len: int | None = field(default=None)
     docblock_bias_seq_len: int | None = field(default=None)
-    local_bias_seq_len: int | None = field(default=None)
-    local_bias_max_batch_size: int | None = field(default=None)
-    eager_dense_max_seq_len: int = field(default=0)
     kernel_overrides_path: str | None = field(default=None)
-    debug_stats: bool = field(default=False)
-    warn_fallbacks: bool = field(default=True)
 
 
 @dataclass(frozen=True)
@@ -875,16 +867,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
     _cfg_set(
         cfg.hf, "model_size", _ensure_choice("model.hf.model_size", cfg.hf.model_size, _HF_MODEL_SIZE_CHOICES)
     )
-    _cfg_set(cfg.hf.flash, "force_varlen", bool(cfg.hf.flash.force_varlen))
-    if cfg.hf.flash.varlen_min_seq_len is not None:
-        _cfg_set(cfg.hf.flash, "varlen_min_seq_len", int(cfg.hf.flash.varlen_min_seq_len))
     if cfg.hf.flash.docblock_bias_seq_len is not None:
         _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
-    if cfg.hf.flash.local_bias_seq_len is not None:
-        _cfg_set(cfg.hf.flash, "local_bias_seq_len", int(cfg.hf.flash.local_bias_seq_len))
-    if cfg.hf.flash.local_bias_max_batch_size is not None:
-        _cfg_set(cfg.hf.flash, "local_bias_max_batch_size", int(cfg.hf.flash.local_bias_max_batch_size))
-    _cfg_set(cfg.hf.flash, "eager_dense_max_seq_len", int(cfg.hf.flash.eager_dense_max_seq_len))
     if cfg.hf.flash.kernel_overrides_path is not None:
         _cfg_set(
             cfg.hf.flash, "kernel_overrides_path", str(cfg.hf.flash.kernel_overrides_path).strip() or None
@@ -961,16 +945,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
         probability = float(value)
         if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
             raise ValueError(f"model.dropout.{field_name} must be finite and in [0, 1] or null.")
-    if cfg.hf.flash.varlen_min_seq_len is not None and int(cfg.hf.flash.varlen_min_seq_len) <= 0:
-        raise ValueError("model.hf.flash.varlen_min_seq_len must be > 0.")
     if cfg.hf.flash.docblock_bias_seq_len is not None and int(cfg.hf.flash.docblock_bias_seq_len) < 0:
         raise ValueError("model.hf.flash.docblock_bias_seq_len must be >= 0.")
-    if cfg.hf.flash.local_bias_seq_len is not None and int(cfg.hf.flash.local_bias_seq_len) < 0:
-        raise ValueError("model.hf.flash.local_bias_seq_len must be >= 0.")
-    if cfg.hf.flash.local_bias_max_batch_size is not None and int(cfg.hf.flash.local_bias_max_batch_size) < 0:
-        raise ValueError("model.hf.flash.local_bias_max_batch_size must be >= 0.")
-    if int(cfg.hf.flash.eager_dense_max_seq_len) < 0:
-        raise ValueError("model.hf.flash.eager_dense_max_seq_len must be >= 0.")
     if cfg.backbone_type != "hf_deberta_v2" and cfg.hf.attention_impl == "flash":
         raise ValueError(
             "model.hf.attention_impl='flash' is only supported with model.backbone_type='hf_deberta_v2'."

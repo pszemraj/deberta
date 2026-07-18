@@ -280,7 +280,7 @@ def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
             load_model_config_snapshot,
             asdict(make_model_config()),
             ("hf", "flash"),
-            "warn_fallbacks",
+            "kernel_overrides_path",
             "model_config.json.hf.flash",
         ),
         (

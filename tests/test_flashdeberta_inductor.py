@@ -34,13 +34,7 @@ def test_real_fixed_flash_attention_compiles_with_inductor_and_backward() -> Non
         pad_token_id=0,
         position_biased_input=False,
     )
-    # Pin the dense route so Dynamo tests the fixed custom-op boundary, not the
-    # capability-scoped eager policy lookup used by auto routing.
-    cfg.hf_flash = {
-        "local_bias_seq_len": 0,
-        "local_bias_max_batch_size": 0,
-        "warn_fallbacks": False,
-    }
+    cfg.hf_flash = {}
     attention = FlashDisentangledSelfAttention(cfg).to(device="cuda", dtype=torch.bfloat16)
 
     def _reject_eager(**_kwargs):

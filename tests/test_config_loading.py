@@ -163,13 +163,8 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
                 "  hf:",
                 "    attention_impl: flash",
                 "    flash:",
-                "      force_varlen: true",
-                "      varlen_min_seq_len: 4096",
                 "      docblock_bias_seq_len: 0",
-                "      local_bias_seq_len: 1024",
-                "      local_bias_max_batch_size: 2",
-                "      debug_stats: true",
-                "      warn_fallbacks: false",
+                "      kernel_overrides_path: custom.json",
                 "data:",
                 "  source:",
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
@@ -181,13 +176,8 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     cfg = load_config(config_path)
 
     assert cfg.model.hf.attention_impl == "flash"
-    assert cfg.model.hf.flash.force_varlen is True
-    assert cfg.model.hf.flash.varlen_min_seq_len == 4096
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
-    assert cfg.model.hf.flash.local_bias_seq_len == 1024
-    assert cfg.model.hf.flash.local_bias_max_batch_size == 2
-    assert cfg.model.hf.flash.debug_stats is True
-    assert cfg.model.hf.flash.warn_fallbacks is False
+    assert cfg.model.hf.flash.kernel_overrides_path == "custom.json"
 
 
 def test_config_reference_loads() -> None:

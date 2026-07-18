@@ -667,13 +667,12 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
 def test_validate_model_config_normalizes_hf_flash_config():
     cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        hf={"attention_impl": "flash", "flash": {"force_varlen": True, "varlen_min_seq_len": "4096"}},
+        hf={"attention_impl": "flash", "flash": {"docblock_bias_seq_len": "4096"}},
     )
     validate_model_config(cfg)
 
     assert cfg.hf.attention_impl == "flash"
-    assert cfg.hf.flash.force_varlen is True
-    assert cfg.hf.flash.varlen_min_seq_len == 4096
+    assert cfg.hf.flash.docblock_bias_seq_len == 4096
 
 
 def test_validate_model_config_rejects_flash_attention_for_rope():
@@ -999,14 +998,14 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
     )
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        hf={"attention_impl": "flash", "flash": {"force_varlen": True}},
+        hf={"attention_impl": "flash", "flash": {"docblock_bias_seq_len": 1024}},
     )
     validate_model_config(model_cfg)
 
     meta = _build_run_metadata(model_cfg=model_cfg)
 
     assert meta["flash_attention"]["requested_attention_impl"] == "flash"
-    assert meta["flash_attention"]["requested_flash_config"]["force_varlen"] is True
+    assert meta["flash_attention"]["requested_flash_config"]["docblock_bias_seq_len"] == 1024
     assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
 
 

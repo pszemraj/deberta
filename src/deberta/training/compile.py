@@ -12,7 +12,7 @@ import torch
 
 from deberta.config import ModelConfig, _normalize_sdpa_kernel
 from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS, FLASH_SCALAR_BATCH_KEYS
-from deberta.modeling.flash_config import flash_cfg_bool, flash_cfg_get, flash_cfg_optional_int
+from deberta.modeling.flash_config import flash_cfg_get, flash_cfg_optional_int
 from deberta.modeling.flashdeberta_kernel_tuning import (
     configure_flashdeberta_kernel_overrides,
     flash_padding_route,
@@ -138,8 +138,6 @@ def _flash_route_hint_for_padding_batch(
         seq_len=int(seq_len),
         total_tokens=int(active_tokens),
         batch_size=int(batch_size),
-        force_varlen=flash_cfg_bool(flash_cfg, name="force_varlen", default="0"),
-        varlen_min_seq_len=flash_cfg_optional_int(flash_cfg, name="varlen_min_seq_len", default=None),
         compute_capability=device_compute_capability(device) if device is not None else None,
     )
 

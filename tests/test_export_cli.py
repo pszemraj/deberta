@@ -609,7 +609,7 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
                     "hidden_size": 768,
                     "hf_attention_kernel": "stable",
                     "hf_attention_impl": "flash",
-                    "hf_flash": {"force_varlen": True},
+                    "hf_flash": {"docblock_bias_seq_len": 1024},
                     "use_rmsnorm_heads": False,
                     "legacy": True,
                     "cls_token_id": 1,

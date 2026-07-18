@@ -183,28 +183,6 @@ model:
     attention_impl: "eager"
 
     flash:
-      # [model.hf.flash.force_varlen]
-      # type: bool
-      # schema default: false
-      # default: literal false
-      # required: optional
-      # values: true | false
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: only used when model.hf.attention_impl=flash; true forces right-padded batches onto variable-length kernels and overrides varlen_min_seq_len.
-      # recommendation: keep false outside benchmarks and route debugging.
-      force_varlen: false
-
-      # [model.hf.flash.varlen_min_seq_len]
-      # type: int | None
-      # schema default: null
-      # default: null uses the capability table (fixed below 2048, varlen at 2048+ in shipped policy)
-      # required: optional
-      # values: null or integer > 0
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: a positive value replaces the padded fixed/varlen threshold and does not affect packed document-block routes.
-      # precedence: force_varlen=true overrides this threshold.
-      varlen_min_seq_len: null
-
       # [model.hf.flash.docblock_bias_seq_len]
       # type: int | None
       # schema default: null
@@ -216,41 +194,6 @@ model:
       # warning: dense bias saves a quadratic (B,H,S,S) tensor for backward and can OOM immediately.
       # recommendation: clear a positive override after controlled tuning.
       docblock_bias_seq_len: null
-
-      # [model.hf.flash.local_bias_seq_len]
-      # type: int | None
-      # schema default: null
-      # default: null uses capability policy (shipped local-bias row is sm_120-only)
-      # required: optional
-      # values: null, 0, or integer > 0
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: applies only to plain unpadded training batches; 0 disables and a positive value permits only the exact length.
-      # interaction: off-table GPUs must set this together with local_bias_max_batch_size; either zero disables local bias.
-      # interaction: independent of docblock_bias_seq_len.
-      local_bias_seq_len: null
-
-      # [model.hf.flash.local_bias_max_batch_size]
-      # type: int | None
-      # schema default: null
-      # default: null uses capability policy
-      # required: optional
-      # values: null, 0, or integer > 0
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: caps dense local-bias use.
-      # interaction: off-table GPUs must set this together with local_bias_seq_len; either zero disables local bias.
-      # warning: dense bias is hardware-sensitive and stores quadratic attention state.
-      local_bias_max_batch_size: null
-
-      # [model.hf.flash.eager_dense_max_seq_len]
-      # type: int
-      # schema default: 0
-      # default: literal 0 (debug fallback disabled)
-      # required: optional
-      # values: integer >= 0
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: only used with flash; a positive threshold allows selected short dense calls to use eager attention for comparisons.
-      # recommendation: leave 0 for training because enabling it changes routing and performance.
-      eager_dense_max_seq_len: 0
 
       # [model.hf.flash.kernel_overrides_path]
       # type: str | None
@@ -273,30 +216,6 @@ model:
       # warning: missing files, invalid JSON/object roots, unknown sections, malformed rows, and invalid launch values fail when the Flash attention module is constructed, with file and row context where applicable.
       # recommendation: keep null unless using tuning-tool output that has passed parity and smoke training on the target GPU.
       kernel_overrides_path: null
-
-      # [model.hf.flash.debug_stats]
-      # type: bool
-      # schema default: false
-      # default: literal false (route counters disabled)
-      # required: optional
-      # values: true | false
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: enables process-local counters for flash routes and eager fallback reasons, readable through flashdeberta_stats_snapshot.
-      # interaction: counters are hard-disabled inside torch.compile graphs and are diagnostic counters rather than training metrics.
-      # recommendation: use false for normal training and true only while diagnosing routes with train.compile.enabled=false.
-      debug_stats: false
-
-      # [model.hf.flash.warn_fallbacks]
-      # type: bool
-      # schema default: true
-      # default: literal true (warn once for each eager-fallback reason)
-      # required: optional
-      # values: true | false
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: controls per-process eager-fallback warnings emitted outside torch.compile graphs; host-side batch-preparation warnings remain independent.
-      # interaction: compiled forwards cannot emit these warnings.
-      # recommendation: keep true unless a diagnostic or benchmark deliberately needs quiet output, because false can hide throughput loss.
-      warn_fallbacks: true
 
     # [model.hf.max_position_embeddings]
     # type: int | None

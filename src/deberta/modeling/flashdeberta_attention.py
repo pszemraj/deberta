@@ -1,18 +1,8 @@
 """FlashDeBERTa attention adapter for the native DeBERTa-v2/v3 backbone.
 
-This revision is tuned for the current repo state and for ``torch.compile``.
-
-What changed versus the earlier adapter
---------------------------------------
-1. Stats are now debug-only and disabled by default. The prior adapter mutated
-   a Python ``Counter`` inside the attention forward path, which is exactly the
-   kind of Python/global state that TorchDynamo may guard on and recompile.
-2. Runtime policy is read from the resolved DeBERTa config at construction time;
-   FlashDeBERTa environment-variable controls are not used.
-3. Dense-vs-varlen routing no longer inspects attention-mask contents inside the
-   compiled forward path. In this repository's training loop, dense batches already
-   arrive as ``attention_mask=None`` because the collator drops all-ones masks.
-   Using that contract is both faster and more compile-friendly.
+Dense-vs-varlen routing does not inspect attention-mask contents inside the
+compiled forward path. In this repository's training loop, dense batches already
+arrive as ``attention_mask=None`` because the collator drops all-ones masks.
 
 Important behavior
 ------------------
@@ -22,17 +12,13 @@ Important behavior
   ``torch.compile`` does not trace into FlashDeBERTa's Python/Triton wrapper.
 - Pairwise masks still fall back to eager attention for correctness.
 
-Runtime controls
-----------------
-Use ``model.hf.attention_impl=flash`` and ``model.hf.flash.*`` for routing,
-kernel policy, fallback warnings, and optional debug counters.
+Use ``model.hf.attention_impl=flash`` and ``model.hf.flash.*`` for routing and
+kernel policy.
 """
 
 from __future__ import annotations
 
 import math
-import warnings
-from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import Any
@@ -45,7 +31,7 @@ from deberta.modeling.deberta_v2_native import (
 from deberta.modeling.deberta_v2_native import (
     build_relative_position as _build_relative_position,
 )
-from deberta.modeling.flash_config import flash_cfg_bool, flash_cfg_get, flash_cfg_optional_int
+from deberta.modeling.flash_config import flash_cfg_get, flash_cfg_optional_int
 from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_from_positions,
     flashdeberta_bias_import_error,
@@ -83,7 +69,6 @@ from deberta.modeling.mask_utils import (
 )
 
 _FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
-_FLASH_STATS: Counter[str] = Counter()
 
 
 @dataclass(frozen=True)
@@ -94,15 +79,8 @@ class FlashDebertaRuntimeConfig:
     guard surface inside compiled attention forwards.
     """
 
-    force_varlen: bool = False
-    varlen_min_seq_len: int | None = None
     docblock_bias_seq_len: int | None = None
-    local_bias_seq_len: int | None = None
-    local_bias_max_batch_size: int | None = None
-    eager_dense_max_seq_len: int = 0
     kernel_overrides_path: str | None = None
-    enable_debug_stats: bool = False
-    warn_fallbacks: bool = True
 
 
 def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRuntimeConfig:
@@ -114,55 +92,15 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
 
     raw = getattr(config, "hf_flash", None) if config is not None else None
     return FlashDebertaRuntimeConfig(
-        force_varlen=flash_cfg_bool(raw, name="force_varlen", default=False),
-        varlen_min_seq_len=flash_cfg_optional_int(raw, name="varlen_min_seq_len"),
         docblock_bias_seq_len=flash_cfg_optional_int(raw, name="docblock_bias_seq_len"),
-        local_bias_seq_len=flash_cfg_optional_int(raw, name="local_bias_seq_len"),
-        local_bias_max_batch_size=flash_cfg_optional_int(raw, name="local_bias_max_batch_size"),
-        eager_dense_max_seq_len=max(0, int(flash_cfg_get(raw, "eager_dense_max_seq_len", 0))),
         kernel_overrides_path=flash_cfg_get(raw, "kernel_overrides_path", None),
-        enable_debug_stats=flash_cfg_bool(raw, name="debug_stats", default=False),
-        warn_fallbacks=flash_cfg_bool(raw, name="warn_fallbacks", default=True),
     )
-
-
-def flashdeberta_stats_snapshot() -> dict[str, int]:
-    """Return a copy of eager/debug-only flash path counters.
-
-    These counters are intentionally disabled by default and are not intended as
-    a normal-training metric source.
-
-    :return dict[str, int]: Counter snapshot keyed by path or fallback name.
-    """
-
-    return dict(_FLASH_STATS)
-
-
-def reset_flashdeberta_stats() -> None:
-    """Reset eager/debug-only flash path counters."""
-
-    _FLASH_STATS.clear()
-
-
-def _record_stat(name: str, value: int = 1) -> None:
-    """Increment an eager/debug-only flash path counter.
-
-    This is a strict no-op inside compiled graphs.
-
-    :param str name: Counter key.
-    :param int value: Increment amount, defaults to ``1``.
-    """
-
-    if is_torch_compiling():
-        return
-    _FLASH_STATS[name] += int(value)
 
 
 def _should_use_varlen(
     *,
     attention_mask: torch.Tensor | None,
     seq_len: int,
-    runtime_config: FlashDebertaRuntimeConfig | None = None,
 ) -> bool:
     """Return whether the varlen kernel should be used for this call.
 
@@ -182,7 +120,6 @@ def _should_use_varlen(
 
     :param torch.Tensor | None attention_mask: Optional attention mask.
     :param int seq_len: Sequence length for the current call.
-    :param FlashDebertaRuntimeConfig | None runtime_config: Optional instance-local runtime policy.
     :return bool: True when the varlen kernel should run.
     """
 
@@ -192,12 +129,9 @@ def _should_use_varlen(
     if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
         return False
 
-    cfg = runtime_config or FlashDebertaRuntimeConfig()
     return (
         flash_padding_route(
             seq_len=int(seq_len),
-            force_varlen=bool(cfg.force_varlen),
-            varlen_min_seq_len=cfg.varlen_min_seq_len,
             compute_capability=device_compute_capability(attention_mask.device),
         )
         == "varlen"
@@ -280,8 +214,6 @@ def _dense_bucket_index_tensor(
 class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     """FlashDeBERTa-backed variant of native disentangled self-attention."""
 
-    _warned_reasons: set[str] = set()
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the FlashDeBERTa runtime policy.
 
@@ -294,25 +226,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         configure_flashdeberta_kernel_overrides(self._runtime_config.kernel_overrides_path)
         super().__init__(*args, **kwargs)
 
-    def _warn_once(self, *, reason: str, message: str) -> None:
-        """Emit one warning per process for a fallback reason.
-
-        Warnings are skipped while executing inside compiled graphs.
-
-        :param str reason: Stable fallback key.
-        :param str message: Warning text to emit.
-        """
-
-        if not self._runtime_config.warn_fallbacks:
-            return
-        if is_torch_compiling():
-            return
-        if reason in self._warned_reasons:
-            return
-        self._warned_reasons.add(reason)
-        warnings.warn(message, stacklevel=2)
-
-    def _fallback_reason(
+    def _requires_eager_fallback(
         self,
         *,
         hidden_states: torch.Tensor,
@@ -320,15 +234,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_states: torch.Tensor,
         rel_embeddings: torch.Tensor | None,
         flash_meta: FlashBatchMeta | None = None,
-    ) -> tuple[str, str] | None:
-        """Return the first reason this call should use eager attention.
+    ) -> bool:
+        """Return whether this call requires eager attention.
 
         :param torch.Tensor hidden_states: Key/value hidden states.
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor query_states: Query hidden states.
         :param torch.Tensor | None rel_embeddings: Relative embedding table.
         :param FlashBatchMeta | None flash_meta: Optional out-of-graph routing metadata.
-        :return tuple[str, str] | None: Fallback reason key and message, or ``None``.
+        :return bool: True when the call requires eager attention.
         """
 
         query_len = int(query_states.shape[-2])
@@ -336,117 +250,63 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         dropout_p = float(getattr(self.dropout, "p", 0.0))
         normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
 
-        dense_eager_limit = int(self._runtime_config.eager_dense_max_seq_len)
-        if dense_eager_limit > 0 and attention_mask is None and key_len <= dense_eager_limit:
-            return (
-                "dense_short_policy",
-                "FlashDeBERTa dense short-sequence policy selected eager attention for this batch.",
-            )
         if (
             attention_mask is not None
             and is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
             and normalized_route != "docblock_bias"
         ):
-            return (
-                "pairwise_mask",
-                "FlashDeBERTa attention does not support pairwise (B,S,S)/(B,1,S,S) masks; using eager attention.",
-            )
+            return True
         if attention_mask is not None:
             if flash_meta is None or not flash_meta.mask_contract_validated:
-                return (
-                    "unvalidated_mask_metadata",
-                    "FlashDeBERTa requires mask metadata validated before the model boundary; "
-                    "using eager attention without inspecting device mask contents.",
-                )
+                return True
             expected_contract = "docblock" if flash_meta.is_cross_document() else "prefix"
             if flash_meta.mask_contract != expected_contract:
-                return (
-                    "invalid_mask_contract",
-                    "FlashDeBERTa mask contract does not match the selected route: "
-                    f"expected={expected_contract!r}, got={flash_meta.mask_contract!r}; "
-                    "using eager attention.",
-                )
+                return True
             if expected_contract == "prefix" and flash_meta.seq_lengths is None:
-                return (
-                    "missing_prefix_lengths",
-                    "Validated FlashDeBERTa prefix metadata is missing sequence lengths; "
-                    "using eager attention.",
-                )
+                return True
         if "p2p" in self.pos_att_type:
-            return (
-                "p2p",
-                "FlashDeBERTa attention does not support pos_att_type='p2p'; using eager attention.",
-            )
+            return True
         if self.training and dropout_p > 0.0:
             # Validated repo configs reject positive dropout with flash. Keep
             # this fallback for direct/custom module construction.
-            return (
-                "attention_dropout",
-                "FlashDeBERTa attention requires attention_probs_dropout_prob=0.0 during training; using eager attention.",
-            )
+            return True
         if not self.relative_attention:
-            return (
-                "relative_attention_disabled",
-                "FlashDeBERTa integration currently targets relative-attention DeBERTa configs; using eager attention.",
-            )
+            return True
         if rel_embeddings is None:
-            return (
-                "missing_rel_embeddings",
-                "FlashDeBERTa attention requires relative embeddings for the current config; using eager attention.",
-            )
+            return True
         if int(self.position_buckets) <= 0:
-            return (
-                "missing_position_buckets",
-                "FlashDeBERTa attention requires config.position_buckets > 0; using eager attention.",
-            )
-        fixed_import_error = flashdeberta_fixed_import_error()
-        if fixed_import_error is not None:
-            detail = str(fixed_import_error)
-            return (
-                "missing_flashdeberta",
-                f"FlashDeBERTa fixed-length attention is unavailable ({detail}); using eager attention.",
-            )
+            return True
+        if flashdeberta_fixed_import_error() is not None:
+            return True
         if hidden_states.device.type != "cuda":
-            return (
-                "device",
-                "FlashDeBERTa attention requires CUDA tensors; using eager attention.",
-            )
+            return True
         if query_len != key_len:
-            return (
-                "query_key_length_mismatch",
-                "FlashDeBERTa attention integration currently expects self-attention with matching query/key lengths; using eager attention.",
-            )
-        return None
+            return True
+        return False
 
-    def _projected_qkv_fallback_reason(
+    def _projected_qkv_requires_eager_fallback(
         self,
         *,
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
-    ) -> tuple[str, str] | None:
+    ) -> bool:
         """Return whether projected QKV tensors are unsupported by the flash kernels.
 
         :param torch.Tensor query_layer: Projected query tensor.
         :param torch.Tensor key_layer: Projected key tensor.
         :param torch.Tensor value_layer: Projected value tensor.
-        :return tuple[str, str] | None: Fallback reason key and message, or ``None``.
+        :return bool: True when the projected tensors require eager attention.
         """
 
         qkv_dtypes = {query_layer.dtype, key_layer.dtype, value_layer.dtype}
         if len(qkv_dtypes) != 1:
-            return (
-                "mixed_qkv_dtype",
-                "FlashDeBERTa attention requires projected query/key/value tensors to share one dtype; using eager attention.",
-            )
+            return True
 
         qkv_dtype = query_layer.dtype
         if qkv_dtype not in _FLASH_SUPPORTED_DTYPES:
-            return (
-                "dtype",
-                "FlashDeBERTa attention currently supports float16/bfloat16 projected QKV activations; using eager attention.",
-            )
-        return None
+            return True
+        return False
 
     def _shape_varlen(self, x: torch.Tensor) -> torch.Tensor:
         """Reshape projection output into varlen-friendly multi-head layout.
@@ -487,8 +347,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
-        if self._runtime_config.enable_debug_stats:
-            _record_stat("flash_fixed_calls")
         return flashdeberta_fixed(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -527,30 +385,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if not self.training:
             return False
-        local_bias_max_batch_size = self._runtime_config.local_bias_max_batch_size
-        local_bias_seq_len = self._runtime_config.local_bias_seq_len
-        local_bias_policy = None
-        if local_bias_max_batch_size is None or local_bias_seq_len is None:
-            # Consult the tuning table only when a config override leaves a
-            # decision open; fully configured runtimes skip the lookup.
-            local_bias_policy = flash_route_policy(
-                policy="local_bias",
-                seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
-                compute_capability=device_compute_capability(device) if device is not None else None,
-            )
-        if local_bias_max_batch_size is None:
-            if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
-                return False
-            try:
-                local_bias_max_batch_size = int(local_bias_policy.get("max_batch_size", 0))
-            except Exception:
-                local_bias_max_batch_size = 0
-        if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
+        local_bias_policy = flash_route_policy(
+            policy="local_bias",
+            seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
+            compute_capability=device_compute_capability(device) if device is not None else None,
+        )
+        if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
             return False
-        if local_bias_seq_len is None:
-            if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
-                return False
-        elif int(local_bias_seq_len) <= 0 or int(seq_len) != int(local_bias_seq_len):
+        local_bias_max_batch_size = int(local_bias_policy.get("max_batch_size", 0))
+        if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
             return False
         if pos_key is None and pos_query is None:
             return False
@@ -570,7 +413,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         pos_query: torch.Tensor | None,
         sm_scale: float,
         keep_mask: torch.Tensor | None,
-        stat: str,
     ) -> torch.Tensor:
         """Run dense position-bias attention with optional pairwise masking.
 
@@ -581,7 +423,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
         :param torch.Tensor | None keep_mask: Optional pairwise keep mask.
-        :param str stat: Debug counter name.
         :return torch.Tensor: Flash output in ``(B, H, S, D)`` layout.
         """
 
@@ -592,8 +433,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             device=query_layer.device,
         )
-        if self._runtime_config.enable_debug_stats:
-            _record_stat(stat)
         output = flashdeberta_bias_from_positions(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -639,7 +478,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             pos_query=pos_query,
             sm_scale=sm_scale,
             keep_mask=None,
-            stat="flash_bias_calls",
         )
 
     def _flash_varlen(
@@ -679,8 +517,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_relative_distance=int(self.max_relative_positions),
             causal=False,
         )
-        if self._runtime_config.enable_debug_stats:
-            _record_stat("flash_varlen_calls")
         return out
 
     def _flash_docblock(
@@ -729,8 +565,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             total_tokens=active_tokens,
             causal=False,
         )
-        if self._runtime_config.enable_debug_stats:
-            _record_stat("flash_docblock_calls")
         return out
 
     def _flash_docblock_bias(
@@ -766,7 +600,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             pos_query=pos_query,
             keep_mask=keep_mask,
             sm_scale=sm_scale,
-            stat="flash_docblock_bias_calls",
         )
 
     def _eager_fallback_attention_mask(
@@ -867,51 +700,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             rel_embeddings=rel_embeddings,
         )
 
-    def _fallback_to_eager(
-        self,
-        *,
-        reason: str,
-        message: str,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        output_attentions: bool,
-        query_states: torch.Tensor,
-        relative_pos: torch.Tensor | None,
-        rel_embeddings: torch.Tensor | None,
-        flash_meta: FlashBatchMeta | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Record fallback stats, warn once, and run the eager attention path.
-
-        Every fallback site in :meth:`forward` shares this contract; keep the
-        stats naming (``fallback_calls`` plus ``fallback_<reason>``) and the
-        eager call in one place so a contract change cannot miss a site.
-
-        :param str reason: Stable fallback reason key used for stats and warn dedup.
-        :param str message: Human-readable fallback explanation.
-        :param torch.Tensor hidden_states: Key/value hidden states.
-        :param torch.Tensor | None attention_mask: Original attention mask.
-        :param bool output_attentions: Whether to return attention probabilities.
-        :param torch.Tensor query_states: Query hidden states.
-        :param torch.Tensor | None relative_pos: Caller-provided relative-position ids, if any.
-        :param torch.Tensor | None rel_embeddings: Relative embedding table.
-        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :return tuple[torch.Tensor, torch.Tensor | None]: Eager attention output and optional probs.
-        """
-
-        if self._runtime_config.enable_debug_stats:
-            _record_stat("fallback_calls")
-            _record_stat(f"fallback_{reason}")
-        self._warn_once(reason=reason, message=message)
-        return self._eager_forward_fallback(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            query_states=query_states,
-            relative_pos=relative_pos,
-            rel_embeddings=rel_embeddings,
-            flash_meta=flash_meta,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -939,7 +727,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         if query_states is None:
             query_states = hidden_states
         fallback_to_eager = partial(
-            self._fallback_to_eager,
+            self._eager_forward_fallback,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
@@ -949,46 +737,26 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             flash_meta=flash_meta,
         )
 
-        if self._runtime_config.enable_debug_stats:
-            _record_stat("forward_calls")
-
         if relative_pos is not None:
             # The flash kernels compute default relative positions on device and
             # cannot honor an arbitrary caller-provided tensor; only eager
             # attention preserves the native relative_pos contract.
-            return fallback_to_eager(
-                reason="explicit_relative_pos",
-                message=(
-                    "FlashDeBERTa kernels compute default relative positions internally; "
-                    "using eager attention because an explicit relative_pos tensor was supplied."
-                ),
-            )
+            return fallback_to_eager()
 
         if output_attentions:
-            return fallback_to_eager(
-                reason="output_attentions",
-                message=(
-                    "FlashDeBERTa kernels do not materialize attention probabilities; "
-                    "using eager attention for output_attentions=True."
-                ),
-            )
+            return fallback_to_eager()
 
-        reason = self._fallback_reason(
+        if self._requires_eager_fallback(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             query_states=query_states,
             rel_embeddings=rel_embeddings,
             flash_meta=flash_meta,
-        )
-        if reason is not None:
-            key, message = reason
+        ):
             # The encoder-level get_rel_pos patch suppresses the shared (S,S)
             # allocation globally. Unsupported correctness fallbacks rebuild
             # relative-position bias inside eager attention instead.
-            return fallback_to_eager(
-                reason=key,
-                message=message,
-            )
+            return fallback_to_eager()
 
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
@@ -1007,7 +775,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             use_varlen = _should_use_varlen(
                 attention_mask=attention_mask,
                 seq_len=int(hidden_states.shape[-2]),
-                runtime_config=self._runtime_config,
             )
 
         if use_docblock_bias:
@@ -1016,28 +783,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 query_len=query_len,
                 key_len=int(hidden_states.shape[-2]),
             ):
-                return fallback_to_eager(
-                    reason="docblock_bias_mask",
-                    message=(
-                        "FlashDeBERTa dense doc-block bias routing requires a pairwise keep mask; "
-                        "attempting eager attention, which runs only if a safe pairwise doc-block mask "
-                        "can be reused or reconstructed."
-                    ),
-                )
+                return fallback_to_eager()
             bias_import_error = flashdeberta_bias_import_error()
             if bias_import_error is not None:
-                return fallback_to_eager(
-                    reason="docblock_bias_missing",
-                    message="FlashDeBERTa dense doc-block bias path is unavailable; using eager attention.",
-                )
+                return fallback_to_eager()
             if is_torch_compiling() and not flashdeberta_compiled_position_bias_available():
-                return fallback_to_eager(
-                    reason="docblock_bias_compile",
-                    message=(
-                        "FlashDeBERTa dense doc-block bias path is not compile-visible on this build; "
-                        "using eager attention."
-                    ),
-                )
+                return fallback_to_eager()
 
         if use_docblock:
             docblock_active_tokens, docblock_num_segments, docblock_max_segment = _resolve_docblock_scalars(
@@ -1052,47 +803,19 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 or docblock_num_segments is None
                 or docblock_max_segment is None
             ):
-                return fallback_to_eager(
-                    reason="docblock_metadata_missing",
-                    message=(
-                        "FlashDeBERTa doc-block routing requires precomputed segment metadata and host stats; "
-                        "attempting eager attention, which runs only if a safe pairwise doc-block mask "
-                        "can be reused or reconstructed."
-                    ),
-                )
+                return fallback_to_eager()
             docblock_import_error = flashdeberta_docblock_import_error()
             if docblock_import_error is not None:
-                return fallback_to_eager(
-                    reason="docblock_missing",
-                    message="FlashDeBERTa doc-block flash path is unavailable; using eager attention.",
-                )
+                return fallback_to_eager()
             if is_torch_compiling() and not flashdeberta_compiled_docblock_available():
-                return fallback_to_eager(
-                    reason="docblock_compile",
-                    message=(
-                        "FlashDeBERTa doc-block flash path is not compile-visible on this build; "
-                        "using eager attention."
-                    ),
-                )
+                return fallback_to_eager()
 
         if use_varlen and not use_docblock:
             varlen_import_error = flashdeberta_varlen_import_error()
             if varlen_import_error is not None:
-                return fallback_to_eager(
-                    reason="varlen_missing",
-                    message=(
-                        "FlashDeBERTa variable-length attention is unavailable "
-                        f"({varlen_import_error}); using eager attention."
-                    ),
-                )
+                return fallback_to_eager()
             if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
-                return fallback_to_eager(
-                    reason="varlen_compile",
-                    message=(
-                        "FlashDeBERTa variable-length attention is not compile-visible on this build; "
-                        "using eager attention."
-                    ),
-                )
+                return fallback_to_eager()
 
         if use_varlen:
             query_layer = self._shape_varlen(self.query_proj(query_states))
@@ -1103,19 +826,14 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             key_layer = self._shape(self.key_proj(hidden_states)).contiguous()
             value_layer = self._shape(self.value_proj(hidden_states)).contiguous()
 
-        projected_reason = self._projected_qkv_fallback_reason(
+        if self._projected_qkv_requires_eager_fallback(
             query_layer=query_layer,
             key_layer=key_layer,
             value_layer=value_layer,
-        )
-        if projected_reason is not None:
-            key, message = projected_reason
+        ):
             # Keep the same eager fallback contract here for dtype/layout
             # mismatches instead of reviving the encoder-wide relative_pos tensor.
-            return fallback_to_eager(
-                reason=key,
-                message=message,
-            )
+            return fallback_to_eager()
 
         pos_key: torch.Tensor | None = None
         pos_query: torch.Tensor | None = None
@@ -1142,8 +860,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             scale_factor += 1
         sm_scale = 1.0 / math.sqrt(float(self.attention_head_size * scale_factor))
 
-        if self._runtime_config.enable_debug_stats:
-            _record_stat("flash_eligible_calls")
         if use_docblock_bias:
             output = self._flash_docblock_bias(
                 query_layer=query_layer,
@@ -1214,8 +930,4 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         return output, None
 
 
-__all__ = [
-    "FlashDisentangledSelfAttention",
-    "flashdeberta_stats_snapshot",
-    "reset_flashdeberta_stats",
-]
+__all__ = ["FlashDisentangledSelfAttention"]

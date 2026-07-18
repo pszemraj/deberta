@@ -32,15 +32,6 @@ import torch
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.training.compile import prepare_flash_attention_batch_metadata  # noqa: E402
 
-try:  # noqa: E402
-    from deberta.modeling.flashdeberta_attention import (  # type: ignore
-        flashdeberta_stats_snapshot,
-        reset_flashdeberta_stats,
-    )
-except Exception:  # pragma: no cover
-    flashdeberta_stats_snapshot = None
-    reset_flashdeberta_stats = None
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -56,7 +47,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=12)
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--drop-all-ones-mask", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--debug-stats", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--profile-dir", type=Path, default=None)
     return parser.parse_args()
 
@@ -70,7 +60,6 @@ def _build_config(args: argparse.Namespace) -> DebertaV2Config:
         num_layers=int(args.num_layers),
         num_heads=int(args.num_heads),
         intermediate_size=int(args.intermediate_size),
-        debug_stats=bool(args.debug_stats) and str(args.mode) == "flash",
     )
 
 
@@ -100,13 +89,6 @@ def _build_batch(args: argparse.Namespace, *, device: torch.device, pad_token_id
         "active_tokens_per_batch": int(batch * active_len),
         "slot_tokens_per_batch": int(batch * seq_len),
     }
-
-
-def _format_stats(stats: dict[str, int] | None) -> str:
-    if not stats:
-        return "{}"
-    items = ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
-    return "{" + items + "}"
 
 
 def main() -> None:
@@ -140,9 +122,6 @@ def main() -> None:
     )
     if flash_meta is not None:
         flash_meta = flash_meta.to(device)
-
-    if callable(reset_flashdeberta_stats):
-        reset_flashdeberta_stats()
 
     times_ms: list[float] = []
     total_warmup = int(args.warmup)
@@ -192,15 +171,12 @@ def main() -> None:
     p90_ms = statistics.quantiles(times_ms, n=10)[8] if len(times_ms) >= 10 else max(times_ms)
     max_mem_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
 
-    stats = flashdeberta_stats_snapshot() if callable(flashdeberta_stats_snapshot) else None
-
     print(f"mode={args.mode}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size} pad_ratio={args.pad_ratio:.3f} dtype=bf16")
     print(f"mean_ms={mean_ms:.2f} p50_ms={p50_ms:.2f} p90_ms={p90_ms:.2f}")
     print(f"active_tok_per_s={active_tok_s:.2f}")
     print(f"slot_tok_per_s={slot_tok_s:.2f}")
     print(f"max_memory_gib={max_mem_gib:.3f}")
-    print(f"flash_stats={_format_stats(stats)}")
 
 
 if __name__ == "__main__":

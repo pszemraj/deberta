@@ -46,7 +46,6 @@ from deberta.config import (  # noqa: E402
     ModelConfig,
     ModelGeneratorConfig,
     ModelHFConfig,
-    ModelHFFlashConfig,
     load_config,
     resolve_effective_mixed_precision,
 )
@@ -288,7 +287,6 @@ def build_synthetic_backbone_config(
     num_layers: int,
     num_heads: int,
     intermediate_size: int,
-    debug_stats: bool = False,
 ) -> Any:
     """Build a synthetic benchmark shape through the production config builder.
 
@@ -299,7 +297,6 @@ def build_synthetic_backbone_config(
     :param int num_layers: Backbone depth.
     :param int num_heads: Attention-head count.
     :param int intermediate_size: MLP intermediate width.
-    :param bool debug_stats: Whether to enable FlashDeBERTa route counters.
     :return Any: Materialized native DeBERTa config.
     """
 
@@ -307,7 +304,6 @@ def build_synthetic_backbone_config(
         hf=ModelHFConfig(
             attention_impl=str(mode),
             max_position_embeddings=int(seq_len),
-            flash=ModelHFFlashConfig(debug_stats=bool(debug_stats)),
         ),
         generator=ModelGeneratorConfig(
             hidden_size=int(hidden_size),
