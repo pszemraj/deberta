@@ -137,20 +137,6 @@ def is_flash_attention_impl(value: object) -> bool:
     return str(value).strip().lower() == "flash"
 
 
-def is_flash_head_dim_supported(head_dim: int) -> bool:
-    """Return whether FlashDeBERTa kernels support one head dimension.
-
-    Every attention route uses the head dimension as a Triton compile-time
-    range width, which must be a positive power of two.
-
-    :param int head_dim: Attention head dimension.
-    :return bool: True when the dimension is a positive power of two.
-    """
-
-    dimension = int(head_dim)
-    return dimension > 0 and (dimension & (dimension - 1)) == 0
-
-
 def disentangled_attention_span(position_buckets: int, max_relative_distance: int) -> int:
     """Return the relative-position span used by disentangled-attention kernels.
 

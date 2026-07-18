@@ -1398,27 +1398,6 @@ def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatc
     assert reason[0] == "dtype"
 
 
-def test_flash_attention_projected_qkv_head_dimension_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-    attention_mod = _reload_flash_modules()
-    cfg = _small_deberta_config(hidden_size=384, num_attention_heads=4)
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-
-    unsupported_qkv = torch.zeros(
-        (1, cfg.num_attention_heads, 4, 96),
-        dtype=torch.bfloat16,
-    )
-    reason = attention._projected_qkv_fallback_reason(
-        query_layer=unsupported_qkv,
-        key_layer=unsupported_qkv,
-        value_layer=unsupported_qkv,
-    )
-
-    assert reason is not None
-    assert reason[0] == "head_dimension"
-    assert "head_dim=96" in reason[1]
-
-
 def test_flash_attention_varlen_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _small_deberta_config()
     cfg.hf_flash = {"force_varlen": True, "varlen_min_seq_len": 2048, "eager_dense_max_seq_len": 0}

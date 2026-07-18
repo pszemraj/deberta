@@ -14,7 +14,6 @@ from deberta.modeling.deberta_v2_native import (
 )
 from deberta.modeling.flashdeberta_op_utils import (
     is_flash_attention_impl,
-    is_flash_head_dim_supported,
 )
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
@@ -610,7 +609,7 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
         if num_attention_heads > 0 and hidden_size % num_attention_heads == 0
         else 0
     )
-    if not is_flash_head_dim_supported(head_dim):
+    if head_dim <= 0 or head_dim & (head_dim - 1):
         raise ValueError(
             f"{component} flash attention requires hidden_size / num_attention_heads to be a "
             "positive power of two; "
