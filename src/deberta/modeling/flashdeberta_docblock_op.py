@@ -1206,49 +1206,28 @@ def flashdeberta_docblock(
     :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
     """
 
-    if _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP is not None and query_layer.device.type == "cuda":
-        num_segments_tensor = _scalar_tensor(num_segments, name="num_segments")
-        max_seqlen_tensor = _scalar_tensor(max_seqlen, name="max_seqlen")
-        total_tokens_tensor = _scalar_tensor(total_tokens, name="total_tokens")
-        output, *_ = _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP(
-            query_layer,
-            key_layer,
-            value_layer,
-            segment_offsets,
-            segment_lengths,
-            cu_seqlens,
-            pos_key,
-            pos_query,
-            float(sm_scale),
-            int(position_buckets),
-            int(max_relative_distance),
-            num_segments_tensor,
-            max_seqlen_tensor,
-            total_tokens_tensor,
-            bool(causal),
-        )
-        return output
+    if _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP is None or query_layer.device.type != "cuda":
+        raise RuntimeError("FlashDeBERTa doc-block attention requires the CUDA custom op.")
 
-    # With the supported torch and pinned FlashDeBERTa versions, CUDA low-level
-    # imports and autograd custom-op registration are all-or-nothing. This raw
-    # path remains only for non-CUDA and directly exercised test plumbing.
-    output, *_ = _docblock_forward_impl(
-        query_layer=query_layer,
-        key_layer=key_layer,
-        value_layer=value_layer,
-        segment_offsets=segment_offsets,
-        segment_lengths=segment_lengths,
-        cu_seqlens=cu_seqlens,
-        pos_key=pos_key,
-        pos_query=pos_query,
-        sm_scale=sm_scale,
-        position_buckets=position_buckets,
-        max_relative_distance=max_relative_distance,
-        num_segments=_scalar_int(num_segments, name="num_segments"),
-        max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
-        total_tokens=_scalar_int(total_tokens, name="total_tokens"),
-        causal=causal,
-        require_lse=False,
+    num_segments_tensor = _scalar_tensor(num_segments, name="num_segments")
+    max_seqlen_tensor = _scalar_tensor(max_seqlen, name="max_seqlen")
+    total_tokens_tensor = _scalar_tensor(total_tokens, name="total_tokens")
+    output, *_ = _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP(
+        query_layer,
+        key_layer,
+        value_layer,
+        segment_offsets,
+        segment_lengths,
+        cu_seqlens,
+        pos_key,
+        pos_query,
+        float(sm_scale),
+        int(position_buckets),
+        int(max_relative_distance),
+        num_segments_tensor,
+        max_seqlen_tensor,
+        total_tokens_tensor,
+        bool(causal),
     )
     return output
 
