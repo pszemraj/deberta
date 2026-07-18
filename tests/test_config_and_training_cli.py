@@ -988,36 +988,6 @@ def test_build_run_metadata_scope_fields(
     assert "config_schema_version" in meta
 
 
-def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPatch):
-    import importlib.metadata as importlib_metadata
-
-    monkeypatch.setattr(
-        importlib_metadata,
-        "version",
-        lambda name: "0.0.7" if str(name) == "flashdeberta" else "0.0.0",
-    )
-    model_cfg = make_model_config(
-        backbone_type="hf_deberta_v2",
-        hf={"attention_impl": "flash", "flash": {"docblock_bias_seq_len": 1024}},
-    )
-    validate_model_config(model_cfg)
-
-    meta = _build_run_metadata(model_cfg=model_cfg)
-
-    assert meta["flash_attention"]["requested_attention_impl"] == "flash"
-    assert meta["flash_attention"]["requested_flash_config"]["docblock_bias_seq_len"] == 1024
-    assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
-
-
-def test_build_run_metadata_omits_flash_attention_for_eager_config():
-    model_cfg = make_model_config(backbone_type="hf_deberta_v2")
-    validate_model_config(model_cfg)
-
-    meta = _build_run_metadata(model_cfg=model_cfg)
-
-    assert "flash_attention" not in meta
-
-
 def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -45,13 +44,11 @@ logger = logging.getLogger(__name__)
 
 def _build_run_metadata(
     *,
-    model_cfg: ModelConfig | None = None,
     effective_compile_scope: str | None = None,
     compile_scope_reason: str | None = None,
 ) -> dict[str, Any]:
     """Build run-metadata payload stored alongside config snapshots.
 
-    :param ModelConfig | None model_cfg: Optional resolved model config.
     :param str | None effective_compile_scope: Resolved compile scope after auto-resolution.
     :param str | None compile_scope_reason: Reason for scope selection when auto-resolved.
     :return dict[str, Any]: Metadata mapping.
@@ -66,20 +63,6 @@ def _build_run_metadata(
         meta["effective_compile_scope"] = str(effective_compile_scope)
     if compile_scope_reason is not None:
         meta["compile_scope_reason"] = str(compile_scope_reason)
-    if model_cfg is not None and str(model_cfg.hf.attention_impl).strip().lower() == "flash":
-        try:
-            flashdeberta_version = metadata.version("flashdeberta")
-        except metadata.PackageNotFoundError:
-            flashdeberta_version = None
-
-        meta["flash_attention"] = {
-            # Routing and eager fallbacks are per batch/call, so this artifact
-            # records the requested policy rather than claiming one resolved
-            # runtime implementation for the whole run.
-            "requested_attention_impl": str(model_cfg.hf.attention_impl),
-            "requested_flash_config": asdict_without_private(model_cfg.hf.flash),
-            "flashdeberta_version": flashdeberta_version,
-        }
     return meta
 
 
@@ -347,7 +330,6 @@ def _persist_or_validate_run_configs(
     output_run_meta_path = output_dir / RUN_METADATA_FILENAME
 
     run_meta = _build_run_metadata(
-        model_cfg=model_cfg,
         effective_compile_scope=effective_compile_scope,
         compile_scope_reason=compile_scope_reason,
     )
