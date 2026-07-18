@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from functools import cache
-from typing import Any, TypeVar
 
 import torch
 
@@ -14,55 +12,6 @@ try:  # pragma: no cover - optional Triton dependency
 except Exception:  # pragma: no cover - optional Triton dependency
     _triton = None
     tl = None
-
-_KeyT = TypeVar("_KeyT")
-_ValueT = TypeVar("_ValueT")
-
-
-class BoundedLRUCache(OrderedDict[_KeyT, _ValueT]):
-    """Ordered mapping that refreshes reads and evicts least-recently-used entries.
-
-    :param int max_entries: Maximum number of retained entries.
-    :raises ValueError: If ``max_entries`` is not positive.
-    """
-
-    def __init__(self, *, max_entries: int) -> None:
-        """Initialize a bounded least-recently-used mapping."""
-
-        if int(max_entries) <= 0:
-            raise ValueError(f"max_entries must be positive; got {max_entries}.")
-        super().__init__()
-        self.max_entries = int(max_entries)
-
-    def __getitem__(self, key: _KeyT) -> _ValueT:
-        """Return and refresh one cached value."""
-
-        value = super().__getitem__(key)
-        self.move_to_end(key)
-        return value
-
-    def get(self, key: _KeyT, default: Any = None) -> _ValueT | Any:
-        """Return and refresh one cached value, or ``default`` on a miss.
-
-        :param _KeyT key: Cache key to look up.
-        :param Any default: Value returned on a miss, defaults to None.
-        :return _ValueT | Any: Cached value or ``default``.
-        """
-
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def __setitem__(self, key: _KeyT, value: _ValueT) -> None:
-        """Insert one value and evict least-recently-used entries past the bound."""
-
-        if key in self:
-            super().__delitem__(key)
-        super().__setitem__(key, value)
-        while len(self) > self.max_entries:
-            self.popitem(last=False)
-
 
 TRITON_ROW_COPY_PREFIX_PACK = 0
 TRITON_ROW_COPY_PREFIX_PACK_STRIDED = 1

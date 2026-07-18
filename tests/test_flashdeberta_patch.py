@@ -1281,21 +1281,6 @@ def test_pack_layout_validation_rejects_shape_and_device_drift(other: torch.Tens
         require_matching_tensor_layout(torch.empty((2, 3)), other, context="test")
 
 
-def test_bounded_lru_cache_refreshes_hot_entries_before_eviction() -> None:
-    from deberta.modeling.flashdeberta_op_utils import BoundedLRUCache
-
-    cache = BoundedLRUCache[str, int](max_entries=3)
-    cache["hot"] = 1
-    cache["cold-1"] = 2
-    cache["cold-2"] = 3
-
-    assert cache.get("hot") == 1
-    cache["new"] = 4
-
-    assert list(cache) == ["cold-2", "hot", "new"]
-    assert "cold-1" not in cache
-
-
 @pytest.mark.parametrize(
     ("value", "expected"),
     [("flash", True), (" FLASH ", True), ("eager", False), (None, False)],

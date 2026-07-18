@@ -22,7 +22,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     resolve_repo_tuned_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
-    BoundedLRUCache,
     device_compute_capability,
     keep_mask_head_stride,
     strides_or_zeros,
@@ -38,10 +37,10 @@ try:
 except Exception:  # pragma: no cover - optional import
     triton = None
     tl = None
-_DENSE_BUCKET_RANGE_CACHE = BoundedLRUCache[
+_DENSE_BUCKET_RANGE_CACHE: dict[
     tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int],
     tuple[weakref.ReferenceType[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
-](max_entries=32)
+] = {}
 
 
 def _dense_bias_repo_tuned_config(
@@ -218,17 +217,13 @@ def _dense_bucket_ranges(
 
     cache_key: tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int] | None = None
     if not is_torch_compiling():
-        try:
-            cache_key = _dense_bucket_range_cache_key(bucket_index, num_buckets=num_buckets)
-        except Exception:
-            cache_key = None
-        if cache_key is not None:
-            cached = _DENSE_BUCKET_RANGE_CACHE.get(cache_key)
-            if cached is not None:
-                bucket_ref, ranges = cached
-                if bucket_ref() is _dense_bucket_cache_owner(bucket_index):
-                    return ranges
-                _DENSE_BUCKET_RANGE_CACHE.pop(cache_key, None)
+        cache_key = _dense_bucket_range_cache_key(bucket_index, num_buckets=num_buckets)
+        cached = _DENSE_BUCKET_RANGE_CACHE.get(cache_key)
+        if cached is not None:
+            bucket_ref, ranges = cached
+            if bucket_ref() is _dense_bucket_cache_owner(bucket_index):
+                return ranges
+            _DENSE_BUCKET_RANGE_CACHE.pop(cache_key, None)
 
     seq_len = int(bucket_index.shape[0])
     column_ids = torch.arange(seq_len, device=bucket_index.device, dtype=torch.int64)
@@ -265,15 +260,11 @@ def _dense_bucket_ranges(
     )
 
     if cache_key is not None:
-        try:
-            bucket_ref = weakref.ref(
-                _dense_bucket_cache_owner(bucket_index),
-                lambda _ref, key=cache_key: _DENSE_BUCKET_RANGE_CACHE.pop(key, None),
-            )
-        except TypeError:
-            bucket_ref = None
-        if bucket_ref is not None:
-            _DENSE_BUCKET_RANGE_CACHE[cache_key] = (bucket_ref, (start, end))
+        bucket_ref = weakref.ref(
+            _dense_bucket_cache_owner(bucket_index),
+            lambda _ref, key=cache_key: _DENSE_BUCKET_RANGE_CACHE.pop(key, None),
+        )
+        _DENSE_BUCKET_RANGE_CACHE[cache_key] = (bucket_ref, (start, end))
     return start, end
 
 
