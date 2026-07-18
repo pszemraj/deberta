@@ -19,23 +19,31 @@ field and matching CLI flag is listed in the
 ```bash
 deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
   --train.max_steps 500 \
+  --optim.scheduler.warmup_steps 50 \
   --train.checkpoint.output_dir runs/quickstart_hfv2_small \
   --logging.wandb.enabled false
 ```
 
-Distributed launch (single node FSDP2 config):
+Distributed launch (single node FSDP2 config). The template defaults to eight processes; set `num_processes` to the available GPU count as described in [Distributed training](../advanced/distributed-training.md#launch-with-accelerate).
 
 ```bash
 accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
-  deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml
+  deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
+  --train.max_steps 500 \
+  --optim.scheduler.warmup_steps 50 \
+  --train.checkpoint.output_dir runs/quickstart_hfv2_small_fsdp \
+  --logging.wandb.enabled false
 ```
 
 Optional FlashDeBERTa trial run:
 
 ```bash
-accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
-  deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
-  --model.hf.attention_impl flash
+deberta train configs/pretrain_hf_deberta_v2_parity_small.yaml \
+  --model.hf.attention_impl flash \
+  --train.max_steps 50 \
+  --optim.scheduler.warmup_steps 5 \
+  --train.checkpoint.output_dir runs/quickstart_hfv2_small_flash \
+  --logging.wandb.enabled false
 ```
 
 This command requires the `flash` extra. Route selection and hardware constraints are covered in
@@ -43,8 +51,4 @@ This command requires the `flash` extra. Route selection and hardware constraint
 
 ## 3) Find the exported discriminator
 
-The supplied config enables `train.checkpoint.export_hf_final`. The first command therefore
-attempts to write the discriminator to `runs/quickstart_hfv2_small/final_hf`; the distributed
-examples use the config's `runs/hf_deberta_v2_parity_small/final_hf` unless given the same output
-override. For manual exports, other checkpoints, or both RTD components, see
-[Exporting models](../guides/exporting-models.md), including the distinction between automatic partial export and strict manual export.
+The supplied config enables `train.checkpoint.export_hf_final`. Each parity command therefore attempts to write the discriminator under its distinct output directory, such as `runs/quickstart_hfv2_small/final_hf`. For manual exports, other checkpoints, or both RTD components, see [Exporting models](../guides/exporting-models.md), including the distinction between automatic partial export and strict manual export.
