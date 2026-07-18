@@ -266,7 +266,6 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
         flash_route_choice,
         flash_seq_bucket,
         resolve_flash_kernel_config,
-        tuned_capability_keys,
     )
 
     configure_flashdeberta_kernel_overrides(None)
@@ -286,7 +285,6 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
         == "docblock"
     )
     assert flash_route_choice(policy="docblock", seq_bucket=docblock_bucket) == "docblock"
-    assert tuned_capability_keys() == frozenset({"sm_120"})
     assert resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=(12, 0),

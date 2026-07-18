@@ -280,32 +280,6 @@ def flash_route_choice(
     return None
 
 
-def tuned_capability_keys() -> frozenset[str]:
-    """Return the explicit compute-capability keys present in the active table.
-
-    :return frozenset[str]: Keys such as ``{"sm_120"}``; wildcard rows are excluded.
-    """
-
-    payload = _load_tuning_payload()
-    rows: list[Any] = []
-    kernels = payload.get("kernels", [])
-    if isinstance(kernels, list):
-        rows.extend(kernels)
-    policies = payload.get("route_policies", {})
-    if isinstance(policies, dict):
-        for choices in policies.values():
-            if isinstance(choices, list):
-                rows.extend(choices)
-    keys: set[str] = set()
-    for raw in rows:
-        if not isinstance(raw, dict):
-            continue
-        value = str(raw.get("compute_capability", "*")).strip().lower()
-        if value and value != "*":
-            keys.add(value)
-    return frozenset(keys)
-
-
 def flash_padding_route(
     *,
     seq_len: int,
