@@ -138,8 +138,6 @@ def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_siz
     density = None if total_tokens is None else float(total_tokens) / float(capacity)
     buckets = _load_tuning_payload().get("seq_buckets", [])
     for raw in buckets:
-        if not isinstance(raw, dict):
-            continue
         min_seq = raw.get("min_seq_len")
         max_seq = raw.get("max_seq_len")
         if min_seq is not None and int(seq_len) < int(min_seq):
@@ -158,9 +156,7 @@ def flash_seq_bucket(*, seq_len: int, total_tokens: int | None = None, batch_siz
                 continue
         elif any(key in raw for key in ("min_density", "max_density", "max_density_exclusive")):
             continue
-        name = raw.get("name")
-        if isinstance(name, str) and name:
-            return name
+        return str(raw["name"])
     return "default"
 
 
@@ -193,23 +189,21 @@ def flash_route_policy(
     """
 
     policies = _load_tuning_payload().get("route_policies", {})
-    choices = policies.get(str(policy).strip().lower()) if isinstance(policies, dict) else None
-    if not isinstance(choices, list):
+    choices = policies.get(str(policy).strip().lower())
+    if choices is None:
         return None
     cc_key = compute_capability_key(compute_capability) if compute_capability is not None else None
     wildcard_match: dict[str, Any] | None = None
     for raw in reversed(choices):
-        if not isinstance(raw, dict):
-            continue
-        if str(raw.get("seq_bucket", "")).strip() != str(seq_bucket).strip():
+        if str(raw["seq_bucket"]).strip() != str(seq_bucket).strip():
             continue
         entry_cc = str(raw.get("compute_capability", "*")).strip().lower()
         if entry_cc == "*":
             if wildcard_match is None:
-                wildcard_match = dict(raw)
+                wildcard_match = raw
             continue
         if cc_key is not None and entry_cc == cc_key:
-            return dict(raw)
+            return raw
     return wildcard_match
 
 
@@ -275,8 +269,7 @@ def flash_route_choice(
     if raw is not None:
         if not _route_policy_row_allows(raw, seq_len=seq_len, batch_size=batch_size):
             return None
-        choice = raw.get("choice")
-        return str(choice).strip() if choice is not None else None
+        return str(raw["choice"]).strip()
     return None
 
 
@@ -390,23 +383,19 @@ def _entry_matches(context: FlashKernelContext, entry: dict[str, Any]) -> bool:
     return True
 
 
-def _kernel_launch_tuple(entry: dict[str, Any]) -> tuple[int, int, int, int] | None:
+def _kernel_launch_tuple(entry: dict[str, Any]) -> tuple[int, int, int, int]:
     """Parse the launch tuple from one kernel table entry.
 
     :param dict[str, Any] entry: Matching JSON entry.
-    :return tuple[int, int, int, int] | None: ``(BLOCK_M, BLOCK_N, stages, warps)``
-        or None when the entry is malformed.
+    :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
-    try:
-        return (
-            int(entry["block_m"]),
-            int(entry["block_n"]),
-            int(entry["num_stages"]),
-            int(entry["num_warps"]),
-        )
-    except Exception:
-        return None
+    return (
+        int(entry["block_m"]),
+        int(entry["block_n"]),
+        int(entry["num_stages"]),
+        int(entry["num_warps"]),
+    )
 
 
 def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, int, int] | None:
@@ -426,11 +415,9 @@ def resolve_flash_kernel_config(context: FlashKernelContext) -> tuple[int, int, 
     """
 
     kernels = _load_tuning_payload().get("kernels", [])
-    if not isinstance(kernels, list):
-        return None
     wildcard_match: dict[str, Any] | None = None
     for raw in reversed(kernels):
-        if not isinstance(raw, dict) or not _entry_matches(context, raw):
+        if not _entry_matches(context, raw):
             continue
         if str(raw.get("compute_capability", "*")).strip().lower() == "*":
             if wildcard_match is None:
