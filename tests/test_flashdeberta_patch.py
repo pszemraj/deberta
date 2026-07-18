@@ -2536,6 +2536,27 @@ def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.M
         assert clone_entry.cu_seqlens.data_ptr() != first_entry.cu_seqlens.data_ptr()
 
 
+def test_varlen_metadata_cache_verifies_storage_identity_on_key_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    with _empty_varlen_caches(varlen_mod):
+        first_mask = torch.tensor([[True, False, False, False]], dtype=torch.bool)
+        second_mask = torch.tensor([[True, True, True, False]], dtype=torch.bool)
+        shared_key = varlen_mod._mask_metadata_cache_key(first_mask)
+        monkeypatch.setattr(varlen_mod, "_mask_metadata_cache_key", lambda _mask: shared_key)
+
+        first_entry = varlen_mod._get_unpad_metadata_entry(first_mask)
+        second_entry = varlen_mod._get_unpad_metadata_entry(second_mask)
+        repeated_entry = varlen_mod._get_unpad_metadata_entry(second_mask)
+
+        assert first_entry.max_seqlen == first_entry.total_tokens == 1
+        assert second_entry.max_seqlen == second_entry.total_tokens == 3
+        assert torch.equal(second_entry.seqlens, torch.tensor([3], dtype=torch.int32))
+        assert repeated_entry is second_entry
+
+
 def test_varlen_mid_tensor_cache_reuses_registered_cu_seqlens() -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 

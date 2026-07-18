@@ -115,6 +115,7 @@ _GRAD_PACK_DELTA_BLOCK_ROWS = 32
 class _MaskMetadataCacheEntry:
     """Cached unpadding metadata for one padding-mask tensor."""
 
+    mask_storage_ref: weakref.ReferenceType[Any]
     seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
@@ -1129,14 +1130,29 @@ def _get_unpad_metadata_entry(mask_2d: torch.Tensor) -> _MaskMetadataCacheEntry:
     :return _MaskMetadataCacheEntry: Cached or newly built metadata entry.
     """
 
+    storage = mask_2d.untyped_storage()
     cache_key = _mask_metadata_cache_key(mask_2d)
     cached = _MASK_METADATA_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        if cached.mask_storage_ref() is storage:
+            return cached
+        _MASK_METADATA_CACHE.pop(cache_key, None)
 
     seqlens, cu_seqlens, max_seqlen, total_tokens, cu_seqlens_host = _build_unpad_metadata(mask_2d)
 
+    def _cleanup(storage_ref: weakref.ReferenceType[Any]) -> None:
+        """Evict metadata when its source mask storage is released.
+
+        :param weakref.ReferenceType[Any] storage_ref: Released source-storage reference.
+        :return None: This callback mutates the module-local cache in place.
+        """
+
+        cached_entry = _MASK_METADATA_CACHE.get(cache_key)
+        if cached_entry is not None and cached_entry.mask_storage_ref is storage_ref:
+            _MASK_METADATA_CACHE.pop(cache_key, None)
+
     entry = _MaskMetadataCacheEntry(
+        mask_storage_ref=weakref.ref(storage, _cleanup),
         seqlens=seqlens,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
