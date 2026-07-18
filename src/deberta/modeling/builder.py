@@ -12,7 +12,10 @@ from deberta.modeling.deberta_v2_native import (
     DebertaV2Model,
     _normalize_pos_att_type,
 )
-from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
+from deberta.modeling.flashdeberta_op_utils import (
+    is_flash_attention_impl,
+    is_flash_head_dim_supported,
+)
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 _SPECIAL_ID_ATTRS = (
@@ -600,6 +603,19 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
 
     if not is_flash_attention_impl(getattr(cfg, "hf_attention_impl", "eager")):
         return
+    hidden_size = int(getattr(cfg, "hidden_size", 0) or 0)
+    num_attention_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
+    head_dim = (
+        hidden_size // num_attention_heads
+        if num_attention_heads > 0 and hidden_size % num_attention_heads == 0
+        else 0
+    )
+    if not is_flash_head_dim_supported(head_dim):
+        raise ValueError(
+            f"{component} flash attention requires hidden_size / num_attention_heads to be a "
+            "positive power of two; "
+            f"got hidden_size={hidden_size}, num_attention_heads={num_attention_heads}, head_dim={head_dim}."
+        )
     if not bool(getattr(cfg, "relative_attention", False)):
         raise ValueError(f"{component} flash attention requires relative_attention=true.")
     if int(getattr(cfg, "position_buckets", 0)) <= 0:

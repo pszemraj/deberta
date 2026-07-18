@@ -573,6 +573,27 @@ def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
         )
 
 
+def test_build_hf_configs_reject_flash_generator_non_power_of_two_head_dimension() -> None:
+    model_cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        hf={"attention_impl": "flash"},
+        generator={"hidden_size": 768, "num_attention_heads": 8},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "generator flash attention.*positive power of two.*"
+            "hidden_size=768, num_attention_heads=8, head_dim=96"
+        ),
+    ):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=128100),
+            max_position_embeddings=64,
+        )
+
+
 def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritative(
     monkeypatch: pytest.MonkeyPatch,
 ):

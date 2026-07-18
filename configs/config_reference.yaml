@@ -176,7 +176,7 @@ model:
     # default: literal "eager"
     # required: optional
     # values: "eager" | "flash"
-    # contract: flash requires hf_deberta_v2, installation with `pip install -e '.[flash]'`, CUDA with bf16 support, and effective hidden/attention dropout of exactly 0.0.
+    # contract: flash requires hf_deberta_v2, installation with `pip install -e '.[flash]'`, CUDA with bf16 support, effective hidden/attention dropout of exactly 0.0, and positive power-of-two attention head dimensions for both materialized components.
     # interaction: set both model.dropout fields explicitly to 0.0 because null may preserve nonzero checkpoint/preset dropout.
     # warning: build-time incompatibilities fail, while unsupported per-call masks use eager fallbacks.
     # recommendation: eager is the portable default.
@@ -354,6 +354,7 @@ model:
     # values: null or integer > 0
     # contract: derived generator only; must be null with model.pretrained.generator_path and is invalid in pretrained mode without a separate generator checkpoint.
     # constraint: resolved width must divide evenly by heads and equal discriminator embedding width with model.embedding_sharing=es|gdes.
+    # interaction: with model.hf.attention_impl=flash, resolved hidden_size / resolved num_attention_heads must be a positive power of two.
     # recommendation: use embedding_sharing=none for a narrower generator.
     hidden_size: null
 
@@ -375,6 +376,7 @@ model:
     # values: null or integer > 0
     # contract: derived generator only; must be null with model.pretrained.generator_path and is invalid in pretrained mode without a separate generator checkpoint.
     # constraint: must divide the resolved generator hidden size.
+    # interaction: with model.hf.attention_impl=flash, resolved hidden_size / resolved num_attention_heads must be a positive power of two.
     num_attention_heads: null
 
   rope:

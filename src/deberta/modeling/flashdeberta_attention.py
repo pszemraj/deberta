@@ -66,7 +66,10 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     flash_route_policy,
     flash_seq_bucket,
 )
-from deberta.modeling.flashdeberta_op_utils import device_compute_capability
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    is_flash_head_dim_supported,
+)
 from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_compiled_varlen_available,
     flashdeberta_varlen_import_error,
@@ -447,6 +450,13 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return (
                 "dtype",
                 "FlashDeBERTa attention currently supports float16/bfloat16 projected QKV activations; using eager attention.",
+            )
+        head_dim = int(query_layer.shape[-1])
+        if not is_flash_head_dim_supported(head_dim):
+            return (
+                "head_dimension",
+                "FlashDeBERTa attention requires a positive power-of-two projected QKV head dimension; "
+                f"got head_dim={head_dim}; using eager attention.",
             )
         return None
 
