@@ -6,8 +6,6 @@ from dataclasses import dataclass, replace
 
 import torch
 
-_INTEGER_DTYPES = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
-
 
 def is_torch_compiling() -> bool:
     """Return whether execution is happening under ``torch.compile``.
@@ -168,21 +166,15 @@ def build_validated_prefix_lengths(
     attention_mask: torch.Tensor,
     *,
     seq_len: int,
-    supplied_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Derive and validate right-padded prefix lengths on CPU.
 
-    ``attention_mask`` is authoritative. Optional precomputed lengths are only
-    accepted after exact reconciliation with the mask; they never override it.
     This boundary helper intentionally rejects device tensors so validation
-    cannot introduce a hidden CUDA synchronization in a compiled attention
-    layer.
+    cannot introduce a hidden CUDA synchronization in a compiled attention layer.
 
     :param torch.Tensor attention_mask: CPU padding keep mask.
     :param int seq_len: Exact sequence length.
-    :param torch.Tensor | None supplied_lengths: Optional CPU lengths to verify.
-    :raises ValueError: If tensors are not CPU-resident, the mask is not a
-        right-padded prefix, or supplied lengths disagree.
+    :raises ValueError: If the mask is not CPU-resident or a right-padded prefix.
     :return torch.Tensor: Mask-derived CPU int32 lengths with shape ``(B,)``.
     """
 
@@ -194,22 +186,6 @@ def build_validated_prefix_lengths(
     expected_keep_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
     if not torch.equal(keep_mask, expected_keep_mask):
         raise ValueError("Flash fixed/varlen attention requires a right-padded prefix mask.")
-
-    if supplied_lengths is not None:
-        if supplied_lengths.device.type != "cpu":
-            raise ValueError(
-                "Supplied flash sequence lengths must be validated on CPU before device transfer."
-            )
-        if supplied_lengths.dtype not in _INTEGER_DTYPES:
-            raise ValueError(
-                "Supplied flash sequence lengths disagree with their contract: integer dtype required."
-            )
-        supplied = supplied_lengths.to(dtype=torch.int32)
-        if supplied.ndim != 1 or supplied.shape != lengths.shape or not torch.equal(supplied, lengths):
-            raise ValueError(
-                "Supplied flash sequence lengths disagree with attention_mask: "
-                f"derived={lengths.tolist()}, supplied={supplied.tolist()}."
-            )
     return lengths
 
 
