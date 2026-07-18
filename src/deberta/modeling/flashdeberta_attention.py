@@ -31,7 +31,6 @@ from deberta.modeling.deberta_v2_native import (
 from deberta.modeling.deberta_v2_native import (
     build_relative_position as _build_relative_position,
 )
-from deberta.modeling.flash_config import flash_cfg_get, flash_cfg_optional_int
 from deberta.modeling.flashdeberta_bias_op import (
     flashdeberta_bias_from_positions,
     flashdeberta_bias_import_error,
@@ -89,10 +88,11 @@ def _runtime_config_from_deberta_config(config: Any | None) -> FlashDebertaRunti
     :return FlashDebertaRuntimeConfig: Instance-local runtime policy.
     """
 
-    raw = getattr(config, "hf_flash", None) if config is not None else None
+    raw = getattr(config, "hf_flash", {}) if config is not None else {}
+    docblock_bias_seq_len = raw.get("docblock_bias_seq_len")
     return FlashDebertaRuntimeConfig(
-        docblock_bias_seq_len=flash_cfg_optional_int(raw, name="docblock_bias_seq_len"),
-        kernel_overrides_path=flash_cfg_get(raw, "kernel_overrides_path", None),
+        docblock_bias_seq_len=(None if docblock_bias_seq_len is None else int(docblock_bias_seq_len)),
+        kernel_overrides_path=raw.get("kernel_overrides_path"),
     )
 
 

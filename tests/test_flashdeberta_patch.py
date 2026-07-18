@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 import torch
 
+from deberta.config import ModelHFFlashConfig
 from deberta.modeling.mask_utils import FlashBatchMeta, build_doc_block_mask, build_doc_segment_metadata
 
 
@@ -134,7 +135,7 @@ def test_flash_runtime_config_reads_supported_options() -> None:
     from deberta.modeling.flashdeberta_attention import _runtime_config_from_deberta_config
 
     config = types.SimpleNamespace(
-        hf_flash={"docblock_bias_seq_len": "1024", "kernel_overrides_path": "custom.json"}
+        hf_flash={"docblock_bias_seq_len": 1024, "kernel_overrides_path": "custom.json"}
     )
 
     runtime = _runtime_config_from_deberta_config(config)
@@ -515,7 +516,7 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=8192,
-            flash_cfg={"docblock_bias_seq_len": 8192},
+            flash_cfg=ModelHFFlashConfig(docblock_bias_seq_len=8192),
             device=device,
         )
         == "docblock_bias"
@@ -532,7 +533,7 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
         _flash_route_hint_for_docblock_batch(
             seq_len=4096,
             batch_size=16,
-            flash_cfg={"docblock_bias_seq_len": 4096},
+            flash_cfg=ModelHFFlashConfig(docblock_bias_seq_len=4096),
             device=device,
         )
         == "docblock_bias"
@@ -540,7 +541,7 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
-            flash_cfg={"docblock_bias_seq_len": 1024},
+            flash_cfg=ModelHFFlashConfig(docblock_bias_seq_len=1024),
             device=device,
         )
         == "docblock_bias"
@@ -548,7 +549,7 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
-            flash_cfg={"docblock_bias_seq_len": 0},
+            flash_cfg=ModelHFFlashConfig(docblock_bias_seq_len=0),
             device=device,
         )
         == "docblock"
@@ -562,7 +563,7 @@ def test_docblock_bias_route_uses_table_with_ragged_override(
     assert (
         _flash_route_hint_for_docblock_batch(
             seq_len=1024,
-            flash_cfg={"docblock_bias_seq_len": 1024},
+            flash_cfg=ModelHFFlashConfig(docblock_bias_seq_len=1024),
             device=device,
         )
         == "docblock_bias"
@@ -2488,7 +2489,7 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_ove
             batch=batch,
             backbone_type="hf_deberta_v2",
             flash_enabled=False,
-            flash_cfg={"kernel_overrides_path": str(missing_override_path)},
+            flash_cfg=ModelHFFlashConfig(kernel_overrides_path=str(missing_override_path)),
         )
 
         assert meta is None
@@ -2648,7 +2649,7 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock_bias() -> None:
         batch=batch,
         backbone_type="hf_deberta_v2",
         flash_enabled=True,
-        flash_cfg={"docblock_bias_seq_len": 5},
+        flash_cfg=ModelHFFlashConfig(docblock_bias_seq_len=5),
     )
 
     assert meta is not None

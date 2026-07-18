@@ -10,8 +10,7 @@ from typing import Any
 
 import torch
 
-from deberta.config import ModelConfig, _normalize_sdpa_kernel
-from deberta.modeling.flash_config import flash_cfg_get, flash_cfg_optional_int
+from deberta.config import ModelConfig, ModelHFFlashConfig, _normalize_sdpa_kernel
 from deberta.modeling.flashdeberta_kernel_tuning import (
     configure_flashdeberta_kernel_overrides,
     flash_padding_route,
@@ -115,7 +114,6 @@ def _flash_route_hint_for_padding_batch(
     seq_len: int,
     active_tokens: int,
     batch_size: int,
-    flash_cfg: Any | None = None,
     device: torch.device | None = None,
 ) -> str:
     """Select a fixed-vs-varlen route for one standard padded batch.
@@ -123,7 +121,6 @@ def _flash_route_hint_for_padding_batch(
     :param int seq_len: Padded sequence length.
     :param int active_tokens: Total active tokens across the batch.
     :param int batch_size: Batch size.
-    :param Any | None flash_cfg: Optional resolved flash config.
     :param torch.device | None device: Batch device for capability-scoped table rows.
     :return str: Either ``fixed`` or ``varlen``.
     """
@@ -140,7 +137,7 @@ def _flash_route_hint_for_docblock_batch(
     *,
     seq_len: int,
     batch_size: int | None = None,
-    flash_cfg: Any | None = None,
+    flash_cfg: ModelHFFlashConfig | None = None,
     device: torch.device | None = None,
 ) -> str:
     """Select the doc-block flash backend for one packed batch.
@@ -156,16 +153,12 @@ def _flash_route_hint_for_docblock_batch(
 
     :param int seq_len: Packed sequence length.
     :param int | None batch_size: Packed batch size, when known.
-    :param Any | None flash_cfg: Optional resolved flash config.
+    :param ModelHFFlashConfig | None flash_cfg: Optional resolved flash config.
     :param torch.device | None device: Batch device for capability-scoped table rows.
     :return str: Either ``docblock_bias`` or ``docblock``.
     """
 
-    override_bias_seq_len = flash_cfg_optional_int(
-        flash_cfg,
-        name="docblock_bias_seq_len",
-        default=None,
-    )
+    override_bias_seq_len = flash_cfg.docblock_bias_seq_len if flash_cfg is not None else None
     if override_bias_seq_len is not None:
         if int(override_bias_seq_len) > 0 and int(seq_len) == int(override_bias_seq_len):
             return "docblock_bias"
@@ -184,15 +177,15 @@ def _flash_route_hint_for_docblock_batch(
     return "docblock"
 
 
-def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
+def _configure_flash_kernel_overrides_from_cfg(flash_cfg: ModelHFFlashConfig | None) -> None:
     """Apply config-driven FlashDeBERTa kernel override tables for route helpers.
 
-    :param Any | None flash_cfg: Optional flash config object or mapping.
+    :param ModelHFFlashConfig | None flash_cfg: Optional flash config.
     """
 
     if flash_cfg is None:
         return
-    value = flash_cfg_get(flash_cfg, "kernel_overrides_path", None)
+    value = flash_cfg.kernel_overrides_path
     configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
 
 
@@ -218,7 +211,7 @@ def prepare_flash_attention_batch_metadata(
     batch: dict[str, Any],
     backbone_type: str,
     flash_enabled: bool = False,
-    flash_cfg: Any | None = None,
+    flash_cfg: ModelHFFlashConfig | None = None,
     route_device: torch.device | None = None,
 ) -> tuple[dict[str, Any], FlashBatchMeta | None]:
     """Select the attention route from collator-built batch metadata.
@@ -226,7 +219,7 @@ def prepare_flash_attention_batch_metadata(
     :param dict[str, Any] batch: Device-local batch mapping.
     :param str backbone_type: Backbone type string.
     :param bool flash_enabled: Whether the active backend can consume flash metadata.
-    :param Any | None flash_cfg: Optional resolved flash config for route selection.
+    :param ModelHFFlashConfig | None flash_cfg: Optional resolved flash config for route selection.
     :param torch.device | None route_device: Optional eventual activation device
         when preparing metadata before transfer.
     :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
@@ -284,7 +277,6 @@ def prepare_flash_attention_batch_metadata(
         seq_len=seq_len,
         active_tokens=int(flash_meta.active_tokens_scalar),
         batch_size=batch_size,
-        flash_cfg=flash_cfg,
         device=routing_device,
     )
     return batch, dataclasses.replace(flash_meta, route_hint=route_hint)
