@@ -1151,8 +1151,6 @@ def test_flash_attention_dense_local_bias_path_dispatches(monkeypatch: pytest.Mo
     cfg.max_relative_positions = 1024
     cfg.position_buckets = 256
     attention_mod, attention, cfg = _flash_attention_harness(monkeypatch, cfg=cfg)
-    # The shipped local-bias policy row is scoped to sm_120.
-    monkeypatch.setattr(attention_mod, "device_compute_capability", lambda _device: (12, 0))
     attention.train()
     seen: dict[str, object] = {}
 
@@ -1187,6 +1185,7 @@ def test_flash_attention_dense_local_bias_path_dispatches(monkeypatch: pytest.Mo
         attention_mask=None,
         output_attentions=False,
         rel_embeddings=rel_embeddings,
+        flash_meta=FlashBatchMeta(route_hint="local_bias"),
     )
 
     assert probs is None
@@ -1199,35 +1198,6 @@ def test_flash_attention_dense_local_bias_path_dispatches(monkeypatch: pytest.Mo
     )
     assert seen["bucket_shape"] == (1024, 1024)
     assert seen["keep_mask"] is None
-
-
-def test_local_bias_gate_uses_capability_table_independent_of_docblock_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    attention_mod = _patch_flashdeberta_available(monkeypatch)
-
-    def _gate(hf_flash: dict[str, object], *, capability: tuple[int, int] = (12, 0)) -> bool:
-        cfg = _small_deberta_config()
-        cfg.hf_flash = hf_flash
-        attention = attention_mod.FlashDisentangledSelfAttention(cfg)
-        attention.train()
-        monkeypatch.setattr(attention_mod, "device_compute_capability", lambda _device: capability)
-        pos_term = torch.zeros((1, 1, 1, 1))
-        return attention._should_use_local_bias(
-            attention_mask=None,
-            batch_size=1,
-            seq_len=1024,
-            pos_key=pos_term,
-            pos_query=pos_term,
-            device=torch.device("cpu"),
-        )
-
-    assert _gate({}) is True
-    # The packed doc-block override must not leak into the plain-batch local-bias route.
-    assert _gate({"docblock_bias_seq_len": 0}) is True
-    assert _gate({"docblock_bias_seq_len": 2048}) is True
-    # The shipped policy row is sm_120-scoped: other hardware keeps local-bias off.
-    assert _gate({}, capability=(9, 0)) is False
 
 
 @pytest.mark.parametrize(
@@ -2174,7 +2144,9 @@ def test_flashdeberta_pack_and_varlen_modules_import_without_triton(monkeypatch:
         assert isinstance(bias_mod.flashdeberta_compiled_position_bias_available(), bool)
 
 
-def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded() -> None:
+def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import deberta.training.compile as compile_mod
 
     dense_batch = {"input_ids": torch.zeros((2, 1024), dtype=torch.long)}
@@ -2186,6 +2158,19 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert prepared_dense is dense_batch
     assert dense_meta is not None
     assert dense_meta.route_hint == "dense"
+
+    local_bias_batch = {"input_ids": torch.zeros((2, 1024), dtype=torch.long)}
+    with monkeypatch.context() as patch:
+        patch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
+        prepared_local_bias, local_bias_meta = compile_mod.prepare_flash_attention_batch_metadata(
+            batch=local_bias_batch,
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+            route_device=torch.device("cuda"),
+        )
+    assert prepared_local_bias is local_bias_batch
+    assert local_bias_meta is not None
+    assert local_bias_meta.route_hint == "local_bias"
 
     pairwise_batch = {
         "input_ids": torch.zeros((1, 4), dtype=torch.long),

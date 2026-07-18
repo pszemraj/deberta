@@ -229,7 +229,14 @@ def prepare_flash_attention_batch_metadata(
 
     attention_mask = batch.get("attention_mask")
     if attention_mask is None:
-        return batch, FlashBatchMeta(route_hint="dense")
+        route_hint = flash_route_choice(
+            policy="local_bias",
+            seq_bucket=flash_seq_bucket(seq_len=seq_len),
+            compute_capability=device_compute_capability(routing_device),
+            seq_len=seq_len,
+            batch_size=batch_size,
+        )
+        return batch, FlashBatchMeta(route_hint="local_bias" if route_hint == "local_bias" else "dense")
     if not isinstance(attention_mask, torch.Tensor):
         return batch, None
     if is_pairwise_mask(attention_mask, query_len=seq_len, key_len=seq_len):

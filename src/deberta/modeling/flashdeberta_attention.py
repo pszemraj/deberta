@@ -47,8 +47,6 @@ from deberta.modeling.flashdeberta_fixed_op import (
 from deberta.modeling.flashdeberta_kernel_tuning import (
     configure_flashdeberta_kernel_overrides,
     flash_padding_route,
-    flash_route_policy,
-    flash_seq_bucket,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.flashdeberta_varlen_op import (
@@ -316,20 +314,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         self,
         *,
         attention_mask: torch.Tensor | None,
-        batch_size: int,
-        seq_len: int,
+        route_hint: str | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
-        device: torch.device | None = None,
     ) -> bool:
         """Return whether the dense local-bias flash path should run.
 
         :param torch.Tensor | None attention_mask: Optional attention mask.
-        :param int batch_size: Runtime batch size.
-        :param int seq_len: Sequence length.
+        :param str | None route_hint: Batch-prepared flash route.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
-        :param torch.device | None device: Activation device for capability-scoped table rows.
         :return bool: True when dense local-bias flash should run.
         """
 
@@ -337,15 +331,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return False
         if not self.training:
             return False
-        local_bias_policy = flash_route_policy(
-            policy="local_bias",
-            seq_bucket=flash_seq_bucket(seq_len=int(seq_len)),
-            compute_capability=device_compute_capability(device) if device is not None else None,
-        )
-        if local_bias_policy is None or str(local_bias_policy.get("choice", "")).strip() != "local_bias":
-            return False
-        local_bias_max_batch_size = int(local_bias_policy.get("max_batch_size", 0))
-        if local_bias_max_batch_size <= 0 or int(batch_size) > local_bias_max_batch_size:
+        if route_hint != "local_bias":
             return False
         if pos_key is None and pos_query is None:
             return False
@@ -709,7 +695,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             use_varlen = False
         elif route == "varlen":
             use_varlen = True
-        elif route in {"fixed", "dense", "pairwise"}:
+        elif route in {"fixed", "dense", "local_bias", "pairwise"}:
             use_varlen = False
         else:
             use_varlen = _should_use_varlen(
@@ -840,11 +826,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         else:
             if self._should_use_local_bias(
                 attention_mask=attention_mask,
-                batch_size=bsz,
-                seq_len=query_len,
+                route_hint=route,
                 pos_key=pos_key,
                 pos_query=pos_query,
-                device=query_layer.device,
             ):
                 output = self._flash_local_bias(
                     query_layer=query_layer,
