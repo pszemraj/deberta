@@ -14,6 +14,8 @@ deberta export <run_dir>/checkpoint-<step> \
   --output-dir <run_dir>/exported_hf
 ```
 
+Export infers the run directory from the checkpoint parent and requires that directory's `model_config.json`, `data_config.json`, and `run_metadata.json`. If a checkpoint was moved elsewhere, pass `--run-dir <original-run-dir>` explicitly.
+
 `--what` supports:
 
 - `discriminator`
@@ -38,6 +40,8 @@ Default output path is `<run_dir>/exported_hf` and must be empty if it already e
 
 Native `hf_deberta_v2` exports load through stock Hugging Face `AutoModel` APIs. RoPE exports are
 standalone artifacts but require this package's `DebertaRoPEModel` implementation.
+
+Flash-trained checkpoints are reconstructed with eager attention during consolidation, so export does not require the optional FlashDeBERTa runtime.
 
 Training-only keys are removed from exported model configs, and export metadata uses run/checkpoint directory names rather than machine-local absolute paths. Safetensors output is enabled by default; use `--no-safe-serialization` only when a consumer requires PyTorch serialization.
 
