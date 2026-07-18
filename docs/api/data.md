@@ -41,9 +41,7 @@ MLMConfig(
 
 Masking configuration.
 
-Mask selection uses DeBERTa's windowed policy: ``max_ngram=1`` selects windowed unigrams and
-larger values enable whole-word n-grams. Replacement probabilities are conditional on token
-selection and must sum to at most one; the remainder keeps the original token.
+See [Collator masking behavior](../guides/data-pipeline.md#collator-masking-behavior) for mask selection and replacement semantics.
 
 ## `load_hf_dataset`
 

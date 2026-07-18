@@ -165,11 +165,7 @@ build_backbone_configs(
 
 Build discriminator + generator configs.
 
-- For backbone_type='hf_deberta_v2': discriminator config is synthesized from repo defaults
-for scratch runs, or loaded from ``model.pretrained.discriminator_path`` for pretrained runs.
-Generator config is derived from discriminator unless ``model.pretrained.generator_path``
-is set, in which case that config is loaded.
-- For backbone_type='rope': returns DebertaRoPEConfig instances.
+Backbone-specific scratch and pretrained config resolution is described in [Architectures](../advanced/architectures.md#backbone-types).
 
 ### Parameters
 

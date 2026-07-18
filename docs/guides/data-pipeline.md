@@ -30,7 +30,7 @@ Outputs:
 - `input_ids`
 - `special_tokens_mask`
 - optional `attention_mask` (only when padding exists)
-- `doc_ids` for document-blocked packing
+- `doc_ids (B,S)` for document-blocked packing
 
 ## Cross-document attention blocking
 
@@ -38,7 +38,7 @@ Outputs:
 boundaries. It is only valid with `data.packing.enabled=true`.
 
 - `false`: packed samples attend across document boundaries; no document mask is built
-- `true`: the collator emits compact `doc_ids (B,S)`. Every segment begins with its own CLS token.
+- `true`: packed samples attend only within document segments. Every segment begins with its own CLS token.
 
 The collator also emits two fixed-shape objective tensors for blocked rows:
 
@@ -89,6 +89,8 @@ Mask replacement controls:
 
 - `train.objective.mask_token_prob`
 - `train.objective.random_token_prob`
+
+Replacement probabilities are conditional on token selection and must sum to at most one; the remainder keeps the original token.
 
 Unmasked labels are `-100`; masked labels keep original token ids.
 

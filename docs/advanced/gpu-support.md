@@ -29,11 +29,8 @@ On `sm_120`, the shipped table enables measured dense `docblock_bias` and small-
 
 On any other supported CUDA GPU, `model.hf.attention_impl=flash` still runs Flash attention: a missing capability row does not trigger eager attention. Per-call input contracts such as attention-output requests or unsupported mask layouts can still select eager attention. What changes off `sm_120`:
 
-- **Padded routing is identical**: `fixed` below `2048`, `varlen` at `2048+`.
-- **Packed doc-block batches default to the ragged `docblock` route** instead of dense
-  `docblock_bias`. The dense route's speed advantage came from `sm_120`-gated backward
-  specializations; without them it degrades to a PyTorch positional-gradient reduction and saves
-  a dense `(B,H,S,S)` bias for backward. Ragged is the memory-light, specialization-free default.
+- **Padded batches use the capability-independent [fixed/varlen policy](flash-attention.md#route-families).**
+- **Packed doc-block batches default to the ragged `docblock` route** instead of dense `docblock_bias`. The dense route's measured speed advantage depends on `sm_120`-gated backward specializations; see [route families](flash-attention.md#route-families) for the memory tradeoff.
 - **The `local_bias` route stays off** (its only shipped policy row is `sm_120`-scoped); plain
   dense batches use the `fixed` route.
 - **Unmatched kernel launch configs use repo-owned deterministic fallbacks**, not upstream FlashDeBERTa heuristics. Capability-specific tuning is still recommended because a conservative tile may run slowly on another architecture.
@@ -91,9 +88,6 @@ whose bounds exclude the batch length resolves to the ragged fallback instead:
 }
 ```
 
-Dense `docblock_bias` saves a quadratic bias for backward, so use `max_seq_len` and `max_batch_size` bounds that reflect the target GPU's VRAM rather than copying the shipped 32 GiB limits. A same-capability card with more VRAM can raise those bounds with a same-key override row, which outranks the shipped row. Batch preparation warns when a bound keeps a measured capability on the ragged route.
+Use `max_seq_len` and `max_batch_size` bounds that reflect the target GPU's VRAM rather than copying the shipped 32 GiB limits. A same-capability card with more VRAM can raise those bounds with a same-key override row, which outranks the shipped row. Batch preparation warns when a bound keeps a measured capability on the ragged route.
 
-Validate route changes and kernel tiles with the [retuning workflow](flash-attention.md#retuning).
-Durable results can be added as capability-scoped rows in the shipped table. Triton launch
-configurations depend on shared memory, scheduling, and SM count; applying one GPU's tiles globally
-can fail at launch or regress throughput on another architecture.
+Validate route changes and kernel tiles with the [retuning workflow](flash-attention.md#retuning). Triton launch configurations depend on shared memory, scheduling, and SM count; applying one GPU's tiles globally can fail at launch or regress throughput on another architecture.

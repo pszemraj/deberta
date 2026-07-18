@@ -1,8 +1,6 @@
 # FlashDeBERTa attention
 
-FlashDeBERTa provides optional Triton implementations of disentangled attention for the native
-`hf_deberta_v2` backbone. Shipped route and kernel measurements target `sm_120`; dated benchmark
-results are recorded in the [development log](../devlog.md).
+FlashDeBERTa provides optional Triton implementations of disentangled attention for the native `hf_deberta_v2` backbone. Hardware support and the shipped tuning scope are described in [GPU support](gpu-support.md); dated benchmark results are recorded in the [development log](../devlog.md).
 
 ## Enable
 
@@ -37,10 +35,7 @@ The adapter selects one route per batch:
 Every route uses the same canonical signed relative bucket `query_position - key_position` for
 both C2P and P2C terms. Route changes must not change the encoder's attention function.
 
-Route selection comes from `route_policies` in the JSON tuning table. Upstream FlashDeBERTa
-environment-variable routing is not consulted. The shipped padding policy switches from `fixed`
-to `varlen` at `2048`; capability-scoped doc-block and local-bias behavior is described in
-[GPU support](gpu-support.md).
+Route selection comes from `route_policies` in the JSON tuning table. Upstream FlashDeBERTa environment-variable routing is not consulted. Capability-scoped doc-block and local-bias behavior is described in [GPU support](gpu-support.md).
 
 Dense `docblock_bias` is faster on measured shapes but saves a quadratic `(B,H,S,S)` bias for
 backward. Ragged `docblock` avoids that allocation and is the conservative choice for hardware or
