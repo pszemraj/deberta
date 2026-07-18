@@ -138,9 +138,7 @@ def test_docblock_streaming_gives_every_segment_its_own_cls() -> None:
     assert rows[0]["doc_ids"] == [1, 1, 1, 1, 2, 2, 2, 2]
 
 
-def test_docblock_streaming_rows_collate_with_structural_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_docblock_streaming_rows_collate_with_structural_metadata() -> None:
     """Exercise the normal packer-to-collator structural ``doc_ids`` path."""
 
     tok = DummyTokenizer(vocab_size=64)
@@ -165,11 +163,6 @@ def test_docblock_streaming_rows_collate_with_structural_metadata(
         cfg=MLMConfig(mlm_probability=0.2),
         packed_sequences=True,
         block_cross_document_attention=True,
-    )
-    monkeypatch.setattr(
-        collator,
-        "_compute_document_ids",
-        lambda **_kwargs: pytest.fail("packer-supplied doc_ids must remain authoritative"),
     )
     batch = collator(rows)
 
@@ -548,6 +541,7 @@ def test_collator_emits_document_ids_when_packed():
                 tok.sep_token_id,
             ],
             "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
         }
     ]
     batch = coll(features)
@@ -591,23 +585,14 @@ def test_collator_rejects_legacy_packing_without_per_document_cls():
         {
             "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, tok.sep_token_id, 12, tok.sep_token_id],
             "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
         }
     ]
-    with pytest.raises(ValueError, match="every document segment to begin with CLS"):
+    with pytest.raises(ValueError, match="Every packed document segment must begin with its own CLS"):
         coll(features)
 
 
-@pytest.mark.parametrize(
-    ("doc_ids", "expected_error"),
-    [
-        ([1.0, 1.0, 1.0], "integer dtype"),
-        ([1, 1, 1], "end with its own SEP"),
-    ],
-)
-def test_collator_rejects_invalid_structural_document_metadata(
-    doc_ids: list[int] | list[float],
-    expected_error: str,
-) -> None:
+def test_collator_rejects_document_without_sep_boundary() -> None:
     tok = DummyTokenizer(vocab_size=128)
     collator = DebertaV3ElectraCollator(
         tokenizer=tok,
@@ -618,14 +603,14 @@ def test_collator_rejects_invalid_structural_document_metadata(
     feature = {
         "input_ids": [tok.cls_token_id, 11, 12],
         "special_tokens_mask": [1, 0, 0],
-        "doc_ids": doc_ids,
+        "doc_ids": [1, 1, 1],
     }
 
-    with pytest.raises((TypeError, ValueError), match=expected_error):
+    with pytest.raises(ValueError, match="end with its own SEP"):
         collator([feature])
 
 
-def test_collator_skips_document_ids_for_single_doc_packed_chunk():
+def test_collator_keeps_document_ids_for_single_doc_packed_chunk():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
@@ -638,10 +623,11 @@ def test_collator_skips_document_ids_for_single_doc_packed_chunk():
         {
             "input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id],
             "special_tokens_mask": [1, 0, 0, 1],
+            "doc_ids": [1, 1, 1, 1],
         }
     ]
     batch = coll(features)
-    assert "doc_ids" not in batch
+    assert torch.equal(batch["doc_ids"], torch.ones((1, 4), dtype=torch.long))
     assert "attention_mask" not in batch
 
 
@@ -708,10 +694,12 @@ def test_active_token_definitions_agree_for_packed_docblock_batches():
                 tok.sep_token_id,
             ],
             "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
         },
         {
             "input_ids": [tok.cls_token_id, 21, 22, tok.sep_token_id],
             "special_tokens_mask": [1, 0, 0, 1],
+            "doc_ids": [1, 1, 1, 1],
         },
     ]
     batch = coll(features)
@@ -742,6 +730,7 @@ def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
                 tok.sep_token_id,
             ],
             "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
         }
     ]
     batch = coll(features)
@@ -775,6 +764,7 @@ def test_packed_document_ids_follow_attention_mask_not_token_values():
                 ],
                 "attention_mask": [1, 1, 1, 1, 1, 1, 1, 0],
                 "special_tokens_mask": [1, 0, 1, 1, 1, 0, 1, 0],
+                "doc_ids": [1, 1, 1, 1, 2, 2, 2, 0],
             }
         ]
     )

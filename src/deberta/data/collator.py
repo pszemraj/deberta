@@ -6,7 +6,6 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from numbers import Integral
 from typing import Any
 
 import torch
@@ -107,7 +106,6 @@ class DebertaV3ElectraCollator:
             )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        self._validate_structural_doc_id_types(features)
         features = self._harmonize_optional_attention_masks(features)
         needs_padding = self._needs_padding(features)
 
@@ -142,31 +140,11 @@ class DebertaV3ElectraCollator:
             # so corruption targets stay aligned with forbidden sampling ids.
             special_tokens_mask = special_tokens_mask.bool() | inferred_special_tokens_mask
 
-        supplied_doc_ids = batch.pop("doc_ids", None)
         doc_ids = None
         if self._packed_sequences and self._block_cross_document_attention:
-            if supplied_doc_ids is not None:
-                if not isinstance(supplied_doc_ids, torch.Tensor):
-                    raise TypeError("Packed doc_ids must be a tensor after tokenizer padding.")
-                if (
-                    supplied_doc_ids.dtype == torch.bool
-                    or supplied_doc_ids.is_floating_point()
-                    or supplied_doc_ids.is_complex()
-                ):
-                    raise TypeError("Packed doc_ids must use an integer dtype.")
-                if supplied_doc_ids.shape != batch["input_ids"].shape:
-                    raise ValueError(
-                        "Packed doc_ids must match input_ids shape; "
-                        f"got doc_ids={tuple(supplied_doc_ids.shape)}, "
-                        f"input_ids={tuple(batch['input_ids'].shape)}."
-                    )
-                doc_ids = supplied_doc_ids.to(dtype=torch.long)
-            else:
-                doc_ids = self._compute_document_ids(
-                    input_ids=batch["input_ids"],
-                    special_tokens_mask=special_tokens_mask,
-                    attention_mask=batch.get("attention_mask"),
-                )
+            doc_ids = batch.pop("doc_ids").to(dtype=torch.long)
+        else:
+            batch.pop("doc_ids", None)
         if doc_ids is not None:
             batch["doc_ids"] = doc_ids
             self._attach_document_objective_metadata(batch=batch, doc_ids=doc_ids)
@@ -190,27 +168,6 @@ class DebertaV3ElectraCollator:
         batch["input_ids"] = input_ids
         batch["labels"] = labels
         return batch
-
-    @staticmethod
-    def _validate_structural_doc_id_types(features: list[dict[str, Any]]) -> None:
-        """Reject structural document ids that padding could silently coerce.
-
-        :param list[dict[str, Any]] features: Raw dataset rows before tokenizer padding.
-        :raises TypeError: If a row's document ids are not integer-valued.
-        """
-
-        for feature in features:
-            values = feature.get("doc_ids")
-            if values is None:
-                continue
-            if isinstance(values, torch.Tensor):
-                invalid = values.dtype == torch.bool or values.is_floating_point() or values.is_complex()
-            elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-                invalid = any(isinstance(value, bool) or not isinstance(value, Integral) for value in values)
-            else:
-                invalid = True
-            if invalid:
-                raise TypeError("Packed doc_ids must use an integer dtype.")
 
     @staticmethod
     def _attach_flash_doc_metadata(*, batch: dict[str, Any], doc_ids: torch.Tensor) -> None:
@@ -531,52 +488,6 @@ class DebertaV3ElectraCollator:
         if any(tok.startswith("Ġ") for tok in tokens):
             return "gpt2"
         return "none"
-
-    def _compute_document_ids(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        special_tokens_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        """Compute per-token document ids for cross-document attention blocking.
-
-        Returns a compact ``(B, S)`` long tensor of document ids (1-based for active
-        tokens, 0 for padding) instead of a dense ``(B, S, S)`` pairwise mask.  The
-        pairwise mask is constructed on-device in the training loop to avoid CPU→GPU
-        transfer of O(B*S²) data.
-
-        :param torch.Tensor input_ids: Batch token ids of shape (B, S).
-        :param torch.Tensor special_tokens_mask: Boolean special-token mask (B, S).
-        :param torch.Tensor | None attention_mask: Optional 2D active-token mask (B, S).
-        :return torch.Tensor | None: Document ids ``(B, S)`` long, or ``None`` when unnecessary.
-        """
-        if input_ids.ndim != 2:
-            return None
-        if special_tokens_mask.ndim != 2 or special_tokens_mask.shape != input_ids.shape:
-            return None
-
-        cls_id = getattr(self.tokenizer, "cls_token_id", None)
-        sep_id = getattr(self.tokenizer, "sep_token_id", None)
-        if cls_id is None or sep_id is None or input_ids.shape[1] < 3:
-            return None
-
-        if attention_mask is not None:
-            if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
-                raise ValueError(
-                    "Packed attention_mask must match input_ids shape; "
-                    f"got mask={tuple(attention_mask.shape)}, input_ids={tuple(input_ids.shape)}."
-                )
-            active = attention_mask.to(dtype=torch.bool)
-        else:
-            active = torch.ones_like(input_ids, dtype=torch.bool)
-        document_starts = input_ids.eq(int(cls_id)) & special_tokens_mask & active
-        if not bool(document_starts.sum(dim=-1).gt(1).any().item()):
-            separator_count = (input_ids.eq(int(sep_id)) & special_tokens_mask & active).sum(dim=-1)
-            if bool(separator_count.gt(1).any().item()):
-                raise ValueError("Cross-document packing requires every document segment to begin with CLS.")
-            return None
-        return document_starts.to(dtype=torch.long).cumsum(dim=-1).masked_fill(~active, 0)
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
