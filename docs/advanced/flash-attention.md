@@ -98,8 +98,6 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
 
 - [`flashdeberta_microbench.py`](../../tools/flashdeberta_microbench.py) compares eager and flash
   on synthetic dense and padded shapes.
-- [`flashdeberta_rtd_profile.py`](../../tools/flashdeberta_rtd_profile.py) profiles complete RTD
-  optimizer steps for one config.
 - [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and
   selected gradients against eager attention.
 - [`run_flashdeberta_benchmarks.sh`](../../tools/run_flashdeberta_benchmarks.sh) runs the tracked
