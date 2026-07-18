@@ -1,6 +1,6 @@
 # FlashDeBERTa attention
 
-FlashDeBERTa provides optional Triton implementations of disentangled attention for the native `hf_deberta_v2` backbone. Hardware support and the shipped tuning scope are described in [GPU support](gpu-support.md); dated benchmark results are recorded in the [development log](../devlog.md).
+FlashDeBERTa provides optional Triton implementations of disentangled attention for the native `hf_deberta_v2` backbone. Hardware support and the shipped tuning scope are described in [GPU support](gpu-support.md).
 
 ## Enable
 
@@ -100,7 +100,6 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
   on synthetic dense and padded shapes.
 - [`flashdeberta_rtd_profile.py`](../../tools/flashdeberta_rtd_profile.py) profiles complete RTD
   optimizer steps for one config.
-- [`flashdeberta_rtd_compare_step.py`](../../tools/flashdeberta_rtd_compare_step.py) compares one identical batch and initial state through the production generator and discriminator phase methods, with observation hooks that do not replace phase logic.
 - [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and
   selected gradients against eager attention.
 - [`run_flashdeberta_benchmarks.sh`](../../tools/run_flashdeberta_benchmarks.sh) runs the tracked
