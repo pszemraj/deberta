@@ -564,8 +564,10 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
             document rows use local ids; rotary attention itself is invariant to each isolated
             segment's constant row offset.
         :param bool | None output_hidden_states: Optional hidden-state output flag.
-        :param bool | None output_attentions: Optional attention output flag.
+        :param bool | None output_attentions: Optional attention-output flag. Attention maps are
+            unsupported; resolving this flag to ``True`` raises ``NotImplementedError``.
         :param bool | None return_dict: Optional return-dataclass flag.
+        :raises NotImplementedError: If attention-map output is requested.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model output container/tuple.
         """
         output_hidden_states = (

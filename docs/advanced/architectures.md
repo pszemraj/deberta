@@ -44,7 +44,7 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 
 The native backbone can run disentangled attention through Triton FlashDeBERTa kernels
 (`model.hf.attention_impl=flash`), including packed doc-block routing. Routes, kernel tuning,
-tooling, caveats, and open follow-ups: [Advanced / FlashDeBERTa attention](flash-attention.md).
+tooling, and caveats: [Advanced / FlashDeBERTa attention](flash-attention.md).
 
 ## RoPE-specific controls
 

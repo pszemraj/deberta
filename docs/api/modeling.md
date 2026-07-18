@@ -410,8 +410,12 @@ Run encoder forward pass.
 - `token_type_ids` (`torch.Tensor | None`): Optional segment ids.
 - `position_ids` (`torch.Tensor | None`): Optional learned absolute-position ids. Packed document rows use local ids; rotary attention itself is invariant to each isolated segment's constant row offset.
 - `output_hidden_states` (`bool | None`): Optional hidden-state output flag.
-- `output_attentions` (`bool | None`): Optional attention output flag.
+- `output_attentions` (`bool | None`): Optional attention-output flag. Attention maps are unsupported; resolving this flag to ``True`` raises ``NotImplementedError``.
 - `return_dict` (`bool | None`): Optional return-dataclass flag.
+
+### Raises
+
+- `NotImplementedError`: If attention-map output is requested.
 
 ### Returns
 
