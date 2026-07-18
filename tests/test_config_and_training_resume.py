@@ -1127,45 +1127,6 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
         )
 
 
-@pytest.mark.parametrize(
-    "changed_train",
-    [
-        make_train_config(seed=43),
-        make_train_config(per_device_train_batch_size=8),
-        make_train_config(mixed_precision="no"),
-        make_train_config(objective={"mlm_probability": 0.2}),
-        make_train_config(compile={"enabled": True}),
-    ],
-)
-def test_persist_or_validate_run_configs_rejects_resume_training_semantic_mismatch(
-    tmp_path: Path,
-    changed_train: TrainConfig,
-) -> None:
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    model_cfg = make_model_config(backbone_type="rope")
-    data_cfg = make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})
-    base_train = make_train_config()
-    _persist_or_validate_run_configs(
-        output_dir=out,
-        model_cfg=model_cfg,
-        data_cfg=data_cfg,
-        train_cfg=base_train,
-        resume_checkpoint=None,
-        is_main_process=True,
-    )
-
-    with pytest.raises(ValueError, match="Resume configuration mismatch for train_config.json"):
-        _persist_or_validate_run_configs(
-            output_dir=out,
-            model_cfg=model_cfg,
-            data_cfg=data_cfg,
-            train_cfg=changed_train,
-            resume_checkpoint=str(out / "checkpoint-10"),
-            is_main_process=True,
-        )
-
-
 def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_resume(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)

@@ -837,7 +837,6 @@ train:
   # required: optional
   # values: integer >= 1
   # contract: micro-batches per optimizer step; token_weighted_gradient_accumulation controls loss weighting within the window.
-  # resume interaction: exact resume requires this value to match the source train snapshot because changing it alters update semantics and saved data-progress interpretation.
   gradient_accumulation_steps: 1
 
   # [train.token_weighted_gradient_accumulation]
