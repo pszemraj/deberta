@@ -199,10 +199,7 @@ def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
     if flash_cfg is None:
         return
     value = flash_cfg_get(flash_cfg, "kernel_overrides_path", None)
-    configure_flashdeberta_kernel_overrides(
-        str(value).strip() if value is not None else None,
-        reload_if_changed=False,
-    )
+    configure_flashdeberta_kernel_overrides(str(value).strip() if value is not None else None)
 
 
 def _flash_active_tokens_host(value: Any) -> int | None:
