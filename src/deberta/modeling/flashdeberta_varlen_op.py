@@ -100,7 +100,7 @@ _GRAD_PACK_DELTA_BLOCK_ROWS = 32
 class _CuSeqlensHostCacheEntry:
     """Cached host tuple for one cumulative-seqlens tensor."""
 
-    cu_ref: weakref.ReferenceType[torch.Tensor] | None
+    cu_ref: weakref.ReferenceType[torch.Tensor]
     cu_seqlens_host: tuple[int, ...]
 
 
@@ -108,7 +108,7 @@ class _CuSeqlensHostCacheEntry:
 class _MidTensorCacheEntry:
     """Cached varlen tile-metadata tensors for one cumulative-seqlens tensor."""
 
-    cu_ref: weakref.ReferenceType[torch.Tensor] | None
+    cu_ref: weakref.ReferenceType[torch.Tensor]
     mid_batch: torch.Tensor
     mid_start: torch.Tensor
     mn: int
@@ -349,25 +349,21 @@ def _register_cu_seqlens_host_tuple(
     """
 
     cache_key = id(cu_seqlens)
-    cu_ref: weakref.ReferenceType[torch.Tensor] | None = None
-    try:
 
-        def _cleanup(_ref: object, key: int = cache_key) -> None:
-            """Remove cached host and mid tensors when ``cu_seqlens`` is released.
+    def _cleanup(_ref: object, key: int = cache_key) -> None:
+        """Remove cached host and mid tensors when ``cu_seqlens`` is released.
 
-            :param object _ref: Weakref callback payload from the released tensor.
-            :param int key: Cache key associated with the released tensor.
-            :return None: This callback mutates the module-local caches in place.
-            """
+        :param object _ref: Weakref callback payload from the released tensor.
+        :param int key: Cache key associated with the released tensor.
+        :return None: This callback mutates the module-local caches in place.
+        """
 
-            _CU_SEQLENS_HOST_CACHE.pop(key, None)
-            stale_keys = [mid_key for mid_key in _MID_TENSOR_CACHE if mid_key[0] == key]
-            for stale_key in stale_keys:
-                _MID_TENSOR_CACHE.pop(stale_key, None)
+        _CU_SEQLENS_HOST_CACHE.pop(key, None)
+        stale_keys = [mid_key for mid_key in _MID_TENSOR_CACHE if mid_key[0] == key]
+        for stale_key in stale_keys:
+            _MID_TENSOR_CACHE.pop(stale_key, None)
 
-        cu_ref = weakref.ref(cu_seqlens, _cleanup)
-    except TypeError:
-        cu_ref = None
+    cu_ref = weakref.ref(cu_seqlens, _cleanup)
 
     _CU_SEQLENS_HOST_CACHE[cache_key] = _CuSeqlensHostCacheEntry(
         cu_ref=cu_ref,
@@ -385,7 +381,7 @@ def _cu_seqlens_host_tuple(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
     cache_key = id(cu_seqlens)
     cached = _CU_SEQLENS_HOST_CACHE.get(cache_key)
     if cached is not None:
-        cached_tensor = cached.cu_ref() if cached.cu_ref is not None else None
+        cached_tensor = cached.cu_ref()
         if cached_tensor is cu_seqlens:
             return cached.cu_seqlens_host
         _CU_SEQLENS_HOST_CACHE.pop(cache_key, None)
@@ -442,7 +438,7 @@ def _get_mid_tensors_cached(
     cache_key = (id(cu_seqlens), int(block_m), str(device.type), device.index)
     cached = _MID_TENSOR_CACHE.get(cache_key)
     if cached is not None:
-        cached_tensor = cached.cu_ref() if cached.cu_ref is not None else None
+        cached_tensor = cached.cu_ref()
         if cached_tensor is cu_seqlens:
             return cached.mid_batch, cached.mid_start, cached.mn
         _MID_TENSOR_CACHE.pop(cache_key, None)
@@ -455,14 +451,8 @@ def _get_mid_tensors_cached(
     mid_batch = torch.tensor(mid_batch_host, dtype=torch.long, device=device)
     mid_start = torch.tensor(mid_start_host, dtype=torch.long, device=device)
 
-    cu_ref: weakref.ReferenceType[torch.Tensor] | None = None
-    try:
-        cu_ref = weakref.ref(cu_seqlens)
-    except TypeError:
-        cu_ref = None
-
     _MID_TENSOR_CACHE[cache_key] = _MidTensorCacheEntry(
-        cu_ref=cu_ref,
+        cu_ref=weakref.ref(cu_seqlens),
         mid_batch=mid_batch,
         mid_start=mid_start,
         mn=int(mn),
