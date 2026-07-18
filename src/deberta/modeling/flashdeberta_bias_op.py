@@ -22,7 +22,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     CONSERVATIVE_FLASH_KERNEL_CONFIG,
     FlashKernelContext,
     resolve_flash_kernel_config,
-    resolve_repo_tuned_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
@@ -126,24 +125,27 @@ def _bias_repo_tuned_config(
     """
 
     normalized_kind = str(kind).strip().lower()
-    return resolve_repo_tuned_config(
-        guard=lambda: (
-            normalized_kind in {"fwd", "bwd", "bwd_kv", "bwd_q"}
-            and not causal
-            and dtype in {torch.float16, torch.bfloat16}
-            and head_dim <= 64
-        ),
-        compute_capability=lambda: device_compute_capability(device),
-        route="bias",
-        kind=normalized_kind,
-        seq_len=max(query_len, key_len),
-        batch_size=batch_size,
-        query_len=query_len,
-        key_len=key_len,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        dtype=_kernel_dtype_name(dtype),
-        causal=causal,
+    if (
+        normalized_kind not in {"fwd", "bwd", "bwd_kv", "bwd_q"}
+        or causal
+        or dtype not in {torch.float16, torch.bfloat16}
+        or head_dim > 64
+    ):
+        return None
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=device_compute_capability(device),
+            route="bias",
+            kind=normalized_kind,
+            seq_len=max(query_len, key_len),
+            batch_size=batch_size,
+            query_len=query_len,
+            key_len=key_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=_kernel_dtype_name(dtype),
+            causal=causal,
+        )
     )
 
 

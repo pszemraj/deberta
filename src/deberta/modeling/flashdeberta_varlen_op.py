@@ -32,7 +32,8 @@ except Exception:  # pragma: no cover - optional Triton dependency
 
 from deberta.modeling.flashdeberta_kernel_tuning import (
     CONSERVATIVE_FLASH_KERNEL_CONFIG,
-    resolve_repo_tuned_config,
+    FlashKernelContext,
+    resolve_flash_kernel_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
@@ -186,19 +187,20 @@ def _varlen_repo_tuned_config(
     """
 
     normalized_kind = str(kind).strip().lower()
-    return resolve_repo_tuned_config(
-        guard=lambda: normalized_kind in {"fwd", "bwd_kv", "bwd_q"},
-        compute_capability=lambda: device_compute_capability(device),
-        route=route,
-        kind=normalized_kind,
-        seq_len=seq_len,
-        total_tokens=total_tokens,
-        batch_size=batch_size,
-        head_dim=head_dim,
-        dtype=_kernel_dtype_name(dtype),
-        causal=causal,
-        disentangled=disentangled,
-        att_span=att_span,
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=device_compute_capability(device),
+            route=route,
+            kind=normalized_kind,
+            seq_len=seq_len,
+            total_tokens=total_tokens,
+            batch_size=batch_size,
+            head_dim=head_dim,
+            dtype=_kernel_dtype_name(dtype),
+            causal=causal,
+            disentangled=disentangled,
+            att_span=att_span,
+        )
     )
 
 

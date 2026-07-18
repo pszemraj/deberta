@@ -19,7 +19,8 @@ import torch
 
 from deberta.modeling.flashdeberta_kernel_tuning import (
     CONSERVATIVE_FLASH_KERNEL_CONFIG,
-    resolve_repo_tuned_config,
+    FlashKernelContext,
+    resolve_flash_kernel_config,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
@@ -115,19 +116,20 @@ def _fixed_repo_tuned_config(
     """
 
     normalized_kind = str(kind).strip().lower()
-    return resolve_repo_tuned_config(
-        guard=lambda: normalized_kind in {"fwd", "bwd"},
-        compute_capability=lambda: device_compute_capability(device),
-        route="fixed",
-        kind=normalized_kind,
-        seq_len=max(query_len, key_len),
-        query_len=query_len,
-        key_len=key_len,
-        head_dim=head_dim,
-        dtype=_kernel_dtype_name(dtype),
-        causal=causal,
-        disentangled=disentangled,
-        att_span=att_span,
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=device_compute_capability(device),
+            route="fixed",
+            kind=normalized_kind,
+            seq_len=max(query_len, key_len),
+            query_len=query_len,
+            key_len=key_len,
+            head_dim=head_dim,
+            dtype=_kernel_dtype_name(dtype),
+            causal=causal,
+            disentangled=disentangled,
+            att_span=att_span,
+        )
     )
 
 
