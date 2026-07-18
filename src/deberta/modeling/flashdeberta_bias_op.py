@@ -27,7 +27,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     keep_mask_head_stride,
-    lookup_existing_op_pair,
     strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -1807,24 +1806,12 @@ def _position_bias_backward_from_dense_grad(
 
 
 def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
-    """Register or retrieve the fused position-bias attention custom ops.
+    """Register the fused position-bias attention custom ops.
 
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing = lookup_existing_op_pair(
-        _BIAS_OP_NAMESPACE, _POSITION_BIAS_FWD_OP_NAME, _POSITION_BIAS_BWD_OP_NAME
-    )
-    if existing is not None:
-        return existing
-
-    if (
-        triton is None
-        or _flash_attn_v2_fwd_bias_lowlevel is None
-        or _flash_attn_v2_bwd_bias_lowlevel is None
-        or not hasattr(torch, "library")
-        or not hasattr(torch.library, "custom_op")
-    ):
+    if triton is None or _flash_attn_v2_fwd_bias_lowlevel is None or _flash_attn_v2_bwd_bias_lowlevel is None:
         return None, None
 
     @torch.library.custom_op(

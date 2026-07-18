@@ -32,9 +32,6 @@ from deberta.modeling.flashdeberta_op_utils import (
 from deberta.modeling.flashdeberta_op_utils import (
     optional_triton_jit as _optional_triton_jit,
 )
-from deberta.modeling.flashdeberta_op_utils import (
-    traceable_triton_kernel as _traceable_triton_kernel,
-)
 
 try:  # pragma: no cover - optional Triton dependency
     import triton
@@ -484,8 +481,6 @@ def segment_pack_grad_and_delta_from_padded(
             cu_seqlens=cu_seqlens,
         )
         and out_unpad.device == grad_output.device
-        and hasattr(torch, "library")
-        and hasattr(torch.library, "wrap_triton")
     )
     if not can_use_triton:
         grad_unpad = segment_pack_padded_rows(
@@ -517,7 +512,7 @@ def segment_pack_grad_and_delta_from_padded(
         triton.cdiv(max_len, _SEGMENT_GRAD_DELTA_BLOCK_ROWS),
         int(grad_output.shape[2]),
     )
-    _traceable_triton_kernel(_pack_segment_grad_and_delta_kernel)[grid](
+    torch.library.wrap_triton(_pack_segment_grad_and_delta_kernel)[grid](
         grad_output,
         out_unpad,
         grad_unpad,

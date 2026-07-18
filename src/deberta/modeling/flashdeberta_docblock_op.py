@@ -20,7 +20,6 @@ import torch
 import deberta.modeling.flashdeberta_varlen_op as _varlen_mod
 from deberta.modeling.flashdeberta_op_utils import (
     disentangled_attention_span,
-    lookup_existing_op_pair,
 )
 from deberta.modeling.flashdeberta_packed_backward import (
     PackedBackwardInputs,
@@ -566,20 +565,14 @@ def _docblock_backward_impl(
 
 
 def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
-    """Register or retrieve the opaque doc-block-aware custom ops.
+    """Register the opaque doc-block-aware custom ops.
 
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
 
-    existing = lookup_existing_op_pair(_DOCBLOCK_OP_NAMESPACE, _DOCBLOCK_FWD_OP_NAME, _DOCBLOCK_BWD_OP_NAME)
-    if existing is not None:
-        return existing
-
     if (
         _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is None
         or _varlen_mod._flash_attn_v2_bwd_dise_varlen_lowlevel is None
-        or not hasattr(torch, "library")
-        or not hasattr(torch.library, "custom_op")
     ):
         return None, None
 

@@ -24,7 +24,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     disentangled_attention_span,
-    lookup_existing_op_pair,
     strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -157,9 +156,6 @@ def _fixed_use_triton_op() -> bool:
         and _bwd_preprocess_raw is not None
         and _bwd_kv_dise_kernel_raw is not None
         and _bwd_q_dise_kernel_raw is not None
-        and hasattr(torch, "library")
-        and hasattr(torch.library, "triton_op")
-        and hasattr(torch.library, "wrap_triton")
     )
 
 
@@ -682,14 +678,10 @@ def _fixed_triton_backward_impl(
 
 
 def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
-    """Register or retrieve the compile-visible fixed-length Triton ops.
+    """Register the compile-visible fixed-length Triton ops.
 
     :return tuple[Any | None, Any | None]: Forward and backward custom-op handles.
     """
-
-    existing = lookup_existing_op_pair(_FIXED_OP_NAMESPACE, _FIXED_FWD_OP_NAME, _FIXED_BWD_OP_NAME)
-    if existing is not None:
-        return existing
 
     if not _fixed_use_triton_op():
         return None, None

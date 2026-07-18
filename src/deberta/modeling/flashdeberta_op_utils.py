@@ -72,38 +72,6 @@ TRITON_ROW_COPY_SEGMENT_PACK_STRIDED = 4
 TRITON_ROW_COPY_SEGMENT_UNPACK = 5
 
 
-def lookup_registered_op(namespace: str, name: str) -> Any | None:
-    """Return a previously registered custom op overload, if one exists.
-
-    :param str namespace: Operator namespace.
-    :param str name: Operator name.
-    :return Any | None: Registered overload or ``None``.
-    """
-
-    ns = getattr(torch.ops, namespace, None)
-    if ns is None or not hasattr(ns, name):
-        return None
-    op = getattr(ns, name)
-    return getattr(op, "default", op)
-
-
-def lookup_existing_op_pair(namespace: str, fwd_name: str, bwd_name: str) -> tuple[Any, Any] | None:
-    """Return an already-registered forward/backward custom-op pair, if complete.
-
-    :param str namespace: Operator namespace.
-    :param str fwd_name: Forward operator name.
-    :param str bwd_name: Backward operator name.
-    :return tuple[Any, Any] | None: ``(forward, backward)`` overloads, or ``None``
-        unless both are registered.
-    """
-
-    existing_forward = lookup_registered_op(namespace, fwd_name)
-    existing_backward = lookup_registered_op(namespace, bwd_name)
-    if existing_forward is not None and existing_backward is not None:
-        return existing_forward, existing_backward
-    return None
-
-
 def kernel_dtype_name(dtype: torch.dtype) -> str:
     """Return a compact dtype name for tuning-table matching.
 
@@ -158,21 +126,6 @@ def optional_triton_jit(fn: object) -> object:
     if _triton is None:
         return fn
     return _triton.jit(fn)
-
-
-def traceable_triton_kernel(kernel: object) -> object:
-    """Return a traceable Triton kernel wrapper when PyTorch exposes one.
-
-    :param object kernel: Raw Triton kernel or autotuned wrapper.
-    :return object: Traceable wrapper when available, otherwise ``kernel`` unchanged.
-    """
-
-    if not hasattr(torch, "library") or not hasattr(torch.library, "wrap_triton"):
-        return kernel
-    try:
-        return torch.library.wrap_triton(kernel)
-    except Exception:
-        return kernel
 
 
 @optional_triton_jit
@@ -404,7 +357,7 @@ def launch_triton_row_copy(
         _triton.cdiv(max(1, int(max_rows)), int(block_rows)),
         col_programs,
     )
-    traceable_triton_kernel(_triton_row_copy_kernel)[grid](
+    torch.library.wrap_triton(_triton_row_copy_kernel)[grid](
         *padded_inputs,
         *padded_outputs,
         offsets,

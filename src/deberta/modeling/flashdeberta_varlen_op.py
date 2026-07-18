@@ -37,7 +37,6 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
 from deberta.modeling.flashdeberta_op_utils import (
     device_compute_capability,
     disentangled_attention_span,
-    lookup_existing_op_pair,
     strides_or_zeros,
 )
 from deberta.modeling.flashdeberta_op_utils import (
@@ -166,9 +165,6 @@ def _varlen_use_triton_op() -> bool:
         and _bwd_preprocess_varlen_raw is not None
         and _bwd_kv_dise_kernel_varlen_raw is not None
         and _bwd_q_dise_kernel_varlen_raw is not None
-        and hasattr(torch, "library")
-        and hasattr(torch.library, "triton_op")
-        and hasattr(torch.library, "wrap_triton")
     )
 
 
@@ -704,8 +700,6 @@ def _pack_grad_and_delta_from_padded(
 
     can_use_triton = (
         _TRITON_AVAILABLE
-        and hasattr(torch, "library")
-        and hasattr(torch.library, "wrap_triton")
         and grad_output.device.type == "cuda"
         and out_unpad.device.type == "cuda"
         and seqlens.device == grad_output.device
@@ -1485,19 +1479,13 @@ def _varlen_triton_backward_impl(
 
 
 def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
-    """Register or retrieve compile-visible padded-varlen Triton ops.
+    """Register compile-visible padded-varlen Triton ops.
 
     :return tuple[Any | None, Any | None]: Forward and backward Triton-op handles.
     """
 
     if not _varlen_use_triton_op():
         return None, None
-
-    existing = lookup_existing_op_pair(
-        _VARLEN_OP_NAMESPACE, f"{_VARLEN_FWD_OP_NAME}_triton", f"{_VARLEN_BWD_OP_NAME}_triton"
-    )
-    if existing is not None:
-        return existing
 
     @torch.library.triton_op(
         f"{_VARLEN_OP_NAMESPACE}::{_VARLEN_FWD_OP_NAME}_triton",
