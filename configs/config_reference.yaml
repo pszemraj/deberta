@@ -847,6 +847,7 @@ data:
     # required: optional
     # values: integer >= 1
     # contract: total attempts for transient dataset loading and streaming I/O failures.
+    # HTTP status behavior: retries explicit 429, 500, 502, 503, and 504 responses; any other explicit HTTP status fails immediately.
     # resume behavior: a retried stream is replayed to its last yielded example with the same epoch seed and shard, avoiding duplicates.
     # failure behavior: schema, authentication, and other non-transient errors fail immediately.
     retry_attempts: 3
