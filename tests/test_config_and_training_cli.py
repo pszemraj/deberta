@@ -1008,7 +1008,6 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
     assert meta["flash_attention"]["requested_attention_impl"] == "flash"
     assert meta["flash_attention"]["requested_flash_config"]["force_varlen"] is True
     assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
-    assert meta["flash_attention"]["flashdeberta_distribution_version"] == "0.0.7"
 
 
 def test_build_run_metadata_omits_flash_attention_for_eager_config():

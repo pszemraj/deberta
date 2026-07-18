@@ -75,7 +75,6 @@ from deberta.modeling.flashdeberta_varlen_op import (
     flashdeberta_varlen_import_error,
     flashdeberta_varlen_padded,
 )
-from deberta.modeling.flashdeberta_version import require_flashdeberta_version
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     build_doc_block_mask,
@@ -287,13 +286,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     _warned_reasons: set[str] = set()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize after enforcing the supported FlashDeBERTa package pin.
+        """Initialize the FlashDeBERTa runtime policy.
 
         :param Any args: Positional constructor arguments.
         :param Any kwargs: Keyword constructor arguments.
         """
 
-        require_flashdeberta_version()
         config = args[0] if args else kwargs.get("config")
         self._runtime_config = _runtime_config_from_deberta_config(config)
         configure_flashdeberta_kernel_overrides(self._runtime_config.kernel_overrides_path)

@@ -43,5 +43,5 @@ jobs:
           python-version: "3.11"
       - name: Install flash extra on a clean CPU-only machine
         run: python -m pip install -e '.[flash]'
-      - name: Import package and enforce the flashdeberta version pin
-        run: python -c "import deberta; from deberta.modeling.flashdeberta_version import require_flashdeberta_version; print('flashdeberta', require_flashdeberta_version())"
+      - name: Import package and flash dependency
+        run: python -c "import deberta, flashdeberta"

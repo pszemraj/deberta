@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -66,10 +67,10 @@ def _build_run_metadata(
     if compile_scope_reason is not None:
         meta["compile_scope_reason"] = str(compile_scope_reason)
     if model_cfg is not None and str(model_cfg.hf.attention_impl).strip().lower() == "flash":
-        from deberta.modeling.flashdeberta_version import (
-            flashdeberta_distribution_version,
-            flashdeberta_runtime_version,
-        )
+        try:
+            flashdeberta_version = metadata.version("flashdeberta")
+        except metadata.PackageNotFoundError:
+            flashdeberta_version = None
 
         meta["flash_attention"] = {
             # Routing and eager fallbacks are per batch/call, so this artifact
@@ -77,8 +78,7 @@ def _build_run_metadata(
             # runtime implementation for the whole run.
             "requested_attention_impl": str(model_cfg.hf.attention_impl),
             "requested_flash_config": asdict_without_private(model_cfg.hf.flash),
-            "flashdeberta_version": flashdeberta_runtime_version(),
-            "flashdeberta_distribution_version": flashdeberta_distribution_version(),
+            "flashdeberta_version": flashdeberta_version,
         }
     return meta
 

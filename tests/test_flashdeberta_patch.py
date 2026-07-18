@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import importlib.metadata as importlib_metadata
 import json
 import logging
 import sys
@@ -29,7 +28,6 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> None:
 
     flash_pkg = types.ModuleType("flashdeberta")
     flash_pkg.__path__ = []  # type: ignore[attr-defined]
-    flash_pkg.__version__ = "0.0.7"  # type: ignore[attr-defined]
     ops_pkg = types.ModuleType("flashdeberta.ops")
     ops_pkg.__path__ = []  # type: ignore[attr-defined]
     flash_attention_mod = types.ModuleType("flashdeberta.ops.flash_attention")
@@ -153,15 +151,6 @@ def _install_fake_flashdeberta(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention_varlen", flash_attention_varlen_mod)
     monkeypatch.setitem(sys.modules, "flashdeberta.ops.flash_attention_bias", flash_attention_bias_mod)
 
-    real_version = importlib_metadata.version
-
-    def _fake_distribution_version(name: str) -> str:
-        if str(name) == "flashdeberta":
-            return "0.0.7"
-        return real_version(name)
-
-    monkeypatch.setattr(importlib_metadata, "version", _fake_distribution_version)
-
 
 def _reload_flash_modules() -> types.ModuleType:
     """Reload the FlashDeBERTa adapter to pick up test-time fake imports."""
@@ -257,34 +246,6 @@ def _kernel_tuning_overrides(
         yield override_path
     finally:
         configure_flashdeberta_kernel_overrides(None)
-
-
-def test_flashdeberta_version_guard_accepts_pinned_version(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_flashdeberta(monkeypatch)
-
-    import deberta.modeling.flashdeberta_version as version_mod
-
-    version_mod = importlib.reload(version_mod)
-
-    assert version_mod.flashdeberta_version_error() is None
-    assert version_mod.flashdeberta_runtime_version() == "0.0.7"
-
-
-@pytest.mark.parametrize("installed", [None, "0.0.6"])
-def test_flashdeberta_version_guard_rejects_missing_or_mismatched_distribution(
-    monkeypatch: pytest.MonkeyPatch, installed: str | None
-) -> None:
-    import deberta.modeling.flashdeberta_version as version_mod
-
-    def _distribution_version(_name: str) -> str:
-        if installed is None:
-            raise importlib_metadata.PackageNotFoundError("flashdeberta")
-        return installed
-
-    monkeypatch.setattr(version_mod.metadata, "version", _distribution_version)
-    expected = "metadata was not found" if installed is None else "Unsupported flashdeberta version"
-    with pytest.raises(RuntimeError, match=expected):
-        version_mod.require_flashdeberta_version()
 
 
 def test_flash_cfg_bool_honors_missing_defaults_and_string_values() -> None:
