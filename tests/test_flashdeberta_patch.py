@@ -207,7 +207,6 @@ def _empty_varlen_caches(varlen_mod: types.ModuleType) -> Iterator[None]:
     """Run one cache test with fresh varlen module caches."""
 
     caches = (
-        varlen_mod._MASK_METADATA_CACHE,
         varlen_mod._CU_SEQLENS_HOST_CACHE,
         varlen_mod._MID_TENSOR_CACHE,
     )
@@ -1156,6 +1155,8 @@ def test_flash_attention_varlen_path_dispatches(monkeypatch: pytest.MonkeyPatch)
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask_2d: torch.Tensor,
+        seq_lengths: torch.Tensor | None,
+        active_tokens: torch.Tensor | int | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -1168,6 +1169,8 @@ def test_flash_attention_varlen_path_dispatches(monkeypatch: pytest.MonkeyPatch)
         del (
             key_layer,
             value_layer,
+            seq_lengths,
+            active_tokens,
             pos_key,
             pos_query,
             sm_scale,
@@ -2045,7 +2048,7 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
     fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
-    calls = {"triton": 0, "custom": 0}
+    calls = {"triton": 0}
 
     def _fake_triton_op(*args):
         calls["triton"] += 1
@@ -2055,17 +2058,8 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
             device=args[0].device,
         )
 
-    def _fake_custom_op(*args):
-        calls["custom"] += 1
-        return torch.zeros_like(args[0]), torch.zeros(
-            (args[0].shape[0], args[0].shape[1], args[0].shape[2]),
-            dtype=torch.float32,
-            device=args[0].device,
-        )
-
     monkeypatch.setattr(varlen_mod, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(varlen_mod, "_FLASHDEBERTA_VARLEN_TRITON_OP", _fake_triton_op)
-    monkeypatch.setattr(varlen_mod, "_FLASHDEBERTA_VARLEN_CUSTOM_OP", _fake_custom_op)
 
     with fake_tensor_mod.FakeTensorMode():
         q = torch.empty((1, 4, 2, 8), device="cuda", dtype=torch.bfloat16)
@@ -2089,7 +2083,7 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
     assert output.shape == q.shape
     assert output.dtype == q.dtype
     assert output.device.type == q.device.type
-    assert calls == {"triton": 1, "custom": 0}
+    assert calls == {"triton": 1}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Inductor varlen coverage.")
@@ -2141,75 +2135,21 @@ def test_varlen_triton_op_compiles_with_inductor_and_backpropagates() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
-def test_varlen_metadata_cache_reuses_repeated_mask_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_varlen_mid_tensor_cache_reuses_cu_seqlens() -> None:
     import deberta.modeling.flashdeberta_varlen_op as varlen_mod
 
     with _empty_varlen_caches(varlen_mod):
-        calls = {"count": 0}
-        orig_build = varlen_mod._build_unpad_metadata
-
-        def _counting_build(mask_2d: torch.Tensor):
-            calls["count"] += 1
-            return orig_build(mask_2d)
-
-        monkeypatch.setattr(varlen_mod, "_build_unpad_metadata", _counting_build)
-
-        mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
-        first_entry = varlen_mod._get_unpad_metadata_entry(mask)
-        second_entry = varlen_mod._get_unpad_metadata_entry(mask)
-        clone_entry = varlen_mod._get_unpad_metadata_entry(mask.clone())
-
-        assert calls["count"] == 2
-        assert first_entry.max_seqlen == second_entry.max_seqlen == clone_entry.max_seqlen == 2
-        assert first_entry.seqlens.data_ptr() == second_entry.seqlens.data_ptr()
-        assert first_entry.cu_seqlens.data_ptr() == second_entry.cu_seqlens.data_ptr()
-        assert clone_entry.seqlens.data_ptr() != first_entry.seqlens.data_ptr()
-        assert clone_entry.cu_seqlens.data_ptr() != first_entry.cu_seqlens.data_ptr()
-
-
-def test_varlen_metadata_cache_verifies_storage_identity_on_key_collision(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
-
-    with _empty_varlen_caches(varlen_mod):
-        first_mask = torch.tensor([[True, False, False, False]], dtype=torch.bool)
-        second_mask = torch.tensor([[True, True, True, False]], dtype=torch.bool)
-        shared_key = varlen_mod._mask_metadata_cache_key(first_mask)
-        monkeypatch.setattr(varlen_mod, "_mask_metadata_cache_key", lambda _mask: shared_key)
-
-        first_entry = varlen_mod._get_unpad_metadata_entry(first_mask)
-        second_entry = varlen_mod._get_unpad_metadata_entry(second_mask)
-        repeated_entry = varlen_mod._get_unpad_metadata_entry(second_mask)
-
-        assert first_entry.max_seqlen == first_entry.total_tokens == 1
-        assert second_entry.max_seqlen == second_entry.total_tokens == 3
-        assert torch.equal(second_entry.seqlens, torch.tensor([3], dtype=torch.int32))
-        assert repeated_entry is second_entry
-
-
-def test_varlen_mid_tensor_cache_reuses_registered_cu_seqlens() -> None:
-    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
-
-    with _empty_varlen_caches(varlen_mod):
-        mask = torch.tensor(
-            [
-                [True, True, False, False],
-                [True, False, False, False],
-            ],
-            dtype=torch.bool,
-        )
-        entry = varlen_mod._get_unpad_metadata_entry(mask)
+        cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
 
         first_batch, first_start, first_mn = varlen_mod._get_mid_tensors_cached(
-            cu_seqlens=entry.cu_seqlens,
+            cu_seqlens=cu_seqlens,
             block_m=2,
-            device=entry.cu_seqlens.device,
+            device=cu_seqlens.device,
         )
         second_batch, second_start, second_mn = varlen_mod._get_mid_tensors_cached(
-            cu_seqlens=entry.cu_seqlens,
+            cu_seqlens=cu_seqlens,
             block_m=2,
-            device=entry.cu_seqlens.device,
+            device=cu_seqlens.device,
         )
 
         assert first_mn == second_mn == 2
@@ -4132,53 +4072,6 @@ def test_varlen_repo_tuned_config_uses_density_bucket(monkeypatch: pytest.Monkey
 
     assert sparse_cfg == (64, 32, 2, 4)
     assert long_cfg == (64, 64, 3, 8)
-
-
-def test_varlen_backward_fake_outputs_use_contiguous_padded_layout() -> None:
-    fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
-
-    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
-
-    # Recover the op from the process-global torch.library registry instead of
-    # the module global: earlier fake-package tests can leave the canonical
-    # module imported without ops even though the registered op is live.
-    _, varlen_bwd_op = varlen_mod._build_varlen_custom_ops()
-    if varlen_bwd_op is None:
-        pytest.skip("Compiled varlen custom op is unavailable in this environment.")
-
-    with fake_tensor_mod.FakeTensorMode():
-        q = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
-        k = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
-        v = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
-        grad_out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
-        out = torch.empty((2, 4, 3, 5), device="cuda", dtype=torch.bfloat16)
-        lse = torch.empty((2, 4, 3), device="cuda", dtype=torch.float32)
-        mask = torch.ones((2, 4), device="cuda", dtype=torch.bool)
-        pos_key = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
-        pos_query = torch.empty((2, 3, 4, 7), device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
-
-        _, _, _, dpos_key, dpos_query = varlen_bwd_op(
-            grad_out,
-            q,
-            k,
-            v,
-            mask,
-            out,
-            lse,
-            pos_key,
-            pos_query,
-            1.0,
-            32,
-            128,
-            False,
-        )
-
-    assert dpos_key is not None
-    assert dpos_query is not None
-    assert dpos_key.shape == pos_key.shape
-    assert dpos_query.shape == pos_query.shape
-    assert dpos_key.stride() == (84, 21, 7, 1)
-    assert dpos_query.stride() == (84, 21, 7, 1)
 
 
 def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.MonkeyPatch) -> None:

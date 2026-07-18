@@ -57,9 +57,4 @@ The data pipeline defines the [attention and objective metadata contract](../gui
 
 Dense, unpadded batches take a fast path with no Flash metadata, so no dynamic metadata threads through Dynamo guards.
 
-The padded-varlen custom op uses a `B,S,H,D` internal layout and repo-local prefix-pack Triton
-kernels. Because repo masks use standard prefix padding, active tokens pack and repad directly
-from `seqlens`/`cu_seqlens` instead of generic `nonzero`/`gather`/`index_copy` flows, and the
-backward fuses packed `grad_out` construction with `delta` computation. When profiling unpacked
-runs, expect the remaining cost to be the varlen Triton backward kernel plus the smaller
-prefix pack/unpack kernels, not `aten::index`-style hotspots.
+The compiled padded-varlen Triton op and its eager autograd wrapper use a `B,S,H,D` internal layout and repo-local prefix-pack kernels. Because repo masks use standard prefix padding, active tokens pack and repad directly from `seqlens`/`cu_seqlens` instead of generic `nonzero`/`gather`/`index_copy` flows, and the backward fuses packed `grad_out` construction with `delta` computation. When profiling unpacked runs, expect the remaining cost to be the varlen Triton backward kernel plus the smaller prefix pack/unpack kernels, not `aten::index`-style hotspots.

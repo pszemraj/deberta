@@ -8,8 +8,8 @@ Important behavior
 ------------------
 - Fixed-length flash remains the default path for dense / maskless batches.
 - Varlen flash is used for padded batches when enabled by runtime policy.
-- The padded varlen path now runs through an opaque custom op on CUDA so
-  ``torch.compile`` does not trace into FlashDeBERTa's Python/Triton wrapper.
+- Compiled padded-varlen attention uses a repo-owned Triton op so
+  ``torch.compile`` does not trace into FlashDeBERTa's Python launcher.
 - Pairwise masks still fall back to eager attention for correctness.
 
 Use ``model.hf.attention_impl=flash`` and ``model.hf.flash.*`` for routing and
@@ -107,8 +107,8 @@ def _should_use_varlen(
     training path, the collator already drops all-ones masks, so
     ``attention_mask is None`` is the dense signal and ``attention_mask is not None``
     is the padded signal. When ``torch.compile`` is active we require the
-    opaque custom-op varlen wrapper so Dynamo does not trace into
-    FlashDeBERTa's Python/Triton launcher.
+    compile-visible Triton varlen op so Dynamo does not trace into Python
+    launch setup.
 
     Route policy is shared with the training loop through
     :func:`flash_padding_route`. This fallback only runs when no
@@ -467,6 +467,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         attention_mask: torch.Tensor,
+        flash_meta: FlashBatchMeta | None,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -477,6 +478,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param torch.Tensor attention_mask: Padding-style keep mask.
+        :param FlashBatchMeta | None flash_meta: Optional precomputed padding metadata.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.
@@ -490,6 +492,8 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             key_layer=key_layer,
             value_layer=value_layer,
             attention_mask_2d=mask_2d,
+            seq_lengths=flash_meta.seq_lengths if flash_meta is not None else None,
+            active_tokens=(flash_meta.active_tokens_scalar if flash_meta is not None else None),
             pos_key=pos_key,
             pos_query=pos_query,
             sm_scale=sm_scale,
@@ -855,6 +859,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 key_layer=key_layer,
                 value_layer=value_layer,
                 attention_mask=attention_mask,
+                flash_meta=flash_meta,
                 pos_key=pos_key,
                 pos_query=pos_query,
                 sm_scale=sm_scale,
