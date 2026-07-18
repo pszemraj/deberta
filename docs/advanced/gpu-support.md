@@ -35,8 +35,6 @@ On any other supported CUDA GPU, `model.hf.attention_impl=flash` still runs Flas
   dense batches use the `fixed` route.
 - **Unmatched kernel launch configs use repo-owned deterministic fallbacks**, not upstream FlashDeBERTa heuristics. Capability-specific tuning is still recommended because a conservative tile may run slowly on another architecture.
 
-When the first Flash batch is prepared, a GPU without measured rows logs a one-time warning naming the detected capability and pointing here.
-
 ## Opting into the dense routes on other hardware
 
 The measured routes work on any supported GPU; they are just not the default until measured. Two
@@ -88,6 +86,6 @@ whose bounds exclude the batch length resolves to the ragged fallback instead:
 }
 ```
 
-Use `max_seq_len` and `max_batch_size` bounds that reflect the target GPU's VRAM rather than copying the shipped 32 GiB limits. A same-capability card with more VRAM can raise those bounds with a same-key override row, which outranks the shipped row. Batch preparation warns when a bound keeps a measured capability on the ragged route.
+Use `max_seq_len` and `max_batch_size` bounds that reflect the target GPU's VRAM rather than copying the shipped 32 GiB limits. A same-capability card with more VRAM can raise those bounds with a same-key override row, which outranks the shipped row.
 
 Validate route changes and kernel tiles with the [retuning workflow](flash-attention.md#retuning). Triton launch configurations depend on shared memory, scheduling, and SM count; applying one GPU's tiles globally can fail at launch or regress throughput on another architecture.

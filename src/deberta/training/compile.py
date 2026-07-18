@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 import types
 from collections.abc import Callable
 from typing import Any
@@ -15,12 +14,10 @@ from deberta.config import ModelConfig, _normalize_sdpa_kernel
 from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS, FLASH_SCALAR_BATCH_KEYS
 from deberta.modeling.flash_config import flash_cfg_bool, flash_cfg_get, flash_cfg_optional_int
 from deberta.modeling.flashdeberta_kernel_tuning import (
-    compute_capability_key,
     configure_flashdeberta_kernel_overrides,
     flash_padding_route,
     flash_route_choice,
     flash_seq_bucket,
-    tuned_capability_keys,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.mask_utils import (
@@ -193,149 +190,6 @@ def _flash_route_hint_for_docblock_batch(
     if table_route in {"docblock", "docblock_bias"}:
         return table_route
     return "docblock"
-
-
-def _is_main_process() -> bool:
-    """Check whether this process should emit once-per-process flash notices.
-
-    Launchers (accelerate, torchrun) export ``RANK``; a single-process run has
-    no ``RANK`` and counts as main. This keeps host-side flash warnings from
-    repeating once per rank in distributed training.
-
-    :return bool: True for rank 0 or unlaunched processes.
-    """
-
-    return os.environ.get("RANK", "0").strip() in {"", "0"}
-
-
-_UNTUNED_FLASH_HARDWARE_NOTICED: set[str] = set()
-
-
-def _notice_untuned_flash_hardware_once(device: torch.device) -> None:
-    """Log once per GPU class when flash runs without measured tuning rows.
-
-    :param torch.device device: Device hosting the flash batch.
-    """
-
-    if device.type != "cuda" or not _is_main_process():
-        return
-    key = compute_capability_key(device_compute_capability(device))
-    if key in _UNTUNED_FLASH_HARDWARE_NOTICED:
-        return
-    _UNTUNED_FLASH_HARDWARE_NOTICED.add(key)
-    if key in tuned_capability_keys():
-        return
-    logger.warning(
-        "FlashDeBERTa has no measured tuning rows for %s; flash stays enabled with "
-        "hardware-agnostic route defaults and generic kernel configs. "
-        "See docs/advanced/gpu-support.md to tune this GPU.",
-        key,
-    )
-
-
-_NON_PREFIX_PADDING_FALLBACK_NOTICED = False
-
-
-def _notice_non_prefix_padding_fallback_once() -> None:
-    """Warn once per process when non-prefix padding masks keep batches on eager.
-
-    Batch preparation runs host-side outside compiled graphs, so this is the
-    one fallback signal that survives compiled training; the per-layer
-    fallback warnings are skipped inside compiled forwards by design.
-    """
-
-    global _NON_PREFIX_PADDING_FALLBACK_NOTICED
-    if _NON_PREFIX_PADDING_FALLBACK_NOTICED or not _is_main_process():
-        return
-    _NON_PREFIX_PADDING_FALLBACK_NOTICED = True
-    logger.warning(
-        "FlashDeBERTa batch preparation saw a padding mask with holes or left "
-        "padding; such batches run eager attention (throughput drops for them). "
-        "This is logged once per process; set model.hf.flash.debug_stats=true in "
-        "an uncompiled run to count occurrences."
-    )
-
-
-_DOCBLOCK_ROUTE_NOTICED: set[tuple[str, int, int]] = set()
-
-
-def _notice_docblock_route_once(
-    *,
-    route_hint: str,
-    seq_len: int,
-    batch_size: int,
-    device: torch.device | None,
-    flash_cfg: Any | None = None,
-) -> None:
-    """Log the doc-block route decision once per batch shape.
-
-    Route selection depends on batch shape, so a config change (batch size,
-    sequence length) can silently flip dense ``docblock_bias`` to ragged
-    ``docblock`` and cost the measured speedup. Batch preparation runs
-    host-side outside compiled graphs, so this signal survives compiled
-    training where the per-layer ``model.hf.flash.debug_stats`` counters are
-    no-ops.
-
-    :param str route_hint: Selected doc-block route for this shape.
-    :param int seq_len: Packed sequence length.
-    :param int batch_size: Packed batch size.
-    :param torch.device | None device: Batch device for capability lookup.
-    :param Any | None flash_cfg: Optional resolved flash config for override detection.
-    """
-
-    if not _is_main_process():
-        return
-    key = (str(route_hint), int(seq_len), int(batch_size))
-    if key in _DOCBLOCK_ROUTE_NOTICED:
-        return
-    _DOCBLOCK_ROUTE_NOTICED.add(key)
-    seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
-    compute_capability = device_compute_capability(device) if device is not None else None
-    if route_hint == "docblock_bias":
-        override_bias_seq_len = flash_cfg_optional_int(flash_cfg, name="docblock_bias_seq_len", default=None)
-        if override_bias_seq_len is not None:
-            bounded_route = flash_route_choice(
-                policy="docblock",
-                seq_bucket=seq_bucket,
-                compute_capability=compute_capability,
-                seq_len=int(seq_len),
-                batch_size=int(batch_size),
-            )
-            if bounded_route != "docblock_bias":
-                logger.warning(
-                    "model.hf.flash.docblock_bias_seq_len forces the dense doc-block route "
-                    "for (B=%d, S=%d), a shape the tuning table would keep ragged - the knob "
-                    "bypasses the table's max_batch_size/max_seq_len bounds and the dense "
-                    "route saves a (B,H,S,S) bias for backward. Clear the knob or verify "
-                    "memory headroom for this shape.",
-                    batch_size,
-                    seq_len,
-                )
-                return
-    if route_hint != "docblock_bias":
-        unbounded_route = flash_route_choice(
-            policy="docblock",
-            seq_bucket=seq_bucket,
-            compute_capability=compute_capability,
-        )
-        if unbounded_route == "docblock_bias":
-            logger.warning(
-                "FlashDeBERTa keeps packed doc-block batches (B=%d, S=%d) on the ragged "
-                "'docblock' route: the tuning table's dense row exists for this shape but "
-                "its max_batch_size/max_seq_len bounds exclude the batch (the dense route "
-                "saves a (B,H,S,S) bias for backward). If this GPU has memory headroom, "
-                "raise the row bounds via model.hf.flash.kernel_overrides_path; see "
-                "docs/advanced/gpu-support.md.",
-                batch_size,
-                seq_len,
-            )
-            return
-    logger.info(
-        "FlashDeBERTa doc-block route for packed batches (B=%d, S=%d): %s (logged once per shape).",
-        batch_size,
-        seq_len,
-        route_hint,
-    )
 
 
 def _configure_flash_kernel_overrides_from_cfg(flash_cfg: Any | None) -> None:
@@ -615,7 +469,6 @@ def prepare_flash_attention_batch_metadata(
     flash_enabled = bool(flash_enabled)
     if flash_enabled and btype == "hf_deberta_v2":
         _configure_flash_kernel_overrides_from_cfg(flash_cfg)
-        _notice_untuned_flash_hardware_once(routing_device)
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
@@ -659,14 +512,6 @@ def prepare_flash_attention_batch_metadata(
             flash_cfg=flash_cfg,
             device=routing_device,
         )
-        _notice_docblock_route_once(
-            route_hint=route_hint,
-            seq_len=seq_len,
-            batch_size=batch_size,
-            device=routing_device,
-            flash_cfg=flash_cfg,
-        )
-
         segment_offsets = batch.get("flash_doc_segment_offsets")
         segment_lengths = batch.get("flash_doc_segment_lengths")
         cu_seqlens = batch.get("flash_doc_cu_seqlens")
@@ -819,7 +664,6 @@ def prepare_flash_attention_batch_metadata(
         except ValueError as exc:
             if "right-padded prefix mask" not in str(exc):
                 raise
-            _notice_non_prefix_padding_fallback_once()
             _clear_flash_batch_metadata(batch)
             return batch, None
 

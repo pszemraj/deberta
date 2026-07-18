@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import logging
 import sys
 import types
 import warnings
@@ -889,40 +888,6 @@ def test_flash_route_policy_capability_precedence_and_override_append(tmp_path) 
             == "docblock_bias"
         )
         assert flash_route_choice(policy="docblock", seq_bucket="1024_exact") == "docblock"
-
-
-def test_untuned_flash_hardware_notice_logs_once(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    import deberta.training.compile as compile_mod
-
-    def _notices() -> list[logging.LogRecord]:
-        return [r for r in caplog.records if "no measured tuning rows" in r.getMessage()]
-
-    device = torch.device("cuda", 0)
-    monkeypatch.setattr(compile_mod, "_UNTUNED_FLASH_HARDWARE_NOTICED", set())
-    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (9, 0))
-    with caplog.at_level(logging.WARNING, logger="deberta.training.compile"):
-        compile_mod._notice_untuned_flash_hardware_once(device)
-        compile_mod._notice_untuned_flash_hardware_once(device)
-    assert len(_notices()) == 1
-    assert "sm_90" in _notices()[0].getMessage()
-
-    # Hardware with measured rows stays quiet.
-    caplog.clear()
-    monkeypatch.setattr(compile_mod, "_UNTUNED_FLASH_HARDWARE_NOTICED", set())
-    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
-    with caplog.at_level(logging.WARNING, logger="deberta.training.compile"):
-        compile_mod._notice_untuned_flash_hardware_once(device)
-    assert not _notices()
-
-    # CPU batches (tests, metadata probes) never notice.
-    caplog.clear()
-    monkeypatch.setattr(compile_mod, "_UNTUNED_FLASH_HARDWARE_NOTICED", set())
-    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (9, 0))
-    with caplog.at_level(logging.WARNING, logger="deberta.training.compile"):
-        compile_mod._notice_untuned_flash_hardware_once(torch.device("cpu"))
-    assert not _notices()
 
 
 def test_dense_bucket_index_reuses_native_log_bucket_math(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3346,48 +3311,26 @@ def test_prepare_flash_attention_batch_metadata_respects_force_varlen() -> None:
     assert int(meta.active_tokens_scalar) == 5
 
 
-def test_prepare_flash_metadata_does_not_route_non_prefix_padding_mask_to_flash(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_prepare_flash_metadata_does_not_route_non_prefix_padding_mask_to_flash() -> None:
     """Metadata prep must not bake prefix seq_lengths from a mask with holes."""
 
     import deberta.training.compile as compile_mod
 
-    monkeypatch.setattr(compile_mod, "_NON_PREFIX_PADDING_FALLBACK_NOTICED", False)
     batch = {
         "input_ids": torch.zeros((1, 4), dtype=torch.long),
         "attention_mask": torch.tensor([[True, False, True, False]]),
     }
 
-    with caplog.at_level(logging.WARNING, logger=compile_mod.logger.name):
-        prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
-            batch=batch,
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-        # Batch prep is the one fallback signal that survives compiled
-        # training, so this eager downgrade must be visible by default.
-        assert any("holes or left padding" in record.message for record in caplog.records)
-        caplog.clear()
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch=dict(batch),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-        assert not caplog.records
+    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+    )
 
     assert prepared is batch
     assert meta is None
     assert "flash_seq_lengths" not in prepared
     assert "flash_active_tokens" not in prepared
-
-
-def _docblock_route_notice_batch(*, batch_size: int = 2, seq_len: int = 5) -> dict[str, torch.Tensor]:
-    return {
-        "input_ids": torch.zeros((batch_size, seq_len), dtype=torch.long),
-        "doc_ids": torch.ones((batch_size, seq_len), dtype=torch.long),
-    }
 
 
 def test_bounded_out_docblock_batches_get_the_wildcard_route(
@@ -3420,134 +3363,6 @@ def test_bounded_out_docblock_batches_get_the_wildcard_route(
             compute_capability=None,
         )
         assert bounded_route == wildcard_route == "docblock", (seq_len, batch_size)
-
-
-def test_prepare_flash_metadata_logs_docblock_route_once_per_shape(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Route selection is shape-dependent; the chosen route must be visible once per shape."""
-
-    import deberta.training.compile as compile_mod
-
-    monkeypatch.setattr(compile_mod, "_DOCBLOCK_ROUTE_NOTICED", set())
-    with caplog.at_level(logging.INFO, logger=compile_mod.logger.name):
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-        route_records = [r for r in caplog.records if "doc-block route" in r.message]
-        assert len(route_records) == 1
-        assert "docblock" in route_records[0].getMessage()
-        caplog.clear()
-        # Same shape again: silent. A new shape logs again.
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-        assert not [r for r in caplog.records if "doc-block route" in r.message]
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(batch_size=3),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-        assert [r for r in caplog.records if "doc-block route" in r.message]
-
-
-def test_prepare_flash_metadata_warns_when_bounds_exclude_dense_docblock_route(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A batch bounded out of a measured dense row must say so, not silently go ragged."""
-
-    import deberta.training.compile as compile_mod
-
-    monkeypatch.setattr(compile_mod, "_DOCBLOCK_ROUTE_NOTICED", set())
-    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
-    with caplog.at_level(logging.INFO, logger=compile_mod.logger.name):
-        # sm_120 has a dense docblock_bias row at S=1024 bounded to B<=8, so
-        # B=9 is excluded by bounds rather than unmeasured.
-        _, meta = compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(batch_size=9, seq_len=1024),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-    assert meta is not None
-    assert meta.normalized_route_hint() == "docblock"
-    bound_warnings = [
-        r for r in caplog.records if r.levelno == logging.WARNING and "bounds exclude" in r.message
-    ]
-    assert len(bound_warnings) == 1
-    assert "kernel_overrides_path" in bound_warnings[0].getMessage()
-
-
-def test_prepare_flash_metadata_warns_when_knob_forces_dense_past_table_bounds(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """docblock_bias_seq_len bypasses the table's safety bounds; that must be loud."""
-
-    import deberta.training.compile as compile_mod
-
-    monkeypatch.setattr(compile_mod, "_DOCBLOCK_ROUTE_NOTICED", set())
-    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
-    flash_cfg = {"docblock_bias_seq_len": 1024}
-    with caplog.at_level(logging.INFO, logger=compile_mod.logger.name):
-        # B=9 exceeds the sm_120 dense row's max_batch_size=8, so only the
-        # knob keeps this shape dense.
-        _, meta = compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(batch_size=9, seq_len=1024),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-            flash_cfg=flash_cfg,
-        )
-        assert meta is not None
-        assert meta.normalized_route_hint() == "docblock_bias"
-        knob_warnings = [
-            r for r in caplog.records if r.levelno == logging.WARNING and "docblock_bias_seq_len" in r.message
-        ]
-        assert len(knob_warnings) == 1
-        caplog.clear()
-        # A knob shape the table would choose dense for anyway stays an
-        # info-level route line, not a warning.
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(batch_size=2, seq_len=1024),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-            flash_cfg=flash_cfg,
-        )
-        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert [r for r in caplog.records if "doc-block route" in r.message]
-
-
-def test_flash_route_notices_are_rank_gated(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Non-main ranks must stay silent so notices do not repeat per rank."""
-
-    import deberta.training.compile as compile_mod
-
-    monkeypatch.setattr(compile_mod, "_DOCBLOCK_ROUTE_NOTICED", set())
-    monkeypatch.setattr(compile_mod, "_NON_PREFIX_PADDING_FALLBACK_NOTICED", False)
-    monkeypatch.setenv("RANK", "1")
-    with caplog.at_level(logging.INFO, logger=compile_mod.logger.name):
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch=_docblock_route_notice_batch(),
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-        compile_mod.prepare_flash_attention_batch_metadata(
-            batch={
-                "input_ids": torch.zeros((1, 4), dtype=torch.long),
-                "attention_mask": torch.tensor([[True, False, True, False]]),
-            },
-            backbone_type="hf_deberta_v2",
-            flash_enabled=True,
-        )
-    assert not caplog.records
 
 
 def test_flash_attention_docblock_path_records_stats(monkeypatch: pytest.MonkeyPatch) -> None:
