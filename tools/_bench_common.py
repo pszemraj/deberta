@@ -16,7 +16,7 @@ import statistics
 import sys
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,7 +50,7 @@ from deberta.config import (  # noqa: E402
     resolve_effective_mixed_precision,
 )
 from deberta.data.loading import load_hf_dataset  # noqa: E402
-from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones  # noqa: E402
+from deberta.modeling import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
 from deberta.modeling.flashdeberta_kernel_tuning import (  # noqa: E402
     compute_capability_key,
@@ -66,10 +66,7 @@ from deberta.training.compile import (  # noqa: E402
     prepare_flash_attention_batch_metadata,
 )
 from deberta.training.runtime import _build_train_dataset_and_collator  # noqa: E402
-from deberta.training.steps import (  # noqa: E402
-    _move_batch_to_device,
-    _sync_discriminator_embeddings_if_available,
-)
+from deberta.training.steps import _move_batch_to_device  # noqa: E402
 
 
 def write_profiler_outputs(
@@ -85,22 +82,6 @@ def write_profiler_outputs(
     for device in ("cuda", "cpu"):
         table = averages.table(sort_by=f"self_{device}_time_total", row_limit=int(row_limit))
         (profile_dir / f"key_averages_{device}.txt").write_text(table + "\n", encoding="utf-8")
-
-
-def autocast_context(mixed_precision: str) -> Any:
-    """Return the autocast context matching a mixed-precision mode.
-
-    Mixed precision in this repo is ``bf16`` or ``no``; fp16 is deliberately
-    unsupported, matching the training config contract.
-
-    :param str mixed_precision: Effective mixed-precision mode.
-    :return Any: Autocast context manager (or nullcontext for full precision).
-    """
-
-    normalized = str(mixed_precision).strip().lower()
-    if normalized == "bf16":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    return nullcontext()
 
 
 def device_capability_text(device: torch.device) -> str:
@@ -332,47 +313,6 @@ def build_bf16_backbone(backbone_config: Any, *, device: torch.device) -> Debert
 
     model = DebertaV2Model(backbone_config).to(device=device, dtype=torch.bfloat16)
     model.train()
-    return model
-
-
-def build_rtd_pretrainer(
-    *,
-    cfg: Any,
-    tokenizer: Any,
-    device: torch.device,
-    train_mode: bool = True,
-) -> DebertaV3RTDPretrainer:
-    """Build the full RTD pretrainer with pretrained backbones on one device.
-
-    :param Any cfg: Full training config.
-    :param Any tokenizer: Tokenizer instance.
-    :param torch.device device: Target device.
-    :param bool train_mode: Whether to switch the model into train mode.
-    :return DebertaV3RTDPretrainer: RTD pretrainer model.
-    """
-
-    disc_config, gen_config = build_backbone_configs(
-        model_cfg=cfg.model,
-        tokenizer=tokenizer,
-        max_position_embeddings=int(cfg.data.packing.max_seq_length),
-    )
-    disc_backbone, gen_backbone = build_backbones(
-        model_cfg=cfg.model,
-        disc_config=disc_config,
-        gen_config=gen_config,
-        load_pretrained_weights=True,
-    )
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=disc_backbone,
-        generator_backbone=gen_backbone,
-        disc_config=disc_config,
-        gen_config=gen_config,
-        embedding_sharing=cfg.model.embedding_sharing,
-        additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
-    ).to(device=device)
-    _sync_discriminator_embeddings_if_available(model)
-    if train_mode:
-        model.train()
     return model
 
 
