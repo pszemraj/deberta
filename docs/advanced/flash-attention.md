@@ -47,9 +47,8 @@ shapes without a measured dense policy.
 The ordinary fixed and varlen routes accept only right-padded prefix masks in exact `(B,S)` or
 `(B,1,1,S)` form. Non-prefix masks use eager attention for that call; length mismatches raise.
 The collator derives and verifies `seq_lengths` from the CPU mask before device transfer. Batch
-preparation reconciles any supplied lengths and counters, then carries a static attestation into
-the model. Unattested device masks use eager attention without a tensor-to-Python layout check in
-each layer.
+preparation selects a route from that metadata. Device masks without collator metadata use eager
+attention without a tensor-to-Python layout check in each layer.
 
 Packed doc-block batches accept only metadata prepared through the contract described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking).
 
@@ -57,8 +56,8 @@ Per-call eager fallbacks preserve semantics:
 
 - `output_attentions=true` uses eager attention to return `(B,H,S,S)` probabilities.
 - An explicit `relative_pos` tensor is forwarded through eager attention unchanged.
-- A doc-block fallback requires an explicit pairwise mask or validated segment metadata from which
-  it can rebuild one; it never trusts unattested descriptors or degrades to a padding-only mask.
+- A doc-block fallback requires an explicit pairwise mask or the original compact `doc_ids` from
+  which it can rebuild one; it never degrades to a padding-only mask.
 
 ## Configuration and overrides
 

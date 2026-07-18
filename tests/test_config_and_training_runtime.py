@@ -101,20 +101,23 @@ def _tiny_rtd_config() -> BackboneConfigStub:
     )
 
 
-def test_move_batch_to_device_keeps_shared_cpu_scalars_host_resident() -> None:
-    from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
+def test_move_batch_to_device_moves_flash_metadata_but_keeps_scalars_on_cpu() -> None:
+    from deberta.modeling.mask_utils import FlashBatchMeta
     from deberta.training.steps import _move_batch_to_device
 
     batch = {
-        key: torch.tensor(index, dtype=torch.int32)
-        for index, key in enumerate(CPU_SCALAR_BATCH_KEYS, start=1)
+        "_flash_meta": FlashBatchMeta(
+            seq_lengths=torch.tensor([2], dtype=torch.int32),
+            active_tokens_scalar=torch.tensor(2, dtype=torch.int32),
+        ),
+        "input_ids": torch.ones((1, 2), dtype=torch.long),
+        "ordinary_scalar": torch.tensor(7, dtype=torch.int32),
     }
-    batch["input_ids"] = torch.ones((1, 2), dtype=torch.long)
-    batch["ordinary_scalar"] = torch.tensor(7, dtype=torch.int32)
 
     moved = _move_batch_to_device(batch, torch.device("meta"))
 
-    assert all(moved[key].device.type == "cpu" for key in CPU_SCALAR_BATCH_KEYS)
+    assert moved["_flash_meta"].seq_lengths.device.type == "meta"
+    assert moved["_flash_meta"].active_tokens_scalar.device.type == "cpu"
     assert moved["input_ids"].device.type == "meta"
     assert moved["ordinary_scalar"].device.type == "meta"
 
@@ -1187,10 +1190,10 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             return "dense_hs1"
 
         def _forward_masked_hs0(self, **kwargs):
-            return "masked_hs0", kwargs["flash_meta"].normalized_route_hint()
+            return "masked_hs0", kwargs["flash_meta"].route_hint
 
         def _forward_masked_hs1(self, **kwargs):
-            return "masked_hs1", kwargs["flash_meta"].normalized_route_hint()
+            return "masked_hs1", kwargs["flash_meta"].route_hint
 
         def _forward_resolved(self, **_kwargs):
             raise AssertionError("standard training options must use a compiled entrypoint")

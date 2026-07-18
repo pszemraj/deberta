@@ -50,9 +50,9 @@ specialization changes which kernels launch, not what Dynamo sees.
 
 The data pipeline defines the [attention and objective metadata contract](../guides/data-pipeline.md#cross-document-attention-blocking). Two properties keep it compile-stable:
 
-- Padded fixed/varlen batches carry mask-derived lengths plus a static prefix attestation. Route
-  dispatch reads only that Python-level contract; it does not call `torch.equal`, `.item()`, or
-  `bool(tensor)` in each layer. Device masks without an attestation take the eager route.
+- Padded fixed/varlen batches carry mask-derived lengths from the collator. Route dispatch reads
+  that metadata without calling `torch.equal`, `.item()`, or `bool(tensor)` in each layer. Device
+  masks without collator metadata take the eager route.
 - Ragged doc-block descriptors and objective metadata have fixed shapes. Document-count changes therefore do not recompile the `masked_docblock_*` entrypoints, and the eager RTD head consumes its document context outside the compiled scope.
 
 Dense, unpadded batches take a fast path with no Flash metadata, so no dynamic metadata threads through Dynamo guards.

@@ -21,7 +21,7 @@ DebertaV3ElectraCollator(
 Dynamic MLM masking collator suitable for RTD/ELECTRA-style pretraining.
 
 Produces masked ``input_ids``, MLM ``labels``, and optional attention/token-type tensors.
-Packed doc-block batches carry ``doc_ids``; ``emit_flash_metadata=True`` additionally emits the attested ``flash_*`` fields. See
+Packed doc-block batches carry ``doc_ids``; ``emit_flash_metadata=True`` additionally emits compact Flash routing metadata. See
 [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
 batch-preparation contract.
 

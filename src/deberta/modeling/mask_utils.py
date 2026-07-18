@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from functools import lru_cache
-from typing import Literal
 
 import torch
 
@@ -31,44 +29,22 @@ class FlashBatchMeta:
     :param torch.Tensor | None doc_segment_offsets: Optional flat padded row offsets per doc segment.
     :param torch.Tensor | None doc_segment_lengths: Optional per-segment doc lengths.
     :param torch.Tensor | None doc_cu_seqlens: Optional cumulative packed doc offsets.
-    :param int | None active_tokens_host: Optional host-side active token count.
-    :param int | None doc_num_segments_host: Optional host-side active doc segment count.
-    :param int | None doc_max_segment_length_host: Optional host-side max doc segment length.
+    :param torch.Tensor | None doc_ids: Optional compact document ids for eager fallback.
     :param torch.Tensor | None active_tokens_scalar: Optional CPU scalar active-token tensor for compiled routes.
     :param torch.Tensor | None doc_num_segments_scalar: Optional CPU scalar segment-count tensor for compiled routes.
     :param torch.Tensor | None doc_max_segment_length_scalar: Optional CPU scalar max-segment tensor for compiled routes.
-    :param str | None route_hint: Optional normalized flash route hint.
-    :param Literal["all_active", "prefix", "docblock"] mask_contract: Static mask
-        contract proven by the batch metadata producer.
-    :param bool mask_contract_validated: Whether the mask and all consumed metadata
-        were reconciled before entering the model. Direct construction leaves this
-        false; normal training metadata preparation is responsible for attestation.
+    :param str | None route_hint: Optional flash route hint.
     """
 
     seq_lengths: torch.Tensor | None = None
     doc_segment_offsets: torch.Tensor | None = None
     doc_segment_lengths: torch.Tensor | None = None
     doc_cu_seqlens: torch.Tensor | None = None
-    active_tokens_host: int | None = None
-    doc_num_segments_host: int | None = None
-    doc_max_segment_length_host: int | None = None
+    doc_ids: torch.Tensor | None = None
     active_tokens_scalar: torch.Tensor | None = None
     doc_num_segments_scalar: torch.Tensor | None = None
     doc_max_segment_length_scalar: torch.Tensor | None = None
     route_hint: str | None = None
-    mask_contract: Literal["all_active", "prefix", "docblock"] = "all_active"
-    mask_contract_validated: bool = False
-
-    def normalized_route_hint(self) -> str | None:
-        """Return the normalized route hint.
-
-        :return str | None: Lowercase route hint or ``None``.
-        """
-
-        if self.route_hint is None:
-            return None
-        text = str(self.route_hint).strip().lower()
-        return text if text else None
 
     def is_cross_document(self) -> bool:
         """Return whether this batch carries packed cross-document semantics.
@@ -83,7 +59,8 @@ class FlashBatchMeta:
         """
 
         return (
-            self.normalized_route_hint() in {"docblock", "docblock_bias"}
+            self.route_hint in {"docblock", "docblock_bias"}
+            or self.doc_ids is not None
             or self.doc_segment_offsets is not None
         )
 
@@ -93,11 +70,7 @@ class FlashBatchMeta:
         *,
         non_blocking: bool = False,
     ) -> FlashBatchMeta:
-        """Move kernel-consumed metadata tensors while keeping host scalars on CPU.
-
-        Production training constructs metadata after moving each batch, so
-        this transfer helper primarily serves standalone tools that prepare
-        metadata before selecting their execution device.
+        """Move kernel-consumed metadata tensors while keeping scalar tensors on CPU.
 
         :param torch.device | str device: Destination device.
         :param bool non_blocking: Whether tensor copies may proceed asynchronously.
@@ -123,6 +96,7 @@ class FlashBatchMeta:
             doc_segment_offsets=_move(self.doc_segment_offsets),
             doc_segment_lengths=_move(self.doc_segment_lengths),
             doc_cu_seqlens=_move(self.doc_cu_seqlens),
+            doc_ids=_move(self.doc_ids),
         )
 
 
@@ -239,146 +213,6 @@ def build_validated_prefix_lengths(
     return lengths
 
 
-def validate_doc_segments_against_mask(
-    *,
-    attention_mask: torch.Tensor,
-    segment_offsets: torch.Tensor,
-    segment_lengths: torch.Tensor,
-    seq_len: int,
-    doc_ids: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-) -> None:
-    """Validate flat doc-segment descriptors against authoritative CPU masks.
-
-    The repo stores offsets as flat ``batch_index * seq_len + token_index``
-    values rather than a padded ``(B,max_segments)`` matrix. Active descriptors
-    must form one positive-length prefix, cover every active position exactly
-    once, stay within a single batch row, and agree with document boundaries.
-
-    :param torch.Tensor attention_mask: CPU padding keep mask in ``(B,S)`` form.
-    :param torch.Tensor segment_offsets: Flat CPU segment offsets.
-    :param torch.Tensor segment_lengths: Flat CPU segment lengths with zero tail padding.
-    :param int seq_len: Exact sequence length.
-    :param torch.Tensor | None doc_ids: Optional authoritative document ids.
-    :param torch.Tensor | None cu_seqlens: Optional padded cumulative lengths.
-    :raises ValueError: If descriptors are malformed or disagree with the mask/layout.
-    """
-
-    tensors = {
-        "attention_mask": attention_mask,
-        "segment_offsets": segment_offsets,
-        "segment_lengths": segment_lengths,
-    }
-    if doc_ids is not None:
-        tensors["doc_ids"] = doc_ids
-    if cu_seqlens is not None:
-        tensors["cu_seqlens"] = cu_seqlens
-    for name, tensor in tensors.items():
-        if tensor.device.type != "cpu":
-            raise ValueError(f"{name} must be validated on CPU before document metadata device transfer.")
-
-    keep_mask = mask_to_2d_keep_mask(attention_mask, seq_len=seq_len)
-    if segment_offsets.ndim != 1 or segment_lengths.ndim != 1:
-        raise ValueError(
-            "Document segment offsets and lengths must be flat 1D tensors; "
-            f"got offsets={tuple(segment_offsets.shape)}, lengths={tuple(segment_lengths.shape)}."
-        )
-    if segment_offsets.shape != segment_lengths.shape:
-        raise ValueError(
-            "Document segment offsets and lengths must have identical shapes; "
-            f"got offsets={tuple(segment_offsets.shape)}, lengths={tuple(segment_lengths.shape)}."
-        )
-    if segment_offsets.dtype not in _INTEGER_DTYPES or segment_lengths.dtype not in _INTEGER_DTYPES:
-        raise ValueError("Document segment offsets and lengths must use integer dtypes.")
-    if cu_seqlens is not None and cu_seqlens.dtype not in _INTEGER_DTYPES:
-        raise ValueError("Document cumulative lengths must use an integer dtype.")
-
-    batch_size = int(keep_mask.shape[0])
-    offsets = segment_offsets.to(dtype=torch.int64)
-    lengths = segment_lengths.to(dtype=torch.int64)
-    covered = torch.zeros_like(keep_mask, dtype=torch.bool)
-    if bool((offsets < 0).any().item()) or bool((lengths < 0).any().item()):
-        raise ValueError("Document segment offsets and lengths must be non-negative.")
-    positive = lengths > 0
-    active_segments = int(positive.sum().item())
-    expected_positive = torch.arange(int(lengths.numel())) < active_segments
-    if not torch.equal(positive, expected_positive):
-        raise ValueError("Positive document segments must precede zero-padded descriptors.")
-    if bool(offsets[active_segments:].ne(0).any().item()):
-        raise ValueError("Zero-length document descriptors must have offset=0.")
-    ids = None
-    if doc_ids is not None:
-        if doc_ids.dtype not in _INTEGER_DTYPES:
-            raise ValueError("doc_ids must use an integer dtype.")
-        if doc_ids.ndim != 2 or doc_ids.shape != keep_mask.shape:
-            raise ValueError(
-                "doc_ids must match attention_mask shape; "
-                f"got doc_ids={tuple(doc_ids.shape)}, mask={tuple(keep_mask.shape)}."
-            )
-        ids = doc_ids.to(dtype=torch.long)
-        if not torch.equal(ids.ne(0), keep_mask):
-            raise ValueError("doc_ids liveness disagrees with attention_mask.")
-
-    for segment_idx in range(active_segments):
-        start = int(offsets[segment_idx].item())
-        length = int(lengths[segment_idx].item())
-        row = start // int(seq_len)
-        row_start = start % int(seq_len)
-        row_end = row_start + length
-        if row >= batch_size or row_end > int(seq_len):
-            raise ValueError(
-                f"Document segment exceeds its batch row at segment={segment_idx}: "
-                f"offset={start}, length={length}, batch_size={batch_size}, seq_len={seq_len}."
-            )
-        if bool(covered[row, row_start:row_end].any().item()):
-            raise ValueError(f"Overlapping document segments at segment={segment_idx}.")
-
-        if ids is not None:
-            segment_doc_ids = ids[row, row_start:row_end]
-            doc_id = int(segment_doc_ids[0].item())
-            if doc_id <= 0 or not bool(segment_doc_ids.eq(doc_id).all().item()):
-                raise ValueError(f"Document segment crosses a document boundary at segment={segment_idx}.")
-            if (
-                row_start > 0
-                and bool(keep_mask[row, row_start - 1].item())
-                and int(ids[row, row_start - 1].item()) == doc_id
-            ):
-                raise ValueError(f"Document segment starts inside document {doc_id}.")
-            if (
-                row_end < int(seq_len)
-                and bool(keep_mask[row, row_end].item())
-                and int(ids[row, row_end].item()) == doc_id
-            ):
-                raise ValueError(f"Document segment ends inside document {doc_id}.")
-
-        covered[row, row_start:row_end] = True
-
-    if not torch.equal(covered, keep_mask):
-        missing = int((keep_mask & ~covered).sum().item())
-        extra = int((covered & ~keep_mask).sum().item())
-        raise ValueError(
-            "Document segment descriptors disagree with attention_mask: "
-            f"missing_active_tokens={missing}, included_masked_tokens={extra}."
-        )
-
-    if cu_seqlens is not None:
-        if cu_seqlens.ndim != 1 or int(cu_seqlens.numel()) != int(lengths.numel()) + 1:
-            raise ValueError(
-                "Document cumulative lengths must be flat with one more entry than segment lengths."
-            )
-        expected_cu = torch.zeros_like(cu_seqlens, dtype=torch.int64)
-        if active_segments > 0:
-            expected_cu[1 : active_segments + 1] = torch.cumsum(
-                lengths[:active_segments], dim=0, dtype=torch.int64
-            )
-        actual_cu = cu_seqlens.to(dtype=torch.int64)
-        if not torch.equal(actual_cu, expected_cu):
-            raise ValueError(
-                "Document cumulative lengths disagree with segment lengths: "
-                f"expected={expected_cu.tolist()}, supplied={actual_cu.tolist()}."
-            )
-
-
 def is_pairwise_mask(attention_mask: torch.Tensor, *, query_len: int, key_len: int) -> bool:
     """Return whether a mask encodes per-query pairwise constraints.
 
@@ -459,27 +293,6 @@ def reduce_keep_mask_to_2d(attention_mask: torch.Tensor, *, seq_len: int | None 
     return mask
 
 
-@lru_cache(maxsize=8)
-def _doc_block_cls_key(
-    seq_len: int,
-    device_type: str,
-    device_index: int | None,
-) -> torch.Tensor:
-    """Return the cached fallback-CLS mask for one device shape.
-
-    :param int seq_len: Sequence length.
-    :param str device_type: Torch device type.
-    :param int | None device_index: Optional device index.
-    :return torch.Tensor: CLS key mask.
-    """
-
-    device = torch.device(device_type, device_index)
-    cls_key = torch.zeros((int(seq_len),), dtype=torch.bool, device=device)
-    if int(seq_len) > 0:
-        cls_key[0] = True
-    return cls_key
-
-
 def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     """Build a dense pairwise keep mask from compact document ids.
 
@@ -497,8 +310,9 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     keep = same_doc & active[:, :, None] & active[:, None, :]
 
     seq_len = int(ids.shape[1])
-    cache_key = (seq_len, str(ids.device.type), ids.device.index)
-    cls_key = _doc_block_cls_key(*cache_key)
+    cls_key = torch.zeros((seq_len,), dtype=torch.bool, device=ids.device)
+    if seq_len > 0:
+        cls_key[0] = True
 
     keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
 
@@ -559,73 +373,14 @@ def build_doc_segment_metadata(
     return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, total_tokens
 
 
-def doc_segment_metadata_host_stats(
-    segment_lengths: torch.Tensor,
-    *,
-    active_tokens: int | None = None,
-) -> tuple[int | None, int | None, int | None]:
-    """Return host-side doc-segment stats for already-built metadata.
-
-    :param torch.Tensor segment_lengths: Padded per-segment lengths.
-    :param int | None active_tokens: Optional total active token count.
-    :return tuple[int | None, int | None, int | None]: Active segment count, max segment length, and active tokens.
-    """
-
-    if segment_lengths.device.type != "cpu":
-        return None, None, active_tokens
-    active = segment_lengths[segment_lengths.ne(0)]
-    if int(active.numel()) == 0:
-        return 0, 0, active_tokens
-    return int(active.numel()), int(active.max().item()), active_tokens
-
-
-def doc_ids_from_segments(
-    *,
-    offsets: torch.Tensor,
-    lengths: torch.Tensor,
-    batch_size: int,
-    seq_len: int,
-) -> torch.Tensor:
-    """Reconstruct compact document ids from padded segment descriptors.
-
-    :param torch.Tensor offsets: Flat row offsets for segment starts.
-    :param torch.Tensor lengths: Segment lengths with zero padding.
-    :param int batch_size: Batch size.
-    :param int seq_len: Sequence length.
-    :return torch.Tensor: Reconstructed ``doc_ids`` tensor.
-    """
-
-    doc_ids = torch.zeros((int(batch_size), int(seq_len)), device=offsets.device, dtype=torch.long)
-    active_lengths = lengths.to(dtype=torch.long).clamp_min(0)
-    num_segments = int(active_lengths.count_nonzero().item())
-    if num_segments == 0:
-        return doc_ids
-    active_offsets = offsets[:num_segments].to(dtype=torch.long)
-    active_lengths = active_lengths[:num_segments]
-    for idx in range(num_segments):
-        offset = int(active_offsets[idx].item())
-        length = int(active_lengths[idx].item())
-        if length <= 0:
-            continue
-        row = offset // int(seq_len)
-        start = offset % int(seq_len)
-        end = min(int(seq_len), start + length)
-        if 0 <= row < int(batch_size) and start < end:
-            doc_ids[row, start:end] = int(idx + 1)
-    return doc_ids
-
-
 __all__ = [
     "FlashBatchMeta",
     "build_validated_prefix_lengths",
     "build_doc_block_mask",
     "build_doc_segment_metadata",
-    "doc_segment_metadata_host_stats",
-    "doc_ids_from_segments",
     "expand_keep_mask_to_4d",
     "is_pairwise_mask",
     "mask_to_2d_keep_mask",
     "normalize_keep_mask",
     "reduce_keep_mask_to_2d",
-    "validate_doc_segments_against_mask",
 ]

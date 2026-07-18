@@ -61,7 +61,6 @@ from deberta.modeling.flashdeberta_varlen_op import (
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     build_doc_block_mask,
-    doc_ids_from_segments,
     expand_keep_mask_to_4d,
     is_pairwise_mask,
     is_torch_compiling,
@@ -140,36 +139,21 @@ def _should_use_varlen(
 
 def _resolve_docblock_scalars(
     flash_meta: FlashBatchMeta | None,
-) -> tuple[torch.Tensor | int | None, torch.Tensor | int | None, torch.Tensor | int | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """Resolve doc-block active-token/segment scalars from flash metadata.
 
-    Compiled routes prefer the CPU scalar tensors; eager metadata falls back
-    to host integers.
-
     :param FlashBatchMeta | None flash_meta: Optional flash metadata bundle.
-    :return tuple[torch.Tensor | int | None, torch.Tensor | int | None, torch.Tensor | int | None]:
-        ``(active_tokens, num_segments, max_segment_length)`` as scalar
-        tensors, host ints, or ``None`` per missing field.
+    :return tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        ``(active_tokens, num_segments, max_segment_length)`` as scalar tensors.
     """
 
     if flash_meta is None:
         return None, None, None
-    active_tokens = (
-        flash_meta.active_tokens_scalar
-        if flash_meta.active_tokens_scalar is not None
-        else flash_meta.active_tokens_host
+    return (
+        flash_meta.active_tokens_scalar,
+        flash_meta.doc_num_segments_scalar,
+        flash_meta.doc_max_segment_length_scalar,
     )
-    num_segments = (
-        flash_meta.doc_num_segments_scalar
-        if flash_meta.doc_num_segments_scalar is not None
-        else flash_meta.doc_num_segments_host
-    )
-    max_segment_length = (
-        flash_meta.doc_max_segment_length_scalar
-        if flash_meta.doc_max_segment_length_scalar is not None
-        else flash_meta.doc_max_segment_length_host
-    )
-    return active_tokens, num_segments, max_segment_length
 
 
 @lru_cache(maxsize=8)
@@ -248,22 +232,18 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         query_len = int(query_states.shape[-2])
         key_len = int(hidden_states.shape[-2])
         dropout_p = float(getattr(self.dropout, "p", 0.0))
-        normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
+        route = flash_meta.route_hint if flash_meta is not None else None
 
         if (
             attention_mask is not None
             and is_pairwise_mask(attention_mask, query_len=query_len, key_len=key_len)
-            and normalized_route != "docblock_bias"
+            and route != "docblock_bias"
         ):
             return True
-        if attention_mask is not None:
-            if flash_meta is None or not flash_meta.mask_contract_validated:
-                return True
-            expected_contract = "docblock" if flash_meta.is_cross_document() else "prefix"
-            if flash_meta.mask_contract != expected_contract:
-                return True
-            if expected_contract == "prefix" and flash_meta.seq_lengths is None:
-                return True
+        if attention_mask is not None and (
+            flash_meta is None or (not flash_meta.is_cross_document() and flash_meta.seq_lengths is None)
+        ):
+            return True
         if "p2p" in self.pos_att_type:
             return True
         if self.training and dropout_p > 0.0:
@@ -612,20 +592,14 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
     ) -> torch.Tensor | None:
         """Return an eager-safe attention mask, rebuilding doc-block masks on demand.
 
-        Doc-block batches carry their cross-document blocking in ``flash_meta``
-        (the flash kernels consume segment metadata), so the mask tensor alone
-        may be a compact 2D padding mask. Eager attention only sees the mask
-        tensor; falling back with the compact mask would silently allow
-        cross-document attention. This helper therefore fails closed for
-        doc-block batches: reuse an explicit pairwise mask, rebuild one from
-        complete segment metadata, or raise - never downgrade to a padding mask.
+        Doc-block batches may carry a compact 2D mask for the flash kernels.
+        Eager attention needs the pairwise mask rebuilt from their ``doc_ids``.
 
         :param torch.Tensor | None attention_mask: Original attention mask.
         :param torch.Tensor hidden_states: Key/value hidden states.
         :param torch.Tensor query_states: Query hidden states.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
-        :raises RuntimeError: For a doc-block fallback whose pairwise mask can
-            be neither reused nor rebuilt from segment metadata.
+        :raises RuntimeError: If a doc-block fallback lacks its source ``doc_ids``.
         :return torch.Tensor | None: Eager-compatible attention mask.
         """
 
@@ -645,22 +619,12 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 f"query_len={query_len} != key_len={key_len}; provide an explicit pairwise "
                 "attention_mask."
             )
-        if flash_meta.doc_segment_offsets is None or flash_meta.doc_segment_lengths is None:
+        if flash_meta.doc_ids is None:
             raise RuntimeError(
-                "FlashDeBERTa doc-block eager fallback requires complete doc_segment_offsets/"
-                "doc_segment_lengths metadata or an explicit pairwise doc-block attention_mask. "
-                "Refusing to fall back to a compact 2D padding mask because that would allow "
-                "cross-document attention."
+                "FlashDeBERTa doc-block eager fallback requires doc_ids or an explicit "
+                "pairwise doc-block attention_mask."
             )
-        if not flash_meta.mask_contract_validated or flash_meta.mask_contract != "docblock":
-            raise RuntimeError("FlashDeBERTa doc-block eager fallback refuses unvalidated segment metadata.")
-        doc_ids = doc_ids_from_segments(
-            offsets=flash_meta.doc_segment_offsets,
-            lengths=flash_meta.doc_segment_lengths,
-            batch_size=int(hidden_states.shape[0]),
-            seq_len=key_len,
-        )
-        return build_doc_block_mask(doc_ids).unsqueeze(1)
+        return build_doc_block_mask(flash_meta.doc_ids).unsqueeze(1)
 
     def _eager_forward_fallback(
         self,
@@ -760,16 +724,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
 
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
-        normalized_route = flash_meta.normalized_route_hint() if flash_meta is not None else None
-        use_docblock_bias = normalized_route == "docblock_bias"
-        use_docblock = normalized_route == "docblock"
+        route = flash_meta.route_hint if flash_meta is not None else None
+        use_docblock_bias = route == "docblock_bias"
+        use_docblock = route == "docblock"
         if use_docblock:
             use_varlen = True
         elif use_docblock_bias:
             use_varlen = False
-        elif normalized_route == "varlen":
+        elif route == "varlen":
             use_varlen = True
-        elif normalized_route in {"fixed", "dense", "pairwise"}:
+        elif route in {"fixed", "dense", "pairwise"}:
             use_varlen = False
         else:
             use_varlen = _should_use_varlen(

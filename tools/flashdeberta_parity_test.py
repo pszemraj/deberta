@@ -15,7 +15,6 @@ from deberta.modeling.mask_utils import (  # noqa: E402
     FlashBatchMeta,
     build_doc_block_mask,
     build_doc_segment_metadata,
-    doc_segment_metadata_host_stats,
 )
 
 
@@ -133,6 +132,7 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
     doc_segment_offsets: torch.Tensor | None = None
     doc_segment_lengths: torch.Tensor | None = None
     doc_cu_seqlens: torch.Tensor | None = None
+    doc_ids: torch.Tensor | None = None
     active_tokens: int | None = None
     doc_num_segments: int | None = None
     doc_max_seqlen: int | None = None
@@ -153,10 +153,9 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
                 doc_cu_seqlens,
                 active_tokens,
             ) = build_doc_segment_metadata(doc_ids_cpu)
-            doc_num_segments, doc_max_seqlen, _ = doc_segment_metadata_host_stats(
-                doc_segment_lengths,
-                active_tokens=active_tokens,
-            )
+            active_segment_lengths = doc_segment_lengths[doc_segment_lengths.ne(0)]
+            doc_num_segments = int(active_segment_lengths.numel())
+            doc_max_seqlen = int(active_segment_lengths.max()) if doc_num_segments else 0
             doc_segment_offsets = doc_segment_offsets.to(device=device)
             doc_segment_lengths = doc_segment_lengths.to(device=device)
             doc_cu_seqlens = doc_cu_seqlens.to(device=device)
@@ -171,14 +170,17 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
         doc_segment_offsets=doc_segment_offsets,
         doc_segment_lengths=doc_segment_lengths,
         doc_cu_seqlens=doc_cu_seqlens,
-        active_tokens_host=active_tokens,
-        doc_num_segments_host=doc_num_segments,
-        doc_max_segment_length_host=doc_max_seqlen,
-        route_hint=case.route_hint,
-        mask_contract=(
-            "docblock" if case.docblock else "prefix" if attention_mask is not None else "all_active"
+        doc_ids=doc_ids,
+        active_tokens_scalar=(
+            torch.tensor(active_tokens, dtype=torch.int32) if active_tokens is not None else None
         ),
-        mask_contract_validated=True,
+        doc_num_segments_scalar=(
+            torch.tensor(doc_num_segments, dtype=torch.int32) if doc_num_segments is not None else None
+        ),
+        doc_max_segment_length_scalar=(
+            torch.tensor(doc_max_seqlen, dtype=torch.int32) if doc_max_seqlen is not None else None
+        ),
+        route_hint=case.route_hint,
     )
 
     return {

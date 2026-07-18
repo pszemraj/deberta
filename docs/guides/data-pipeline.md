@@ -48,7 +48,7 @@ The collator also emits two fixed-shape objective tensors for blocked rows:
   gathers that context before LayerNorm, preserving the standalone `LayerNorm(token + CLS)`
   architecture for every packed document.
 
-When FlashDeBERTa is enabled, the collator additionally precomputes fixed-capacity segment descriptors and host statistics before device transfer. It validates exact, non-overlapping segment coverage against `attention_mask` before attesting that metadata. Eager training does not emit the Flash-only fields.
+When FlashDeBERTa is enabled, the collator additionally precomputes fixed-capacity segment descriptors and scalar route inputs before device transfer. Eager training does not emit the Flash-only metadata.
 
 What consumes `doc_ids` depends on the attention path:
 
@@ -59,11 +59,9 @@ What consumes `doc_ids` depends on the attention path:
 
 Batch preparation is a second stage. `prepare_flash_attention_batch_metadata` consumes `doc_ids`,
 chooses the attention route, and either materializes the pairwise mask or packages the collator's
-segment metadata into `FlashBatchMeta`. External consumers must preserve the collator's `flash_*`
-fields, `position_ids`, and `doc_context_index` through device transfer and call this function
-before the forward pass. A device batch that has lost required segment metadata fails rather than
-rebuilding it on the GPU. Preparation consumes the raw Flash fields while leaving the two objective
-tensors in the batch.
+`FlashBatchMeta`. External consumers must preserve `_flash_meta`, `position_ids`, and
+`doc_context_index` through device transfer and call this function before the forward pass.
+Preparation consumes `_flash_meta` while leaving the two objective tensors in the batch.
 
 `attention_mask` is the only token-liveness authority. A token whose numeric ID equals
 `pad_token_id` remains active when its mask value is true, and an arbitrary non-pad filler remains

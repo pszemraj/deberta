@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from deberta.data.batch_contract import CPU_SCALAR_BATCH_KEYS
+from deberta.modeling.mask_utils import FlashBatchMeta
 from deberta.training.loop_utils import (
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
@@ -327,10 +327,6 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[s
     :return dict[str, Any]: Batch placed on ``device``.
     """
     return {
-        k: v
-        if k in CPU_SCALAR_BATCH_KEYS and isinstance(v, torch.Tensor) and v.ndim == 0
-        else v.to(device, non_blocking=True)
-        if isinstance(v, torch.Tensor)
-        else v
+        k: v.to(device, non_blocking=True) if isinstance(v, (torch.Tensor, FlashBatchMeta)) else v
         for k, v in batch.items()
     }

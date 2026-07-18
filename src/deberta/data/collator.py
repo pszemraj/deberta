@@ -11,28 +11,13 @@ from typing import Any
 
 import torch
 
-from deberta.data.batch_contract import FLASH_SCALAR_BATCH_KEYS, HostScalarBatchKey
 from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
     build_doc_segment_metadata,
     build_validated_prefix_lengths,
-    doc_segment_metadata_host_stats,
-    validate_doc_segments_against_mask,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _set_scalar_pair(batch: dict[str, Any], key: HostScalarBatchKey, value: int) -> None:
-    """Store one host integer and its CPU scalar-tensor mirror.
-
-    :param dict[str, Any] batch: Mutable collated batch.
-    :param HostScalarBatchKey key: Paired batch-key contract.
-    :param int value: Scalar value to publish.
-    """
-
-    normalized = int(value)
-    batch[key.host] = normalized
-    batch[key.scalar] = torch.tensor(normalized, dtype=torch.int32)
 
 
 @dataclass
@@ -55,7 +40,7 @@ class DebertaV3ElectraCollator:
 
     Produces masked ``input_ids``, MLM ``labels``, and optional attention/token-type tensors.
     Packed doc-block batches carry ``doc_ids``; ``emit_flash_metadata=True`` additionally emits
-    attested ``flash_*`` fields. See
+    the compact metadata consumed by FlashDeBERTa. See
     [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
     batch-preparation contract.
 
@@ -79,7 +64,7 @@ class DebertaV3ElectraCollator:
         :param MLMConfig cfg: Masking configuration.
         :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
         :param bool block_cross_document_attention: Whether to emit compact document metadata for packed inputs.
-        :param bool emit_flash_metadata: Whether to attest Flash routing metadata.
+        :param bool emit_flash_metadata: Whether to build Flash routing metadata.
         :param int | None pad_to_multiple_of: Optional right-padding multiple.
         """
         self.tokenizer = tokenizer
@@ -121,7 +106,7 @@ class DebertaV3ElectraCollator:
                 "whole-word n-gram masking will degrade to conservative token-level groups."
             )
 
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         self._validate_structural_doc_id_types(features)
         features = self._harmonize_optional_attention_masks(features)
         needs_padding = self._needs_padding(features)
@@ -137,11 +122,6 @@ class DebertaV3ElectraCollator:
             pad_kwargs["return_attention_mask"] = False
         batch = self.tokenizer.pad(features, **pad_kwargs)
 
-        # Flash metadata is an internal attestation created from this collated
-        # batch. Never inherit stale or user-supplied claims from dataset rows.
-        for key in tuple(batch):
-            if key.startswith("flash_"):
-                batch.pop(key)
         batch.pop("doc_context_index", None)
         if self._packed_sequences and self._block_cross_document_attention:
             batch.pop("position_ids", None)
@@ -240,33 +220,18 @@ class DebertaV3ElectraCollator:
         :param torch.Tensor doc_ids: Compact document ids in ``(B,S)`` layout.
         """
 
-        attention_mask = batch.get("attention_mask")
-        keep_mask = (
-            attention_mask.to(dtype=torch.bool)
-            if isinstance(attention_mask, torch.Tensor)
-            else torch.ones_like(doc_ids, dtype=torch.bool)
-        )
         segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(doc_ids)
-        validate_doc_segments_against_mask(
-            attention_mask=keep_mask,
-            segment_offsets=segment_offsets,
-            segment_lengths=segment_lengths,
-            seq_len=int(doc_ids.shape[-1]),
-            doc_ids=doc_ids,
-            cu_seqlens=cu_seqlens,
+        active_segment_lengths = segment_lengths[segment_lengths.ne(0)]
+        num_segments = int(active_segment_lengths.numel())
+        max_segment_length = int(active_segment_lengths.max()) if num_segments else 0
+        batch["_flash_meta"] = FlashBatchMeta(
+            doc_segment_offsets=segment_offsets,
+            doc_segment_lengths=segment_lengths,
+            doc_cu_seqlens=cu_seqlens,
+            active_tokens_scalar=torch.tensor(active_tokens, dtype=torch.int32),
+            doc_num_segments_scalar=torch.tensor(num_segments, dtype=torch.int32),
+            doc_max_segment_length_scalar=torch.tensor(max_segment_length, dtype=torch.int32),
         )
-        num_segments, max_segment_length, _ = doc_segment_metadata_host_stats(
-            segment_lengths,
-            active_tokens=int(active_tokens),
-        )
-        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.active_tokens, active_tokens)
-        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.doc_num_segments, num_segments)
-        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.doc_max_seqlen, max_segment_length)
-        batch["flash_doc_segment_offsets"] = segment_offsets
-        batch["flash_doc_segment_lengths"] = segment_lengths
-        batch["flash_doc_cu_seqlens"] = cu_seqlens
-        batch["flash_mask_contract"] = "docblock"
-        batch["flash_mask_contract_validated"] = True
 
     def _attach_document_objective_metadata(
         self,
@@ -331,7 +296,7 @@ class DebertaV3ElectraCollator:
             return
         if attention_mask.shape != batch["input_ids"].shape:
             raise ValueError(
-                "attention_mask must match input_ids before flash metadata is attested; "
+                "attention_mask must match input_ids before flash metadata is built; "
                 f"got mask={tuple(attention_mask.shape)}, "
                 f"input_ids={tuple(batch['input_ids'].shape)}."
             )
@@ -342,15 +307,15 @@ class DebertaV3ElectraCollator:
             )
         except ValueError as exc:
             # Arbitrary legal keep masks remain eager. Do not publish a lossy
-            # length summary or an attestation for them.
+            # length summary for them.
             if "right-padded prefix mask" not in str(exc):
                 raise
             return
         active_tokens = int(seq_lengths.sum(dtype=torch.int32))
-        batch["flash_seq_lengths"] = seq_lengths
-        _set_scalar_pair(batch, FLASH_SCALAR_BATCH_KEYS.active_tokens, active_tokens)
-        batch["flash_mask_contract"] = "prefix"
-        batch["flash_mask_contract_validated"] = True
+        batch["_flash_meta"] = FlashBatchMeta(
+            seq_lengths=seq_lengths,
+            active_tokens_scalar=torch.tensor(active_tokens, dtype=torch.int32),
+        )
 
     def _harmonize_optional_attention_masks(self, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Ensure optional ``attention_mask`` keys are consistent before tokenizer padding.

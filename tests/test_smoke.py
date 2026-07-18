@@ -568,10 +568,11 @@ def test_collator_emits_document_ids_when_packed():
     assert doc_ids[0, 3].item() == doc_ids[0, 5].item()
     # Cross-document ids differ.
     assert doc_ids[0, 1].item() != doc_ids[0, 3].item()
-    assert batch["flash_active_tokens"] == 6
-    assert torch.equal(batch["flash_doc_segment_offsets"][:2], torch.tensor([0, 3], dtype=torch.int32))
-    assert torch.equal(batch["flash_doc_segment_lengths"][:2], torch.tensor([3, 3], dtype=torch.int32))
-    assert torch.equal(batch["flash_doc_cu_seqlens"][:3], torch.tensor([0, 3, 6], dtype=torch.int32))
+    flash_meta = batch["_flash_meta"]
+    assert int(flash_meta.active_tokens_scalar) == 6
+    assert torch.equal(flash_meta.doc_segment_offsets[:2], torch.tensor([0, 3], dtype=torch.int32))
+    assert torch.equal(flash_meta.doc_segment_lengths[:2], torch.tensor([3, 3], dtype=torch.int32))
+    assert torch.equal(flash_meta.doc_cu_seqlens[:3], torch.tensor([0, 3, 6], dtype=torch.int32))
     assert torch.equal(batch["position_ids"], torch.tensor([[0, 1, 2, 0, 1, 2]]))
     assert torch.equal(batch["doc_context_index"], torch.tensor([[0, 0, 0, 3, 3, 3]]))
 
@@ -666,16 +667,15 @@ def _assert_active_token_definitions_agree(batch, *, expected_active: int) -> No
     assert int(rtd_loss_active.sum().item()) == expected_active
     assert torch.equal(rtd_loss_active, batch["doc_ids"].ne(0))
 
-    # Flash prep derives its count through segment metadata (a structurally
-    # different algorithm from .ne(0).sum()), so pin it explicitly too.
+    # Flash prep consumes the collator's active-token count.
     prepared, meta = prepare_flash_attention_batch_metadata(
         batch=dict(batch),
         backbone_type="hf_deberta_v2",
         flash_enabled=True,
     )
     assert meta is not None
-    assert not any(key.startswith("flash_") for key in prepared)
-    assert int(meta.active_tokens_host) == expected_active
+    assert "_flash_meta" not in prepared
+    assert int(meta.active_tokens_scalar) == expected_active
     assert torch.equal(prepared["position_ids"], batch["position_ids"])
     assert torch.equal(prepared["doc_context_index"], batch["doc_context_index"])
 
@@ -781,29 +781,7 @@ def test_packed_document_ids_follow_attention_mask_not_token_values():
 
     assert batch["doc_ids"][0, 2].item() != 0
     assert batch["doc_ids"][0, 7].item() == 0
-    assert batch["flash_active_tokens"] == 7
-
-
-def test_collator_replaces_dataset_flash_metadata_with_its_own_attestation():
-    """Dataset columns cannot attest a mask contract on the collator's behalf."""
-
-    coll = DebertaV3ElectraCollator(
-        tokenizer=DummyTokenizer(vocab_size=128),
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-    )
-    batch = coll(
-        [
-            {
-                "input_ids": [1, 11, 12, 2],
-                "attention_mask": [1, 0, 1, 0],
-                "special_tokens_mask": [1, 0, 0, 1],
-                "flash_seq_lengths": [3, 0, 0, 0],
-                "flash_mask_contract_validated": [1, 1, 1, 1],
-            }
-        ]
-    )
-
-    assert not any(key.startswith("flash_") for key in batch)
+    assert int(batch["_flash_meta"].active_tokens_scalar) == 7
 
 
 def test_build_doc_block_mask_matches_expected_structure():
@@ -1153,8 +1131,9 @@ def test_collator_handles_mixed_attention_mask_keys():
         assert "attention_mask" in batch
         assert batch["attention_mask"].shape == batch["input_ids"].shape
         assert (batch["attention_mask"] == 0).any()
-        assert torch.equal(batch["flash_seq_lengths"].sort().values, torch.tensor([3, 4], dtype=torch.int32))
-        assert batch["flash_active_tokens"] == 7
+        flash_meta = batch["_flash_meta"]
+        assert torch.equal(flash_meta.seq_lengths.sort().values, torch.tensor([3, 4], dtype=torch.int32))
+        assert int(flash_meta.active_tokens_scalar) == 7
 
 
 def test_collator_infers_special_tokens_mask_when_missing():
@@ -1570,7 +1549,7 @@ def test_rope_pretrainer_ignores_flash_metadata_boundary():
     labels[:, 2] = input_ids[:, 2]
     flash_meta = FlashBatchMeta(
         seq_lengths=torch.tensor([8, 7], dtype=torch.int32),
-        active_tokens_host=15,
+        active_tokens_scalar=torch.tensor(15, dtype=torch.int32),
         route_hint="fixed",
     )
 
@@ -1651,7 +1630,7 @@ def test_pretrainer_generator_phase_gates_flash_metadata_for_base_signature_back
         attention_mask=torch.ones_like(input_ids),
         flash_meta=FlashBatchMeta(
             seq_lengths=torch.tensor([6, 6], dtype=torch.int32),
-            active_tokens_host=12,
+            active_tokens_scalar=torch.tensor(12, dtype=torch.int32),
             route_hint="fixed",
         ),
     )
@@ -1917,9 +1896,9 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
         doc_segment_offsets=flash_doc_segment_offsets,
         doc_segment_lengths=flash_doc_segment_lengths,
         doc_cu_seqlens=flash_doc_cu_seqlens,
-        active_tokens_host=3,
-        doc_num_segments_host=2,
-        doc_max_segment_length_host=2,
+        active_tokens_scalar=torch.tensor(3, dtype=torch.int32),
+        doc_num_segments_scalar=torch.tensor(2, dtype=torch.int32),
+        doc_max_segment_length_scalar=torch.tensor(2, dtype=torch.int32),
         route_hint="docblock_bias",
     )
 
@@ -1935,14 +1914,14 @@ def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
     assert tuple(masked.shape) == (1, 4)
     seen_meta = last_layer.seen["flash_meta"]
     assert isinstance(seen_meta, FlashBatchMeta)
-    assert seen_meta.normalized_route_hint() == "docblock_bias"
+    assert seen_meta.route_hint == "docblock_bias"
     assert torch.equal(seen_meta.seq_lengths, flash_seq_lengths)
     assert torch.equal(seen_meta.doc_segment_offsets, flash_doc_segment_offsets)
     assert torch.equal(seen_meta.doc_segment_lengths, flash_doc_segment_lengths)
     assert torch.equal(seen_meta.doc_cu_seqlens, flash_doc_cu_seqlens)
-    assert seen_meta.active_tokens_host == 3
-    assert seen_meta.doc_num_segments_host == 2
-    assert seen_meta.doc_max_segment_length_host == 2
+    assert int(seen_meta.active_tokens_scalar) == 3
+    assert int(seen_meta.doc_num_segments_scalar) == 2
+    assert int(seen_meta.doc_max_segment_length_scalar) == 2
 
 
 def test_masked_lm_head_has_only_tied_projection_bias():
@@ -2257,9 +2236,6 @@ def test_rtd_head_requires_per_document_cls_for_docblock_flash_meta():
         doc_segment_offsets=torch.tensor([0, 2, 4, 6], dtype=torch.int32),
         doc_segment_lengths=torch.tensor([2, 2, 2, 2], dtype=torch.int32),
         doc_cu_seqlens=torch.tensor([0, 2, 4, 6, 8], dtype=torch.int32),
-        active_tokens_host=8,
-        doc_num_segments_host=4,
-        doc_max_segment_length_host=2,
         route_hint="docblock",
     )
 
@@ -2617,7 +2593,6 @@ def test_flash_batch_meta_is_cross_document_predicate():
     assert FlashBatchMeta(route_hint="varlen").is_cross_document() is False
     assert FlashBatchMeta(route_hint="docblock").is_cross_document() is True
     assert FlashBatchMeta(route_hint="docblock_bias").is_cross_document() is True
-    assert FlashBatchMeta(route_hint=" DOCBLOCK ").is_cross_document() is True
     assert (
         FlashBatchMeta(doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32)).is_cross_document()
         is True

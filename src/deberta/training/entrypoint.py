@@ -1313,12 +1313,12 @@ def run_pretraining(
             return window, gen_window_tokens_per_rank, disc_window_tokens_per_rank
 
         def _prepare_training_batch(
-            batch: dict[str, torch.Tensor],
-        ) -> tuple[dict[str, torch.Tensor], Any | None]:
+            batch: dict[str, Any],
+        ) -> tuple[dict[str, Any], Any | None]:
             """Move one batch and attach compile-stable flash metadata.
 
-            :param dict[str, torch.Tensor] batch: Host-side collated training batch.
-            :return tuple[dict[str, torch.Tensor], Any | None]: Device batch and flash metadata.
+            :param dict[str, Any] batch: Host-side collated training batch.
+            :return tuple[dict[str, Any], Any | None]: Device batch and flash metadata.
             """
 
             prepared = _move_batch_to_device(batch, accelerator.device)

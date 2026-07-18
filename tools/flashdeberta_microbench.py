@@ -30,6 +30,7 @@ import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
 
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
+from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import prepare_flash_attention_batch_metadata  # noqa: E402
 
 
@@ -109,6 +110,12 @@ def main() -> None:
     batch = _build_batch(args, device=torch.device("cpu"), pad_token_id=int(cfg.pad_token_id))
     active_tokens_per_batch = int(batch["active_tokens_per_batch"])
     slot_tokens_per_batch = int(batch["slot_tokens_per_batch"])
+    attention_mask = batch.get("attention_mask")
+    if isinstance(attention_mask, torch.Tensor):
+        batch["_flash_meta"] = FlashBatchMeta(
+            seq_lengths=attention_mask.sum(dim=-1, dtype=torch.int32),
+            active_tokens_scalar=torch.tensor(active_tokens_per_batch, dtype=torch.int32),
+        )
     batch, flash_meta = prepare_flash_attention_batch_metadata(
         batch=batch,
         backbone_type="hf_deberta_v2",

@@ -448,7 +448,7 @@ def sample_flash_batches(
             flash_enabled=True,
             flash_cfg=getattr(model_cfg.hf, "flash", None),
         )
-        flash_route_hint = flash_meta.normalized_route_hint() if flash_meta is not None else None
+        flash_route_hint = flash_meta.route_hint if flash_meta is not None else None
         if flash_route_hint not in route_hints:
             continue
         attention_mask = batch.get("attention_mask")
@@ -459,8 +459,8 @@ def sample_flash_batches(
         seq_len = int(input_ids.shape[-1])
         batch_size = int(input_ids.shape[0])
         active_tokens = (
-            int(flash_meta.active_tokens_host)
-            if flash_meta is not None and flash_meta.active_tokens_host is not None
+            int(flash_meta.active_tokens_scalar)
+            if flash_meta is not None and flash_meta.active_tokens_scalar is not None
             else batch_size * seq_len
         )
 
