@@ -271,7 +271,7 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     configure_flashdeberta_kernel_overrides(None)
 
     bucket = flash_seq_bucket(seq_len=2048, total_tokens=3000, batch_size=2)
-    assert bucket == "2048_medium"
+    assert bucket == "2048_plus"
     assert flash_route_choice(policy="padding", seq_bucket=bucket) == "varlen"
     # Dense doc-block is the measured sm_120 default; other hardware and
     # capability-blind callers get the conservative ragged route.
@@ -281,10 +281,9 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
         == "docblock_bias"
     )
     assert (
-        flash_route_choice(policy="docblock", seq_bucket=docblock_bucket, compute_capability=(9, 0))
-        == "docblock"
+        flash_route_choice(policy="docblock", seq_bucket=docblock_bucket, compute_capability=(9, 0)) is None
     )
-    assert flash_route_choice(policy="docblock", seq_bucket=docblock_bucket) == "docblock"
+    assert flash_route_choice(policy="docblock", seq_bucket=docblock_bucket) is None
     assert resolve_flash_kernel_config(
         FlashKernelContext(
             compute_capability=(12, 0),
@@ -480,7 +479,7 @@ def test_flashdeberta_kernel_tuning_override_path_wins(tmp_path) -> None:
                     "compute_capability": "sm_120",
                     "route": "varlen",
                     "kind": "bwd_kv",
-                    "seq_bucket": "2048_medium",
+                    "seq_bucket": "2048_plus",
                     "head_dim": 64,
                     "block_m": 16,
                     "block_n": 32,
@@ -521,7 +520,7 @@ def test_flash_kernel_config_capability_precedence_and_override_append(tmp_path)
                 {
                     "route": "varlen",
                     "kind": "bwd_kv",
-                    "seq_bucket": "2048_medium",
+                    "seq_bucket": "2048_plus",
                     "head_dim": "*",
                     "block_m": 16,
                     "block_n": 16,
@@ -546,7 +545,7 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         tmp_path,
         {
             "route_policies": {
-                "padding": [{"seq_bucket": "2048_medium", "choice": "fixed"}],
+                "padding": [{"seq_bucket": "2048_plus", "choice": "fixed"}],
                 "docblock": [{"seq_bucket": "1024_exact", "choice": "docblock"}],
             }
         },
@@ -560,14 +559,10 @@ def test_flash_padding_route_honors_policy_row_seq_len_bounds(tmp_path) -> None:
 
     with _kernel_tuning_overrides(
         tmp_path,
-        {
-            "route_policies": {
-                "padding": [{"seq_bucket": "under_2048", "choice": "varlen", "max_seq_len": 1024}]
-            }
-        },
+        {"route_policies": {"padding": [{"seq_bucket": "default", "choice": "varlen", "max_seq_len": 1024}]}},
     ):
-        # Both lengths resolve to the under_2048 bucket (1024 itself would
-        # match 1024_exact); only the in-bound length may take the row.
+        # Both lengths resolve to the default bucket; only the in-bound length
+        # may take the row.
         assert flash_padding_route(seq_len=512, total_tokens=512, batch_size=1) == "varlen"
         # Beyond the row's own bound the row must not apply; the resolver
         # falls back to the conservative default instead.
@@ -579,11 +574,7 @@ def test_flash_padding_route_honors_policy_row_batch_size_bounds(tmp_path) -> No
 
     with _kernel_tuning_overrides(
         tmp_path,
-        {
-            "route_policies": {
-                "padding": [{"seq_bucket": "under_2048", "choice": "varlen", "max_batch_size": 2}]
-            }
-        },
+        {"route_policies": {"padding": [{"seq_bucket": "default", "choice": "varlen", "max_batch_size": 2}]}},
     ):
         assert flash_padding_route(seq_len=512, total_tokens=1024, batch_size=2) == "varlen"
         # Past the row's batch bound the row must not apply, mirroring the
@@ -598,11 +589,10 @@ def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
         tmp_path,
         {"seq_buckets": [{"name": "exact_3000", "min_seq_len": 3000, "max_seq_len": 3000}]},
     ):
-        # The shipped buckets cover every length, so the override bucket is
+        # The shipped 2048 bucket also covers this length, so the override is
         # only reachable if override rows are consulted first.
         assert flash_seq_bucket(seq_len=3000) == "exact_3000"
-        # Shipped resolution order is untouched for lengths the override
-        # does not claim: 1024 must keep matching 1024_exact, not under_2048.
+        # Shipped resolution order is untouched for lengths the override does not claim.
         assert flash_seq_bucket(seq_len=1024) == "1024_exact"
         assert flash_seq_bucket(seq_len=4096) == "4096_plus"
 
@@ -725,10 +715,9 @@ def test_flash_route_policy_capability_precedence_and_override_append(tmp_path) 
             flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(12, 0))
             == "docblock_bias"
         )
-        # Hardware without an exact row still resolves the shipped wildcard.
+        # Hardware without an exact row leaves routing to the consumer default.
         assert (
-            flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(8, 0))
-            == "docblock"
+            flash_route_choice(policy="docblock", seq_bucket="1024_exact", compute_capability=(8, 0)) is None
         )
 
     # An appended wildcard row must not outrank the shipped exact sm_120 row.
@@ -2884,38 +2873,6 @@ def test_prepare_flash_metadata_does_not_route_non_prefix_padding_mask_to_flash(
     assert meta is None
 
 
-def test_bounded_out_docblock_batches_get_the_wildcard_route(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bounded-out shapes must resolve exactly like hardware with no measured rows.
-
-    A bounded-out exact-capability row returns None from the table and the
-    consumer falls back to a hardcoded ragged default. Nothing in the code
-    forces that default to match the table's wildcard rows, so pin the
-    equality here: if a wildcard docblock row's choice ever changes, the
-    fallback must be revisited rather than silently diverging.
-    """
-
-    import deberta.training.compile as compile_mod
-    from deberta.modeling.flashdeberta_kernel_tuning import flash_route_choice, flash_seq_bucket
-
-    monkeypatch.setattr(compile_mod, "device_compute_capability", lambda _device: (12, 0))
-    # One out-of-bound shape per density-less bucket with a bounded sm_120
-    # dense row: B=9 exceeds 1024_exact's cap, B=3 exceeds the 2048/4096 caps.
-    for seq_len, batch_size in [(1024, 9), (2048, 3), (4096, 3)]:
-        bounded_route = compile_mod._flash_route_hint_for_docblock_batch(
-            seq_len=seq_len,
-            batch_size=batch_size,
-            device=torch.device("cpu"),
-        )
-        wildcard_route = flash_route_choice(
-            policy="docblock",
-            seq_bucket=flash_seq_bucket(seq_len=seq_len),
-            compute_capability=None,
-        )
-        assert bounded_route == wildcard_route == "docblock", (seq_len, batch_size)
-
-
 def test_flash_attention_docblock_path_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     attention_mod, attention, cfg = _flash_attention_harness(monkeypatch)
     monkeypatch.setattr(
@@ -4445,7 +4402,7 @@ def test_specialized_docblock_bias_backward_enables_new_seq_len_from_table(tmp_p
                 {
                     "route": "bias_docblock_specialized",
                     "kind": "bwd",
-                    "seq_bucket": "under_2048",
+                    "seq_bucket": "default",
                     "query_len": 512,
                     "key_len": 512,
                     "head_dim": 64,
