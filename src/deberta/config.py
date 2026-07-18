@@ -313,8 +313,6 @@ class DataSourceConfig:
     text_column_name: str = field(default="text")
     streaming: bool = field(default=True)
     shuffle_buffer_size: int = field(default=10_000)
-    retry_attempts: int = field(default=3)
-    retry_backoff_seconds: float = field(default=1.0)
 
 
 @dataclass(frozen=True)
@@ -1157,10 +1155,6 @@ def validate_data_config(cfg: DataConfig) -> None:
         raise ValueError("data.packing.max_seq_length must be >= 8 for pretraining.")
     if int(src.shuffle_buffer_size) < 0:
         raise ValueError("data.source.shuffle_buffer_size must be >= 0.")
-    if int(src.retry_attempts) < 1:
-        raise ValueError("data.source.retry_attempts must be >= 1.")
-    if not math.isfinite(float(src.retry_backoff_seconds)) or float(src.retry_backoff_seconds) < 0.0:
-        raise ValueError("data.source.retry_backoff_seconds must be finite and >= 0.")
     if not bool(src.streaming) and int(src.shuffle_buffer_size) not in {0, 1}:
         raise ValueError(
             "data.source.shuffle_buffer_size must be 0 or 1 when data.source.streaming=false "

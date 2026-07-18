@@ -443,8 +443,6 @@ def _build_train_dataset_and_collator(
             seed=train_cfg.seed,
             shuffle_buffer_size=data_cfg.source.shuffle_buffer_size,
             block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
-            retry_attempts=data_cfg.source.retry_attempts,
-            retry_backoff_seconds=data_cfg.source.retry_backoff_seconds,
         ),
         process_index=process_index,
         num_processes=num_processes,

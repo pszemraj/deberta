@@ -35,20 +35,17 @@ def load_hf_dataset(cfg: DataConfig) -> Any:
         :return Any: Retry callback.
         """
 
-        def _notice(attempt: int, delay: float, exc: BaseException) -> None:
+        def _notice(attempt: int, exc: BaseException) -> None:
             """Log one transient dataset retry.
 
             :param int attempt: Failed attempt number.
-            :param float delay: Delay before retrying.
             :param BaseException exc: Transient failure.
             :return None: None.
             """
             logger.warning(
-                "%s failed transiently (attempt %d/%d, retry in %.1fs): %s",
+                "%s failed transiently after attempt %d; retrying: %s",
                 label,
                 attempt,
-                source.retry_attempts,
-                delay,
                 exc,
             )
 
@@ -62,8 +59,6 @@ def load_hf_dataset(cfg: DataConfig) -> Any:
             )
         ds = call_with_dataset_retry(
             lambda: datasets.load_from_disk(source.load_from_disk),
-            attempts=source.retry_attempts,
-            backoff_seconds=source.retry_backoff_seconds,
             on_retry=_retry_notice("Dataset load_from_disk"),
         )
         # Support DatasetDict
@@ -89,8 +84,6 @@ def load_hf_dataset(cfg: DataConfig) -> Any:
             load_kwargs["data_files"] = files
         return call_with_dataset_retry(
             lambda: datasets.load_dataset(source.dataset_name, **load_kwargs),
-            attempts=source.retry_attempts,
-            backoff_seconds=source.retry_backoff_seconds,
             on_retry=_retry_notice("Dataset load"),
         )
 
@@ -102,8 +95,6 @@ def load_hf_dataset(cfg: DataConfig) -> Any:
                 split=source.train_split,
                 streaming=source.streaming,
             ),
-            attempts=source.retry_attempts,
-            backoff_seconds=source.retry_backoff_seconds,
             on_retry=_retry_notice("Text dataset load"),
         )
 

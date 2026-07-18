@@ -761,28 +761,6 @@ data:
     # non-streaming behavior: 0 means no shuffle and 1 means one full map-style dataset shuffle.
     shuffle_buffer_size: 10000
 
-    # [data.source.retry_attempts]
-    # type: int
-    # schema default: 3
-    # default: literal 3
-    # required: optional
-    # values: integer >= 1
-    # contract: total attempts for transient dataset loading and streaming I/O failures.
-    # HTTP status behavior: retries explicit 429, 500, 502, 503, and 504 responses; any other explicit HTTP status fails immediately.
-    # resume behavior: a retried stream is replayed to its last yielded example with the same epoch seed and shard, avoiding duplicates.
-    # failure behavior: schema, authentication, and other non-transient errors fail immediately.
-    retry_attempts: 3
-
-    # [data.source.retry_backoff_seconds]
-    # type: float
-    # schema default: 1.0
-    # default: literal 1.0
-    # required: optional
-    # values: finite number >= 0
-    # contract: initial delay before retrying a transient dataset failure; delay doubles after each failure and is capped at 60 seconds.
-    # recommendation: use 0 only for local tests; remote streams should keep a positive delay.
-    retry_backoff_seconds: 1.0
-
   packing:
     # [data.packing.enabled]
     # type: bool

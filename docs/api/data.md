@@ -70,14 +70,10 @@ PackedStreamingConfig(
     seed: 'int',
     shuffle_buffer_size: 'int',
     block_cross_document_attention: 'bool' = False,
-    retry_attempts: 'int' = 3,
-    retry_backoff_seconds: 'float' = 1.0,
 )
 ```
 
 Configuration for packing raw text into fixed-length token blocks.
-
-The retry fields bound recovery from transient streaming failures; their attempt-count, backoff, and replay semantics are defined under `data.source.*` in the [config reference](../../configs/config_reference.yaml).
 
 ## `PackedStreamingDataset`
 

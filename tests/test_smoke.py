@@ -370,8 +370,6 @@ def test_streaming_retries_without_duplicating_examples() -> None:
             max_seq_length=8,
             seed=0,
             shuffle_buffer_size=0,
-            retry_attempts=2,
-            retry_backoff_seconds=0.0,
         ),
     )
 
@@ -407,8 +405,6 @@ def test_streaming_retry_failure_policy(error: Exception, expected_iterations: i
             max_seq_length=8,
             seed=0,
             shuffle_buffer_size=0,
-            retry_attempts=3,
-            retry_backoff_seconds=0.0,
         ),
     )
 
@@ -419,7 +415,7 @@ def test_streaming_retry_failure_policy(error: Exception, expected_iterations: i
 
 def test_call_with_dataset_retry_retries_transient_failure() -> None:
     calls = 0
-    retries: list[tuple[int, float, str]] = []
+    retries: list[tuple[int, str]] = []
 
     def operation() -> str:
         nonlocal calls
@@ -430,14 +426,12 @@ def test_call_with_dataset_retry_retries_transient_failure() -> None:
 
     result = call_with_dataset_retry(
         operation,
-        attempts=2,
-        backoff_seconds=0.0,
-        on_retry=lambda attempt, delay, exc: retries.append((attempt, delay, str(exc))),
+        on_retry=lambda attempt, exc: retries.append((attempt, str(exc))),
     )
 
     assert result == "ok"
     assert calls == 2
-    assert retries == [(1, 0.0, "temporary")]
+    assert retries == [(1, "temporary")]
 
 
 def test_call_with_dataset_retry_does_not_retry_non_transient_failure() -> None:
@@ -447,8 +441,6 @@ def test_call_with_dataset_retry_does_not_retry_non_transient_failure() -> None:
     with pytest.raises(ValueError, match="invalid"):
         call_with_dataset_retry(
             operation,
-            attempts=3,
-            backoff_seconds=0.0,
             on_retry=lambda *_args: pytest.fail("non-transient failure retried"),
         )
 

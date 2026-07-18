@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from deberta.data.retry import handle_dataset_retry_failure
+from deberta.data.retry import DATASET_RETRY_ATTEMPTS, handle_dataset_retry_failure
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +24,6 @@ class PackedStreamingConfig:
     seed: int
     shuffle_buffer_size: int
     block_cross_document_attention: bool = False
-    retry_attempts: int = 3
-    retry_backoff_seconds: float = 1.0
 
 
 class PackedStreamingDataset(torch.utils.data.IterableDataset):
@@ -146,9 +144,8 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
 
         :return Iterator[dict[str, Any]]: Example iterator.
         """
-        attempts = max(1, int(self.cfg.retry_attempts))
         yielded = 0
-        for attempt in range(1, attempts + 1):
+        for attempt in range(1, DATASET_RETRY_ATTEMPTS + 1):
             try:
                 iterator = self._new_example_iterator()
                 # Arbitrary shuffled iterables expose no exact seek contract.
@@ -165,16 +162,12 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 handle_dataset_retry_failure(
                     exc,
                     attempt=attempt,
-                    attempts=attempts,
-                    backoff_seconds=self.cfg.retry_backoff_seconds,
-                    on_retry=lambda failed_attempt, delay, failure, yielded=yielded: logger.warning(
+                    on_retry=lambda failed_attempt, failure, yielded=yielded: logger.warning(
                         "Dataset stream failed transiently at epoch %d after %d examples "
-                        "(attempt %d/%d, retry in %.1fs): %s",
+                        "(attempt %d); retrying: %s",
                         self._current_epoch(),
                         yielded,
                         failed_attempt,
-                        attempts,
-                        delay,
                         failure,
                     ),
                 )
