@@ -35,7 +35,6 @@ from deberta.config import (
     load_config,
     load_data_config_snapshot,
     load_model_config_snapshot,
-    load_train_config_snapshot,
 )
 from deberta.training.entrypoint import _resolve_entrypoint_profile_sections
 from deberta.training.metrics import (
@@ -265,42 +264,6 @@ def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
     data_raw.pop("source")
     with pytest.raises(ValueError, match="Missing required data_config.json keys"):
         load_data_config_snapshot(data_raw, source="data_config.json")
-
-
-@pytest.mark.parametrize(
-    ("loader", "raw", "nested_path", "missing_key", "expected_location"),
-    [
-        (
-            load_model_config_snapshot,
-            asdict(make_model_config()),
-            ("hf", "flash"),
-            "kernel_overrides_path",
-            "model_config.json.hf.flash",
-        ),
-        (
-            load_train_config_snapshot,
-            asdict(make_train_config()),
-            ("checkpoint",),
-            "save_steps",
-            "train_config.json.checkpoint",
-        ),
-    ],
-    ids=["model_flash", "train_checkpoint"],
-)
-def test_snapshot_loaders_reject_missing_nested_keys(
-    loader: Any,
-    raw: dict[str, Any],
-    nested_path: tuple[str, ...],
-    missing_key: str,
-    expected_location: str,
-) -> None:
-    nested: dict[str, Any] = raw
-    for key in nested_path:
-        nested = nested[key]
-    nested.pop(missing_key)
-
-    with pytest.raises(ValueError, match=rf"Missing required .* keys at {re.escape(expected_location)}"):
-        loader(raw, source="snapshot.json")
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):

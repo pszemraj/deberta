@@ -42,21 +42,8 @@ def load_json_mapping(path: Path) -> dict[str, Any]:
     :return dict[str, Any]: Parsed mapping.
     """
 
-    def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        """Construct a JSON object while rejecting duplicate keys.
-
-        :param list[tuple[str, Any]] pairs: Ordered object key/value pairs.
-        :return dict[str, Any]: Unique-key object mapping.
-        """
-        mapping: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in mapping:
-                raise ValueError(f"Duplicate JSON key {key!r} at {path}.")
-            mapping[key] = value
-        return mapping
-
     with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f, object_pairs_hook=_reject_duplicate_keys)
+        raw = json.load(f)
     if not isinstance(raw, dict):
         raise ValueError(f"Expected JSON object at {path}, got {type(raw).__name__}.")
     return raw

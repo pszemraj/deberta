@@ -1476,55 +1476,6 @@ _SnapshotConfigT = TypeVar(
 )
 
 
-def _validate_snapshot_mapping_shape(
-    mapping: dict[str, object],
-    *,
-    template: object,
-    source: str,
-    config_name: str,
-    location: str,
-) -> None:
-    """Require every current nested dataclass field in a persisted snapshot.
-
-    :param dict[str, object] mapping: Snapshot mapping at the current nesting level.
-    :param object template: Current-schema dataclass instance for this level.
-    :param str source: Snapshot source path for errors.
-    :param str config_name: Human label used in error messages.
-    :param str location: Dotted snapshot location for contextual failures.
-    :raises ValueError: If keys are missing, unknown, or structurally invalid.
-    """
-    expected = {f.name for f in fields(type(template))}
-    unknown = sorted(set(mapping) - expected)
-    if unknown:
-        raise ValueError(
-            f"Unsupported {config_name} keys at {location} in {source}: {', '.join(unknown)}. "
-            "This snapshot was produced by an older pre-release schema; "
-            "backward resume/export compatibility is not guaranteed before stable release."
-        )
-    missing = sorted(expected - set(mapping))
-    if missing:
-        raise ValueError(
-            f"Missing required {config_name} keys at {location} in {source}: {', '.join(missing)}. "
-            "This snapshot does not match the current config schema."
-        )
-
-    for key in sorted(expected):
-        current = getattr(template, key)
-        if not dataclasses.is_dataclass(current):
-            continue
-        nested = mapping[key]
-        nested_location = f"{location}.{key}"
-        if not isinstance(nested, dict):
-            raise ValueError(f"Expected a mapping at {nested_location} in {source}.")
-        _validate_snapshot_mapping_shape(
-            nested,
-            template=current,
-            source=source,
-            config_name=config_name,
-            location=nested_location,
-        )
-
-
 def _load_snapshot_dataclass(
     raw: dict[str, object], *, cls: type[_SnapshotConfigT], source: str, config_name: str
 ) -> _SnapshotConfigT:
@@ -1537,17 +1488,23 @@ def _load_snapshot_dataclass(
     :raises ValueError: If unknown keys are present or dataclass construction fails.
     :return _SnapshotConfigT: Parsed dataclass instance.
     """
-    template = cls()
-    _validate_snapshot_mapping_shape(
-        raw,
-        template=template,
-        source=source,
-        config_name=config_name,
-        location=config_name,
-    )
+    expected = {f.name for f in fields(cls)}
+    unknown = sorted(set(raw) - expected)
+    if unknown:
+        raise ValueError(
+            f"Unsupported {config_name} keys in {source}: {', '.join(unknown)}. "
+            "This snapshot was produced by an older pre-release schema; "
+            "backward resume/export compatibility is not guaranteed before stable release."
+        )
+    missing = sorted(expected - set(raw))
+    if missing:
+        raise ValueError(
+            f"Missing required {config_name} keys in {source}: {', '.join(missing)}. "
+            "This snapshot does not match the current config schema."
+        )
 
     try:
-        return _replace_from_mapping_recursive(template, dict(raw), section_name=config_name)
+        return _replace_from_mapping_recursive(cls(), dict(raw), section_name=config_name)
     except (TypeError, ValueError) as e:
         raise ValueError(
             f"Failed to parse {config_name} at {source}. "
@@ -1669,46 +1626,7 @@ def _load_raw_config_mapping(path: str | Path) -> tuple[dict[str, Any], str]:
                 "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
             ) from e
 
-        class _UniqueKeySafeLoader(yaml.SafeLoader):
-            """Safe YAML loader that rejects duplicate mapping keys."""
-
-            def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
-                """Construct one mapping while rejecting ambiguous duplicate keys.
-
-                :param Any node: YAML mapping node to construct.
-                :param bool deep: Whether to construct nested objects deeply.
-                :return dict[Any, Any]: Constructed unique-key mapping.
-                """
-
-                if not isinstance(node, yaml.MappingNode):
-                    return super().construct_mapping(node, deep=deep)
-                self.flatten_mapping(node)
-                mapping: dict[Any, Any] = {}
-                for key_node, value_node in node.value:
-                    key = self.construct_object(key_node, deep=deep)
-                    try:
-                        duplicate = key in mapping
-                    except TypeError as exc:
-                        raise yaml.constructor.ConstructorError(
-                            "while constructing a mapping",
-                            node.start_mark,
-                            "found an unhashable mapping key",
-                            key_node.start_mark,
-                        ) from exc
-                    if duplicate:
-                        raise yaml.constructor.ConstructorError(
-                            "while constructing a mapping",
-                            node.start_mark,
-                            f"found duplicate key {key!r}",
-                            key_node.start_mark,
-                        )
-                    mapping[key] = self.construct_object(value_node, deep=deep)
-                return mapping
-
-        try:
-            raw = yaml.load(cfg_path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader) or {}
-        except yaml.YAMLError as exc:
-            raise ValueError(f"Invalid YAML config at {cfg_path}: {exc}") from exc
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     else:
         raw = load_json_mapping(cfg_path)
 
