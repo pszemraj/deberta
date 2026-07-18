@@ -62,17 +62,6 @@ from deberta.modeling.mask_utils import is_torch_compiling
 
 try:
     from flashdeberta.ops.flash_attention_varlen import (
-        flash_attention_with_disentangled_varlen as _flash_attention_with_disentangled_varlen_highlevel,
-    )
-
-    _FLASH_VARLEN_HIGHLEVEL_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - optional import
-    _flash_attention_with_disentangled_varlen_highlevel = None
-    _FLASH_VARLEN_HIGHLEVEL_IMPORT_ERROR = exc
-
-try:
-    import flashdeberta.ops.flash_attention_varlen as _flash_attention_varlen_module
-    from flashdeberta.ops.flash_attention_varlen import (
         _bwd_kv_dise_kernel_varlen as _bwd_kv_dise_kernel_varlen_raw,
     )
     from flashdeberta.ops.flash_attention_varlen import (
@@ -93,7 +82,6 @@ try:
 
     _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
-    _flash_attention_varlen_module = None
     _bwd_kv_dise_kernel_varlen_raw = None
     _bwd_preprocess_varlen_raw = None
     _bwd_q_dise_kernel_varlen_raw = None
@@ -133,12 +121,10 @@ _MID_TENSOR_CACHE: dict[tuple[int, int, str, int | None], _MidTensorCacheEntry] 
 def flashdeberta_varlen_import_error() -> Exception | None:
     """Return the most relevant import failure for varlen support.
 
-    :return Exception | None: Import failure or ``None`` when some varlen path is available.
+    :return Exception | None: Import failure or ``None`` when varlen kernels are available.
     """
-    if _flash_attention_with_disentangled_varlen_highlevel is not None:
+    if _flash_attn_v2_fwd_dise_lowlevel is not None and _flash_attn_v2_bwd_dise_varlen_lowlevel is not None:
         return None
-    if _FLASH_VARLEN_HIGHLEVEL_IMPORT_ERROR is not None:
-        return _FLASH_VARLEN_HIGHLEVEL_IMPORT_ERROR
     return _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR
 
 
@@ -232,7 +218,7 @@ def _run_packed_varlen_forward(
     max_relative_distance: int,
     causal: bool,
     att_span: int,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one already-packed varlen forward pass.
 
     :param str route: Tuning-table route namespace.
@@ -249,8 +235,8 @@ def _run_packed_varlen_forward(
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
     :param int att_span: Effective relative-position span.
-    :raises RuntimeError: If neither upstream varlen forward implementation is available.
-    :return tuple[torch.Tensor, torch.Tensor | None]: Packed output and optional packed LSE.
+    :raises RuntimeError: If the low-level varlen forward implementation is unavailable.
+    :return tuple[torch.Tensor, torch.Tensor]: Packed output and LSE.
     """
 
     if _flash_attn_v2_fwd_dise_lowlevel is not None:
@@ -290,24 +276,6 @@ def _run_packed_varlen_forward(
             num_stages,
             att_span,
         )
-
-    if _flash_attention_with_disentangled_varlen_highlevel is not None:
-        output = _flash_attention_with_disentangled_varlen_highlevel(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            pos_key_unpad,
-            pos_query_unpad,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            bool(causal),
-            float(sm_scale),
-            int(position_buckets),
-            int(max_relative_distance),
-        )
-        return output, None
 
     detail = flashdeberta_varlen_import_error()
     raise RuntimeError(
@@ -1004,38 +972,6 @@ def _varlen_backward_raw_impl(
         num_stages=q_num_stages,
     )
     return dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad
-
-
-def _patch_upstream_varlen_mid_cache() -> None:
-    """Replace upstream varlen mid-cache helpers with repo-local caching."""
-
-    if _flash_attention_varlen_module is None:
-        return
-
-    def _repo_get_mid_cached(
-        cu_seqlens: torch.Tensor,
-        B: int,
-        BLOCK_M: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Return repo-cached mid tensors with the upstream helper signature.
-
-        :param torch.Tensor cu_seqlens: Cumulative seqlens tensor for one batch.
-        :param int B: Upstream batch-size argument, unused by the repo-local cache.
-        :param int BLOCK_M: Query tile height.
-        :param torch.device device: Device where the returned tensors should live.
-        :return tuple[torch.Tensor, torch.Tensor, int]:
-            Cached ``(mid_batch, mid_start, mn)`` tensors and tile count.
-        """
-
-        del B
-        return _get_mid_tensors_cached(
-            cu_seqlens=cu_seqlens,
-            block_m=int(BLOCK_M),
-            device=device,
-        )
-
-    _flash_attention_varlen_module.get_mid_cached = _repo_get_mid_cached
 
 
 def _varlen_padded_backward_impl(
@@ -1791,7 +1727,6 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
 
 
 _FLASHDEBERTA_VARLEN_TRITON_OP, _FLASHDEBERTA_VARLEN_TRITON_BWD_OP = _build_varlen_triton_ops()
-_patch_upstream_varlen_mid_cache()
 
 
 class _EagerVarlen(torch.autograd.Function):

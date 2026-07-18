@@ -188,11 +188,10 @@ def _docblock_forward_impl(
     num_segments: int,
     max_seqlen: int,
     total_tokens: int,
-    require_lse: bool,
     aux_capacity: int | None = None,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor | None,
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -218,19 +217,15 @@ def _docblock_forward_impl(
     :param int num_segments: Host-side active segment count.
     :param int max_seqlen: Host-side maximum segment length.
     :param int total_tokens: Host-side total active token count.
-    :param bool require_lse: Whether the caller also needs padded LSE values.
     :param int | None aux_capacity: Optional fixed packed-buffer capacity for
         compile-stable auxiliary outputs.
     :raises RuntimeError: If the low-level varlen kernels are unavailable.
-    :return tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor,
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Padded output, optional padded LSE, and packed forward auxiliaries.
     """
 
-    if (
-        _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is None
-        and _varlen_mod._flash_attention_with_disentangled_varlen_highlevel is None
-    ):
+    if _varlen_mod._flash_attn_v2_fwd_dise_lowlevel is None:
         detail = flashdeberta_docblock_import_error()
         raise RuntimeError(
             "FlashDeBERTa doc-block attention is unavailable."
@@ -284,14 +279,12 @@ def _docblock_forward_impl(
             if pos_query is not None
             else None
         )
-        if require_lse:
-            lse = torch.zeros(
-                (batch_size, seq_len, int(query_layer.shape[2])),
-                device=query_layer.device,
-                dtype=torch.float32,
-            )
-            return output, lse, q_empty, k_empty, v_empty, q_empty, lse_empty, pos_key_empty, pos_query_empty
-        return output, None, q_empty, k_empty, v_empty, q_empty, lse_empty, pos_key_empty, pos_query_empty
+        lse = torch.zeros(
+            (batch_size, seq_len, int(query_layer.shape[2])),
+            device=query_layer.device,
+            dtype=torch.float32,
+        )
+        return output, lse, q_empty, k_empty, v_empty, q_empty, lse_empty, pos_key_empty, pos_query_empty
 
     q_unpad, k_unpad, v_unpad = segment_pack_padded_rows_triple(
         query_layer,
@@ -346,22 +339,6 @@ def _docblock_forward_impl(
     lse_aux = _pad_packed_aux(lse_unpad, capacity=packed_capacity)
     pos_key_aux = _pad_packed_aux(pos_key_unpad, capacity=packed_capacity)
     pos_query_aux = _pad_packed_aux(pos_query_unpad, capacity=packed_capacity)
-    if not require_lse:
-        return (
-            out_padded,
-            None,
-            q_aux,
-            k_aux,
-            v_aux,
-            out_aux,
-            lse_aux if lse_aux is not None else torch.empty((0,), device=query_layer.device),
-            pos_key_aux,
-            pos_query_aux,
-        )
-    if lse_unpad is None:
-        raise RuntimeError(
-            "Compiled FlashDeBERTa doc-block attention requires low-level forward primitives with LSE support."
-        )
     lse_padded = segment_unpack_padded_rows(
         lse_unpad,
         segment_offsets=active_segment_offsets,
@@ -651,12 +628,9 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
                 max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
                 total_tokens=_scalar_int(total_tokens, name="total_tokens"),
                 causal=causal,
-                require_lse=True,
                 aux_capacity=int(q.shape[0]) * int(q.shape[1]),
             )
         )
-        if lse is None:  # pragma: no cover - require_lse=True above
-            raise RuntimeError("Doc-block custom op expected padded LSE output.")
         return (
             output,
             lse,

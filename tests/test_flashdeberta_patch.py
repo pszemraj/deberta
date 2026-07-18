@@ -1672,7 +1672,6 @@ def test_docblock_forward_pads_saved_aux_without_expanding_kernel_tokens(
             num_segments=2,
             max_seqlen=2,
             total_tokens=3,
-            require_lse=True,
             aux_capacity=5,
         )
     )
@@ -3489,9 +3488,7 @@ def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod
         keep_mask=per_head_mask,
         scale=bias_scale,
     )
-    out, lse = bias_mod._bias_eager_forward_impl(
-        q=q, k=k, v=v, bias=bias, sm_scale=sm_scale, causal=False, require_lse=True
-    )
+    out, lse = bias_mod._bias_eager_forward_impl(q=q, k=k, v=v, bias=bias, sm_scale=sm_scale, causal=False)
     if lse is None:
         pytest.skip("Low-level bias forward with LSE is unavailable.")
     grad_out = torch.randn_like(out)

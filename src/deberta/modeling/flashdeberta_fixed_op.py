@@ -32,16 +32,6 @@ from deberta.modeling.flashdeberta_op_utils import (
 
 try:
     from flashdeberta.ops.flash_attention import (
-        flash_attention_with_disentangled as _flash_attention_with_disentangled_highlevel,
-    )
-
-    _FLASH_FIXED_HIGHLEVEL_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - optional import
-    _flash_attention_with_disentangled_highlevel = None
-    _FLASH_FIXED_HIGHLEVEL_IMPORT_ERROR = exc
-
-try:
-    from flashdeberta.ops.flash_attention import (
         _bwd_kv_dise_kernel as _bwd_kv_dise_kernel_raw,
     )
     from flashdeberta.ops.flash_attention import (
@@ -78,15 +68,11 @@ _FIXED_BWD_OP_NAME = "flashdeberta_fixed_backward"
 def flashdeberta_fixed_import_error() -> Exception | None:
     """Return the most relevant import failure for fixed-length support.
 
-    :return Exception | None: Import failure or ``None`` when some fixed path is available.
+    :return Exception | None: Import failure or ``None`` when fixed kernels are available.
     """
 
-    if _flash_attention_with_disentangled_highlevel is not None:
-        return None
     if _flash_attn_v2_fwd_dise_lowlevel is not None and _flash_attn_v2_bwd_dise_lowlevel is not None:
         return None
-    if _FLASH_FIXED_HIGHLEVEL_IMPORT_ERROR is not None:
-        return _FLASH_FIXED_HIGHLEVEL_IMPORT_ERROR
     return _FLASH_FIXED_LOWLEVEL_IMPORT_ERROR
 
 
@@ -223,100 +209,6 @@ def _fixed_config(
     if tuned is not None:
         return tuned
     return CONSERVATIVE_FLASH_KERNEL_CONFIG
-
-
-def _fixed_eager_forward_impl(
-    *,
-    query_layer: torch.Tensor,
-    key_layer: torch.Tensor,
-    value_layer: torch.Tensor,
-    seq_lengths: torch.Tensor | None,
-    pos_key: torch.Tensor | None,
-    pos_query: torch.Tensor | None,
-    sm_scale: float,
-    position_buckets: int,
-    max_relative_distance: int,
-    causal: bool,
-    require_lse: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run fixed-length FlashDeBERTa attention eagerly.
-
-    :param torch.Tensor query_layer: Queries in ``(B, H, S, D)`` layout.
-    :param torch.Tensor key_layer: Keys in ``(B, H, S, D)`` layout.
-    :param torch.Tensor value_layer: Values in ``(B, H, S, D)`` layout.
-    :param torch.Tensor | None seq_lengths: Optional per-example active lengths.
-    :param torch.Tensor | None pos_key: Optional c2p tensor.
-    :param torch.Tensor | None pos_query: Optional p2c tensor.
-    :param float sm_scale: Softmax scale.
-    :param int position_buckets: Relative-position bucket count.
-    :param int max_relative_distance: Maximum relative distance.
-    :param bool causal: Whether causal masking is enabled.
-    :param bool require_lse: Whether padded LSE output is required.
-    :raises RuntimeError: If no fixed-length implementation is importable.
-    :return tuple[torch.Tensor, torch.Tensor | None]: Output tensor and optional LSE.
-    """
-
-    if _flash_attn_v2_fwd_dise_lowlevel is None and _flash_attention_with_disentangled_highlevel is None:
-        detail = flashdeberta_fixed_import_error()
-        raise RuntimeError(
-            "FlashDeBERTa fixed-length attention is unavailable."
-            if detail is None
-            else f"FlashDeBERTa fixed-length attention is unavailable ({detail})."
-        )
-
-    batch_size, num_heads, query_len, head_dim = query_layer.shape
-    key_len = int(key_layer.shape[-2])
-    if _flash_attn_v2_fwd_dise_lowlevel is not None:
-        att_span = disentangled_attention_span(position_buckets, max_relative_distance)
-        block_m, block_n, num_stages, num_warps = _fixed_config(
-            kind="fwd",
-            query_len=query_len,
-            key_len=key_len,
-            head_dim=head_dim,
-            causal=bool(causal),
-            position_buckets=position_buckets,
-            max_relative_distance=max_relative_distance,
-            dtype=query_layer.dtype,
-            device=query_layer.device,
-            has_pos=(pos_key is not None or pos_query is not None),
-        )
-        output, lse = _flash_attn_v2_fwd_dise_lowlevel(
-            query_layer,
-            key_layer,
-            value_layer,
-            seq_lengths,
-            pos_key,
-            pos_query,
-            bool(causal),
-            float(sm_scale),
-            block_m,
-            block_n,
-            int(position_buckets),
-            int(max_relative_distance),
-            num_warps,
-            num_stages,
-            att_span,
-        )
-        return output, lse
-
-    if require_lse:
-        raise RuntimeError(
-            "Compiled FlashDeBERTa fixed-length attention requires low-level forward primitives with LSE output."
-        )
-
-    output = _flash_attention_with_disentangled_highlevel(
-        query_layer,
-        key_layer,
-        value_layer,
-        seq_lengths,
-        pos_key,
-        pos_query,
-        bool(causal),
-        float(sm_scale),
-        int(position_buckets),
-        int(max_relative_distance),
-    )
-    return output, None
 
 
 def _fixed_triton_forward_impl(
@@ -908,10 +800,8 @@ def flashdeberta_fixed(
 ) -> torch.Tensor:
     """Run fixed-length FlashDeBERTa attention.
 
-    On CUDA with the low-level FlashDeBERTa primitives available, this uses an
-    opaque custom-op path so ``torch.compile`` does not trace through the
-    upstream Python autograd wrapper. Otherwise it falls back to the upstream
-    eager implementation.
+    On CUDA this uses an opaque custom-op path so ``torch.compile`` does not
+    trace through FlashDeBERTa's Python launchers.
 
     :param torch.Tensor query_layer: Queries in ``(B, H, S, D)`` layout.
     :param torch.Tensor key_layer: Keys in ``(B, H, S, D)`` layout.
@@ -941,20 +831,12 @@ def flashdeberta_fixed(
         )
         return output
 
-    output, _ = _fixed_eager_forward_impl(
-        query_layer=query_layer,
-        key_layer=key_layer,
-        value_layer=value_layer,
-        seq_lengths=seq_lengths,
-        pos_key=pos_key,
-        pos_query=pos_query,
-        sm_scale=sm_scale,
-        position_buckets=position_buckets,
-        max_relative_distance=max_relative_distance,
-        causal=causal,
-        require_lse=False,
+    detail = flashdeberta_fixed_import_error()
+    raise RuntimeError(
+        "FlashDeBERTa fixed-length Triton support is unavailable."
+        if detail is None
+        else f"FlashDeBERTa fixed-length Triton support is unavailable ({detail})."
     )
-    return output
 
 
 __all__ = [

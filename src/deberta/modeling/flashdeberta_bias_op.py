@@ -42,16 +42,6 @@ except Exception:  # pragma: no cover - optional import
 
 try:
     from flashdeberta.ops.flash_attention_bias import (
-        flash_attention_with_bias as _flash_attention_with_bias_highlevel,
-    )
-
-    _FLASH_BIAS_HIGHLEVEL_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - optional import
-    _flash_attention_with_bias_highlevel = None
-    _FLASH_BIAS_HIGHLEVEL_IMPORT_ERROR = exc
-
-try:
-    from flashdeberta.ops.flash_attention_bias import (
         _bwd_kv_kernel as _bwd_kv_kernel_bias_raw,
     )
     from flashdeberta.ops.flash_attention_bias import (
@@ -84,15 +74,11 @@ _POSITION_BIAS_BWD_OP_NAME = "flashdeberta_position_bias_attention_backward_v2"
 def flashdeberta_bias_import_error() -> Exception | None:
     """Return the most relevant import failure for local-bias support.
 
-    :return Exception | None: Import failure or ``None`` when some bias path is available.
+    :return Exception | None: Import failure or ``None`` when bias kernels are available.
     """
 
-    if _flash_attention_with_bias_highlevel is not None:
-        return None
     if _flash_attn_v2_fwd_bias_lowlevel is not None and _flash_attn_v2_bwd_bias_lowlevel is not None:
         return None
-    if _FLASH_BIAS_HIGHLEVEL_IMPORT_ERROR is not None:
-        return _FLASH_BIAS_HIGHLEVEL_IMPORT_ERROR
     return _FLASH_BIAS_LOWLEVEL_IMPORT_ERROR
 
 
@@ -1369,8 +1355,7 @@ def _bias_eager_forward_impl(
     bias: torch.Tensor,
     sm_scale: float,
     causal: bool,
-    require_lse: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run dense bias attention through the low-level CUDA launcher.
 
     :param torch.Tensor q: Queries in ``(B, H, S, D)`` layout.
@@ -1379,17 +1364,11 @@ def _bias_eager_forward_impl(
     :param torch.Tensor bias: Additive bias in ``(B, H, S, S)`` layout.
     :param float sm_scale: Softmax scale.
     :param bool causal: Whether causal masking is enabled.
-    :param bool require_lse: Whether to return LSE for backward.
-    :return tuple[torch.Tensor, torch.Tensor | None]: Output and optional LSE tensor.
+    :return tuple[torch.Tensor, torch.Tensor]: Output and LSE tensors.
     """
 
     if _flash_attn_v2_fwd_bias_lowlevel is None:
-        if _flash_attention_with_bias_highlevel is None:
-            raise RuntimeError("FlashDeBERTa local-bias attention is unavailable.")
-        out = _flash_attention_with_bias_highlevel(
-            q, k, v, bias, causal=bool(causal), sm_scale=float(sm_scale)
-        )
-        return out, None
+        raise RuntimeError("FlashDeBERTa local-bias attention is unavailable.")
 
     batch_size, num_heads, query_len, head_dim = q.shape
     key_len = int(k.shape[2])
@@ -1416,8 +1395,6 @@ def _bias_eager_forward_impl(
         int(num_warps),
         int(num_stages),
     )
-    if not require_lse:
-        return out, None
     return out, lse
 
 
@@ -1871,7 +1848,6 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             bias=bias,
             sm_scale=float(sm_scale),
             causal=bool(causal),
-            require_lse=True,
         )
         return out, lse, bias
 
@@ -2267,7 +2243,6 @@ def flashdeberta_bias_from_positions(
         ),
         sm_scale=sm_scale,
         causal=causal,
-        require_lse=False,
     )
     return output
 
