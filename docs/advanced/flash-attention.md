@@ -99,7 +99,7 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
   on synthetic dense and padded shapes.
 - [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and
   selected gradients against eager attention.
-Packed benchmark configs are under [`configs/flashdeberta/`](../../configs/flashdeberta/).
+The runnable Flash training example is [`pretrain_flashdeberta_1024.yaml`](../../configs/flashdeberta/pretrain_flashdeberta_1024.yaml). The tuning tools override its packing and route settings for their own sampled workloads.
 
 Before merging Flash changes, run `bash tools/premerge.sh`. It records the commit and dirty-tree state under `local-scratch/premerge/` while running lint, docstring checks, the full test suite, and CUDA parity.
 

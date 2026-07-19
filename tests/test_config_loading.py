@@ -251,16 +251,16 @@ def test_load_nested_unknown_top_level_key_raises(tmp_path: Path, format_name: s
 @pytest.mark.parametrize(
     "config_name",
     [
-        "pretrain_hf_deberta_v2_parity_base.yaml",
-        "pretrain_hf_deberta_v2_parity_small.yaml",
+        "pretrain_deberta_v3_bespoke_100k.yaml",
+        "pretrain_rope_fineweb_edu.yaml",
+        "tiny_cpu_smoke.yaml",
+        "flashdeberta/pretrain_flashdeberta_1024.yaml",
     ],
 )
-def test_parity_yaml_configs_load(config_name: str) -> None:
+def test_example_yaml_configs_load(config_name: str) -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     config_path = repo_root / "configs" / config_name
     cfg = load_config(config_path)
 
-    assert cfg.model.backbone_type == "hf_deberta_v2"
-    assert cfg.model.pretrained.discriminator_path == ""
-    assert bool(cfg.train.decoupled_training) is True
+    assert cfg.data.source.dataset_name is not None or cfg.data.source.data_files is not None

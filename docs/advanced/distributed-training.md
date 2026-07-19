@@ -8,7 +8,7 @@ Single-node FSDP2 templates:
 - experimental `rope`: [`fsdp2_1node.yaml`](../../configs/accelerate/fsdp2_1node.yaml)
 
 Both templates set `num_processes: 8`; change it to the number of GPUs on the node. See the
-[Quickstart](../getting-started/quickstart.md#2-small-parity-style-run-on-fineweb-edu) for a launch
+[Quickstart](../getting-started/quickstart.md#2-choose-a-pretraining-recipe) for a launch
 command.
 
 ## FSDP version handling

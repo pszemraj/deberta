@@ -25,7 +25,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "config",
         nargs="?",
-        default="configs/flashdeberta/pretrain_rtd_hf_deberta_v3pos_smol2stage4_2048_wp32k_v2.yaml",
+        default="configs/flashdeberta/pretrain_flashdeberta_1024.yaml",
     )
     parser.add_argument("--branch", choices=("discriminator", "generator"), default="discriminator")
     parser.add_argument("--route", choices=("fixed", "varlen", "both"), default="both")
