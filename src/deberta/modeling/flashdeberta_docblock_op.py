@@ -58,26 +58,6 @@ def _scalar_int(value: int | torch.Tensor, *, name: str) -> int:
     return int(value)
 
 
-def _scalar_tensor(value: int | torch.Tensor, *, name: str) -> torch.Tensor:
-    """Return a CPU scalar tensor for compile-stable custom-op inputs.
-
-    :param int | torch.Tensor value: Python integer or scalar tensor.
-    :param str name: Name used in validation errors.
-    :raises ValueError: If a tensor value is not scalar.
-    :return torch.Tensor: CPU scalar int32 tensor.
-    """
-
-    if isinstance(value, torch.Tensor):
-        if value.ndim != 0:
-            raise ValueError(f"{name} must be a scalar tensor, got shape {tuple(value.shape)}.")
-        if value.device.type == "cpu" and value.dtype == torch.int32:
-            return value
-        if value.device.type == "cpu":
-            return value.to(dtype=torch.int32)
-        return torch.tensor(int(value.detach().cpu().item()), dtype=torch.int32)
-    return torch.tensor(int(value), dtype=torch.int32)
-
-
 def flashdeberta_docblock_import_error() -> Exception | None:
     """Return the most relevant import failure for doc-block flash support.
 
@@ -503,6 +483,10 @@ def _docblock_backward_impl(
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
             causal=causal,
+            # Doc-block segments can be highly ragged. Exact host-built tile
+            # descriptors incur one device-to-host metadata sync for a fresh
+            # batch, but avoid the potentially much larger fixed launch grid
+            # of num_segments * ceil(max_segment_length / block_size).
             dense_mid_tensors=False,
             route="docblock",
         )
@@ -1148,9 +1132,9 @@ def flashdeberta_docblock(
     sm_scale: float,
     position_buckets: int,
     max_relative_distance: int,
-    num_segments: int | torch.Tensor,
-    max_seqlen: int | torch.Tensor,
-    total_tokens: int | torch.Tensor,
+    num_segments: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    total_tokens: torch.Tensor,
     causal: bool,
 ) -> torch.Tensor:
     """Run doc-block-aware FlashDeBERTa attention.
@@ -1166,9 +1150,9 @@ def flashdeberta_docblock(
     :param float sm_scale: Softmax scale.
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
-    :param int | torch.Tensor num_segments: Host-side active segment count.
-    :param int | torch.Tensor max_seqlen: Host-side maximum segment length.
-    :param int | torch.Tensor total_tokens: Host-side total active token count.
+    :param torch.Tensor num_segments: Host-side active segment count scalar.
+    :param torch.Tensor max_seqlen: Host-side maximum segment length scalar.
+    :param torch.Tensor total_tokens: Host-side total active token count scalar.
     :param bool causal: Whether causal masking is enabled.
     :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
     """
@@ -1176,9 +1160,6 @@ def flashdeberta_docblock(
     if _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP is None or query_layer.device.type != "cuda":
         raise RuntimeError("FlashDeBERTa doc-block attention requires the CUDA custom op.")
 
-    num_segments_tensor = _scalar_tensor(num_segments, name="num_segments")
-    max_seqlen_tensor = _scalar_tensor(max_seqlen, name="max_seqlen")
-    total_tokens_tensor = _scalar_tensor(total_tokens, name="total_tokens")
     output, *_ = _FLASHDEBERTA_DOCBLOCK_CUSTOM_OP(
         query_layer,
         key_layer,
@@ -1191,9 +1172,9 @@ def flashdeberta_docblock(
         float(sm_scale),
         int(position_buckets),
         int(max_relative_distance),
-        num_segments_tensor,
-        max_seqlen_tensor,
-        total_tokens_tensor,
+        num_segments,
+        max_seqlen,
+        total_tokens,
         bool(causal),
     )
     return output

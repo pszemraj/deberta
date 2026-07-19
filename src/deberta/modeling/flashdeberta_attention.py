@@ -468,9 +468,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
         flash_meta: FlashBatchMeta,
-        active_tokens: torch.Tensor | int | None,
-        doc_num_segments: torch.Tensor | int | None,
-        doc_max_segment_length: torch.Tensor | int | None,
+        active_tokens: torch.Tensor,
+        doc_num_segments: torch.Tensor,
+        doc_max_segment_length: torch.Tensor,
         pos_key: torch.Tensor | None,
         pos_query: torch.Tensor | None,
         sm_scale: float,
@@ -481,9 +481,9 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         :param torch.Tensor key_layer: Projected keys in ``(B, S, H, D)`` layout.
         :param torch.Tensor value_layer: Projected values in ``(B, S, H, D)`` layout.
         :param FlashBatchMeta flash_meta: FlashDeBERTa doc-block metadata bundle.
-        :param torch.Tensor | int | None active_tokens: Resolved active-token scalar.
-        :param torch.Tensor | int | None doc_num_segments: Resolved segment-count scalar.
-        :param torch.Tensor | int | None doc_max_segment_length: Resolved max-segment scalar.
+        :param torch.Tensor active_tokens: Resolved active-token scalar.
+        :param torch.Tensor doc_num_segments: Resolved segment-count scalar.
+        :param torch.Tensor doc_max_segment_length: Resolved max-segment scalar.
         :param torch.Tensor | None pos_key: Optional c2p term.
         :param torch.Tensor | None pos_query: Optional p2c term.
         :param float sm_scale: Softmax scale.

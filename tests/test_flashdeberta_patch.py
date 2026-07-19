@@ -2692,9 +2692,9 @@ def test_flash_attention_docblock_path_dispatches(monkeypatch: pytest.MonkeyPatc
         sm_scale: float,
         position_buckets: int,
         max_relative_distance: int,
-        num_segments: int | torch.Tensor,
-        max_seqlen: int | torch.Tensor,
-        total_tokens: int | torch.Tensor,
+        num_segments: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        total_tokens: torch.Tensor,
         causal: bool,
     ) -> torch.Tensor:
         del (
@@ -2710,9 +2710,9 @@ def test_flash_attention_docblock_path_dispatches(monkeypatch: pytest.MonkeyPatc
         seen["segment_offsets"] = segment_offsets
         seen["segment_lengths"] = segment_lengths
         seen["cu_seqlens"] = cu_seqlens
-        seen["num_segments"] = torch.as_tensor(num_segments).cpu()
-        seen["max_seqlen"] = torch.as_tensor(max_seqlen).cpu()
-        seen["total_tokens"] = torch.as_tensor(total_tokens).cpu()
+        seen["num_segments"] = num_segments.cpu()
+        seen["max_seqlen"] = max_seqlen.cpu()
+        seen["total_tokens"] = total_tokens.cpu()
         return torch.zeros_like(query_layer)
 
     monkeypatch.setattr(attention_mod, "flashdeberta_docblock", _fake_docblock_wrapper)
