@@ -20,6 +20,8 @@ run_pretraining(
 
 Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
 
+TODO: Split the internal `run_pretraining` orchestration into setup, training-window, and finalization helpers while preserving its checkpoint, distributed, and failure-handling contracts.
+
 ### Parameters
 
 - `model_cfg` (`ModelConfig`): Model configuration.
