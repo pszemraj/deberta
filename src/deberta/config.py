@@ -837,6 +837,13 @@ def _apply_backbone_option_severity_policy(cfg: ModelConfig, defaults: ModelConf
                 f"Current value ({cfg.hf.model_size!r}) has no effect on the rope backbone.",
             ),
         ]
+    rules.append(
+        (
+            cfg.hf.attention_impl != "flash" and asdict(cfg.hf.flash) != asdict(defaults.hf.flash),
+            "warning",
+            "model.hf.flash.* has no effect unless model.hf.attention_impl='flash'.",
+        )
+    )
 
     for active, severity, message in rules:
         if not active:
@@ -871,6 +878,15 @@ def validate_model_config(cfg: ModelConfig) -> None:
         _cfg_set(
             cfg.hf.flash, "kernel_overrides_path", str(cfg.hf.flash.kernel_overrides_path).strip() or None
         )
+    if cfg.hf.attention_impl == "flash" and cfg.hf.flash.kernel_overrides_path is not None:
+        from deberta.modeling.flashdeberta_kernel_tuning import (
+            validate_flashdeberta_kernel_overrides,
+        )
+
+        try:
+            validate_flashdeberta_kernel_overrides(cfg.hf.flash.kernel_overrides_path)
+        except ValueError as exc:
+            raise ValueError(f"Invalid model.hf.flash.kernel_overrides_path: {exc}") from exc
 
     _cfg_set(
         cfg.rope, "norm_arch", _ensure_choice("model.rope.norm_arch", cfg.rope.norm_arch, _NORM_ARCH_CHOICES)

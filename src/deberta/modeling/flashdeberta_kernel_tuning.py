@@ -22,6 +22,20 @@ _SHAPE_KEYED_CACHE_MAXSIZE = 4096
 # configuration contract.
 CONSERVATIVE_FLASH_KERNEL_CONFIG = (16, 16, 1, 4)
 
+_ROUTE_POLICY_CHOICES = {
+    "padding": {"fixed", "varlen"},
+    "docblock": {"docblock", "docblock_bias"},
+    "local_bias": {"local_bias"},
+}
+_KERNEL_KIND_CHOICES = {
+    "bias": {"fwd", "bwd", "bwd_q", "bwd_kv"},
+    "bias_docblock_specialized": {"bwd", "bwd_q", "bwd_kv"},
+    "dense_bias": {"fwd"},
+    "docblock": {"fwd", "bwd_q", "bwd_kv"},
+    "fixed": {"fwd", "bwd"},
+    "varlen": {"fwd", "bwd_q", "bwd_kv"},
+}
+
 
 @dataclass(frozen=True)
 class FlashKernelContext:
@@ -55,6 +69,8 @@ def configure_flashdeberta_kernel_overrides(path: str | None) -> None:
     resolved = normalized or None
     if resolved == _ACTIVE_OVERRIDES_PATH:
         return
+    if resolved is not None:
+        _load_override_payload(Path(resolved).expanduser())
     _ACTIVE_OVERRIDES_PATH = resolved
     _load_tuning_payload.cache_clear()
     flash_seq_bucket.cache_clear()
@@ -83,6 +99,139 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _require_mapping(value: Any, *, location: str) -> dict[str, Any]:
+    """Return one tuning-table mapping or raise a contextual validation error.
+
+    :param Any value: Candidate JSON value.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If the value is not a mapping.
+    :return dict[str, Any]: Validated mapping.
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{location} must be a JSON object, got {type(value).__name__}.")
+    return value
+
+
+def _require_rows(value: Any, *, location: str) -> list[Any]:
+    """Return one tuning-table row list or raise a contextual validation error.
+
+    :param Any value: Candidate JSON value.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If the value is not a list.
+    :return list[Any]: Validated row list.
+    """
+
+    if not isinstance(value, list):
+        raise ValueError(f"{location} must be a JSON array, got {type(value).__name__}.")
+    return value
+
+
+def _require_fields(row: dict[str, Any], *, required: set[str], location: str) -> None:
+    """Require the fields consumed directly by one tuning-table resolver.
+
+    :param dict[str, Any] row: Candidate tuning row.
+    :param set[str] required: Required field names.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If any required field is absent.
+    """
+
+    missing = sorted(required - row.keys())
+    if missing:
+        raise ValueError(f"{location} is missing required field(s): {', '.join(missing)}.")
+
+
+def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None:
+    """Validate the override-table structure consumed by route and kernel lookup.
+
+    :param dict[str, Any] payload: Parsed override payload.
+    :param Path source: Source path used in diagnostics.
+    :raises ValueError: If the required override schema is invalid.
+    """
+
+    unknown = sorted(set(payload) - {"version", "seq_buckets", "route_policies", "kernels"})
+    if unknown:
+        raise ValueError(f"Unknown top-level field(s) in {source}: {', '.join(unknown)}.")
+
+    for index, raw in enumerate(_require_rows(payload.get("seq_buckets", []), location="seq_buckets")):
+        location = f"seq_buckets[{index}]"
+        row = _require_mapping(raw, location=location)
+        _require_fields(row, required={"name"}, location=location)
+        if not str(row["name"]).strip():
+            raise ValueError(f"{location}.name must be non-empty.")
+
+    policies = _require_mapping(payload.get("route_policies", {}), location="route_policies")
+    for policy, raw_rows in policies.items():
+        choices = _ROUTE_POLICY_CHOICES.get(str(policy))
+        if choices is None:
+            allowed = ", ".join(sorted(_ROUTE_POLICY_CHOICES))
+            raise ValueError(f"Unknown route policy {policy!r}; expected one of: {allowed}.")
+        for index, raw in enumerate(_require_rows(raw_rows, location=f"route_policies.{policy}")):
+            location = f"route_policies.{policy}[{index}]"
+            row = _require_mapping(raw, location=location)
+            _require_fields(row, required={"seq_bucket", "choice"}, location=location)
+            choice = str(row["choice"]).strip()
+            if choice not in choices:
+                allowed = ", ".join(sorted(choices))
+                raise ValueError(f"{location}.choice must be one of: {allowed}. Got {choice!r}.")
+
+    for index, raw in enumerate(_require_rows(payload.get("kernels", []), location="kernels")):
+        location = f"kernels[{index}]"
+        row = _require_mapping(raw, location=location)
+        _require_fields(
+            row,
+            required={
+                "route",
+                "kind",
+                "seq_bucket",
+                "block_m",
+                "block_n",
+                "num_stages",
+                "num_warps",
+            },
+            location=location,
+        )
+        route = str(row["route"]).strip()
+        kind = str(row["kind"]).strip()
+        kinds = _KERNEL_KIND_CHOICES.get(route)
+        if kinds is None or kind not in kinds:
+            raise ValueError(f"{location} has unsupported route/kind pair {route!r}/{kind!r}.")
+        for field_name in ("block_m", "block_n", "num_stages", "num_warps"):
+            try:
+                value = int(row[field_name])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{location}.{field_name} must be a positive integer.") from exc
+            if value <= 0:
+                raise ValueError(f"{location}.{field_name} must be a positive integer.")
+
+
+def _load_override_payload(path: Path) -> dict[str, Any]:
+    """Read and validate one user-provided tuning override table.
+
+    :param Path path: Override-table path.
+    :raises ValueError: If the file cannot be loaded or its required schema is invalid.
+    :return dict[str, Any]: Validated override payload.
+    """
+
+    try:
+        raw = _read_json(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to load FlashDeBERTa kernel overrides from {path}: {exc}") from exc
+    payload = _require_mapping(raw, location=f"FlashDeBERTa kernel overrides at {path}")
+    _validate_override_payload(payload, source=path)
+    return payload
+
+
+def validate_flashdeberta_kernel_overrides(path: str) -> None:
+    """Validate one configured FlashDeBERTa kernel override table.
+
+    :param str path: JSON override-table path.
+    :raises ValueError: If the file cannot be loaded or its required schema is invalid.
+    """
+
+    _load_override_payload(Path(path).expanduser())
+
+
 def _load_tuning_payload() -> dict[str, Any]:
     """Load the default table plus optional user override entries.
 
@@ -102,7 +251,7 @@ def _load_tuning_payload() -> dict[str, Any]:
         return payload
 
     expanded_override_path = Path(override_path).expanduser()
-    overrides = _read_json(expanded_override_path)
+    overrides = _load_override_payload(expanded_override_path)
     merged: dict[str, Any] = dict(payload)
 
     override_buckets = overrides.get("seq_buckets", [])

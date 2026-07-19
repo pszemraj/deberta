@@ -462,15 +462,19 @@ def test_validate_model_config_rejects_hf_max_position_embeddings_in_pretrained_
         builder_mod.validate_model_config(cfg)
 
 
-def test_build_hf_configs_propagates_flash_runtime_policy():
+def test_build_hf_configs_propagates_flash_runtime_policy(tmp_path: Path):
+
+    override_path = tmp_path / "custom.json"
+    override_path.write_text("{}", encoding="utf-8")
 
     cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         hf={
             "attention_impl": "flash",
+            "model_size": "xsmall",
             "flash": {
                 "docblock_bias_seq_len": 0,
-                "kernel_overrides_path": "custom.json",
+                "kernel_overrides_path": str(override_path),
             },
         },
     )
@@ -485,7 +489,16 @@ def test_build_hf_configs_propagates_flash_runtime_policy():
     for built_cfg in (disc_cfg, gen_cfg):
         assert built_cfg.hf_attention_impl == "flash"
         assert built_cfg.hf_flash["docblock_bias_seq_len"] == 0
-        assert built_cfg.hf_flash["kernel_overrides_path"] == "custom.json"
+        assert built_cfg.hf_flash["kernel_overrides_path"] == str(override_path)
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Attention
+    from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
+    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
+
+    try:
+        assert isinstance(DebertaV2Attention(disc_cfg).self, FlashDisentangledSelfAttention)
+    finally:
+        configure_flashdeberta_kernel_overrides(None)
 
 
 def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:

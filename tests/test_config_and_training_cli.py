@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import warnings
 from pathlib import Path
@@ -455,6 +456,44 @@ def test_validate_model_config_normalizes_hf_flash_config():
 
     assert cfg.hf.attention_impl == "flash"
     assert cfg.hf.flash.docblock_bias_seq_len == 4096
+
+
+def test_validate_model_config_warns_when_flash_options_are_inactive() -> None:
+    cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        hf={"flash": {"docblock_bias_seq_len": 1024}},
+    )
+
+    with pytest.warns(UserWarning, match=r"model\.hf\.flash\.\* has no effect"):
+        validate_model_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        (None, "Unable to load FlashDeBERTa kernel overrides"),
+        ({"kernels": [{}]}, r"kernels\[0\].*missing required field"),
+    ],
+    ids=["missing_file", "malformed_kernel_row"],
+)
+def test_validate_model_config_rejects_invalid_flash_kernel_overrides(
+    tmp_path: Path,
+    payload: dict[str, object] | None,
+    match: str,
+) -> None:
+    override_path = tmp_path / "flash-overrides.json"
+    if payload is not None:
+        override_path.write_text(json.dumps(payload), encoding="utf-8")
+    cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        hf={
+            "attention_impl": "flash",
+            "flash": {"kernel_overrides_path": str(override_path)},
+        },
+    )
+
+    with pytest.raises(ValueError, match=match):
+        validate_model_config(cfg)
 
 
 def test_validate_model_config_rejects_flash_attention_for_rope():

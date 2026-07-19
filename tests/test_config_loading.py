@@ -153,6 +153,8 @@ def test_load_json_nested(tmp_path: Path):
 def test_load_yaml_hf_flash_config(tmp_path: Path):
 
     config_path = tmp_path / "flash.yaml"
+    override_path = tmp_path / "custom.json"
+    override_path.write_text("{}", encoding="utf-8")
     config_path.write_text(
         "\n".join(
             [
@@ -162,7 +164,7 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
                 "    attention_impl: flash",
                 "    flash:",
                 "      docblock_bias_seq_len: 0",
-                "      kernel_overrides_path: custom.json",
+                f"      kernel_overrides_path: {override_path}",
                 "data:",
                 "  source:",
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
@@ -175,7 +177,7 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
 
     assert cfg.model.hf.attention_impl == "flash"
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
-    assert cfg.model.hf.flash.kernel_overrides_path == "custom.json"
+    assert cfg.model.hf.flash.kernel_overrides_path == str(override_path)
 
 
 @pytest.mark.parametrize(

@@ -64,7 +64,7 @@ All route and override fields live under `model.hf.flash.*`. Their exact null, z
 exact-length semantics are defined on each field in the
 [config reference](../../configs/config_reference.yaml).
 
-An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to the dense memory cost. `kernel_overrides_path` is merged with the shipped table when a route or kernel lookup first uses it.
+An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to the dense memory cost. An active `kernel_overrides_path` is loaded and validated with the training config, then merged with the shipped table for route and kernel lookups.
 
 ## Tuning table
 
