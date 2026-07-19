@@ -695,7 +695,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             use_varlen = False
         elif route == "varlen":
             use_varlen = True
-        elif route in {"fixed", "dense", "local_bias", "pairwise"}:
+        elif route in {"fixed", "dense", "local_bias"}:
             use_varlen = False
         else:
             use_varlen = _should_use_varlen(

@@ -13,12 +13,9 @@ except Exception:  # pragma: no cover - optional Triton dependency
     _triton = None
     tl = None
 
-TRITON_ROW_COPY_PREFIX_PACK = 0
-TRITON_ROW_COPY_PREFIX_PACK_STRIDED = 1
-TRITON_ROW_COPY_PREFIX_UNPACK = 2
-TRITON_ROW_COPY_SEGMENT_PACK = 3
-TRITON_ROW_COPY_SEGMENT_PACK_STRIDED = 4
-TRITON_ROW_COPY_SEGMENT_UNPACK = 5
+TRITON_ROW_COPY_SEGMENT_PACK = 0
+TRITON_ROW_COPY_SEGMENT_PACK_STRIDED = 1
+TRITON_ROW_COPY_SEGMENT_UNPACK = 2
 
 
 def kernel_dtype_name(dtype: torch.dtype) -> str:
@@ -118,8 +115,8 @@ def _triton_row_copy_kernel(
     :param Any output_a_ptr: First destination tensor pointer.
     :param Any output_b_ptr: Second destination tensor pointer, used when ``ARITY >= 2``.
     :param Any output_c_ptr: Third destination tensor pointer, used when ``ARITY >= 3``.
-    :param Any offsets_ptr: Flat padded-row offsets for segment modes.
-    :param Any lengths_ptr: Active row count per metadata record.
+    :param Any offsets_ptr: Flat padded-row offsets per segment.
+    :param Any lengths_ptr: Active row count per segment.
     :param Any cu_seqlens_ptr: Cumulative packed-row offsets.
     :param Any stride_a_b: First-input batch stride for rank-4 strided modes.
     :param Any stride_a_s: First-input sequence stride for rank-4 strided modes.
@@ -139,7 +136,7 @@ def _triton_row_copy_kernel(
     :param Any feature_size: Rank-4 per-head width for strided modes.
     :param Any col_tiles: Feature-tile count per head for strided modes.
     :param Any ARITY: Compile-time source/destination tensor count.
-    :param Any ADDRESS_MODE: Compile-time prefix/segment and pack/unpack addressing mode.
+    :param Any ADDRESS_MODE: Compile-time segment pack/unpack addressing mode.
     :param Any BLOCK_ROWS: Compile-time row tile size.
     :param Any BLOCK_COLS: Compile-time column tile size.
     :return None: This Triton kernel writes directly to destination pointers.
@@ -150,16 +147,12 @@ def _triton_row_copy_kernel(
     tile_col_or_hf = tl.program_id(2)
     row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
 
-    is_prefix = ADDRESS_MODE <= 2
-    is_pack = ADDRESS_MODE == 0 or ADDRESS_MODE == 1 or ADDRESS_MODE == 3 or ADDRESS_MODE == 4
-    is_strided = ADDRESS_MODE == 1 or ADDRESS_MODE == 4
+    is_pack = ADDRESS_MODE == 0 or ADDRESS_MODE == 1
+    is_strided = ADDRESS_MODE == 1
 
     length = tl.load(lengths_ptr + record_idx)
     packed_base = tl.load(cu_seqlens_ptr + record_idx)
-    if is_prefix:
-        padded_base = record_idx * seq_len
-    else:
-        padded_base = tl.load(offsets_ptr + record_idx)
+    padded_base = tl.load(offsets_ptr + record_idx)
 
     if is_strided:
         head_idx = tile_col_or_hf // col_tiles
@@ -215,29 +208,24 @@ def _triton_row_copy_kernel(
     if is_pack:
         src_rows = padded_rows
         dst_rows = packed_rows
-        store_mask = active_mask
     else:
         src_rows = packed_rows
         dst_rows = padded_rows
-        if ADDRESS_MODE == 2:
-            store_mask = (row_offsets[:, None] < seq_len) & (col_offsets[None, :] < row_size)
-        else:
-            store_mask = active_mask
 
     src_a_ptrs = input_a_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
     dst_a_ptrs = output_a_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
     values_a = tl.load(src_a_ptrs, mask=active_mask, other=0)
-    tl.store(dst_a_ptrs, values_a, mask=store_mask)
+    tl.store(dst_a_ptrs, values_a, mask=active_mask)
     if ARITY >= 2:
         src_b_ptrs = input_b_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
         dst_b_ptrs = output_b_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
         values_b = tl.load(src_b_ptrs, mask=active_mask, other=0)
-        tl.store(dst_b_ptrs, values_b, mask=store_mask)
+        tl.store(dst_b_ptrs, values_b, mask=active_mask)
     if ARITY >= 3:
         src_c_ptrs = input_c_ptr + src_rows[:, None] * row_size + col_offsets[None, :]
         dst_c_ptrs = output_c_ptr + dst_rows[:, None] * row_size + col_offsets[None, :]
         values_c = tl.load(src_c_ptrs, mask=active_mask, other=0)
-        tl.store(dst_c_ptrs, values_c, mask=store_mask)
+        tl.store(dst_c_ptrs, values_c, mask=active_mask)
 
 
 def launch_triton_row_copy(
@@ -262,8 +250,8 @@ def launch_triton_row_copy(
 
     :param tuple[torch.Tensor, ...] inputs: One to three source tensors.
     :param tuple[torch.Tensor, ...] outputs: Matching destination tensors.
-    :param torch.Tensor offsets: Flat padded-row offsets for segment modes; ignored for prefix modes.
-    :param torch.Tensor lengths: Active row count per prefix or segment.
+    :param torch.Tensor offsets: Flat padded-row offsets per segment.
+    :param torch.Tensor lengths: Active row count per segment.
     :param torch.Tensor cu_seqlens: Packed cumulative row offsets.
     :param int address_mode: One of the ``TRITON_ROW_COPY_*`` addressing modes.
     :param int seq_len: Padded sequence length.
@@ -285,10 +273,7 @@ def launch_triton_row_copy(
     if arity not in (1, 2, 3) or len(outputs) != arity:
         raise ValueError(f"Triton row-copy expects matching arity 1..3; got {arity} and {len(outputs)}.")
 
-    strided = address_mode in (
-        TRITON_ROW_COPY_PREFIX_PACK_STRIDED,
-        TRITON_ROW_COPY_SEGMENT_PACK_STRIDED,
-    )
+    strided = address_mode == TRITON_ROW_COPY_SEGMENT_PACK_STRIDED
     if strided and any(tensor.ndim != 4 for tensor in inputs):
         raise ValueError("Strided Triton row-copy inputs must have shape (B,S,H,F).")
 
