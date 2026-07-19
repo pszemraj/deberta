@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import errno
+import time
 from collections.abc import Callable
 from typing import TypeVar
 
 T = TypeVar("T")
 DATASET_RETRY_ATTEMPTS = 3
+DATASET_RETRY_BACKOFF_SECONDS = 1.0
 
 _TRANSIENT_ERROR_NAMES = {
     "ChunkedEncodingError",
@@ -87,7 +89,7 @@ def handle_dataset_retry_failure(
     attempt: int,
     on_retry: Callable[[int, BaseException], None],
 ) -> None:
-    """Raise a terminal dataset failure or notify before retrying.
+    """Raise a terminal dataset failure or notify and wait before retrying.
 
     :param BaseException exc: Failure from the current attempt.
     :param int attempt: One-based current attempt.
@@ -98,6 +100,7 @@ def handle_dataset_retry_failure(
     if int(attempt) >= DATASET_RETRY_ATTEMPTS or not is_transient_dataset_error(exc):
         raise exc
     on_retry(int(attempt), exc)
+    time.sleep(DATASET_RETRY_BACKOFF_SECONDS * (2 ** (int(attempt) - 1)))
 
 
 def call_with_dataset_retry(

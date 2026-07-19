@@ -12,7 +12,7 @@ If none are provided, config validation fails.
 
 Map-style sources (`data.source.streaming=false`, including `load_from_disk`) are explicitly partitioned across the combined distributed-rank and DataLoader-worker space. HF iterable sources (`data.source.streaming=true`) receive distributed-rank sharding from the dataset wrapper and retain their native DataLoader-worker partitioning.
 
-Dataset loading and streaming retry transient I/O failures up to three times. Retried streams replay to the last yielded example with the same epoch seed and shard; schema, authentication, and other non-transient errors fail immediately.
+Dataset loading and streaming retry transient I/O failures up to three times with exponential backoff. Retried streams replay to the last yielded example with the same epoch seed and shard; schema, authentication, and other non-transient errors fail immediately.
 
 ## Packed streaming path
 

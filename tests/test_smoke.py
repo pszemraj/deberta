@@ -348,7 +348,9 @@ def test_packed_streaming_epoch_changes_shuffle_seed():
     assert probe.last_seed == 10
 
 
-def test_streaming_retries_without_duplicating_examples() -> None:
+def test_streaming_retries_without_duplicating_examples(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("deberta.data.retry.time.sleep", lambda _delay: None)
+
     class _FlakyDataset:
         def __init__(self) -> None:
             self.iterations = 0
@@ -386,7 +388,13 @@ def test_streaming_retries_without_duplicating_examples() -> None:
     ],
     ids=["non_transient", "transient_exhausted", "permanent_os_error"],
 )
-def test_streaming_retry_failure_policy(error: Exception, expected_iterations: int) -> None:
+def test_streaming_retry_failure_policy(
+    error: Exception,
+    expected_iterations: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("deberta.data.retry.time.sleep", lambda _delay: None)
+
     class _FailingDataset:
         def __init__(self) -> None:
             self.iterations = 0
@@ -413,9 +421,11 @@ def test_streaming_retry_failure_policy(error: Exception, expected_iterations: i
     assert source.iterations == expected_iterations
 
 
-def test_call_with_dataset_retry_retries_transient_failure() -> None:
+def test_call_with_dataset_retry_retries_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
     retries: list[tuple[int, str]] = []
+    delays: list[float] = []
+    monkeypatch.setattr("deberta.data.retry.time.sleep", delays.append)
 
     def operation() -> str:
         nonlocal calls
@@ -432,6 +442,23 @@ def test_call_with_dataset_retry_retries_transient_failure() -> None:
     assert result == "ok"
     assert calls == 2
     assert retries == [(1, "temporary")]
+    assert delays == [1.0]
+
+
+def test_call_with_dataset_retry_uses_exponential_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    delays: list[float] = []
+    monkeypatch.setattr("deberta.data.retry.time.sleep", delays.append)
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise TimeoutError("temporary")
+        return "ok"
+
+    assert call_with_dataset_retry(operation, on_retry=lambda *_args: None) == "ok"
+    assert delays == [1.0, 2.0]
 
 
 def test_call_with_dataset_retry_does_not_retry_non_transient_failure() -> None:
