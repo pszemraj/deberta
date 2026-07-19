@@ -480,6 +480,42 @@ def _install_stable_backbone_compile_dispatch(
     masked_hs0_fn = masked_hs0
     masked_hs1_fn = masked_hs1
 
+    def _make_routed_dense_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
+        """Bind a fixed flash route onto one stable dense entrypoint.
+
+        :param Callable[..., Any] base_fn: Stable dense helper to wrap.
+        :param str route: Flash route literal stamped onto static metadata.
+        :return Callable[..., Any]: Route-bound dense entrypoint.
+        """
+
+        routed_meta = FlashBatchMeta(route_hint=route)
+
+        def _routed_dense_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+        ) -> Any:
+            """Call the dense helper with a fixed flash route.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :return Any: Dense-path backbone outputs.
+            """
+
+            return base_fn(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                flash_meta=routed_meta,
+            )
+
+        return _routed_dense_fn
+
     def _make_routed_masked_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
         """Bind a fixed flash route onto one stable masked entrypoint.
 
@@ -537,6 +573,12 @@ def _install_stable_backbone_compile_dispatch(
     compiled_dense = {
         False: torch.compile(dense_hs0_fn, **compile_kwargs),
         True: torch.compile(dense_hs1_fn, **compile_kwargs),
+    }
+    compiled_dense_routed = {
+        "local_bias": {
+            False: torch.compile(_make_routed_dense_fn(dense_hs0_fn, "local_bias"), **compile_kwargs),
+            True: torch.compile(_make_routed_dense_fn(dense_hs1_fn, "local_bias"), **compile_kwargs),
+        }
     }
     compiled_masked = {
         False: torch.compile(masked_hs0_fn, **compile_kwargs),
@@ -603,14 +645,22 @@ def _install_stable_backbone_compile_dispatch(
                 return_dict=resolved_return_dict,
                 flash_meta=flash_meta,
             )
+        route = flash_meta.route_hint if flash_meta is not None else None
         if attention_mask is None:
+            routed_dense = compiled_dense_routed.get(route) if route is not None else None
+            if routed_dense is not None:
+                return routed_dense[resolved_output_hidden_states](
+                    input_ids=input_ids,
+                    token_type_ids=token_type_ids,
+                    position_ids=position_ids,
+                    inputs_embeds=inputs_embeds,
+                )
             return compiled_dense[resolved_output_hidden_states](
                 input_ids=input_ids,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
             )
-        route = flash_meta.route_hint if flash_meta is not None else None
         routed = compiled_masked_routed.get(route) if route is not None else None
         if routed is not None:
             assert flash_meta is not None, "A compiled routed target requires explicit FlashBatchMeta."
@@ -632,6 +682,7 @@ def _install_stable_backbone_compile_dispatch(
         )
 
     module._compiled_forward_dense = compiled_dense
+    module._compiled_forward_dense_routed = compiled_dense_routed
     module._compiled_forward_masked = compiled_masked
     module._compiled_forward_masked_routed = compiled_masked_routed
     module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]
@@ -639,6 +690,11 @@ def _install_stable_backbone_compile_dispatch(
         [
             f"{target}[dense_hs0]",
             f"{target}[dense_hs1]",
+            *(
+                f"{target}[dense_{route}_hs{int(hs)}]"
+                for route in compiled_dense_routed
+                for hs in (False, True)
+            ),
             f"{target}[masked_hs0]",
             f"{target}[masked_hs1]",
             *(

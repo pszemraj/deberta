@@ -55,6 +55,6 @@ The data pipeline defines the [attention and objective metadata contract](../gui
   masks without collator metadata take the eager route.
 - Ragged doc-block descriptors and objective metadata have fixed shapes. Document-count changes therefore do not recompile the `masked_docblock_*` entrypoints, and the eager RTD head consumes its document context outside the compiled scope.
 
-Dense, unpadded batches take a fast path with no Flash metadata, so no dynamic metadata threads through Dynamo guards.
+Plain dense, unpadded batches take a fast path with no Flash metadata. The `local_bias` policy uses a separate route-bound dense specialization whose hint is static, so no dynamic metadata threads through Dynamo guards.
 
 The compiled padded-varlen Triton op and its eager autograd wrapper use a `B,S,H,D` internal layout and repo-local prefix-pack kernels. Because repo masks use standard prefix padding, active tokens pack and repad directly from `seqlens`/`cu_seqlens` instead of generic `nonzero`/`gather`/`index_copy` flows, and the backward fuses packed `grad_out` construction with `delta` computation. When profiling unpacked runs, expect the remaining cost to be the varlen Triton backward kernel plus the smaller prefix pack/unpack kernels, not `aten::index`-style hotspots.

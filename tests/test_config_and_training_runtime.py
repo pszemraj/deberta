@@ -1183,11 +1183,13 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
         def _resolve_forward_options(self, **kwargs):
             return False, bool(kwargs["output_hidden_states"]), True
 
-        def _forward_dense_hs0(self, **_kwargs):
-            return "dense_hs0"
+        def _forward_dense_hs0(self, **kwargs):
+            flash_meta = kwargs.get("flash_meta")
+            return "dense_hs0", flash_meta.route_hint if flash_meta is not None else None
 
-        def _forward_dense_hs1(self, **_kwargs):
-            return "dense_hs1"
+        def _forward_dense_hs1(self, **kwargs):
+            flash_meta = kwargs.get("flash_meta")
+            return "dense_hs1", flash_meta.route_hint if flash_meta is not None else None
 
         def _forward_masked_hs0(self, **kwargs):
             return "masked_hs0", kwargs["flash_meta"].route_hint
@@ -1208,6 +1210,13 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
     )
 
     mask = torch.ones((1, 4), dtype=torch.bool)
+    for hidden_states in (False, True):
+        result = backbone(
+            output_hidden_states=hidden_states,
+            flash_meta=FlashBatchMeta(route_hint="local_bias"),
+        )
+        assert result == (f"dense_hs{int(hidden_states)}", "local_bias")
+
     for route in ("fixed", "varlen", "docblock", "docblock_bias"):
         for hidden_states in (False, True):
             result = backbone(
@@ -1217,8 +1226,8 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             )
             assert result == (f"masked_hs{int(hidden_states)}", route)
 
-    assert len(compile_calls) == 12
-    assert len(targets) == 12
+    assert len(compile_calls) == 14
+    assert len(targets) == 14
 
 
 def test_stabilize_compile_attention_mask_rope_doc_blocking():

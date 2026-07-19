@@ -1279,14 +1279,12 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         output_attentions: bool,
         output_hidden_states: bool,
         return_dict: bool,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run forward on the dense no-mask path with resolved flags.
 
-        This path intentionally has no ``flash_meta`` parameter: a dense batch
-        (``attention_mask is None``) carries no flash metadata content — its
-        route hint is at most ``"dense"``, which every consumer treats exactly
-        like ``None`` — and keeping the compiled dense entrypoints tensor-only
-        avoids Dynamo guards on a semantically empty object.
+        Ordinary dense batches carry no Flash metadata. The optional bundle is
+        reserved for the route-bound ``local_bias`` compile specialization.
 
         :param torch.Tensor | None input_ids: Optional input token ids.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
@@ -1295,6 +1293,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param bool output_attentions: Resolved attention-output flag.
         :param bool output_hidden_states: Resolved hidden-state-output flag.
         :param bool return_dict: Resolved return-format flag.
+        :param FlashBatchMeta | None flash_meta: Optional route-bound FlashDeBERTa metadata.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
@@ -1307,6 +1306,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            flash_meta=flash_meta,
         )
 
     def _forward_masked_resolved(
@@ -1355,6 +1355,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run the dense training fast path with hidden-state outputs disabled.
 
@@ -1362,6 +1363,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param FlashBatchMeta | None flash_meta: Optional route-bound FlashDeBERTa metadata.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
@@ -1373,6 +1375,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_attentions=False,
             output_hidden_states=False,
             return_dict=True,
+            flash_meta=flash_meta,
         )
 
     def _forward_dense_hs1(
@@ -1382,6 +1385,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
         """Run the dense training fast path with hidden-state outputs enabled.
 
@@ -1389,6 +1393,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         :param torch.Tensor | None token_type_ids: Optional token type ids.
         :param torch.Tensor | None position_ids: Optional position ids.
         :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param FlashBatchMeta | None flash_meta: Optional route-bound FlashDeBERTa metadata.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
         """
 
@@ -1400,6 +1405,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
+            flash_meta=flash_meta,
         )
 
     def _forward_masked_hs0(
