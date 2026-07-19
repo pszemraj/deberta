@@ -25,7 +25,7 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.export_cli import ExportArgumentDefaultsHelpFormatter, add_export_arguments
+from deberta.export_cli import add_export_arguments
 from deberta.training.entrypoint import run_pretraining_dry_run
 from deberta.training.run_config import _build_run_metadata, _persist_or_validate_run_configs
 from deberta.training.steps import _global_grad_l2_norm
@@ -192,21 +192,6 @@ def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.Mon
     assert cfg.checkpoint_dir == "runs/demo/checkpoint-10"
     assert cfg.export_what == "generator"
     assert cfg.output_dir == "runs/demo/exported_hf"
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["runs/demo/checkpoint-10", "--safe-serialization", "--no-safe-serialization"],
-        ["runs/demo/checkpoint-10", "--offload-to-cpu", "--no-offload-to-cpu"],
-        ["runs/demo/checkpoint-10", "--rank0-only", "--no-rank0-only"],
-    ],
-)
-def test_export_parser_rejects_conflicting_boolean_flags(argv: list[str]):
-    parser = argparse.ArgumentParser(prog="deberta export")
-    add_export_arguments(parser)
-    with pytest.raises(SystemExit):
-        parser.parse_args(argv)
 
 
 def test_validate_data_config_rejects_conflicting_sources():
@@ -592,17 +577,13 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
         validate_model_config(cfg)
 
 
-def test_export_help_does_not_show_misleading_defaults_on_no_flags() -> None:
-    parser = argparse.ArgumentParser(
-        prog="deberta export",
-        formatter_class=ExportArgumentDefaultsHelpFormatter,
-    )
+def test_export_help_documents_boolean_defaults() -> None:
+    parser = argparse.ArgumentParser(prog="deberta export")
     add_export_arguments(parser)
     help_text = parser.format_help()
-    assert "--safe-serialization" in help_text and "(default: True)" in help_text
-    for opt in ("--no-safe-serialization", "--no-offload-to-cpu", "--no-rank0-only"):
-        line = next((ln for ln in help_text.splitlines() if opt in ln), "")
-        assert "(default:" not in line
+    assert "default, recommended safetensors" in help_text
+    assert "instead of offloading it to CPU" in help_text
+    assert "default rank-0-only gather" in help_text
 
 
 @pytest.mark.parametrize(

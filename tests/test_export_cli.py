@@ -499,6 +499,14 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    model_cfg = make_model_config(
+        tokenizer={"name_or_path": "dummy-tokenizer"},
+        embedding_sharing="gdes",
+    )
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(model_cfg)),
+        encoding="utf-8",
+    )
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -543,7 +551,6 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
             run_dir=str(run_dir),
             output_dir=str(out_dir),
             export_what="discriminator",
-            embedding_sharing="gdes",
         )
     )
 
@@ -701,26 +708,10 @@ def test_namespace_to_export_config_maps_allow_partial_export() -> None:
             safe_serialization=True,
             offload_to_cpu=True,
             rank0=True,
-            embedding_sharing=None,
             allow_partial_export=True,
         )
         cfg = export_cli.namespace_to_export_config(ns)
         assert cfg.allow_partial_export is True
-
-
-def test_export_parser_rejects_conflicting_what_alias_values() -> None:
-    parser = argparse.ArgumentParser(prog="deberta export")
-    export_cli.add_export_arguments(parser)
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "runs/demo/checkpoint-10",
-                "--what",
-                "discriminator",
-                "--export-what",
-                "generator",
-            ]
-        )
 
 
 def test_run_export_rejects_invalid_export_what_before_runtime_imports() -> None:

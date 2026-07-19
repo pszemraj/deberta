@@ -14,7 +14,7 @@ deberta export <run_dir>/checkpoint-<step> \
   --output-dir <run_dir>/exported_hf
 ```
 
-Export infers the run directory from the checkpoint parent and requires that directory's `model_config.json`, `data_config.json`, and `run_metadata.json`. If a checkpoint was moved elsewhere, pass `--run-dir <original-run-dir>` explicitly.
+Export infers the run directory from the checkpoint parent and requires that directory's `model_config.json` and `data_config.json`. It validates `run_metadata.json` when that optional snapshot is present. If a checkpoint was moved elsewhere, pass `--run-dir <original-run-dir>` explicitly.
 
 `--what` supports:
 
@@ -26,10 +26,10 @@ Export infers the run directory from the checkpoint parent and requires that dir
 
 For distributed runs (`distributed_type=FSDP`), export uses Accelerate/Torch distributed checkpoint loading and gathers full state for final artifact writing.
 
-Key knobs:
+FSDP export offloads the consolidated state to CPU and gathers it on rank 0 by default. Override those defaults only when the alternative fits the available memory:
 
-- `--offload-to-cpu` / `--no-offload-to-cpu`
-- `--rank0-only` / `--no-rank0-only`
+- `--no-offload-to-cpu`
+- `--no-rank0-only`
 
 Default output path is `<run_dir>/exported_hf` and must be empty if it already exists.
 

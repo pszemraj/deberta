@@ -8,7 +8,6 @@ from pathlib import Path
 
 from deberta.config import load_config
 from deberta.export_cli import (
-    ExportArgumentDefaultsHelpFormatter,
     add_export_arguments,
     namespace_to_export_config,
     run_export,
@@ -50,7 +49,6 @@ def _build_export_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     export = subparsers.add_parser(
         "export",
         help="Consolidate and export checkpoint to standalone HF artifacts.",
-        formatter_class=ExportArgumentDefaultsHelpFormatter,
     )
     add_export_arguments(export)
 

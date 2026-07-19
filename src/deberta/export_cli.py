@@ -45,52 +45,6 @@ from deberta.utils.paths import validate_existing_output_dir
 logger = logging.getLogger(__name__)
 
 
-class ExportArgumentDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
-    """Argparse formatter with clearer defaults for paired ``--foo``/``--no-foo`` flags."""
-
-    def _get_help_string(self, action: argparse.Action) -> str:
-        """Render help text while suppressing misleading defaults on ``--no-*`` flags.
-
-        :param argparse.Action action: Parser action.
-        :return str: Help text.
-        """
-        help_text = action.help or ""
-        if isinstance(action, argparse._StoreFalseAction) or any(
-            str(opt).startswith("--no-") for opt in action.option_strings
-        ):
-            return help_text
-        return super()._get_help_string(action)
-
-
-class _ConflictAwareChoiceAction(argparse.Action):
-    """Reject conflicting repeated values for aliased choice flags."""
-
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Any,
-        option_string: str | None = None,
-    ) -> None:
-        """Apply parsed value while rejecting conflicting duplicate assignments.
-
-        :param argparse.ArgumentParser parser: Active parser.
-        :param argparse.Namespace namespace: Namespace being populated.
-        :param Any values: Parsed value.
-        :param str | None option_string: Triggering option string.
-        """
-        seen_attr = f"__seen_{self.dest}"
-        if bool(getattr(namespace, seen_attr, False)):
-            previous = getattr(namespace, self.dest, None)
-            if previous != values:
-                parser.error(
-                    f"Conflicting values for --what/--export-what: {previous!r} then {values!r}. "
-                    "Provide only one value."
-                )
-        setattr(namespace, self.dest, values)
-        setattr(namespace, seen_attr, True)
-
-
 def _normalize_export_target(value: str) -> str:
     """Normalize and validate export target selection.
 
@@ -158,8 +112,6 @@ class ExportConfig:
     offload_to_cpu: bool = True
     rank0: bool = True
 
-    # Override embedding_sharing (normally read from model_config.json)
-    embedding_sharing: str | None = None
     allow_partial_export: bool = False
 
 
@@ -170,89 +122,66 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument(
         "checkpoint_dir",
-        help="Path to checkpoint-<step> directory saved by training.",
+        help="Required path to an existing checkpoint-<step> directory saved by training.",
     )
     parser.add_argument(
         "--output-dir",
         default=None,
         help=(
             "Output directory for exported artifacts. Defaults to <run_dir>/exported_hf. "
-            "If provided, it must not contain existing files."
+            "The resolved directory must be absent or empty."
         ),
     )
     parser.add_argument(
         "--run-dir",
         default=None,
-        help="Optional run directory containing model_config.json/data_config.json. Defaults to checkpoint parent.",
+        help=(
+            "Run directory containing required model_config.json and data_config.json snapshots; "
+            "run_metadata.json is validated when present. Defaults to the checkpoint parent."
+        ),
     )
     parser.add_argument(
         "--what",
-        "--export-what",
         dest="export_what",
         default="discriminator",
         choices=("discriminator", "generator", "both"),
-        action=_ConflictAwareChoiceAction,
-        help="Which component(s) to export.",
+        help=(
+            "Component to export. A single component uses a flat output directory; 'both' writes "
+            "discriminator/ and generator/ subdirectories."
+        ),
     )
-    safe_group = parser.add_mutually_exclusive_group()
-    safe_group.add_argument(
-        "--safe-serialization",
-        dest="safe_serialization",
-        action="store_true",
-        help="Use safetensors format when saving HF artifacts.",
-    )
-    safe_group.add_argument(
+    parser.add_argument(
         "--no-safe-serialization",
         dest="safe_serialization",
         action="store_false",
-        help="Disable safetensors format when saving HF artifacts.",
+        help="Save model weights with PyTorch serialization instead of the default, recommended safetensors.",
     )
-    parser.set_defaults(safe_serialization=True)
 
-    offload_group = parser.add_mutually_exclusive_group()
-    offload_group.add_argument(
-        "--offload-to-cpu",
-        dest="offload_to_cpu",
-        action="store_true",
-        help=("Offload consolidated full state dict to CPU under FSDP export. Ignored for non-FSDP exports."),
-    )
-    offload_group.add_argument(
+    parser.add_argument(
         "--no-offload-to-cpu",
         dest="offload_to_cpu",
         action="store_false",
         help=(
-            "Keep consolidated full state dict on accelerator memory under FSDP export. "
-            "Ignored for non-FSDP exports."
+            "Keep the consolidated full state dict on accelerator memory instead of offloading it to CPU. "
+            "The full state must fit accelerator memory; ignored for non-FSDP exports."
         ),
     )
-    parser.set_defaults(offload_to_cpu=True)
 
-    rank0_group = parser.add_mutually_exclusive_group()
-    rank0_group.add_argument(
-        "--rank0-only",
-        dest="rank0",
-        action="store_true",
-        help="Gather full state dict on rank 0 only under FSDP export. Ignored for non-FSDP exports.",
-    )
-    rank0_group.add_argument(
+    parser.add_argument(
         "--no-rank0-only",
         dest="rank0",
         action="store_false",
-        help="Gather full state dict on all ranks under FSDP export. Ignored for non-FSDP exports.",
-    )
-    parser.set_defaults(rank0=True)
-    parser.add_argument(
-        "--embedding-sharing",
-        default=None,
-        choices=("none", "es", "gdes"),
-        help="Override embedding sharing mode. Defaults to training config value.",
+        help=(
+            "Gather the full state dict on every rank instead of the default rank-0-only gather. "
+            "Ignored for non-FSDP exports."
+        ),
     )
     parser.add_argument(
         "--allow-partial-export",
         action="store_true",
         help=(
-            "Allow partial backbone state loads when exporting. "
-            "By default export fails on any missing/unexpected backbone keys."
+            "Recovery/debugging only: permit missing or unexpected backbone keys, which can leave "
+            "parameters initialized rather than restored. Strict loading is the default."
         ),
     )
 
@@ -271,7 +200,6 @@ def namespace_to_export_config(ns: argparse.Namespace) -> ExportConfig:
         safe_serialization=bool(ns.safe_serialization),
         offload_to_cpu=bool(ns.offload_to_cpu),
         rank0=bool(ns.rank0),
-        embedding_sharing=ns.embedding_sharing,
         allow_partial_export=bool(getattr(ns, "allow_partial_export", False)),
     )
 
@@ -491,7 +419,7 @@ def run_export(cfg: ExportConfig) -> None:
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
 
-    embedding_sharing = (cfg.embedding_sharing or model_cfg.embedding_sharing or "none").lower()
+    embedding_sharing = (model_cfg.embedding_sharing or "none").lower()
     strict_export_load = not bool(cfg.allow_partial_export)
 
     # Tokenizer (needed for configs, and we also export it)
@@ -588,7 +516,7 @@ def run_export(cfg: ExportConfig) -> None:
         # Non-FSDP: unwrap DDP etc.
         if (not bool(cfg.offload_to_cpu)) or (not bool(cfg.rank0)):
             logger.warning(
-                "--offload-to-cpu/--rank0-only only apply to FSDP export; current distributed_type=%s, "
+                "--no-offload-to-cpu/--no-rank0-only only apply to FSDP export; current distributed_type=%s, "
                 "so those options are ignored.",
                 accelerator.distributed_type,
             )
