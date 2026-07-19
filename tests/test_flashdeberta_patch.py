@@ -707,6 +707,29 @@ def _flash_attention_harness(
     return attention_mod, attention, cfg
 
 
+def test_flash_attention_missing_runtime_raises_on_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    attention_mod = _patch_flashdeberta_available(monkeypatch)
+    cfg = _small_deberta_config()
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg)
+    import_error = ImportError("missing FlashDeBERTa low-level kernels")
+    monkeypatch.setattr(attention_mod, "flashdeberta_fixed_import_error", lambda: import_error)
+    hidden_states = types.SimpleNamespace(
+        shape=(1, 4, cfg.hidden_size),
+        device=torch.device("cuda"),
+    )
+    query_states = types.SimpleNamespace(shape=(1, 4, cfg.hidden_size))
+
+    with pytest.raises(RuntimeError, match="Install the project with the flash extra") as exc_info:
+        attention._requires_eager_fallback(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            query_states=query_states,
+            rel_embeddings=torch.empty(0),
+        )
+
+    assert exc_info.value.__cause__ is import_error
+
+
 def test_native_flash_helper_preserves_relative_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

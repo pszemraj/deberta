@@ -20,6 +20,9 @@ The flash path has these constraints:
 - CUDA is required. See [GPU support](gpu-support.md) for supported capabilities and off-table
   behavior.
 
+CUDA runtime availability is fail-closed: missing `.[flash]` dependencies or incompatible core
+low-level imports raise an actionable error instead of silently running eager attention.
+
 ## Route families
 
 The adapter selects one route per batch:

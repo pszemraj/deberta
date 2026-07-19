@@ -226,10 +226,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             return True
         if int(self.position_buckets) <= 0:
             return True
-        if flashdeberta_fixed_import_error() is not None:
-            return True
         if hidden_states.device.type != "cuda":
             return True
+        fixed_import_error = flashdeberta_fixed_import_error()
+        if fixed_import_error is not None:
+            raise RuntimeError(
+                "FlashDeBERTa attention was requested on CUDA, but its fixed-length runtime "
+                "could not be imported. Install the project with the flash extra "
+                "(`pip install -e '.[flash]'`) and ensure FlashDeBERTa and Triton are "
+                "compatible with the installed PyTorch build."
+            ) from fixed_import_error
         if query_len != key_len:
             return True
         return False
