@@ -29,6 +29,7 @@ from typing import Any
 import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
 import torch
 
+from deberta.config import ModelHFFlashConfig  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
 from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
 from deberta.training.compile import prepare_flash_attention_batch_metadata  # noqa: E402
@@ -120,7 +121,7 @@ def main() -> None:
         batch=batch,
         backbone_type="hf_deberta_v2",
         flash_enabled=str(args.mode) == "flash",
-        flash_cfg=cfg.hf_flash,
+        flash_cfg=ModelHFFlashConfig(**cfg.hf_flash),
         route_device=device,
     )
     input_ids = batch["input_ids"].to(device)

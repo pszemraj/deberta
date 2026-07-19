@@ -29,6 +29,7 @@ class ParityCase:
     pad_tail: int = 0
     docblock: bool = False
     strict_ratio: bool = False
+    head_dim: int = 16
 
 
 _PARITY_CASE_NAMES = (
@@ -68,17 +69,17 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _build_tiny_config(*, seq_len: int, flash: bool) -> DebertaV2Config:
+def _build_tiny_config(*, seq_len: int, flash: bool, head_dim: int) -> DebertaV2Config:
     """Build a small DeBERTa config suitable for parity testing."""
 
     return _bench_common.build_synthetic_backbone_config(
         mode="flash" if bool(flash) else "eager",
         seq_len=seq_len,
         vocab_size=128,
-        hidden_size=64,
+        hidden_size=4 * int(head_dim),
         num_layers=2,
         num_heads=4,
-        intermediate_size=128,
+        intermediate_size=8 * int(head_dim),
     )
 
 
@@ -294,8 +295,8 @@ def _scaled_grad_limits(reference: torch.Tensor, *, max_rel: float, mean_rel: fl
 
 
 def _run_case(case: ParityCase, *, device: torch.device) -> None:
-    cfg_ref = _build_tiny_config(seq_len=case.seq_len, flash=False)
-    cfg_flash = _build_tiny_config(seq_len=case.seq_len, flash=True)
+    cfg_ref = _build_tiny_config(seq_len=case.seq_len, flash=False, head_dim=case.head_dim)
+    cfg_flash = _build_tiny_config(seq_len=case.seq_len, flash=True, head_dim=case.head_dim)
 
     torch.manual_seed(0)
     ref = DebertaV2Model(cfg_ref).to(device=device, dtype=torch.float32).train()
@@ -396,7 +397,7 @@ def main() -> None:
         ParityCase("dense", seq_len=256, batch_size=2, route_hint="dense"),
         ParityCase("fixed_padded", seq_len=256, batch_size=2, route_hint="fixed", pad_tail=64),
         ParityCase("varlen", seq_len=256, batch_size=2, route_hint="varlen", pad_tail=64),
-        ParityCase("local_bias", seq_len=1024, batch_size=2, route_hint="dense"),
+        ParityCase("local_bias", seq_len=1024, batch_size=2, route_hint="local_bias"),
         ParityCase("docblock", seq_len=256, batch_size=2, route_hint="docblock", pad_tail=32, docblock=True),
         ParityCase(
             "docblock_1024",
@@ -439,6 +440,7 @@ def main() -> None:
                     route_hint="docblock_bias",
                     docblock=True,
                     strict_ratio=True,
+                    head_dim=64,
                 ),
                 ParityCase(
                     "docbias_1024",
@@ -448,6 +450,7 @@ def main() -> None:
                     pad_tail=96,
                     docblock=True,
                     strict_ratio=True,
+                    head_dim=64,
                 ),
                 ParityCase(
                     "docbias_2048",
@@ -457,6 +460,7 @@ def main() -> None:
                     pad_tail=160,
                     docblock=True,
                     strict_ratio=True,
+                    head_dim=64,
                 ),
                 ParityCase(
                     "docbias_4096",
@@ -466,6 +470,7 @@ def main() -> None:
                     pad_tail=256,
                     docblock=True,
                     strict_ratio=True,
+                    head_dim=64,
                 ),
             ]
         )
