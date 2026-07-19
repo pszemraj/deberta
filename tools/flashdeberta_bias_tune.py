@@ -61,15 +61,25 @@ def main() -> None:
         tool_name="flashdeberta_bias_tune.py",
         require_bf16=True,
     )
+    tuning_model_cfg = dataclasses.replace(
+        cfg.model,
+        hf=dataclasses.replace(
+            cfg.model.hf,
+            flash=dataclasses.replace(
+                cfg.model.hf.flash,
+                docblock_bias_seq_len=int(cfg.data.packing.max_seq_length),
+            ),
+        ),
+    )
     backbone_config, head_dim, att_span = bench.build_branch_backbone_config(
-        model_cfg=cfg.model,
+        model_cfg=tuning_model_cfg,
         data_cfg=cfg.data,
         tokenizer=tokenizer,
         branch=str(args.branch),
     )
     samples = bench.sample_flash_batches(
         loader=loader,
-        model_cfg=cfg.model,
+        model_cfg=tuning_model_cfg,
         sample_batches=int(args.sample_batches),
         device=device,
         head_dim=head_dim,
