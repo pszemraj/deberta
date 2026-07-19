@@ -1,1349 +1,403 @@
 # DeBERTa RTD pretraining configuration reference
 #
-# This single file is both the complete config reference and a valid native-DeBERTa RTD pretraining config. Copy it, change the dataset and output settings, and delete keys you do not intend to own.
+# This comments-only file documents every key accepted by `deberta train`. It is a per-key contract, not a runnable config or task template; worked configs live separately under `configs/`.
+# Dotted paths below map directly to nested YAML or JSON mappings. Files may use `.yaml`, `.yml`, or `.json` and may contain only the top-level `model`, `data`, `train`, `optim`, and `logging` sections; unknown keys fail validation.
+# Every leaf is optional unless marked conditionally required. Omission uses the stated default. YAML booleans must be true/false values, strings must remain strings, numeric strings are accepted, and null is accepted only by `| None` fields.
+# Duplicate mapping keys are not rejected: YAML and JSON parsing retain the last value. Never duplicate a key. Relative paths resolve from the process working directory; only keys that explicitly say so expand `~`.
+# This surface configures RTD pretraining. It does not configure export or downstream fine-tuning/evaluation.
+# GPU count and FSDP are launcher settings, not YAML keys: a one-GPU request needs no extra key and uses this same YAML in one process; multiple GPUs use the same YAML with the appropriate Accelerate launch configuration.
+# The repository is pre-stable. Persisted resume/export snapshots carry a schema version, and incompatible versions are rejected rather than migrated.
 #
-# SCOPE
-# - This surface configures `deberta train` RTD pretraining only.
-# - It cannot express downstream fine-tuning, task/MTEB evaluation, export, or distributed-launch settings.
-# - Export uses `deberta export`; distributed launch uses a separate Accelerate YAML; downstream fine-tuning and evaluation require tooling outside this training config.
-# - The active values below form a sensible native `hf_deberta_v2` starting point, not a universal recipe. Model size, sequence length, effective token batch, hardware, and corpus determine the final training recipe.
-# - Lifecycle: the repository is pre-stable. Run snapshots carry a schema version, and resume/export intentionally reject snapshots from incompatible code schemas instead of guessing a migration.
+# Backbone-profile omission defaults
+# Five leaves have backbone-dependent omission behavior: `train.objective.mask_token_prob`, `train.objective.random_token_prob`, `train.objective.disc_loss_weight`, `optim.adam.epsilon`, and `optim.scheduler.warmup_steps`.
+# Their native/RoPE defaults are documented on each leaf. Any explicit file value wins, including a value equal to the dataclass schema default.
 #
-# WORKFLOW CHOICES
-# - Fresh native pretraining: keep model.backbone_type="hf_deberta_v2", model.from_scratch=true, model.pretrained.* empty/null, and train.checkpoint.resume_from_checkpoint=null.
-# - Fresh experimental RoPE pretraining: set model.backbone_type="rope" and keep model.from_scratch=true.
-# - For the RoPE omission profile, delete the pinned values at train.objective.mask_token_prob, train.objective.random_token_prob, train.objective.disc_loss_weight, optim.adam.epsilon, and optim.scheduler.warmup_steps.
-# - Alternatively, set all five profile-sensitive values deliberately; leaving this reference's native values active does not invoke RoPE defaults.
-# - Fresh initialization from pretrained weights: set model.from_scratch=false and model.pretrained.discriminator_path. This starts at optimizer step 0 with a new optimizer; it is not an exact training resume.
-# - Short smoke or learning-signal proof: use scheduler.type="constant" or "constant_with_warmup", or set warmup_steps meaningfully below train.max_steps. The native omission default is 10000 warmup steps, so a 10-step proof that omits scheduler settings measures only the extreme start of warmup and may show no learning trend.
-# - Exact training resume starts from the source run's config_resolved.yaml.
-# - Same-directory continuation sets train.checkpoint.resume_from_checkpoint="auto" and keeps both output directories unchanged.
-# - Continuation into a new run sets an explicit committed checkpoint and changes both train.checkpoint.output_dir and logging.output_dir to the new destination; changing only the checkpoint output would reuse and overwrite the source run's logging snapshots.
-# - Read the full train.checkpoint.resume_from_checkpoint contract before changing anything else.
-# - FlashDeBERTa requires the native backbone, model.hf.attention_impl="flash", both model.dropout values at 0.0, and the `flash` extra.
-# - Begin FlashDeBERTa validation with train.compile.enabled=false until the uncompiled route works on the target GPU.
-#
-# FILE CONTRACT
-# - Accepted file types: YAML (.yaml/.yml) and JSON (.json).
-# - Runtime sections: model, data, train, optim, and logging. Unknown keys fail validation.
-# - Duplicate YAML or JSON keys fail validation instead of silently letting the later value win.
-# - Bool fields accept values parsed by YAML as booleans: unquoted true/false/yes/no/on/off and their case variants. Quoted strings and numeric 0/1 are rejected. Prefer canonical lowercase true/false.
-# - String fields require YAML strings; quote boolean-looking aliases such as logging.wandb.watch: "false" because unquoted false is parsed as a bool and rejected.
-# - Numeric fields accept YAML numbers or numeric strings. null is accepted only for `| None` types.
-# - Relative local paths resolve from the process working directory, never from the YAML file's directory.
-# - `~` is expanded for checkpoint, logging, and explicit resume paths; other local-path fields document their exact behavior inline.
-# - A config file is fully validated before CLI overrides are applied. A broken file cannot be repaired by a later flag.
-#
-# CLI AND PRECEDENCE
-# - Every leaf below is also a dotted flag: `model.backbone_type` becomes `--model.backbone_type VALUE`.
-# - Highest priority: dotted CLI flag > config file > documented omission behavior.
-# - Boolean dotted flags accept true/t/yes/y/on/1 and false/f/no/n/off/0, case-insensitively. Prefer true/false for auditability.
-# - Nullable dotted flags accept `null` or `none`; for example, `--logging.run_name null` clears a value from the file.
-# - `deberta train CONFIG --dry-run` performs config, output, resume, tokenizer, dataset, collator, and backbone-config preflight without optimization or checkpoint writes.
-# - Dry-run does not load pretrained weights, instantiate the RTD model, exercise CUDA/Flash kernels, or prove the run fits memory. It may use the network and populate caches.
-#
-# DEFAULTS
-# - `schema default` is the dataclass fallback.
-# - `default` is what omission actually does. Backbone recipes state intentional deviations.
-# - All keys are optional unless `required` says otherwise. The dataset-source group is conditionally required: configure dataset_name, data_files, or load_from_disk.
-# - This reference spells out every leaf, making every active value explicit.
-# - Computed backbone-profile defaults apply only when the relevant key is omitted; changing only model.backbone_type does not rewrite values retained from this file.
-#
-# RUN OUTPUTS
-# - A null checkpoint output dir becomes runs/<project>/<timestamp>_<run-or-config-name>.
-# - A null logging output dir uses the resolved checkpoint output dir.
-# - The run output dir receives model/data/train/optim/logging JSON snapshots and run_metadata.json; each checkpoint-* subdirectory contains transactionally committed model/optimizer/scheduler/RNG/data-progress state.
-# - The logging dir receives config_original.yaml and config_resolved.yaml. W&B uploads those configs.
-# - With W&B disabled and logging.debug.metrics=false, periodic loss/LR/throughput values are console-only; no durable scalar-history file is written.
-
-model:
-  # [model.backbone_type]
-  # type: str
-  # schema default: "hf_deberta_v2"
-  # default: literal "hf_deberta_v2"
-  # required: optional
-  # values: "hf_deberta_v2" | "rope"
-  # contract: hf_deberta_v2 is the supported native DeBERTa-v2/v3 parity path; rope is the experimental RoPE/RMSNorm path.
-  # lifecycle: every model.rope.* key is experimental and only applies to backbone_type=rope.
-  # interaction: changing this key alone does not activate the five backbone-profile omission defaults while those leaves remain explicit.
-  backbone_type: "hf_deberta_v2"
-
-  # [model.from_scratch]
-  # type: bool
-  # schema default: true
-  # default: literal true
-  # required: optional
-  # values: true | false
-  # contract: false initializes a fresh optimizer-step-0 run from model.pretrained.discriminator_path; it does not restore optimizer, scheduler, RNG, or data progress.
-  # interaction: pretrained RoPE requires repo-native DebertaRoPE checkpoints, keeps scratch-only model.rope.* values at schema defaults, and applies checkpoint adaptations only through model.rope.pretrained.*.
-  # recommendation: use true for random initialization and train.checkpoint.resume_from_checkpoint for exact continuation.
-  from_scratch: true
-
-  # [model.embedding_sharing]
-  # type: str
-  # schema default: "gdes"
-  # default: literal "gdes"
-  # required: optional
-  # values: "none" | "es" | "gdes"
-  # gdes: recommended RTD default; discriminator embeddings are a frozen generator-synchronized base plus a full-size trainable bias.
-  # es: directly aliases generator embedding parameters into the discriminator, requires train.decoupled_training=false, and requires optim.lr.generator=-1 or equal to optim.lr.base.
-  # none: keeps independent generator and discriminator embeddings.
-  # compatibility: es and gdes require every shared embedding tensor to have exactly matching shapes and replace loaded discriminator embeddings with generator-derived values.
-  # recommendation: use none when generator/discriminator widths or checkpoint embeddings differ.
-  embedding_sharing: "gdes"
-
-  # [model.gradient_checkpointing]
-  # type: bool
-  # schema default: false
-  # default: literal false (feature off)
-  # required: optional
-  # values: true | false
-  # contract: true checkpoints both backbones to reduce activation memory at the cost of recomputation.
-  # recommendation: enable only after measuring memory and throughput; it does not replace optimizer-state sharding.
-  gradient_checkpointing: false
-
-  tokenizer:
-    # [model.tokenizer.name_or_path]
-    # type: str
-    # schema default: "microsoft/deberta-v3-base"
-    # default: literal "microsoft/deberta-v3-base"
-    # required: optional
-    # values: non-empty Hugging Face tokenizer id or local tokenizer directory whose tokenizer defines PAD, CLS, SEP, and MASK ids
-    # path: local relative paths resolve from the process working directory; `~` is not expanded, so use an expanded or absolute local path.
-    # scratch behavior: copies vocabulary size and special ids into new model configs.
-    # pretrained behavior: requires tokenizer vocabulary size and every defined special id to match both checkpoint configs unless the resize policy can reconcile vocabulary size alone.
-    name_or_path: "microsoft/deberta-v3-base"
-
-    # [model.tokenizer.allow_vocab_resize]
-    # type: bool
-    # schema default: false
-    # default: literal false (growth forbidden)
-    # required: optional
-    # values: true | false
-    # contract: permits growth with inert placeholder tokens when vocab_target or vocab_multiple demands it; resizing never shrinks.
-    # pretrained behavior: when vocab_target is null, true also grows a smaller tokenizer to checkpoint vocab_size and cannot grow beyond that size.
-    # recommendation: keep false unless the vocabulary change is deliberate and checkpoint compatibility is understood.
-    allow_vocab_resize: false
-
-    # [model.tokenizer.vocab_target]
-    # type: int | None
-    # schema default: null
-    # default: literal null (no explicit target)
-    # required: optional
-    # values: null or integer > 0 and >= the loaded tokenizer size
-    # contract: growth requires model.tokenizer.allow_vocab_resize=true and is rounded again by model.tokenizer.vocab_multiple.
-    # interaction: in pretrained mode the target cannot exceed checkpoint vocab_size.
-    vocab_target: null
-
-    # [model.tokenizer.vocab_multiple]
-    # type: int
-    # schema default: 1
-    # default: literal 1 (no rounding)
-    # required: optional
-    # values: integer >= 1
-    # contract: rounds tokenizer size upward; any growth requires model.tokenizer.allow_vocab_resize=true.
-    # interaction: pretrained mode cannot round beyond checkpoint vocab_size.
-    # recommendation: use 128 only when vocabulary padding for hardware efficiency justifies changing the tokenizer.
-    vocab_multiple: 1
-
-  hf:
-    # [model.hf.model_size]
-    # type: str
-    # schema default: "base"
-    # default: literal "base"
-    # required: optional
-    # values: "xsmall" | "small" | "base" | "large"
-    # contract: only controls synthesized scratch hf_deberta_v2 configs; pretrained native configs and explicit generator configs preserve their source dimensions.
-    # dimensions: hidden/layers/heads/FFN are xsmall=384/12/6/1536, small=768/6/12/3072, base=768/12/12/3072, and large=1024/24/16/4096.
-    # interaction: a non-default value with rope is ignored with a warning.
-    model_size: "base"
-
-    # [model.hf.attention_kernel]
-    # type: str
-    # schema default: "dynamic"
-    # default: literal "dynamic"
-    # required: optional
-    # values: "dynamic" | "cached_bmm" | "stable"
-    # aliases: default->dynamic, cache/cached->cached_bmm, safe/compile_safe->stable
-    # contract: selects native eager disentangled-bias math; dynamic uses einsum, while cached_bmm and stable currently select the same explicit batched-matmul implementation.
-    # naming: cached_bmm and stable preserve tuning intent rather than selecting different math.
-    # interaction: this does not enable FlashDeBERTa, applies only to hf_deberta_v2, and a non-default value with rope is ignored with a warning.
-    attention_kernel: "dynamic"
-
-    # [model.hf.attention_impl]
-    # type: str
-    # schema default: "eager"
-    # default: literal "eager"
-    # required: optional
-    # values: "eager" | "flash"
-    # contract: flash requires hf_deberta_v2, installation with `pip install -e '.[flash]'`, CUDA with bf16 support, effective hidden/attention dropout of exactly 0.0, and positive power-of-two attention head dimensions for both materialized components.
-    # interaction: set both model.dropout fields explicitly to 0.0 because null may preserve nonzero checkpoint/preset dropout.
-    # warning: build-time incompatibilities fail, while unsupported per-call masks use eager fallbacks.
-    # recommendation: eager is the portable default.
-    attention_impl: "eager"
-
-    flash:
-      # [model.hf.flash.docblock_bias_seq_len]
-      # type: int | None
-      # schema default: null
-      # default: null uses capability policy: dense at measured 1024/2048/4096 on sm_120, ragged elsewhere
-      # required: optional
-      # values: null, 0, or integer > 0
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # contract: 0 forces ragged docblock; a positive value forces dense docblock_bias only at that exact length on any GPU and bypasses table max-length/max-batch safeguards.
-      # warning: dense bias saves a quadratic (B,H,S,S) tensor for backward and can OOM immediately.
-      # recommendation: clear a positive override after controlled tuning.
-      docblock_bias_seq_len: null
-
-      # [model.hf.flash.kernel_overrides_path]
-      # type: str | None
-      # schema default: null
-      # default: null uses the shipped JSON table
-      # required: optional
-      # values: null, an empty/whitespace-only string (normalized to null), or path to a JSON object
-      # status: experimental; only used when model.hf.attention_impl=flash
-      # path: relative paths resolve from the process working directory and `~` is expanded.
-      # file shape: the JSON object may contain seq_buckets and kernels arrays plus a route_policies object with padding, docblock, and local_bias arrays.
-      # bucket rows: require a unique non-empty name; optional constraints are min_seq_len, max_seq_len, min_density, max_density, and max_density_exclusive.
-      # policy rows: require seq_bucket and choice; choices are fixed|varlen for padding, docblock|docblock_bias for docblock, and local_bias for local_bias.
-      # policy matching: optional fields are compute_capability="*"|"sm_<major><minor>", min_seq_len, max_seq_len, and max_batch_size.
-      # kernel rows: require seq_bucket and one supported route/kind pair.
-      # bias pairs: bias:{fwd,bwd,bwd_q,bwd_kv}; bias_docblock_specialized:{bwd,bwd_q,bwd_kv}; dense_bias:{fwd}.
-      # packed pairs: docblock:{fwd,bwd_q,bwd_kv}; fixed:{fwd,bwd}; varlen:{fwd,bwd_q,bwd_kv}.
-      # launch values: kernel rows also require positive block_m, block_n, num_stages, and num_warps values.
-      # kernel matching: optional predicates are compute_capability, head_dim, exact/min/max batch_size|query_len|key_len|num_heads, causal, disentangled, has_mask, dtype, and att_span_min.
-      # precedence: later equally specific policy/kernel rows win; override buckets match before shipped buckets and replace same-name buckets.
-      # warning: missing files or invalid JSON/table values fail when a route or kernel lookup first uses the table.
-      # recommendation: keep null unless using tuning-tool output that has passed parity and smoke training on the target GPU.
-      kernel_overrides_path: null
-
-    # [model.hf.max_position_embeddings]
-    # type: int | None
-    # schema default: null
-    # default: null keeps 512 for a synthesized scratch discriminator/derived generator; explicit scratch generator configs preserve their source value
-    # required: optional
-    # values: null or integer > 0
-    # contract: only valid for hf_deberta_v2 with model.from_scratch=true and applies to both native component configs after source loading.
-    # constraint: resolved discriminator and generator budgets must each be >= data.packing.max_seq_length.
-    # recommendation: set this for synthesized scratch training above 512; pretrained native checkpoints cannot be extended through this key.
-    max_position_embeddings: null
-
-  pretrained:
-    # [model.pretrained.discriminator_path]
-    # type: str
-    # schema default: ""
-    # default: literal empty string in scratch mode
-    # required: required when model.from_scratch=false
-    # values: empty/whitespace-only string when unused; otherwise non-empty checkpoint directory or model id
-    # contract: leading/trailing whitespace is stripped; this source is required and used only when model.from_scratch=false.
-    # scratch behavior: non-empty values are ignored, so leave this empty.
-    # path: relative local paths resolve from the process working directory; `~` is not expanded, so use an expanded or absolute local path.
-    # compatibility: the checkpoint family must match model.backbone_type; Microsoft DeBERTa v2/v3 checkpoints are invalid for rope.
-    discriminator_path: ""
-
-    # [model.pretrained.generator_path]
-    # type: str | None
-    # schema default: null
-    # default: null derives generator config from discriminator; pretrained mode reuses discriminator weights
-    # required: optional
-    # values: null, an empty/whitespace-only string (normalized to null), or non-empty checkpoint directory/model id
-    # contract: non-empty values are stripped of leading/trailing whitespace.
-    # path: relative local paths resolve from the process working directory; `~` is not expanded, so use an expanded or absolute local path.
-    # compatibility: a separate source must match model.backbone_type and have embedding shapes compatible with model.embedding_sharing=es|gdes.
-    # precedence: a separate source supplies the generator config and makes every model.generator.* override invalid.
-    # scratch behavior: only the separate source's config is used and all weights are newly initialized; a RoPE source keeps its architecture except an explicit model.rope.max_position_embeddings override.
-    # pretrained behavior: a separate source supplies config and weights; null derives generator config from the discriminator and loads generator weights from discriminator_path.
-    generator_path: null
-
-  generator:
-    # [model.generator.num_hidden_layers]
-    # type: int | None
-    # schema default: null
-    # default: half discriminator depth for hf_deberta_v2; one-third for rope; minimum 1
-    # required: optional
-    # values: null or integer > 0
-    # contract: only affects a derived generator and must be null when pretrained.generator_path is set.
-    num_hidden_layers: null
-
-    # [model.generator.hidden_size]
-    # type: int | None
-    # schema default: null
-    # default: null inherits discriminator hidden size
-    # required: optional
-    # values: null or integer > 0
-    # contract: derived generator only; must be null with model.pretrained.generator_path and is invalid in pretrained mode without a separate generator checkpoint.
-    # constraint: resolved width must divide evenly by heads and equal discriminator embedding width with model.embedding_sharing=es|gdes.
-    # interaction: with model.hf.attention_impl=flash, resolved hidden_size / resolved num_attention_heads must be a positive power of two.
-    # recommendation: use embedding_sharing=none for a narrower generator.
-    hidden_size: null
-
-    # [model.generator.intermediate_size]
-    # type: int | None
-    # schema default: null
-    # default: null inherits discriminator FFN width
-    # required: optional
-    # values: null or integer > 0
-    # contract: derived generator only; must be null with model.pretrained.generator_path and is invalid in pretrained mode without a separate generator checkpoint.
-    # precedence: the explicit value is final and, unlike model.rope.intermediate_size, is not reduced by model.rope.swiglu_adjust_intermediate.
-    intermediate_size: null
-
-    # [model.generator.num_attention_heads]
-    # type: int | None
-    # schema default: null
-    # default: null inherits discriminator head count
-    # required: optional
-    # values: null or integer > 0
-    # contract: derived generator only; must be null with model.pretrained.generator_path and is invalid in pretrained mode without a separate generator checkpoint.
-    # constraint: must divide the resolved generator hidden size.
-    # interaction: with model.hf.attention_impl=flash, resolved hidden_size / resolved num_attention_heads must be a positive power of two.
-    num_attention_heads: null
-
-  rope:
-    # All model.rope.* keys are experimental.
-    # Scratch keys below are valid only when model.backbone_type=rope and model.from_scratch=true.
-    # In pretrained RoPE mode they must remain at their schema defaults; use model.rope.pretrained.* for explicit checkpoint-compatible overrides.
-
-    # [model.rope.hidden_size]
-    # type: int
-    # schema default: 768
-    # default: literal 768
-    # required: optional
-    # values: integer > 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: must be divisible by model.rope.num_attention_heads and controls embeddings, residual width, and attention projection width.
-    # compatibility: changing it prevents loading checkpoints with a different width.
-    hidden_size: 768
-
-    # [model.rope.num_hidden_layers]
-    # type: int
-    # schema default: 12
-    # default: literal 12
-    # required: optional
-    # values: integer > 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: discriminator depth; a derived generator defaults to one-third of this value unless model.generator.num_hidden_layers is set.
-    num_hidden_layers: 12
-
-    # [model.rope.num_attention_heads]
-    # type: int
-    # schema default: 12
-    # default: literal 12
-    # required: optional
-    # values: integer > 0 that divides model.rope.hidden_size
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: head dimension is hidden_size divided by this value. Keep divisibility exact.
-    num_attention_heads: 12
-
-    # [model.rope.intermediate_size]
-    # type: int
-    # schema default: 3072
-    # default: literal 3072 before optional SwiGLU adjustment
-    # required: optional
-    # values: integer > 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: FFN width.
-    # interaction: with ffn_type=swiglu and swiglu_adjust_intermediate=true, runtime scales this to roughly two-thirds and rounds upward to a multiple of 128 to preserve MLP-like parameter count.
-    intermediate_size: 3072
-
-    # [model.rope.hidden_act]
-    # type: str
-    # schema default: "gelu"
-    # default: literal "gelu"
-    # required: optional
-    # values (GELU): "gelu" | "gelu_10" | "gelu_accurate" | "gelu_fast" | "gelu_new" | "gelu_python" | "gelu_pytorch_tanh" | "quick_gelu"
-    # values (other): "laplace" | "leaky_relu" | "linear" | "mish" | "prelu" | "relu" | "relu2" | "relu6" | "sigmoid" | "silu" | "swish" | "tanh"
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: used only by model.rope.ffn_type=mlp; swiglu always uses SiLU and ignores this key. Recommend gelu for BERT/DeBERTa comparison. Changing the active MLP value changes checkpoint behavior.
-    hidden_act: "gelu"
-
-    # [model.rope.rope_theta]
-    # type: float
-    # schema default: 10000.0
-    # default: literal 10000.0
-    # required: optional
-    # values: finite number > 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: rotary frequency base; larger values shift long-range frequencies but do not by themselves guarantee stable context extension.
-    # recommendation: keep 10000 unless reproducing a measured long-context setup.
-    rope_theta: 10000.0
-
-    # [model.rope.rotary_pct]
-    # type: float
-    # schema default: 1.0
-    # default: literal 1.0
-    # required: optional
-    # values: number in (0, 1]
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: runtime computes floor(head_dim * rotary_pct) and rounds down to an even rotary dimension.
-    # warning: a small accepted positive fraction can become zero and disable RoPE; verify the effective even dimension.
-    # recommendation: use 1.0; partial rotary changes architecture and should be a deliberate ablation.
-    rotary_pct: 1.0
-
-    # [model.rope.use_absolute_position_embeddings]
-    # type: bool
-    # schema default: false
-    # default: literal false (absolute embedding table absent)
-    # required: optional
-    # values: true | false
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: true adds learned absolute positions in addition to RoPE.
-    # compatibility: the value must match checkpoint architecture.
-    # recommendation: keep false for the modern RoPE baseline.
-    use_absolute_position_embeddings: false
-
-    # [model.rope.max_position_embeddings]
-    # type: int | None
-    # schema default: null
-    # default: null derives the required value from data.packing.max_seq_length
-    # required: optional
-    # values: null or integer > 0 and >= data.packing.max_seq_length
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: sizes optional learned absolute positions and the config context budget.
-    # recommendation: set explicitly only when the model budget must exceed the current training sequence length.
-    max_position_embeddings: null
-
-    # [model.rope.type_vocab_size]
-    # type: int
-    # schema default: 2
-    # default: literal 2
-    # required: optional
-    # values: integer >= 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: 0 disables token-type embeddings; 1 permits only segment id 0; 2 supports BERT-style 0/1 ids.
-    # recommendation: keep 2 unless the tokenizer/data contract guarantees a smaller vocabulary.
-    type_vocab_size: 2
-
-    # [model.rope.norm_arch]
-    # type: str
-    # schema default: "post"
-    # default: literal "post"
-    # required: optional
-    # values: "post" | "keel"
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: post applies RMSNorm after residual addition; keel enables KEEL residual scaling and makes keel_alpha_init/keel_alpha_learnable active.
-    # recommendation: use post unless running a KEEL experiment.
-    norm_arch: "post"
-
-    # [model.rope.norm_eps]
-    # type: float
-    # schema default: 1e-6
-    # default: literal 1e-6
-    # required: optional
-    # values: finite number > 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: RMSNorm epsilon. Recommend 1e-6 for bf16 stability; changing it changes checkpoint numerics.
-    norm_eps: 1e-6
-
-    # [model.rope.keel_alpha_init]
-    # type: float | None
-    # schema default: null
-    # default: null computes 1/sqrt(2 * num_hidden_layers) when norm_arch=keel
-    # required: optional
-    # values: null or finite number
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: only used with model.rope.norm_arch=keel; a non-null value with post has no effect and emits a warning.
-    # recommendation: leave null for depth-scaled KEEL initialization.
-    keel_alpha_init: null
-
-    # [model.rope.keel_alpha_learnable]
-    # type: bool
-    # schema default: false
-    # default: literal false
-    # required: optional
-    # values: true | false
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: only used with model.rope.norm_arch=keel; true makes both KEEL residual scalars trainable.
-    # interaction: true with post has no effect and emits a warning.
-    keel_alpha_learnable: false
-
-    # [model.rope.attention_implementation]
-    # type: str
-    # schema default: "sdpa"
-    # default: literal "sdpa"
-    # required: optional
-    # values: "sdpa" | "eager"
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: sdpa is controlled by train.sdpa_kernel; eager uses explicit attention math for debugging and parity.
-    # interaction: any non-auto train.sdpa_kernel is invalid with eager.
-    # recommendation: use sdpa for normal training.
-    attention_implementation: "sdpa"
-
-    # [model.rope.ffn_type]
-    # type: str
-    # schema default: "mlp"
-    # default: literal "mlp"
-    # required: optional
-    # values: "mlp" | "swiglu"
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: mlp is a BERT-style GELU FFN; swiglu enables gated SiLU and activates model.rope.swiglu_adjust_intermediate.
-    # compatibility: changing this value changes checkpoint architecture.
-    ffn_type: "mlp"
-
-    # [model.rope.use_bias]
-    # type: bool
-    # schema default: false
-    # default: literal false
-    # required: optional
-    # values: true | false
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: adds linear-layer biases. Keep false for the modern baseline; it must match checkpoint shape.
-    use_bias: false
-
-    # [model.rope.swiglu_adjust_intermediate]
-    # type: bool
-    # schema default: true
-    # default: literal true
-    # required: optional
-    # values: true | false
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: only used with model.rope.ffn_type=swiglu; true scales intermediate_size to approximately two-thirds and rounds to 128, while false uses the configured width directly.
-    # interaction: a non-default value with mlp has no effect and emits a warning.
-    swiglu_adjust_intermediate: true
-
-    # [model.rope.initializer_range]
-    # type: float
-    # schema default: 0.02
-    # default: literal 0.02
-    # required: optional
-    # values: finite number >= 0
-    # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=true
-    # contract: standard deviation for scratch weight initialization.
-    # warning: zero creates degenerate zero-initialized weight matrices and is accepted only for controlled tests.
-    # recommendation: use 0.02 for normal scratch initialization.
-    initializer_range: 0.02
-
-    pretrained:
-      # These overrides are experimental and valid only for backbone_type=rope with from_scratch=false.
-      # Each non-null value replaces the same field loaded from the checkpoint config and must remain compatible with the saved weights.
-      # In scratch mode, any non-null pretrained override is invalid.
-
-      # [model.rope.pretrained.max_position_embeddings]
-      # type: int | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null or integer > 0 and >= data.packing.max_seq_length
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes the config position budget; learned absolute-position weights must remain shape-compatible when the checkpoint uses them.
-      max_position_embeddings: null
-
-      # [model.rope.pretrained.rope_theta]
-      # type: float | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null or finite number > 0
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes rotary frequencies without changing saved tensor shapes.
-      # warning: use only for an intentional checkpoint adaptation because it changes inference and training behavior immediately.
-      rope_theta: null
-
-      # [model.rope.pretrained.rotary_pct]
-      # type: float | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null or number in (0, 1]
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes rotary dimension and can make checkpoint behavior incompatible even when tensor shapes load.
-      # effective value: runtime computes floor(head_dim * rotary_pct) and rounds down to even.
-      # warning: a small accepted value can become zero and disable RoPE; verify the effective even dimension.
-      # recommendation: match the checkpoint unless deliberately adapting it.
-      rotary_pct: null
-
-      # [model.rope.pretrained.use_absolute_position_embeddings]
-      # type: bool | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null | true | false
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: must match whether the checkpoint contains and uses absolute-position embeddings.
-      # warning: changing it can create missing or unexpected weights.
-      use_absolute_position_embeddings: null
-
-      # [model.rope.pretrained.type_vocab_size]
-      # type: int | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null or integer >= 0
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes token-type embedding shape/presence. It must match checkpoint weights and input ids.
-      type_vocab_size: null
-
-      # [model.rope.pretrained.norm_arch]
-      # type: str | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null | "post" | "keel"
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: switching post/keel changes residual architecture and parameter expectations; keel_alpha_* applies only when the resolved value is keel.
-      # recommendation: match the checkpoint.
-      norm_arch: null
-
-      # [model.rope.pretrained.norm_eps]
-      # type: float | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null or finite number > 0
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes normalization numerics without changing tensor shapes.
-      # recommendation: preserve the checkpoint value unless correcting a known compatibility issue.
-      norm_eps: null
-
-      # [model.rope.pretrained.keel_alpha_init]
-      # type: float | None
-      # schema default: null
-      # default: null preserves checkpoint config or uses depth-derived KEEL initialization
-      # required: optional
-      # values: null or finite number
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: only meaningful when resolved norm_arch=keel. It changes residual scaling immediately.
-      keel_alpha_init: null
-
-      # [model.rope.pretrained.keel_alpha_learnable]
-      # type: bool | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null | true | false
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: only meaningful when resolved norm_arch=keel and must match checkpoint parameter layout.
-      keel_alpha_learnable: null
-
-      # [model.rope.pretrained.ffn_type]
-      # type: str | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null | "mlp" | "swiglu"
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes FFN architecture and saved tensor shapes.
-      # warning: this is not a safe post-hoc performance toggle.
-      # recommendation: match the checkpoint.
-      ffn_type: null
-
-      # [model.rope.pretrained.use_bias]
-      # type: bool | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null | true | false
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: changes linear parameter layout and must match checkpoint weights.
-      use_bias: null
-
-      # [model.rope.pretrained.initializer_range]
-      # type: float | None
-      # schema default: null
-      # default: null preserves checkpoint config
-      # required: optional
-      # values: null or finite number >= 0
-      # status: experimental; only valid with model.backbone_type=rope and model.from_scratch=false
-      # contract: only affects newly initialized or missing parameters; loaded weights are unchanged.
-      # recommendation: preserve the checkpoint value unless partial initialization is intentional.
-      initializer_range: null
-
-  dropout:
-    # [model.dropout.hidden_prob]
-    # type: float | None
-    # schema default: 0.0
-    # default: literal 0.0 (hidden dropout off); null preserves 0.1 for synthesized native scratch configs, 0.0 for synthesized RoPE scratch configs, or the checkpoint/source-config value
-    # required: optional
-    # values: null or number in [0, 1]
-    # contract: applies to both backbones; model.hf.attention_impl=flash requires this key explicitly set to 0.0.
-    # interaction: null can preserve nonzero native scratch or pretrained dropout and is rejected for flash.
-    # warning: 1.0 drops all eligible activations and is useful only for pathological tests.
-    # recommendation: use 0.0 for parity and throughput.
-    hidden_prob: 0.0
-
-    # [model.dropout.attention_probs_prob]
-    # type: float | None
-    # schema default: 0.0
-    # default: literal 0.0 (attention-probability dropout off); null preserves 0.1 for synthesized native scratch configs, 0.0 for synthesized RoPE scratch configs, or the checkpoint/source-config value
-    # required: optional
-    # values: null or number in [0, 1]
-    # contract: applies to both backbones; model.hf.attention_impl=flash requires this key explicitly set to 0.0.
-    # interaction: null can preserve nonzero native scratch or pretrained dropout and is rejected for flash.
-    # warning: positive values add regularization but make the configured flash implementation fail at build time.
-    attention_probs_prob: 0.0
-
-data:
-  source:
-    # Exactly one source mode must be usable: dataset_name (optionally with data_files), data_files alone, or load_from_disk. load_from_disk is mutually exclusive with every other source selector.
-
-    # [data.source.dataset_name]
-    # type: str | None
-    # schema default: null
-    # default: literal null
-    # required: one of dataset_name, data_files, or load_from_disk is required
-    # values: null, an empty/whitespace-only string (normalized to null), or non-empty Hugging Face dataset id/builder name
-    # contract: non-empty values are stripped of leading/trailing whitespace and may be combined with data.source.dataset_config_name and data.source.data_files.
-    # interaction: with data_files, this selects the builder used to read those files; it cannot be combined with load_from_disk.
-    dataset_name: "HuggingFaceFW/fineweb-edu"
-
-    # [data.source.dataset_config_name]
-    # type: str | None
-    # schema default: null
-    # default: literal null
-    # required: optional
-    # values: null, an empty/whitespace-only string (normalized to null), or non-empty dataset subset/config name
-    # contract: non-empty values are stripped of leading/trailing whitespace; this requires data.source.dataset_name and cannot be combined with load_from_disk.
-    # recommendation: leave null when the dataset has no named subset.
-    dataset_config_name: "default"
-
-    # [data.source.data_files]
-    # type: str | None
-    # schema default: null
-    # default: literal null
-    # required: one of dataset_name, data_files, or load_from_disk is required
-    # values: null, an empty/whitespace-only string (normalized to null), or comma-separated local paths/URLs containing at least one non-empty item
-    # contract: the full value is stripped of leading/trailing whitespace before comma splitting.
-    # path: relative local paths resolve from the process working directory; `~` is passed to the dataset loader unchanged.
-    # builder: with dataset_name, files are passed to that builder; without dataset_name, the Hugging Face text builder is used.
-    # interaction: cannot be combined with load_from_disk.
-    # limitation: commas always split this single string, so a path or URL containing a comma cannot be represented.
-    data_files: null
-
-    # [data.source.load_from_disk]
-    # type: str | None
-    # schema default: null
-    # default: literal null
-    # required: one of dataset_name, data_files, or load_from_disk is required
-    # values: null, an empty/whitespace-only string (normalized to null), or non-empty directory created by Hugging Face Dataset.save_to_disk
-    # contract: non-empty values are stripped of leading/trailing whitespace.
-    # path: relative paths resolve from the process working directory; `~` is passed unchanged, so prefer an expanded or absolute path.
-    # interaction: requires data.source.streaming=false and cannot be combined with dataset_name, dataset_config_name, or data_files.
-    # split behavior: DatasetDict inputs select data.source.train_split.
-    load_from_disk: null
-
-    # [data.source.train_split]
-    # type: str
-    # schema default: "train"
-    # default: literal "train"
-    # required: optional
-    # values: non-empty split name present in the selected source
-    # contract: passed as split for load_dataset; for a load_from_disk DatasetDict it selects the mapping entry, while a single saved Dataset ignores split selection.
-    train_split: "train"
-
-    # [data.source.text_column_name]
-    # type: str
-    # schema default: "text"
-    # default: literal "text"
-    # required: optional
-    # values: non-empty column name present in every consumed example
-    # contract: raw text is read from this column before tokenization.
-    # warning: a wrong name fails when examples are consumed, including during dry-run preflight.
-    text_column_name: "text"
-
-    # [data.source.streaming]
-    # type: bool
-    # schema default: true
-    # default: literal true
-    # required: optional
-    # values: true | false
-    # true behavior: uses Hugging Face IterableDataset streaming and is recommended for large remote corpora.
-    # false behavior: loads a Hugging Face map-style Dataset and is required by load_from_disk.
-    # interaction: load_from_disk requires false; when false, shuffle_buffer_size must be 0 or 1.
-    streaming: true
-
-    # [data.source.shuffle_buffer_size]
-    # type: int
-    # schema default: 10000
-    # default: literal 10000
-    # required: optional
-    # values: integer >= 0 when streaming=true; only 0 or 1 when streaming=false
-    # streaming behavior: uses this reservoir size; 0 disables shuffling and 1 cannot reorder a one-item reservoir.
-    # streaming tradeoff: larger buffers improve mixing at the cost of host memory and startup.
-    # non-streaming behavior: 0 means no shuffle and 1 means one full map-style dataset shuffle.
-    shuffle_buffer_size: 10000
-
-  packing:
-    # [data.packing.enabled]
-    # type: bool
-    # schema default: true
-    # default: literal true
-    # required: optional
-    # values: true | false
-    # true behavior: concatenates documents into fixed-length rows; when block_cross_document_attention=false, attention and positions cross internal document separators.
-    # false behavior: chunks long documents to max_seq_length-2 tokens, adds one outer CLS/SEP pair per chunk, and pads every row to max_seq_length; it does not emit raw variable-length documents.
-    # interaction: block_cross_document_attention=true requires this field to be true.
-    # recommendation: use true for throughput unless sequential chunk semantics are required.
-    enabled: true
-
-    # [data.packing.max_seq_length]
-    # type: int
-    # schema default: 512
-    # default: literal 512
-    # required: optional
-    # values: integer >= 8 and within both model backbones' max-position budget
-    # contract: controls fixed training-row length in both packed and sequential modes.
-    # scratch interaction: synthesized native DeBERTa defaults to 512 positions, so longer values require model.hf.max_position_embeddings.
-    # pretrained interaction: pretrained and explicit component configs must each already cover this value.
-    # warning: with document blocking above 2048, non-segment-aware routes may build O(S^2) masks and emit a memory warning.
-    max_seq_length: 512
-
-    # [data.packing.block_cross_document_attention]
-    # type: bool
-    # schema default: false
-    # default: literal false
-    # required: optional
-    # values: true | false
-    # contract: true requires packing.enabled and preserves per-document semantics inside each packed row.
-    # segment semantics: every segment receives its own CLS/SEP, position_ids restart at zero, the RTD head uses that segment's CLS context, and attention cannot cross segments.
-    # rope interaction: train.sdpa_kernel=flash is invalid because strict flash SDPA cannot consume doc-block masks; use auto, mem_efficient, or math.
-    # native flash behavior: FlashDeBERTa uses dense or ragged doc-block routes.
-    block_cross_document_attention: false
-
-train:
-  # [train.seed]
-  # type: int
-  # schema default: 42
-  # default: literal 42
-  # required: optional
-  # values: integer from 0 through 2**32 - 1 inclusive
-  # contract: base seed for model initialization, masking, and data-order setup.
-  # warning: exact replay still depends on distributed topology, worker count, data source behavior, and non-deterministic kernels.
-  seed: 42
-
-  # [train.max_steps]
-  # type: int
-  # schema default: 10000
-  # default: literal 10000 when omitted; this runnable reference deliberately uses 50000
-  # required: optional
-  # values: integer >= 1
-  # contract: optimizer-step budget and the only duration control; there is no num_epochs alternative.
-  # interaction: gradient accumulation changes micro-batches per step, not this count.
-  # resume behavior: values above saved global_step request more steps and values <= saved global_step perform no optimization.
-  max_steps: 50000
-
-  # [train.per_device_train_batch_size]
-  # type: int
-  # schema default: 4
-  # default: literal 4
-  # required: optional
-  # values: integer >= 1
-  # contract: micro-batch examples per process; global examples per optimizer step equal this value times train.gradient_accumulation_steps times distributed process count.
-  # recommendation: tune this against VRAM before increasing accumulation.
-  per_device_train_batch_size: 4
-
-  # [train.gradient_accumulation_steps]
-  # type: int
-  # schema default: 1
-  # default: literal 1
-  # required: optional
-  # values: integer >= 1
-  # contract: micro-batches per optimizer step; token_weighted_gradient_accumulation controls loss weighting within the window.
-  gradient_accumulation_steps: 1
-
-  # [train.token_weighted_gradient_accumulation]
-  # type: bool
-  # schema default: true
-  # default: literal true
-  # required: optional
-  # values: true | false
-  # contract: true weights accumulated losses by active tokens rather than treating variable-density micro-batches equally.
-  # recommendation: keep true for packed, padded, or ragged training.
-  token_weighted_gradient_accumulation: true
-
-  # [train.mixed_precision]
-  # type: str
-  # schema default: "bf16"
-  # default: literal "bf16"
-  # required: optional
-  # values: "bf16" | "no"
-  # aliases: bfloat16/true/1/yes/y/on->bf16; none/false/0/off/n->no (quote boolean-like YAML strings)
-  # contract: bf16 fails preflight if bf16 sanity checks fail; no uses full precision and generally costs more memory and throughput.
-  # constraint: fp16 is not supported.
-  # recommendation: use bf16 on supported modern GPUs.
-  mixed_precision: "bf16"
-
-  # [train.tf32]
-  # type: bool
-  # schema default: true
-  # default: literal true
-  # required: optional
-  # values: true | false
-  # contract: enables TensorFloat-32 matmul policy where CUDA hardware supports it; otherwise it has no effect.
-  # recommendation: use true on Ampere-or-newer GPUs unless strict fp32 matmul parity is required.
-  tf32: true
-
-  # [train.sdpa_kernel]
-  # type: str
-  # schema default: "auto"
-  # default: literal "auto"
-  # required: optional
-  # values: "auto" | "flash" | "mem_efficient" | "math"
-  # aliases: mem/mem-efficient/efficient->mem_efficient; flashattention/flash_attention->flash
-  # contract: only affects model.backbone_type=rope with model.rope.attention_implementation=sdpa.
-  # interaction: a non-auto value with hf_deberta_v2 is ignored with a warning; with rope eager it is invalid.
-  # interaction: flash is invalid when data.packing.block_cross_document_attention=true.
-  # recommendation: use auto unless isolating a kernel.
-  sdpa_kernel: "auto"
-
-  # [train.decoupled_training]
-  # type: bool
-  # schema default: true
-  # default: literal true
-  # required: optional
-  # values: true | false
-  # true behavior: performs separate generator and discriminator optimizer phases and is recommended with model.embedding_sharing=gdes|none.
-  # false behavior: uses a joint forward and backward update.
-  # interaction: true is invalid with embedding_sharing=es because discriminator-phase gradients on shared embeddings would be dropped.
-  # resume warning: this value is locked on exact resume because it changes optimizer count and topology.
-  decoupled_training: true
-
-  dataloader:
-    # [train.dataloader.num_workers]
-    # type: int
-    # schema default: 2
-    # default: literal 2
-    # required: optional
-    # values: integer >= 0
-    # contract: worker subprocesses per distributed process; 0 consumes data in the training process.
-    # sharding: map-style sources are explicitly partitioned across the combined rank-worker space; HF IterableDataset sources receive rank sharding from the wrapper and assign their available source shards to workers natively.
-    # iterable source limit: workers beyond an iterable source's available shard count remain idle with a warning and do not improve throughput.
-    # recommendation: use 0 for deterministic debugging and clearer exceptions, then increase only after measuring throughput.
-    num_workers: 2
-
-    # [train.dataloader.pin_memory]
-    # type: bool
-    # schema default: true
-    # default: literal true
-    # required: optional
-    # values: true | false
-    # contract: pins host batches for asynchronous CUDA transfer.
-    # recommendation: use true for CUDA; false may reduce host-memory pressure for CPU-only runs.
-    pin_memory: true
-
-  compile:
-    # All train.compile.* keys are experimental.
-    # Compile failures are hard errors; there is no silent eager fallback.
-    # Validate the selected scope against the exact attention and data route before long runs.
-
-    # [train.compile.enabled]
-    # type: bool
-    # schema default: false
-    # default: literal false (torch.compile off)
-    # required: optional
-    # values: true | false
-    # status: experimental
-    # contract: true compiles selected inner backbone paths, not the full RTD wrapper.
-    # interaction: mode, scope, and backend only apply when true; non-default values while false are ignored with warnings.
-    enabled: false
-
-    # [train.compile.mode]
-    # type: str
-    # schema default: "default"
-    # default: literal "default"
-    # required: optional
-    # values: "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"
-    # aliases: reduce_overhead->reduce-overhead; max_autotune->max-autotune; max_autotune_no_cudagraphs->max-autotune-no-cudagraphs
-    # status: experimental
-    # contract: only used when compile.enabled=true.
-    # tradeoff: reduce-overhead may use more memory or cudagraphs; max-autotune increases compile time; no-cudagraphs avoids capture issues.
-    # recommendation: start with default.
-    mode: "default"
-
-    # [train.compile.scope]
-    # type: str
-    # schema default: "auto"
-    # default: literal "auto"
-    # required: optional
-    # values: "auto" | "backbones" | "encoder" | "gen_encoder" | "disc_encoder" | "ffn" | "gen_ffn" | "disc_ffn"
-    # aliases: backbone/both/full->backbones; encoders->encoder; ffns->ffn
-    # generator aliases: generator_encoder/generator-encoder->gen_encoder; generator_ffn/generator-ffn->gen_ffn
-    # discriminator aliases: discriminator_encoder/discriminator-encoder->disc_encoder; discriminator_ffn/discriminator-ffn->disc_ffn
-    # spelling: canonical underscore values also accept hyphens
-    # status: experimental
-    # auto behavior: resolves to backbones except for rope with block_cross_document_attention=true, where it resolves to ffn to avoid the dynamic doc-block mask path.
-    # scopes: backbones compiles both full backbones; encoder/ffn target that component in both models; gen_* and disc_* target only the named model.
-    # recommendation: start with auto.
-    scope: "auto"
-
-    # [train.compile.backend]
-    # type: str
-    # schema default: "inductor"
-    # default: literal "inductor"
-    # required: optional
-    # values: "inductor" | "aot_eager"
-    # aliases: aot-eager->aot_eager
-    # status: experimental
-    # contract: only used when compile.enabled=true; inductor is the optimizing production backend, while aot_eager is a debugging backend and is not expected to improve throughput.
-    backend: "inductor"
-
-  objective:
-    # [train.objective.mlm_probability]
-    # type: float
-    # schema default: 0.15
-    # default: literal 0.15
-    # required: optional
-    # values: finite number in (0, 1)
-    # contract: fraction of active, eligible tokens selected for MLM/RTD corruption.
-    # recommendation: use 0.15 for parity unless a measured corruption-rate experiment requires otherwise.
-    mlm_probability: 0.15
-
-    # [train.objective.mask_token_prob]
-    # type: float
-    # schema default: 1.0
-    # default: when omitted, 1.0 for hf_deberta_v2 and 0.8 for rope
-    # required: optional
-    # values: finite number >= 0; sum with random_token_prob must be <= 1
-    # contract: conditional probability that a selected token becomes [MASK]; the remaining probability after mask+random keeps the original token.
-    # precedence: explicit values are never replaced by the backbone profile.
-    # active value: this file uses the native parity value 1.0.
-    mask_token_prob: 1.0
-
-    # [train.objective.random_token_prob]
-    # type: float
-    # schema default: 0.0
-    # default: when omitted, 0.0 for hf_deberta_v2 and 0.1 for rope
-    # required: optional
-    # values: finite number >= 0; sum with mask_token_prob must be <= 1
-    # contract: conditional probability that a selected token becomes a sampled random token; special and control ids are excluded.
-    # precedence: explicit values are never replaced by the backbone profile.
-    # active value: this file uses the native parity value 0.0.
-    random_token_prob: 0.0
-
-    # [train.objective.mlm_max_ngram]
-    # type: int
-    # schema default: 1
-    # default: literal 1
-    # required: optional
-    # values: integer >= 1
-    # contract: maximum DeBERTa windowed masking span; 1 is windowed unigram masking, not BERT iid token masking.
-    # fallback: values >1 request whole-word n-gram grouping, but unsupported tokenizer boundary schemes degrade to conservative token-level groups with a warning.
-    # recommendation: use 1 for parity.
-    mlm_max_ngram: 1
-
-    # [train.objective.sampling_temperature]
-    # type: float
-    # schema default: 1.0
-    # default: literal 1.0
-    # required: optional
-    # values: finite number > 0
-    # contract: softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random.
-    # recommendation: use 1.0 unless replacement entropy is being measured.
-    sampling_temperature: 1.0
-
-    # [train.objective.gen_loss_weight]
-    # type: float
-    # schema default: 1.0
-    # default: literal 1.0
-    # required: optional
-    # values: finite number >= 0; at least one objective weight must be > 0
-    # contract: multiplies generator MLM loss; 0 disables generator optimization in decoupled mode.
-    # recommendation: use 1.0 for the established recipe.
-    gen_loss_weight: 1.0
-
-    # [train.objective.disc_loss_weight]
-    # type: float
-    # schema default: 10.0
-    # default: when omitted, 10.0 for hf_deberta_v2 and 50.0 for rope
-    # required: optional
-    # values: finite number >= 0; at least one objective weight must be > 0
-    # contract: multiplies discriminator RTD loss; 0 disables discriminator optimization in decoupled mode.
-    # precedence: explicit values are never replaced by the backbone profile.
-    # active value: this file uses the native parity value 10.0.
-    disc_loss_weight: 10.0
-
-  checkpoint:
-    # [train.checkpoint.output_dir]
-    # type: str | None
-    # schema default: null
-    # default: runs/<project>/<timestamp>_<run-or-config-name> when null
-    # required: optional
-    # values: null, empty string (normalized to null), or directory path
-    # contract: checkpoint and run-metadata destination; logging.output_dir defaults to this resolved path.
-    # path: relative paths resolve from the process working directory, `~` is expanded, and the runtime path is absolute.
-    # safety: existing non-empty directories fail unless overwrite is true or resume_from_checkpoint is set.
-    output_dir: "runs/config_reference"
-
-    # [train.checkpoint.overwrite_output_dir]
-    # type: bool
-    # schema default: false
-    # default: literal false
-    # required: optional
-    # values: true | false
-    # contract: true permits destructive reuse or removal of an existing output directory.
-    # interaction: mutually exclusive with resume_from_checkpoint because overwrite could delete the resume source.
-    # recommendation: keep false.
-    overwrite_output_dir: false
-
-    # [train.checkpoint.save_steps]
-    # type: int
-    # schema default: 1000
-    # default: literal 1000
-    # required: optional
-    # values: integer >= 0
-    # contract: periodic checkpoint interval in optimizer steps; 0 disables periodic saves.
-    # interaction: a final checkpoint is still attempted after progress or a single-process crash.
-    save_steps: 1000
-
-    # [train.checkpoint.save_total_limit]
-    # type: int
-    # schema default: 3
-    # default: literal 3
-    # required: optional
-    # values: integer >= 0
-    # contract: retains the newest checkpoint-* directories after committed saves; 0 disables rotation and can consume unbounded disk.
-    # warning: checkpoint deletion is irreversible, so choose a limit consistent with recovery needs.
-    save_total_limit: 3
-
-    # [train.checkpoint.resume_from_checkpoint]
-    # type: str | None
-    # schema default: null
-    # default: literal null (fresh run)
-    # required: optional
-    # values: null | empty/whitespace-only string (normalized to null) | "auto" | existing committed checkpoint directory
-    # restoration: resume asks Accelerate to restore model, optimizer, scheduler, and RNG state, then restores this repo's global step and data-progress state; it is distinct from model.from_scratch=false.
-    # source requirements: the directory must contain .complete, valid data_state.json progress, non-empty model weights, and source-run model/data/train/optim/logging snapshots.
-    # path: explicit relative paths resolve from the process working directory and `~` is expanded.
-    # compatibility: model, data, optim, logging, and all training-semantic train fields must match the source snapshots after documented inactive-field normalization.
-    # allowed changes: train.max_steps plus checkpoint output, overwrite, save cadence/retention, resume strategy/replay cap, and final-export controls may change; logging.output_dir may also change.
-    # warning: changing batch size, gradient accumulation, precision, TF32, seed, compile/SDPA policy, dataloader behavior, objectives, decoupled topology, model, data, optimizer, or other logging settings is rejected.
-    # interaction: mutually exclusive with overwrite_output_dir=true.
-    # auto behavior: "auto" scans output_dir, skips incomplete newer checkpoints when an older committed checkpoint exists, and starts fresh when output_dir is empty.
-    # auto failure: "auto" errors when a non-empty output has no checkpoint-* directories or none are resumable; use an explicit path when resume is mandatory.
-    resume_from_checkpoint: null
-
-    # [train.checkpoint.resume_data_strategy]
-    # type: str
-    # schema default: "auto"
-    # default: literal "auto"
-    # required: optional
-    # values: "auto" | "replay" | "restart_epoch"
-    # contract: replay reconsumes saved micro-batch progress from epoch zero; restart_epoch starts a new epoch offset at global_step.
-    # precedence: auto replays only when consumed micro-batches are <= resume_replay_max_micro_batches and otherwise restarts the epoch.
-    # recommendation: use auto for bounded startup cost; use replay when closest data alignment is mandatory and the replay cost is acceptable.
-    resume_data_strategy: "auto"
-
-    # [train.checkpoint.resume_replay_max_micro_batches]
-    # type: int
-    # schema default: 10000
-    # default: literal 10000
-    # required: optional
-    # values: integer >= 0
-    # contract: threshold used only by resume_data_strategy=auto; progress above it selects restart_epoch, while explicit replay ignores this cap.
-    # tradeoff: larger values improve data alignment but can make resume startup very slow.
-    resume_replay_max_micro_batches: 10000
-
-    # [train.checkpoint.export_hf_final]
-    # type: bool
-    # schema default: true
-    # default: literal true
-    # required: optional
-    # values: true | false
-    # contract: after successful training, attempts discriminator export from the final committed checkpoint into <output_dir>/final_hf.
-    # warning: export failure is logged but does not change training exit status.
-    # recommendation: disable for benchmarks and probes to avoid extra I/O and model construction.
-    export_hf_final: true
-
-optim:
-  # Exact resume requires every optim.* value to match the source run snapshot. Learning rate and scheduler changes are new-training decisions, not supported resume overrides.
-  lr:
-    # [optim.lr.base]
-    # type: float
-    # schema default: 0.0005
-    # default: literal 0.0005
-    # required: optional
-    # values: finite number > 0
-    # contract: base AdamW learning rate and inheritance source for generator and discriminator overrides.
-    # warning: runtime does not scale it for per-device batch, accumulation, world size, sequence length, or active-token density; scaling is manual.
-    # recommendation: 5e-4 is the project-tested native starting point, not a universal optimum.
-    base: 0.0005
-
-    # [optim.lr.generator]
-    # type: float
-    # schema default: -1.0
-    # default: -1.0 inherits optim.lr.base
-    # required: optional
-    # values: -1.0 or finite number > 0
-    # contract: generator-specific override.
-    # interaction: with model.embedding_sharing=es, it must inherit or equal optim.lr.base because shared embedding parameters cannot use conflicting rates.
-    generator: -1.0
-
-    # [optim.lr.discriminator]
-    # type: float
-    # schema default: -1.0
-    # default: -1.0 inherits optim.lr.base
-    # required: optional
-    # values: -1.0 or finite number > 0
-    # contract: discriminator-specific override.
-    # recommendation: leave -1.0 unless the two RTD phases have a measured need for different learning rates.
-    discriminator: -1.0
-
-  adam:
-    # [optim.adam.beta1]
-    # type: float
-    # schema default: 0.9
-    # default: literal 0.9
-    # required: optional
-    # values: finite number in [0, 1)
-    # contract: Adam first-moment decay. Recommend 0.9 unless reproducing a known optimizer recipe.
-    beta1: 0.9
-
-    # [optim.adam.beta2]
-    # type: float
-    # schema default: 0.999
-    # default: literal 0.999
-    # required: optional
-    # values: finite number in [0, 1)
-    # contract: Adam second-moment decay; lower values adapt variance faster but can make large-scale pretraining noisier.
-    # recommendation: use 0.999 unless reproducing a measured optimizer recipe.
-    beta2: 0.999
-
-    # [optim.adam.epsilon]
-    # type: float
-    # schema default: 1e-6
-    # default: when omitted, 1e-6 for hf_deberta_v2 and 1e-8 for rope
-    # required: optional
-    # values: finite number > 0
-    # contract: Adam denominator epsilon.
-    # precedence: explicit values are never replaced by the backbone profile.
-    # effective value: at optimizer construction, bf16 raises values below 1e-6 to 1e-6 for stability.
-    # active value: this file uses the native parity value 1e-6.
-    epsilon: 1e-6
-
-  scheduler:
-    # [optim.scheduler.type]
-    # type: str
-    # schema default: "linear"
-    # default: literal "linear"
-    # required: optional
-    # values: "linear" | "cosine" | "cosine_with_restarts" | "polynomial" | "constant" | "constant_with_warmup"
-    # contract: linear/cosine/polynomial decay after warmup; cosine_with_restarts adds cycles; constant ignores warmup_steps; constant_with_warmup warms then holds.
-    # recommendation: use linear for parity unless another schedule is measured.
-    type: "linear"
-
-    # [optim.scheduler.warmup_steps]
-    # type: int
-    # schema default: 10000
-    # default: when omitted, 10000 for hf_deberta_v2 and 1000 for rope; this runnable reference deliberately uses 1000
-    # required: optional
-    # values: integer >= 0
-    # contract: optimizer steps spent warming the learning rate; ignored by scheduler.type=constant.
-    # precedence: explicit values are never replaced by the backbone profile.
-    # warning: the native omission default is 10000; a short run with train.max_steps<=10000 can remain entirely in warmup and provide no useful learning-signal test.
-    # recommendation: keep warmup meaningfully smaller than train.max_steps; for a 10-step smoke proof use constant or constant_with_warmup with warmup_steps=1. This file uses 1000 of 50000 steps.
-    warmup_steps: 1000
-
-  # [optim.weight_decay]
-  # type: float
-  # schema default: 0.01
-  # default: literal 0.01
-  # required: optional
-  # values: finite number >= 0
-  # contract: AdamW weight decay for decay-eligible parameter groups; 0 disables weight decay.
-  # recommendation: use 0.01 as a starting point.
-  weight_decay: 0.01
-
-  # [optim.max_grad_norm]
-  # type: float
-  # schema default: 1.0
-  # default: literal 1.0
-  # required: optional
-  # values: finite number >= 0
-  # contract: global gradient clipping norm; 0 disables clipping.
-  # recommendation: use the repo-tested 1.0 starting point and change it only with dedicated instrumentation because normal periodic metrics do not report gradient norm.
-  max_grad_norm: 1.0
-
-logging:
-  # Exact resume requires every logging.* value except logging.output_dir to match the source run snapshot. Keep project/run identity, W&B settings, logging interval, and debug mode unchanged when resuming.
-  # [logging.project_name]
-  # type: str
-  # schema default: "deberta-train"
-  # default: literal "deberta-train"
-  # required: optional
-  # values: non-empty string
-  # contract: leading/trailing whitespace is stripped; this is the W&B project name and namespace used by automatic checkpoint path generation.
-  # recommendation: avoid slashes or path-like values; runtime sanitizes it for local directory names.
-  project_name: "deberta-train"
-
-  # [logging.run_name]
-  # type: str | None
-  # schema default: null
-  # default: null/empty derives the auto-output label from config filename or "run"; with an explicit output path, W&B uses the logging output directory basename
-  # required: optional
-  # values: null, empty string (normalized to null), or non-empty string
-  # contract: explicit W&B run name and auto-output naming hint; leading/trailing whitespace is stripped and it does not replace project_name.
-  # recommendation: use stable descriptive names when comparing runs; timestamps still distinguish auto output paths.
-  run_name: "config_reference"
-
-  # [logging.output_dir]
-  # type: str | None
-  # schema default: null
-  # default: null uses resolved train.checkpoint.output_dir
-  # required: optional
-  # values: null, empty string (normalized to null), or directory path
-  # contract: stores original/resolved YAML snapshots, W&B local files, optional debug metrics, crash rows, and nonfinite artifacts.
-  # path: relative paths resolve from the process working directory, `~` is expanded, and the runtime path is absolute.
-  # warning: a separate existing directory is reused without the checkpoint directory's overwrite guard, and config snapshots there are overwritten.
-  # resume interaction: config_resolved.yaml contains this concrete path; when resuming into a new checkpoint output, also change this key to the new logging destination or the source run's config snapshots will be replaced.
-  # recommendation: use a fresh directory or leave null to colocate safely with checkpoints.
-  output_dir: null
-
-  # [logging.logging_steps]
-  # type: int
-  # schema default: 50
-  # default: literal 50
-  # required: optional
-  # values: integer >= 0
-  # contract: optimizer-step interval for periodic loss, LR, and throughput logging; 0 disables periodic rows but not crash or final metadata.
-  # local behavior: with W&B disabled, normal periodic values are console-only; logging.debug.metrics does not create a full local metric history.
-  # tradeoff: smaller values add synchronization and I/O overhead.
-  logging_steps: 50
-
-  wandb:
-    # [logging.wandb.enabled]
-    # type: bool
-    # schema default: false
-    # default: literal false (W&B off)
-    # required: optional
-    # values: true | false
-    # contract: true fails fast unless `pip install -e '.[wandb]'` is installed and requires valid W&B authentication or W&B's standard offline mode.
-    # output: uploads config snapshots and writes W&B local files under logging.output_dir.
-    # warning: the default watch="gradients" activates model gradient watching immediately; set watch="none" for scalar tracking alone.
-    # recommendation: keep false for untracked local runs.
-    enabled: false
-
-    # [logging.wandb.watch]
-    # type: str
-    # schema default: "gradients"
-    # default: literal "gradients", but inactive while logging.wandb.enabled=false
-    # required: optional
-    # values: "none" | "gradients" | "parameters" | "all"
-    # aliases: off/disabled/"false"/"0"->none; grad/gradient->gradients; weights/params/param->parameters
-    # contract: only applies when wandb.enabled=true; none disables model watching, while gradients/parameters/all select tensors sent at watch_log_freq.
-    # YAML warning: quote the "false" and "0" aliases; unquoted false/0 have the wrong scalar type and fail validation.
-    # inactive behavior: non-default values while W&B is disabled are ignored with a warning.
-    # performance warning: enabling W&B without changing the schema-default gradients mode can add substantial communication, compute, and memory overhead.
-    watch: "gradients"
-
-    # [logging.wandb.watch_log_freq]
-    # type: int
-    # schema default: 100
-    # default: literal 100, but inactive while logging.wandb.enabled=false or watch=none
-    # required: optional
-    # values: integer >= 1
-    # contract: sampling interval passed directly to wandb.watch; with gradient accumulation and decoupled phases it is not guaranteed to correspond one-to-one with optimizer steps.
-    # interaction: non-default values while W&B is disabled are ignored with a warning.
-    # recommendation: increase it to reduce tracking overhead.
-    watch_log_freq: 100
-
-  debug:
-    # [logging.debug.metrics]
-    # type: bool
-    # schema default: false
-    # default: literal false (extra diagnostics off)
-    # required: optional
-    # values: true | false
-    # status: diagnostic
-    # contract: true appends periodic zero-token-window counters to <logging.output_dir>/metrics.jsonl.gz; it does not persist normal loss, LR, or throughput rows.
-    # independent output: crash rows may append to that file and nonfinite JSON artifacts are written regardless of this flag.
-    # tradeoff: extra counters add synchronization, storage, and noise.
-    # recommendation: keep false unless diagnosing empty or fully masked accumulation windows.
-    metrics: false
+# Run outputs
+# A null checkpoint directory resolves to `runs/<project>/<timestamp>_<run-or-config-name>`; a null logging directory uses that resolved directory.
+# Training writes model/data/train/optim/logging JSON snapshots and run metadata beside transactional `checkpoint-*` directories. It writes `config_original.yaml` and `config_resolved.yaml` under the logging directory.
+
+# MODEL
+
+# [model.backbone_type] str = "hf_deberta_v2"; values: "hf_deberta_v2" | "rope".
+# `hf_deberta_v2` is the supported repo-native DeBERTa-v2/v3 path; `rope` and every `model.rope.*` key are experimental.
+
+# [model.from_scratch] bool = true; values: true | false.
+# false starts a new step-zero run from `model.pretrained.*`; it does not restore optimizer, scheduler, RNG, step, or data progress. Use checkpoint resume for exact continuation.
+
+# [model.embedding_sharing] str = "gdes"; values: "none" | "es" | "gdes".
+# `none` keeps independent embeddings; `es` aliases them and requires `train.decoupled_training=false` plus generator LR inheritance/equality; `gdes` uses a synchronized generator base plus trainable discriminator bias and is the recommended RTD default. Shared modes require matching embedding shapes.
+
+# [model.gradient_checkpointing] bool = false; values: true | false.
+# true checkpoints both backbones, reducing activation memory at the cost of recomputation; enable only after measuring the run's memory/throughput tradeoff.
+
+# model.tokenizer
+
+# [model.tokenizer.name_or_path] str = "microsoft/deberta-v3-base"; must be a non-empty Hugging Face tokenizer id or local directory defining PAD, CLS, SEP, and MASK tokens.
+# Scratch configs copy vocabulary/special IDs; pretrained configs require compatible vocabulary and defined special IDs. Local paths and `~` are passed to the tokenizer loader unchanged.
+
+# [model.tokenizer.allow_vocab_resize] bool = false; values: true | false.
+# true permits upward-only growth when a target/multiple requires it, adding ordinary non-special placeholder tokens; pretrained growth cannot exceed checkpoint `vocab_size`.
+
+# [model.tokenizer.vocab_target] int | None = null; null requests no explicit target, otherwise value must be > 0 and at least the loaded tokenizer size.
+# Growth requires `allow_vocab_resize=true`, is rounded again by `vocab_multiple`, and cannot exceed pretrained checkpoint vocabulary size.
+
+# [model.tokenizer.vocab_multiple] int = 1; must be >= 1.
+# Rounds vocabulary upward; any growth requires `allow_vocab_resize=true`. Use 128 only when deliberate vocabulary padding justifies changing tokenizer size.
+
+# model.hf — applies to `model.backbone_type="hf_deberta_v2"`; non-default size/kernel/position settings with RoPE are ignored with warnings, while Flash with RoPE is invalid.
+
+# [model.hf.model_size] str = "base"; values: "xsmall" | "small" | "base" | "large".
+# Synthesized scratch discriminator dimensions (hidden/layers/heads/FFN): xsmall 384/12/6/1536, small 768/6/12/3072, base 768/12/12/3072, large 1024/24/16/4096. Pretrained or explicit component configs retain source dimensions.
+
+# [model.hf.attention_kernel] str = "dynamic"; values: "dynamic" | "cached_bmm" | "stable"; aliases: default->dynamic, cache/cached->cached_bmm, safe/compile_safe->stable.
+# Selects native eager disentangled-bias math; `dynamic` uses einsum, while `cached_bmm` and `stable` currently use the same explicit batched-matmul path. It does not enable Flash.
+
+# [model.hf.attention_impl] str = "eager"; values: "eager" | "flash".
+# Flash is experimental and requires the `flash` extra, CUDA bf16 (`train.mixed_precision="bf16"`), both dropout values resolving to 0.0, and a positive power-of-two head dimension for each component.
+# Materialized configs must also use relative attention with positive buckets, no P2P term, and a relative span covering the full position budget. Unsupported per-call masks may route to eager; build-time incompatibilities fail.
+
+# model.hf.flash — experimental and inactive unless `model.hf.attention_impl="flash"`.
+
+# [model.hf.flash.docblock_bias_seq_len] int | None = null; values: null or integer >= 0.
+# null uses the shipped capability/batch policy; 0 always uses ragged document blocking; a positive value forces dense bias only at that exact sequence length, ragged elsewhere, and bypasses shipped safety bounds. Dense bias saves a quadratic `(B,H,S,S)` tensor for backward and can OOM.
+
+# [model.hf.flash.kernel_overrides_path] str | None = null; null/blank uses the shipped tuning table, otherwise value names a JSON file containing an object with optional `seq_buckets`, `route_policies`, and `kernels` entries.
+# `~` is expanded and relative paths use the working directory. Override buckets replace same-name buckets; policy/kernel rows append and equally specific later rows win. Loading is lazy, so missing/malformed files can fail only when first used; use measured tuner output that has passed parity on the target GPU.
+# Bucket rows require `name`; optional bounds are `min_seq_len`, `max_seq_len`, `min_density`, `max_density`, and `max_density_exclusive`. Policy rows require `seq_bucket` and `choice`: padding uses fixed|varlen, docblock uses docblock|docblock_bias, and local_bias uses local_bias; optional bounds are `compute_capability`, `min_seq_len`, `max_seq_len`, and `max_batch_size`.
+# Kernel rows require `route`, `kind`, `seq_bucket`, `block_m`, `block_n`, `num_stages`, and `num_warps`. Supported route/kind pairs are bias:{fwd,bwd,bwd_q,bwd_kv}, bias_docblock_specialized:{bwd,bwd_q,bwd_kv}, dense_bias:{fwd}, docblock:{fwd,bwd_q,bwd_kv}, fixed:{fwd,bwd}, and varlen:{fwd,bwd_q,bwd_kv}; optional match predicates are compute_capability, head_dim, exact/min/max batch_size|query_len|key_len|num_heads, causal, disentangled, has_mask, dtype, and att_span_min.
+
+# [model.hf.max_position_embeddings] int | None = null; null leaves synthesized scratch native components at 512, otherwise value must be > 0.
+# Valid only for native scratch runs, applied to both components, and must cover `data.packing.max_seq_length`. Pretrained native context cannot be extended through this key.
+
+# model.pretrained
+
+# [model.pretrained.discriminator_path] str = ""; conditionally required and non-empty when `model.from_scratch=false`.
+# Names a checkpoint directory/model id; ignored in scratch mode. The checkpoint family must match the backbone, and Microsoft DeBERTa v2/v3 sources are invalid for RoPE. Local paths and `~` are passed through unchanged.
+
+# [model.pretrained.generator_path] str | None = null; blank normalizes to null, which derives generator config from the discriminator and, in pretrained mode, also loads generator weights from the discriminator source.
+# A non-null source supplies generator config and pretrained weights (config only in scratch mode), must match the backbone/shared-embedding shapes, and makes every `model.generator.*` override invalid. Local paths and `~` are passed through unchanged.
+
+# model.generator — controls a generator derived from the discriminator; all values must be null when `model.pretrained.generator_path` is set.
+
+# [model.generator.num_hidden_layers] int | None = null; null derives half the native discriminator depth or one-third the RoPE depth, minimum 1; explicit values must be > 0.
+# This is the only generator shape override allowed when loading generator weights from `model.pretrained.discriminator_path`.
+
+# [model.generator.hidden_size] int | None = null; null inherits discriminator width, otherwise value must be > 0 and divisible by resolved head count.
+# Invalid in pretrained mode without a separate generator source. Shared embeddings require discriminator width; Flash additionally requires the resulting head dimension to be a power of two.
+
+# [model.generator.intermediate_size] int | None = null; null inherits discriminator FFN width, otherwise value must be > 0.
+# Invalid in pretrained mode without a separate generator source; the explicit width is final and is not adjusted by RoPE SwiGLU scaling.
+
+# [model.generator.num_attention_heads] int | None = null; null inherits discriminator heads, otherwise value must be > 0 and divide resolved generator width.
+# Invalid in pretrained mode without a separate generator source; Flash additionally requires the resulting head dimension to be a power of two.
+
+# model.rope — experimental scratch architecture. These keys are valid only with `model.backbone_type="rope"` and `model.from_scratch=true`; native runs reject changed RoPE settings, and pretrained RoPE requires these scratch keys to stay at schema defaults.
+
+# [model.rope.hidden_size] int = 768; must be > 0 and divisible by `model.rope.num_attention_heads`.
+# Controls embedding, residual, and projection width; changing it changes checkpoint shape.
+
+# [model.rope.num_hidden_layers] int = 12; must be > 0.
+# Sets discriminator depth; a derived generator defaults to one-third this depth.
+
+# [model.rope.num_attention_heads] int = 12; must be > 0 and divide `model.rope.hidden_size`.
+# Head dimension is hidden size divided by this value.
+
+# [model.rope.intermediate_size] int = 3072; must be > 0.
+# With `ffn_type="swiglu"` and adjustment enabled, runtime scales this to about two-thirds and rounds upward to 128.
+
+# [model.rope.hidden_act] str = "gelu"; values: "gelu" | "gelu_10" | "gelu_accurate" | "gelu_fast" | "gelu_new" | "gelu_python" | "gelu_pytorch_tanh" | "laplace" | "leaky_relu" | "linear" | "mish" | "prelu" | "quick_gelu" | "relu" | "relu2" | "relu6" | "sigmoid" | "silu" | "swish" | "tanh".
+# Used by MLP only; SwiGLU always uses SiLU. `gelu` is the comparison/default choice.
+
+# [model.rope.rope_theta] float = 10000.0; must be finite and > 0.
+# Rotary frequency base; keep the default unless reproducing a measured long-context setup.
+
+# [model.rope.rotary_pct] float = 1.0; must be finite and in (0, 1].
+# Runtime floors `head_dim * rotary_pct` to an even dimension; a small accepted fraction can become zero and disable RoPE. Use 1.0 unless intentionally ablating partial rotary.
+
+# [model.rope.use_absolute_position_embeddings] bool = false; values: true | false.
+# true adds learned absolute positions in addition to RoPE and changes checkpoint architecture; false is the modern baseline.
+
+# [model.rope.max_position_embeddings] int | None = null; null uses `data.packing.max_seq_length` for a synthesized scratch config, otherwise value must be > 0 and cover the training length.
+# Sizes the model context budget and any enabled learned absolute-position table.
+
+# [model.rope.type_vocab_size] int = 2; must be >= 0.
+# 0 disables token-type embeddings, 1 permits segment id 0 only, and 2 supports BERT-style 0/1 ids; changing it changes checkpoint shape.
+
+# [model.rope.norm_arch] str = "post"; values: "post" | "keel".
+# `post` applies RMSNorm after residual addition; `keel` enables KEEL residual scaling and activates the two `keel_alpha_*` keys. Use post unless running a KEEL experiment.
+
+# [model.rope.norm_eps] float = 1e-6; must be finite and > 0.
+# RMSNorm epsilon; 1e-6 is the bf16-oriented default, and changing it changes checkpoint numerics.
+
+# [model.rope.keel_alpha_init] float | None = null; null computes `1/sqrt(2 * num_hidden_layers)` when `norm_arch="keel"`, otherwise any finite value is accepted.
+# Inactive with post; a non-null value then emits a warning.
+
+# [model.rope.keel_alpha_learnable] bool = false; values: true | false.
+# Only applies to KEEL and makes its residual scalars trainable; true with post is ignored with a warning.
+
+# [model.rope.attention_implementation] str = "sdpa"; values: "sdpa" | "eager".
+# `sdpa` is controlled by `train.sdpa_kernel`; eager is a parity/debug path and requires `train.sdpa_kernel="auto"`. Use SDPA for normal training.
+
+# [model.rope.ffn_type] str = "mlp"; values: "mlp" | "swiglu".
+# MLP uses `hidden_act`; SwiGLU uses gated SiLU and activates `swiglu_adjust_intermediate`. Changing this changes checkpoint architecture.
+
+# [model.rope.use_bias] bool = false; values: true | false.
+# Adds linear-layer biases and changes checkpoint parameter layout; false is the modern baseline.
+
+# [model.rope.swiglu_adjust_intermediate] bool = true; values: true | false.
+# With SwiGLU, true scales configured FFN width by about 2/3 and rounds to 128; with MLP a non-default false value is ignored with a warning.
+
+# [model.rope.initializer_range] float = 0.02; must be finite and >= 0.
+# Standard deviation for scratch initialization. Zero is accepted for controlled tests but produces degenerate zero-initialized weight matrices; use 0.02 normally.
+
+# model.rope.pretrained — experimental checkpoint adaptations valid only with RoPE and `model.from_scratch=false`. null preserves the checkpoint config; non-null values can alter behavior or tensor layout and should match the source unless adaptation is deliberate.
+
+# [model.rope.pretrained.max_position_embeddings] int | None = null; otherwise must be > 0 and cover `data.packing.max_seq_length`.
+# Changing a checkpoint that uses learned absolute positions can cause position-table shape mismatch.
+
+# [model.rope.pretrained.rope_theta] float | None = null; otherwise must be finite and > 0.
+# Changes rotary frequencies immediately without changing saved tensor shapes.
+
+# [model.rope.pretrained.rotary_pct] float | None = null; otherwise must be finite and in (0, 1].
+# Runtime floors the resolved rotary dimension to even; changing this changes checkpoint behavior and a small value can effectively disable RoPE.
+
+# [model.rope.pretrained.use_absolute_position_embeddings] bool | None = null; values: null | true | false.
+# Must match whether checkpoint weights contain/use the absolute-position table; changing it can create missing or unexpected weights.
+
+# [model.rope.pretrained.type_vocab_size] int | None = null; otherwise must be >= 0.
+# Changes token-type embedding presence/shape and must remain compatible with checkpoint weights and input IDs.
+
+# [model.rope.pretrained.norm_arch] str | None = null; values: null | "post" | "keel".
+# Switching architecture changes residual behavior and parameter expectations; `keel_alpha_*` applies only to resolved KEEL.
+
+# [model.rope.pretrained.norm_eps] float | None = null; otherwise must be finite and > 0.
+# Changes normalization numerics without changing tensor shapes; preserve the checkpoint value unless correcting known compatibility.
+
+# [model.rope.pretrained.keel_alpha_init] float | None = null; otherwise any finite value is accepted.
+# Meaningful only with resolved KEEL and changes residual scaling immediately.
+
+# [model.rope.pretrained.keel_alpha_learnable] bool | None = null; values: null | true | false.
+# Meaningful only with resolved KEEL and must match checkpoint parameter layout.
+
+# [model.rope.pretrained.ffn_type] str | None = null; values: null | "mlp" | "swiglu".
+# Changes FFN architecture and saved tensor shapes; this is not a safe post-hoc performance toggle.
+
+# [model.rope.pretrained.use_bias] bool | None = null; values: null | true | false.
+# Changes linear parameter layout and must match checkpoint weights.
+
+# [model.rope.pretrained.initializer_range] float | None = null; otherwise must be finite and >= 0.
+# Affects only newly initialized/missing parameters; loaded weights are unchanged.
+
+# model.dropout — shared runtime overrides for both backbone families. null preserves the source/preset value; numeric values replace it on both components.
+
+# [model.dropout.hidden_prob] float | None = 0.0; values: null or finite number in [0, 1].
+# Omission disables hidden dropout; null preserves source dropout. Flash requires the resolved value 0.0. Value 1.0 drops every eligible activation and is only sensible for pathological tests.
+
+# [model.dropout.attention_probs_prob] float | None = 0.0; values: null or finite number in [0, 1].
+# Omission disables attention-probability dropout; null preserves source dropout. Flash requires the resolved value 0.0.
+
+# DATA
+
+# data.source — conditionally required: configure `dataset_name`, `data_files`, or `load_from_disk`. `load_from_disk` is exclusive; otherwise `dataset_name` may be used alone or as the builder for `data_files`.
+
+# [data.source.dataset_name] str | None = null; blank normalizes to null, otherwise value is a Hugging Face dataset id/builder name.
+# May be paired with `dataset_config_name` and/or `data_files`; cannot be paired with `load_from_disk`.
+
+# [data.source.dataset_config_name] str | None = null; blank normalizes to null, otherwise value is a dataset subset/config name.
+# Requires `dataset_name` and cannot be paired with `load_from_disk`.
+
+# [data.source.data_files] str | None = null; blank normalizes to null, otherwise value is a comma-separated list of non-empty local paths/URLs.
+# With `dataset_name`, files go to that builder; alone they use the HF text builder. Commas always split, so comma-containing paths cannot be represented; local `~` is passed through unchanged. Cannot be paired with `load_from_disk`.
+
+# [data.source.load_from_disk] str | None = null; blank normalizes to null, otherwise value is a directory created by `Dataset.save_to_disk`.
+# Requires `streaming=false` and forbids `dataset_name`, `dataset_config_name`, and `data_files`; a saved DatasetDict selects `train_split`. Local `~` is passed through unchanged.
+
+# [data.source.train_split] str = "train"; must be a non-empty split name available in the source.
+# Passed to `load_dataset`; selects a DatasetDict entry from `load_from_disk`, while a single saved Dataset ignores it.
+
+# [data.source.text_column_name] str = "text"; must be a non-empty column name available in consumed examples.
+# Missing columns fail when examples are read, including during `--dry-run`.
+
+# [data.source.streaming] bool = true; values: true | false.
+# true uses HF IterableDataset streaming; false loads a map-style dataset and is required by `load_from_disk`. Non-streaming also restricts `shuffle_buffer_size` to 0 or 1.
+
+# [data.source.shuffle_buffer_size] int = 10000; with streaming must be >= 0, with non-streaming must be 0 or 1.
+# Streaming uses this reservoir size (0/1 cannot reorder meaningfully); non-streaming 0 disables shuffle and 1 requests one full dataset shuffle. Larger streaming buffers trade host memory/startup for mixing.
+
+# data.packing
+
+# [data.packing.enabled] bool = true; values: true | false.
+# true concatenates documents into fixed-length rows; false chunks each document to `max_seq_length-2`, adds one outer CLS/SEP pair, and pads to the fixed length. Packing is the throughput-oriented default.
+
+# [data.packing.max_seq_length] int = 512; must be >= 8 and no larger than either component's position budget.
+# Controls fixed row length in both modes. Synthesized native configs need `model.hf.max_position_embeddings` above 512; pretrained/explicit configs must already cover the value.
+
+# [data.packing.block_cross_document_attention] bool = false; values: true | false; true requires `data.packing.enabled=true`.
+# true wraps each packed segment with CLS/SEP, restarts its positions, supplies segment-specific RTD context, and prevents cross-document attention. RoPE cannot combine it with `train.sdpa_kernel="flash"`; non-segment-aware routes may materialize quadratic masks and warn above length 2048.
+
+# TRAIN
+
+# [train.seed] int = 42; must be in [0, 2**32 - 1].
+# Seeds initialization, corruption, and data-order setup; exact results still depend on topology, workers, source behavior, and nondeterministic kernels.
+
+# [train.max_steps] int = 10000; must be >= 1.
+# Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. On resume, a value <= restored global step performs no optimization.
+
+# [train.per_device_train_batch_size] int = 4; must be >= 1.
+# Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Tune against VRAM before increasing accumulation.
+
+# [train.gradient_accumulation_steps] int = 1; must be >= 1.
+# Micro-batches per optimizer step. Resume accepts a changed value with only a warning, so keep it unchanged unless the resulting data alignment/effective batch change is deliberate.
+
+# [train.token_weighted_gradient_accumulation] bool = true; values: true | false.
+# true weights variable-density micro-batches by active token count rather than equally; keep enabled for packed, padded, or ragged training.
+
+# [train.mixed_precision] str = "bf16"; canonical values: "bf16" | "no"; quoted aliases: bfloat16/true/1/yes/y/on->bf16, none/false/0/off/n->no.
+# fp16 is unsupported. bf16 fails runtime preflight when unsupported; `no` uses full precision and more memory. Quote boolean/numeric-looking aliases in YAML or use canonical strings.
+
+# [train.tf32] bool = true; values: true | false.
+# Enables TF32 matmul policy on supported CUDA hardware and otherwise has no effect; keep true unless strict fp32 matmul parity is required.
+
+# [train.sdpa_kernel] str = "auto"; values: "auto" | "flash" | "mem_efficient" | "math"; aliases: mem/mem-efficient/efficient->mem_efficient, flashattention/flash_attention->flash.
+# Applies only to RoPE with `attention_implementation="sdpa"`; non-auto native values are ignored with a warning and non-auto RoPE eager values are invalid. `flash` is invalid with document blocking. Use auto normally.
+
+# [train.decoupled_training] bool = true; values: true | false.
+# true uses separate generator/discriminator forward-backward phases and optimizers; false uses a joint update. true is incompatible with `embedding_sharing="es"`; changing topology on resume fails at optimizer-topology validation.
+
+# train.dataloader
+
+# [train.dataloader.num_workers] int = 2; must be >= 0.
+# Worker processes per rank; 0 keeps data loading in the trainer for deterministic debugging. Iterable workers beyond available source shards stay idle; increase only after measuring throughput.
+
+# [train.dataloader.pin_memory] bool = true; values: true | false.
+# Pins host batches for asynchronous CUDA transfer; use true for CUDA and consider false for CPU-only runs or host-memory pressure.
+
+# train.compile — experimental. Compile targets inner model paths, never the full RTD wrapper; failures are hard errors with no eager fallback.
+
+# [train.compile.enabled] bool = false; values: true | false.
+# false disables compilation; non-default mode/scope/backend settings are then ignored with warnings. Validate the exact attention/data route before a long compiled run.
+
+# [train.compile.mode] str = "default"; values: "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"; underscore aliases map to their hyphenated forms.
+# Active only when enabled. `reduce-overhead` may use more memory/cudagraphs; max-autotune modes cost more compile time. Start with default.
+
+# [train.compile.scope] str = "auto"; values: "auto" | "backbones" | "encoder" | "gen_encoder" | "disc_encoder" | "ffn" | "gen_ffn" | "disc_ffn".
+# Aliases: both/backbone/full->backbones, encoders->encoder, ffns->ffn, generator_encoder->gen_encoder, discriminator_encoder->disc_encoder, generator_ffn->gen_ffn, discriminator_ffn->disc_ffn; hyphens are accepted in underscore spellings.
+# auto selects both backbones except RoPE document-blocking, where it selects both FFNs to avoid dynamic mask graph churn. Prefix scopes target only the named component; start with auto.
+
+# [train.compile.backend] str = "inductor"; values: "inductor" | "aot_eager"; alias: aot-eager->aot_eager.
+# Active only when enabled; inductor is the optimizing backend and aot_eager is for debugging, not throughput.
+
+# train.objective
+
+# [train.objective.mlm_probability] float = 0.15; must be finite and in (0, 1).
+# Fraction of active eligible tokens selected for MLM/RTD corruption; 0.15 is the parity default.
+
+# [train.objective.mask_token_prob] float; schema default 1.0; omission is 1.0 for native and 0.8 for RoPE.
+# Must be finite and >= 0; sum with `random_token_prob` must be <= 1. It is the conditional selected-token probability of replacing with MASK; leftover probability keeps the original token.
+
+# [train.objective.random_token_prob] float; schema default 0.0; omission is 0.0 for native and 0.1 for RoPE.
+# Must be finite and >= 0; sum with `mask_token_prob` must be <= 1. It is the conditional selected-token probability of random replacement; special/control IDs are excluded.
+
+# [train.objective.mlm_max_ngram] int = 1; must be >= 1.
+# Maximum DeBERTa windowed masking span; values > 1 request whole-word n-grams, with unsupported tokenizer boundary schemes falling back to conservative token groups with a warning.
+
+# [train.objective.sampling_temperature] float = 1.0; must be finite and > 0.
+# Softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random. Use 1.0 unless measuring replacement entropy.
+
+# [train.objective.gen_loss_weight] float = 1.0; must be finite and >= 0; at least one objective weight must be > 0.
+# Multiplies generator MLM loss; in decoupled mode 0 skips the generator phase.
+
+# [train.objective.disc_loss_weight] float; schema default 10.0; omission is 10.0 for native and 50.0 for RoPE.
+# Must be finite and >= 0; at least one objective weight must be > 0. Multiplies RTD loss; in decoupled mode 0 skips the discriminator phase.
+
+# train.checkpoint
+
+# [train.checkpoint.output_dir] str | None = null; blank normalizes to null, which computes `runs/<project>/<timestamp>_<run-or-config-name>`.
+# Stores snapshots and checkpoints; `~` is expanded and the path becomes absolute. Existing non-empty directories fail unless resume or destructive overwrite is selected; null `logging.output_dir` follows this resolved path.
+
+# [train.checkpoint.overwrite_output_dir] bool = false; values: true | false.
+# true recursively deletes the entire existing non-empty output directory before training; this is irreversible and mutually exclusive with resume. Keep false.
+
+# [train.checkpoint.save_steps] int = 1000; must be >= 0.
+# Periodic checkpoint interval in optimizer steps; 0 disables periodic saves. A final checkpoint is still attempted after progress, and a single-process crash also attempts one.
+
+# [train.checkpoint.save_total_limit] int = 3; must be >= 0.
+# Retains newest committed `checkpoint-*` directories after each save and deletes older ones; 0 disables rotation and can consume unbounded disk. Deletion is irreversible.
+
+# [train.checkpoint.resume_from_checkpoint] str | None = null; blank/null starts fresh, "auto" searches `output_dir`, otherwise value must name an existing committed `checkpoint-*` directory.
+# Resume restores model, optimizer, scheduler, RNG, global step, recovery multiplier, and data progress. The checkpoint must contain `.complete`, current `data_state.json`, non-empty weights, and source-run model/data/optim/logging snapshots; run metadata is validated when present.
+# Compatibility checks require model, data, optim, and logging snapshots to match, except `logging.output_dir` and documented inert model fields. `train.*` is not compared: start from the source `config_resolved.yaml` and deliberately change only duration/checkpoint plumbing unless a semantic change is intended.
+# "auto" uses the newest resumable checkpoint, skips incomplete newer ones, starts fresh only when the output directory is empty, and errors on non-empty output with no resumable checkpoint. Explicit paths expand `~`; resume is mutually exclusive with overwrite.
+
+# [train.checkpoint.resume_data_strategy] str = "auto"; values: "auto" | "replay" | "restart_epoch".
+# replay reconsumes saved micro-batches from epoch zero; restart_epoch starts a new epoch offset at restored global step; auto replays only when consumed micro-batches are <= `resume_replay_max_micro_batches`.
+
+# [train.checkpoint.resume_replay_max_micro_batches] int = 10000; must be >= 0.
+# Threshold used only by auto; larger caps improve data alignment but can make resume startup slow, while explicit replay ignores the cap.
+
+# [train.checkpoint.export_hf_final] bool = true; values: true | false.
+# After successful training, best-effort exports only the discriminator from the final committed checkpoint to `<output_dir>/final_hf` with partial loading allowed. Failure does not fail training; disable for probes, and use manual `deberta export` for strict verification.
+
+# OPTIM
+# Every `optim.*` value must match the source snapshot for exact resume. Learning-rate/scheduler changes are new-training decisions, not supported resume overrides.
+
+# [optim.lr.base] float = 0.0005; must be finite and > 0.
+# Base AdamW rate and inheritance source for component rates. Runtime does not scale it for batch, accumulation, process count, sequence length, or token density; 5e-4 is the repo-tested native starting point, not a universal optimum.
+
+# [optim.lr.generator] float = -1.0; value is -1.0 (inherit base) or finite and > 0.
+# With `embedding_sharing="es"`, it must inherit or equal base because shared parameters cannot use conflicting rates.
+
+# [optim.lr.discriminator] float = -1.0; value is -1.0 (inherit base) or finite and > 0.
+# Leave inherited unless measured phase behavior warrants a distinct rate.
+
+# [optim.adam.beta1] float = 0.9; must be finite and in [0, 1).
+# Adam first-moment decay; 0.9 is the established default.
+
+# [optim.adam.beta2] float = 0.999; must be finite and in [0, 1).
+# Adam second-moment decay; lower values adapt variance faster but can make pretraining noisier.
+
+# [optim.adam.epsilon] float; schema default 1e-6; omission is 1e-6 for native and 1e-8 for RoPE; must be finite and > 0.
+# At optimizer construction, bf16 raises any smaller value to 1e-6 for stability.
+
+# [optim.scheduler.type] str = "linear"; values: "linear" | "cosine" | "cosine_with_restarts" | "polynomial" | "constant" | "constant_with_warmup".
+# Linear/cosine/polynomial decay after warmup; restarts adds cycles; constant ignores warmup; constant_with_warmup warms then holds. Linear is the parity default.
+
+# [optim.scheduler.warmup_steps] int; schema default 10000; omission is 10000 for native and 1000 for RoPE; must be >= 0.
+# Ignored by constant scheduling. Keep it meaningfully below `train.max_steps`; for a very short learning-signal run, use constant or constant_with_warmup and a small warmup.
+
+# [optim.weight_decay] float = 0.01; must be finite and >= 0.
+# AdamW decay for decay-eligible groups; 0 disables it. 0.01 is the project starting point.
+
+# [optim.max_grad_norm] float = 1.0; must be finite and >= 0.
+# Global clipping norm; 0 disables clipping. Use the tested 1.0 starting point unless dedicated measurements justify a change.
+
+# LOGGING
+# Exact resume compares every `logging.*` value except `logging.output_dir`; keep project/run identity, cadence, W&B, and debug settings unchanged.
+
+# [logging.project_name] str = "deberta-train"; must be non-empty after whitespace stripping.
+# W&B project and namespace for automatic checkpoint paths; path-like characters are sanitized locally.
+
+# [logging.run_name] str | None = null; blank normalizes to null.
+# Explicit W&B name and auto-output label; null uses config filename/"run" for auto paths and logging-directory basename for W&B. Use stable descriptive names when comparing runs.
+
+# [logging.output_dir] str | None = null; blank/null uses resolved checkpoint output directory.
+# Stores original/resolved configs, W&B files, and debug/crash artifacts; `~` is expanded. A separate existing directory has no checkpoint overwrite guard and its config snapshots are overwritten, so use a fresh path or leave null.
+
+# [logging.logging_steps] int = 50; must be >= 0.
+# Optimizer-step interval for periodic loss/LR/throughput rows; 0 disables them. Without W&B, normal rows are console-only; smaller intervals add synchronization/I/O overhead.
+
+# logging.wandb
+
+# [logging.wandb.enabled] bool = false; values: true | false.
+# true requires the `wandb` extra and authentication/offline setup, uploads config snapshots, and writes local W&B files. Default `watch="gradients"` also enables model watching; use watch none for scalar-only tracking.
+
+# [logging.wandb.watch] str = "gradients"; values: "none" | "gradients" | "parameters" | "all"; aliases: off/disabled/"false"/"0"->none, grad/gradient->gradients, weights/params/param->parameters.
+# Active only when W&B is enabled; non-default values while disabled are ignored with a warning. Gradient/parameter watching can add substantial compute, communication, and memory overhead; quote boolean/numeric-looking aliases in YAML.
+
+# [logging.wandb.watch_log_freq] int = 100; must be >= 1.
+# Passed to `wandb.watch`, active only when W&B and watching are enabled; non-default values while W&B is off warn. Increase it to reduce overhead; it is not guaranteed to map one-to-one to optimizer steps.
+
+# logging.debug
+
+# [logging.debug.metrics] bool = false; values: true | false; diagnostic.
+# true appends periodic zero-token-window counters to `<logging.output_dir>/metrics.jsonl.gz`; it does not persist normal loss/LR/throughput history. Crash rows and nonfinite artifacts may be written independently; keep false unless diagnosing empty/masked windows.

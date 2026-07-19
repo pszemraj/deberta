@@ -19,8 +19,6 @@ from deberta.config import (
     validate_train_config,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
 
 def test_programmatic_config_resolves_rope_profile_without_serializing_provenance() -> None:
     cfg = Config(model=ModelConfig(backbone_type="rope"))
@@ -178,15 +176,6 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     assert cfg.model.hf.attention_impl == "flash"
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
     assert cfg.model.hf.flash.kernel_overrides_path == "custom.json"
-
-
-def test_config_reference_loads() -> None:
-    # Keep this as an end-to-end loader contract. The reference is deliberately
-    # hand-authored; schema-enumeration tests would turn its prose into generated
-    # scaffolding and cannot verify the field-level guidance that matters here.
-    cfg = load_config(REPO_ROOT / "configs" / "config_reference.yaml")
-    assert cfg.model.backbone_type == "hf_deberta_v2"
-    assert cfg.data.source.dataset_name == "HuggingFaceFW/fineweb-edu"
 
 
 @pytest.mark.parametrize(
