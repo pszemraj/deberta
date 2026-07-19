@@ -961,8 +961,8 @@ def validate_model_config(cfg: ModelConfig) -> None:
         ]
         if enabled_dropout:
             raise ValueError(
-                "model.hf.attention_impl='flash' requires dropout disabled: both fields must be "
-                "explicitly set to 0.0; "
+                "model.hf.attention_impl='flash' requires dropout disabled: both fields must resolve "
+                "to 0.0; "
                 "null preserves backbone/checkpoint dropout and is not accepted. Invalid values: "
                 + ", ".join(enabled_dropout)
             )

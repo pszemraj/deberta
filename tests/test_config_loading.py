@@ -200,7 +200,7 @@ def test_config_reference_loads() -> None:
                 hf={"attention_impl": "flash"},
                 dropout={"hidden_prob": None, "attention_probs_prob": 0.0},
             ),
-            "explicitly set to 0.0",
+            "must resolve to 0.0",
         ),
     ],
 )
