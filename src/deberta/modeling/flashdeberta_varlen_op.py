@@ -1030,8 +1030,26 @@ def _varlen_padded_backward_impl(
         dq = torch.zeros_like(query_layer)
         dk = torch.zeros_like(key_layer)
         dv = torch.zeros_like(value_layer)
-        dpos_key = torch.zeros_like(pos_key) if pos_key is not None else None
-        dpos_query = torch.zeros_like(pos_query) if pos_query is not None else None
+        # Compiled autograd retains only packed positional auxiliaries; use their bucket
+        # dimensions to reconstruct the padded input-gradient shapes.
+        dpos_key = (
+            torch.zeros_like(pos_key)
+            if pos_key is not None
+            else pos_key_unpad.new_zeros(
+                (batch_size, seq_len, int(query_layer.shape[2]), int(pos_key_unpad.shape[-1]))
+            )
+            if pos_key_unpad is not None
+            else None
+        )
+        dpos_query = (
+            torch.zeros_like(pos_query)
+            if pos_query is not None
+            else pos_query_unpad.new_zeros(
+                (batch_size, seq_len, int(query_layer.shape[2]), int(pos_query_unpad.shape[-1]))
+            )
+            if pos_query_unpad is not None
+            else None
+        )
         return dq, dk, dv, dpos_key, dpos_query
 
     pack_kwargs = {

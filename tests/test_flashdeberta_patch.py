@@ -1876,6 +1876,59 @@ def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.Mo
     assert calls == {"triton": 1}
 
 
+@pytest.mark.parametrize("batch_size,seq_len", [(0, 3), (2, 0)])
+def test_compiled_varlen_empty_backward_restores_padded_position_grad_shapes(
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    num_heads = 2
+    head_dim = 4
+    q = torch.empty((batch_size, seq_len, num_heads, head_dim))
+    packed_q = torch.empty((0, num_heads, head_dim))
+    packed_lse = torch.empty((0, num_heads), dtype=torch.float32)
+    pos_key_unpad = torch.empty((0, num_heads, 5))
+    pos_query_unpad = torch.empty((0, num_heads, 7))
+    seqlens = torch.zeros((batch_size,), dtype=torch.int32)
+    cu_seqlens = torch.zeros((batch_size + 1,), dtype=torch.int32)
+
+    dq, dk, dv, dpos_key, dpos_query = varlen_mod._varlen_padded_backward_impl(
+        grad_output=torch.empty_like(q),
+        query_layer=q,
+        key_layer=q,
+        value_layer=q,
+        output_padded=q,
+        lse_padded=torch.empty((batch_size, seq_len, num_heads), dtype=torch.float32),
+        pos_key=None,
+        pos_query=None,
+        sm_scale=0.5,
+        position_buckets=8,
+        max_relative_distance=8,
+        causal=False,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=seq_len,
+        total_tokens=0,
+        q_unpad=packed_q,
+        k_unpad=packed_q,
+        v_unpad=packed_q,
+        out_unpad=packed_q,
+        lse_unpad=packed_lse,
+        pos_key_unpad=pos_key_unpad,
+        pos_query_unpad=pos_query_unpad,
+        dense_mid_tensors=True,
+    )
+
+    assert dq.shape == q.shape
+    assert dk.shape == q.shape
+    assert dv.shape == q.shape
+    assert dpos_key is not None and dpos_key.shape == (batch_size, seq_len, num_heads, 5)
+    assert dpos_query is not None and dpos_query.shape == (batch_size, seq_len, num_heads, 7)
+    assert torch.count_nonzero(dpos_key).item() == 0
+    assert torch.count_nonzero(dpos_query).item() == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Inductor varlen coverage.")
 def test_varlen_triton_op_compiles_with_inductor_and_backpropagates() -> None:
     pytest.importorskip("triton")
