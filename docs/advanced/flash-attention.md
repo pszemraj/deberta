@@ -4,8 +4,7 @@ FlashDeBERTa provides optional Triton implementations of disentangled attention 
 
 ## Enable
 
-Install the `flash` extra as described in [Installation](../getting-started/installation.md), then
-set `model.hf.attention_impl: flash` or pass `--model.hf.attention_impl flash`.
+Install the `flash` extra as described in [Installation](../getting-started/installation.md), then set `model.hf.attention_impl: flash` in the training config.
 
 The flash path has these constraints:
 

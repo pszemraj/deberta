@@ -91,7 +91,7 @@ _TORCH_COMPILE_SCOPE_ALIASES = {
 # The literal dataclass defaults below describe the default hf_deberta_v2
 # profile. Config-file omissions still need to resolve against the selected
 # backbone without overwriting values explicitly supplied in YAML/JSON or by a
-# dotted CLI override.
+# programmatic dotted override.
 _BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "hf_deberta_v2": {
         "train.objective.mask_token_prob": 1.0,

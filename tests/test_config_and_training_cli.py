@@ -31,9 +31,7 @@ from deberta.training.run_config import _build_run_metadata, _persist_or_validat
 from deberta.training.steps import _global_grad_l2_norm
 
 
-def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_main_cli_train_subcommand_loads_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(
@@ -52,16 +50,16 @@ def test_main_cli_train_subcommand_loads_yaml_and_applies_overrides(
     )
 
     seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
+    cli_mod.main(["train", str(cfg_path)])
 
     assert "train_cfg" in seen
     assert seen["data_cfg"].packing.max_seq_length == 32
-    assert seen["train_cfg"].max_steps == 7
+    assert seen["train_cfg"].max_steps == 5
     assert seen["config_path"] == cfg_path
 
 
 def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
 
     cfg_path = tmp_path / "train.yaml"
@@ -89,196 +87,9 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
     assert "train_cfg" in seen
     assert int(seen["optim_cfg"].scheduler.warmup_steps) == 1000
     assert seen["config_path"] == cfg_path
-    err = capsys.readouterr().err
-    assert "optim.scheduler.warmup_steps" not in err
 
 
-def test_main_cli_train_reports_when_file_value_is_changed_by_cli_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(["train", str(cfg_path), "--train.max_steps", "7"])
-
-    assert "train_cfg" in seen
-    assert int(seen["train_cfg"].max_steps) == 7
-    err = capsys.readouterr().err
-    assert "train.max_steps: 5 -> 7 (CLI override (--train.max_steps))" in err
-
-
-def test_main_cli_train_supports_dotted_overrides_with_type_casting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-                "optim:",
-                "  adam:",
-                "    epsilon: 1e-6",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(
-        [
-            "train",
-            str(cfg_path),
-            "--train.max_steps",
-            "11",
-            "--optim.adam.epsilon",
-            "1e-5",
-            "--model.hf.max_position_embeddings",
-            "640",
-        ]
-    )
-
-    assert int(seen["train_cfg"].max_steps) == 11
-    assert float(seen["optim_cfg"].adam.epsilon) == pytest.approx(1e-5)
-    assert int(seen["model_cfg"].hf.max_position_embeddings) == 640
-    err = capsys.readouterr().err
-    assert "train.max_steps: 5 -> 11 (CLI override (--train.max_steps))" in err
-
-
-def test_main_cli_train_supports_null_for_optional_numeric_dotted_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  hf:",
-                "    max_position_embeddings: 640",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(
-        [
-            "train",
-            str(cfg_path),
-            "--model.hf.max_position_embeddings",
-            "null",
-        ]
-    )
-
-    assert seen["model_cfg"].hf.max_position_embeddings is None
-    err = capsys.readouterr().err
-    assert (
-        "model.hf.max_position_embeddings: 640 -> None (CLI override (--model.hf.max_position_embeddings))"
-    ) in err
-
-
-def test_main_cli_train_supports_null_for_optional_constrained_dotted_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  backbone_type: rope",
-                "  from_scratch: false",
-                "  pretrained:",
-                "    discriminator_path: /tmp/rope-disc",
-                "  rope:",
-                "    pretrained:",
-                "      norm_arch: keel",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(
-        [
-            "train",
-            str(cfg_path),
-            "--model.rope.pretrained.norm_arch",
-            "none",
-        ]
-    )
-
-    assert seen["model_cfg"].rope.pretrained.norm_arch is None
-    err = capsys.readouterr().err
-    assert (
-        "model.rope.pretrained.norm_arch: 'keel' -> None (CLI override (--model.rope.pretrained.norm_arch))"
-        in err
-    )
-
-
-def test_main_cli_train_supports_dotted_overrides_for_extended_sections(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(
-        [
-            "train",
-            str(cfg_path),
-            "--optim.scheduler.warmup_steps",
-            "333",
-            "--logging.wandb.watch",
-            "all",
-        ]
-    )
-
-    assert int(seen["optim_cfg"].scheduler.warmup_steps) == 333
-    assert seen["logging_cfg"].wandb.watch == "all"
-
-
-def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_main_cli_train_rejects_unknown_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(
         "\n".join(
@@ -296,8 +107,24 @@ def test_main_cli_train_rejects_invalid_dotted_override(tmp_path: Path, monkeypa
         cli_mod.main(["train", str(cfg_path), "--train.no_such_field", "1"])
 
 
-def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: pytest.MonkeyPatch):
+def test_main_cli_train_dry_run_calls_preflight_and_skips_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     seen: dict[str, Any] = {}
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  source:",
+                "    dataset_name: HuggingFaceFW/fineweb-edu",
+                "train:",
+                "  max_steps: 5",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     def _fake_run_pretraining(*args, **kwargs):
         del args, kwargs
@@ -323,42 +150,24 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(monkeypatch: 
     monkeypatch.setattr(cli_mod, "run_pretraining", _fake_run_pretraining)
     monkeypatch.setattr(cli_mod, "run_pretraining_dry_run", _fake_dry_run)
 
-    cli_mod.main(
-        [
-            "train",
-            "--data.source.dataset_name",
-            "HuggingFaceFW/fineweb-edu",
-            "--train.max_steps",
-            "5",
-            "--dry-run",
-        ]
-    )
+    cli_mod.main(["train", str(cfg_path), "--dry-run"])
     assert "train_cfg" in seen
     assert int(seen["train_cfg"].max_steps) == 5
+    assert seen["config_path"] == cfg_path
 
 
 def test_train_parser_accepts_dry_run_flag():
     parser = cli_mod._build_main_parser()
-    ns = parser.parse_args(
-        [
-            "train",
-            "--data.source.dataset_name",
-            "HuggingFaceFW/fineweb-edu",
-            "--train.max_steps",
-            "5",
-            "--dry-run",
-        ]
-    )
+    ns = parser.parse_args(["train", "config.yaml", "--dry-run"])
     assert ns.command == "train"
+    assert ns.config == "config.yaml"
     assert ns.dry_run is True
 
 
-@pytest.mark.parametrize("scope", ["generator-encoder", "gen-encoder", "disc-ffn"])
-def test_train_parser_accepts_hyphenated_compile_scope_aliases(scope: str) -> None:
+def test_train_parser_requires_config() -> None:
     parser = cli_mod._build_main_parser()
-    ns = parser.parse_args(["train", "--train.compile.scope", scope])
-
-    assert vars(ns)["dot__train__compile__scope"] == scope
+    with pytest.raises(SystemExit):
+        parser.parse_args(["train"])
 
 
 def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.MonkeyPatch):
@@ -383,18 +192,6 @@ def test_main_cli_export_subcommand_builds_export_config(monkeypatch: pytest.Mon
     assert cfg.checkpoint_dir == "runs/demo/checkpoint-10"
     assert cfg.export_what == "generator"
     assert cfg.output_dir == "runs/demo/exported_hf"
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["train", "--model.rope.norm_arch", "invalid"],
-    ],
-)
-def test_train_cli_rejects_invalid_constrained_values_at_parse_time(argv: list[str]):
-    parser = cli_mod._build_main_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(argv)
 
 
 @pytest.mark.parametrize(
