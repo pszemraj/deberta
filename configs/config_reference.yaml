@@ -247,7 +247,7 @@
 # Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Tune against VRAM before increasing accumulation.
 
 # [train.gradient_accumulation_steps] int = 1; must be >= 1.
-# Micro-batches per optimizer step. Resume accepts a changed value with only a warning, so keep it unchanged unless the resulting data alignment/effective batch change is deliberate.
+# Micro-batches per optimizer step. Exact resume requires this value to match the source train snapshot because it changes update semantics and saved data-progress interpretation.
 
 # [train.token_weighted_gradient_accumulation] bool = true; values: true | false.
 # true weights variable-density micro-batches by active token count rather than equally; keep enabled for packed, padded, or ragged training.
@@ -262,7 +262,7 @@
 # Applies only to RoPE with `attention_implementation="sdpa"`; non-auto native values are ignored with a warning and non-auto RoPE eager values are invalid. `flash` is invalid with document blocking. Use auto normally.
 
 # [train.decoupled_training] bool = true; values: true | false.
-# true uses separate generator/discriminator forward-backward phases and optimizers; false uses a joint update. true is incompatible with `embedding_sharing="es"`; changing topology on resume fails at optimizer-topology validation.
+# true uses separate generator/discriminator forward-backward phases and optimizers; false uses a joint update. true is incompatible with `embedding_sharing="es"`; exact resume requires this value to match the source train snapshot.
 
 # train.dataloader
 
@@ -305,10 +305,10 @@
 # Softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random. Use 1.0 unless measuring replacement entropy.
 
 # [train.objective.gen_loss_weight] float = 1.0; must be finite and >= 0; at least one objective weight must be > 0.
-# Multiplies generator MLM loss; in decoupled mode 0 skips the generator phase.
+# Multiplies generator MLM loss; in decoupled mode 0 skips the generator phase. Exact resume requires this value to match the source train snapshot.
 
 # [train.objective.disc_loss_weight] float; schema default 10.0; omission is 10.0 for native and 50.0 for RoPE.
-# Must be finite and >= 0; at least one objective weight must be > 0. Multiplies RTD loss; in decoupled mode 0 skips the discriminator phase.
+# Must be finite and >= 0; at least one objective weight must be > 0. Multiplies RTD loss; in decoupled mode 0 skips the discriminator phase. Exact resume requires this value to match the source train snapshot.
 
 # train.checkpoint
 
@@ -325,8 +325,8 @@
 # Retains newest committed `checkpoint-*` directories after each save and deletes older ones; 0 disables rotation and can consume unbounded disk. Deletion is irreversible.
 
 # [train.checkpoint.resume_from_checkpoint] str | None = null; blank/null starts fresh, "auto" searches `output_dir`, otherwise value must name an existing committed `checkpoint-*` directory.
-# Resume restores model, optimizer, scheduler, RNG, global step, recovery multiplier, and data progress. The checkpoint must contain `.complete`, current `data_state.json`, non-empty weights, and source-run model/data/optim/logging snapshots; run metadata is validated when present.
-# Compatibility checks require model, data, optim, and logging snapshots to match, except `logging.output_dir` and documented inert model fields. `train.*` is not compared: start from the source `config_resolved.yaml` and deliberately change only duration/checkpoint plumbing unless a semantic change is intended.
+# Resume restores model, optimizer, scheduler, RNG, global step, recovery multiplier, and data progress. The checkpoint must contain `.complete`, current `data_state.json`, non-empty weights, and source-run model/data/train/optim/logging snapshots; run metadata is validated when present.
+# Compatibility checks require model, data, optim, logging, and training-semantics snapshots to match, except `logging.output_dir`, documented inert model fields, `train.max_steps`, and `train.checkpoint.*`. Start from the source `config_resolved.yaml` and change only duration or checkpoint plumbing.
 # "auto" uses the newest resumable checkpoint, skips incomplete newer ones, starts fresh only when the output directory is empty, and errors on non-empty output with no resumable checkpoint. Explicit paths expand `~`; resume is mutually exclusive with overwrite.
 
 # [train.checkpoint.resume_data_strategy] str = "auto"; values: "auto" | "replay" | "restart_epoch".

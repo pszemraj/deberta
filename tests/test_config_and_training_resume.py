@@ -1127,6 +1127,50 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
         )
 
 
+@pytest.mark.parametrize(
+    "changed_train",
+    [
+        make_train_config(gradient_accumulation_steps=2),
+        make_train_config(objective={"gen_loss_weight": 2.0}),
+        make_train_config(objective={"disc_loss_weight": 20.0}),
+        make_train_config(decoupled_training=False),
+    ],
+    ids=[
+        "gradient-accumulation",
+        "generator-loss-weight",
+        "discriminator-loss-weight",
+        "decoupled-training",
+    ],
+)
+def test_persist_or_validate_run_configs_rejects_resume_training_dynamics_mismatch(
+    tmp_path: Path,
+    changed_train: TrainConfig,
+) -> None:
+    out = tmp_path / "run"
+    out.mkdir(parents=True, exist_ok=True)
+    model_cfg = make_model_config(backbone_type="rope")
+    data_cfg = make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})
+    base_train = make_train_config()
+    _persist_or_validate_run_configs(
+        output_dir=out,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=base_train,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    with pytest.raises(ValueError, match="Resume configuration mismatch for train_config.json"):
+        _persist_or_validate_run_configs(
+            output_dir=out,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=changed_train,
+            resume_checkpoint=str(out / "checkpoint-10"),
+            is_main_process=True,
+        )
+
+
 def test_persist_or_validate_run_configs_does_not_backfill_metadata_on_failed_resume(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
