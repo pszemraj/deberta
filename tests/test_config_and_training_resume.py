@@ -176,7 +176,9 @@ def test_run_pretraining_resume_rejects_checkpoint_step_metadata_mismatch(
 
 
 def test_run_pretraining_logs_window_averaged_rtd_metrics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
@@ -207,6 +209,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
         compile={"enabled": False},
     )
 
+    caplog.set_level(logging.INFO)
     pretrain_mod.run_pretraining(
         model_cfg=make_model_config(),
         data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
@@ -228,6 +231,7 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert "gen_token_count" not in metrics
     assert "disc_token_count" not in metrics
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
+    assert "pos=0.6667" in caplog.text
 
 
 def test_run_pretraining_keeps_resolved_yaml_roundtrippable_for_resume(

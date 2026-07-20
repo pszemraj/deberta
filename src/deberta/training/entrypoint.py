@@ -1161,6 +1161,7 @@ def run_pretraining(
                             f"gen={metrics['gen_loss']:.4f}",
                             f"disc={metrics['disc_loss']:.4f}",
                             f"acc={metrics['disc_acc']:.4f}",
+                            f"pos={metrics['disc_pos_frac']:.4f}",
                             f"tok/s={metrics['input_tokens_per_sec']:.1f}",
                             f"tok_seen={metrics['input_tokens_seen']:.0f}",
                         ]
