@@ -533,6 +533,7 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
             {
                 "embeddings.word_embeddings.base_weight": torch.tensor([1.0]),
                 "embeddings.word_embeddings.bias": torch.tensor([0.2]),
+                "embeddings.position_embeddings.bias": torch.tensor([0.3]),
                 "encoder.weight": torch.tensor([3.0]),
             },
             {"embeddings.word_embeddings.weight": torch.tensor([0.8])},

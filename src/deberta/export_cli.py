@@ -274,10 +274,8 @@ def _prepare_discriminator_state_for_strict_load(
             continue
 
         if key.endswith(".bias"):
-            prefix = key[: -len(".bias")]
-            weight_key = f"{prefix}.weight"
             # Bias tensors are merge-only for GDES and should not participate in strict backbone load.
-            if weight_key in model_keys and key not in model_keys:
+            if key not in model_keys:
                 prepared.pop(key, None)
 
     return prepared

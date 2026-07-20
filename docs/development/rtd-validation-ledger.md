@@ -58,16 +58,16 @@ Decision: no core RTD-objective mismatch is currently indicated. Treat schedulin
 
 ### Strict GDES export
 
-Status: confirmed defect; fix pending.
+Status: fixed and validated.
 
 Strict discriminator export of checkpoint 12k retains `embeddings.position_embeddings.bias`, even though a standalone Hugging Face backbone configured with `position_biased_input=false` has no absolute-position embedding. A local runtime patch that drops GDES bias keys absent from the export model produced a 110M-parameter artifact that loaded through `AutoModel`. Active-token outputs matched with cosine approximately 1.0 and maximum absolute error `8.8e-6`.
 
-Decision: add a focused regression test and make the absent-key filtering part of strict export before the next checkpoint is treated as an artifact.
+The strict-load preparation now drops every GDES embedding bias key that is absent from the target export backbone, including the orphaned position bias. The focused export suites pass (`21 passed`). Strict export of the actual 12k checkpoint then completed without partial loading, and the resulting 110,026,752-parameter artifact loaded through `AutoModel`. The earlier runtime-patched parity check already measured active-token cosine approximately 1.0 and maximum absolute error `8.8e-6`, within the acceptance threshold.
+
+Decision: strict GDES export is no longer a blocker. Keep strict loading as the artifact acceptance path.
 
 ## Next iteration
 
-1. Fix and test strict GDES export.
-2. Turn the existing ignored held-out analysis into a small reusable checkpoint evaluator for loss gain, ROC-AUC, AP, logit dispersion, and representation dispersion.
-3. Validate the existing FlashDeBERTa production template (`1e-4`, linear decay) with short smoke runs.
-4. Run a 1,000–3,000-step staged validation, evaluate against the criteria above, and verify strict export.
-
+1. Turn the existing ignored held-out analysis into a small reusable checkpoint evaluator for loss gain, ROC-AUC, AP, logit dispersion, and representation dispersion.
+2. Validate the existing FlashDeBERTa production template (`1e-4`, linear decay) with short smoke runs.
+3. Run a 1,000–3,000-step staged validation, evaluate against the criteria above, and verify strict export.
