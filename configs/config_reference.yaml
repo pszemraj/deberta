@@ -384,7 +384,7 @@
 # Stores original/resolved configs, W&B files, and debug/crash artifacts; `~` is expanded. A separate existing directory has no checkpoint overwrite guard and its config snapshots are overwritten, so use a fresh path or leave null.
 
 # [logging.logging_steps] int = 50; must be >= 0.
-# Optimizer-step interval for periodic loss/LR/throughput rows; 0 disables them. Without W&B, normal rows are console-only; smaller intervals add synchronization/I/O overhead.
+# Optimizer-step interval for periodic loss/LR/throughput rows; 0 disables them. RTD rows include the replacement-positive fraction and `gain`, the discriminator BCE improvement over a constant class-prior predictor; positive gain indicates useful discrimination. Without W&B, normal rows are console-only; smaller intervals add synchronization/I/O overhead.
 
 # logging.wandb
 

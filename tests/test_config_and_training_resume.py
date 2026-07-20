@@ -2,6 +2,7 @@ import dataclasses
 import gzip
 import json
 import logging
+import math
 import types
 from pathlib import Path
 from typing import Any
@@ -227,10 +228,13 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     metrics = step_rows[-1]
     assert metrics["gen_loss"] == pytest.approx(8.2, rel=0.0, abs=1e-6)
     assert metrics["disc_loss"] == pytest.approx(104.0 / 12.0, rel=0.0, abs=1e-6)
+    disc_prior_loss = -(2.0 / 3.0 * math.log(2.0 / 3.0) + 1.0 / 3.0 * math.log(1.0 / 3.0))
+    assert metrics["disc_loss_gain"] == pytest.approx(disc_prior_loss - 104.0 / 12.0, rel=0.0, abs=1e-6)
     assert metrics["disc_acc"] == pytest.approx(0.3, rel=0.0, abs=1e-6)
     assert "gen_token_count" not in metrics
     assert "disc_token_count" not in metrics
     assert metrics["disc_pos_frac"] == pytest.approx(8.0 / 12.0, rel=0.0, abs=1e-6)
+    assert "gain=-8.0302" in caplog.text
     assert "pos=0.6667" in caplog.text
 
 

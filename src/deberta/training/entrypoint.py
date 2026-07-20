@@ -1126,6 +1126,12 @@ def run_pretraining(
             disc_pos_frac = (
                 global_disc_positive / global_disc_tokens if global_disc_tokens > 0.0 else float("nan")
             )
+            disc_prior_loss = -sum(
+                probability * math.log(probability)
+                for probability in (disc_pos_frac, 1.0 - disc_pos_frac)
+                if probability > 0.0
+            )
+            disc_loss_gain = disc_prior_loss - disc_loss_window
             loss = float(train_cfg.objective.gen_loss_weight) * float(gen_loss_window) + float(
                 train_cfg.objective.disc_loss_weight
             ) * float(disc_loss_window)
@@ -1144,6 +1150,7 @@ def run_pretraining(
                 "loss": float(loss),
                 "gen_loss": float(gen_loss_window),
                 "disc_loss": float(disc_loss_window),
+                "disc_loss_gain": float(disc_loss_gain),
                 "disc_acc": float(disc_acc_window),
                 "disc_pos_frac": float(disc_pos_frac),
                 "input_tokens_per_sec": float(input_tokens_per_sec),
@@ -1160,6 +1167,7 @@ def run_pretraining(
                             f"loss={metrics['loss']:.4f}",
                             f"gen={metrics['gen_loss']:.4f}",
                             f"disc={metrics['disc_loss']:.4f}",
+                            f"gain={metrics['disc_loss_gain']:.4f}",
                             f"acc={metrics['disc_acc']:.4f}",
                             f"pos={metrics['disc_pos_frac']:.4f}",
                             f"tok/s={metrics['input_tokens_per_sec']:.1f}",
