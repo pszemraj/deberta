@@ -76,6 +76,20 @@ The tracked evaluator reproduced the established 12k result over 16,384 tokens: 
 
 Decision: use this command after staged checkpoints so run decisions use the same deterministic measurement path.
 
+### Streaming preflight shutdown
+
+Status: fixed and validated.
+
+The first staged dry-run passed every reported preflight check but aborted during interpreter shutdown with `PyGILState_Release` from PyArrow. The failure reproduced outside the sandbox with a minimal `datasets.load_dataset(..., streaming=True)` iterator, so it was not a CUDA or sandbox restriction. The environment was Python 3.11.15, Datasets 3.6.0, and PyArrow 21.0.0.
+
+Explicitly releasing and collecting an unshuffled iterator exited cleanly. Reservoir shuffle with `buffer_size=10000` still reproduced the abort during immediate process exit. Dry-run now samples one unshuffled source row because order is irrelevant to configuration/tokenization preflight, then explicitly closes and collects the iterator. Actual training still uses the configured shuffle unchanged. The checkpoint evaluator also releases its main-process data sampler before model evaluation.
+
+The targeted CLI and evaluator suites pass (`94 passed`). The exact FlashDeBERTa dry-run and a shuffled one-batch checkpoint evaluation both exit zero outside the sandbox.
+
+The CLI also intentionally rejected the attempted dotted command-line overrides, so staged runs use explicit YAML files rather than hidden runtime mutations.
+
+Decision: the data-source preflight and evaluator lifecycle are no longer blockers. Proceed to the 100-step linear-decay smoke.
+
 ## Next iteration
 
 1. Validate the existing FlashDeBERTa production template (`1e-4`, linear decay) with short smoke runs.

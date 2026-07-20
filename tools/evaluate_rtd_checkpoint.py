@@ -9,6 +9,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 from contextlib import nullcontext
@@ -166,11 +167,14 @@ def _build_eval_batch(cfg: Any, tokenizer: Any, *, batches: int, seed: int) -> d
         "position_ids",
         "doc_context_index",
     )
-    return {
+    batch = {
         key: torch.cat([row[key] for row in rows])
         for key in tensor_keys
         if all(isinstance(row.get(key), torch.Tensor) for row in rows)
     }
+    del rows, iterator, loader, dataset, raw_train
+    gc.collect()
+    return batch
 
 
 def _state_stats(model: torch.nn.Module) -> dict[str, int]:

@@ -14,7 +14,7 @@ from _config_factories import (
     make_optim_config,
     make_train_config,
 )
-from _fakes import capture_run_pretraining_kwargs
+from _fakes import capture_run_pretraining_kwargs, setup_pretraining_mocks
 
 import deberta.cli as cli_mod
 from deberta.config import (
@@ -269,6 +269,56 @@ def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Pa
             ),
             config_path=None,
         )
+
+
+def test_run_pretraining_dry_run_releases_sample_iterator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entrypoint_mod = setup_pretraining_mocks(monkeypatch)
+    close_calls: list[bool] = []
+    collect_calls: list[bool] = []
+    shuffle_buffer_sizes: list[int] = []
+
+    class _CloseableDataset:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "labels": torch.tensor([[-100, 2, -100]]),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            }
+
+        def close(self) -> None:
+            close_calls.append(True)
+
+    dataset = _CloseableDataset()
+
+    def _build_dataset(**kwargs):
+        shuffle_buffer_sizes.append(int(kwargs["data_cfg"].source.shuffle_buffer_size))
+        return dataset, lambda rows: rows[0]
+
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "_build_train_dataset_and_collator",
+        _build_dataset,
+    )
+    monkeypatch.setattr(entrypoint_mod.gc, "collect", lambda: collect_calls.append(True) or 0)
+
+    result = entrypoint_mod.run_pretraining_dry_run(
+        model_cfg=make_model_config(),
+        data_cfg=make_data_config(source={"dataset_name": "dummy-dataset"}),
+        train_cfg=make_train_config(
+            checkpoint={"output_dir": str(tmp_path / "run")},
+            max_steps=5,
+        ),
+    )
+
+    assert result["status"] == "ok"
+    assert close_calls == [True]
+    assert collect_calls == [True]
+    assert shuffle_buffer_sizes == [0]
 
 
 def test_validate_data_config_rejects_non_streaming_shuffle_buffer_above_one():

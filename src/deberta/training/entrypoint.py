@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import gc
 import inspect
 import logging
 import math
 import time
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -338,10 +339,14 @@ def run_pretraining_dry_run(
             "network/auth settings."
         ) from exc
 
+    preflight_data_cfg = replace(
+        data_cfg,
+        source=replace(data_cfg.source, shuffle_buffer_size=0),
+    )
     train_dataset, collator = _build_train_dataset_and_collator(
         raw_train=raw_train,
         tokenizer=tokenizer,
-        data_cfg=data_cfg,
+        data_cfg=preflight_data_cfg,
         train_cfg=train_cfg,
         process_index=0,
         num_processes=1,
@@ -387,7 +392,7 @@ def run_pretraining_dry_run(
             "Backbone config preflight failed. Check model/backbone/tokenizer settings and vocab alignment options."
         ) from exc
 
-    return {
+    summary = {
         "status": "ok",
         "output_dir": str(checkpoint_output_dir),
         "checkpoint_output_dir": str(checkpoint_output_dir),
@@ -401,6 +406,12 @@ def run_pretraining_dry_run(
         "discriminator_vocab_size": int(disc_config.vocab_size),
         "generator_vocab_size": int(gen_config.vocab_size),
     }
+    close_example_iter = getattr(example_iter, "close", None)
+    if callable(close_example_iter):
+        close_example_iter()
+    del batch, sample, close_example_iter, example_iter, train_dataset, raw_train
+    gc.collect()
+    return summary
 
 
 def run_pretraining(
