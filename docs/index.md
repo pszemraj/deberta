@@ -19,6 +19,10 @@
 - flash routes, kernel tuning, and caveats: [Advanced / FlashDeBERTa attention](advanced/flash-attention.md)
 - per-GPU expectations and tuning for non-`sm_120` hardware: [Advanced / GPU support](advanced/gpu-support.md)
 
+## Development
+
+- chronological pretraining experiments and acceptance criteria: [RTD validation ledger](development/rtd-validation-ledger.md)
+
 ## API reference
 
 - [API / Modeling](api/modeling.md)
