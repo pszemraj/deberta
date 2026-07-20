@@ -122,8 +122,30 @@ Unlike the 100-step smoke, the endpoint improved over the midpoint despite LR re
 
 Decision: proceed to the committed 3,000-step recipe at `configs/flashdeberta/validate_flashdeberta_1024_3k.yaml`. It preserves the 2% warmup ratio with 60 warmup steps and saves checkpoints at 1k, 2k, and 3k.
 
+### Linear-decay 3,000-step validation
+
+Status: passed all acceptance criteria.
+
+The committed validation recipe preserves the production model, data, effective batch size 32, BF16, GDES, peak learning rate `1e-4`, and linear scheduler. It compresses the production schedule from 50,000 steps with 1,000 warmup steps to 3,000 steps with 60 warmup steps, preserving the 2% warmup ratio. The run completed 98.30M input tokens in 36m52s at steady-state throughput near 45k tok/s. Checkpoints 1k, 2k, and 3k saved cleanly with no non-finite events.
+
+The deterministic 16-sequence alternate-shuffle evaluation improved at every checkpoint:
+
+| Step | Generator CE | Replacement rate | Discriminator BCE | Gain over prior | ROC-AUC | AP | Token RMS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 5.072 | 12.52% | 0.3286 | 0.0485 | 0.731 | 0.325 | 0.683 |
+| 2,000 | 4.613 | 12.08% | 0.2842 | 0.0844 | 0.814 | 0.454 | 0.760 |
+| 3,000 | 4.462 | 11.97% | 0.2775 | 0.0888 | 0.820 | 0.469 | 0.794 |
+
+All 315 state tensors, containing 205,678,593 elements, were finite at every checkpoint. At 3k, AP was 3.92 times the realized positive prior. Accuracy at a zero logit threshold was 89.7%, but recall was only 19.0%; this again confirms that ranking and prior-relative loss, rather than raw zero-threshold accuracy, are the useful measurements.
+
+A larger confirmation over 64 sequences and 65,536 active tokens measured generator CE `4.362`, replacement rate `0.1187`, discriminator BCE `0.2787`, prior gain `0.0857`, ROC-AUC `0.8182`, AP `0.4579`, logit standard deviation `3.30`, and token-centered RMS `0.788`. The result therefore does not depend on the smaller 16-sequence sample.
+
+Strict discriminator export of checkpoint 3k completed and loaded through `AutoModel`. Native-checkpoint versus standalone-export comparison over 26,880 active hidden-state elements measured maximum absolute error `3.78e-6`, mean absolute error `4.89e-7`, and cosine similarity `0.99999994`. The first two disposable parity-script attempts failed before model execution because the repository root was absent from the script import path and then because the tokenizer field was read from `data` instead of `model`; removing the unnecessary tool import and correcting the field resolved both. No tracked implementation change was needed.
+
+Decision: accept checkpoint 3k as the first end-to-end non-degenerate model produced by this codebase. The linear `1e-4` recipe clears the convergence, representation, finiteness, export, and parity gates. Proceed with `configs/flashdeberta/pretrain_flashdeberta_1024.yaml` for a longer production-scale run while continuing to monitor held-out prior gain, ROC-AUC, and AP at saved checkpoints.
+
 ## Next iteration
 
-1. Dry-run the committed 3,000-step recipe outside the sandbox.
-2. Run and evaluate checkpoints 1k, 2k, and 3k against the acceptance criteria.
-3. Strict-export the strongest accepted checkpoint and verify active-token parity.
+1. Start the 50,000-step production recipe only when that longer GPU allocation is desired; the 3,000-step convergence gate no longer blocks it.
+2. Evaluate each 5,000-step production checkpoint with the tracked alternate-shuffle evaluator and retain downstream mean-pooling probes as a representation-quality cross-check.
+3. Treat a material fall in held-out ranking or representation dispersion, rather than zero-threshold accuracy, as the signal to pause and investigate.
