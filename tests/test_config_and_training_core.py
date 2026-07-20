@@ -106,6 +106,7 @@ def test_entrypoint_resolves_omitted_sections_from_rope_profile() -> None:
     assert train_cfg.objective.mask_token_prob == pytest.approx(0.8)
     assert train_cfg.objective.random_token_prob == pytest.approx(0.1)
     assert train_cfg.objective.disc_loss_weight == pytest.approx(50.0)
+    assert optim_cfg.lr.base == pytest.approx(5e-4)
     assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
     assert optim_cfg.scheduler.warmup_steps == 1_000
 
@@ -134,6 +135,7 @@ def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
     assert train_cfg.objective.mask_token_prob == pytest.approx(1.0)
     assert train_cfg.objective.random_token_prob == pytest.approx(0.0)
     assert train_cfg.objective.disc_loss_weight == pytest.approx(10.0)
+    assert optim_cfg.lr.base == pytest.approx(1e-4)
     assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
     assert optim_cfg.scheduler.warmup_steps == 10_000
 
@@ -218,6 +220,7 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
     assert cfg2.train.objective.mask_token_prob == pytest.approx(0.8)
     assert cfg2.train.objective.random_token_prob == pytest.approx(0.1)
     assert cfg2.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg2.optim.lr.base == pytest.approx(5e-4)
     assert cfg2.optim.adam.epsilon == pytest.approx(1e-8)
     assert cfg2.optim.scheduler.warmup_steps == 1_000
 
@@ -225,6 +228,7 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
     assert cfg2.train.objective.mask_token_prob == pytest.approx(1.0)
     assert cfg2.train.objective.random_token_prob == pytest.approx(0.0)
     assert cfg2.train.objective.disc_loss_weight == pytest.approx(10.0)
+    assert cfg2.optim.lr.base == pytest.approx(1e-4)
     assert cfg2.optim.adam.epsilon == pytest.approx(1e-6)
     assert cfg2.optim.scheduler.warmup_steps == 10_000
 

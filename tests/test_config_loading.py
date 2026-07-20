@@ -26,6 +26,7 @@ def test_programmatic_config_resolves_rope_profile_without_serializing_provenanc
     assert cfg.train.objective.mask_token_prob == pytest.approx(0.8)
     assert cfg.train.objective.random_token_prob == pytest.approx(0.1)
     assert cfg.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg.optim.lr.base == pytest.approx(5e-4)
     assert cfg.optim.adam.epsilon == pytest.approx(1e-8)
     assert cfg.optim.scheduler.warmup_steps == 1_000
     assert set(dataclasses.asdict(cfg)) == {"model", "data", "train", "optim", "logging"}
@@ -50,6 +51,7 @@ def test_programmatic_config_preserves_custom_profile_values() -> None:
     assert cfg.train.objective.mask_token_prob == pytest.approx(0.6)
     assert cfg.train.objective.random_token_prob == pytest.approx(0.2)
     assert cfg.train.objective.disc_loss_weight == pytest.approx(7.0)
+    assert cfg.optim.lr.base == pytest.approx(1e-4)
     assert cfg.optim.adam.epsilon == pytest.approx(2e-7)
     assert cfg.optim.scheduler.warmup_steps == 77
 
@@ -72,6 +74,7 @@ def test_programmatic_config_preserves_explicit_schema_default_profile_values() 
     assert cfg.train.objective.mask_token_prob == pytest.approx(1.0)
     assert cfg.train.objective.random_token_prob == pytest.approx(0.0)
     assert cfg.train.objective.disc_loss_weight == pytest.approx(10.0)
+    assert cfg.optim.lr.base == pytest.approx(1e-4)
     assert cfg.optim.adam.epsilon == pytest.approx(1e-6)
     assert cfg.optim.scheduler.warmup_steps == 10_000
 
@@ -109,6 +112,7 @@ def test_load_yaml_nested(tmp_path: Path):
     assert cfg_nested.train.objective.mask_token_prob == pytest.approx(0.8)
     assert cfg_nested.train.objective.random_token_prob == pytest.approx(0.1)
     assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg_nested.optim.lr.base == pytest.approx(5e-4)
     assert cfg_nested.optim.adam.epsilon == pytest.approx(1e-8)
     assert cfg_nested.optim.scheduler.warmup_steps == 1_000
 
@@ -178,6 +182,7 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     assert cfg.model.hf.attention_impl == "flash"
     assert cfg.model.hf.flash.docblock_bias_seq_len == 0
     assert cfg.model.hf.flash.kernel_overrides_path == str(override_path)
+    assert cfg.optim.lr.base == pytest.approx(1e-4)
 
 
 @pytest.mark.parametrize(

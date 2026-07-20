@@ -52,7 +52,7 @@ train:
 
 optim:
   lr:
-    base: 5.0e-4
+    base: 1.0e-4
   scheduler:
     type: linear
     warmup_steps: 5000

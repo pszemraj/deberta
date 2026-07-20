@@ -97,6 +97,7 @@ _BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
         "train.objective.mask_token_prob": 1.0,
         "train.objective.random_token_prob": 0.0,
         "train.objective.disc_loss_weight": 10.0,
+        "optim.lr.base": 1e-4,
         "optim.adam.epsilon": 1e-6,
         "optim.scheduler.warmup_steps": 10_000,
     },
@@ -104,6 +105,7 @@ _BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
         "train.objective.mask_token_prob": 0.8,
         "train.objective.random_token_prob": 0.1,
         "train.objective.disc_loss_weight": 50.0,
+        "optim.lr.base": 5e-4,
         "optim.adam.epsilon": 1e-8,
         "optim.scheduler.warmup_steps": 1_000,
     },
@@ -400,7 +402,7 @@ class TrainConfig:
 class OptimLRConfig:
     """Learning-rate values for optimizer setup."""
 
-    base: float = field(default=5e-4)
+    base: float = field(default=1e-4)
     generator: float = field(default=-1.0)
     discriminator: float = field(default=-1.0)
 
@@ -532,6 +534,11 @@ class Config:
             for path, value in profile.items()
             if path.startswith("optim.adam.") and path not in explicit
         }
+        lr_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("optim.lr.") and path not in explicit
+        }
         scheduler_updates = {
             path.rsplit(".", 1)[-1]: value
             for path, value in profile.items()
@@ -551,6 +558,7 @@ class Config:
             "optim",
             replace(
                 self.optim,
+                lr=replace(self.optim.lr, **lr_updates),
                 adam=replace(self.optim.adam, **adam_updates),
                 scheduler=replace(self.optim.scheduler, **scheduler_updates),
             ),

@@ -9,7 +9,7 @@
 # The repository is pre-stable. Persisted resume/export snapshots carry a schema version, and incompatible versions are rejected rather than migrated.
 #
 # Backbone-profile omission defaults
-# Five leaves have backbone-dependent omission behavior: `train.objective.mask_token_prob`, `train.objective.random_token_prob`, `train.objective.disc_loss_weight`, `optim.adam.epsilon`, and `optim.scheduler.warmup_steps`.
+# Six leaves have backbone-dependent omission behavior: `train.objective.mask_token_prob`, `train.objective.random_token_prob`, `train.objective.disc_loss_weight`, `optim.lr.base`, `optim.adam.epsilon`, and `optim.scheduler.warmup_steps`.
 # Their native/RoPE defaults are documented on each leaf. Any explicit file value wins, including a value equal to the dataclass schema default.
 #
 # Run outputs
@@ -341,8 +341,8 @@
 # OPTIM
 # Every `optim.*` value must match the source snapshot for exact resume. Learning-rate/scheduler changes are new-training decisions, not supported resume overrides.
 
-# [optim.lr.base] float = 0.0005; must be finite and > 0.
-# Base AdamW rate and inheritance source for component rates. Runtime does not scale it for batch, accumulation, process count, sequence length, or token density; 5e-4 is the repo-tested native starting point, not a universal optimum.
+# [optim.lr.base] float; schema default 0.0001; omission is 0.0001 for native and 0.0005 for RoPE; must be finite and > 0.
+# Base AdamW rate and inheritance source for component rates. Runtime does not scale it for batch, accumulation, process count, sequence length, or token density. Use the native 1e-4 default for DeBERTa RTD; 5e-4 can collapse its discriminator to the replacement-class prior.
 
 # [optim.lr.generator] float = -1.0; value is -1.0 (inherit base) or finite and > 0.
 # With `embedding_sharing="es"`, it must inherit or equal base because shared parameters cannot use conflicting rates.
