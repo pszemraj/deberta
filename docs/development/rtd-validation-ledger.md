@@ -107,8 +107,23 @@ All 315 state tensors were finite. The step-50 ranking signal and large represen
 
 Decision: proceed to a 500-step linear stage before committing GPU time to 3,000 steps. Evaluate both the midpoint and endpoint because a compressed linear schedule is not an exact prefix of the 50k production schedule.
 
+### Linear-decay 500-step stage
+
+Status: passed as an intermediate stage; final convergence gate not yet met.
+
+This run used 10 warmup steps and linear decay over 500 total steps, again preserving the production template's 2% warmup ratio. It completed 16.38M input tokens in 6m21s, with steady-state throughput near 45k tok/s. Both checkpoints saved, all state tensors were finite, and strict endpoint export succeeded.
+
+| Step | Generator CE | Replacement rate | Discriminator BCE | Gain over prior | ROC-AUC | AP | Token RMS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 250 | 6.390 | 13.83% | 0.3817 | 0.0201 | 0.612 | 0.197 | 0.573 |
+| 500 | 5.973 | 13.37% | 0.3673 | 0.0261 | 0.645 | 0.232 | 0.628 |
+
+Unlike the 100-step smoke, the endpoint improved over the midpoint despite LR reaching zero. AP at step 500 is 1.74 times its realized prior, and representation dispersion continues to grow. The run is non-degenerate and learning coherently but remains below the final `0.70` AUC, `2x`-prior AP, and `0.03` gain thresholds.
+
+Decision: proceed to the committed 3,000-step recipe at `configs/flashdeberta/validate_flashdeberta_1024_3k.yaml`. It preserves the 2% warmup ratio with 60 warmup steps and saves checkpoints at 1k, 2k, and 3k.
+
 ## Next iteration
 
-1. Run and evaluate a 500-step linear-decay stage.
-2. Commit the 3,000-step validation recipe if the intermediate stage remains finite and develops useful ranking signal.
-3. Run the 3,000-step validation, evaluate against the criteria above, and verify strict export.
+1. Dry-run the committed 3,000-step recipe outside the sandbox.
+2. Run and evaluate checkpoints 1k, 2k, and 3k against the acceptance criteria.
+3. Strict-export the strongest accepted checkpoint and verify active-token parity.

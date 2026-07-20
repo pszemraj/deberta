@@ -1,0 +1,64 @@
+# Three-thousand-step convergence validation for the production FlashDeBERTa recipe.
+# This compresses the linear schedule while preserving its 2% warmup ratio; it is not an exact
+# prefix of configs/flashdeberta/pretrain_flashdeberta_1024.yaml.
+
+model:
+  backbone_type: hf_deberta_v2
+  from_scratch: true
+  embedding_sharing: gdes
+  tokenizer:
+    name_or_path: BEE-spoke-data/wordpiece-tokenizer-32k-en_code-msp
+    allow_vocab_resize: true
+    vocab_multiple: 128
+  hf:
+    model_size: base
+    attention_impl: flash
+    max_position_embeddings: 1024
+  dropout:
+    hidden_prob: 0.0
+    attention_probs_prob: 0.0
+
+data:
+  source:
+    dataset_name: EleutherAI/SmolLM2-1.7B-stage-4-100B
+    dataset_config_name: default
+    train_split: train
+    text_column_name: text
+    streaming: true
+    shuffle_buffer_size: 10000
+  packing:
+    enabled: true
+    max_seq_length: 1024
+    block_cross_document_attention: false
+
+train:
+  max_steps: 3000
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 8
+  mixed_precision: bf16
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+  compile:
+    enabled: false
+  checkpoint:
+    output_dir: local-scratch/flashdeberta-linear-validation-3k/run
+    save_steps: 1000
+    save_total_limit: 3
+    # Strict export is run explicitly after checkpoint evaluation.
+    export_hf_final: false
+
+optim:
+  lr:
+    base: 1.0e-4
+  scheduler:
+    type: linear
+    warmup_steps: 60
+
+logging:
+  project_name: flashdeberta-validation
+  run_name: flashdeberta-linear-validation-3k
+  output_dir: local-scratch/flashdeberta-linear-validation-3k/run
+  logging_steps: 50
+  wandb:
+    enabled: false
