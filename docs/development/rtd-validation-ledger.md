@@ -90,7 +90,25 @@ The CLI also intentionally rejected the attempted dotted command-line overrides,
 
 Decision: the data-source preflight and evaluator lifecycle are no longer blockers. Proceed to the 100-step linear-decay smoke.
 
+### Linear-decay 100-step smoke
+
+Status: runtime passed; convergence gate not expected and not met.
+
+This run compressed the production template to 100 steps with two warmup steps, preserving its 2% warmup ratio. All other model, data, batch, precision, and `1e-4` peak-LR settings matched `configs/flashdeberta/pretrain_flashdeberta_1024.yaml`. Configuration and outputs are under `local-scratch/flashdeberta-linear-smoke-100/`.
+
+Training completed in 89 seconds at approximately 45k tok/s after startup. Checkpoints 50 and 100 saved cleanly, no non-finite events occurred, and strict discriminator export of checkpoint 100 succeeded.
+
+| Step | Generator CE | Replacement rate | Discriminator BCE | Gain over prior | ROC-AUC | AP | Token RMS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 7.671 | 14.90% | 0.3937 | 0.0272 | 0.682 | 0.280 | 0.538 |
+| 100 | 7.458 | 14.89% | 0.4108 | 0.0099 | 0.611 | 0.221 | 0.521 |
+
+All 315 state tensors were finite. The step-50 ranking signal and large representation dispersion rule out collapse, but the run is too short to meet the final acceptance criteria. Regression from step 50 to 100 coincided with the deliberately compressed scheduler approaching zero LR; it is not the prior numerical-collapse signature.
+
+Decision: proceed to a 500-step linear stage before committing GPU time to 3,000 steps. Evaluate both the midpoint and endpoint because a compressed linear schedule is not an exact prefix of the 50k production schedule.
+
 ## Next iteration
 
-1. Validate the existing FlashDeBERTa production template (`1e-4`, linear decay) with short smoke runs.
-2. Run a 1,000–3,000-step staged validation, evaluate against the criteria above, and verify strict export.
+1. Run and evaluate a 500-step linear-decay stage.
+2. Commit the 3,000-step validation recipe if the intermediate stage remains finite and develops useful ranking signal.
+3. Run the 3,000-step validation, evaluate against the criteria above, and verify strict export.
