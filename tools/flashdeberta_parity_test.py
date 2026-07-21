@@ -389,10 +389,6 @@ def main() -> None:
     """Run forward/backward parity checks on a CUDA device."""
 
     args = _parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for tools/flashdeberta_parity_test.py.")
-
-    device = torch.device("cuda")
     cases = [
         ParityCase("dense", seq_len=256, batch_size=2, route_hint="dense"),
         ParityCase("fixed_padded", seq_len=256, batch_size=2, route_hint="fixed", pad_tail=64),
@@ -477,6 +473,12 @@ def main() -> None:
     requested_cases = set(args.case)
     if requested_cases:
         cases = [case for case in cases if case.name in requested_cases]
+    if not cases:
+        raise ValueError("No parity cases remain after applying --case and route-family filters.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for tools/flashdeberta_parity_test.py.")
+
+    device = torch.device("cuda")
     for case in cases:
         _run_case(case, device=device)
     print("OK")

@@ -7,6 +7,24 @@ import pytest
 import torch
 
 
+def test_flash_parity_rejects_empty_case_selection() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tools/flashdeberta_parity_test.py",
+            "--case",
+            "docblock_bias",
+            "--no-include-docblock-bias",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "No parity cases remain" in result.stderr
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for real Inductor coverage.")
 def test_real_fixed_flash_attention_compiles_with_inductor_and_backward() -> None:
     """The production fixed custom op must remain opaque to real Inductor."""
@@ -289,4 +307,5 @@ def test_flash_rtd_one_step_forward_backward() -> None:
     optimizer.step()
 
     assert torch.isfinite(output.loss)
-    assert any(parameter.grad is not None for parameter in model.parameters())
+    assert any(parameter.grad is not None for parameter in model.generator.parameters())
+    assert any(parameter.grad is not None for parameter in model.discriminator.parameters())

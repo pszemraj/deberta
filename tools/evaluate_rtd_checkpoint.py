@@ -51,6 +51,48 @@ def _autocast_context(precision: str) -> Any:
     return nullcontext()
 
 
+@torch.no_grad()
+def _forward_discriminator_with_diagnostics(
+    model: DebertaV3RTDPretrainer,
+    *,
+    input_ids: torch.Tensor,
+    corrupted_input_ids: torch.Tensor,
+    disc_labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    token_type_ids: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    doc_context_index: torch.Tensor | None,
+    precision: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the shared discriminator phase and capture its hidden states and logits."""
+    captured: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def _capture_head_output(
+        _module: torch.nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        captured.append((inputs[0], output))
+
+    handle = model.discriminator_head.register_forward_hook(_capture_head_output)
+    try:
+        with _autocast_context(precision):
+            model.forward_discriminator_phase(
+                input_ids=input_ids,
+                corrupted_input_ids=corrupted_input_ids,
+                disc_labels=disc_labels,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                doc_context_index=doc_context_index,
+            )
+    finally:
+        handle.remove()
+
+    (diagnostics,) = captured
+    return diagnostics
+
+
 def _ranking_metrics(logits: torch.Tensor, labels: torch.Tensor) -> tuple[float, float]:
     """Return tie-aware ROC-AUC and average precision for binary targets."""
     scores = logits.detach().float().cpu().flatten()
@@ -83,6 +125,7 @@ def _ranking_metrics(logits: torch.Tensor, labels: torch.Tensor) -> tuple[float,
 def _discriminator_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, float | int]:
     scores = logits.detach().float().cpu().flatten()
     targets = labels.detach().float().cpu().flatten()
+    positive_count = int(targets.sum().item())
     positive_rate = float(targets.mean().item())
     prior_bce = -sum(
         probability * math.log(probability)
@@ -92,9 +135,10 @@ def _discriminator_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[s
     bce = float(F.binary_cross_entropy_with_logits(scores, targets).item())
     roc_auc, average_precision = _ranking_metrics(scores, targets)
     predictions = scores.gt(0)
+    true_positive_count = int((predictions & targets.bool()).sum().item())
     return {
         "tokens": int(targets.numel()),
-        "positives": int(targets.sum().item()),
+        "positives": positive_count,
         "positive_rate": positive_rate,
         "bce": bce,
         "prior_bce": prior_bce,
@@ -102,7 +146,7 @@ def _discriminator_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[s
         "roc_auc": roc_auc,
         "average_precision": average_precision,
         "accuracy_at_zero": float(predictions.eq(targets.bool()).float().mean().item()),
-        "recall_at_zero": float((predictions & targets.bool()).sum().item() / targets.sum().item()),
+        "recall_at_zero": float(true_positive_count / positive_count) if positive_count else 0.0,
         "predicted_positive_rate_at_zero": float(predictions.float().mean().item()),
         "logit_mean": float(scores.mean().item()),
         "logit_std": float(scores.std(unbiased=False).item()),
@@ -249,25 +293,23 @@ def _evaluate_checkpoint(
     for start in range(0, int(original.shape[0]), int(batch_size)):
         stop = start + int(batch_size)
         batch_attention = attention_mask[start:stop] if attention_mask is not None else None
-        with _autocast_context(precision):
-            disc_output = model.discriminator(
-                input_ids=corrupted[start:stop],
-                attention_mask=batch_attention,
-                token_type_ids=token_type_ids[start:stop] if token_type_ids is not None else None,
-                position_ids=position_ids[start:stop] if position_ids is not None else None,
-                return_dict=True,
-            )
-            disc_logits = model.discriminator_head(
-                disc_output.last_hidden_state,
-                attention_mask=batch_attention,
-                doc_context_index=(doc_context_index[start:stop] if doc_context_index is not None else None),
-            )
+        hidden, disc_logits = _forward_discriminator_with_diagnostics(
+            model,
+            input_ids=original[start:stop],
+            corrupted_input_ids=corrupted[start:stop],
+            disc_labels=disc_labels[start:stop],
+            attention_mask=batch_attention,
+            token_type_ids=token_type_ids[start:stop] if token_type_ids is not None else None,
+            position_ids=position_ids[start:stop] if position_ids is not None else None,
+            doc_context_index=doc_context_index[start:stop] if doc_context_index is not None else None,
+            precision=precision,
+        )
 
         active = attention_mask_to_active_tokens(
             input_ids=original[start:stop],
             attention_mask=batch_attention,
         )
-        hidden = disc_output.last_hidden_state.float()
+        hidden = hidden.float()
         active_f = active.unsqueeze(-1).to(hidden)
         token_count = active_f.sum(dim=1, keepdim=True).clamp_min(1.0)
         sequence_mean = (hidden * active_f).sum(dim=1, keepdim=True) / token_count

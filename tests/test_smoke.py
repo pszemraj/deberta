@@ -3910,3 +3910,20 @@ def test_rotary_embedding_uses_full_head_dim_for_partial_rope_pct():
     dim = torch.arange(0, 16, 2).float()
     expected = 1.0 / (10000.0 ** (dim / 32))
     torch.testing.assert_close(rope.inv_freq, expected)
+
+
+def test_rope_embeddings_rmsnorm_matches_torch_reference(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPEEmbeddings
+
+    cfg = tiny_rope_config_factory(norm_eps=1e-6)
+    embeddings = DebertaRoPEEmbeddings(cfg).eval()
+    reference = torch.nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps).eval()
+    reference.load_state_dict(embeddings.norm.state_dict())
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
+
+    with torch.no_grad():
+        actual = embeddings(input_ids)
+        expected = reference(embeddings.word_embeddings(input_ids))
+
+    assert isinstance(embeddings.norm, torch.nn.RMSNorm)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
