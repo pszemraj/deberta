@@ -1,5 +1,6 @@
-# Native DeBERTa-v3-style RTD pretraining with FlashDeBERTa at 1024 tokens.
-# Validate this uncompiled recipe on the target GPU before enabling torch.compile.
+# Validated 50k production recipe for native DeBERTa-v3 RTD with FlashDeBERTa at 1024 tokens.
+# The uncompiled 3k convergence gate is recorded in docs/development/rtd-validation-ledger.md.
+# Keep torch.compile disabled unless the exact training route passes a separate validation run.
 
 model:
   backbone_type: hf_deberta_v2
@@ -43,7 +44,8 @@ train:
   checkpoint:
     output_dir: null
     save_steps: 5000
-    save_total_limit: 3
+    # Retain the complete 5k-step trajectory for post-run convergence evaluation.
+    save_total_limit: 10
     export_hf_final: true
 
 optim:

@@ -146,6 +146,6 @@ Decision: accept checkpoint 3k as the first end-to-end non-degenerate model prod
 
 ## Next iteration
 
-1. Start the 50,000-step production recipe only when that longer GPU allocation is desired; the 3,000-step convergence gate no longer blocks it.
+1. Start the 50,000-step production recipe only when that longer GPU allocation is desired; the 3,000-step convergence gate no longer blocks it. The production config retains all ten 5,000-step checkpoints for post-run analysis.
 2. Evaluate each 5,000-step production checkpoint with the tracked alternate-shuffle evaluator and retain downstream mean-pooling probes as a representation-quality cross-check.
 3. Treat a material fall in held-out ranking or representation dispersion, rather than zero-threshold accuracy, as the signal to pause and investigate.
