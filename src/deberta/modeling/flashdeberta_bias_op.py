@@ -128,7 +128,7 @@ def _bias_repo_tuned_config(
     if (
         normalized_kind not in {"fwd", "bwd", "bwd_kv", "bwd_q"}
         or causal
-        or dtype not in {torch.float16, torch.bfloat16}
+        or dtype != torch.bfloat16
         or head_dim > 64
     ):
         return None
@@ -285,7 +285,7 @@ def _should_use_specialized_docblock_bias_backward(
         return False
     if q.device.type != "cuda" or bias.device.type != "cuda":
         return False
-    if q.dtype not in {torch.float16, torch.bfloat16}:
+    if q.dtype != torch.bfloat16:
         return False
     if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype != bias.dtype:
         return False

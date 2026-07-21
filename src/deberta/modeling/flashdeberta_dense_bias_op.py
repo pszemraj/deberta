@@ -1,4 +1,3 @@
-# ruff: noqa: F821,UP037
 """Compile-safe dense DeBERTa bias assembly for FlashDeBERTa local-bias routes.
 
 The short-sequence local-bias flash path still needs a dense additive bias
@@ -68,7 +67,7 @@ def _dense_bias_repo_tuned_config(
         or ``None`` when no measured config is promoted.
     """
 
-    if device.type != "cuda" or dtype not in {torch.float16, torch.bfloat16}:
+    if device.type != "cuda" or dtype != torch.bfloat16:
         return None
     return resolve_flash_kernel_config(
         FlashKernelContext(
@@ -263,6 +262,12 @@ def _dense_bucket_ranges(
         include_self=True,
     )
 
+    if __debug__ and cache_key is not None:
+        counts = torch.zeros_like(missing).scatter_add_(-1, bucket_ids, torch.ones_like(column_ids))
+        spans = torch.where(end >= 0, end - start + 1, torch.zeros_like(end))
+        if not torch.equal(counts, spans):
+            raise AssertionError("Dense bucket rows must keep each bucket in one contiguous range.")
+
     if cache_key is not None:
         bucket_ref = weakref.ref(
             _dense_bucket_cache_owner(bucket_index),
@@ -340,39 +345,41 @@ if triton is not None:
 
     @triton.jit
     def _dense_bias_fwd_kernel(
-        pos_key_ptr: "ptr",
-        pos_query_ptr: "ptr",
-        bucket_ptr: "ptr",
-        keep_mask_ptr: "ptr",
-        out_ptr: "ptr",
-        stride_pk_b: "int",
-        stride_pk_h: "int",
-        stride_pk_s: "int",
-        stride_pk_p: "int",
-        stride_pq_b: "int",
-        stride_pq_h: "int",
-        stride_pq_s: "int",
-        stride_pq_p: "int",
-        stride_bucket_s: "int",
-        stride_bucket_n: "int",
-        stride_mask_b: "int",
-        stride_mask_h: "int",
-        stride_mask_s: "int",
-        stride_mask_n: "int",
-        stride_out_b: "int",
-        stride_out_h: "int",
-        stride_out_s: "int",
-        stride_out_n: "int",
-        H: "int",
-        S: "int",
-        scale: "float",
-        neg_bias: "float",
+        pos_key_ptr: None,
+        pos_query_ptr: None,
+        bucket_ptr: None,
+        keep_mask_ptr: None,
+        out_ptr: None,
+        stride_pk_b: int,
+        stride_pk_h: int,
+        stride_pk_s: int,
+        stride_pk_p: int,
+        stride_pq_b: int,
+        stride_pq_h: int,
+        stride_pq_s: int,
+        stride_pq_p: int,
+        stride_bucket_s: int,
+        stride_bucket_n: int,
+        stride_mask_b: int,
+        stride_mask_h: int,
+        stride_mask_s: int,
+        stride_mask_n: int,
+        stride_out_b: int,
+        stride_out_h: int,
+        stride_out_s: int,
+        stride_out_n: int,
+        H: int,
+        S: int,
+        PK_BUCKETS: int,
+        PQ_BUCKETS: int,
+        scale: float,
+        neg_bias: float,
         HAS_POS_KEY: tl.constexpr,
         HAS_POS_QUERY: tl.constexpr,
         HAS_MASK: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-    ) -> "None":
+    ) -> None:
         """Assemble scaled dense local-bias tiles inside one Triton kernel.
 
         :param pos_key_ptr: Base pointer for the optional c2p tensor.
@@ -400,6 +407,8 @@ if triton is not None:
         :param stride_out_n: Column stride for ``out_ptr``.
         :param H: Number of attention heads.
         :param S: Sequence length.
+        :param PK_BUCKETS: Number of valid c2p buckets.
+        :param PQ_BUCKETS: Number of valid p2c buckets.
         :param scale: Softmax scale applied to positional terms.
         :param neg_bias: Value written for masked entries.
         :param HAS_POS_KEY: Whether the c2p term is active.
@@ -420,15 +429,15 @@ if triton is not None:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         valid = (offs_m[:, None] < S) & (offs_n[None, :] < S)
+        bucket = tl.load(
+            bucket_ptr + offs_m[:, None] * stride_bucket_s + offs_n[None, :] * stride_bucket_n,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         if HAS_POS_KEY:
-            bucket = tl.load(
-                bucket_ptr + offs_m[:, None] * stride_bucket_s + offs_n[None, :] * stride_bucket_n,
-                mask=valid,
-                other=0,
-            ).to(tl.int32)
             pk_ptrs = (
                 pos_key_ptr
                 + off_b * stride_pk_b
@@ -436,14 +445,10 @@ if triton is not None:
                 + offs_m[:, None] * stride_pk_s
                 + bucket * stride_pk_p
             )
-            acc += tl.load(pk_ptrs, mask=valid, other=0.0).to(tl.float32)
+            pk_valid = valid & (bucket >= 0) & (bucket < PK_BUCKETS)
+            acc += tl.load(pk_ptrs, mask=pk_valid, other=0.0).to(tl.float32)
 
         if HAS_POS_QUERY:
-            bucket = tl.load(
-                bucket_ptr + offs_m[:, None] * stride_bucket_s + offs_n[None, :] * stride_bucket_n,
-                mask=valid,
-                other=0,
-            ).to(tl.int32)
             pq_ptrs = (
                 pos_query_ptr
                 + off_b * stride_pq_b
@@ -451,7 +456,8 @@ if triton is not None:
                 + offs_n[None, :] * stride_pq_s
                 + bucket * stride_pq_p
             )
-            acc += tl.load(pq_ptrs, mask=valid, other=0.0).to(tl.float32)
+            pq_valid = valid & (bucket >= 0) & (bucket < PQ_BUCKETS)
+            acc += tl.load(pq_ptrs, mask=pq_valid, other=0.0).to(tl.float32)
 
         acc *= scale
         if HAS_MASK:
@@ -551,6 +557,8 @@ def _dense_bias_forward_cuda(
             output.stride(3),
             num_heads,
             seq_len,
+            int(pos_key.shape[-1]) if pos_key is not None else 0,
+            int(pos_query.shape[-1]) if pos_query is not None else 0,
             float(scale),
             float(-1.0e4 * float(scale)),
             HAS_POS_KEY=pos_key is not None,

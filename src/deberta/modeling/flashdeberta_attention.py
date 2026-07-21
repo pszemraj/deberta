@@ -63,7 +63,7 @@ from deberta.modeling.mask_utils import (
     mask_to_2d_keep_mask,
 )
 
-_FLASH_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_FLASH_SUPPORTED_DTYPES = {torch.bfloat16}
 
 
 def _should_use_varlen(
@@ -693,6 +693,15 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         model_dtype = hidden_states.dtype
         bsz, query_len, _ = query_states.shape
         route = flash_meta.route_hint if flash_meta is not None else None
+        if (
+            flash_meta is not None
+            and flash_meta.is_cross_document()
+            and route not in {"docblock", "docblock_bias"}
+        ):
+            raise RuntimeError(
+                "Packed cross-document FlashDeBERTa metadata requires a docblock or "
+                f"docblock_bias route, got route_hint={route!r}."
+            )
         use_docblock_bias = route == "docblock_bias"
         use_docblock = route == "docblock"
         if use_docblock:
@@ -718,9 +727,16 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 return fallback_to_eager()
             bias_import_error = flashdeberta_bias_import_error()
             if bias_import_error is not None:
-                return fallback_to_eager()
+                raise RuntimeError(
+                    "The selected FlashDeBERTa docblock_bias route is unavailable. "
+                    "Install the project with the flash extra (`pip install -e '.[flash]'`) "
+                    "and ensure its Triton kernels are compatible with the installed PyTorch build."
+                ) from bias_import_error
             if is_torch_compiling() and not flashdeberta_compiled_position_bias_available():
-                return fallback_to_eager()
+                raise RuntimeError(
+                    "The selected FlashDeBERTa docblock_bias route has no compile-visible "
+                    "Triton implementation in this environment."
+                )
 
         if use_docblock:
             docblock_active_tokens, docblock_num_segments, docblock_max_segment = _resolve_docblock_scalars(
@@ -738,16 +754,30 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 return fallback_to_eager()
             docblock_import_error = flashdeberta_docblock_import_error()
             if docblock_import_error is not None:
-                return fallback_to_eager()
+                raise RuntimeError(
+                    "The selected FlashDeBERTa docblock route is unavailable. "
+                    "Install the project with the flash extra (`pip install -e '.[flash]'`) "
+                    "and ensure its Triton kernels are compatible with the installed PyTorch build."
+                ) from docblock_import_error
             if is_torch_compiling() and not flashdeberta_compiled_docblock_available():
-                return fallback_to_eager()
+                raise RuntimeError(
+                    "The selected FlashDeBERTa docblock route has no compile-visible "
+                    "Triton implementation in this environment."
+                )
 
         if use_varlen and not use_docblock:
             varlen_import_error = flashdeberta_varlen_import_error()
             if varlen_import_error is not None:
-                return fallback_to_eager()
+                raise RuntimeError(
+                    "The selected FlashDeBERTa varlen route is unavailable. "
+                    "Install the project with the flash extra (`pip install -e '.[flash]'`) "
+                    "and ensure its Triton kernels are compatible with the installed PyTorch build."
+                ) from varlen_import_error
             if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
-                return fallback_to_eager()
+                raise RuntimeError(
+                    "The selected FlashDeBERTa varlen route has no compile-visible "
+                    "Triton implementation in this environment."
+                )
 
         if use_varlen:
             query_layer = self._shape_varlen(self.query_proj(query_states))

@@ -244,6 +244,7 @@ def _docblock_forward_impl(
         v_empty = value_layer.new_empty(
             (packed_capacity, int(value_layer.shape[2]), int(value_layer.shape[3]))
         )
+        out_empty = output.new_empty((packed_capacity, int(output.shape[2]), int(output.shape[3])))
         lse_empty = torch.empty(
             (packed_capacity, int(query_layer.shape[2])),
             device=query_layer.device,
@@ -264,7 +265,7 @@ def _docblock_forward_impl(
             device=query_layer.device,
             dtype=torch.float32,
         )
-        return output, lse, q_empty, k_empty, v_empty, q_empty, lse_empty, pos_key_empty, pos_query_empty
+        return output, lse, q_empty, k_empty, v_empty, out_empty, lse_empty, pos_key_empty, pos_query_empty
 
     q_unpad, k_unpad, v_unpad = segment_pack_padded_rows_triple(
         query_layer,

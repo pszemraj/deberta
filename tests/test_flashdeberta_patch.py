@@ -992,12 +992,18 @@ def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatc
 
     head_dim = cfg.hidden_size // cfg.num_attention_heads
     bf16_qkv = torch.zeros((1, cfg.num_attention_heads, 4, head_dim), dtype=torch.bfloat16)
+    fp16_qkv = bf16_qkv.half()
     fp32_qkv = bf16_qkv.float()
 
     assert not attention._projected_qkv_requires_eager_fallback(
         query_layer=bf16_qkv,
         key_layer=bf16_qkv,
         value_layer=bf16_qkv,
+    )
+    assert attention._projected_qkv_requires_eager_fallback(
+        query_layer=fp16_qkv,
+        key_layer=fp16_qkv,
+        value_layer=fp16_qkv,
     )
     assert attention._projected_qkv_requires_eager_fallback(
         query_layer=fp32_qkv,
@@ -1065,58 +1071,72 @@ def test_flash_attention_varlen_path_dispatches(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.parametrize(
-    ("import_error", "compiling"),
+    ("route", "unavailability"),
     [
-        (ImportError("varlen-only Triton API missing"), False),
-        (None, True),
+        ("varlen", "import"),
+        ("varlen", "compile"),
+        ("docblock", "import"),
+        ("docblock", "compile"),
+        ("docblock_bias", "import"),
+        ("docblock_bias", "compile"),
     ],
 )
-def test_flash_attention_varlen_unavailability_falls_back_before_dispatch(
+def test_flash_attention_selected_route_unavailability_raises_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
-    import_error: Exception | None,
-    compiling: bool,
+    route: str,
+    unavailability: str,
 ) -> None:
-    """A healthy fixed import must not hide an unavailable selected varlen route."""
+    """A healthy fixed import must not hide an unavailable selected route."""
 
     cfg = _small_deberta_config()
     attention_mod, attention, cfg = _flash_attention_harness(monkeypatch, cfg=cfg)
-    fallback_calls = 0
-    eager_fallback = attention._eager_forward_fallback
-
-    def _record_fallback(**kwargs):
-        nonlocal fallback_calls
-        fallback_calls += 1
-        return eager_fallback(**kwargs)
-
-    monkeypatch.setattr(attention, "_eager_forward_fallback", _record_fallback)
-    monkeypatch.setattr(attention_mod, "flashdeberta_varlen_import_error", lambda: import_error)
-    monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: compiling)
+    import_error = ImportError(f"{route} Triton API missing") if unavailability == "import" else None
+    monkeypatch.setattr(attention_mod, "is_torch_compiling", lambda: unavailability == "compile")
+    monkeypatch.setattr(attention_mod, "flashdeberta_varlen_import_error", lambda: None)
+    monkeypatch.setattr(attention_mod, "flashdeberta_docblock_import_error", lambda: None)
+    monkeypatch.setattr(attention_mod, "flashdeberta_bias_import_error", lambda: None)
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: False)
-    monkeypatch.setattr(
-        attention_mod,
-        "flashdeberta_varlen_padded",
-        lambda **kwargs: pytest.fail("unavailable varlen route must fall back before dispatch"),
-    )
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_docblock_available", lambda: False)
+    monkeypatch.setattr(attention_mod, "flashdeberta_compiled_position_bias_available", lambda: False)
+
+    seq_lengths = torch.tensor([2], dtype=torch.int32)
+    if route == "varlen":
+        monkeypatch.setattr(attention_mod, "flashdeberta_varlen_import_error", lambda: import_error)
+        attention_mask = torch.tensor([True, True, False, False]).view(1, 1, 1, 4)
+        flash_meta = FlashBatchMeta(seq_lengths=seq_lengths, route_hint=route)
+    elif route == "docblock":
+        monkeypatch.setattr(attention_mod, "flashdeberta_docblock_import_error", lambda: import_error)
+        attention_mask = torch.tensor([[True, True, False, False]])
+        flash_meta = FlashBatchMeta(
+            doc_segment_offsets=torch.tensor([0], dtype=torch.int32),
+            doc_segment_lengths=torch.tensor([2], dtype=torch.int32),
+            doc_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            active_tokens_scalar=torch.tensor(2, dtype=torch.int32),
+            doc_num_segments_scalar=torch.tensor(1, dtype=torch.int32),
+            doc_max_segment_length_scalar=torch.tensor(2, dtype=torch.int32),
+            route_hint=route,
+        )
+    else:
+        monkeypatch.setattr(attention_mod, "flashdeberta_bias_import_error", lambda: import_error)
+        attention_mask = torch.tensor(
+            [[[True, True, False, False], [True, True, False, False]] * 2],
+            dtype=torch.bool,
+        )
+        flash_meta = FlashBatchMeta(route_hint=route)
 
     hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
-    attention_mask = torch.tensor([True, True, False, False]).view(1, 1, 1, 4)
-    flash_meta = FlashBatchMeta(
-        seq_lengths=torch.tensor([2], dtype=torch.int32),
-        route_hint="varlen",
-    )
     rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
 
-    output, probs = attention(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        output_attentions=False,
-        rel_embeddings=rel_embeddings,
-        flash_meta=flash_meta,
-    )
+    with pytest.raises(RuntimeError, match=rf"selected FlashDeBERTa {route} route") as exc_info:
+        attention(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
+        )
 
-    assert tuple(output.shape) == (1, 4, cfg.hidden_size)
-    assert probs is None
-    assert fallback_calls == 1
+    assert exc_info.value.__cause__ is import_error
 
 
 def test_flash_attention_fixed_path_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1645,6 +1665,28 @@ def test_docblock_forward_pads_saved_aux_without_expanding_kernel_tokens(
     expected[0, :2] = q[0, :2] + 1.0
     expected[0, 3:4] = q[0, 3:4] + 1.0
     assert torch.equal(output, expected)
+
+    zero_outputs = docblock_mod._docblock_forward_impl(
+        query_layer=q,
+        key_layer=q + 10,
+        value_layer=q + 20,
+        segment_offsets=segment_offsets,
+        segment_lengths=torch.zeros_like(segment_lengths),
+        cu_seqlens=torch.zeros_like(cu_seqlens),
+        pos_key=pos,
+        pos_query=pos + 10,
+        sm_scale=1.0,
+        position_buckets=4,
+        max_relative_distance=4,
+        causal=False,
+        num_segments=0,
+        max_seqlen=0,
+        total_tokens=0,
+        aux_capacity=5,
+    )
+    zero_q_aux, zero_out_aux = zero_outputs[2], zero_outputs[5]
+    assert zero_q_aux.shape == zero_out_aux.shape == (5, 2, 3)
+    assert zero_q_aux.data_ptr() != zero_out_aux.data_ptr()
 
 
 def test_docblock_backward_narrows_fixed_capacity_saved_aux(
@@ -2634,6 +2676,28 @@ def test_docblock_missing_metadata_can_fallback_with_explicit_pairwise_mask(
     assert float(probs[0, 0, boundary, :boundary].detach().abs().max()) == pytest.approx(0.0)
 
 
+def test_flash_attention_rejects_cross_document_metadata_on_non_doc_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-document metadata must never reach a route that ignores document boundaries."""
+
+    _attention_mod, attention, cfg = _flash_attention_harness(monkeypatch)
+    hidden_states = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
+    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size))
+
+    with pytest.raises(RuntimeError, match="requires a docblock or docblock_bias route"):
+        attention(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+            flash_meta=FlashBatchMeta(
+                doc_segment_offsets=torch.tensor([0], dtype=torch.int32),
+                route_hint="fixed",
+            ),
+        )
+
+
 def test_prepare_flash_attention_batch_metadata_routes_docblock_bias() -> None:
     import deberta.training.compile as compile_mod
 
@@ -2966,6 +3030,23 @@ def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
     expected = torch.zeros((2, 3, 4, 4), dtype=torch.float32).scatter_add_(-1, gather_index, grad)
 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+    noncontiguous_buckets = torch.tensor(
+        [
+            [0, 1, 0, 2],
+            [0, 1, 1, 2],
+            [0, 0, 1, 2],
+            [0, 0, 1, 1],
+        ],
+        dtype=torch.int64,
+    )
+    with pytest.raises(AssertionError, match="one contiguous range"):
+        dense_bias_mod._dense_bucket_reduce(
+            grad=grad,
+            bucket_index=noncontiguous_buckets,
+            num_buckets=4,
+            output_dtype=torch.float32,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3426,6 +3507,27 @@ def test_dense_bias_triton_builder_honors_per_head_keep_mask() -> None:
         scale=scale,
     )
     torch.testing.assert_close(triton_bias, eager_bias, atol=2e-2, rtol=2e-2)
+
+    invalid_buckets = bucket_index.clone()
+    invalid_buckets[0, 0] = -1
+    invalid_buckets[0, 1] = num_buckets
+    valid_buckets = invalid_buckets.ge(0) & invalid_buckets.lt(num_buckets)
+    clamped_buckets = invalid_buckets.clamp(0, num_buckets - 1)
+    expected_invalid = dense_bias_mod._dense_bias_forward_fallback(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=clamped_buckets,
+        keep_mask=None,
+        scale=scale,
+    ).masked_fill(~valid_buckets.view(1, 1, seq_len, seq_len), 0.0)
+    actual_invalid = dense_bias_mod._dense_bias_forward_cuda(
+        pos_key=pos_key,
+        pos_query=pos_query,
+        bucket_index=invalid_buckets,
+        keep_mask=None,
+        scale=scale,
+    )
+    torch.testing.assert_close(actual_invalid, expected_invalid, atol=2e-2, rtol=2e-2)
 
     with pytest.raises(ValueError, match="head dimension"):
         dense_bias_mod._dense_bias_forward_cuda(
@@ -4039,6 +4141,16 @@ def test_bias_repo_tuned_config_is_table_owned(monkeypatch: pytest.MonkeyPatch) 
     assert bias_mod._bias_repo_tuned_config(kind="bwd", **base) == (64, 64, 2, 4)
     assert bias_mod._bias_repo_tuned_config(kind="bwd_kv", **base) == (64, 64, 2, 4)
     assert bias_mod._bias_repo_tuned_config(kind="bwd_q", **base) == (64, 64, 2, 4)
+    assert (
+        bias_mod._bias_repo_tuned_config(
+            kind="fwd",
+            **{
+                **base,
+                "dtype": torch.float16,
+            },
+        )
+        is None
+    )
 
     assert (
         bias_mod._bias_repo_tuned_config(
@@ -4201,6 +4313,17 @@ def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: p
             dtype=torch.bfloat16,
             device=torch.device("cuda"),
             has_mask=True,
+        )
+        is None
+    )
+    assert (
+        dense_bias_mod._dense_bias_repo_tuned_config(
+            batch_size=4,
+            num_heads=12,
+            seq_len=1024,
+            dtype=torch.float16,
+            device=torch.device("cuda"),
+            has_mask=False,
         )
         is None
     )
