@@ -144,8 +144,49 @@ Strict discriminator export of checkpoint 3k completed and loaded through `AutoM
 
 Decision: accept checkpoint 3k as the first end-to-end non-degenerate model produced by this codebase. The linear `1e-4` recipe clears the convergence, representation, finiteness, export, and parity gates. Proceed with `configs/flashdeberta/pretrain_flashdeberta_1024.yaml` for a longer production-scale run while continuing to monitor held-out prior gain, ROC-AUC, and AP at saved checkpoints.
 
+### Linear-decay 50,000-step production run
+
+Status: passed all acceptance criteria with useful downstream representations.
+
+The tracked production recipe completed 1.638B input tokens in 10h14m17s at approximately 44.7k tok/s. All ten 5,000-step checkpoints committed successfully. The final training window reported generator CE `1.889`, discriminator BCE `0.189`, prior gain `0.0673`, and replacement rate `0.0710` as the linear scheduler reached zero.
+
+The deterministic 16-sequence alternate-shuffle evaluation showed sustained improvement rather than late collapse:
+
+| Step | Generator CE | Replacement rate | Discriminator BCE | Gain over prior | ROC-AUC | AP | Token RMS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 5,000 | 3.351 | 10.36% | 0.2744 | 0.0586 | 0.787 | 0.328 | 0.883 |
+| 10,000 | 2.819 | 9.39% | 0.2537 | 0.0579 | 0.800 | 0.323 | 0.906 |
+| 15,000 | 2.603 | 9.01% | 0.2457 | 0.0572 | 0.804 | 0.307 | 0.890 |
+| 20,000 | 2.475 | 8.71% | 0.2378 | 0.0580 | 0.810 | 0.312 | 0.883 |
+| 25,000 | 2.387 | 8.45% | 0.2316 | 0.0579 | 0.816 | 0.305 | 0.886 |
+| 30,000 | 2.315 | 8.39% | 0.2298 | 0.0583 | 0.816 | 0.311 | 0.884 |
+| 35,000 | 2.239 | 8.21% | 0.2266 | 0.0573 | 0.816 | 0.309 | 0.890 |
+| 40,000 | 2.201 | 8.09% | 0.2231 | 0.0580 | 0.822 | 0.305 | 0.886 |
+| 45,000 | 2.170 | 8.07% | 0.2220 | 0.0586 | 0.823 | 0.312 | 0.888 |
+| 50,000 | 2.147 | 8.09% | 0.2198 | 0.0611 | 0.828 | 0.323 | 0.887 |
+
+Every checkpoint had zero non-finite elements across all 315 state tensors. A larger endpoint confirmation over 64 sequences and 65,536 active tokens measured generator CE `2.050`, replacement rate `0.0780`, discriminator BCE `0.2091`, prior gain `0.0649`, ROC-AUC `0.8424`, AP `0.3440`, logit standard deviation `4.12`, and token-centered RMS `0.890`. AP was 4.41 times the realized replacement prior. Zero-threshold recall was only 9.0%, so the 92.5% raw accuracy remains a calibration artifact rather than the useful quality measure.
+
+The frozen 5,000-example SST-2 probe also improved beyond the 12k result:
+
+| Checkpoint | CLS validation accuracy | Mean-pooled validation accuracy |
+|---:|---:|---:|
+| Fresh | 63.2% | 63.4% |
+| 5,000 | 61.0% | 65.1% |
+| 10,000 | 63.2% | 69.4% |
+| 25,000 | 66.4% | 67.3% |
+| 50,000 | 67.9% | 70.8% |
+
+Mean pooling remains the preferred default. The temporary mean-probe dip at 25k recovered to a new best at 50k, while token-level representation dispersion remained stable throughout training.
+
+Wikitext transfer confirms a calibration limitation rather than collapse. Against replacements sampled by the 50k generator, the discriminator retained ROC-AUC `0.642` and AP `0.255` against a `0.085` prior, but BCE was `0.541` against prior entropy `0.291`. The F1-optimal logit threshold was approximately `-1.31`, and zero-threshold recall was only 6.7%. Fixed-random substitution similarly retained ranking signal (ROC-AUC `0.648`, AP `0.456` against a `0.148` prior) with poor raw calibration. Any product use of RTD logits therefore needs a threshold or calibration fit on its target corruption and text distribution.
+
+The automatic final Hugging Face artifact loaded through `AutoModel`. Comparison with checkpoint 50k over 26,880 active hidden-state elements measured maximum absolute error `8.52e-6`, mean absolute error `7.46e-7`, and cosine similarity indistinguishable from 1.0. Generated evaluation outputs are under `local-scratch/flashdeberta-production-50k/`; the run and export remain under `runs/flashdeberta/20260720_205652_pretrain_flashdeberta_1024/`.
+
+Decision: accept checkpoint 50k and its `final_hf` export as the successful production outcome. The original convergence failure is resolved: the generator improves, discriminator ranking strengthens through the end of training, representations remain diverse, downstream mean-pooled quality improves, and export is faithful. Treat cross-domain RTD calibration as a downstream product concern, not a pretraining defect.
+
 ## Next iteration
 
-1. Start the 50,000-step production recipe only when that longer GPU allocation is desired; the 3,000-step convergence gate no longer blocks it. The production config retains all ten 5,000-step checkpoints for post-run analysis.
-2. Evaluate each 5,000-step production checkpoint with the tracked alternate-shuffle evaluator and retain downstream mean-pooling probes as a representation-quality cross-check.
-3. Treat a material fall in held-out ranking or representation dispersion, rather than zero-threshold accuracy, as the signal to pause and investigate.
+1. Use checkpoint 50k or `final_hf` for downstream fine-tuning and broader encoder benchmarks; default to mean pooling for frozen-feature use.
+2. If exposing RTD scores directly, fit calibration and the operating threshold on labeled target-domain corruptions rather than using sigmoid probability 0.5.
+3. Preserve the retained trajectory until downstream comparisons confirm that no earlier checkpoint is preferable for a specific task.
