@@ -20,8 +20,9 @@ The flash path has these constraints:
 - CUDA is required. See [GPU support](gpu-support.md) for supported capabilities and off-table
   behavior.
 
-CUDA runtime availability is fail-closed: missing `.[flash]` dependencies or incompatible core
-low-level imports raise an actionable error instead of silently running eager attention.
+Training and `--dry-run` preflight probe the optional runtime before output or dataset setup. Missing `.[flash]` dependencies or incompatible core low-level imports raise an actionable error instead of silently running eager attention.
+
+For Flash-configured runs, `run_metadata.json` records the configured attention policy and installed `flashdeberta` version. Routing and supported eager fallbacks remain per-call decisions, so the metadata does not claim that every call used one route.
 
 ## Route families
 

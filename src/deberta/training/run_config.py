@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -44,11 +45,13 @@ logger = logging.getLogger(__name__)
 
 def _build_run_metadata(
     *,
+    model_cfg: ModelConfig | None = None,
     effective_compile_scope: str | None = None,
     compile_scope_reason: str | None = None,
 ) -> dict[str, Any]:
     """Build run-metadata payload stored alongside config snapshots.
 
+    :param ModelConfig | None model_cfg: Optional resolved model config.
     :param str | None effective_compile_scope: Resolved compile scope after auto-resolution.
     :param str | None compile_scope_reason: Reason for scope selection when auto-resolved.
     :return dict[str, Any]: Metadata mapping.
@@ -63,6 +66,19 @@ def _build_run_metadata(
         meta["effective_compile_scope"] = str(effective_compile_scope)
     if compile_scope_reason is not None:
         meta["compile_scope_reason"] = str(compile_scope_reason)
+    if model_cfg is not None and str(model_cfg.hf.attention_impl).strip().lower() == "flash":
+        try:
+            flashdeberta_version = metadata.version("flashdeberta")
+        except metadata.PackageNotFoundError:
+            flashdeberta_version = None
+
+        meta["flash_attention"] = {
+            # Routing and eager fallbacks are per batch/call, so this artifact records the
+            # configured policy rather than claiming one runtime implementation for every call.
+            "requested_attention_impl": str(model_cfg.hf.attention_impl),
+            "requested_flash_config": asdict_without_private(model_cfg.hf.flash),
+            "flashdeberta_version": flashdeberta_version,
+        }
     return meta
 
 
@@ -211,6 +227,10 @@ def _effective_train_config_for_resume_compare(cfg: TrainConfig) -> dict[str, An
     payload = asdict_without_private(cfg)
     defaults = asdict_without_private(TrainConfig())
     payload["max_steps"] = defaults["max_steps"]
+    payload["dataloader"]["pin_memory"] = defaults["dataloader"]["pin_memory"]
+    payload["compile"]["scope"] = defaults["compile"]["scope"]
+    # Worker count remains strict: it controls source sharding in the iterable training
+    # datasets and can therefore change replayed samples after resume.
     for field_name in (
         "output_dir",
         "overwrite_output_dir",
@@ -330,6 +350,7 @@ def _persist_or_validate_run_configs(
     output_run_meta_path = output_dir / RUN_METADATA_FILENAME
 
     run_meta = _build_run_metadata(
+        model_cfg=model_cfg,
         effective_compile_scope=effective_compile_scope,
         compile_scope_reason=compile_scope_reason,
     )

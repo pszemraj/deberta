@@ -1142,12 +1142,14 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
         make_train_config(objective={"gen_loss_weight": 2.0}),
         make_train_config(objective={"disc_loss_weight": 20.0}),
         make_train_config(decoupled_training=False),
+        make_train_config(dataloader={"num_workers": 0}),
     ],
     ids=[
         "gradient-accumulation",
         "generator-loss-weight",
         "discriminator-loss-weight",
         "decoupled-training",
+        "dataloader-workers",
     ],
 )
 def test_persist_or_validate_run_configs_rejects_resume_training_dynamics_mismatch(

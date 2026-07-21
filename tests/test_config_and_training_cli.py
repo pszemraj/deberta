@@ -17,6 +17,7 @@ from _config_factories import (
 from _fakes import capture_run_pretraining_kwargs, setup_pretraining_mocks
 
 import deberta.cli as cli_mod
+import deberta.training.runtime as runtime_mod
 from deberta.config import (
     _looks_like_hf_deberta_checkpoint,
     validate_data_config,
@@ -269,6 +270,37 @@ def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Pa
             ),
             config_path=None,
         )
+
+
+def test_run_pretraining_dry_run_rejects_missing_flash_extra_before_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entrypoint_mod = setup_pretraining_mocks(monkeypatch)
+    import_error = ModuleNotFoundError("No module named 'flashdeberta'")
+    dataset_touched = False
+
+    def _unexpected_dataset_load(_cfg):
+        nonlocal dataset_touched
+        dataset_touched = True
+        raise AssertionError("dataset setup must follow FlashDeBERTa dependency validation")
+
+    monkeypatch.setattr(runtime_mod, "_flashdeberta_runtime_import_error", lambda: import_error)
+    monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", _unexpected_dataset_load)
+    output_dir = tmp_path / "run"
+
+    with pytest.raises(RuntimeError, match=r"pip install -e '\.\[flash\]'") as exc_info:
+        run_pretraining_dry_run(
+            model_cfg=make_model_config(hf={"attention_impl": "flash"}),
+            data_cfg=make_data_config(source={"dataset_name": "dummy-dataset"}),
+            train_cfg=make_train_config(
+                checkpoint={"output_dir": str(output_dir)},
+                max_steps=5,
+            ),
+        )
+
+    assert exc_info.value.__cause__ is import_error
+    assert dataset_touched is False
+    assert not output_dir.exists()
 
 
 def test_run_pretraining_dry_run_releases_sample_iterator(
@@ -855,6 +887,32 @@ def test_build_run_metadata_scope_fields(
     assert "config_schema_version" in meta
 
 
+def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.metadata as importlib_metadata
+
+    monkeypatch.setattr(
+        importlib_metadata,
+        "version",
+        lambda name: "0.0.7" if str(name) == "flashdeberta" else "0.0.0",
+    )
+    model_cfg = make_model_config(
+        hf={"attention_impl": "flash", "flash": {"docblock_bias_seq_len": 1024}},
+    )
+    validate_model_config(model_cfg)
+
+    meta = _build_run_metadata(model_cfg=model_cfg)
+
+    assert meta["flash_attention"]["requested_attention_impl"] == "flash"
+    assert meta["flash_attention"]["requested_flash_config"]["docblock_bias_seq_len"] == 1024
+    assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
+
+
+def test_build_run_metadata_omits_flash_attention_for_eager_config() -> None:
+    meta = _build_run_metadata(model_cfg=make_model_config())
+
+    assert "flash_attention" not in meta
+
+
 def test_persist_or_validate_run_configs_preflight_mode_writes_no_snapshots(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
@@ -894,12 +952,14 @@ def test_persist_run_configs_writes_compile_scope_to_metadata(tmp_path: Path):
     assert meta["compile_scope_reason"] == "auto scope selected FFN-only"
 
 
-def test_persist_run_configs_warns_on_compile_scope_drift_on_resume(tmp_path: Path, caplog):
+def test_persist_run_configs_allows_runtime_knob_drift_and_warns_on_compile_scope(
+    tmp_path: Path, caplog
+) -> None:
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     model_cfg = make_model_config()
     data_cfg = make_data_config(source={"data_files": "dummy.txt"})
-    train_cfg = make_train_config()
+    train_cfg = make_train_config(compile={"enabled": True, "scope": "backbones"})
 
     # Initial run persists scope=backbones.
     _persist_or_validate_run_configs(
@@ -916,13 +976,18 @@ def test_persist_run_configs_warns_on_compile_scope_drift_on_resume(tmp_path: Pa
     ckpt = out / "checkpoint-100"
     ckpt.mkdir()
 
-    # Resume with different scope should log a warning.
+    resumed_train_cfg = make_train_config(
+        dataloader={"pin_memory": False},
+        compile={"enabled": True, "scope": "ffn"},
+    )
+
+    # Runtime-only pinning and compile scope changes are resume-compatible; scope drift is recorded.
     with caplog.at_level(logging.WARNING):
         _persist_or_validate_run_configs(
             output_dir=out,
             model_cfg=model_cfg,
             data_cfg=data_cfg,
-            train_cfg=train_cfg,
+            train_cfg=resumed_train_cfg,
             resume_checkpoint=str(ckpt),
             is_main_process=True,
             effective_compile_scope="ffn",

@@ -15,6 +15,7 @@
 # Run outputs
 # A null checkpoint directory resolves to `runs/<project>/<timestamp>_<run-or-config-name>`; a null logging directory uses that resolved directory.
 # Training writes model/data/train/optim/logging JSON snapshots and run metadata beside transactional `checkpoint-*` directories. It writes `config_original.yaml` and `config_resolved.yaml` under the logging directory.
+# Flash-configured runs additionally record the configured Flash policy and installed `flashdeberta` version in run metadata; individual attention calls may still take documented eager fallbacks.
 
 # MODEL
 
@@ -267,10 +268,10 @@
 # train.dataloader
 
 # [train.dataloader.num_workers] int = 2; must be >= 0.
-# Worker processes per rank; 0 keeps data loading in the trainer for deterministic debugging. Iterable workers beyond available source shards stay idle; increase only after measuring throughput.
+# Worker processes per rank; 0 keeps data loading in the trainer for deterministic debugging. This value must match on resume because it controls source sharding and can change replayed samples. Iterable workers beyond available source shards stay idle; increase only after measuring throughput.
 
 # [train.dataloader.pin_memory] bool = true; values: true | false.
-# Pins host batches for asynchronous CUDA transfer; use true for CUDA and consider false for CPU-only runs or host-memory pressure.
+# Pins host batches for asynchronous CUDA transfer; use true for CUDA and consider false for CPU-only runs or host-memory pressure. This runtime-only setting may change on resume.
 
 # train.compile — experimental. Compile targets inner model paths, never the full RTD wrapper; failures are hard errors with no eager fallback.
 
@@ -282,7 +283,7 @@
 
 # [train.compile.scope] str = "auto"; values: "auto" | "backbones" | "encoder" | "gen_encoder" | "disc_encoder" | "ffn" | "gen_ffn" | "disc_ffn".
 # Aliases: both/backbone/full->backbones, encoders->encoder, ffns->ffn, generator_encoder->gen_encoder, discriminator_encoder->disc_encoder, generator_ffn->gen_ffn, discriminator_ffn->disc_ffn; hyphens are accepted in underscore spellings.
-# auto selects both backbones except RoPE document-blocking, where it selects both FFNs to avoid dynamic mask graph churn. Prefix scopes target only the named component; start with auto.
+# auto selects both backbones except RoPE document-blocking, where it selects both FFNs to avoid dynamic mask graph churn. Prefix scopes target only the named component; start with auto. Scope may change on resume; effective scope drift emits a warning because it can invalidate compiled graph caches but does not alter checkpoint structure.
 
 # [train.compile.backend] str = "inductor"; values: "inductor" | "aot_eager"; alias: aot-eager->aot_eager.
 # Active only when enabled; inductor is the optimizing backend and aot_eager is for debugging, not throughput.
@@ -326,7 +327,7 @@
 
 # [train.checkpoint.resume_from_checkpoint] str | None = null; blank/null starts fresh, "auto" searches `output_dir`, otherwise value must name an existing committed `checkpoint-*` directory.
 # Resume restores model, optimizer, scheduler, RNG, global step, recovery multiplier, and data progress. The checkpoint must contain `.complete`, current `data_state.json`, non-empty weights, and source-run model/data/train/optim/logging snapshots; run metadata is validated when present.
-# Compatibility checks require model, data, optim, logging, and training-semantics snapshots to match, except `logging.output_dir`, documented inert model fields, `train.max_steps`, and `train.checkpoint.*`. Start from the source `config_resolved.yaml` and change only duration or checkpoint plumbing.
+# Compatibility checks require model, data, optim, logging, and training-semantics snapshots to match, except `logging.output_dir`, documented inert model fields, `train.max_steps`, `train.dataloader.pin_memory`, `train.compile.scope`, and `train.checkpoint.*`. Start from the source `config_resolved.yaml` and change only documented resume-compatible runtime or checkpoint plumbing.
 # "auto" uses the newest resumable checkpoint, skips incomplete newer ones, starts fresh only when the output directory is empty, and errors on non-empty output with no resumable checkpoint. Explicit paths expand `~`; resume is mutually exclusive with overwrite.
 
 # [train.checkpoint.resume_data_strategy] str = "auto"; values: "auto" | "replay" | "restart_epoch".

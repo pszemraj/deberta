@@ -382,6 +382,37 @@ def _build_training_collator(
     )
 
 
+def _flashdeberta_runtime_import_error() -> Exception | None:
+    """Return the fixed-kernel import failure for the optional Flash runtime.
+
+    :return Exception | None: Import failure, or None when the core runtime is available.
+    """
+
+    try:
+        from deberta.modeling.flashdeberta_fixed_op import flashdeberta_fixed_import_error
+    except Exception as exc:  # pragma: no cover - optional import boundary
+        return exc
+    return flashdeberta_fixed_import_error()
+
+
+def _validate_flashdeberta_runtime(model_cfg: ModelConfig) -> None:
+    """Fail early when configured FlashDeBERTa dependencies cannot be imported.
+
+    :param ModelConfig model_cfg: Validated model configuration.
+    :raises RuntimeError: If Flash attention is configured without its usable runtime.
+    """
+
+    if str(model_cfg.hf.attention_impl).strip().lower() != "flash":
+        return
+    detail = _flashdeberta_runtime_import_error()
+    if detail is not None:
+        raise RuntimeError(
+            "model.hf.attention_impl='flash' requires the FlashDeBERTa runtime. Install the "
+            "project with the flash extra (`pip install -e '.[flash]'`) and ensure "
+            "FlashDeBERTa and Triton are compatible with the installed PyTorch build."
+        ) from detail
+
+
 def _validate_training_configs(
     *,
     model_cfg: ModelConfig,
@@ -410,6 +441,7 @@ def _validate_training_configs(
         model_cfg=model_cfg,
         optim_cfg=optim_cfg,
     )
+    _validate_flashdeberta_runtime(model_cfg)
 
 
 def _build_train_dataset_and_collator(
