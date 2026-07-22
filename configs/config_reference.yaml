@@ -337,7 +337,7 @@
 # Threshold used only by auto; larger caps improve data alignment but can make resume startup slow, while explicit replay ignores the cap.
 
 # [train.checkpoint.export_hf_final] bool = true; values: true | false.
-# After successful single-process training, requires the committed checkpoint at the final global step and strictly exports only its discriminator to `<output_dir>/final_hf`. A failed final checkpoint save, missing final checkpoint, state incompatibility, or export failure fails the training command. Disable for probes and every experimental multi-GPU run; use manual `deberta export` for another checkpoint, the generator, both components, or experimental sharded-checkpoint validation.
+# After successful single-process training, requires the committed checkpoint at the final global step and strictly exports only its discriminator to `<output_dir>/final_hf`. Same-directory continuation replaces an existing managed `final_hf` only after the refreshed export passes strict load and output parity. A failed final checkpoint save, missing final checkpoint, state incompatibility, or export failure fails the training command and leaves a previous `final_hf` intact. Disable for probes and every experimental multi-GPU run; use manual `deberta export` for another checkpoint, the generator, both components, or experimental sharded-checkpoint validation.
 
 # OPTIM
 # Every `optim.*` value must match the source snapshot for exact resume. Learning-rate/scheduler changes are new-training decisions, not supported resume overrides.

@@ -273,10 +273,18 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
     torch.testing.assert_close(out.disc_positive_count, torch.zeros((), dtype=out.disc_positive_count.dtype))
 
 
+@pytest.mark.parametrize("publish_fails", [False, True], ids=["replace", "rollback"])
 def test_export_discriminator_hf_subprocess_uses_strict_export(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    publish_fails: bool,
 ) -> None:
     calls: list[list[str]] = []
+    checkpoint_dir = tmp_path / "run" / "checkpoint-1"
+    checkpoint_dir.mkdir(parents=True)
+    output_dir = tmp_path / "run" / "final_hf"
+    output_dir.mkdir()
+    (output_dir / "old.txt").write_text("old", encoding="utf-8")
 
     class _Proc:
         returncode = 0
@@ -292,27 +300,59 @@ def test_export_discriminator_hf_subprocess_uses_strict_export(
     ) -> _Proc:
         del stdout, stderr, text, check
         calls.append(list(cmd))
+        refresh_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        refresh_dir.mkdir()
+        (refresh_dir / "new.txt").write_text("new", encoding="utf-8")
         return _Proc()
 
     import deberta.training.export_helpers as export_mod
 
     monkeypatch.setattr(export_mod.subprocess, "run", _fake_run)
+    if publish_fails:
+        original_replace = Path.replace
 
-    _export_discriminator_hf_subprocess(
-        checkpoint_dir=Path("runs/demo/checkpoint-1"),
-        output_dir=Path("runs/demo/final_hf"),
-    )
+        def _fail_refresh_publish(path: Path, target: Path) -> Path:
+            if path.name.startswith(".final_hf.refresh-"):
+                raise OSError("refresh publish failed")
+            return original_replace(path, target)
+
+        monkeypatch.setattr(Path, "replace", _fail_refresh_publish)
+
+    if publish_fails:
+        with pytest.raises(OSError, match="refresh publish failed"):
+            _export_discriminator_hf_subprocess(
+                checkpoint_dir=checkpoint_dir,
+                output_dir=output_dir,
+            )
+    else:
+        _export_discriminator_hf_subprocess(
+            checkpoint_dir=checkpoint_dir,
+            output_dir=output_dir,
+        )
 
     assert calls
     cmd = calls[-1]
     assert cmd[0] == sys.executable
-    assert cmd[1:5] == ["-m", "deberta", "export", "runs/demo/checkpoint-1"]
+    assert cmd[1:5] == ["-m", "deberta", "export", str(checkpoint_dir)]
     assert "--allow-partial-export" not in cmd
+    assert Path(cmd[cmd.index("--output-dir") + 1]) != output_dir
+    if publish_fails:
+        assert (output_dir / "old.txt").read_text(encoding="utf-8") == "old"
+        assert not (output_dir / "new.txt").exists()
+    else:
+        assert (output_dir / "new.txt").read_text(encoding="utf-8") == "new"
+        assert not (output_dir / "old.txt").exists()
+    assert not list(output_dir.parent.glob(".final_hf.*-*"))
 
 
 def test_export_discriminator_hf_subprocess_raises_on_failure(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    output_dir = tmp_path / "run" / "final_hf"
+    output_dir.mkdir(parents=True)
+    (output_dir / "old.txt").write_text("old", encoding="utf-8")
+
     class _Proc:
         returncode = 7
         stdout = "strict load failed"
@@ -325,7 +365,10 @@ def test_export_discriminator_hf_subprocess_raises_on_failure(
         text: bool,
         check: bool,
     ) -> _Proc:
-        del cmd, stdout, stderr, text, check
+        del stdout, stderr, text, check
+        refresh_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        refresh_dir.mkdir()
+        (refresh_dir / "partial.txt").write_text("partial", encoding="utf-8")
         return _Proc()
 
     import deberta.training.export_helpers as export_mod
@@ -334,11 +377,13 @@ def test_export_discriminator_hf_subprocess_raises_on_failure(
 
     with pytest.raises(RuntimeError, match="exit=7") as exc_info:
         _export_discriminator_hf_subprocess(
-            checkpoint_dir=Path("runs/demo/checkpoint-1"),
-            output_dir=Path("runs/demo/final_hf"),
+            checkpoint_dir=tmp_path / "run" / "checkpoint-1",
+            output_dir=output_dir,
         )
 
     assert "strict load failed" in str(exc_info.value)
+    assert (output_dir / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not list(output_dir.parent.glob(".final_hf.*-*"))
 
 
 @pytest.mark.parametrize(

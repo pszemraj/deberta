@@ -11,7 +11,12 @@ from typing import Any
 
 import pytest
 import torch
-from _config_factories import make_data_config, make_model_config, make_train_config
+from _config_factories import (
+    make_data_config,
+    make_model_config,
+    make_native_deberta_config,
+    make_train_config,
+)
 from _fakes import AutoTokenizerStub, BackboneConfigStub, FakeAccelerator
 
 import deberta.export_cli as export_cli
@@ -186,6 +191,39 @@ def test_verify_staged_encoder_output_parity_checks_reloaded_config(tmp_path: Pa
             export_model=source,
             component_dir=component_dir,
         )
+
+
+@pytest.mark.parametrize("backbone_type", ["hf_deberta_v2", "rope"])
+def test_verify_staged_encoder_output_parity_supports_real_export_backbones(
+    tmp_path: Path,
+    backbone_type: str,
+) -> None:
+    if backbone_type == "hf_deberta_v2":
+        from transformers import AutoModel
+
+        model = AutoModel.from_config(make_native_deberta_config())
+    else:
+        from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+
+        model = DebertaRoPEModel(
+            DebertaRoPEConfig(
+                vocab_size=64,
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                intermediate_size=64,
+                max_position_embeddings=32,
+                type_vocab_size=0,
+            )
+        )
+
+    component_dir = tmp_path / backbone_type
+    model.save_pretrained(component_dir)
+    export_cli._verify_staged_encoder_output_parity(
+        component="discriminator",
+        export_model=model,
+        component_dir=component_dir,
+    )
 
 
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
