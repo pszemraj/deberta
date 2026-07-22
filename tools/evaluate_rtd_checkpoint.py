@@ -227,6 +227,8 @@ def _build_eval_batch(cfg: Any, tokenizer: Any, *, batches: int, seed: int) -> d
         for key in tensor_keys
         if all(isinstance(row.get(key), torch.Tensor) for row in rows)
     }
+    # Release streaming/PyArrow iterator state before model evaluation so its
+    # background callbacks cannot survive until interpreter shutdown.
     del rows, iterator, loader, dataset, raw_train
     gc.collect()
     return batch

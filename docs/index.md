@@ -21,7 +21,7 @@
 
 ## Development
 
-- chronological pretraining experiments and acceptance criteria: [RTD validation ledger](development/rtd-validation-ledger.md)
+- pretraining acceptance criteria and staged validation evidence: [RTD validation ledger](development/rtd-validation-ledger.md)
 
 ## API reference
 

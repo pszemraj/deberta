@@ -1,7 +1,6 @@
 # Native DeBERTa-v3-style RTD pretraining with the BEE-spoke 32k tokenizer.
 # Usage:
-#   accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
-#     deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
+#   deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
 
 model:
   backbone_type: hf_deberta_v2

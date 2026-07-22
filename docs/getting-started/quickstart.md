@@ -28,14 +28,7 @@ For a single-process run:
 deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
 ```
 
-Multi-GPU training is intentionally unsupported in this PR. The repository retains experimental FSDP2 templates for the dedicated distributed-validation follow-up; do not use them for a long-running job. The current scaffolding is invoked with:
-
-```bash
-accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
-  deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
-```
-
-See [Distributed training](../advanced/distributed-training.md) for the unvalidated contracts and known failure boundaries. Validate the uncompiled Flash example before combining FlashDeBERTa with `torch.compile` in a supported single-process run.
+Multi-GPU training is intentionally unsupported. [Distributed training](../advanced/distributed-training.md) lists the unvalidated contracts and the experimental FSDP2 launch scaffolding. Validate the uncompiled Flash example before combining FlashDeBERTa with `torch.compile` in a supported single-process run.
 
 ## 3) Resume exact training state
 
@@ -55,6 +48,8 @@ deberta train resume.yaml
 
 To continue into a new run, use an explicit committed `checkpoint-<step>` path and change both `train.checkpoint.output_dir` and `logging.output_dir`. Model, data, optimizer, and logging settings other than the logging output directory must remain compatible with the source snapshots; the exact current checks are documented on `train.checkpoint.resume_from_checkpoint` in the config reference.
 
+Resume provenance is checked during preflight and again immediately before absent snapshots are copied into a new run directory. A source snapshot that changes between those checks fails the run.
+
 ## 4) Find or export the discriminator
 
-When `train.checkpoint.export_hf_final` is enabled, training requires the checkpoint at the final global step and strictly exports its discriminator under `<output_dir>/final_hf`; a failed final checkpoint save, missing checkpoint, or export failure fails the training command. For another checkpoint, the generator, or both components, see [Exporting models](../guides/exporting-models.md).
+Automatic final export and manual component export are covered in [Exporting models](../guides/exporting-models.md).

@@ -26,11 +26,14 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 - `model.embedding_sharing` supports `none`, `es`, `gdes`
 - decoupled two-phase RTD updates are enabled by default (`train.decoupled_training=true`)
 - newly attached MLM and RTD heads use the owning backbone's `initializer_range`; backbone
-  parameters are not reinitialized
+  parameters are not reinitialized. Backbones and attached heads are separate initialization
+  phases, so changing their construction order also changes from-scratch RNG behavior.
 - native generators with `position_biased_input=false` use Enhanced Mask Decoding with raw learned
   position states, penultimate-layer KV, and two shared applications of the last layer
 - generic backbone `z_steps` is not an EMD substitute; RTD generators require `z_steps=0`
 - Document-blocked packing preserves standalone objective semantics as described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking).
+
+Decoupled and combined training are separate execution contracts. Decoupled training normalizes each phase over its own token window, performs a generator optimizer step before the discriminator phase, and synchronizes GDES embeddings between those phases. Combined training forms one weighted objective and performs one optimizer step.
 
 ## Parity divergences
 
@@ -49,3 +52,5 @@ tooling, and caveats: [Advanced / FlashDeBERTa attention](flash-attention.md).
 ## RoPE-specific controls
 
 `rope` adds controls for rotary geometry, optional learned absolute input embeddings, MLP/SwiGLU selection, RMSNorm placement, attention implementation, and KEEL residual scaling. Exact fields and interactions are listed under `model.rope.*` in the [config reference](../../configs/config_reference.yaml).
+
+RoPE attention accepts rank-2 and rank-3 keep masks. Native DeBERTa mask utilities also accept rank-4 masks, so RoPE retains its own rank check and expansion rather than sharing the broader native mask normalization contract.

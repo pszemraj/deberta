@@ -408,6 +408,8 @@ def run_pretraining_dry_run(
     close_example_iter = getattr(example_iter, "close", None)
     if callable(close_example_iter):
         close_example_iter()
+    # Streaming PyArrow iterators can retain shutdown-time callbacks after a short
+    # preflight. Release the iterator and its dataset graph before returning.
     del batch, sample, close_example_iter, example_iter, train_dataset, raw_train
     gc.collect()
     return summary
@@ -422,7 +424,7 @@ def run_pretraining(
     logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> None:
-    """Run RTD pretraining on the supported single-process path with experimental FSDP2 plumbing.
+    """Run RTD pretraining.
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.

@@ -1,4 +1,4 @@
-# Experimental scaffolding only: multi-GPU training is unsupported in this PR.
+# Experimental scaffolding only: multi-GPU training is currently unsupported.
 compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: FSDP

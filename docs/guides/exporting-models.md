@@ -24,14 +24,12 @@ Export infers the run directory from the checkpoint parent and requires that dir
 
 ## Experimental FSDP checkpoint consolidation
 
-The manual exporter contains an experimental path that uses Accelerate/Torch distributed checkpoint loading and gathers full state for final artifact writing. Multi-GPU training and sharded-checkpoint export are not supported in this PR because their end-to-end state and output parity have not been validated.
+The manual exporter contains an experimental path that uses Accelerate/Torch distributed checkpoint loading and gathers full state for final artifact writing. See [Distributed training](../advanced/distributed-training.md) for the support boundary and required validation.
 
 FSDP export offloads the consolidated state to CPU and gathers it on rank 0 by default. Override those defaults only when the alternative fits the available memory:
 
 - `--no-offload-to-cpu`
 - `--no-rank0-only`
-
-Experimental distributed runs must set `train.checkpoint.export_hf_final=false`; the automatic plain subprocess does not recreate the training topology. Run manual consolidation only as validation work and verify the exported encoder before treating it as an artifact. See [Distributed training](../advanced/distributed-training.md).
 
 Default output path is `<run_dir>/exported_hf` and must be empty if it already exists.
 

@@ -12,7 +12,7 @@ If none are provided, config validation fails.
 
 Map-style sources (`data.source.streaming=false`, including `load_from_disk`) are explicitly partitioned across the combined distributed-rank and DataLoader-worker space. HF iterable sources (`data.source.streaming=true`) receive distributed-rank sharding from the dataset wrapper and retain their native DataLoader-worker partitioning.
 
-Dataset loading and streaming retry transient I/O failures up to three times with exponential backoff. Retried streams replay to the last yielded example with the same epoch seed and shard; schema, authentication, and other non-transient errors fail immediately.
+Dataset loading and streaming make at most three attempts for transient I/O failures, with exponential backoff between the two retries. Retried streams replay to the last yielded example with the same epoch seed and shard; schema, authentication, and other non-transient errors fail immediately.
 
 ## Packed streaming path
 
@@ -47,6 +47,8 @@ The collator also emits two fixed-shape objective tensors for blocked rows:
 - `doc_context_index (B,S)` maps each token to its document's CLS position. The RTD classifier
   gathers that context before LayerNorm, preserving the standalone `LayerNorm(token + CLS)`
   architecture for every packed document.
+
+The collator derives contiguous document starts and ends once in row-major order. The objective tensors and FlashDeBERTa segment descriptors consume those same boundaries.
 
 When FlashDeBERTa is enabled, the collator additionally precomputes fixed-capacity segment descriptors and scalar route inputs before device transfer. Eager training does not emit the Flash-only metadata.
 

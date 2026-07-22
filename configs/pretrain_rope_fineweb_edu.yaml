@@ -1,7 +1,6 @@
 # Experimental RoPE/RMSNorm/SwiGLU RTD pretraining example.
 # Usage:
-#   accelerate launch --config_file configs/accelerate/fsdp2_1node.yaml --no_python \
-#     deberta train configs/pretrain_rope_fineweb_edu.yaml
+#   deberta train configs/pretrain_rope_fineweb_edu.yaml
 
 model:
   backbone_type: rope
