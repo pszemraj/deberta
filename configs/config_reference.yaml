@@ -5,7 +5,7 @@
 # Every leaf is optional unless marked conditionally required. Omission uses the stated default. YAML booleans must be true/false values, strings must remain strings, numeric strings are accepted, and null is accepted only by `| None` fields.
 # Duplicate mapping keys are not rejected: YAML and JSON parsing retain the last value. Never duplicate a key. Relative paths resolve from the process working directory; only keys that explicitly say so expand `~`.
 # This surface configures RTD pretraining. It does not configure export or downstream fine-tuning/evaluation.
-# GPU count and FSDP are launcher settings, not YAML keys: a one-GPU request needs no extra key and uses this same YAML in one process; multiple GPUs use the same YAML with the appropriate Accelerate launch configuration.
+# GPU count and FSDP are launcher settings, not YAML keys. A one-GPU request needs no extra key and uses this same YAML in one process. Multi-GPU training is unsupported in this PR; retained Accelerate/FSDP2 templates are experimental scaffolding for a dedicated validation follow-up.
 # The repository is pre-stable. Persisted resume/export snapshots carry a schema version, and incompatible versions are rejected rather than migrated.
 #
 # Backbone-profile omission defaults
@@ -320,7 +320,7 @@
 # true recursively deletes the entire existing non-empty output directory before training; this is irreversible and mutually exclusive with resume. Keep false.
 
 # [train.checkpoint.save_steps] int = 1000; must be >= 0.
-# Periodic checkpoint interval in optimizer steps; 0 disables periodic saves. A final checkpoint is still attempted after progress, and a single-process crash also attempts one.
+# Periodic checkpoint interval in optimizer steps; 0 disables periodic saves. After a successful run with progress, failure to save the final step fails the command. A single-process crash also attempts a best-effort save without replacing the original crash; distributed crash-time saves are skipped because checkpoint collectives may deadlock after rank failure.
 
 # [train.checkpoint.save_total_limit] int = 3; must be >= 0.
 # Retains newest committed `checkpoint-*` directories after each save and deletes older ones; 0 disables rotation and can consume unbounded disk. Deletion is irreversible.
@@ -337,7 +337,7 @@
 # Threshold used only by auto; larger caps improve data alignment but can make resume startup slow, while explicit replay ignores the cap.
 
 # [train.checkpoint.export_hf_final] bool = true; values: true | false.
-# After successful training, requires the committed checkpoint at the final global step and strictly exports only its discriminator to `<output_dir>/final_hf`. A missing final checkpoint, state incompatibility, or export failure fails the training command; disable for probes, and use manual `deberta export` for another checkpoint, the generator, or both components.
+# After successful single-process training, requires the committed checkpoint at the final global step and strictly exports only its discriminator to `<output_dir>/final_hf`. A failed final checkpoint save, missing final checkpoint, state incompatibility, or export failure fails the training command. Disable for probes and every experimental multi-GPU run; use manual `deberta export` for another checkpoint, the generator, both components, or experimental sharded-checkpoint validation.
 
 # OPTIM
 # Every `optim.*` value must match the source snapshot for exact resume. Learning-rate/scheduler changes are new-training decisions, not supported resume overrides.

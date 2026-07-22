@@ -97,7 +97,7 @@ def _ranking_metrics(
     logits: torch.Tensor,
     labels: torch.Tensor,
 ) -> tuple[float | None, float | None]:
-    """Return tie-aware ROC-AUC and average precision for binary targets."""
+    """Return tie-aware binary ranking metrics, using ``None`` when a class is absent."""
     scores = logits.detach().float().cpu().flatten()
     targets = labels.detach().bool().cpu().flatten()
     order = torch.argsort(scores, descending=True, stable=True)

@@ -70,7 +70,7 @@ Decision: strict GDES export is no longer a blocker. Keep strict loading as the 
 
 Status: passed.
 
-`tools/evaluate_rtd_checkpoint.py` now evaluates one or more checkpoints on a deterministic alternate shuffle of the configured training source. It reports generator CE and realized replacement rate; discriminator BCE, prior gain, ROC-AUC, AP, zero-threshold behavior, and logit dispersion; representation token-centered RMS; and checkpoint finiteness. The ROC-AUC and AP implementations are dependency-free and covered by hand-calculated and tied-score tests (`4 passed`).
+`tools/evaluate_rtd_checkpoint.py` now evaluates one or more checkpoints on a deterministic alternate shuffle of the configured training source. It reports generator CE and realized replacement rate; discriminator BCE, prior gain, ROC-AUC, AP, zero-threshold behavior, and logit dispersion; representation token-centered RMS; and checkpoint finiteness. The dependency-free ranking metrics are covered by hand-calculated, tied-score, and single-class tests. Undefined ROC-AUC, and AP when no positive targets exist, serialize as JSON `null`; zero-threshold recall is `0.0` when no positive targets exist.
 
 The tracked evaluator reproduced the established 12k result over 16,384 tokens: generator CE `2.709`, replacement rate `0.0909`, discriminator BCE `0.2481`, loss gain `0.0565`, ROC-AUC `0.7991`, AP `0.3080`, token-centered RMS `0.8880`, and zero non-finite elements across all 315 state tensors. The generated JSON remains under `local-scratch/flashdeberta-validation-12k/`.
 

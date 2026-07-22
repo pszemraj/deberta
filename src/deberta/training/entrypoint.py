@@ -423,7 +423,7 @@ def run_pretraining(
     logging_cfg: LoggingConfig | None = None,
     config_path: str | Path | None = None,
 ) -> None:
-    """Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
+    """Run RTD pretraining on the supported single-process path with experimental FSDP2 plumbing.
 
     :param ModelConfig model_cfg: Model configuration.
     :param DataConfig data_cfg: Data configuration.

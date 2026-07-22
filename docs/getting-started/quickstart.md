@@ -28,14 +28,14 @@ For a single-process run:
 deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
 ```
 
-For single-node FSDP2, set `num_processes` in the architecture-specific Accelerate file to the available GPU count, then launch:
+Multi-GPU training is intentionally unsupported in this PR. The repository retains experimental FSDP2 templates for the dedicated distributed-validation follow-up; do not use them for a long-running job. The current scaffolding is invoked with:
 
 ```bash
 accelerate launch --config_file configs/accelerate/fsdp2_hf_deberta_1node.yaml --no_python \
   deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
 ```
 
-See [Distributed training](../advanced/distributed-training.md) for the native and RoPE launcher distinction. Validate the uncompiled Flash example before combining FlashDeBERTa with `torch.compile`.
+See [Distributed training](../advanced/distributed-training.md) for the unvalidated contracts and known failure boundaries. Validate the uncompiled Flash example before combining FlashDeBERTa with `torch.compile` in a supported single-process run.
 
 ## 3) Resume exact training state
 
@@ -57,4 +57,4 @@ To continue into a new run, use an explicit committed `checkpoint-<step>` path a
 
 ## 4) Find or export the discriminator
 
-When `train.checkpoint.export_hf_final` is enabled, training requires the checkpoint at the final global step and strictly exports its discriminator under `<output_dir>/final_hf`; a missing checkpoint or export failure fails the training command. For another checkpoint, the generator, or both components, see [Exporting models](../guides/exporting-models.md).
+When `train.checkpoint.export_hf_final` is enabled, training requires the checkpoint at the final global step and strictly exports its discriminator under `<output_dir>/final_hf`; a failed final checkpoint save, missing checkpoint, or export failure fails the training command. For another checkpoint, the generator, or both components, see [Exporting models](../guides/exporting-models.md).

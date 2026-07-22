@@ -22,14 +22,16 @@ Export infers the run directory from the checkpoint parent and requires that dir
 - `generator`
 - `both`
 
-## FSDP checkpoint consolidation
+## Experimental FSDP checkpoint consolidation
 
-For distributed runs (`distributed_type=FSDP`), export uses Accelerate/Torch distributed checkpoint loading and gathers full state for final artifact writing.
+The manual exporter contains an experimental path that uses Accelerate/Torch distributed checkpoint loading and gathers full state for final artifact writing. Multi-GPU training and sharded-checkpoint export are not supported in this PR because their end-to-end state and output parity have not been validated.
 
 FSDP export offloads the consolidated state to CPU and gathers it on rank 0 by default. Override those defaults only when the alternative fits the available memory:
 
 - `--no-offload-to-cpu`
 - `--no-rank0-only`
+
+Experimental distributed runs must set `train.checkpoint.export_hf_final=false`; the automatic plain subprocess does not recreate the training topology. Run manual consolidation only as validation work and verify the exported encoder before treating it as an artifact. See [Distributed training](../advanced/distributed-training.md).
 
 Default output path is `<run_dir>/exported_hf` and must be empty if it already exists.
 
@@ -58,4 +60,4 @@ token-type embeddings:
 
 ## Partial export mode
 
-Both manual `deberta export` and automatic `train.checkpoint.export_hf_final` are strict on state-dict compatibility by default. Strict exports reload each staged encoder and verify its output against the in-memory materialized encoder before atomically publishing the artifact. Automatic export failure fails the training command. Use the manual command with `--allow-partial-export` only for recovery or debugging; partial exports skip staged encoder parity.
+Both manual `deberta export` and automatic `train.checkpoint.export_hf_final` are strict on state-dict compatibility by default. Strict exports reload each staged encoder and verify its output against the in-memory materialized encoder before atomically publishing the artifact. On the supported single-process path, a failed final checkpoint save or automatic export fails the training command. Use the manual command with `--allow-partial-export` only for recovery or debugging; partial exports skip staged encoder parity.

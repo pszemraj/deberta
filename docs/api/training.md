@@ -18,7 +18,7 @@ run_pretraining(
 ) -> 'None'
 ```
 
-Run RTD pretraining with Accelerate/FSDP2-compatible plumbing.
+Run RTD pretraining on the supported single-process path with retained experimental FSDP2 plumbing.
 
 TODO: Split the internal `run_pretraining` orchestration into setup, training-window, and finalization helpers while preserving its checkpoint, distributed, and failure-handling contracts.
 
