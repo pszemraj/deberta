@@ -30,7 +30,6 @@ def _export_discriminator_hf_subprocess(
         "discriminator",
         "--output-dir",
         str(output_dir),
-        "--allow-partial-export",
     ]
     logger.info(
         "Running post-train export in subprocess from checkpoint %s.",
@@ -44,10 +43,8 @@ def _export_discriminator_hf_subprocess(
         check=False,
     )
     if proc.returncode != 0:
-        logger.warning(
-            "Post-train export subprocess failed (exit=%d). Output:\n%s",
-            int(proc.returncode),
-            str(proc.stdout).strip(),
+        raise RuntimeError(
+            f"Post-train export subprocess failed (exit={int(proc.returncode)}). "
+            f"Output:\n{str(proc.stdout).strip()}"
         )
-        return
     logger.info("Post-train export complete: %s", output_dir)

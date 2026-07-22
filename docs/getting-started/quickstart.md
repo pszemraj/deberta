@@ -57,4 +57,4 @@ To continue into a new run, use an explicit committed `checkpoint-<step>` path a
 
 ## 4) Find or export the discriminator
 
-When `train.checkpoint.export_hf_final` is enabled, training makes a best-effort discriminator export under `<output_dir>/final_hf`. For strict manual export, another checkpoint, the generator, or both components, see [Exporting models](../guides/exporting-models.md).
+When `train.checkpoint.export_hf_final` is enabled, training requires the checkpoint at the final global step and strictly exports its discriminator under `<output_dir>/final_hf`; a missing checkpoint or export failure fails the training command. For another checkpoint, the generator, or both components, see [Exporting models](../guides/exporting-models.md).

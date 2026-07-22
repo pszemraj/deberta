@@ -1995,27 +1995,28 @@ def run_pretraining(
                 getattr(accelerator, "num_processes", "unknown"),
             )
 
+        final_export_error: Exception | None = None
         if (
             bool(train_cfg.checkpoint.export_hf_final)
             and crash_reason is None
             and bool(getattr(accelerator, "is_main_process", True))
         ):
-            export_step = int(last_saved_step)
-            if export_step <= 0 and int(global_step) > 0:
-                export_step = int(global_step)
-            if export_step > 0:
-                checkpoint_dir = output_dir / f"checkpoint-{export_step}"
-                if checkpoint_dir.exists():
-                    with suppress(Exception):
-                        _export_discriminator_hf_subprocess(
-                            checkpoint_dir=checkpoint_dir,
-                            output_dir=output_dir / "final_hf",
+            export_step = int(global_step)
+            try:
+                if export_step > 0:
+                    checkpoint_dir = output_dir / f"checkpoint-{export_step}"
+                    if not checkpoint_dir.exists():
+                        raise FileNotFoundError(
+                            "Cannot export the final training step because its checkpoint directory "
+                            f"does not exist: {checkpoint_dir}"
                         )
-                else:
-                    logger.warning(
-                        "Skipping final export: checkpoint directory does not exist: %s",
-                        checkpoint_dir,
+                    _export_discriminator_hf_subprocess(
+                        checkpoint_dir=checkpoint_dir,
+                        output_dir=output_dir / "final_hf",
                     )
+            except Exception as export_exc:
+                exit_code = 1
+                final_export_error = export_exc
 
         if crash_reason is not None:
             crash_log_step = int(
@@ -2061,3 +2062,5 @@ def run_pretraining(
                     accelerator.end_training()
 
         _flush_loggers()
+        if final_export_error is not None:
+            raise final_export_error

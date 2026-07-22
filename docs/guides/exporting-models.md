@@ -38,6 +38,8 @@ Default output path is `<run_dir>/exported_hf` and must be empty if it already e
 - `--what discriminator` or `--what generator`: writes the model, tokenizer, `export_meta.json`, and supporting files in a flat directory at `--output-dir`.
 - `--what both`: writes model weights, config, README, and license under `--output-dir/discriminator/` and `--output-dir/generator/`; tokenizer files and `export_meta.json` remain at the shared `--output-dir` root. Load the selected model from its component directory and the tokenizer from the root.
 
+`export_meta.json` records `artifact_type` as `rtd_pretrained_encoder` for one component or `rtd_pretrained_encoder_bundle` for both, the requested target, `strict_state_load`, `includes_rtd_head`, and the per-component `embedding_materialization`. Generator materialization is `generator_checkpoint`. Discriminator materialization is `discriminator_checkpoint` for `none`, `generator_checkpoint_shared` for `es`, or `generator_checkpoint_plus_discriminator_bias` for `gdes`.
+
 Native `hf_deberta_v2` exports load through stock Hugging Face `AutoModel` APIs. RoPE exports are
 standalone artifacts but require this package's `DebertaRoPEModel` implementation.
 
@@ -56,4 +58,4 @@ token-type embeddings:
 
 ## Partial export mode
 
-Manual `deberta export` is strict on state-dict compatibility by default. Use `--allow-partial-export` only for recovery or debugging. The automatic `train.checkpoint.export_hf_final` subprocess deliberately allows partial loading so a completed training run is not failed by an export-only mismatch; run the manual command afterward when strict verification is required.
+Both manual `deberta export` and automatic `train.checkpoint.export_hf_final` are strict on state-dict compatibility by default. Strict exports reload each staged encoder and verify its output against the in-memory materialized encoder before atomically publishing the artifact. Automatic export failure fails the training command. Use the manual command with `--allow-partial-export` only for recovery or debugging; partial exports skip staged encoder parity.

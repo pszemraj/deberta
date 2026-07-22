@@ -655,22 +655,42 @@ def test_run_pretraining_decoupled_routes_phase_calls_through_forward(
     assert len(model.calls.get("forward_discriminator_phase", [])) == 1
 
 
-def test_run_pretraining_final_export_uses_subprocess_helper(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "export_case",
+    ["success", "subprocess_failure", "missing_checkpoint", "final_save_failure"],
+)
+def test_run_pretraining_final_export_is_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    export_case: str,
 ) -> None:
     export_calls: list[tuple[str, str]] = []
+    flush_calls: list[None] = []
 
     def _fake_export_subprocess(*, checkpoint_dir: Path, output_dir: Path) -> None:
         export_calls.append((str(checkpoint_dir), str(output_dir)))
+        if export_case == "subprocess_failure":
+            raise RuntimeError("strict export failed")
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        save_checkpoint_fn=make_checkpoint_saver(create_checkpoint_dir=True),
-        extra_patches={"_export_discriminator_hf_subprocess": _fake_export_subprocess},
+        save_checkpoint_fn=make_checkpoint_saver(
+            create_checkpoint_dir=export_case != "missing_checkpoint",
+            fail_label="final" if export_case == "final_save_failure" else None,
+        ),
+        extra_patches={
+            "_export_discriminator_hf_subprocess": _fake_export_subprocess,
+            "_flush_loggers": lambda: flush_calls.append(None),
+        },
     )
+    max_steps = 3 if export_case == "final_save_failure" else 1
     train_cfg = make_train_config(
-        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": True},
-        max_steps=1,
+        checkpoint={
+            "output_dir": str(tmp_path / "run"),
+            "save_steps": 2 if export_case == "final_save_failure" else 0,
+            "export_hf_final": True,
+        },
+        max_steps=max_steps,
         mixed_precision="no",
         tf32=False,
         dataloader={"num_workers": 0},
@@ -680,11 +700,45 @@ def test_run_pretraining_final_export_uses_subprocess_helper(
         compile={"enabled": False},
     )
 
-    pretrain_mod.run_pretraining(
-        model_cfg=make_model_config(backbone_type="rope"),
-        data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
-        train_cfg=train_cfg,
-    )
+    if export_case == "subprocess_failure":
+        with pytest.raises(RuntimeError, match="strict export failed"):
+            pretrain_mod.run_pretraining(
+                model_cfg=make_model_config(backbone_type="rope"),
+                data_cfg=make_data_config(
+                    source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}
+                ),
+                train_cfg=train_cfg,
+                logging_cfg=make_logging_config(wandb={"enabled": True, "watch": "none"}),
+            )
+    elif export_case in {"missing_checkpoint", "final_save_failure"}:
+        with pytest.raises(FileNotFoundError, match="Cannot export the final training step") as exc_info:
+            pretrain_mod.run_pretraining(
+                model_cfg=make_model_config(backbone_type="rope"),
+                data_cfg=make_data_config(
+                    source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}
+                ),
+                train_cfg=train_cfg,
+                logging_cfg=make_logging_config(wandb={"enabled": True, "watch": "none"}),
+            )
+        assert f"checkpoint-{max_steps}" in str(exc_info.value)
+    else:
+        pretrain_mod.run_pretraining(
+            model_cfg=make_model_config(backbone_type="rope"),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
+            train_cfg=train_cfg,
+            logging_cfg=make_logging_config(wandb={"enabled": True, "watch": "none"}),
+        )
+
+    assert flush_calls == [None]
+    accelerator = FakeAccelerator.last_instance
+    assert accelerator is not None
+    assert accelerator.wandb_run.finished_exit_code == (0 if export_case == "success" else 1)
+
+    if export_case in {"missing_checkpoint", "final_save_failure"}:
+        assert not export_calls
+        if export_case == "final_save_failure":
+            assert (tmp_path / "run" / "checkpoint-2").is_dir()
+        return
 
     assert export_calls
     ckpt_path, export_path = export_calls[-1]

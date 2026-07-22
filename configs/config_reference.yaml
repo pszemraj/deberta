@@ -337,7 +337,7 @@
 # Threshold used only by auto; larger caps improve data alignment but can make resume startup slow, while explicit replay ignores the cap.
 
 # [train.checkpoint.export_hf_final] bool = true; values: true | false.
-# After successful training, best-effort exports only the discriminator from the final committed checkpoint to `<output_dir>/final_hf` with partial loading allowed. Failure does not fail training; disable for probes, and use manual `deberta export` for strict verification.
+# After successful training, requires the committed checkpoint at the final global step and strictly exports only its discriminator to `<output_dir>/final_hf`. A missing final checkpoint, state incompatibility, or export failure fails the training command; disable for probes, and use manual `deberta export` for another checkpoint, the generator, or both components.
 
 # OPTIM
 # Every `optim.*` value must match the source snapshot for exact resume. Learning-rate/scheduler changes are new-training decisions, not supported resume overrides.

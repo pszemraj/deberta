@@ -281,6 +281,52 @@ def _prepare_discriminator_state_for_strict_load(
     return prepared
 
 
+def _verify_staged_encoder_output_parity(
+    *,
+    component: str,
+    export_model: Any,
+    component_dir: Path,
+) -> None:
+    """Verify staged serialization preserves one materialized encoder's output.
+
+    :param str component: Export component name used in failure diagnostics.
+    :param Any export_model: In-memory materialized encoder.
+    :param Path component_dir: Staged component directory to reload.
+    """
+    config = export_model.config
+    seq_len = min(8, int(config.max_position_embeddings))
+    vocab_size = int(config.vocab_size)
+    input_ids = (torch.arange(seq_len, dtype=torch.long) + 1).remainder(vocab_size).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+
+    export_model.to(device="cpu").eval()
+    with torch.inference_mode():
+        expected = export_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        ).last_hidden_state
+
+    staged_model = type(export_model).from_pretrained(str(component_dir)).to(device="cpu").eval()
+    with torch.inference_mode():
+        actual = staged_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        ).last_hidden_state
+
+    try:
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-5, atol=2e-5)
+    except AssertionError as exc:
+        raise RuntimeError(
+            f"Staged {component} encoder output does not match the materialized export model."
+        ) from exc
+
+
 def _export_component(
     *,
     component: str,
@@ -366,6 +412,12 @@ def _export_component(
         train_cfg=train_cfg,
         embedding_sharing=embedding_sharing,
     )
+    if bool(strict_export_load):
+        _verify_staged_encoder_output_parity(
+            component=component_key,
+            export_model=export_model,
+            component_dir=out_dir,
+        )
     return True
 
 
@@ -536,6 +588,16 @@ def run_export(cfg: ExportConfig) -> None:
     stage_dir = out_dir.parent / f".{out_dir.name}.tmp-{uuid.uuid4().hex}"
     stage_dir.mkdir(parents=True, exist_ok=False)
 
+    embedding_materialization: dict[str, str] = {}
+    if export_what in {"discriminator", "both"}:
+        embedding_materialization["discriminator"] = {
+            "none": "discriminator_checkpoint",
+            "es": "generator_checkpoint_shared",
+            "gdes": "generator_checkpoint_plus_discriminator_bias",
+        }[embedding_sharing]
+    if export_what in {"generator", "both"}:
+        embedding_materialization["generator"] = "generator_checkpoint"
+
     meta: dict[str, Any] = {
         # Directory names only: exported directories ship to other machines
         # and the Hub, so provenance must not leak local absolute paths.
@@ -543,6 +605,13 @@ def run_export(cfg: ExportConfig) -> None:
         "run_name": run_dir.name,
         "embedding_sharing": embedding_sharing,
         "backbone_type": model_cfg.backbone_type,
+        "export_target": export_what,
+        "artifact_type": (
+            "rtd_pretrained_encoder_bundle" if export_what == "both" else "rtd_pretrained_encoder"
+        ),
+        "strict_state_load": bool(strict_export_load),
+        "includes_rtd_head": False,
+        "embedding_materialization": embedding_materialization,
     }
 
     try:
@@ -586,6 +655,7 @@ def run_export(cfg: ExportConfig) -> None:
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, sort_keys=True)
 
+        # Strict loads and staged encoder parity complete before this atomic publication step.
         if out_dir.exists():
             # At this point we already enforced "empty only".
             out_dir.rmdir()

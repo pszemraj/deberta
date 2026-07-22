@@ -70,6 +70,54 @@ class _FakeExportBackbone(torch.nn.Module):
         return None
 
 
+def test_verify_staged_encoder_output_parity_checks_reloaded_config(tmp_path: Path) -> None:
+    class _ReloadableEncoder(torch.nn.Module):
+        def __init__(self, *, scale: float, weight: float) -> None:
+            super().__init__()
+            self.config = types.SimpleNamespace(vocab_size=16, max_position_embeddings=8)
+            self.scale = float(scale)
+            self.weight = torch.nn.Parameter(torch.tensor(float(weight)))
+
+        def forward(self, input_ids: torch.Tensor, **kwargs: Any) -> Any:
+            del kwargs
+            hidden = input_ids.float().unsqueeze(-1) * self.weight * self.scale
+            return types.SimpleNamespace(last_hidden_state=hidden)
+
+        def save_pretrained(self, path: str) -> None:
+            target = Path(path)
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "config.json").write_text(
+                json.dumps({"scale": self.scale, "weight": float(self.weight.detach())}),
+                encoding="utf-8",
+            )
+
+        @classmethod
+        def from_pretrained(cls, path: str) -> _ReloadableEncoder:
+            payload = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+            return cls(scale=float(payload["scale"]), weight=float(payload["weight"]))
+
+    component_dir = tmp_path / "staged"
+    source = _ReloadableEncoder(scale=1.0, weight=2.0)
+    source.save_pretrained(str(component_dir))
+
+    export_cli._verify_staged_encoder_output_parity(
+        component="discriminator",
+        export_model=source,
+        component_dir=component_dir,
+    )
+
+    (component_dir / "config.json").write_text(
+        json.dumps({"scale": 3.0, "weight": 2.0}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="Staged discriminator encoder output does not match"):
+        export_cli._verify_staged_encoder_output_parity(
+            component="discriminator",
+            export_model=source,
+            component_dir=component_dir,
+        )
+
+
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -209,6 +257,7 @@ def _install_export_fakes(
         lambda model_cfg, disc_config, gen_config, export_what: (_FakeExportBackbone(), None),
     )
     monkeypatch.setattr(export_cli, "merge_embeddings_into_export_backbone", lambda *args, **kwargs: None)
+    monkeypatch.setattr(export_cli, "_verify_staged_encoder_output_parity", lambda **kwargs: None)
 
 
 def test_run_export_meta_carries_no_local_absolute_paths(
@@ -234,9 +283,59 @@ def test_run_export_meta_carries_no_local_absolute_paths(
     meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
     assert meta["checkpoint_name"] == checkpoint_dir.name
     assert meta["run_name"] == run_dir.name
+    assert meta["export_target"] == "discriminator"
+    assert meta["artifact_type"] == "rtd_pretrained_encoder"
+    assert meta["strict_state_load"] is True
+    assert meta["includes_rtd_head"] is False
+    assert meta["embedding_materialization"] == {"discriminator": "discriminator_checkpoint"}
     # Export directories ship to other machines and the Hub; provenance must
     # not leak the exporting machine's directory layout.
     assert str(tmp_path) not in json.dumps(meta)
+
+
+@pytest.mark.parametrize("parity_fails", [False, True], ids=["success", "failure"])
+def test_run_export_verifies_staged_encoder_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    parity_fails: bool,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=_new_export_call_counters(),
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+    out_dir = tmp_path / "exported"
+    parity_calls: list[Path] = []
+
+    def _verify_parity(*, component: str, export_model: Any, component_dir: Path) -> None:
+        del export_model
+        assert component == "discriminator"
+        assert component_dir.is_dir()
+        assert not out_dir.exists()
+        parity_calls.append(component_dir)
+        if parity_fails:
+            raise RuntimeError("staged parity failed")
+
+    monkeypatch.setattr(export_cli, "_verify_staged_encoder_output_parity", _verify_parity)
+    cfg = export_cli.ExportConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        run_dir=str(run_dir),
+        output_dir=str(out_dir),
+    )
+
+    if parity_fails:
+        with pytest.raises(RuntimeError, match="staged parity failed"):
+            export_cli.run_export(cfg)
+        assert not out_dir.exists()
+        assert not list(tmp_path.glob(".exported.tmp-*"))
+    else:
+        export_cli.run_export(cfg)
+        assert out_dir.is_dir()
+
+    assert len(parity_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -457,6 +556,12 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         fsdp2=False,
         provide_torch_state_dict_api=False,
     )
+    parity_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        export_cli,
+        "_verify_staged_encoder_output_parity",
+        lambda **kwargs: parity_calls.append(dict(kwargs)),
+    )
 
     monkeypatch.setattr(
         export_cli,
@@ -493,6 +598,9 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         )
         assert out_dir.exists()
         assert not (out_dir / "discriminator").exists()
+        meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+        assert meta["strict_state_load"] is False
+        assert not parity_calls
 
 
 def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
@@ -559,6 +667,10 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
     assert not (out_dir / "discriminator").exists()
     assert len(merge_calls) == 1
     assert "embeddings.word_embeddings.bias" in merge_calls[0]["disc_sd"]
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["embedding_materialization"] == {
+        "discriminator": "generator_checkpoint_plus_discriminator_bias"
+    }
 
 
 def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
@@ -685,6 +797,14 @@ def test_run_export_both_targets_save_into_component_subdirectories(
     assert (out_dir / "generator" / "config.json").exists()
     assert (out_dir / "discriminator" / "README.md").exists()
     assert (out_dir / "generator" / "README.md").exists()
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["artifact_type"] == "rtd_pretrained_encoder_bundle"
+    assert meta["export_target"] == "both"
+    assert meta["includes_rtd_head"] is False
+    assert meta["embedding_materialization"] == {
+        "discriminator": "discriminator_checkpoint",
+        "generator": "generator_checkpoint",
+    }
 
 
 def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):

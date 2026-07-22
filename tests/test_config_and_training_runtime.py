@@ -275,7 +275,7 @@ def test_pretrainer_skips_discriminator_when_no_masked_tokens(monkeypatch: pytes
     torch.testing.assert_close(out.disc_positive_count, torch.zeros((), dtype=out.disc_positive_count.dtype))
 
 
-def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
+def test_export_discriminator_hf_subprocess_uses_strict_export(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
@@ -309,7 +309,38 @@ def test_export_discriminator_hf_subprocess_uses_allow_partial_export(
     cmd = calls[-1]
     assert cmd[0] == sys.executable
     assert cmd[1:5] == ["-m", "deberta", "export", "runs/demo/checkpoint-1"]
-    assert "--allow-partial-export" in cmd
+    assert "--allow-partial-export" not in cmd
+
+
+def test_export_discriminator_hf_subprocess_raises_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Proc:
+        returncode = 7
+        stdout = "strict load failed"
+
+    def _fake_run(
+        cmd: list[str],
+        *,
+        stdout: Any,
+        stderr: Any,
+        text: bool,
+        check: bool,
+    ) -> _Proc:
+        del cmd, stdout, stderr, text, check
+        return _Proc()
+
+    import deberta.training.export_helpers as export_mod
+
+    monkeypatch.setattr(export_mod.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="exit=7") as exc_info:
+        _export_discriminator_hf_subprocess(
+            checkpoint_dir=Path("runs/demo/checkpoint-1"),
+            output_dir=Path("runs/demo/final_hf"),
+        )
+
+    assert "strict load failed" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
