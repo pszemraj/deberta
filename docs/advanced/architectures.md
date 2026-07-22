@@ -33,7 +33,7 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 - generic backbone `z_steps` is not an EMD substitute; RTD generators require `z_steps=0`
 - Document-blocked packing preserves standalone objective semantics as described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking).
 
-Decoupled and combined training are separate execution contracts. Decoupled training normalizes each phase over its own token window, performs a generator optimizer step before the discriminator phase, and synchronizes GDES embeddings between those phases. Combined training forms one weighted objective and performs one optimizer step.
+Decoupled and combined training are separate execution contracts. With the default token-weighted accumulation, decoupled training normalizes each phase over its own token window, performs a generator optimizer step before the discriminator phase, and synchronizes GDES embeddings between those phases. Combined training forms one weighted objective and performs one optimizer step.
 
 ## Parity divergences
 
