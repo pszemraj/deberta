@@ -54,6 +54,7 @@ from deberta.training.loop_utils import (
 )
 from deberta.training.runtime import (
     _build_optimizer,
+    _build_scheduler,
     _build_training_collator,
     _cycle_dataloader,
 )
@@ -93,6 +94,26 @@ def _tiny_rtd_config() -> BackboneConfigStub:
         sep_token_id=2,
         mask_token_id=3,
     )
+
+
+def test_build_linear_scheduler_reaches_base_lr_before_decay() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    scheduler = _build_scheduler(
+        optimizer,
+        train_cfg=make_train_config(max_steps=4),
+        optim_cfg=make_optim_config(
+            scheduler={"type": "linear", "warmup_steps": 1},
+        ),
+    )
+
+    assert scheduler.get_last_lr() == pytest.approx([0.0])
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.get_last_lr() == pytest.approx([0.1])
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.get_last_lr()[0] < 0.1
 
 
 def test_move_batch_to_device_moves_flash_metadata_but_keeps_scalars_on_cpu() -> None:

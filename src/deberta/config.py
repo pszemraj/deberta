@@ -99,7 +99,6 @@ _BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
         "train.objective.disc_loss_weight": 10.0,
         "optim.lr.base": 1e-4,
         "optim.adam.epsilon": 1e-6,
-        "optim.scheduler.warmup_steps": 10_000,
     },
     "rope": {
         "train.objective.mask_token_prob": 0.8,
@@ -107,7 +106,6 @@ _BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
         "train.objective.disc_loss_weight": 50.0,
         "optim.lr.base": 5e-4,
         "optim.adam.epsilon": 1e-8,
-        "optim.scheduler.warmup_steps": 1_000,
     },
 }
 _TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
@@ -421,7 +419,7 @@ class OptimSchedulerConfig:
     """Scheduler controls."""
 
     type: str = field(default="linear")
-    warmup_steps: int = field(default=10_000)
+    warmup_steps: int = field(default=1_000)
 
 
 @dataclass(frozen=True)
@@ -1409,6 +1407,17 @@ def validate_training_workflow_options(
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
             "with strict flash SDPA kernels. Use train.sdpa_kernel=auto|mem_efficient|math instead."
         )
+
+    if optim_cfg is not None:
+        scheduler_type = str(optim_cfg.scheduler.type).strip().lower()
+        warmup_steps = int(optim_cfg.scheduler.warmup_steps)
+        max_steps = int(train_cfg.max_steps)
+        if scheduler_type != "constant" and warmup_steps >= max_steps:
+            raise ValueError(
+                "optim.scheduler.warmup_steps must be less than train.max_steps for "
+                f"scheduler type {scheduler_type!r}; got warmup_steps={warmup_steps}, "
+                f"max_steps={max_steps}. Only scheduler type 'constant' ignores warmup_steps."
+            )
 
     if model_cfg is not None:
         backbone_type = str(model_cfg.backbone_type).strip().lower()

@@ -48,7 +48,7 @@ def _write_resume_source_snapshots(run_dir: Path, *, train_cfg: TrainConfig) -> 
         train_cfg,
         checkpoint=dataclasses.replace(train_cfg.checkpoint, resume_from_checkpoint=None),
     )
-    optim_cfg = make_optim_config()
+    optim_cfg = make_optim_config(scheduler={"type": "constant"})
     logging_cfg = make_logging_config(output_dir=str(run_dir))
     _persist_or_validate_run_configs(
         output_dir=run_dir,
@@ -1432,6 +1432,7 @@ def test_persist_or_validate_run_configs_writes_original_and_resolved_yaml(
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         train_cfg=train_cfg,
+        optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
         resume_checkpoint=None,
         config_path=src_cfg,
         is_main_process=True,
@@ -1461,6 +1462,7 @@ def test_persist_or_validate_run_configs_preserves_source_when_source_is_resolve
         model_cfg=make_model_config(backbone_type="rope"),
         data_cfg=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
         train_cfg=make_train_config(max_steps=9),
+        optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
         config_path=resolved_path,
         resume_checkpoint=None,
         is_main_process=True,

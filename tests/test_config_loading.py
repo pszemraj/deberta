@@ -32,6 +32,14 @@ def test_programmatic_config_resolves_rope_profile_without_serializing_provenanc
     assert set(dataclasses.asdict(cfg)) == {"model", "data", "train", "optim", "logging"}
 
 
+def test_default_scheduler_warmup_leaves_training_steps_for_decay() -> None:
+    cfg = Config()
+
+    assert cfg.train.max_steps == 10_000
+    assert cfg.optim.scheduler.warmup_steps == 1_000
+    assert cfg.optim.scheduler.warmup_steps < cfg.train.max_steps
+
+
 def test_programmatic_config_preserves_custom_profile_values() -> None:
     cfg = Config(
         model=ModelConfig(backbone_type="rope"),
@@ -76,7 +84,7 @@ def test_programmatic_config_preserves_explicit_schema_default_profile_values() 
     assert cfg.train.objective.disc_loss_weight == pytest.approx(10.0)
     assert cfg.optim.lr.base == pytest.approx(1e-4)
     assert cfg.optim.adam.epsilon == pytest.approx(1e-6)
-    assert cfg.optim.scheduler.warmup_steps == 10_000
+    assert cfg.optim.scheduler.warmup_steps == 1_000
 
 
 def test_load_yaml_nested(tmp_path: Path):
@@ -137,7 +145,7 @@ def test_load_json_nested(tmp_path: Path):
                 "optim": {
                     "lr": {"generator": 3.0e-4},
                     "adam": {"epsilon": 1.0e-6},
-                    "scheduler": {"warmup_steps": 10_000},
+                    "scheduler": {"warmup_steps": 5_000},
                 },
             }
         ),
@@ -151,7 +159,7 @@ def test_load_json_nested(tmp_path: Path):
     assert cfg_nested.train.objective.random_token_prob == pytest.approx(0.0)
     assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(10.0)
     assert cfg_nested.optim.adam.epsilon == pytest.approx(1e-6)
-    assert cfg_nested.optim.scheduler.warmup_steps == 10_000
+    assert cfg_nested.optim.scheduler.warmup_steps == 5_000
 
 
 def test_load_yaml_hf_flash_config(tmp_path: Path):

@@ -84,6 +84,9 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 1",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 0",
             ]
         ),
         encoding="utf-8",
@@ -121,7 +124,7 @@ def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
     )
     explicit_optim = make_optim_config(
         adam={"epsilon": 1e-6},
-        scheduler={"warmup_steps": 10_000},
+        scheduler={"warmup_steps": 1_000},
     )
 
     train_cfg, optim_cfg = _resolve_entrypoint_profile_sections(
@@ -137,7 +140,7 @@ def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
     assert train_cfg.objective.disc_loss_weight == pytest.approx(10.0)
     assert optim_cfg.lr.base == pytest.approx(1e-4)
     assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
-    assert optim_cfg.scheduler.warmup_steps == 10_000
+    assert optim_cfg.scheduler.warmup_steps == 1_000
 
 
 def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
@@ -154,7 +157,7 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
                 "    save_steps: 777",
                 "optim:",
                 "  scheduler:",
-                "    warmup_steps: 222",
+                "    warmup_steps: 2",
                 "logging:",
                 "  wandb:",
                 "    enabled: true",
@@ -166,7 +169,7 @@ def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tm
         encoding="utf-8",
     )
     cfg = load_config(cfg_path)
-    assert int(cfg.optim.scheduler.warmup_steps) == 222
+    assert int(cfg.optim.scheduler.warmup_steps) == 2
     assert int(cfg.train.checkpoint.save_steps) == 777
     assert bool(cfg.logging.wandb.enabled) is True
     assert str(cfg.logging.wandb.watch) == "all"
@@ -230,7 +233,7 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
     assert cfg2.train.objective.disc_loss_weight == pytest.approx(10.0)
     assert cfg2.optim.lr.base == pytest.approx(1e-4)
     assert cfg2.optim.adam.epsilon == pytest.approx(1e-6)
-    assert cfg2.optim.scheduler.warmup_steps == 10_000
+    assert cfg2.optim.scheduler.warmup_steps == 1_000
 
     cfg2 = apply_dotted_override(cfg2, "model.backbone_type=rope")
     cfg2 = apply_dotted_override(cfg2, "logging.wandb.watch=all")
@@ -1274,6 +1277,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
             model_cfg=make_model_config(),
             data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
             train_cfg=train_cfg,
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
             logging_cfg=make_logging_config(wandb={"enabled": True}),
         )
 
@@ -1345,6 +1349,7 @@ def test_run_pretraining_logs_crash_save_failure(
                     source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}
                 ),
                 train_cfg=train_cfg,
+                optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
             )
 
     assert any("Final/crash-time checkpoint save failed" in rec.message for rec in caplog.records)
@@ -1390,6 +1395,7 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
             model_cfg=make_model_config(),
             data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
             train_cfg=train_cfg,
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
         )
 
     assert saved_checkpoints

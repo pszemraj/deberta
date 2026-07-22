@@ -10,7 +10,7 @@ import sys
 import types as _types
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -615,6 +615,28 @@ def setup_pretraining_mocks(
     fake_wandb.save = None
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
+    resolve_profile_sections = entrypoint_mod._resolve_entrypoint_profile_sections
+
+    def _resolve_fake_scheduler_profile(*, model_cfg: Any, train_cfg: Any, optim_cfg: Any) -> Any:
+        resolved_train, resolved_optim = resolve_profile_sections(
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            optim_cfg=optim_cfg,
+        )
+        if optim_cfg is None:
+            resolved_optim = replace(
+                resolved_optim,
+                scheduler=replace(resolved_optim.scheduler, type="constant"),
+            )
+        return resolved_train, resolved_optim
+
+    # The shared fake scheduler is constant, so omitted optimizer sections must resolve to the
+    # same policy for cross-section validation and persisted test snapshots.
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "_resolve_entrypoint_profile_sections",
+        _resolve_fake_scheduler_profile,
+    )
     monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
     monkeypatch.setattr(entrypoint_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)

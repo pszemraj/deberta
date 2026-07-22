@@ -9,7 +9,7 @@
 # The repository is pre-stable. Persisted resume/export snapshots carry a schema version, and incompatible versions are rejected rather than migrated.
 #
 # Backbone-profile omission defaults
-# Six leaves have backbone-dependent omission behavior: `train.objective.mask_token_prob`, `train.objective.random_token_prob`, `train.objective.disc_loss_weight`, `optim.lr.base`, `optim.adam.epsilon`, and `optim.scheduler.warmup_steps`.
+# Five leaves have backbone-dependent omission behavior: `train.objective.mask_token_prob`, `train.objective.random_token_prob`, `train.objective.disc_loss_weight`, `optim.lr.base`, and `optim.adam.epsilon`.
 # Their native/RoPE defaults are documented on each leaf. Any explicit file value wins, including a value equal to the dataclass schema default.
 #
 # Run outputs
@@ -242,7 +242,7 @@
 # Seeds initialization, corruption, and data-order setup; exact results still depend on topology, workers, source behavior, and nondeterministic kernels.
 
 # [train.max_steps] int = 10000; must be >= 1.
-# Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. On resume, a value <= restored global step performs no optimization.
+# Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. For every scheduler except constant, this value must exceed `optim.scheduler.warmup_steps`. On resume, a value <= restored global step performs no optimization.
 
 # [train.per_device_train_batch_size] int = 4; must be >= 1.
 # Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Tune against VRAM before increasing accumulation.
@@ -363,8 +363,8 @@
 # [optim.scheduler.type] str = "linear"; values: "linear" | "cosine" | "cosine_with_restarts" | "polynomial" | "constant" | "constant_with_warmup".
 # Linear/cosine/polynomial decay after warmup; restarts adds cycles; constant ignores warmup; constant_with_warmup warms then holds. Linear is the parity default.
 
-# [optim.scheduler.warmup_steps] int; schema default 10000; omission is 10000 for native and 1000 for RoPE; must be >= 0.
-# Ignored by constant scheduling. Keep it meaningfully below `train.max_steps`; for a very short learning-signal run, use constant or constant_with_warmup and a small warmup.
+# [optim.scheduler.warmup_steps] int = 1000; must be >= 0 and, for every scheduler type except constant, strictly less than `train.max_steps`.
+# Constant ignores this value and accepts any nonnegative setting. Other schedulers ramp throughout warmup, so equality would consume the entire run without reaching the configured learning rate before the last update. The 1000-step default is 10% of the default training horizon; use 0 or another proportionally small value for short runs.
 
 # [optim.weight_decay] float = 0.01; must be finite and >= 0.
 # AdamW decay for decay-eligible groups; 0 disables it. 0.01 is the project starting point.

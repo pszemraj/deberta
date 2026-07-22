@@ -46,6 +46,9 @@ def test_main_cli_train_subcommand_loads_yaml(tmp_path: Path, monkeypatch: pytes
                 "    max_seq_length: 32",
                 "train:",
                 "  max_steps: 5",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 0",
             ]
         ),
         encoding="utf-8",
@@ -74,7 +77,7 @@ def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
                 "  source:",
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
-                "  max_steps: 5",
+                "  max_steps: 5000",
                 "optim:",
                 "  scheduler:",
                 "    warmup_steps: 1000",
@@ -123,6 +126,9 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 5",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 0",
             ]
         ),
         encoding="utf-8",
@@ -268,6 +274,7 @@ def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Pa
             train_cfg=make_train_config(
                 checkpoint={"output_dir": str(out_dir), "overwrite_output_dir": False}, max_steps=5
             ),
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
             config_path=None,
         )
 
@@ -296,6 +303,7 @@ def test_run_pretraining_dry_run_rejects_missing_flash_extra_before_dataset(
                 checkpoint={"output_dir": str(output_dir)},
                 max_steps=5,
             ),
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
         )
 
     assert exc_info.value.__cause__ is import_error
@@ -345,6 +353,7 @@ def test_run_pretraining_dry_run_releases_sample_iterator(
             checkpoint={"output_dir": str(tmp_path / "run")},
             max_steps=5,
         ),
+        optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
     )
 
     assert result["status"] == "ok"
@@ -408,6 +417,33 @@ def test_validate_training_workflow_options_rejects_flash_with_packing():
             ),
             train_cfg=make_train_config(sdpa_kernel="flash"),
         )
+
+
+@pytest.mark.parametrize(
+    "scheduler_type",
+    ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant_with_warmup"],
+)
+def test_validate_training_workflow_options_rejects_full_run_warmup(
+    scheduler_type: str,
+) -> None:
+    with pytest.raises(ValueError, match="warmup_steps must be less than train.max_steps"):
+        validate_training_workflow_options(
+            data_cfg=make_data_config(source={"dataset_name": "dummy"}),
+            train_cfg=make_train_config(max_steps=10),
+            optim_cfg=make_optim_config(
+                scheduler={"type": scheduler_type, "warmup_steps": 10},
+            ),
+        )
+
+
+def test_validate_training_workflow_options_allows_constant_to_ignore_warmup() -> None:
+    validate_training_workflow_options(
+        data_cfg=make_data_config(source={"dataset_name": "dummy"}),
+        train_cfg=make_train_config(max_steps=10),
+        optim_cfg=make_optim_config(
+            scheduler={"type": "constant", "warmup_steps": 10_000},
+        ),
+    )
 
 
 def test_validate_training_workflow_options_allows_flash_when_packed_doc_blocking_disabled():
