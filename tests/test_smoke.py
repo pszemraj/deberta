@@ -1833,7 +1833,10 @@ def test_masked_lm_head_has_only_tied_projection_bias():
 
 
 @pytest.mark.parametrize("backbone_type", ["native", "rope"])
-def test_pretrainer_initializes_only_new_heads_from_backbone_contract(backbone_type: str) -> None:
+def test_pretrainer_uses_repo_owned_initialization_only_for_new_heads(
+    backbone_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
     initializer_range = 0.005
@@ -1866,9 +1869,15 @@ def test_pretrainer_initializes_only_new_heads_from_backbone_contract(backbone_t
             type_vocab_size=0,
             initializer_range=initializer_range,
         )
+        cfg.use_rmsnorm_heads = True
         generator = DebertaRoPEModel(cfg)
         discriminator = DebertaRoPEModel(cfg)
 
+    def _reject_private_initializer(_module: torch.nn.Module) -> None:
+        raise AssertionError("RTD task heads must not use Transformers private initialization APIs")
+
+    monkeypatch.setattr(generator, "_initialize_weights", _reject_private_initializer)
+    monkeypatch.setattr(discriminator, "_initialize_weights", _reject_private_initializer)
     generator_before = {name: value.detach().clone() for name, value in generator.named_parameters()}
     discriminator_before = {name: value.detach().clone() for name, value in discriminator.named_parameters()}
     model = DebertaV3RTDPretrainer(
@@ -1897,6 +1906,12 @@ def test_pretrainer_initializes_only_new_heads_from_backbone_contract(backbone_t
         assert linear.bias is not None
         assert torch.count_nonzero(linear.bias).item() == 0
     assert torch.count_nonzero(model.generator_lm_head.bias).item() == 0
+
+    norms = (model.generator_lm_head.transform.norm, model.discriminator_head.norm)
+    for norm in norms:
+        torch.testing.assert_close(norm.weight, torch.ones_like(norm.weight))
+        if getattr(norm, "bias", None) is not None:
+            torch.testing.assert_close(norm.bias, torch.zeros_like(norm.bias))
 
 
 def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():

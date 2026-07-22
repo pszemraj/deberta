@@ -25,7 +25,7 @@ classifiers = [
 
 dependencies = [
   "torch>=2.9.1",
-  "transformers>=4.45.0",
+  "transformers>=4.45.0,<5",
   "accelerate>=1.6.0",
   "datasets>=3.0.0",
   "safetensors",

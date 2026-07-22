@@ -243,19 +243,25 @@ class MaskedLMHead(nn.Module):
         return F.linear(x, w, b)
 
 
-def _initialize_new_head(*, head: nn.Module, backbone: nn.Module, name: str) -> None:
-    """Initialize a newly attached task head without touching its backbone.
+@torch.no_grad()
+def _initialize_new_head(*, head: nn.Module, config: Any) -> None:
+    """Initialize a newly attached task head from repo-owned config rules.
 
     :param nn.Module head: Newly constructed task head.
-    :param nn.Module backbone: Backbone providing the HF initialization contract.
-    :param str name: Component name used in errors.
-    :raises TypeError: If the backbone cannot initialize newly attached modules.
+    :param Any config: Head config providing ``initializer_range``.
     """
 
-    initialize = getattr(backbone, "_initialize_weights", None)
-    if not callable(initialize):
-        raise TypeError(f"{name} backbone does not expose the required _initialize_weights contract.")
-    head.apply(initialize)
+    initializer_range = float(getattr(config, "initializer_range", 0.02))
+    for module in head.modules():
+        if isinstance(module, nn.Linear):
+            module.weight.normal_(mean=0.0, std=initializer_range)
+            if module.bias is not None:
+                module.bias.zero_()
+        elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+            if module.weight is not None:
+                module.weight.fill_(1.0)
+            if getattr(module, "bias", None) is not None:
+                module.bias.zero_()
 
 
 class EnhancedMaskDecoder(nn.Module):
@@ -603,15 +609,12 @@ class DebertaV3RTDPretrainer(nn.Module):
     ) -> None:
         """Initialize RTD pretrainer wrapper.
 
-        :param nn.Module discriminator_backbone: Discriminator encoder backbone with the
-            ``_initialize_weights`` contract used for newly attached task heads.
-        :param nn.Module generator_backbone: Generator encoder backbone with the
-            ``_initialize_weights`` contract used for newly attached task heads.
+        :param nn.Module discriminator_backbone: Discriminator encoder backbone.
+        :param nn.Module generator_backbone: Generator encoder backbone.
         :param Any disc_config: Discriminator config.
         :param Any gen_config: Generator config.
         :param str embedding_sharing: Embedding-sharing policy (none|es|gdes).
         :param Iterable[int] | None additional_forbidden_token_ids: Extra ids excluded from sampling.
-        :raises TypeError: If either backbone cannot initialize its task head.
         :raises ValueError: If generator ``z_steps`` conflicts with Enhanced Mask Decoding.
         """
         super().__init__()
@@ -636,8 +639,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.generator_lm_head = MaskedLMHead(gen_config)
         _initialize_new_head(
             head=self.generator_lm_head,
-            backbone=self.generator,
-            name="generator",
+            config=gen_config,
         )
 
         # EMD module (only active when gen_config.position_biased_input=False)
@@ -647,8 +649,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.discriminator_head = RTDHead(disc_config)
         _initialize_new_head(
             head=self.discriminator_head,
-            backbone=self.discriminator,
-            name="discriminator",
+            config=disc_config,
         )
 
         self.embedding_sharing = str(embedding_sharing or "none")

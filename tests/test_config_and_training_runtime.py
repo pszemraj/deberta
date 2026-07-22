@@ -68,12 +68,6 @@ class _TinyBackbone(torch.nn.Module):
         super().__init__()
         self.embeddings = EmbeddingsStub(vocab_size, hidden_size)
 
-    def _initialize_weights(self, module: torch.nn.Module) -> None:
-        if isinstance(module, torch.nn.Linear):
-            torch.nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-
     def forward(
         self,
         *,
