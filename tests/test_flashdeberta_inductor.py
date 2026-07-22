@@ -5,6 +5,7 @@ import sys
 
 import pytest
 import torch
+from _config_factories import make_native_deberta_config
 
 
 def test_flash_parity_rejects_empty_case_selection() -> None:
@@ -29,7 +30,6 @@ def test_flash_parity_rejects_empty_case_selection() -> None:
 def test_real_fixed_flash_attention_compiles_with_inductor_and_backward() -> None:
     """The production fixed custom op must remain opaque to real Inductor."""
 
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
     from deberta.modeling.flashdeberta_attention import (
         FlashDisentangledSelfAttention,
         flashdeberta_fixed_import_error,
@@ -38,24 +38,17 @@ def test_real_fixed_flash_attention_compiles_with_inductor_and_backward() -> Non
     if flashdeberta_fixed_import_error() is not None:
         pytest.skip("FlashDeBERTa fixed kernels are unavailable in this environment.")
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
+        flash=True,
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
         type_vocab_size=0,
         relative_attention=True,
         position_buckets=8,
         max_relative_positions=16,
         pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         pad_token_id=0,
         position_biased_input=False,
     )
-    cfg.hf_flash = {}
     attention = FlashDisentangledSelfAttention(cfg).to(device="cuda", dtype=torch.bfloat16)
 
     def _reject_eager(**_kwargs):
@@ -93,7 +86,6 @@ def test_real_fixed_flash_attention_compiles_with_inductor_and_backward() -> Non
 def test_real_docblock_flash_metadata_values_do_not_recompile() -> None:
     from torch._dynamo.utils import counters
 
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
     from deberta.modeling.flashdeberta_attention import (
         FlashDisentangledSelfAttention,
         flashdeberta_docblock_import_error,
@@ -103,24 +95,19 @@ def test_real_docblock_flash_metadata_values_do_not_recompile() -> None:
     if flashdeberta_docblock_import_error() is not None:
         pytest.skip("FlashDeBERTa doc-block kernels are unavailable in this environment.")
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
+        flash=True,
         vocab_size=64,
         hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
         intermediate_size=128,
-        max_position_embeddings=16,
         type_vocab_size=0,
         relative_attention=True,
         position_buckets=8,
         max_relative_positions=16,
         pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         pad_token_id=0,
         position_biased_input=False,
     )
-    cfg.hf_flash = {}
     attention = FlashDisentangledSelfAttention(cfg).to(device="cuda", dtype=torch.bfloat16)
 
     def _reject_eager(**_kwargs):
@@ -241,7 +228,7 @@ def test_flash_microbench_runs_flash_mode() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Flash RTD training.")
 def test_flash_rtd_one_step_forward_backward() -> None:
-    from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
     from deberta.modeling.flashdeberta_attention import (
         FlashDisentangledSelfAttention,
         flashdeberta_fixed_import_error,
@@ -251,20 +238,16 @@ def test_flash_rtd_one_step_forward_backward() -> None:
     if flashdeberta_fixed_import_error() is not None:
         pytest.skip("FlashDeBERTa fixed kernels are unavailable in this environment.")
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
+        flash=True,
         vocab_size=64,
         hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
         intermediate_size=128,
-        max_position_embeddings=16,
         type_vocab_size=0,
         relative_attention=True,
         position_buckets=8,
         max_relative_positions=16,
         pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         pad_token_id=0,
         cls_token_id=1,
         sep_token_id=2,
@@ -272,7 +255,6 @@ def test_flash_rtd_one_step_forward_backward() -> None:
         position_biased_input=False,
     )
     cfg.hf_attention_impl = "flash"
-    cfg.hf_flash = {}
     model = DebertaV3RTDPretrainer(
         discriminator_backbone=DebertaV2Model(cfg),
         generator_backbone=DebertaV2Model(cfg),

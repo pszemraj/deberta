@@ -330,20 +330,20 @@ def test_scaled_swiglu_intermediate_size_rounds_to_multiple_of_128():
     assert disc_cfg.intermediate_size == 2816
 
 
-def test_derive_generator_config_uses_half_depth_for_hf_backbone():
+@pytest.mark.parametrize(
+    ("backbone_type", "expected_layers"),
+    [("hf_deberta_v2", 6), ("rope", 4)],
+    ids=["hf_half_depth", "rope_third_depth"],
+)
+def test_derive_generator_config_uses_backbone_depth_ratio(
+    backbone_type: str,
+    expected_layers: int,
+) -> None:
     base_cfg = BackboneConfigStub(num_hidden_layers=12)
-    model_cfg = make_model_config(backbone_type="hf_deberta_v2", generator={"num_hidden_layers": None})
+    model_cfg = make_model_config(backbone_type=backbone_type, generator={"num_hidden_layers": None})
 
     gen_cfg = builder_mod._derive_generator_config(base_cfg, model_cfg)
-    assert int(gen_cfg.num_hidden_layers) == 6
-
-
-def test_derive_generator_config_keeps_third_depth_default_for_non_hf_backbone():
-    base_cfg = BackboneConfigStub(num_hidden_layers=12)
-    model_cfg = make_model_config(backbone_type="rope", generator={"num_hidden_layers": None})
-
-    gen_cfg = builder_mod._derive_generator_config(base_cfg, model_cfg)
-    assert int(gen_cfg.num_hidden_layers) == 4
+    assert int(gen_cfg.num_hidden_layers) == expected_layers
 
 
 def test_build_backbone_configs_respects_explicit_generator_intermediate_with_swiglu_adjust(

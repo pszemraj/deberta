@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 import torch
+from _config_factories import make_native_deberta_config
 
 from deberta.config import ModelHFFlashConfig
 from deberta.modeling.mask_utils import FlashBatchMeta, build_doc_block_mask, build_doc_segment_metadata
@@ -402,32 +403,36 @@ def test_flashdeberta_route_policy_override_path_changes_routing(tmp_path) -> No
         assert _flash_route_hint_for_docblock_batch(seq_len=1024) == "docblock"
 
 
-def test_flash_padding_route_honors_policy_row_seq_len_bounds(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("bound", "inside", "outside"),
+    [
+        (
+            {"max_seq_len": 1024},
+            {"seq_len": 512, "total_tokens": 512, "batch_size": 1},
+            {"seq_len": 1500, "total_tokens": 1500, "batch_size": 1},
+        ),
+        (
+            {"max_batch_size": 2},
+            {"seq_len": 512, "total_tokens": 1024, "batch_size": 2},
+            {"seq_len": 512, "total_tokens": 2048, "batch_size": 4},
+        ),
+    ],
+    ids=("seq_len", "batch_size"),
+)
+def test_flash_padding_route_honors_policy_row_bounds(
+    tmp_path,
+    bound: dict[str, int],
+    inside: dict[str, int],
+    outside: dict[str, int],
+) -> None:
     from deberta.modeling.flashdeberta_kernel_tuning import flash_padding_route
 
     with _kernel_tuning_overrides(
         tmp_path,
-        {"route_policies": {"padding": [{"seq_bucket": "default", "choice": "varlen", "max_seq_len": 1024}]}},
+        {"route_policies": {"padding": [{"seq_bucket": "default", "choice": "varlen", **bound}]}},
     ):
-        # Both lengths resolve to the default bucket; only the in-bound length
-        # may take the row.
-        assert flash_padding_route(seq_len=512, total_tokens=512, batch_size=1) == "varlen"
-        # Beyond the row's own bound the row must not apply; the resolver
-        # falls back to the conservative default instead.
-        assert flash_padding_route(seq_len=1500, total_tokens=1500, batch_size=1) == "fixed"
-
-
-def test_flash_padding_route_honors_policy_row_batch_size_bounds(tmp_path) -> None:
-    from deberta.modeling.flashdeberta_kernel_tuning import flash_padding_route
-
-    with _kernel_tuning_overrides(
-        tmp_path,
-        {"route_policies": {"padding": [{"seq_bucket": "default", "choice": "varlen", "max_batch_size": 2}]}},
-    ):
-        assert flash_padding_route(seq_len=512, total_tokens=1024, batch_size=2) == "varlen"
-        # Past the row's batch bound the row must not apply, mirroring the
-        # seq_len bound semantics above.
-        assert flash_padding_route(seq_len=512, total_tokens=2048, batch_size=4) == "fixed"
+        assert flash_padding_route(**inside) == "varlen"
+        assert flash_padding_route(**outside) == "fixed"
 
 
 def test_flashdeberta_seq_bucket_override_rows_are_reachable(tmp_path) -> None:
@@ -651,9 +656,8 @@ def _small_deberta_config(
 ):
     """Build a small config for native DeBERTa patch tests."""
 
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
-
-    cfg = DebertaV2Config(
+    return make_native_deberta_config(
+        flash=True,
         vocab_size=64,
         hidden_size=int(hidden_size),
         num_hidden_layers=1,
@@ -670,8 +674,6 @@ def _small_deberta_config(
         pad_token_id=0,
         position_biased_input=False,
     )
-    cfg.hf_flash = {}
-    return cfg
 
 
 def _docblock_attention_config(*, seq_len: int):
@@ -3747,7 +3749,6 @@ def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str
 
 
 def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
     from deberta.modeling.mask_utils import build_doc_block_mask, build_doc_segment_metadata
 
     torch.manual_seed(0)
@@ -3756,11 +3757,10 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
     seq_len = 1024
     # Cross the 64/128-token kernel tile boundaries to exercise ragged tails.
     boundary = 517
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
+        flash=True,
         vocab_size=64,
         hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
         intermediate_size=128,
         max_position_embeddings=seq_len,
         type_vocab_size=0,
@@ -3768,12 +3768,9 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
         position_buckets=32,
         max_relative_positions=seq_len,
         pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         pad_token_id=0,
         position_biased_input=False,
     )
-    cfg.hf_flash = {}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
 
     def _reject_eager(**_kwargs):
@@ -3848,7 +3845,6 @@ def test_docblock_bias_dense_route_matches_eager_on_padded_batch() -> None:
 
 
 def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
     from deberta.modeling.mask_utils import build_doc_block_mask
 
     torch.manual_seed(0)
@@ -3856,11 +3852,10 @@ def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
     dtype = torch.bfloat16
     seq_len = 1024
     active_len = 800
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
+        flash=True,
         vocab_size=64,
         hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
         intermediate_size=128,
         max_position_embeddings=seq_len,
         type_vocab_size=0,
@@ -3868,12 +3863,9 @@ def _run_docblock_bias_padded_parity_check(*, attention_mod) -> None:
         position_buckets=32,
         max_relative_positions=seq_len,
         pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         pad_token_id=0,
         position_biased_input=False,
     )
-    cfg.hf_flash = {}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
 
     def _reject_eager(**_kwargs):
@@ -3940,17 +3932,14 @@ def test_non_prefix_padding_mask_matches_eager_on_cuda() -> None:
 
 
 def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
-    from deberta.modeling.deberta_v2_native import DebertaV2Config
-
     torch.manual_seed(0)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     seq_len = 1024
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
+        flash=True,
         vocab_size=64,
         hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
         intermediate_size=128,
         max_position_embeddings=seq_len,
         type_vocab_size=0,
@@ -3958,12 +3947,9 @@ def _run_non_prefix_padding_parity_check(*, attention_mod) -> None:
         position_buckets=32,
         max_relative_positions=seq_len,
         pos_att_type=["c2p", "p2c"],
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         pad_token_id=0,
         position_biased_input=False,
     )
-    cfg.hf_flash = {}
     attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
     reference = attention_mod._EagerDisentangledSelfAttention(cfg)
     reference.load_state_dict(attention.state_dict())

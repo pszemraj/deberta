@@ -46,3 +46,23 @@ def make_optim_config(**overrides: Any) -> OptimConfig:
 
 def make_logging_config(**overrides: Any) -> LoggingConfig:
     return _build(LoggingConfig(), overrides)
+
+
+def make_native_deberta_config(*, flash: bool = False, **overrides: Any) -> Any:
+    """Build a tiny native DeBERTa config while keeping test-specific behavior explicit."""
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Config
+
+    defaults = {
+        "hidden_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "intermediate_size": 64,
+        "max_position_embeddings": 16,
+        "hidden_dropout_prob": 0.0,
+        "attention_probs_dropout_prob": 0.0,
+    }
+    config = DebertaV2Config(**(defaults | overrides))
+    if flash:
+        config.hf_flash = {}
+    return config

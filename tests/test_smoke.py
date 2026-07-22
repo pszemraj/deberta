@@ -7,6 +7,7 @@ import re
 
 import pytest
 import torch
+from _config_factories import make_native_deberta_config
 from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
@@ -2735,21 +2736,13 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
 
 def test_native_hf_deberta_v2_forward_smoke():
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     model = DebertaV2Model(cfg).eval()
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
@@ -2770,23 +2763,15 @@ def test_native_hf_deberta_v2_forward_smoke():
     ids=["c2p_p2c", "with_p2p"],
 )
 def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_type: str, seed: int):
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type=pos_att_type,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
@@ -2821,14 +2806,11 @@ def test_native_disentangled_signed_bucket_forward_and_gradients_match_definitio
 ) -> None:
     """Each positional term must use the same canonical signed q-k bucket."""
 
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
     torch.manual_seed(17)
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         hidden_size=8,
-        num_hidden_layers=1,
         num_attention_heads=2,
         intermediate_size=16,
         max_position_embeddings=4,
@@ -2837,8 +2819,6 @@ def test_native_disentangled_signed_bucket_forward_and_gradients_match_definitio
         relative_attention=True,
         pos_att_type=term,
         share_att_key=False,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = kernel
     attention = DisentangledSelfAttention(cfg).eval()
@@ -2902,7 +2882,6 @@ def test_native_disentangled_signed_bucket_forward_and_gradients_match_definitio
 def test_native_attention_matches_transformers_reference_on_active_tokens() -> None:
     """Corrected native attention must match the independent HF implementation."""
 
-    from transformers import DebertaV2Config
     from transformers.models.deberta_v2.modeling_deberta_v2 import (
         DisentangledSelfAttention as TransformersDisentangledSelfAttention,
     )
@@ -2910,10 +2889,8 @@ def test_native_attention_matches_transformers_reference_on_active_tokens() -> N
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
     torch.manual_seed(29)
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         hidden_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=4,
         intermediate_size=32,
         max_position_embeddings=8,
         max_relative_positions=8,
@@ -2921,8 +2898,6 @@ def test_native_attention_matches_transformers_reference_on_active_tokens() -> N
         relative_attention=True,
         pos_att_type=["c2p", "p2c"],
         share_att_key=False,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "dynamic"
     reference = TransformersDisentangledSelfAttention(cfg).eval()
@@ -2951,21 +2926,12 @@ def test_native_attention_matches_transformers_reference_on_active_tokens() -> N
 
 @pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])
 def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: str):
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = kernel
     attn = DisentangledSelfAttention(cfg).eval()
@@ -3002,21 +2968,12 @@ def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: s
 def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "cached_bmm"
     attn = DisentangledSelfAttention(cfg).eval()
@@ -3063,21 +3020,12 @@ def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
 def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "dynamic"
     attn = DisentangledSelfAttention(cfg).eval()
@@ -3121,60 +3069,15 @@ def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
     assert {eq for eq, _ in einsum_dtypes} == {"bhqd,hkd->bhqk", "bhkd,hqd->bhkq"}
 
 
-def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
-
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="p2p",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    attn = DisentangledSelfAttention(cfg).eval()
-
-    bsz, nheads, qlen, klen = 2, 4, 8, 8
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
-    query = torch.randn(bsz, nheads, qlen, head_dim)
-    key = torch.randn(bsz, nheads, klen, head_dim)
-    rel_embeddings = torch.randn(2 * cfg.max_position_embeddings, cfg.hidden_size)
-
-    score = attn.disentangled_attention_bias(
-        query_layer=query,
-        key_layer=key,
-        relative_pos=None,
-        rel_embeddings=rel_embeddings,
-        scale_factor=2,  # base 1 + p2p 1
-    )
-    assert score.shape == (bsz, nheads, qlen, klen)
-    assert torch.isfinite(score).all()
-    assert float(score.abs().sum().item()) > 0.0
-
-
-def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
+def test_native_hf_deberta_v2_p2p_bias_is_finite_nonzero_and_respects_scale_factor():
     import math
 
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="p2p",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     attn = DisentangledSelfAttention(cfg).eval()
 
@@ -3202,6 +3105,9 @@ def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
 
     mean_abs_2 = float(score_scale_2.abs().mean().item())
     mean_abs_8 = float(score_scale_8.abs().mean().item())
+    assert score_scale_2.shape == (bsz, nheads, qlen, klen)
+    assert torch.isfinite(score_scale_2).all()
+    assert torch.isfinite(score_scale_8).all()
     assert mean_abs_2 > 0.0
     assert mean_abs_8 > 0.0
     ratio = mean_abs_2 / mean_abs_8
@@ -3210,21 +3116,12 @@ def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
 
 @pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])
 def test_native_hf_deberta_v2_c2p_p2c_bias_respects_scale_factor(kernel: str):
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = kernel
     attn = DisentangledSelfAttention(cfg).eval()
@@ -3278,18 +3175,10 @@ def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
 
 
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
         type_vocab_size=0,
     )
 
@@ -3298,62 +3187,37 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
         _ = DebertaV2Model(cfg)
 
 
-def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
-
-    from transformers import DebertaV2Config
-
+@pytest.mark.parametrize(
+    ("num_hidden_layers", "max_position_embeddings", "mask_kind"),
+    [(1, 16, "fully_masked"), (2, 32, "random")],
+    ids=("fully_masked", "random"),
+)
+def test_native_hf_deberta_v2_stable_attention_masks_stay_finite(
+    num_hidden_layers: int,
+    max_position_embeddings: int,
+    mask_kind: str,
+):
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
+        num_hidden_layers=num_hidden_layers,
+        max_position_embeddings=max_position_embeddings,
         relative_attention=True,
         pos_att_type="c2p|p2c",
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "stable"
     model = DebertaV2Model(cfg).eval()
 
+    if mask_kind == "random":
+        torch.manual_seed(7)
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-
-    with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-    assert torch.isfinite(out).all()
-
-
-def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DebertaV2Model
-
-    cfg = DebertaV2Config(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="c2p|p2c",
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
+    attention_mask = (
+        torch.randint(low=0, high=2, size=input_ids.shape, dtype=torch.long).to(torch.bool)
+        if mask_kind == "random"
+        else torch.zeros_like(input_ids, dtype=torch.bool)
     )
-    cfg.hf_attention_kernel = "stable"
-    model = DebertaV2Model(cfg).eval()
-
-    torch.manual_seed(7)
-    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    attention_mask = torch.randint(low=0, high=2, size=input_ids.shape, dtype=torch.long).to(torch.bool)
 
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -3361,21 +3225,11 @@ def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
 
 
 def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
+    cfg = make_native_deberta_config(
         relative_attention=False,
         pos_att_type="",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     attn = DisentangledSelfAttention(cfg).eval()
     x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
@@ -3408,23 +3262,13 @@ def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
 
 
 def test_native_hf_deberta_v2_stable_compile_step_is_finite():
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
         relative_attention=True,
         pos_att_type="c2p|p2c",
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "stable"
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
@@ -3443,22 +3287,14 @@ def test_native_hf_deberta_v2_stable_compile_step_is_finite():
 
 @pytest.mark.parametrize("relative_attention", [False, True], ids=["plain", "disentangled"])
 def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_attention: bool):
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
     extra = {"relative_attention": True, "pos_att_type": "c2p|p2c"} if relative_attention else {}
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
         **extra,
     )
     model = DebertaV2Model(cfg).eval()
@@ -3475,21 +3311,13 @@ def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_a
 
 
 def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     model = DebertaV2Model(cfg).eval()
 
@@ -3515,17 +3343,10 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
 
 
 def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
         conv_kernel_size=3,
