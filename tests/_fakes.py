@@ -653,10 +653,20 @@ def setup_pretraining_mocks(
     )
     monkeypatch.setattr(entrypoint_mod, "build_backbones", build_backbones_fn)
     monkeypatch.setattr(entrypoint_mod, "DebertaV3RTDPretrainer", rtd_cls)
+
+    def _build_fake_optimizer(
+        model: torch.nn.Module,
+        _cfg: Any,
+        **_kwargs: Any,
+    ) -> torch.optim.Optimizer:
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        optimizer._param_order_digest = "test-param-order"
+        return optimizer
+
     monkeypatch.setattr(
         entrypoint_mod,
         "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
+        _build_fake_optimizer,
     )
     monkeypatch.setattr(
         entrypoint_mod,

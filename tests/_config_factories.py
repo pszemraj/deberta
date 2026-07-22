@@ -6,7 +6,6 @@ from dataclasses import fields, is_dataclass, replace
 from typing import Any, TypeVar
 
 from deberta.config import DataConfig, LoggingConfig, ModelConfig, OptimConfig, TrainConfig
-from deberta.utils.mapping import flatten_mapping
 
 T = TypeVar("T")
 
@@ -21,14 +20,11 @@ def _replace_path(config: T, path: str, value: Any) -> T:
 
 def _build(config: T, overrides: dict[str, Any]) -> T:
     valid = {item.name for item in fields(config)}
-    paths: dict[str, Any] = {}
     for key, value in overrides.items():
         if key in valid and isinstance(value, dict) and is_dataclass(getattr(config, key)):
-            paths.update({f"{key}.{child}": item for child, item in flatten_mapping(value).items()})
+            config = replace(config, **{key: _build(getattr(config, key), value)})
         else:
-            paths[key] = value
-    for path, value in paths.items():
-        config = _replace_path(config, path, value)
+            config = _replace_path(config, key, value)
     return config
 
 

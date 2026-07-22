@@ -266,15 +266,6 @@ def _select_latest_checkpoint(checkpoints: list[tuple[int, Path]]) -> Path | Non
     return max(checkpoints, key=lambda item: item[0])[1]
 
 
-def _find_latest_checkpoint(output_dir: Path) -> Path | None:
-    """Find the highest-step ``checkpoint-*`` directory under ``output_dir``.
-
-    :param Path output_dir: Training output directory.
-    :return Path | None: Latest checkpoint path, or ``None`` if absent.
-    """
-    return _select_latest_checkpoint(_list_checkpoints(output_dir))
-
-
 def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
     """Return whether a checkpoint has non-empty model-weight payloads.
 
@@ -693,7 +684,6 @@ def _list_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
 
 
 __all__ = [
-    "_find_latest_checkpoint",
     "_load_checkpoint_progress_metadata",
     "_parse_checkpoint_step",
     "_prepare_output_dir",

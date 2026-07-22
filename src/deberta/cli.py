@@ -75,11 +75,6 @@ def _run_train(ns: argparse.Namespace) -> None:
     :param argparse.Namespace ns: Parsed train args.
     """
     cfg_path = Path(ns.config).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(str(cfg_path))
-    suffix = cfg_path.suffix.lower()
-    if suffix not in {".json", ".yaml", ".yml"}:
-        raise ValueError("Config file must end with .json, .yaml, or .yml")
     cfg = load_config(cfg_path)
 
     if bool(getattr(ns, "dry_run", False)):

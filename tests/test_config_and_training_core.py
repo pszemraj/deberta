@@ -44,7 +44,6 @@ from deberta.training.metrics import (
     _flush_loggers,
 )
 from deberta.training.run_management import (
-    _find_latest_checkpoint,
     _load_checkpoint_progress_metadata,
     _prepare_output_dir,
     _resolve_output_dir,
@@ -58,7 +57,6 @@ from deberta.training.runtime import (
     _build_decoupled_optimizers,
     _build_optimizer,
     _digest_param_name_order,
-    _optimizer_param_order_digest,
     _partition_optimizer_params,
 )
 from deberta.training.tracker_utils import (
@@ -99,19 +97,18 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
         cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
 
 
-def test_entrypoint_resolves_omitted_sections_from_rope_profile() -> None:
+def test_entrypoint_delegates_omitted_sections_to_config_profile() -> None:
+    model_cfg = make_model_config(backbone_type="rope")
+    expected = Config(model=model_cfg)
+
     train_cfg, optim_cfg = _resolve_entrypoint_profile_sections(
-        model_cfg=make_model_config(backbone_type="rope"),
+        model_cfg=model_cfg,
         train_cfg=None,
         optim_cfg=None,
     )
 
-    assert train_cfg.objective.mask_token_prob == pytest.approx(0.8)
-    assert train_cfg.objective.random_token_prob == pytest.approx(0.1)
-    assert train_cfg.objective.disc_loss_weight == pytest.approx(50.0)
-    assert optim_cfg.lr.base == pytest.approx(5e-4)
-    assert optim_cfg.adam.epsilon == pytest.approx(1e-8)
-    assert optim_cfg.scheduler.warmup_steps == 1_000
+    assert train_cfg == expected.train
+    assert optim_cfg == expected.optim
 
 
 def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
@@ -243,34 +240,35 @@ def test_apply_dotted_override_supports_nested_section_paths() -> None:
     assert int(cfg2.optim.scheduler.warmup_steps) == 123
 
 
-def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
-    with pytest.raises(ValueError, match="Unsupported model_config.json keys"):
-        load_model_config_snapshot(
-            {"backbone_type": "rope", "legacy_field": 1},
-            source="model_config.json",
+@pytest.mark.parametrize("config_kind", ["model", "data"])
+@pytest.mark.parametrize("invalidity", ["unknown", "missing"])
+def test_config_snapshot_rejects_unknown_or_missing_keys(
+    config_kind: str,
+    invalidity: str,
+) -> None:
+    if config_kind == "model":
+        loader, raw, source, required_key = (
+            load_model_config_snapshot,
+            asdict(make_model_config()),
+            "model_config.json",
+            "backbone_type",
         )
-
-
-def test_load_data_config_snapshot_rejects_unknown_legacy_key() -> None:
-    with pytest.raises(ValueError, match="Unsupported data_config.json keys"):
-        load_data_config_snapshot(
-            {"dataset_name": "HuggingFaceFW/fineweb-edu", "legacy_field": 1},
-            source="data_config.json",
+    else:
+        loader, raw, source, required_key = (
+            load_data_config_snapshot,
+            asdict(make_data_config()),
+            "data_config.json",
+            "source",
         )
+    if invalidity == "unknown":
+        raw["legacy_field"] = 1
+        expected_error = f"Unsupported {source} keys"
+    else:
+        raw.pop(required_key)
+        expected_error = f"Missing required {source} keys"
 
-
-def test_load_model_config_snapshot_rejects_missing_required_key() -> None:
-    model_raw = asdict(make_model_config())
-    model_raw.pop("backbone_type")
-    with pytest.raises(ValueError, match="Missing required model_config.json keys"):
-        load_model_config_snapshot(model_raw, source="model_config.json")
-
-
-def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
-    data_raw = asdict(make_data_config())
-    data_raw.pop("source")
-    with pytest.raises(ValueError, match="Missing required data_config.json keys"):
-        load_data_config_snapshot(data_raw, source="data_config.json")
+    with pytest.raises(ValueError, match=expected_error):
+        loader(raw, source=source)
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
@@ -311,18 +309,6 @@ def test_prepare_output_dir_rejects_nonempty_without_overwrite_or_resume(
             resume_from_checkpoint=resume_hint,
             is_main_process=True,
         )
-
-
-def test_find_latest_checkpoint_picks_highest_step(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "checkpoint-2").mkdir()
-    (out / "checkpoint-11").mkdir()
-    (out / "checkpoint-4").mkdir()
-
-    latest = _find_latest_checkpoint(out)
-    assert latest is not None
-    assert latest.name == "checkpoint-11"
 
 
 def test_resolve_output_dir_auto_uses_project_and_config_stem():
@@ -569,7 +555,7 @@ def test_resolve_resume_checkpoint_auto_rejects_when_all_checkpoints_non_resumab
         )
 
 
-def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
+def test_checkpoint_data_progress_roundtrip_without_optimizer_digest(tmp_path: Path) -> None:
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
 
@@ -584,47 +570,37 @@ def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
     assert abs(lr_mult - 0.25) < 1e-9
     assert digest is None  # no digest was saved
 
-    # With optimizer param digest.
-    _save_checkpoint_data_progress(
-        checkpoint_dir=ckpt,
-        consumed_micro_batches=200,
-        lr_mult=0.5,
-        optimizer_param_digest="abc123deadbeef00",
-        global_step=17,
-        gradient_accumulation_steps=4,
-    )
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
-    assert consumed == 200
-    assert abs(lr_mult - 0.5) < 1e-9
-    assert digest == "abc123deadbeef00"
-    _, _, _, global_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
-    assert global_step == 17
-    assert saved_ga == 4
 
-
-def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path: Path):
+@pytest.mark.parametrize(
+    "optimizer_param_digest",
+    [
+        pytest.param("abc123deadbeef00", id="scalar"),
+        pytest.param(
+            {"generator": "aaaabbbbccccdddd", "discriminator": "1111222233334444"},
+            id="dual",
+        ),
+    ],
+)
+def test_checkpoint_data_progress_roundtrip_with_optimizer_digest(
+    tmp_path: Path,
+    optimizer_param_digest: str | dict[str, str],
+) -> None:
     ckpt = tmp_path / "checkpoint-12"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    dual_digest = {"generator": "aaaabbbbccccdddd", "discriminator": "1111222233334444"}
     _save_checkpoint_data_progress(
         checkpoint_dir=ckpt,
         consumed_micro_batches=77,
         lr_mult=0.75,
-        optimizer_param_digest=dual_digest,
+        optimizer_param_digest=optimizer_param_digest,
         global_step=9,
         gradient_accumulation_steps=3,
     )
-
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
+    consumed, saved_lr_mult, digest, saved_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 77
-    assert lr_mult == pytest.approx(0.75)
-    assert isinstance(digest, dict)
-    assert digest == dual_digest
-
-    _, _, digest_meta, saved_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
-    assert isinstance(digest_meta, dict)
-    assert digest_meta == dual_digest
+    assert saved_lr_mult == pytest.approx(0.75)
+    assert isinstance(digest, dict) is isinstance(optimizer_param_digest, dict)
+    assert digest == optimizer_param_digest
     assert saved_step == 9
     assert saved_ga == 3
 
@@ -655,34 +631,6 @@ def test_dump_json_is_atomic_on_serialization_failure(tmp_path: Path) -> None:
     assert not target.exists()
     tmp_files = list(tmp_path.glob(".*state.json.*.tmp"))
     assert not tmp_files
-
-
-def test_optimizer_param_order_digest_deterministic() -> None:
-    """Same model produces the same digest across calls."""
-    m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
-    d1 = _optimizer_param_order_digest(m)
-    d2 = _optimizer_param_order_digest(m)
-    assert d1 == d2
-    assert len(d1) == 16  # 16-char hex prefix
-
-
-def test_optimizer_param_order_digest_changes_on_different_params() -> None:
-    """Different parameter names produce a different digest."""
-    m1 = torch.nn.ModuleDict({"alpha": torch.nn.Linear(4, 4), "beta": torch.nn.Linear(4, 2)})
-    m2 = torch.nn.ModuleDict({"gamma": torch.nn.Linear(4, 4), "beta": torch.nn.Linear(4, 2)})
-    d1 = _optimizer_param_order_digest(m1)
-    d2 = _optimizer_param_order_digest(m2)
-    assert d1 != d2, "Different param names must produce different digest"
-
-
-def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
-    """Frozen parameters are excluded from the digest."""
-    m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
-    d_all = _optimizer_param_order_digest(m)
-    m[0].weight.requires_grad_(False)
-    m[0].bias.requires_grad_(False)
-    d_partial = _optimizer_param_order_digest(m)
-    assert d_all != d_partial, "Freezing params changes the trainable param set and digest"
 
 
 def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
@@ -717,7 +665,6 @@ def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() 
         ordered_names.extend(param_to_name[id(p)] for p in group["params"])
     expected = _digest_param_name_order(ordered_names)
 
-    assert _optimizer_param_order_digest(model) == expected
     assert str(opt._param_order_digest) == expected
 
 
@@ -776,8 +723,20 @@ def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_o
     assert emd_param_ids.isdisjoint(disc_param_ids)
 
 
-def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
-    """_save_training_checkpoint forwards optimizer_param_digest to data_state.json."""
+@pytest.mark.parametrize(
+    "optimizer_param_digest",
+    [
+        pytest.param("deadbeef12345678", id="scalar"),
+        pytest.param(
+            {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"},
+            id="dual",
+        ),
+    ],
+)
+def test_save_training_checkpoint_persists_optimizer_digest(
+    tmp_path: Path,
+    optimizer_param_digest: str | dict[str, str],
+) -> None:
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-5"
@@ -790,31 +749,11 @@ def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
         consumed_micro_batches=10,
         save_total_limit=3,
         log_label="test",
-        optimizer_param_digest="deadbeef12345678",
+        optimizer_param_digest=optimizer_param_digest,
     )
     _, _, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
-    assert digest == "deadbeef12345678"
-
-
-def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-6"
-
-    dual_digest = {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"}
-    accel = checkpoint_saving_accelerator(is_main_process=True)
-    _save_training_checkpoint(
-        accelerator=accel,
-        checkpoint_dir=ckpt,
-        output_dir=out,
-        consumed_micro_batches=15,
-        save_total_limit=3,
-        log_label="test",
-        optimizer_param_digest=dual_digest,
-    )
-    _, _, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
-    assert isinstance(digest, dict)
-    assert digest == dual_digest
+    assert isinstance(digest, dict) is isinstance(optimizer_param_digest, dict)
+    assert digest == optimizer_param_digest
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:

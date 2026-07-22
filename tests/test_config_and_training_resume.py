@@ -1092,6 +1092,7 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
 
     def _build_optimizer(model: torch.nn.Module, _cfg: Any, **_kwargs: Any) -> torch.optim.Optimizer:
         opt = _CountingSGD(model.parameters(), lr=0.1)
+        opt._param_order_digest = "test-param-order"
         opt_ref["opt"] = opt
         return opt
 

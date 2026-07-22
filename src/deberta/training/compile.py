@@ -663,8 +663,6 @@ def _install_stable_backbone_compile_dispatch(
             )
         routed = compiled_masked_routed.get(route) if route is not None else None
         if routed is not None:
-            if flash_meta is None:
-                raise RuntimeError("A compiled routed target requires explicit FlashBatchMeta.")
             return routed[resolved_output_hidden_states](
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -682,10 +680,6 @@ def _install_stable_backbone_compile_dispatch(
             flash_meta=_flash_meta_with_route(flash_meta, route),
         )
 
-    module._compiled_forward_dense = compiled_dense
-    module._compiled_forward_dense_routed = compiled_dense_routed
-    module._compiled_forward_masked = compiled_masked
-    module._compiled_forward_masked_routed = compiled_masked_routed
     module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]
     compiled_targets.extend(
         [

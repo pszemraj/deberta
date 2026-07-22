@@ -115,22 +115,6 @@ def _digest_param_name_order(names: list[str]) -> str:
     return hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
 
 
-def _optimizer_param_order_digest(model: torch.nn.Module) -> str:
-    """Compute digest of trainable parameter names in optimizer insertion order.
-
-    This mirrors `_build_optimizer` ordering (grouped as gen-decay, gen-no-decay,
-    disc-decay, disc-no-decay), not raw ``named_parameters()`` registration order.
-
-    :param torch.nn.Module model: Model whose optimizer ordering to digest.
-    :return str: 16-char hex digest.
-    """
-    partitions = _partition_optimizer_params(model)
-    ordered_names: list[str] = []
-    for key in ("gen_decay", "gen_no_decay", "disc_decay", "disc_no_decay"):
-        ordered_names.extend(partitions[key]["names"])
-    return _digest_param_name_order(ordered_names)
-
-
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
     """Return optimizer kwargs enabling fused AdamW when available.
 

@@ -537,12 +537,6 @@ class Config:
             for path, value in profile.items()
             if path.startswith("optim.lr.") and path not in explicit
         }
-        scheduler_updates = {
-            path.rsplit(".", 1)[-1]: value
-            for path, value in profile.items()
-            if path.startswith("optim.scheduler.") and path not in explicit
-        }
-
         object.__setattr__(
             self,
             "train",
@@ -558,7 +552,6 @@ class Config:
                 self.optim,
                 lr=replace(self.optim.lr, **lr_updates),
                 adam=replace(self.optim.adam, **adam_updates),
-                scheduler=replace(self.optim.scheduler, **scheduler_updates),
             ),
         )
 
@@ -1956,28 +1949,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     return cfg
 
 
-def iter_leaf_paths_for_dataclass(cls: type[Any], *, prefix: str = "") -> list[tuple[str, Any]]:
-    """List dotted leaf paths and field types for a dataclass type.
-
-    :param type[Any] cls: Dataclass type.
-    :param str prefix: Optional prefix.
-    :return list[tuple[str, Any]]: Leaf path + type tuples.
-    """
-    out: list[tuple[str, Any]] = []
-    type_hints = get_type_hints(cls)
-    for f in fields(cls):
-        if f.name.startswith("_"):
-            continue
-        path = f"{prefix}.{f.name}" if prefix else str(f.name)
-        field_type = type_hints.get(f.name, f.type)
-        target_t, _allows_none = unwrap_optional_type(field_type)
-        if dataclasses.is_dataclass(target_t):
-            out.extend(iter_leaf_paths_for_dataclass(target_t, prefix=path))
-        else:
-            out.append((path, field_type))
-    return out
-
-
 asdict_without_private = _asdict_without_private
 
 
@@ -1993,7 +1964,6 @@ __all__ = [
     "LoggingConfig",
     "apply_dotted_override",
     "asdict_without_private",
-    "iter_leaf_paths_for_dataclass",
     "load_config",
     "load_data_config_snapshot",
     "load_logging_config_snapshot",

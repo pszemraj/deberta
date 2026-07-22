@@ -74,7 +74,6 @@ from deberta.training.runtime import (
     _build_scheduler,
     _build_train_dataset_and_collator,
     _cycle_dataloader,
-    _optimizer_param_order_digest,
     _validate_training_configs,
 )
 from deberta.training.steps import (
@@ -631,13 +630,6 @@ def run_pretraining(
     )
 
     effective_decoupled_training = bool(train_cfg.decoupled_training)
-    if effective_decoupled_training and (
-        not hasattr(model, "forward_generator_phase") or not hasattr(model, "forward_discriminator_phase")
-    ):
-        raise RuntimeError(
-            "train.decoupled_training=true requires runtime model methods "
-            "forward_generator_phase and forward_discriminator_phase."
-        )
 
     optimizer: torch.optim.Optimizer | None = None
     lr_scheduler: Any | None = None
@@ -659,8 +651,8 @@ def run_pretraining(
             disc_optimizer, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg
         )
         param_digest = {
-            "generator": str(getattr(gen_optimizer, "_param_order_digest", "")),
-            "discriminator": str(getattr(disc_optimizer, "_param_order_digest", "")),
+            "generator": str(gen_optimizer._param_order_digest),
+            "discriminator": str(disc_optimizer._param_order_digest),
         }
         model, gen_optimizer, disc_optimizer, gen_lr_scheduler, disc_lr_scheduler = accelerator.prepare(
             model, gen_optimizer, disc_optimizer, gen_lr_scheduler, disc_lr_scheduler
@@ -673,10 +665,7 @@ def run_pretraining(
             resolved_optim_cfg,
             mixed_precision=mixed_precision,
         )
-        param_digest = getattr(optimizer, "_param_order_digest", None)
-        if param_digest is None:
-            param_digest = _optimizer_param_order_digest(model)
-        param_digest = str(param_digest)
+        param_digest = str(optimizer._param_order_digest)
         lr_scheduler = _build_scheduler(optimizer, train_cfg=train_cfg, optim_cfg=resolved_optim_cfg)
         model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
         _record_unscaled_lrs(optimizer, lr_scheduler)
@@ -1390,7 +1379,6 @@ def run_pretraining(
                 )
 
                 disc_phase_inputs: list[dict[str, torch.Tensor | float | None]] = []
-                loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 gen_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 disc_loss_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 disc_acc_num = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -1437,7 +1425,6 @@ def run_pretraining(
                             )
                         else:
                             gen_obj = gen_loss
-                        loss_for_metrics = loss_for_metrics + (gen_loss_weight * gen_obj.detach())
 
                         offending: str | None = None
                         if not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all():
@@ -1588,7 +1575,6 @@ def run_pretraining(
                             else:
                                 disc_obj = disc_loss
                             disc_obj = disc_obj * float(disc_objective_weight)
-                            loss_for_metrics = loss_for_metrics + (disc_loss_weight * disc_obj.detach())
                             offending = None
                             if not torch.isfinite(disc_phase_out.disc_loss_raw.detach()).all():
                                 offending = "disc_loss_raw"
@@ -1721,12 +1707,6 @@ def run_pretraining(
                     consumed_micro_batches_committed=consumed_micro_batches_committed,
                     lr_mult=lr_mult,
                     last_saved_step=last_saved_step,
-                )
-
-            if global_step < int(train_cfg.max_steps):
-                raise RuntimeError(
-                    "Decoupled training exited before reaching train.max_steps; "
-                    "refusing to fall through into joint-training semantics."
                 )
 
         while not effective_decoupled_training and global_step < int(train_cfg.max_steps):
@@ -1916,30 +1896,27 @@ def run_pretraining(
                 token_weighted_ga=token_weighted_ga,
             )
 
-            if did_optimizer_step:
-                if out is None:
-                    raise RuntimeError("Accumulation window produced no forward pass outputs.")
-                _commit_training_window()
+            _commit_training_window()
 
-                _maybe_log_training_metrics(
-                    lr_scheduler=lr_scheduler,
-                    gen_loss_num=gen_loss_num,
-                    gen_token_count_window=gen_token_count_window,
-                    disc_loss_num=disc_loss_num,
-                    disc_acc_num=disc_acc_num,
-                    disc_token_count_window=disc_token_count_window,
-                    disc_positive_count_window=disc_positive_count_window,
-                    loss_override=float(
-                        accelerator.gather(loss_for_metrics.detach().float().reshape(1)).mean().item()
-                    ),
-                )
+            _maybe_log_training_metrics(
+                lr_scheduler=lr_scheduler,
+                gen_loss_num=gen_loss_num,
+                gen_token_count_window=gen_token_count_window,
+                disc_loss_num=disc_loss_num,
+                disc_acc_num=disc_acc_num,
+                disc_token_count_window=disc_token_count_window,
+                disc_positive_count_window=disc_positive_count_window,
+                loss_override=float(
+                    accelerator.gather(loss_for_metrics.detach().float().reshape(1)).mean().item()
+                ),
+            )
 
-                last_saved_step = _save_checkpoint_if_due(
-                    global_step=global_step,
-                    consumed_micro_batches_committed=consumed_micro_batches_committed,
-                    lr_mult=lr_mult,
-                    last_saved_step=last_saved_step,
-                )
+            last_saved_step = _save_checkpoint_if_due(
+                global_step=global_step,
+                consumed_micro_batches_committed=consumed_micro_batches_committed,
+                lr_mult=lr_mult,
+                last_saved_step=last_saved_step,
+            )
 
     except KeyboardInterrupt as exc:
         exit_code = 130
