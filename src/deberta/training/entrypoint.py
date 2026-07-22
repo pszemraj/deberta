@@ -1961,6 +1961,7 @@ def run_pretraining(
                 train_progress.close()
 
         # Attempt a final checkpoint if we progressed and this exact step wasn't already saved.
+        final_checkpoint_error: Exception | None = None
         final_step = int(global_step)
         should_try_crash_save = (crash_reason is None) or int(getattr(accelerator, "num_processes", 1)) == 1
         if final_step > 0 and final_step != int(last_saved_step) and should_try_crash_save:
@@ -1980,6 +1981,9 @@ def run_pretraining(
                 )
                 last_saved_step = final_step
             except Exception as save_exc:
+                if crash_reason is None:
+                    exit_code = 1
+                    final_checkpoint_error = save_exc
                 logger.error(
                     "Final/crash-time checkpoint save failed at step %d: %s. "
                     "Progress since checkpoint-%d may be lost.",
@@ -1999,6 +2003,7 @@ def run_pretraining(
         if (
             bool(train_cfg.checkpoint.export_hf_final)
             and crash_reason is None
+            and final_checkpoint_error is None
             and bool(getattr(accelerator, "is_main_process", True))
         ):
             export_step = int(global_step)
@@ -2062,5 +2067,7 @@ def run_pretraining(
                     accelerator.end_training()
 
         _flush_loggers()
+        if final_checkpoint_error is not None:
+            raise final_checkpoint_error
         if final_export_error is not None:
             raise final_export_error

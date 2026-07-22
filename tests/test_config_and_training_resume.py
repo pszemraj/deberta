@@ -710,7 +710,7 @@ def test_run_pretraining_final_export_is_strict(
                 train_cfg=train_cfg,
                 logging_cfg=make_logging_config(wandb={"enabled": True, "watch": "none"}),
             )
-    elif export_case in {"missing_checkpoint", "final_save_failure"}:
+    elif export_case == "missing_checkpoint":
         with pytest.raises(FileNotFoundError, match="Cannot export the final training step") as exc_info:
             pretrain_mod.run_pretraining(
                 model_cfg=make_model_config(backbone_type="rope"),
@@ -721,6 +721,16 @@ def test_run_pretraining_final_export_is_strict(
                 logging_cfg=make_logging_config(wandb={"enabled": True, "watch": "none"}),
             )
         assert f"checkpoint-{max_steps}" in str(exc_info.value)
+    elif export_case == "final_save_failure":
+        with pytest.raises(RuntimeError, match="checkpoint save failed"):
+            pretrain_mod.run_pretraining(
+                model_cfg=make_model_config(backbone_type="rope"),
+                data_cfg=make_data_config(
+                    source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}
+                ),
+                train_cfg=train_cfg,
+                logging_cfg=make_logging_config(wandb={"enabled": True, "watch": "none"}),
+            )
     else:
         pretrain_mod.run_pretraining(
             model_cfg=make_model_config(backbone_type="rope"),
