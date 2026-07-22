@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from deberta.modeling.rtd import attention_mask_to_active_tokens
+from deberta.modeling.mask_utils import attention_mask_to_active_tokens
 
 
 def _count_rtd_tokens_for_batch(

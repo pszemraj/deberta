@@ -653,7 +653,7 @@ def test_collator_keeps_document_ids_for_single_doc_packed_chunk():
 def _assert_active_token_definitions_agree(batch, *, expected_active: int) -> None:
     """Pin every production active-token definition for one collator batch."""
 
-    from deberta.modeling.rtd import attention_mask_to_active_tokens
+    from deberta.modeling.mask_utils import attention_mask_to_active_tokens
     from deberta.training.compile import prepare_flash_attention_batch_metadata
     from deberta.training.loop_utils import _count_input_tokens_for_batch, _count_rtd_tokens_for_batch
 

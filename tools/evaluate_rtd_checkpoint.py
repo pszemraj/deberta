@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 from deberta.config import load_config
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
-from deberta.modeling.rtd import attention_mask_to_active_tokens
+from deberta.modeling.mask_utils import attention_mask_to_active_tokens
 from deberta.training.runtime import _build_train_dataset_and_collator
 from deberta.utils.checkpoint import load_model_state_with_compile_key_remap
 

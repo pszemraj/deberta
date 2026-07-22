@@ -42,41 +42,15 @@ from deberta.modeling.mask_utils import (
     FlashBatchMeta,
     expand_keep_mask_to_4d,
     is_pairwise_mask,
-    reduce_keep_mask_to_2d,
+)
+from deberta.modeling.mask_utils import (
+    attention_mask_to_active_tokens as _attention_mask_to_active_tokens,
 )
 
 try:
     from torch.distributed.tensor import DTensor as _TorchDTensor
 except Exception:  # pragma: no cover - optional distributed dependency
     _TorchDTensor = None
-
-
-# -----------------------------------------------------------------------------
-# Mask utilities
-# -----------------------------------------------------------------------------
-
-
-def attention_mask_to_active_tokens(
-    *,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Convert optional attention mask variants into a 2D active-token mask.
-
-    We support the mask layouts used throughout this codebase:
-    - (B,S) key-padding mask
-    - (B,S,S) pairwise keep mask
-    - (B,H,S,S) head-specific keep mask
-
-    :param torch.Tensor input_ids: Input ids with shape ``(B,S)``.
-    :param torch.Tensor | None attention_mask: Optional keep mask in rank-2/3/4 layout.
-    :return torch.Tensor: Boolean active-token mask with shape ``(B,S)``.
-    """
-
-    if attention_mask is None:
-        return torch.ones_like(input_ids, dtype=torch.bool)
-
-    return reduce_keep_mask_to_2d(attention_mask)
 
 
 def _is_sharded_dtensor(tensor: torch.Tensor) -> bool:
@@ -1063,7 +1037,7 @@ class DebertaV3RTDPretrainer(nn.Module):
             flash_meta=flash_meta,
         )
 
-        active = attention_mask_to_active_tokens(
+        active = _attention_mask_to_active_tokens(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )

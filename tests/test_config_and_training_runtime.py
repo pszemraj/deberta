@@ -34,8 +34,7 @@ from deberta.config import (
     validate_logging_config,
     validate_train_config,
 )
-from deberta.modeling.mask_utils import normalize_keep_mask
-from deberta.modeling.rtd import attention_mask_to_active_tokens
+from deberta.modeling.mask_utils import attention_mask_to_active_tokens, normalize_keep_mask
 from deberta.training.checkpointing import _resolve_data_resume_policy
 from deberta.training.compile import (
     _compile_backbones_for_scope,

@@ -269,6 +269,23 @@ def reduce_keep_mask_to_2d(attention_mask: torch.Tensor, *, seq_len: int | None 
     return mask
 
 
+def attention_mask_to_active_tokens(
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Convert an optional keep mask into a 2D active-token mask.
+
+    :param torch.Tensor input_ids: Input ids with shape ``(B,S)``.
+    :param torch.Tensor | None attention_mask: Optional keep mask in rank-2/3/4 layout.
+    :return torch.Tensor: Boolean active-token mask with shape ``(B,S)``.
+    """
+
+    if attention_mask is None:
+        return torch.ones_like(input_ids, dtype=torch.bool)
+    return reduce_keep_mask_to_2d(attention_mask)
+
+
 def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     """Build a dense pairwise keep mask from compact document ids.
 
@@ -295,19 +312,58 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     return keep
 
 
+def build_doc_segment_boundaries(
+    doc_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the active mask and boundary indices for contiguous document segments.
+
+    :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
+    :raises ValueError: If ``doc_ids`` is not rank 2.
+    :raises RuntimeError: If segment start/end counts disagree.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Active-token mask,
+        segment-start indices, and segment-end indices.
+    """
+
+    if doc_ids.ndim != 2:
+        raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
+
+    active = doc_ids.ne(0)
+    if not bool(active.any().item()):
+        empty = torch.empty((0, 2), device=doc_ids.device, dtype=torch.long)
+        return active, empty, empty
+
+    previous = torch.zeros_like(doc_ids)
+    previous[:, 1:] = doc_ids[:, :-1]
+    following = torch.zeros_like(doc_ids)
+    following[:, :-1] = doc_ids[:, 1:]
+
+    start_idx = (active & doc_ids.ne(previous)).nonzero(as_tuple=False)
+    end_idx = (active & doc_ids.ne(following)).nonzero(as_tuple=False)
+    if int(start_idx.shape[0]) != int(end_idx.shape[0]):
+        raise RuntimeError("doc-block segment boundary count mismatch.")
+    return active, start_idx, end_idx
+
+
 def build_doc_segment_metadata(
     doc_ids: torch.Tensor,
+    *,
+    boundaries: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Build contiguous document-segment metadata from compact ``doc_ids``.
 
     :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
+    :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None boundaries:
+        Optional output from :func:`build_doc_segment_boundaries` for the same ``doc_ids``.
     :raises ValueError: If ``doc_ids`` is not rank 2.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]: Flat padded segment offsets,
         segment lengths, cumulative packed offsets, and total active tokens.
     """
 
-    if doc_ids.ndim != 2:
+    if boundaries is None:
+        boundaries = build_doc_segment_boundaries(doc_ids)
+    elif doc_ids.ndim != 2:
         raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
+    _, start_idx, end_idx = boundaries
 
     batch_size, seq_len = int(doc_ids.shape[0]), int(doc_ids.shape[1])
     max_segments = max(1, batch_size * seq_len)
@@ -315,22 +371,8 @@ def build_doc_segment_metadata(
     segment_lengths_padded = torch.zeros((max_segments,), device=doc_ids.device, dtype=torch.int32)
     cu_seqlens_padded = torch.zeros((max_segments + 1,), device=doc_ids.device, dtype=torch.int32)
 
-    active = doc_ids.ne(0)
-    if not bool(active.any().item()):
+    if int(start_idx.shape[0]) == 0:
         return segment_offsets_padded, segment_lengths_padded, cu_seqlens_padded, 0
-
-    prev = torch.zeros_like(doc_ids)
-    prev[:, 1:] = doc_ids[:, :-1]
-    next_ids = torch.zeros_like(doc_ids)
-    next_ids[:, :-1] = doc_ids[:, 1:]
-
-    start_mask = active & doc_ids.ne(prev)
-    end_mask = active & doc_ids.ne(next_ids)
-
-    start_idx = start_mask.nonzero(as_tuple=False)
-    end_idx = end_mask.nonzero(as_tuple=False)
-    if int(start_idx.shape[0]) != int(end_idx.shape[0]):
-        raise RuntimeError("doc-block segment boundary count mismatch.")
 
     segment_starts = start_idx[:, 1].to(dtype=torch.int32)
     segment_ends = end_idx[:, 1].to(dtype=torch.int32)
@@ -351,6 +393,8 @@ def build_doc_segment_metadata(
 
 __all__ = [
     "FlashBatchMeta",
+    "attention_mask_to_active_tokens",
+    "build_doc_segment_boundaries",
     "build_validated_prefix_lengths",
     "build_doc_block_mask",
     "build_doc_segment_metadata",

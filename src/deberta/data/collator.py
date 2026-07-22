@@ -12,6 +12,7 @@ import torch
 
 from deberta.modeling.mask_utils import (
     FlashBatchMeta,
+    build_doc_segment_boundaries,
     build_doc_segment_metadata,
     build_validated_prefix_lengths,
 )
@@ -147,9 +148,18 @@ class DebertaV3ElectraCollator:
             batch.pop("doc_ids", None)
         if doc_ids is not None:
             batch["doc_ids"] = doc_ids
-            self._attach_document_objective_metadata(batch=batch, doc_ids=doc_ids)
+            boundaries = build_doc_segment_boundaries(doc_ids)
+            self._attach_document_objective_metadata(
+                batch=batch,
+                doc_ids=doc_ids,
+                boundaries=boundaries,
+            )
             if self._emit_flash_metadata:
-                self._attach_flash_doc_metadata(batch=batch, doc_ids=doc_ids)
+                self._attach_flash_doc_metadata(
+                    batch=batch,
+                    doc_ids=doc_ids,
+                    boundaries=boundaries,
+                )
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
@@ -170,14 +180,24 @@ class DebertaV3ElectraCollator:
         return batch
 
     @staticmethod
-    def _attach_flash_doc_metadata(*, batch: dict[str, Any], doc_ids: torch.Tensor) -> None:
+    def _attach_flash_doc_metadata(
+        *,
+        batch: dict[str, Any],
+        doc_ids: torch.Tensor,
+        boundaries: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
         """Attach CPU-built flash metadata for compact doc-block batches.
 
         :param dict[str, Any] batch: Collated batch mapping.
         :param torch.Tensor doc_ids: Compact document ids in ``(B,S)`` layout.
+        :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] boundaries: Precomputed
+            active-token mask and segment start/end indices.
         """
 
-        segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(doc_ids)
+        segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(
+            doc_ids,
+            boundaries=boundaries,
+        )
         active_segment_lengths = segment_lengths[segment_lengths.ne(0)]
         num_segments = int(active_segment_lengths.numel())
         max_segment_length = int(active_segment_lengths.max()) if num_segments else 0
@@ -195,30 +215,32 @@ class DebertaV3ElectraCollator:
         *,
         batch: dict[str, Any],
         doc_ids: torch.Tensor,
+        boundaries: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> None:
         """Attach document-local positions and per-token CLS context indices.
 
         :param dict[str, Any] batch: Collated batch mapping.
         :param torch.Tensor doc_ids: Validated document ids in ``(B,S)`` layout.
+        :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] boundaries: Precomputed
+            active-token mask and segment start/end indices.
         :raises ValueError: If any active segment does not have standalone CLS/SEP boundaries.
         """
 
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask")
-        active = (
+        active, start_idx, end_idx = boundaries
+        expected_active = (
             attention_mask.to(dtype=torch.bool)
             if isinstance(attention_mask, torch.Tensor)
             else torch.ones_like(doc_ids, dtype=torch.bool)
         )
-        if not torch.equal(doc_ids.ne(0), active):
+        if not torch.equal(active, expected_active):
             raise ValueError("Packed doc_ids liveness disagrees with attention_mask.")
 
         batch_size, seq_len = doc_ids.shape
         positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        previous = torch.zeros_like(doc_ids)
-        previous[:, 1:] = doc_ids[:, :-1]
-        segment_starts = active & doc_ids.ne(previous)
-        start_positions = torch.where(segment_starts, positions, torch.zeros_like(positions))
+        start_positions = torch.zeros_like(positions)
+        start_positions[start_idx[:, 0], start_idx[:, 1]] = positions[start_idx[:, 0], start_idx[:, 1]]
         doc_context_index = torch.cummax(start_positions, dim=-1).values
 
         cls_token_id = getattr(self.tokenizer, "cls_token_id", None)
@@ -231,10 +253,7 @@ class DebertaV3ElectraCollator:
         sep_token_id = getattr(self.tokenizer, "sep_token_id", None)
         if sep_token_id is None:
             raise ValueError("Packed document segments require tokenizer.sep_token_id.")
-        following = torch.zeros_like(doc_ids)
-        following[:, :-1] = doc_ids[:, 1:]
-        segment_ends = active & doc_ids.ne(following)
-        if bool(input_ids[segment_ends].ne(int(sep_token_id)).any().item()):
+        if bool(input_ids[end_idx[:, 0], end_idx[:, 1]].ne(int(sep_token_id)).any().item()):
             raise ValueError("Every packed document segment must end with its own SEP token.")
 
         position_ids = (positions - doc_context_index).masked_fill(~active, 0)
@@ -464,15 +483,7 @@ class DebertaV3ElectraCollator:
             tok = str(tok)
             if not tok or tok in special_tokens:
                 continue
-            if tok.startswith("##"):
-                continuation[i] = True
-                continue
-            if scheme == "sentencepiece":
-                continuation[i] = not tok.startswith("▁")
-            elif scheme == "gpt2":
-                continuation[i] = not tok.startswith("Ġ")
-            elif scheme == "wordpiece":
-                continuation[i] = False
+            continuation[i] = self._is_word_continuation_token(tok, scheme=scheme)
         return continuation
 
     def _infer_word_boundary_scheme_from_tokens(self, tokens: Sequence[str]) -> str:
@@ -488,6 +499,23 @@ class DebertaV3ElectraCollator:
         if any(tok.startswith("Ġ") for tok in tokens):
             return "gpt2"
         return "none"
+
+    @staticmethod
+    def _is_word_continuation_token(token: str, *, scheme: str | None) -> bool:
+        """Return whether a token string continues the preceding word.
+
+        :param str token: Token string from the tokenizer vocabulary.
+        :param str | None scheme: Detected tokenizer boundary scheme.
+        :return bool: True when the token should join the preceding word group.
+        """
+
+        if token.startswith("##"):
+            return True
+        if scheme == "sentencepiece":
+            return not token.startswith("▁")
+        if scheme == "gpt2":
+            return not token.startswith("Ġ")
+        return False
 
     def _mask_tokens(
         self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
@@ -829,26 +857,6 @@ class DebertaV3ElectraCollator:
             scheme = self._infer_word_boundary_scheme_from_tokens(lexical_tokens)
             self._word_boundary_scheme = scheme
 
-        def _is_continuation(tok: str) -> bool:
-            """Detect whether token text continues the previous word.
-
-            :param str tok: Token string from tokenizer.
-            :return bool: True if token should join previous group.
-            """
-            if tok.startswith("##"):
-                return True
-            if scheme == "sentencepiece":
-                return not tok.startswith("▁")
-            if scheme == "gpt2":
-                return not tok.startswith("Ġ")
-            # WordPiece tokenizers often emit plain tokens for word starts and
-            # reserve only '##' for continuations.
-            if scheme == "wordpiece":
-                return False
-            # Conservative fallback: if we cannot infer continuation markers,
-            # avoid over-merging unrelated adjacent tokens.
-            return False
-
         for i, (tok, is_spec) in enumerate(zip(tokens, spec, strict=True)):
             if is_spec:
                 prev_i = None
@@ -870,7 +878,7 @@ class DebertaV3ElectraCollator:
                 start_new = True
             else:
                 # Adjacent: decide based on token string.
-                if not _is_continuation(tok):
+                if not self._is_word_continuation_token(tok, scheme=scheme):
                     start_new = True
 
             if start_new:
