@@ -19,6 +19,7 @@ kernel policy.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from functools import lru_cache, partial
 from typing import Any
 
@@ -107,23 +108,31 @@ def _should_use_varlen(
     )
 
 
-def _resolve_docblock_scalars(
-    flash_meta: FlashBatchMeta | None,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Resolve doc-block active-token/segment scalars from flash metadata.
+def _require_flash_route_available(
+    *,
+    route: str,
+    import_error: Exception | None,
+    compiled_available: Callable[[], bool],
+) -> None:
+    """Require runtime and compile support for one selected flash route.
 
-    :param FlashBatchMeta | None flash_meta: Optional flash metadata bundle.
-    :return tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        ``(active_tokens, num_segments, max_segment_length)`` as scalar tensors.
+    :param str route: Selected FlashDeBERTa route name.
+    :param Exception | None import_error: Route import failure, if any.
+    :param Callable[[], bool] compiled_available: Compile-visible availability probe.
+    :raises RuntimeError: If the selected route is unavailable.
     """
 
-    if flash_meta is None:
-        return None, None, None
-    return (
-        flash_meta.active_tokens_scalar,
-        flash_meta.doc_num_segments_scalar,
-        flash_meta.doc_max_segment_length_scalar,
-    )
+    if import_error is not None:
+        raise RuntimeError(
+            f"The selected FlashDeBERTa {route} route is unavailable. "
+            "Install the project with the flash extra (`pip install -e '.[flash]'`) "
+            "and ensure its Triton kernels are compatible with the installed PyTorch build."
+        ) from import_error
+    if is_torch_compiling() and not compiled_available():
+        raise RuntimeError(
+            f"The selected FlashDeBERTa {route} route has no compile-visible "
+            "Triton implementation in this environment."
+        )
 
 
 @lru_cache(maxsize=8)
@@ -725,22 +734,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 key_len=int(hidden_states.shape[-2]),
             ):
                 return fallback_to_eager()
-            bias_import_error = flashdeberta_bias_import_error()
-            if bias_import_error is not None:
-                raise RuntimeError(
-                    "The selected FlashDeBERTa docblock_bias route is unavailable. "
-                    "Install the project with the flash extra (`pip install -e '.[flash]'`) "
-                    "and ensure its Triton kernels are compatible with the installed PyTorch build."
-                ) from bias_import_error
-            if is_torch_compiling() and not flashdeberta_compiled_position_bias_available():
-                raise RuntimeError(
-                    "The selected FlashDeBERTa docblock_bias route has no compile-visible "
-                    "Triton implementation in this environment."
-                )
+            _require_flash_route_available(
+                route="docblock_bias",
+                import_error=flashdeberta_bias_import_error(),
+                compiled_available=flashdeberta_compiled_position_bias_available,
+            )
 
         if use_docblock:
-            docblock_active_tokens, docblock_num_segments, docblock_max_segment = _resolve_docblock_scalars(
-                flash_meta
+            docblock_active_tokens = flash_meta.active_tokens_scalar if flash_meta is not None else None
+            docblock_num_segments = flash_meta.doc_num_segments_scalar if flash_meta is not None else None
+            docblock_max_segment = (
+                flash_meta.doc_max_segment_length_scalar if flash_meta is not None else None
             )
             if (
                 flash_meta is None
@@ -752,32 +756,18 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
                 or docblock_max_segment is None
             ):
                 return fallback_to_eager()
-            docblock_import_error = flashdeberta_docblock_import_error()
-            if docblock_import_error is not None:
-                raise RuntimeError(
-                    "The selected FlashDeBERTa docblock route is unavailable. "
-                    "Install the project with the flash extra (`pip install -e '.[flash]'`) "
-                    "and ensure its Triton kernels are compatible with the installed PyTorch build."
-                ) from docblock_import_error
-            if is_torch_compiling() and not flashdeberta_compiled_docblock_available():
-                raise RuntimeError(
-                    "The selected FlashDeBERTa docblock route has no compile-visible "
-                    "Triton implementation in this environment."
-                )
+            _require_flash_route_available(
+                route="docblock",
+                import_error=flashdeberta_docblock_import_error(),
+                compiled_available=flashdeberta_compiled_docblock_available,
+            )
 
         if use_varlen and not use_docblock:
-            varlen_import_error = flashdeberta_varlen_import_error()
-            if varlen_import_error is not None:
-                raise RuntimeError(
-                    "The selected FlashDeBERTa varlen route is unavailable. "
-                    "Install the project with the flash extra (`pip install -e '.[flash]'`) "
-                    "and ensure its Triton kernels are compatible with the installed PyTorch build."
-                ) from varlen_import_error
-            if is_torch_compiling() and not flashdeberta_compiled_varlen_available():
-                raise RuntimeError(
-                    "The selected FlashDeBERTa varlen route has no compile-visible "
-                    "Triton implementation in this environment."
-                )
+            _require_flash_route_available(
+                route="varlen",
+                import_error=flashdeberta_varlen_import_error(),
+                compiled_available=flashdeberta_compiled_varlen_available,
+            )
 
         if use_varlen:
             query_layer = self._shape_varlen(self.query_proj(query_states))

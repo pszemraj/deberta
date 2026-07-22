@@ -14,6 +14,7 @@ gradients with cached row-range metadata derived from the bucket map.
 from __future__ import annotations
 
 import weakref
+from typing import cast
 
 import torch
 
@@ -132,7 +133,6 @@ def _dense_bias_forward_fallback(
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
     :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the final additive bias.
-    :raises RuntimeError: If both positional terms are missing.
     :return torch.Tensor: Scaled dense additive bias in ``(B,H,S,S)`` layout.
     """
 
@@ -153,9 +153,7 @@ def _dense_bias_forward_fallback(
         else:
             bias.add_(p2c_bias)
 
-    if bias is None:  # pragma: no cover - guarded by callers
-        raise RuntimeError("Dense flash bias construction requires at least one positional term.")
-
+    bias = cast(torch.Tensor, bias)
     bias.mul_(float(scale))
     if keep_mask is not None:
         bias.masked_fill_(~keep_mask, -1.0e4 * float(scale))
@@ -499,13 +497,10 @@ def _dense_bias_forward_cuda(
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
     :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the final additive bias.
-    :raises RuntimeError: If both positional terms are missing.
     :return torch.Tensor: Scaled dense additive bias in ``(B,H,S,S)`` layout.
     """
 
-    reference = pos_key if pos_key is not None else pos_query
-    if reference is None:
-        raise RuntimeError("Dense flash bias construction requires at least one positional term.")
+    reference = cast(torch.Tensor, pos_key if pos_key is not None else pos_query)
 
     batch_size, num_heads, seq_len = int(reference.shape[0]), int(reference.shape[1]), int(reference.shape[2])
     output = torch.empty(
