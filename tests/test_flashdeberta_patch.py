@@ -3005,6 +3005,45 @@ def test_dense_bias_fallback_matches_scaled_reference() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is required for device-to-host transfer coverage.",
+            ),
+        ),
+    ],
+)
+def test_docblock_launch_scalars_use_one_host_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+) -> None:
+    import deberta.modeling.flashdeberta_docblock_op as docblock_mod
+
+    cpu_calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def _count_cpu(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        nonlocal cpu_calls
+        cpu_calls += 1
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _count_cpu)
+
+    values = docblock_mod._docblock_scalar_ints(
+        torch.tensor(3, dtype=torch.int32, device=device),
+        torch.tensor(17, dtype=torch.int32, device=device),
+        torch.tensor(41, dtype=torch.int32, device=device),
+    )
+
+    assert values == (3, 17, 41)
+    assert cpu_calls == 1
+
+
 def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 

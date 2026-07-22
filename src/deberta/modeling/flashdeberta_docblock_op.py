@@ -40,22 +40,27 @@ _DOCBLOCK_FWD_OP_NAME = "flashdeberta_docblock_v2"
 _DOCBLOCK_BWD_OP_NAME = "flashdeberta_docblock_backward_v2"
 
 
-def _scalar_int(value: int | torch.Tensor, *, name: str) -> int:
-    """Return a Python int from a host scalar.
+def _docblock_scalar_ints(
+    num_segments: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    total_tokens: torch.Tensor,
+) -> tuple[int, int, int]:
+    """Copy the three doc-block launch scalars to the host together.
 
-    :param int | torch.Tensor value: Python integer or scalar tensor.
-    :param str name: Name used in validation errors.
-    :raises ValueError: If a tensor value is not scalar.
-    :return int: Host integer value.
+    :param torch.Tensor num_segments: Active document-segment count.
+    :param torch.Tensor max_seqlen: Maximum active segment length.
+    :param torch.Tensor total_tokens: Active token count.
+    :raises ValueError: If any input is not scalar.
+    :return tuple[int, int, int]: Host launch values in argument order.
     """
 
-    if isinstance(value, torch.Tensor):
+    values = (num_segments, max_seqlen, total_tokens)
+    names = ("num_segments", "max_seqlen", "total_tokens")
+    for name, value in zip(names, values, strict=True):
         if value.ndim != 0:
             raise ValueError(f"{name} must be a scalar tensor, got shape {tuple(value.shape)}.")
-        if value.device.type == "cpu":
-            return int(value)
-        return int(value.detach().cpu().item())
-    return int(value)
+    host_values = torch.stack(values).detach().cpu().tolist()
+    return tuple(int(value) for value in host_values)
 
 
 def flashdeberta_docblock_import_error() -> Exception | None:
@@ -596,6 +601,11 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :return tuple[torch.Tensor, ...]: Padded output/LSE plus packed forward auxiliaries.
         """
 
+        num_segments_int, max_seqlen_int, total_tokens_int = _docblock_scalar_ints(
+            num_segments,
+            max_seqlen,
+            total_tokens,
+        )
         output, lse, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad, pos_key_unpad, pos_query_unpad = (
             _docblock_forward_impl(
                 query_layer=q,
@@ -609,9 +619,9 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
                 sm_scale=sm_scale,
                 position_buckets=position_buckets,
                 max_relative_distance=max_relative_distance,
-                num_segments=_scalar_int(num_segments, name="num_segments"),
-                max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
-                total_tokens=_scalar_int(total_tokens, name="total_tokens"),
+                num_segments=num_segments_int,
+                max_seqlen=max_seqlen_int,
+                total_tokens=total_tokens_int,
                 causal=causal,
                 aux_capacity=int(q.shape[0]) * int(q.shape[1]),
             )
@@ -791,6 +801,11 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             Padded gradients for q/k/v and optional positional tensors.
         """
 
+        num_segments_int, max_seqlen_int, total_tokens_int = _docblock_scalar_ints(
+            num_segments,
+            max_seqlen,
+            total_tokens,
+        )
         return _docblock_backward_impl(
             grad_output=grad_out,
             query_layer=q,
@@ -806,9 +821,9 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             sm_scale=sm_scale,
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
-            num_segments=_scalar_int(num_segments, name="num_segments"),
-            max_seqlen=_scalar_int(max_seqlen, name="max_seqlen"),
-            total_tokens=_scalar_int(total_tokens, name="total_tokens"),
+            num_segments=num_segments_int,
+            max_seqlen=max_seqlen_int,
+            total_tokens=total_tokens_int,
             causal=causal,
             q_unpad=q_unpad,
             k_unpad=k_unpad,
