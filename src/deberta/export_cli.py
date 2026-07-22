@@ -25,7 +25,6 @@ from deberta.config import (
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.export_utils import (
     clean_exported_config,
-    load_export_state_dict,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
     write_export_readme_and_license,
@@ -376,12 +375,13 @@ def _export_component(
             strict_export_load=bool(strict_export_load),
         )
 
-    incompatible = load_export_state_dict(
-        export_model,
-        state_for_load,
-        strict=bool(strict_export_load),
-        context=f"export.{component_key}",
-    )
+    try:
+        incompatible = export_model.load_state_dict(
+            state_for_load,
+            strict=bool(strict_export_load),
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"export.{component_key}: {exc}") from exc
     if not bool(strict_export_load):
         missing = list(getattr(incompatible, "missing_keys", []))
         unexpected = list(getattr(incompatible, "unexpected_keys", []))
@@ -618,39 +618,26 @@ def run_export(cfg: ExportConfig) -> None:
         # Always export tokenizer at root for convenience
         tokenizer.save_pretrained(str(stage_dir))
 
-        if _export_component(
-            component="discriminator",
-            export_model=export_disc,
-            stage_dir=stage_dir,
-            export_what=export_what,
-            safe_serialization=bool(cfg.safe_serialization),
-            strict_export_load=bool(strict_export_load),
-            model_cfg=model_cfg,
-            data_cfg=data_cfg,
-            train_cfg=train_cfg,
-            embedding_sharing=embedding_sharing,
-            state_dict=disc_sd,
-            disc_sd=disc_sd,
-            gen_sd=gen_sd,
+        for component, export_model, component_state in (
+            ("discriminator", export_disc, disc_sd),
+            ("generator", export_gen, gen_sd),
         ):
-            meta["exported_discriminator"] = True
-
-        if _export_component(
-            component="generator",
-            export_model=export_gen,
-            stage_dir=stage_dir,
-            export_what=export_what,
-            safe_serialization=bool(cfg.safe_serialization),
-            strict_export_load=bool(strict_export_load),
-            model_cfg=model_cfg,
-            data_cfg=data_cfg,
-            train_cfg=train_cfg,
-            embedding_sharing=embedding_sharing,
-            state_dict=gen_sd,
-            disc_sd=disc_sd,
-            gen_sd=gen_sd,
-        ):
-            meta["exported_generator"] = True
+            if _export_component(
+                component=component,
+                export_model=export_model,
+                stage_dir=stage_dir,
+                export_what=export_what,
+                safe_serialization=bool(cfg.safe_serialization),
+                strict_export_load=bool(strict_export_load),
+                model_cfg=model_cfg,
+                data_cfg=data_cfg,
+                train_cfg=train_cfg,
+                embedding_sharing=embedding_sharing,
+                state_dict=component_state,
+                disc_sd=disc_sd,
+                gen_sd=gen_sd,
+            ):
+                meta[f"exported_{component}"] = True
 
         with (stage_dir / "export_meta.json").open("w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, sort_keys=True)

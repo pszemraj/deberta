@@ -193,28 +193,6 @@ def split_pretrainer_state_dict(
     return disc, gen
 
 
-def load_export_state_dict(
-    model: Any,
-    state_dict: dict[str, torch.Tensor],
-    *,
-    strict: bool = False,
-    context: str = "state_dict",
-) -> Any:
-    """Load an export state dict with contextual compatibility errors.
-
-    :param Any model: Target model/module exposing ``state_dict`` and ``load_state_dict``.
-    :param dict[str, torch.Tensor] state_dict: Source state dict.
-    :param bool strict: Whether PyTorch should reject missing or unexpected keys.
-    :param str context: Human-readable context included in strict-mode failures.
-    :raises RuntimeError: If PyTorch rejects the state dict.
-    :return Any: ``load_state_dict`` return value.
-    """
-    try:
-        return model.load_state_dict(state_dict, strict=strict)
-    except RuntimeError as exc:
-        raise RuntimeError(f"{context}: {exc}") from exc
-
-
 def merge_embeddings_into_export_backbone(
     *,
     export_model: Any,
