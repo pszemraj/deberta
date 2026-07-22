@@ -39,6 +39,20 @@ def tiny_rope_config_factory():
     return _build
 
 
+@pytest.fixture
+def packed_doc_collator() -> tuple[DummyTokenizer, DebertaV3ElectraCollator]:
+    """Return the standard tokenizer and document-aware packed collator."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+    )
+    return tokenizer, collator
+
+
 def test_packed_streaming_marks_internal_sep_as_special():
     tok = DummyTokenizer(vocab_size=64)
 
@@ -139,10 +153,10 @@ def test_docblock_streaming_gives_every_segment_its_own_cls() -> None:
     assert rows[0]["doc_ids"] == [1, 1, 1, 1, 2, 2, 2, 2]
 
 
-def test_docblock_streaming_rows_collate_with_structural_metadata() -> None:
+def test_docblock_streaming_rows_collate_with_structural_metadata(packed_doc_collator) -> None:
     """Exercise the normal packer-to-collator structural ``doc_ids`` path."""
 
-    tok = DummyTokenizer(vocab_size=64)
+    tok, collator = packed_doc_collator
     dataset = PackedStreamingDataset(
         hf_dataset=[{"text": "a b"}, {"text": "c d"}, {"text": "e"}],
         tokenizer=tok,
@@ -159,12 +173,6 @@ def test_docblock_streaming_rows_collate_with_structural_metadata() -> None:
     assert "attention_mask" not in rows[0]
     assert "attention_mask" in rows[1]
 
-    collator = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
     batch = collator(rows)
 
     assert torch.equal(batch["doc_ids"][0], torch.tensor([1, 1, 1, 1, 2, 2, 2, 2]))
@@ -541,14 +549,8 @@ def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
         assert sum(1 for tid in mids if tid == tok.sep_token_id) <= 1
 
 
-def test_collator_emits_document_ids_when_packed():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+def test_collator_emits_document_ids_when_packed(packed_doc_collator):
+    tok, coll = packed_doc_collator
 
     features = [
         {
@@ -591,14 +593,8 @@ def test_collator_emits_document_ids_when_packed():
     assert torch.equal(batch["doc_context_index"], torch.tensor([[0, 0, 0, 3, 3, 3]]))
 
 
-def test_collator_rejects_legacy_packing_without_per_document_cls():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+def test_collator_rejects_legacy_packing_without_per_document_cls(packed_doc_collator):
+    tok, coll = packed_doc_collator
 
     # Boundary-aligned packed chunks can produce consecutive separators.
     features = [
@@ -612,14 +608,8 @@ def test_collator_rejects_legacy_packing_without_per_document_cls():
         coll(features)
 
 
-def test_collator_rejects_document_without_sep_boundary() -> None:
-    tok = DummyTokenizer(vocab_size=128)
-    collator = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+def test_collator_rejects_document_without_sep_boundary(packed_doc_collator) -> None:
+    tok, collator = packed_doc_collator
     feature = {
         "input_ids": [tok.cls_token_id, 11, 12],
         "special_tokens_mask": [1, 0, 0],
@@ -630,14 +620,8 @@ def test_collator_rejects_document_without_sep_boundary() -> None:
         collator([feature])
 
 
-def test_collator_keeps_document_ids_for_single_doc_packed_chunk():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+def test_collator_keeps_document_ids_for_single_doc_packed_chunk(packed_doc_collator):
+    tok, coll = packed_doc_collator
 
     features = [
         {
@@ -686,7 +670,7 @@ def _assert_active_token_definitions_agree(batch, *, expected_active: int) -> No
     assert torch.equal(prepared["doc_context_index"], batch["doc_context_index"])
 
 
-def test_active_token_definitions_agree_for_packed_docblock_batches():
+def test_active_token_definitions_agree_for_packed_docblock_batches(packed_doc_collator):
     """GA weighting, tokens/sec logging, RTD loss, and flash prep must count the same tokens.
 
     Four call sites independently derive "active tokens" from a raw collator
@@ -694,13 +678,7 @@ def test_active_token_definitions_agree_for_packed_docblock_batches():
     logged throughput, so this pins them to each other and to doc_ids.ne(0).
     """
 
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+    tok, coll = packed_doc_collator
 
     # Rows of different lengths force a padded tail on the shorter row.
     features = [
@@ -728,16 +706,10 @@ def test_active_token_definitions_agree_for_packed_docblock_batches():
     _assert_active_token_definitions_agree(batch, expected_active=10)
 
 
-def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
+def test_active_token_definitions_agree_for_unpadded_intra_row_packing(packed_doc_collator):
     """A genuinely packed row (multiple docs, no padding) has no attention_mask at all."""
 
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+    tok, coll = packed_doc_collator
 
     features = [
         {
@@ -759,16 +731,10 @@ def test_active_token_definitions_agree_for_unpadded_intra_row_packing():
     _assert_active_token_definitions_agree(batch, expected_active=6)
 
 
-def test_packed_document_ids_follow_attention_mask_not_token_values():
+def test_packed_document_ids_follow_attention_mask_not_token_values(packed_doc_collator):
     """Active pad-valued tokens stay live while masked non-pad fillers stay dead."""
 
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+    tok, coll = packed_doc_collator
     batch = coll(
         [
             {
@@ -854,20 +820,6 @@ def test_mask_utils_reduce_and_expand_helpers_cover_all_ranks():
     per_head = pairwise[:, None].expand(-1, 2, -1, -1)
     assert torch.equal(expand_keep_mask_to_4d(per_head), pairwise[:, None])
     assert torch.equal(expand_keep_mask_to_4d(per_head, collapse_heads=False), per_head)
-
-
-def test_collator_build_drops_document_mask_when_not_packed():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
-
-    features = [
-        {
-            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
-        }
-    ]
-    batch = coll(features)
-    assert "attention_mask" not in batch
 
 
 def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: pytest.MonkeyPatch):
@@ -1080,16 +1032,30 @@ def test_collator_warns_when_word_boundary_scheme_is_none_for_ngram(caplog: pyte
     assert "scheme='none'" in caplog.text
 
 
-def test_collator_drops_all_ones_attention_mask():
+def test_collator_drops_all_ones_attention_mask_when_not_packed():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
 
-    features = [
-        {"input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-        {"input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-    ]
-    batch = coll(features)
-    assert "attention_mask" not in batch
+    feature_sets = (
+        [
+            {
+                "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
+                "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+            }
+        ],
+        [
+            {
+                "input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id],
+                "special_tokens_mask": [1, 0, 0, 1],
+            },
+            {
+                "input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id],
+                "special_tokens_mask": [1, 0, 0, 1],
+            },
+        ],
+    )
+    for features in feature_sets:
+        assert "attention_mask" not in coll(features)
 
 
 @pytest.mark.parametrize(
@@ -1183,28 +1149,8 @@ def test_collator_merges_partial_special_tokens_mask_with_tokenizer_special_ids(
     assert int(batch["labels"][0, 1].item()) == -100
 
 
-def test_collator_random_replacement_avoids_special_ids():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.999, mask_token_prob=0.0, random_token_prob=1.0, max_ngram=1),
-    )
-
-    torch.manual_seed(0)
-    input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
-    special = torch.zeros_like(input_ids, dtype=torch.bool)
-
-    masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
-    changed = labels.ne(-100)
-    assert bool(changed.any().item())
-
-    replaced = masked[changed]
-    for sid in tok.all_special_ids:
-        assert not bool((replaced == sid).any().item())
-
-
-def test_collator_random_replacement_samples_full_vocab_including_added_tokens():
-    """When len(tokenizer) > tokenizer.vocab_size, random replacement must cover the full range."""
+def test_collator_random_replacement_uses_full_non_special_tokenizer_vocab():
+    """Random replacements must exclude specials while including added-token ids."""
     tok = DummyTokenizer(vocab_size=100, extra_length=10)
     assert len(tok) == 110
     assert tok.vocab_size == 100
@@ -1225,7 +1171,10 @@ def test_collator_random_replacement_samples_full_vocab_including_added_tokens()
     special = torch.zeros_like(input_ids, dtype=torch.bool)
     masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
     changed = labels.ne(-100)
+    assert bool(changed.any().item())
     replaced = masked[changed]
+    for special_id in tok.all_special_ids:
+        assert not bool((replaced == special_id).any().item())
     assert bool((replaced >= 100).any().item()), "Expected some replacement tokens from the added-token range"
 
 
@@ -1359,24 +1308,12 @@ def test_self_attention_uses_pairwise_diagonal_for_query_activity(tiny_rope_conf
     assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
 
 
-def test_mlp_has_no_internal_residual_dropout():
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP
+def test_mlp_has_no_internal_residual_dropout(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPEMLP
 
     torch.manual_seed(0)
     for ffn_type in ("mlp", "swiglu"):
-        cfg = DebertaRoPEConfig(
-            vocab_size=64,
-            hidden_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            intermediate_size=64,
-            max_position_embeddings=32,
-            type_vocab_size=0,
-            ffn_type=ffn_type,
-            hidden_dropout_prob=0.9,
-            attention_probs_dropout_prob=0.0,
-        )
+        cfg = tiny_rope_config_factory(ffn_type=ffn_type, hidden_dropout_prob=0.9)
         mlp = DebertaRoPEMLP(cfg)
         x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
 
@@ -1389,24 +1326,12 @@ def test_mlp_has_no_internal_residual_dropout():
         torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
 
 
-def test_self_attention_sdpa_matches_eager_with_padding_mask():
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+def test_self_attention_sdpa_matches_eager_with_padding_mask(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
     torch.manual_seed(0)
-    cfg_kwargs = dict(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    cfg_sdpa = DebertaRoPEConfig(attention_implementation="sdpa", **cfg_kwargs)
-    cfg_eager = DebertaRoPEConfig(attention_implementation="eager", **cfg_kwargs)
+    cfg_sdpa = tiny_rope_config_factory(attention_implementation="sdpa")
+    cfg_eager = tiny_rope_config_factory(attention_implementation="eager")
 
     attn_sdpa = DebertaRoPESelfAttention(cfg_sdpa).eval()
     attn_eager = DebertaRoPESelfAttention(cfg_eager).eval()
@@ -1432,23 +1357,10 @@ def test_self_attention_sdpa_matches_eager_with_padding_mask():
     torch.testing.assert_close(out_sdpa, out_eager, rtol=1e-5, atol=1e-6)
 
 
-def test_rope_projections_respect_use_bias_config():
+def test_rope_projections_respect_use_bias_config(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPEMLP, DebertaRoPESelfAttention
 
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP, DebertaRoPESelfAttention
-
-    base_kwargs = dict(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-
-    cfg_no_bias = DebertaRoPEConfig(use_bias=False, **base_kwargs)
+    cfg_no_bias = tiny_rope_config_factory(use_bias=False)
     attn_no_bias = DebertaRoPESelfAttention(cfg_no_bias)
     mlp_no_bias = DebertaRoPEMLP(cfg_no_bias)
     assert attn_no_bias.qkv.bias is None
@@ -1456,7 +1368,7 @@ def test_rope_projections_respect_use_bias_config():
     assert mlp_no_bias.w12.bias is None
     assert mlp_no_bias.w3.bias is None
 
-    cfg_with_bias = DebertaRoPEConfig(use_bias=True, **base_kwargs)
+    cfg_with_bias = tiny_rope_config_factory(use_bias=True)
     attn_with_bias = DebertaRoPESelfAttention(cfg_with_bias)
     mlp_with_bias = DebertaRoPEMLP(cfg_with_bias)
     assert attn_with_bias.qkv.bias is not None

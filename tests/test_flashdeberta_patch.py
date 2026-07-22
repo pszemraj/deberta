@@ -1300,9 +1300,9 @@ def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
         total_tokens=4,
     )
 
-    expected_a = torch.cat([a[0, :3], a[1, :1]], dim=0)
-    expected_b = torch.cat([b[0, :3], b[1, :1]], dim=0)
-    expected_c = torch.cat([c[0, :3], c[1, :1]], dim=0)
+    expected_a = _prefix_pack_reference(a, seqlens)
+    expected_b = _prefix_pack_reference(b, seqlens)
+    expected_c = _prefix_pack_reference(c, seqlens)
     assert torch.equal(packed_a, expected_a)
     assert torch.equal(packed_b, expected_b)
     assert torch.equal(packed_c1, expected_a)
@@ -1319,15 +1319,9 @@ def test_prefix_pack_pair_and_triple_cpu_roundtrip() -> None:
         seq_len=4,
     )
 
-    expected_unpacked_a = torch.zeros_like(a)
-    expected_unpacked_b = torch.zeros_like(b)
-    expected_unpacked_c = torch.zeros_like(c)
-    expected_unpacked_a[0, :3] = a[0, :3]
-    expected_unpacked_a[1, :1] = a[1, :1]
-    expected_unpacked_b[0, :3] = b[0, :3]
-    expected_unpacked_b[1, :1] = b[1, :1]
-    expected_unpacked_c[0, :3] = c[0, :3]
-    expected_unpacked_c[1, :1] = c[1, :1]
+    expected_unpacked_a = _prefix_unpack_reference(expected_a, seqlens, seq_len=4)
+    expected_unpacked_b = _prefix_unpack_reference(expected_b, seqlens, seq_len=4)
+    expected_unpacked_c = _prefix_unpack_reference(expected_c, seqlens, seq_len=4)
     assert torch.equal(unpacked_c1, expected_unpacked_a)
     assert torch.equal(unpacked_c2, expected_unpacked_b)
     assert torch.equal(unpacked_c3, expected_unpacked_c)
@@ -1372,10 +1366,10 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
         total_tokens=7,
     )
 
-    expected_a = torch.cat((a[0, :2], a[0, 2:4], a[1, :1], a[1, 1:3]), dim=0)
-    expected_b = torch.cat((b[0, :2], b[0, 2:4], b[1, :1], b[1, 1:3]), dim=0)
-    expected_c = torch.cat((c[0, :2], c[0, 2:4], c[1, :1], c[1, 1:3]), dim=0)
-    expected_base = torch.cat((base[0, :2], base[0, 2:4], base[1, :1], base[1, 1:3]), dim=0)
+    expected_a = _segment_pack_reference(a, segment_offsets, segment_lengths)
+    expected_b = _segment_pack_reference(b, segment_offsets, segment_lengths)
+    expected_c = _segment_pack_reference(c, segment_offsets, segment_lengths)
+    expected_base = _segment_pack_reference(base, segment_offsets, segment_lengths)
     assert torch.equal(packed_a, expected_a)
     assert torch.equal(packed_b, expected_b)
     assert torch.equal(packed_c1, expected_a)
@@ -1413,21 +1407,15 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
         seq_len=5,
     )
 
-    expected_unpacked_a = torch.zeros_like(a)
-    expected_unpacked_b = torch.zeros_like(b)
-    expected_unpacked_c = torch.zeros_like(c)
-    expected_unpacked_a[0, :2] = a[0, :2]
-    expected_unpacked_a[0, 2:4] = a[0, 2:4]
-    expected_unpacked_a[1, :1] = a[1, :1]
-    expected_unpacked_a[1, 1:3] = a[1, 1:3]
-    expected_unpacked_b[0, :2] = b[0, :2]
-    expected_unpacked_b[0, 2:4] = b[0, 2:4]
-    expected_unpacked_b[1, :1] = b[1, :1]
-    expected_unpacked_b[1, 1:3] = b[1, 1:3]
-    expected_unpacked_c[0, :2] = c[0, :2]
-    expected_unpacked_c[0, 2:4] = c[0, 2:4]
-    expected_unpacked_c[1, :1] = c[1, :1]
-    expected_unpacked_c[1, 1:3] = c[1, 1:3]
+    expected_unpacked_a = _segment_unpack_reference(
+        expected_a, segment_offsets, segment_lengths, batch_size=2, seq_len=5
+    )
+    expected_unpacked_b = _segment_unpack_reference(
+        expected_b, segment_offsets, segment_lengths, batch_size=2, seq_len=5
+    )
+    expected_unpacked_c = _segment_unpack_reference(
+        expected_c, segment_offsets, segment_lengths, batch_size=2, seq_len=5
+    )
     assert torch.equal(unpacked_a, expected_unpacked_a)
     assert torch.equal(unpacked_b, expected_unpacked_b)
     assert torch.equal(unpacked_c1, expected_unpacked_a)
@@ -1495,10 +1483,8 @@ def test_shared_triton_row_copy_cuda_roundtrips_prefix_and_segments() -> None:
         seq_len=5,
     )
     for source, packed, unpacked in zip(tensors, prefix_packed, prefix_unpacked, strict=True):
-        expected_packed = torch.cat((source[0, :3], source[1, :2]))
-        expected_unpacked = torch.zeros_like(source)
-        expected_unpacked[0, :3] = source[0, :3]
-        expected_unpacked[1, :2] = source[1, :2]
+        expected_packed = _prefix_pack_reference(source, prefix_lengths)
+        expected_unpacked = _prefix_unpack_reference(expected_packed, prefix_lengths, seq_len=5)
         assert torch.equal(packed, expected_packed)
         assert torch.equal(unpacked, expected_unpacked)
 
@@ -1517,7 +1503,7 @@ def test_shared_triton_row_copy_cuda_roundtrips_prefix_and_segments() -> None:
         batch_size=2,
         seq_len=5,
     )
-    assert torch.equal(prefix_single, torch.cat((prefix_source[0, :3], prefix_source[1, :2])))
+    assert torch.equal(prefix_single, _prefix_pack_reference(prefix_source, prefix_lengths))
     assert torch.equal(prefix_single_unpacked, prefix_unpacked[0])
 
     segment_offsets = torch.tensor([0, 2, 5, 6], dtype=torch.int32, device="cuda")
@@ -1541,10 +1527,14 @@ def test_shared_triton_row_copy_cuda_roundtrips_prefix_and_segments() -> None:
         max_segment_length=3,
     )
     for source, packed, unpacked in zip(tensors, segment_packed, segment_unpacked, strict=True):
-        expected_packed = torch.cat((source[0, :2], source[0, 2:4], source[1, :1], source[1, 1:4]))
-        expected_unpacked = torch.zeros_like(source)
-        expected_unpacked[0, :4] = source[0, :4]
-        expected_unpacked[1, :4] = source[1, :4]
+        expected_packed = _segment_pack_reference(source, segment_offsets, segment_lengths)
+        expected_unpacked = _segment_unpack_reference(
+            expected_packed,
+            segment_offsets,
+            segment_lengths,
+            batch_size=2,
+            seq_len=5,
+        )
         assert torch.equal(packed, expected_packed)
         assert torch.equal(unpacked, expected_unpacked)
 
@@ -2092,6 +2082,41 @@ def _prefix_unpack_reference(
     return output
 
 
+def _segment_pack_reference(
+    tensor: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Pack flat document segments with host-side indexing."""
+
+    flattened = tensor.flatten(0, 1)
+    pieces = [
+        flattened[offset : offset + length]
+        for offset, length in zip(segment_offsets.tolist(), segment_lengths.tolist(), strict=True)
+        if length > 0
+    ]
+    return torch.cat(pieces, dim=0) if pieces else flattened[:0]
+
+
+def _segment_unpack_reference(
+    packed: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """Scatter packed document segments with host-side indexing."""
+
+    output = packed.new_zeros((batch_size, seq_len, *packed.shape[1:]))
+    flattened = output.flatten(0, 1)
+    cursor = 0
+    for offset, length in zip(segment_offsets.tolist(), segment_lengths.tolist(), strict=True):
+        flattened[offset : offset + length] = packed[cursor : cursor + length]
+        cursor += length
+    return output
+
+
 def test_prefix_pack_round_trips_with_prefix_padding_contract() -> None:
     import deberta.modeling.flashdeberta_prefix_pack as prefix_mod
 
@@ -2373,12 +2398,17 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert int(varlen_meta.active_tokens_scalar) == 3500
 
 
-def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbones() -> None:
+@pytest.mark.parametrize(
+    ("backbone_type", "flash_enabled"),
+    [("rope", False), ("hf_deberta_v2", False)],
+    ids=("other_backbone", "eager_deberta"),
+)
+def test_prepare_flash_attention_batch_metadata_builds_eager_doc_mask(
+    backbone_type: str,
+    flash_enabled: bool,
+) -> None:
     import deberta.training.compile as compile_mod
 
-    # Cross-document blocking must not depend on caller-side preambles: a
-    # non-hf_deberta_v2 batch carrying doc_ids gets the dense pairwise mask
-    # built here, or packed documents silently attend across boundaries.
     doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
     batch = {
         "input_ids": torch.zeros((1, 4), dtype=torch.long),
@@ -2388,8 +2418,8 @@ def test_prepare_flash_attention_batch_metadata_builds_doc_mask_for_other_backbo
 
     prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
         batch=batch,
-        backbone_type="rope",
-        flash_enabled=False,
+        backbone_type=backbone_type,
+        flash_enabled=flash_enabled,
     )
 
     assert meta is None
@@ -2500,27 +2530,6 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
         assert int(scalar) == expected
 
 
-def test_prepare_flash_attention_batch_metadata_docblock_eager_gets_pairwise_mask() -> None:
-    import deberta.training.compile as compile_mod
-
-    doc_ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.long)
-    batch = {
-        "input_ids": torch.zeros((1, 4), dtype=torch.long),
-        "attention_mask": doc_ids.ne(0),
-        "doc_ids": doc_ids,
-    }
-
-    prepared, meta = compile_mod.prepare_flash_attention_batch_metadata(
-        batch=batch,
-        backbone_type="hf_deberta_v2",
-        flash_enabled=False,
-    )
-
-    assert meta is None
-    assert tuple(prepared["attention_mask"].shape) == (1, 4, 4)
-    assert torch.equal(prepared["attention_mask"], build_doc_block_mask(doc_ids))
-
-
 def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_overrides(
     tmp_path,
 ) -> None:
@@ -2551,43 +2560,20 @@ def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_ove
         configure_flashdeberta_kernel_overrides(None)
 
 
-def test_docblock_pairwise_attention_blocks_cross_document_probs_on_cpu() -> None:
-    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
-    from deberta.modeling.mask_utils import build_doc_block_mask
-
-    seq_len = 16
-    cfg = _docblock_attention_config(seq_len=seq_len)
-    attention = DisentangledSelfAttention(cfg).eval()
-    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
-    rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
-    doc_ids = torch.cat(
-        (
-            torch.ones((1, seq_len // 2), dtype=torch.long),
-            torch.full((1, seq_len // 2), 2, dtype=torch.long),
-        ),
-        dim=1,
-    )
-    pairwise_mask = build_doc_block_mask(doc_ids).unsqueeze(1)
-
-    _, probs = attention(
-        hidden_states=hidden_states,
-        attention_mask=pairwise_mask,
-        output_attentions=True,
-        rel_embeddings=rel_embeddings,
-    )
-
-    assert probs is not None
-    assert float(probs[0, 0, 0, seq_len // 2 :].detach().abs().max()) == pytest.approx(0.0)
-    assert float(probs[0, 0, seq_len // 2, : seq_len // 2].detach().abs().max()) == pytest.approx(0.0)
-
-
-def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cpu(
+@pytest.mark.parametrize("implementation", ["eager", "flash_fallback"])
+def test_docblock_attention_blocks_cross_document_probs_on_cpu(
     monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
 ) -> None:
-    attention_mod = _patch_flashdeberta_available(monkeypatch)
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
     seq_len = 16
     cfg = _docblock_attention_config(seq_len=seq_len)
-    attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
+    if implementation == "eager":
+        attention = DisentangledSelfAttention(cfg).eval()
+    else:
+        attention_mod = _patch_flashdeberta_available(monkeypatch)
+        attention = attention_mod.FlashDisentangledSelfAttention(cfg).eval()
     hidden_states = torch.randn((1, seq_len, cfg.hidden_size), dtype=torch.float32)
     rel_embeddings = torch.zeros((cfg.position_buckets * 2, cfg.hidden_size), dtype=torch.float32)
     doc_ids = torch.cat(
@@ -2597,15 +2583,21 @@ def test_docblock_forced_flash_eager_fallback_rebuilds_pairwise_mask_probs_on_cp
         ),
         dim=1,
     )
+    attention_mask = (
+        build_doc_block_mask(doc_ids).unsqueeze(1) if implementation == "eager" else doc_ids.ne(0)
+    )
+    flash_kwargs = (
+        {"flash_meta": FlashBatchMeta(doc_ids=doc_ids, route_hint="docblock")}
+        if implementation == "flash_fallback"
+        else {}
+    )
+
     _, probs = attention(
         hidden_states=hidden_states,
-        attention_mask=doc_ids.ne(0),
+        attention_mask=attention_mask,
         output_attentions=True,
         rel_embeddings=rel_embeddings,
-        flash_meta=FlashBatchMeta(
-            doc_ids=doc_ids,
-            route_hint="docblock",
-        ),
+        **flash_kwargs,
     )
 
     assert probs is not None
