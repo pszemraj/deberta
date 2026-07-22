@@ -93,7 +93,10 @@ def _forward_discriminator_with_diagnostics(
     return diagnostics
 
 
-def _ranking_metrics(logits: torch.Tensor, labels: torch.Tensor) -> tuple[float, float]:
+def _ranking_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[float | None, float | None]:
     """Return tie-aware ROC-AUC and average precision for binary targets."""
     scores = logits.detach().float().cpu().flatten()
     targets = labels.detach().bool().cpu().flatten()
@@ -110,11 +113,16 @@ def _ranking_metrics(logits: torch.Tensor, labels: torch.Tensor) -> tuple[float,
     false_positives = (~sorted_targets).to(torch.float64).cumsum(0)[group_indices]
     positive_count = sorted_targets.sum().to(torch.float64)
     negative_count = (~sorted_targets).sum().to(torch.float64)
+    if int(positive_count.item()) == 0:
+        return None, None
 
     recall = true_positives / positive_count
     precision = true_positives / (true_positives + false_positives)
     previous_recall = torch.cat([torch.zeros(1, dtype=torch.float64), recall[:-1]])
     average_precision = ((recall - previous_recall) * precision).sum()
+
+    if int(negative_count.item()) == 0:
+        return None, float(average_precision.item())
 
     tpr = torch.cat([torch.zeros(1, dtype=torch.float64), recall])
     fpr = torch.cat([torch.zeros(1, dtype=torch.float64), false_positives / negative_count])
@@ -122,7 +130,10 @@ def _ranking_metrics(logits: torch.Tensor, labels: torch.Tensor) -> tuple[float,
     return float(roc_auc.item()), float(average_precision.item())
 
 
-def _discriminator_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, float | int]:
+def _discriminator_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> dict[str, float | int | None]:
     scores = logits.detach().float().cpu().flatten()
     targets = labels.detach().float().cpu().flatten()
     positive_count = int(targets.sum().item())

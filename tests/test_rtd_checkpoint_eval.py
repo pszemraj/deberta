@@ -53,6 +53,18 @@ def test_discriminator_metrics_define_zero_recall_without_positive_targets() -> 
 
     assert metrics["positives"] == 0
     assert metrics["recall_at_zero"] == 0.0
+    assert metrics["roc_auc"] is None
+    assert metrics["average_precision"] is None
+
+
+def test_ranking_metrics_mark_roc_auc_undefined_without_negative_targets() -> None:
+    roc_auc, average_precision = _ranking_metrics(
+        torch.tensor([2.0, 1.0, -1.0]),
+        torch.ones(3, dtype=torch.long),
+    )
+
+    assert roc_auc is None
+    assert average_precision == 1.0
 
 
 def test_discriminator_diagnostics_use_shared_phase_path() -> None:
