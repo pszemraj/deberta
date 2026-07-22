@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-from pathlib import Path
 from typing import Any
 
 import _bench_common as bench
@@ -22,25 +21,9 @@ from deberta.modeling.mask_utils import FlashBatchMeta
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "config",
-        nargs="?",
-        default="configs/flashdeberta/pretrain_flashdeberta_1024.yaml",
-    )
-    parser.add_argument("--branch", choices=("discriminator", "generator"), default="discriminator")
+    bench.add_real_batch_tuner_args(parser)
     parser.add_argument("--route", choices=("fixed", "varlen", "both"), default="both")
-    parser.add_argument("--sample-batches", type=int, default=8)
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=4)
-    parser.add_argument(
-        "--candidate",
-        action="append",
-        default=[],
-        metavar="NAME=JSON_PATH",
-        help="Named model.hf.flash.kernel_overrides_path candidate; use 'default' for the shipped table.",
-    )
     parser.add_argument("--packing-enabled", choices=("true", "false"), default="false")
-    parser.add_argument("--out-dir", type=Path, default=None)
     return parser.parse_args()
 
 

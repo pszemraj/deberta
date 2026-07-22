@@ -11,6 +11,7 @@ report schemas.
 
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
 import sys
@@ -107,6 +108,32 @@ def resolve_out_dir(path: Path | None, *, default_prefix: str) -> Path:
         path = Path("local-scratch/benchmarks/flashdeberta") / f"{default_prefix}_{stamp}"
     path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
+
+
+def add_real_batch_tuner_args(parser: argparse.ArgumentParser) -> None:
+    """Add arguments shared by the real-batch kernel tuners.
+
+    :param argparse.ArgumentParser parser: Parser to extend.
+    :return None: None.
+    """
+
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="configs/flashdeberta/pretrain_flashdeberta_1024.yaml",
+    )
+    parser.add_argument("--branch", choices=("discriminator", "generator"), default="discriminator")
+    parser.add_argument("--sample-batches", type=int, default=8)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument(
+        "--candidate",
+        action="append",
+        default=[],
+        metavar="NAME=JSON_PATH",
+        help="Named model.hf.flash.kernel_overrides_path candidate; use 'default' for the shipped table.",
+    )
+    parser.add_argument("--out-dir", type=Path, default=None)
 
 
 def parse_candidate_specs(values: list[str]) -> list[tuple[str, str | None]]:
