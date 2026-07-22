@@ -1,6 +1,7 @@
-import argparse
 import json
 import logging
+import runpy
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -27,10 +28,26 @@ from deberta.config import (
     validate_train_config,
     validate_training_workflow_options,
 )
-from deberta.export_cli import add_export_arguments
 from deberta.training.entrypoint import run_pretraining_dry_run
 from deberta.training.run_config import _build_run_metadata, _persist_or_validate_run_configs
 from deberta.training.steps import _global_grad_l2_norm
+
+
+def test_module_entrypoint_invokes_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["deberta"])
+    with pytest.raises(SystemExit):
+        runpy.run_module("deberta", run_name="__main__")
+
+
+def test_package_bounds_transformers_to_supported_major() -> None:
+    pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    dependency = next(
+        line.strip().removesuffix(",").strip('"')
+        for line in pyproject.splitlines()
+        if line.strip().startswith('"transformers')
+    )
+
+    assert dependency == "transformers>=4.45.0,<5"
 
 
 def test_main_cli_train_subcommand_loads_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -60,37 +77,7 @@ def test_main_cli_train_subcommand_loads_yaml(tmp_path: Path, monkeypatch: pytes
     assert "train_cfg" in seen
     assert seen["data_cfg"].packing.max_seq_length == 32
     assert seen["train_cfg"].max_steps == 5
-    assert seen["config_path"] == cfg_path
-
-
-def test_main_cli_train_honors_explicit_yaml_warmup_value_for_hf_backbone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-
-    cfg_path = tmp_path / "train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  backbone_type: hf_deberta_v2",
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5000",
-                "optim:",
-                "  scheduler:",
-                "    warmup_steps: 1000",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    seen = capture_run_pretraining_kwargs(monkeypatch, cli_mod)
-    cli_mod.main(["train", str(cfg_path)])
-
-    assert "train_cfg" in seen
-    assert int(seen["optim_cfg"].scheduler.warmup_steps) == 1000
+    assert seen["optim_cfg"].scheduler.warmup_steps == 0
     assert seen["config_path"] == cfg_path
 
 
@@ -164,14 +151,6 @@ def test_main_cli_train_dry_run_calls_preflight_and_skips_training(
     assert seen["config_path"] == cfg_path
 
 
-def test_train_parser_accepts_dry_run_flag():
-    parser = cli_mod._build_main_parser()
-    ns = parser.parse_args(["train", "config.yaml", "--dry-run"])
-    assert ns.command == "train"
-    assert ns.config == "config.yaml"
-    assert ns.dry_run is True
-
-
 def test_train_parser_requires_config() -> None:
     parser = cli_mod._build_main_parser()
     with pytest.raises(SystemExit):
@@ -231,16 +210,6 @@ def test_validate_train_config_normalizes_resume_hints(resume_hint: str, expecte
     cfg = make_train_config(checkpoint={"resume_from_checkpoint": resume_hint})
     validate_train_config(cfg)
     assert cfg.checkpoint.resume_from_checkpoint == expected
-
-
-def test_model_config_default_backbone_is_hf_deberta_v2() -> None:
-    cfg = make_model_config()
-    assert cfg.backbone_type == "hf_deberta_v2"
-
-
-def test_decoupled_training_defaults_true_and_allows_explicit_disable() -> None:
-    assert bool(make_train_config().decoupled_training) is True
-    assert bool(make_train_config(decoupled_training=False).decoupled_training) is False
 
 
 def test_validate_train_config_rejects_non_boolean_decoupled_training() -> None:
@@ -732,15 +701,6 @@ def test_validate_model_config_rejects_pretrained_rope_overrides_in_scratch_mode
     cfg = make_model_config(backbone_type="rope", from_scratch=True, rope={"pretrained.rope_theta": 50_000.0})
     with pytest.raises(ValueError, match="apply only when model.from_scratch=false"):
         validate_model_config(cfg)
-
-
-def test_export_help_documents_boolean_defaults() -> None:
-    parser = argparse.ArgumentParser(prog="deberta export")
-    add_export_arguments(parser)
-    help_text = parser.format_help()
-    assert "default, recommended safetensors" in help_text
-    assert "instead of offloading it to CPU" in help_text
-    assert "default rank-0-only gather" in help_text
 
 
 @pytest.mark.parametrize(

@@ -140,74 +140,29 @@ def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
     assert optim_cfg.scheduler.warmup_steps == 1_000
 
 
-def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-                "  checkpoint:",
-                "    save_steps: 777",
-                "optim:",
-                "  scheduler:",
-                "    warmup_steps: 2",
-                "logging:",
-                "  wandb:",
-                "    enabled: true",
-                "    watch: all",
-                "  debug:",
-                "    metrics: true",
-            ]
+@pytest.mark.parametrize(
+    ("config_text", "expected_error"),
+    [
+        (
+            "data:\n  source:\n    dataset_name: dummy\n    streaming: 'false'\ntrain:\n  max_steps: 1",
+            "data.source.streaming must be a boolean",
         ),
-        encoding="utf-8",
-    )
-    cfg = load_config(cfg_path)
-    assert int(cfg.optim.scheduler.warmup_steps) == 2
-    assert int(cfg.train.checkpoint.save_steps) == 777
-    assert bool(cfg.logging.wandb.enabled) is True
-    assert str(cfg.logging.wandb.watch) == "all"
-    assert bool(cfg.logging.debug.metrics) is True
-
-
-def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -> None:
+        (
+            "data:\n  source:\n    dataset_name: dummy\ntrain:\n  max_steps: 1\n"
+            "  token_weighted_gradient_accumulation: 'false'",
+            "train.token_weighted_gradient_accumulation must be a boolean",
+        ),
+    ],
+    ids=["data-streaming", "token-weighted-gradient-accumulation"],
+)
+def test_load_config_rejects_string_boolean(
+    tmp_path: Path,
+    config_text: str,
+    expected_error: str,
+) -> None:
     cfg_path = tmp_path / "bad_bool.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "    streaming: 'false'",
-                "train:",
-                "  max_steps: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="data.source.streaming must be a boolean"):
-        load_config(cfg_path)
-
-
-def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumulation(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "bad_bool_train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 1",
-                "  token_weighted_gradient_accumulation: 'false'",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="train.token_weighted_gradient_accumulation must be a boolean"):
+    cfg_path.write_text(config_text, encoding="utf-8")
+    with pytest.raises(ValueError, match=expected_error):
         load_config(cfg_path)
 
 

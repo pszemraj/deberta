@@ -32,12 +32,24 @@ def test_programmatic_config_resolves_rope_profile_without_serializing_provenanc
     assert set(dataclasses.asdict(cfg)) == {"model", "data", "train", "optim", "logging"}
 
 
-def test_default_scheduler_warmup_leaves_training_steps_for_decay() -> None:
+def test_config_defaults_match_training_contract() -> None:
     cfg = Config()
 
     assert cfg.train.max_steps == 10_000
     assert cfg.optim.scheduler.warmup_steps == 1_000
     assert cfg.optim.scheduler.warmup_steps < cfg.train.max_steps
+    assert cfg.train.mixed_precision == "bf16"
+    assert cfg.train.sdpa_kernel == "auto"
+    assert cfg.train.token_weighted_gradient_accumulation is True
+    assert cfg.train.decoupled_training is True
+    assert make_train_config(decoupled_training=False).decoupled_training is False
+    assert cfg.model.backbone_type == "hf_deberta_v2"
+    assert cfg.model.dropout.hidden_prob == pytest.approx(0.0)
+    assert cfg.model.dropout.attention_probs_prob == pytest.approx(0.0)
+    assert cfg.model.hf.model_size == "base"
+    assert cfg.model.rope.ffn_type == "mlp"
+    assert cfg.model.rope.swiglu_adjust_intermediate is True
+    assert cfg.data.packing.block_cross_document_attention is False
 
 
 def test_programmatic_config_preserves_custom_profile_values() -> None:
@@ -105,8 +117,18 @@ def test_load_yaml_nested(tmp_path: Path):
                 "train:",
                 "  checkpoint:",
                 "    overwrite_output_dir: true",
+                "    save_steps: 777",
                 "  objective:",
                 "    mlm_max_ngram: 3",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 2",
+                "logging:",
+                "  wandb:",
+                "    enabled: true",
+                "    watch: all",
+                "  debug:",
+                "    metrics: true",
             ]
         ),
         encoding="utf-8",
@@ -115,6 +137,7 @@ def test_load_yaml_nested(tmp_path: Path):
     assert cfg_nested.model.rope.ffn_type == "swiglu"
     assert cfg_nested.data.packing.max_seq_length == 128
     assert cfg_nested.train.checkpoint.overwrite_output_dir is True
+    assert cfg_nested.train.checkpoint.save_steps == 777
     assert cfg_nested.train.objective.mlm_max_ngram == 3
     assert cfg_nested.train.mixed_precision == "bf16"
     assert cfg_nested.train.objective.mask_token_prob == pytest.approx(0.8)
@@ -122,7 +145,10 @@ def test_load_yaml_nested(tmp_path: Path):
     assert cfg_nested.train.objective.disc_loss_weight == pytest.approx(50.0)
     assert cfg_nested.optim.lr.base == pytest.approx(5e-4)
     assert cfg_nested.optim.adam.epsilon == pytest.approx(1e-8)
-    assert cfg_nested.optim.scheduler.warmup_steps == 1_000
+    assert cfg_nested.optim.scheduler.warmup_steps == 2
+    assert cfg_nested.logging.wandb.enabled is True
+    assert cfg_nested.logging.wandb.watch == "all"
+    assert cfg_nested.logging.debug.metrics is True
 
 
 def test_load_json_nested(tmp_path: Path):

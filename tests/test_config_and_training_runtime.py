@@ -6,7 +6,6 @@ from typing import Any
 import pytest
 import torch
 from _config_factories import (
-    make_data_config,
     make_logging_config,
     make_model_config,
     make_optim_config,
@@ -393,24 +392,6 @@ def test_build_optimizer_raises_adam_epsilon_floor_for_bf16():
 
     opt_fp32 = _build_optimizer(model, cfg, mixed_precision="no")
     assert float(opt_fp32.defaults["eps"]) == pytest.approx(1e-8)
-
-
-def test_config_defaults():
-    """Key config defaults match design requirements."""
-    train = make_train_config()
-    assert train.mixed_precision == "bf16"
-    assert train.sdpa_kernel == "auto"
-    assert train.token_weighted_gradient_accumulation is True
-
-    model = make_model_config()
-    assert model.dropout.hidden_prob == pytest.approx(0.0)
-    assert model.dropout.attention_probs_prob == pytest.approx(0.0)
-    assert model.hf.model_size == "base"
-    assert model.rope.ffn_type == "mlp"
-    assert model.rope.swiglu_adjust_intermediate is True
-
-    data = make_data_config()
-    assert data.packing.block_cross_document_attention is False
 
 
 @pytest.mark.parametrize(
