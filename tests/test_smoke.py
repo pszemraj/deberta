@@ -13,7 +13,7 @@ from _fakes import DummyTokenizer
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
 from deberta.data.retry import call_with_dataset_retry, is_transient_dataset_error
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
-from deberta.modeling.mask_utils import build_doc_block_mask
+from deberta.modeling.mask_utils import build_doc_block_mask, reduce_keep_mask_to_2d
 
 
 @pytest.fixture
@@ -862,6 +862,27 @@ def test_build_doc_block_mask_matches_expected_structure():
     # SDPA safety: inactive pad query has a single keep-edge to CLS key.
     assert mask[0, 5, 0].item() is True
     assert int(mask[0, 5].sum().item()) == 1
+
+    # Left padding: fallback edges must stay off the diagonal so pad tokens
+    # never read as active queries (diagonal == doc_ids != 0).
+    left_doc_ids = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    left_mask = build_doc_block_mask(left_doc_ids)
+    assert torch.equal(
+        torch.diagonal(left_mask, dim1=-2, dim2=-1),
+        left_doc_ids.ne(0),
+    )
+    assert torch.equal(reduce_keep_mask_to_2d(left_mask), left_doc_ids.ne(0))
+
+    # Pad query 0 redirects to key 1; other pad queries keep the key-0 edge.
+    assert left_mask[0, 0, 1].item() is True
+    assert int(left_mask[0, 0].sum().item()) == 1
+    assert left_mask[0, 1, 0].item() is True
+    assert int(left_mask[0, 1].sum().item()) == 1
+
+    # Document blocking is unchanged for the active positions.
+    assert left_mask[0, 2, 3].item() is True
+    assert left_mask[0, 2, 4].item() is False
+    assert left_mask[0, 2, 0].item() is False
 
 
 def test_mask_utils_reduce_and_expand_helpers_cover_all_ranks():

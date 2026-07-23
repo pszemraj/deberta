@@ -528,7 +528,7 @@ class DisentangledSelfAttention(nn.Module):
             # For broadcast padding masks (B,1,1,S), query activity equals key activity —
             # transpose the key dim to get per-query (B,1,S,1). For pairwise masks
             # (B,1,S,S), query activity is encoded on the diagonal (inactive queries
-            # may still keep a CLS fallback edge to avoid all-False rows).
+            # may still keep an off-diagonal fallback edge to avoid all-False rows).
             if keep_mask.shape[-2] == 1:
                 live_queries = keep_mask.transpose(-2, -1)  # (B,1,S,1)
             else:

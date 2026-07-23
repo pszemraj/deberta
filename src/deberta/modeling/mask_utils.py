@@ -290,6 +290,11 @@ def attention_mask_to_active_tokens(
 def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     """Build a dense pairwise keep mask from compact document ids.
 
+    Contract: for ``S > 1`` the diagonal always equals ``doc_ids != 0``, so
+    consumers may read per-query activity from it (loss active-token masks and
+    attention query zeroing both do). Inactive padding queries keep exactly one
+    off-diagonal fallback edge so masked softmax rows stay finite.
+
     :param torch.Tensor doc_ids: Document id tensor ``(B,S)`` with ``0`` for padding.
     :raises ValueError: If ``doc_ids`` is not rank 2.
     :return torch.Tensor: Boolean keep mask ``(B,S,S)``.
@@ -303,12 +308,18 @@ def build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
     same_doc = ids[:, :, None].eq(ids[:, None, :])
     keep = same_doc & active[:, :, None] & active[:, None, :]
 
+    # The fallback edge must stay off the diagonal: a self-edge would make
+    # left-padded position 0 read as an active RTD token. Key 0 serves
+    # queries >= 1; query 0 (left padding) redirects to key 1.
     seq_len = int(ids.shape[1])
-    cls_key = torch.zeros((seq_len,), dtype=torch.bool, device=ids.device)
-    if seq_len > 0:
-        cls_key[0] = True
-
-    keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
+    inactive = ~active
+    if seq_len > 1:
+        keep[:, 1:, 0] |= inactive[:, 1:]
+        keep[:, 0, 1] |= inactive[:, 0]
+    elif seq_len == 1:
+        # Single-position rows have no off-diagonal key; prefer a finite
+        # softmax row over a strict diagonal for this degenerate shape.
+        keep[:, 0, 0] |= inactive[:, 0]
 
     return keep
 
