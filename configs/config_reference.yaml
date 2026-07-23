@@ -228,10 +228,10 @@
 # data.packing
 
 # [data.packing.enabled] bool = true; values: true | false.
-# true concatenates documents into fixed-length rows; false chunks each document to `max_seq_length-2`, adds one outer CLS/SEP pair, and pads to the fixed length. Packing is the throughput-oriented default.
+# true concatenates documents into fixed-length rows; false chunks each document to `max_seq_length-2`, adds one outer CLS/SEP pair, and pads on the right to the fixed length. Packing is the throughput-oriented default.
 
 # [data.packing.max_seq_length] int = 512; must be >= 8 and no larger than either component's position budget.
-# Controls fixed row length in both modes. Synthesized native configs need `model.hf.max_position_embeddings` above 512; pretrained/explicit configs must already cover the value.
+# Controls the exact row length and right-padding target in both modes; it is the sole training padding-shape control. Choose a hardware/kernel-friendly length (shipped configs use 32, 512, or 1024). Synthesized native configs need `model.hf.max_position_embeddings` above 512; pretrained/explicit configs must already cover the value.
 
 # [data.packing.block_cross_document_attention] bool = false; values: true | false; true requires `data.packing.enabled=true`.
 # true wraps each packed segment with CLS/SEP, restarts its positions, supplies segment-specific RTD context, and prevents cross-document attention. RoPE cannot combine it with `train.sdpa_kernel="flash"`; non-segment-aware routes may materialize quadratic masks and warn above length 2048.

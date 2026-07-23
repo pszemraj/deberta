@@ -25,6 +25,10 @@ Packed doc-block batches carry ``doc_ids``; ``emit_flash_metadata=True`` additio
 [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
 batch-preparation contract.
 
+For direct use with variable-length features, `pad_to_multiple_of` delegates to the tokenizer and
+follows its `padding_side`. The built-in training datasets already emit fixed-length, right-padded
+rows and use `data.packing.max_seq_length` as their single shape control.
+
 Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
 those raw helper defaults for the selected backbone; see the [config reference](../../configs/config_reference.yaml).
 

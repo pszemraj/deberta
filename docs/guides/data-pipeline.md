@@ -32,6 +32,11 @@ Outputs:
 - optional `attention_mask` (only when padding exists)
 - `doc_ids (B,S)` for document-blocked packing
 
+Both dataset wrappers emit exactly `data.packing.max_seq_length` positions. Incomplete rows append
+the tokenizer's `pad_token_id` on the right and emit a prefix-shaped attention mask. This setting is
+the sole training row-length and padding target; choose a hardware- and kernel-friendly length
+directly rather than combining it with a second training `pad_to_multiple_of` control.
+
 ## Cross-document attention blocking
 
 `data.packing.block_cross_document_attention` controls attention masking across packed document
