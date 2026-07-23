@@ -13,6 +13,7 @@ from transformers.modeling_outputs import BaseModelOutput
 
 from deberta.modeling.activations import get_act_fn
 from deberta.modeling.mask_utils import normalize_keep_mask
+from deberta.modeling.norms import MixedPrecisionRMSNorm
 from deberta.modeling.rope import RotaryEmbedding
 
 
@@ -134,7 +135,7 @@ class DebertaRoPEEmbeddings(nn.Module):
         else:
             self.position_embeddings = None
 
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
@@ -395,15 +396,15 @@ class DebertaRoPELayer(nn.Module):
         self.mlp = DebertaRoPEMLP(config)
 
         if self.norm_arch == "post":
-            self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.norm1 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.norm2 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
         else:
             # KEEL: inner norm + outer norm per sublayer
-            self.inner_norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.outer_norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.inner_norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.outer_norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.inner_norm1 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.outer_norm1 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.inner_norm2 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.outer_norm2 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
             self.alpha1 = _KEELAlpha(alpha_init, learnable=config.keel_alpha_learnable)

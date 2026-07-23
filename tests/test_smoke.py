@@ -3675,3 +3675,44 @@ def test_rope_embeddings_rmsnorm_matches_torch_reference(tiny_rope_config_factor
 
     assert isinstance(embeddings.norm, torch.nn.RMSNorm)
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_mixed_precision_rmsnorm_preserves_fp32_master_weight_and_gradient():
+    from deberta.modeling.norms import MixedPrecisionRMSNorm
+
+    norm = MixedPrecisionRMSNorm(16, eps=1e-6)
+    hidden_states = torch.randn(2, 3, 16, dtype=torch.bfloat16, requires_grad=True)
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(0.5, 1.5, steps=16))
+        expected = torch.nn.functional.rms_norm(
+            hidden_states.float(),
+            norm.normalized_shape,
+            norm.weight,
+            norm.eps,
+        ).to(dtype=hidden_states.dtype)
+
+    actual = norm(hidden_states)
+    actual.float().sum().backward()
+
+    assert actual.dtype == torch.bfloat16
+    assert norm.weight.dtype == torch.float32
+    assert norm.weight.grad is not None
+    assert norm.weight.grad.dtype == torch.float32
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=8e-3, atol=1.6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused RMSNorm dispatch.")
+def test_mixed_precision_rmsnorm_uses_fused_cuda_dispatch_without_dtype_warning():
+    import warnings
+
+    from deberta.modeling.norms import MixedPrecisionRMSNorm
+
+    norm = MixedPrecisionRMSNorm(768, eps=1e-6, device="cuda")
+    hidden_states = torch.randn(2, 32, 768, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        output = norm(hidden_states)
+
+    assert "FusedRmsNorm" in type(output.grad_fn).__name__
+    assert not any("Mismatch dtype between input and weight" in str(item.message) for item in caught)

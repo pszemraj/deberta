@@ -46,6 +46,7 @@ from deberta.modeling.mask_utils import (
 from deberta.modeling.mask_utils import (
     attention_mask_to_active_tokens as _attention_mask_to_active_tokens,
 )
+from deberta.modeling.norms import MixedPrecisionRMSNorm
 
 try:
     from torch.distributed.tensor import DTensor as _TorchDTensor
@@ -164,7 +165,7 @@ class MLMTransform(nn.Module):
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", False)):
             # RMSNorm is a modernization option. For strict DeBERTa parity, keep this False.
-            self.norm = nn.RMSNorm(embedding_size, eps=eps)
+            self.norm = MixedPrecisionRMSNorm(embedding_size, eps=eps)
         else:
             self.norm = nn.LayerNorm(embedding_size, eps=eps)
 
@@ -460,7 +461,7 @@ class RTDHead(nn.Module):
 
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", False)):
-            self.norm = nn.RMSNorm(hidden_size, eps=eps)
+            self.norm = MixedPrecisionRMSNorm(hidden_size, eps=eps)
         else:
             self.norm = nn.LayerNorm(hidden_size, eps=eps)
 
