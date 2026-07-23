@@ -223,7 +223,7 @@ class DebertaRoPESelfAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, nh, S, hd)
 
         if self.rope is not None:
-            q, k = self.rope.apply(q, k)
+            q, k = self.rope.apply_rotary(q, k)
 
         use_sdpa = self.attn_impl == "sdpa"
         sdpa_attn_mask = None

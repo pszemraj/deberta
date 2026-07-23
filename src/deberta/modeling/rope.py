@@ -134,7 +134,7 @@ class RotaryEmbedding(nn.Module):
         sin = self._cache.sin[:seq_len]
         return cos, sin
 
-    def apply(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def apply_rotary(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply RoPE to q and k.
 
         :param torch.Tensor q: Query tensor shaped (batch, heads, seq, head_dim).

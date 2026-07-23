@@ -3700,10 +3700,14 @@ def test_rotary_apply_full_dim_matches_reference():
     from deberta.modeling.rope import RotaryEmbedding, _rotate_half
 
     rope = RotaryEmbedding(dim=8, base=10_000.0)
+    visited: list[torch.nn.Module] = []
+    assert rope.apply(visited.append) is rope
+    assert visited == [rope]
+
     q = torch.randn((2, 3, 5, 8), dtype=torch.float32)
     k = torch.randn((2, 3, 5, 8), dtype=torch.float32)
 
-    q_out, k_out = rope.apply(q, k)
+    q_out, k_out = rope.apply_rotary(q, k)
 
     cos, sin = rope.get_cos_sin(q.shape[-2], device=q.device, dtype=q.dtype)
     cos = cos[None, None, :, :]
