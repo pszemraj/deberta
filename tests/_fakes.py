@@ -118,6 +118,7 @@ class DummyTokenizer:
     ) -> None:
         self.vocab_type = str(vocab_type).strip().lower()
         self.vocab_size = vocab_size
+        self.padding_side = "right"
         self.pad_token_id = 0
         self.cls_token_id = 1
         self.sep_token_id = 2
@@ -203,7 +204,9 @@ class DummyTokenizer:
                     pad_val = 0
                     if k == "special_tokens_mask":
                         pad_val = 1
-                    batch[k].append(v + [pad_val] * (max_len - len(v)))
+                    padding = [pad_val] * (max_len - len(v))
+                    padded = padding + v if self.padding_side == "left" else v + padding
+                    batch[k].append(padded)
                 else:
                     raise TypeError(f"Unsupported feature type for {k}: {type(v)}")
 

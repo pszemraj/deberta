@@ -65,7 +65,7 @@ class DebertaV3ElectraCollator:
         :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
         :param bool block_cross_document_attention: Whether to emit compact document metadata for packed inputs.
         :param bool emit_flash_metadata: Whether to build Flash routing metadata.
-        :param int | None pad_to_multiple_of: Optional right-padding multiple.
+        :param int | None pad_to_multiple_of: Optional padding multiple.
         """
         self.tokenizer = tokenizer
         self.cfg = cfg
@@ -152,9 +152,13 @@ class DebertaV3ElectraCollator:
         doc_ids = None
         if doc_id_rows is not None:
             doc_ids = torch.zeros_like(batch["input_ids"], dtype=torch.long)
+            padding_side = str(getattr(self.tokenizer, "padding_side", "right")).strip().lower()
             for row_index, row_doc_ids in enumerate(doc_id_rows):
                 row_tensor = torch.as_tensor(row_doc_ids, dtype=torch.long)
-                doc_ids[row_index, : int(row_tensor.numel())] = row_tensor
+                row_length = int(row_tensor.numel())
+                # doc_ids bypass tokenizer.pad, so mirror its per-row padding offset.
+                row_start = int(doc_ids.shape[1]) - row_length if padding_side == "left" else 0
+                doc_ids[row_index, row_start : row_start + row_length] = row_tensor
         else:
             batch.pop("doc_ids", None)
         if doc_ids is not None:

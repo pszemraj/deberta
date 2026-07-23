@@ -593,23 +593,22 @@ def test_collator_emits_document_ids_when_packed(packed_doc_collator):
     assert torch.equal(batch["doc_context_index"], torch.tensor([[0, 0, 0, 3, 3, 3]]))
 
 
-def test_collator_pads_document_ids_independently_of_tokenizer(monkeypatch) -> None:
-    """Custom doc_ids must stay aligned when tokenizer.pad ignores custom fields."""
+@pytest.mark.parametrize(
+    ("padding_side", "expected_doc_ids", "expected_attention_mask"),
+    [
+        ("right", [1, 1, 1, 2, 2, 2, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0]),
+        ("left", [0, 0, 1, 1, 1, 2, 2, 2], [0, 0, 1, 1, 1, 1, 1, 1]),
+    ],
+)
+def test_collator_aligns_document_ids_with_tokenizer_padding_side(
+    padding_side: str,
+    expected_doc_ids: list[int],
+    expected_attention_mask: list[int],
+) -> None:
+    """Custom doc_ids must follow the tokenizer's row-padding offset."""
 
     tokenizer = DummyTokenizer(vocab_size=128)
-    original_pad = tokenizer.pad
-
-    def _pad_without_custom_field_padding(features, **kwargs):
-        doc_id_rows = [feature["doc_ids"] for feature in features] if "doc_ids" in features[0] else None
-        standard_features = [
-            {key: value for key, value in feature.items() if key != "doc_ids"} for feature in features
-        ]
-        batch = original_pad(standard_features, **kwargs)
-        if doc_id_rows is not None:
-            batch["doc_ids"] = torch.tensor(doc_id_rows, dtype=torch.long)
-        return batch
-
-    monkeypatch.setattr(tokenizer, "pad", _pad_without_custom_field_padding)
+    tokenizer.padding_side = padding_side
     collator = DebertaV3ElectraCollator(
         tokenizer=tokenizer,
         cfg=MLMConfig(mlm_probability=0.2),
@@ -635,8 +634,8 @@ def test_collator_pads_document_ids_independently_of_tokenizer(monkeypatch) -> N
     )
 
     assert tuple(batch["input_ids"].shape) == (1, 8)
-    assert torch.equal(batch["doc_ids"], torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]]))
-    assert torch.equal(batch["attention_mask"], torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]]))
+    assert torch.equal(batch["doc_ids"], torch.tensor([expected_doc_ids]))
+    assert torch.equal(batch["attention_mask"], torch.tensor([expected_attention_mask]))
 
 
 def test_collator_reports_missing_document_ids(packed_doc_collator) -> None:
