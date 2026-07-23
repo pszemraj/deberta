@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -238,6 +239,51 @@ def _build_export_backbone(
     return disc, gen
 
 
+# Source-state keys that exist only in training-time modules. Each predicate
+# returns True when the export architecture omits the key by design, so the
+# entry is training-only state rather than a genuine load mismatch. Add new
+# native-vs-export exceptions here instead of inlining checks at load sites.
+_TRAINING_ONLY_EXPORT_STATE_KEYS: dict[str, Callable[[Any], bool]] = {
+    # Native RTD keeps this weight for Enhanced Mask Decoding; the standalone
+    # HF encoder with position_biased_input=False neither defines nor consumes it.
+    "embeddings.position_embeddings.weight": lambda export_model: (
+        not bool(getattr(getattr(export_model, "config", None), "position_biased_input", True))
+    ),
+}
+
+
+def _drop_training_only_state_for_strict_load(
+    *,
+    export_model: Any,
+    state_dict: dict[str, torch.Tensor],
+    strict_export_load: bool,
+) -> dict[str, torch.Tensor]:
+    """Drop known training-only source keys the export model does not define.
+
+    :param Any export_model: Target export model instance.
+    :param dict[str, torch.Tensor] state_dict: Component source state dict.
+    :param bool strict_export_load: Strict source-state loading toggle.
+    :return dict[str, torch.Tensor]: State dict safe for strict export loading.
+    """
+    prepared = dict(state_dict)
+    if not strict_export_load:
+        return prepared
+
+    candidates = [
+        key
+        for key, is_training_only in _TRAINING_ONLY_EXPORT_STATE_KEYS.items()
+        if key in prepared and is_training_only(export_model)
+    ]
+    if not candidates:
+        return prepared
+
+    model_keys = set(export_model.state_dict().keys())
+    for key in candidates:
+        if key not in model_keys:
+            prepared.pop(key)
+    return prepared
+
+
 def _prepare_discriminator_state_for_strict_load(
     *,
     export_disc: Any,
@@ -366,17 +412,11 @@ def _export_component(
     if component_key not in {"discriminator", "generator"}:
         raise ValueError(f"Unsupported export component: {component!r}")
 
-    state_for_load = dict(state_dict)
-    position_key = "embeddings.position_embeddings.weight"
-    if (
-        bool(strict_export_load)
-        and position_key in state_for_load
-        and position_key not in export_model.state_dict()
-        and not bool(getattr(getattr(export_model, "config", None), "position_biased_input", True))
-    ):
-        # Native RTD keeps this weight for Enhanced Mask Decoding; the standalone
-        # HF encoder with position_biased_input=False neither defines nor consumes it.
-        state_for_load.pop(position_key)
+    state_for_load = _drop_training_only_state_for_strict_load(
+        export_model=export_model,
+        state_dict=state_dict,
+        strict_export_load=bool(strict_export_load),
+    )
 
     if component_key == "discriminator":
         state_for_load = _prepare_discriminator_state_for_strict_load(
