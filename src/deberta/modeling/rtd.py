@@ -968,12 +968,15 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         word_w = self._get_generator_word_embedding_weight()
         gen_logits = self.generator_lm_head(gen_masked_hidden, word_embedding_weight=word_w)
-        gen_loss = F.cross_entropy(gen_logits.float(), masked_labels)
+        # Float once and share: CE and sampling would otherwise each materialize
+        # their own (N, vocab) fp32 copy at peak memory.
+        gen_logits_f = gen_logits.float()
+        gen_loss = F.cross_entropy(gen_logits_f, masked_labels)
 
         with torch.no_grad():
             forbidden_mask = getattr(self, "_forbidden_sample_token_mask", None)
             sampled = self._gumbel_sample(
-                gen_logits,
+                gen_logits_f,
                 temperature=sampling_temperature,
                 forbidden_vocab_mask=forbidden_mask,
             ).to(dtype=input_ids.dtype)
