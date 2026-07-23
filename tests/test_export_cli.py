@@ -932,6 +932,66 @@ def test_run_export_both_targets_strict_load_native_emd_state_and_save(
     }
 
 
+def test_run_export_es_sharing_strict_load_drops_native_emd_position_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    from transformers import AutoModel
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    config = make_native_deberta_config(
+        position_biased_input=False,
+        type_vocab_size=0,
+    )
+    native_state = DebertaV2Model(config).state_dict()
+    export_disc = AutoModel.from_config(config)
+    position_key = "embeddings.position_embeddings.weight"
+    assert position_key in native_state
+    assert position_key not in export_disc.state_dict()
+
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    model_cfg = make_model_config(
+        tokenizer={"name_or_path": "dummy-tokenizer"},
+        embedding_sharing="es",
+    )
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(model_cfg)),
+        encoding="utf-8",
+    )
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "split_pretrainer_state_dict",
+        lambda full_sd: (dict(native_state), dict(native_state)),
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (export_disc, None),
+    )
+
+    out_dir = tmp_path / "exported-es"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="discriminator",
+        )
+    )
+
+    assert (out_dir / "config.json").exists()
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["strict_state_load"] is True
+    assert meta["embedding_materialization"] == {"discriminator": "generator_checkpoint_shared"}
+
+
 def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
