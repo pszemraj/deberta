@@ -28,12 +28,13 @@ class ParityCase:
     route_hint: str
     pad_tail: int = 0
     docblock: bool = False
-    strict_ratio: bool = False
     head_dim: int = 16
 
 
 _PARITY_CASE_NAMES = (
     "dense",
+    "dense_hd32",
+    "dense_hd128",
     "fixed_padded",
     "varlen",
     "local_bias",
@@ -330,23 +331,13 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
         max_abs_limit=5e-2,
         mean_abs_limit=8e-3,
     )
-    if case.strict_ratio:
-        _assert_ratio_to_reference(
-            case_name=case.name,
-            label="flash_bf16_out",
-            actual=flash_out,
-            reference=ref_out,
-            eager_err=(eager_out_max, eager_out_mean),
-        )
-    else:
-        _assert_close_to_reference(
-            case_name=case.name,
-            label="flash_bf16_out",
-            actual=flash_out,
-            reference=ref_out,
-            max_abs_limit=max(3.0 * eager_out_max, 7e-2),
-            mean_abs_limit=max(3.0 * eager_out_mean, 1.2e-2),
-        )
+    _assert_ratio_to_reference(
+        case_name=case.name,
+        label="flash_bf16_out",
+        actual=flash_out,
+        reference=ref_out,
+        eager_err=(eager_out_max, eager_out_mean),
+    )
     for key in ("word_embeddings", "rel_embeddings", "query", "value"):
         eager_max_limit, eager_mean_limit = _scaled_grad_limits(
             ref_grads[key],
@@ -361,28 +352,13 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
             max_abs_limit=eager_max_limit,
             mean_abs_limit=eager_mean_limit,
         )
-        if case.strict_ratio:
-            _assert_ratio_to_reference(
-                case_name=case.name,
-                label=f"flash_grad_{key}",
-                actual=flash_grads[key],
-                reference=ref_grads[key],
-                eager_err=(eager_grad_max, eager_grad_mean),
-            )
-        else:
-            flash_max_limit, flash_mean_limit = _scaled_grad_limits(
-                ref_grads[key],
-                max_rel=0.5,
-                mean_rel=0.5,
-            )
-            _assert_close_to_reference(
-                case_name=case.name,
-                label=f"flash_grad_{key}",
-                actual=flash_grads[key],
-                reference=ref_grads[key],
-                max_abs_limit=max(3.0 * eager_grad_max, flash_max_limit),
-                mean_abs_limit=max(3.0 * eager_grad_mean, flash_mean_limit),
-            )
+        _assert_ratio_to_reference(
+            case_name=case.name,
+            label=f"flash_grad_{key}",
+            actual=flash_grads[key],
+            reference=ref_grads[key],
+            eager_err=(eager_grad_max, eager_grad_mean),
+        )
 
 
 def main() -> None:
@@ -391,6 +367,8 @@ def main() -> None:
     args = _parse_args()
     cases = [
         ParityCase("dense", seq_len=256, batch_size=2, route_hint="dense"),
+        ParityCase("dense_hd32", seq_len=256, batch_size=2, route_hint="dense", head_dim=32),
+        ParityCase("dense_hd128", seq_len=256, batch_size=2, route_hint="dense", head_dim=128),
         ParityCase("fixed_padded", seq_len=256, batch_size=2, route_hint="fixed", pad_tail=64),
         ParityCase("varlen", seq_len=256, batch_size=2, route_hint="varlen", pad_tail=64),
         ParityCase("local_bias", seq_len=1024, batch_size=2, route_hint="local_bias"),
@@ -402,7 +380,6 @@ def main() -> None:
             route_hint="docblock",
             pad_tail=96,
             docblock=True,
-            strict_ratio=True,
         ),
         ParityCase(
             "docblock_2048",
@@ -411,7 +388,6 @@ def main() -> None:
             route_hint="docblock",
             pad_tail=160,
             docblock=True,
-            strict_ratio=True,
         ),
         ParityCase(
             "docblock_4096",
@@ -420,7 +396,6 @@ def main() -> None:
             route_hint="docblock",
             pad_tail=256,
             docblock=True,
-            strict_ratio=True,
         ),
     ]
     if bool(args.include_docblock_bias):
@@ -435,7 +410,6 @@ def main() -> None:
                     batch_size=4,
                     route_hint="docblock_bias",
                     docblock=True,
-                    strict_ratio=True,
                     head_dim=64,
                 ),
                 ParityCase(
@@ -445,7 +419,6 @@ def main() -> None:
                     route_hint="docblock_bias",
                     pad_tail=96,
                     docblock=True,
-                    strict_ratio=True,
                     head_dim=64,
                 ),
                 ParityCase(
@@ -455,7 +428,6 @@ def main() -> None:
                     route_hint="docblock_bias",
                     pad_tail=160,
                     docblock=True,
-                    strict_ratio=True,
                     head_dim=64,
                 ),
                 ParityCase(
@@ -465,7 +437,6 @@ def main() -> None:
                     route_hint="docblock_bias",
                     pad_tail=256,
                     docblock=True,
-                    strict_ratio=True,
                     head_dim=64,
                 ),
             ]

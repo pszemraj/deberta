@@ -22,7 +22,7 @@ The flash path has these constraints:
 
 Training and `--dry-run` preflight probe the optional runtime before output or dataset setup. Missing `.[flash]` dependencies or incompatible core low-level imports raise an actionable error instead of silently running eager attention.
 
-For Flash-configured runs, `run_metadata.json` records the configured attention policy and installed `flashdeberta` version. Routing and supported eager fallbacks remain per-call decisions, so the metadata does not claim that every call used one route.
+For Flash-configured runs, `run_metadata.json` records the configured attention policy and the `flashdeberta` version used by the latest successfully validated training or resume invocation. A resume refreshes that version in its output run metadata; resuming into a new output directory leaves the source run's provenance unchanged. Routing and supported eager fallbacks remain per-call decisions, so the metadata does not claim that every call used one route.
 
 ## Route families
 
@@ -70,6 +70,8 @@ exact-length semantics are defined on each field in the
 
 An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to the dense memory cost. An active `kernel_overrides_path` is loaded and validated with the training config, then merged with the shipped table for route and kernel lookups.
 
+Do not force dense `docblock_bias` above sequence length 4096 until its backward path can recompute rather than save the quadratic bias; use ragged `docblock` for longer contexts.
+
 ## Tuning table
 
 Defaults live in
@@ -84,24 +86,15 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
 
 ### Retuning
 
-1. Sample real batches with
-   [`flashdeberta_varlen_tune.py`](../../tools/flashdeberta_varlen_tune.py) or
-   [`flashdeberta_bias_tune.py`](../../tools/flashdeberta_bias_tune.py). Both write batch samples,
-   summaries, and `best_candidates.json` winner manifests under `local-scratch/benchmarks/flashdeberta/` unless an
-   output directory is supplied.
-2. Put durable route or kernel winners in an override table and select it with
-   `model.hf.flash.kernel_overrides_path`. Scope hardware-specific rows with
-   `compute_capability`. Same-name custom sequence buckets replace shipped buckets; new names are
-   evaluated first.
-3. Promote results into the shipped table only after parity, throughput, and memory checks hold
-   across repeated runs.
+1. Sample real batches with [`flashdeberta_varlen_tune.py`](../../tools/flashdeberta_varlen_tune.py) or [`flashdeberta_bias_tune.py`](../../tools/flashdeberta_bias_tune.py). Both write batch samples, summaries, and `best_candidates.json` winner manifests under `local-scratch/benchmarks/flashdeberta/` unless an output directory is supplied. Each manifest retains the path to the candidate override table, which already uses the runtime-consumed schema and can be selected directly without transcription.
+2. Put durable route or kernel winners in an override table and select it with `model.hf.flash.kernel_overrides_path`. Scope hardware-specific rows with `compute_capability`. Same-name custom sequence buckets replace shipped buckets; new names are evaluated first.
+3. Promote results into the shipped table only after parity, throughput, and memory checks hold across repeated runs. Promotion is an explicit review of the winning candidate rows rather than an automated rewrite of package policy.
 
 ## Benchmarking and profiling
 
 - [`flashdeberta_microbench.py`](../../tools/flashdeberta_microbench.py) compares eager and flash
   on synthetic dense and padded shapes.
-- [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and
-  selected gradients against eager attention.
+- [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and selected gradients against fp32 eager attention, requiring every Flash result to stay within three times the corresponding eager-bf16 error, subject only to `1e-7` max-error and `1e-8` mean-error numerical-noise floors. Its real-kernel cases cover head dimensions 16, 32, 64, and 128.
 The runnable Flash training example is [`pretrain_flashdeberta_1024.yaml`](../../configs/flashdeberta/pretrain_flashdeberta_1024.yaml). The tuning tools override its packing and route settings for their own sampled workloads.
 
 Before merging Flash changes, run `bash tools/premerge.sh`. It records the commit and dirty-tree state under `local-scratch/premerge/` while running lint, docstring checks, the full test suite, and CUDA parity.
