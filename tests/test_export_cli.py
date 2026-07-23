@@ -870,9 +870,24 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     assert (out_dir / "README.md").exists()
 
 
-def test_run_export_both_targets_save_into_component_subdirectories(
+def test_run_export_both_targets_strict_load_native_emd_state_and_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
+    from transformers import AutoModel
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    config = make_native_deberta_config(
+        position_biased_input=False,
+        type_vocab_size=0,
+    )
+    native_state = DebertaV2Model(config).state_dict()
+    export_disc = AutoModel.from_config(config)
+    export_gen = AutoModel.from_config(config)
+    position_key = "embeddings.position_embeddings.weight"
+    assert position_key in native_state
+    assert position_key not in export_disc.state_dict()
+
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
@@ -881,14 +896,16 @@ def test_run_export_both_targets_save_into_component_subdirectories(
         fsdp2=False,
         provide_torch_state_dict_api=False,
     )
+    monkeypatch.setattr(
+        export_cli,
+        "split_pretrainer_state_dict",
+        lambda full_sd: (dict(native_state), dict(native_state)),
+    )
 
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (
-            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
-            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
-        ),
+        lambda model_cfg, disc_config, gen_config, export_what: (export_disc, export_gen),
     )
 
     out_dir = tmp_path / "exported-both"

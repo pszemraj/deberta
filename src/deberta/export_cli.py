@@ -366,11 +366,22 @@ def _export_component(
     if component_key not in {"discriminator", "generator"}:
         raise ValueError(f"Unsupported export component: {component!r}")
 
-    state_for_load = state_dict
+    state_for_load = dict(state_dict)
+    position_key = "embeddings.position_embeddings.weight"
+    if (
+        bool(strict_export_load)
+        and position_key in state_for_load
+        and position_key not in export_model.state_dict()
+        and not bool(getattr(getattr(export_model, "config", None), "position_biased_input", True))
+    ):
+        # Native RTD keeps this weight for Enhanced Mask Decoding; the standalone
+        # HF encoder with position_biased_input=False neither defines nor consumes it.
+        state_for_load.pop(position_key)
+
     if component_key == "discriminator":
         state_for_load = _prepare_discriminator_state_for_strict_load(
             export_disc=export_model,
-            disc_sd=state_dict,
+            disc_sd=state_for_load,
             embedding_sharing=embedding_sharing,
             strict_export_load=bool(strict_export_load),
         )
