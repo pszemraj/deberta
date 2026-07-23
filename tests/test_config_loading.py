@@ -279,6 +279,37 @@ def test_load_nested_unknown_top_level_key_raises(tmp_path: Path, format_name: s
 
 
 @pytest.mark.parametrize(
+    ("section", "removed_key", "value", "match"),
+    [
+        (
+            "model",
+            "profile",
+            "modern",
+            r"profile \(remove model\.profile; configure model\.backbone_type and explicit fields directly\)",
+        ),
+        (
+            "logging",
+            "backend",
+            "tensorboard",
+            r"backend \(remove logging\.backend; only logging\.wandb\.enabled remains for optional tracking\)",
+        ),
+    ],
+)
+def test_load_config_explains_removed_keys(
+    tmp_path: Path,
+    section: str,
+    removed_key: str,
+    value: str,
+    match: str,
+) -> None:
+    bad = tmp_path / "removed-key.json"
+    bad.write_text(json.dumps({section: {removed_key: value}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        load_config(bad)
+
+
+@pytest.mark.parametrize(
     "config_name",
     [
         "pretrain_deberta_v3_bespoke_100k.yaml",

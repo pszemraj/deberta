@@ -1568,6 +1568,68 @@ def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matchin
     assert resumed_train_snapshot == original_train_snapshot
 
 
+@pytest.mark.parametrize("separate_output", [False, True], ids=["same_run", "new_run"])
+def test_persist_or_validate_run_configs_refreshes_flashdeberta_version_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separate_output: bool,
+) -> None:
+    import deberta.training.run_config as run_config
+
+    installed_version = {"value": "0.0.7"}
+    monkeypatch.setattr(
+        run_config.metadata,
+        "version",
+        lambda name: installed_version["value"] if name == "flashdeberta" else "0.0.0",
+    )
+
+    source_run = tmp_path / "source-run"
+    source_run.mkdir()
+    model_cfg = make_model_config(hf={"attention_impl": "flash"})
+    data_cfg = make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})
+    train_cfg = make_train_config(max_steps=10)
+    _persist_or_validate_run_configs(
+        output_dir=source_run,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+    checkpoint_dir = source_run / "checkpoint-10"
+    checkpoint_dir.mkdir()
+
+    installed_version["value"] = "0.0.8"
+    output_dir = tmp_path / "resumed-run" if separate_output else source_run
+    output_dir.mkdir(exist_ok=True)
+    _persist_or_validate_run_configs(
+        output_dir=output_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        resume_checkpoint=str(checkpoint_dir),
+        is_main_process=True,
+    )
+
+    output_meta = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert output_meta["flash_attention"]["flashdeberta_version"] == "0.0.8"
+    if separate_output:
+        source_meta = json.loads((source_run / "run_metadata.json").read_text(encoding="utf-8"))
+        assert source_meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
+
+        installed_version["value"] = "0.0.9"
+        _persist_or_validate_run_configs(
+            output_dir=output_dir,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            resume_checkpoint=str(checkpoint_dir),
+            is_main_process=True,
+        )
+        repeated_meta = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
+        assert repeated_meta["flash_attention"]["flashdeberta_version"] == "0.0.9"
+
+
 @pytest.mark.parametrize("schema_offset", [-1, 1])
 def test_persist_or_validate_run_configs_rejects_unknown_run_metadata_schema(
     tmp_path: Path,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
@@ -141,6 +142,74 @@ def _require_fields(row: dict[str, Any], *, required: set[str], location: str) -
         raise ValueError(f"{location} is missing required field(s): {', '.join(missing)}.")
 
 
+def _require_positive_int(row: dict[str, Any], *, field_name: str, location: str) -> int | None:
+    """Validate one optional positive-integer tuning field.
+
+    :param dict[str, Any] row: Candidate tuning row.
+    :param str field_name: Field to validate when present.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If the field is not a positive JSON integer.
+    :return int | None: Validated value, or None when absent.
+    """
+
+    value = row.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{location}.{field_name} must be a positive integer.")
+    return value
+
+
+def _require_unit_interval_number(
+    row: dict[str, Any],
+    *,
+    field_name: str,
+    location: str,
+) -> float | None:
+    """Validate one optional finite density in the closed unit interval.
+
+    :param dict[str, Any] row: Candidate tuning row.
+    :param str field_name: Field to validate when present.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If the field is not a finite JSON number in ``[0, 1]``.
+    :return float | None: Validated value, or None when absent.
+    """
+
+    value = row.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{location}.{field_name} must be a finite number in [0, 1].")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
+        raise ValueError(f"{location}.{field_name} must be a finite number in [0, 1].")
+    return parsed
+
+
+def _validate_positive_int_range(
+    row: dict[str, Any],
+    *,
+    field_name: str,
+    location: str,
+) -> tuple[int | None, int | None]:
+    """Validate optional ``min_*``/``max_*`` positive-integer bounds.
+
+    :param dict[str, Any] row: Candidate tuning row.
+    :param str field_name: Unprefixed bounded field name.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If a bound is invalid or the minimum exceeds the maximum.
+    :return tuple[int | None, int | None]: Validated minimum and maximum.
+    """
+
+    min_name = f"min_{field_name}"
+    max_name = f"max_{field_name}"
+    min_value = _require_positive_int(row, field_name=min_name, location=location)
+    max_value = _require_positive_int(row, field_name=max_name, location=location)
+    if min_value is not None and max_value is not None and min_value > max_value:
+        raise ValueError(f"{location}.{min_name} must be <= {max_name}.")
+    return min_value, max_value
+
+
 def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None:
     """Validate the override-table structure consumed by route and kernel lookup.
 
@@ -159,6 +228,20 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
         _require_fields(row, required={"name"}, location=location)
         if not str(row["name"]).strip():
             raise ValueError(f"{location}.name must be non-empty.")
+        _validate_positive_int_range(row, field_name="seq_len", location=location)
+        min_density = _require_unit_interval_number(
+            row,
+            field_name="min_density",
+            location=location,
+        )
+        for max_name in ("max_density", "max_density_exclusive"):
+            max_density = _require_unit_interval_number(
+                row,
+                field_name=max_name,
+                location=location,
+            )
+            if min_density is not None and max_density is not None and min_density > max_density:
+                raise ValueError(f"{location}.min_density must be <= {max_name}.")
 
     policies = _require_mapping(payload.get("route_policies", {}), location="route_policies")
     for policy, raw_rows in policies.items():
@@ -174,6 +257,8 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
             if choice not in choices:
                 allowed = ", ".join(sorted(choices))
                 raise ValueError(f"{location}.choice must be one of: {allowed}. Got {choice!r}.")
+            _validate_positive_int_range(row, field_name="seq_len", location=location)
+            _require_positive_int(row, field_name="max_batch_size", location=location)
 
     for index, raw in enumerate(_require_rows(payload.get("kernels", []), location="kernels")):
         location = f"kernels[{index}]"
@@ -197,12 +282,13 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
         if kinds is None or kind not in kinds:
             raise ValueError(f"{location} has unsupported route/kind pair {route!r}/{kind!r}.")
         for field_name in ("block_m", "block_n", "num_stages", "num_warps"):
-            try:
-                value = int(row[field_name])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{location}.{field_name} must be a positive integer.") from exc
-            if value <= 0:
-                raise ValueError(f"{location}.{field_name} must be a positive integer.")
+            _require_positive_int(row, field_name=field_name, location=location)
+        if row.get("head_dim") != "*":
+            _require_positive_int(row, field_name="head_dim", location=location)
+        for field_name in ("batch_size", "query_len", "key_len", "num_heads"):
+            _require_positive_int(row, field_name=field_name, location=location)
+            _validate_positive_int_range(row, field_name=field_name, location=location)
+        _require_positive_int(row, field_name="att_span_min", location=location)
 
 
 def _load_override_payload(path: Path) -> dict[str, Any]:

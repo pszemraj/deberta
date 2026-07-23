@@ -1608,21 +1608,24 @@ _TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
 def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
     """Return an actionable migration suggestion for an unknown key.
 
-    Only cross-section train migrations and former root groups retain targeted hints.
-
     :param str section_name: Section path.
     :param str key: Unknown key.
-    :return str | None: Suggested replacement path.
+    :return str | None: Migration hint for the removed or moved key.
     """
     section = str(section_name)
     k = str(key)
     if section == "train":
-        return _TRAIN_CROSS_SECTION_SUGGESTIONS.get(k)
+        replacement = _TRAIN_CROSS_SECTION_SUGGESTIONS.get(k)
+        return f"use {replacement}" if replacement is not None else None
     if section == "root":
         if k == "checkpoint":
-            return "train.checkpoint"
+            return "use train.checkpoint"
         if k == "debug":
-            return "logging.debug"
+            return "use logging.debug"
+    if section == "model" and k == "profile":
+        return "remove model.profile; configure model.backbone_type and explicit fields directly"
+    if section == "logging" and k == "backend":
+        return "remove logging.backend; only logging.wandb.enabled remains for optional tracking"
     return None
 
 
@@ -1671,7 +1674,7 @@ def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, 
         for key in unknown_top:
             sug = _legacy_key_suggestion("root", key)
             if sug is not None:
-                details.append(f"{key} (use {sug})")
+                details.append(f"{key} ({sug})")
             else:
                 details.append(str(key))
         raise ValueError(
@@ -1724,7 +1727,7 @@ def _replace_from_mapping_recursive(cfg_obj: Any, mapping: dict[str, Any], *, se
             if sug is None:
                 rendered.append(str(key))
             else:
-                rendered.append(f"{key} (use {sug})")
+                rendered.append(f"{key} ({sug})")
         raise ValueError(f"Unknown keys in section {section_name!r}: {', '.join(rendered)}")
 
     updates: dict[str, Any] = {}

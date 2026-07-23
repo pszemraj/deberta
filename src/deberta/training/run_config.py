@@ -82,6 +82,28 @@ def _build_run_metadata(
     return meta
 
 
+def _refresh_resume_flashdeberta_version(
+    *,
+    path: Path,
+    current_run_meta: dict[str, Any],
+) -> None:
+    """Refresh the FlashDeBERTa version for the latest training invocation.
+
+    :param Path path: Output run-metadata path.
+    :param dict[str, Any] current_run_meta: Metadata built from the current environment.
+    """
+
+    current_flash = current_run_meta.get("flash_attention")
+    if not isinstance(current_flash, dict):
+        return
+    saved_meta = load_json_mapping(path)
+    saved_flash = saved_meta.get("flash_attention")
+    refreshed_flash = dict(saved_flash) if isinstance(saved_flash, dict) else dict(current_flash)
+    refreshed_flash["flashdeberta_version"] = current_flash.get("flashdeberta_version")
+    saved_meta["flash_attention"] = refreshed_flash
+    dump_json(saved_meta, path)
+
+
 def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
     """Write a mapping payload to YAML.
 
@@ -245,6 +267,32 @@ def _effective_train_config_for_resume_compare(cfg: TrainConfig) -> dict[str, An
     return payload
 
 
+def _resume_snapshot_files_match(*, source: Path, target: Path) -> bool:
+    """Compare copied resume snapshots while allowing the refreshed runtime version.
+
+    :param Path source: Snapshot in the source run directory.
+    :param Path target: Existing snapshot in the resumed output directory.
+    :return bool: Whether the snapshots carry equivalent provenance.
+    """
+
+    source_text = source.read_text(encoding="utf-8")
+    target_text = target.read_text(encoding="utf-8")
+    if source_text == target_text:
+        return True
+    if source.name != RUN_METADATA_FILENAME or target.name != RUN_METADATA_FILENAME:
+        return False
+
+    source_meta = load_json_mapping(source)
+    target_meta = load_json_mapping(target)
+    for payload in (source_meta, target_meta):
+        flash_meta = payload.get("flash_attention")
+        if isinstance(flash_meta, dict):
+            normalized_flash = dict(flash_meta)
+            normalized_flash.pop("flashdeberta_version", None)
+            payload["flash_attention"] = normalized_flash
+    return source_meta == target_meta
+
+
 def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
     """Raise when output_dir contains conflicting copied snapshots for resume provenance.
 
@@ -260,9 +308,7 @@ def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_d
         if not dst.exists():
             continue
 
-        src_text = src.read_text(encoding="utf-8")
-        dst_text = dst.read_text(encoding="utf-8")
-        if dst_text != src_text:
+        if not _resume_snapshot_files_match(source=src, target=dst):
             raise ValueError(
                 "Output directory contains conflicting run snapshot while resuming from "
                 f"a different source run. Conflicting file: {dst}"
@@ -451,8 +497,7 @@ def _persist_or_validate_run_configs(
                 dst = output_dir / filename
                 src_text = src.read_text(encoding="utf-8")
                 if dst.exists():
-                    dst_text = dst.read_text(encoding="utf-8")
-                    if dst_text != src_text:
+                    if not _resume_snapshot_files_match(source=src, target=dst):
                         raise RuntimeError(f"Unexpected snapshot conflict after pre-validation: {dst}")
                 else:
                     dst.write_text(src_text, encoding="utf-8")
@@ -470,6 +515,11 @@ def _persist_or_validate_run_configs(
             )
         elif is_main_process:
             logger.info("Resume mode: preserving existing config snapshots in output_dir.")
+        if is_main_process:
+            _refresh_resume_flashdeberta_version(
+                path=output_run_meta_path,
+                current_run_meta=run_meta,
+            )
         _persist_config_yaml_snapshots(
             logging_output_dir=resolved_logging_output_dir,
             model_cfg=model_cfg,

@@ -560,8 +560,54 @@ def test_validate_model_config_warns_when_flash_options_are_inactive() -> None:
     [
         (None, "Unable to load FlashDeBERTa kernel overrides"),
         ({"kernels": [{}]}, r"kernels\[0\].*missing required field"),
+        (
+            {"seq_buckets": [{"name": "invalid", "min_seq_len": "soon"}]},
+            r"seq_buckets\[0\]\.min_seq_len must be a positive integer",
+        ),
+        (
+            {"seq_buckets": [{"name": "invalid", "min_density": 1.1}]},
+            r"seq_buckets\[0\]\.min_density must be a finite number in \[0, 1\]",
+        ),
+        (
+            {
+                "route_policies": {
+                    "padding": [
+                        {
+                            "seq_bucket": "default",
+                            "choice": "fixed",
+                            "max_batch_size": 0,
+                        }
+                    ]
+                }
+            },
+            r"route_policies\.padding\[0\]\.max_batch_size must be a positive integer",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 4,
+                        "max_query_len": "many",
+                    }
+                ]
+            },
+            r"kernels\[0\]\.max_query_len must be a positive integer",
+        ),
     ],
-    ids=["missing_file", "malformed_kernel_row"],
+    ids=[
+        "missing_file",
+        "malformed_kernel_row",
+        "malformed_bucket_bound",
+        "out_of_range_density",
+        "non_positive_policy_bound",
+        "malformed_kernel_bound",
+    ],
 )
 def test_validate_model_config_rejects_invalid_flash_kernel_overrides(
     tmp_path: Path,
