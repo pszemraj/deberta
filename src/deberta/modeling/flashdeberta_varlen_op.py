@@ -66,9 +66,6 @@ try:
         _bwd_kv_dise_kernel_varlen as _bwd_kv_dise_kernel_varlen_raw,
     )
     from flashdeberta.ops.flash_attention_varlen import (
-        _bwd_preprocess_varlen as _bwd_preprocess_varlen_raw,
-    )
-    from flashdeberta.ops.flash_attention_varlen import (
         _bwd_q_dise_kernel_varlen as _bwd_q_dise_kernel_varlen_raw,
     )
     from flashdeberta.ops.flash_attention_varlen import (
@@ -84,7 +81,6 @@ try:
     _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional import
     _bwd_kv_dise_kernel_varlen_raw = None
-    _bwd_preprocess_varlen_raw = None
     _bwd_q_dise_kernel_varlen_raw = None
     _fwd_kernel_varlen_raw = None
     _flash_attn_v2_bwd_dise_varlen_lowlevel = None
@@ -149,7 +145,6 @@ def _varlen_use_triton_op() -> bool:
         and triton is not None
         and tl is not None
         and _fwd_kernel_varlen_raw is not None
-        and _bwd_preprocess_varlen_raw is not None
         and _bwd_kv_dise_kernel_varlen_raw is not None
         and _bwd_q_dise_kernel_varlen_raw is not None
     )

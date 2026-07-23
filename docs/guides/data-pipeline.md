@@ -49,6 +49,7 @@ The collator also emits two fixed-shape objective tensors for blocked rows:
   architecture for every packed document.
 
 The collator derives contiguous document starts and ends once in row-major order. The objective tensors and FlashDeBERTa segment descriptors consume those same boundaries.
+Within each row, every nonzero `doc_id` must occupy exactly one contiguous segment. The collator rejects reused IDs because dense equality masks would otherwise disagree with ragged segment metadata.
 
 When FlashDeBERTa is enabled, the collator additionally precomputes fixed-capacity segment descriptors and scalar route inputs before device transfer. Eager training does not emit the Flash-only metadata.
 

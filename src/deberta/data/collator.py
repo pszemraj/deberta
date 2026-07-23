@@ -109,6 +109,14 @@ class DebertaV3ElectraCollator:
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         features = self._harmonize_optional_attention_masks(features)
         needs_padding = self._needs_padding(features)
+        doc_id_rows = None
+        if self._packed_sequences and self._block_cross_document_attention:
+            if any("doc_ids" not in feature for feature in features):
+                raise ValueError("Packed document blocking requires doc_ids on every feature.")
+            doc_id_rows = [feature["doc_ids"] for feature in features]
+            features = [
+                {key: value for key, value in feature.items() if key != "doc_ids"} for feature in features
+            ]
 
         # Let tokenizer handle padding for non-packed datasets.
         pad_kwargs: dict[str, Any] = {
@@ -142,8 +150,11 @@ class DebertaV3ElectraCollator:
             special_tokens_mask = special_tokens_mask.bool() | inferred_special_tokens_mask
 
         doc_ids = None
-        if self._packed_sequences and self._block_cross_document_attention:
-            doc_ids = batch.pop("doc_ids").to(dtype=torch.long)
+        if doc_id_rows is not None:
+            doc_ids = torch.zeros_like(batch["input_ids"], dtype=torch.long)
+            for row_index, row_doc_ids in enumerate(doc_id_rows):
+                row_tensor = torch.as_tensor(row_doc_ids, dtype=torch.long)
+                doc_ids[row_index, : int(row_tensor.numel())] = row_tensor
         else:
             batch.pop("doc_ids", None)
         if doc_ids is not None:
@@ -223,7 +234,7 @@ class DebertaV3ElectraCollator:
         :param torch.Tensor doc_ids: Validated document ids in ``(B,S)`` layout.
         :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] boundaries: Precomputed
             active-token mask and segment start/end indices.
-        :raises ValueError: If any active segment does not have standalone CLS/SEP boundaries.
+        :raises ValueError: If document ids or standalone CLS/SEP boundaries are invalid.
         """
 
         input_ids = batch["input_ids"]
@@ -238,6 +249,14 @@ class DebertaV3ElectraCollator:
             raise ValueError("Packed doc_ids liveness disagrees with attention_mask.")
 
         batch_size, seq_len = doc_ids.shape
+        for row_index in range(batch_size):
+            row_start_idx = start_idx[start_idx[:, 0].eq(row_index), 1]
+            segment_doc_ids = doc_ids[row_index, row_start_idx]
+            if int(torch.unique(segment_doc_ids).numel()) != int(segment_doc_ids.numel()):
+                raise ValueError(
+                    "Each nonzero doc_id must occupy exactly one contiguous segment per packed row."
+                )
+
         positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         start_positions = torch.zeros_like(positions)
         start_positions[start_idx[:, 0], start_idx[:, 1]] = positions[start_idx[:, 0], start_idx[:, 1]]

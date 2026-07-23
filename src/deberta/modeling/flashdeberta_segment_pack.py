@@ -577,12 +577,12 @@ def _segment_unpack_padded_rows(
         )
     total = int(shape[0])
     trailing_shape = shape[1:]
-    flattened = tuple(packed.contiguous().view(total, -1) for packed in packed_tensors)
     outputs = tuple(
         packed.new_zeros((int(batch_size), int(seq_len)) + trailing_shape) for packed in packed_tensors
     )
     if total == 0:
         return outputs
+    flattened = tuple(packed.contiguous().view(total, -1) for packed in packed_tensors)
     output_flats = tuple(output.view(int(batch_size) * int(seq_len), -1) for output in outputs)
     row_size = int(flattened[0].shape[1])
 

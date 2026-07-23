@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import subprocess
 import sys
 import types
 from collections.abc import Iterator
@@ -1423,6 +1424,23 @@ def test_segment_pack_pair_and_triple_cpu_roundtrip() -> None:
     assert torch.equal(unpacked_c3, expected_unpacked_c)
 
 
+def test_segment_unpack_zero_active_tokens_returns_padded_zeros() -> None:
+    from deberta.modeling.flashdeberta_segment_pack import segment_unpack_padded_rows
+
+    packed = torch.empty((0, 2, 4))
+    unpacked = segment_unpack_padded_rows(
+        packed,
+        segment_offsets=torch.tensor([0, 3], dtype=torch.int32),
+        segment_lengths=torch.zeros(2, dtype=torch.int32),
+        cu_seqlens=torch.zeros(3, dtype=torch.int32),
+        batch_size=2,
+        seq_len=3,
+    )
+
+    assert unpacked.shape == (2, 3, 2, 4)
+    assert torch.count_nonzero(unpacked).item() == 0
+
+
 def test_segment_pack_rank4_strided_avoids_contiguous_copy(monkeypatch: pytest.MonkeyPatch) -> None:
     import deberta.modeling.flashdeberta_segment_pack as segment_mod
 
@@ -1889,6 +1907,25 @@ def test_varlen_remains_enabled_while_compiling_when_custom_op_is_available(
     monkeypatch.setattr(attention_mod, "flashdeberta_compiled_varlen_available", lambda: False)
 
     assert attention_mod._should_use_varlen(attention_mask=mask, seq_len=2048) is False
+
+
+def test_varlen_triton_availability_requires_only_launched_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+
+    monkeypatch.setattr(varlen_mod, "_TRITON_AVAILABLE", True)
+    monkeypatch.setattr(varlen_mod, "triton", object())
+    monkeypatch.setattr(varlen_mod, "tl", object())
+    for name in (
+        "_fwd_kernel_varlen_raw",
+        "_bwd_kv_dise_kernel_varlen_raw",
+        "_bwd_q_dise_kernel_varlen_raw",
+    ):
+        monkeypatch.setattr(varlen_mod, name, object())
+    monkeypatch.setattr(varlen_mod, "_bwd_preprocess_varlen_raw", None, raising=False)
+
+    assert varlen_mod._varlen_use_triton_op() is True
 
 
 def test_varlen_wrapper_prefers_triton_op_while_compiling(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3082,6 +3119,42 @@ def test_dense_bias_bucket_reduce_matches_scatter_reference() -> None:
         )
 
 
+def test_dense_bias_bucket_contiguity_check_survives_optimized_python() -> None:
+    code = """
+import torch
+import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
+
+bucket_index = torch.tensor(
+    [
+        [0, 1, 0, 2],
+        [0, 1, 1, 2],
+        [0, 0, 1, 2],
+        [0, 0, 1, 1],
+    ],
+    dtype=torch.int64,
+)
+try:
+    dense_bias_mod._dense_bucket_reduce(
+        grad=torch.ones((1, 1, 4, 4)),
+        bucket_index=bucket_index,
+        num_buckets=4,
+        output_dtype=torch.float32,
+    )
+except AssertionError:
+    pass
+else:
+    raise RuntimeError("optimized Python accepted noncontiguous bucket rows")
+"""
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("use_pos_key", "use_pos_query", "use_mask"),
     [(True, True, True), (True, False, False), (False, True, True)],
@@ -3171,7 +3244,14 @@ def test_position_bias_dense_grad_reduction_matches_autograd(
         assert actual_query is None
 
 
-def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
+@pytest.mark.parametrize(
+    ("pos_key_num_buckets", "pos_query_num_buckets"),
+    [(7, 7), (7, 0), (0, 7), (0, 0)],
+)
+def test_position_bias_backward_fake_outputs_use_input_shapes(
+    pos_key_num_buckets: int,
+    pos_query_num_buckets: int,
+) -> None:
     fake_tensor_mod = pytest.importorskip("torch._subclasses.fake_tensor")
 
     import deberta.modeling.flashdeberta_bias_op as bias_mod
@@ -3203,16 +3283,18 @@ def test_position_bias_backward_fake_outputs_use_input_shapes() -> None:
             0.5,
             0.5,
             False,
-            7,
-            7,
+            pos_key_num_buckets,
+            pos_query_num_buckets,
             True,
         )
 
     assert tuple(dq.shape) == tuple(q.shape)
     assert tuple(dk.shape) == tuple(k.shape)
     assert tuple(dv.shape) == tuple(v.shape)
-    assert tuple(dpos_key.shape) == (2, 4, 3, 7)
-    assert tuple(dpos_query.shape) == (2, 4, 3, 7)
+    expected_key_shape = (2, 4, 3, pos_key_num_buckets) if pos_key_num_buckets else (0,)
+    expected_query_shape = (2, 4, 3, pos_query_num_buckets) if pos_query_num_buckets else (0,)
+    assert tuple(dpos_key.shape) == expected_key_shape
+    assert tuple(dpos_query.shape) == expected_query_shape
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused position-bias parity.")
@@ -3306,6 +3388,33 @@ def test_position_bias_attention_cuda_matches_dense_composition(use_mask: bool) 
         (pos_query.grad, pos_query_ref.grad),
     ):
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fixed custom-op checks.")
+def test_fixed_custom_op_marks_lse_non_differentiable() -> None:
+    import deberta.modeling.flashdeberta_fixed_op as fixed_mod
+
+    if fixed_mod._FLASHDEBERTA_FIXED_CUSTOM_OP is None:
+        pytest.skip("Fixed FlashDeBERTa custom op is unavailable.")
+
+    q = torch.randn((1, 2, 16, 32), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    output, lse = fixed_mod._FLASHDEBERTA_FIXED_CUSTOM_OP(
+        q,
+        k,
+        v,
+        None,
+        None,
+        None,
+        0.25,
+        8,
+        16,
+        False,
+    )
+
+    assert output.requires_grad is True
+    assert lse.requires_grad is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for FlashDeBERTa parity.")
@@ -3725,34 +3834,48 @@ def _run_specialized_docblock_backward_per_head_check(*, attention_mod, bias_mod
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for real-kernel leakage checks.")
 @pytest.mark.parametrize("route", ["docblock", "docblock_bias"])
-def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(route: str) -> None:
+@pytest.mark.parametrize("seq_len", [1024, 2048, 4096])
+def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(
+    route: str,
+    seq_len: int,
+) -> None:
     """Gradient-isolation leakage check on the actual Triton doc-block routes.
 
-    Doc-1 query outputs must carry exactly zero gradient back to doc-2 hidden
-    states; any nonzero gradient means cross-document attention leaked. The
-    test rejects eager fallback so only the selected flash route can pass.
+    Doc-1 query outputs must carry exactly zero gradient back to every other
+    document and padding position. Any nonzero gradient means cross-document
+    attention leaked. The test rejects eager fallback so only the selected
+    flash route can pass.
 
     """
 
     attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
     if attention_mod.flashdeberta_fixed_import_error() is not None:
         pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
-    _run_docblock_real_kernel_leak_check(attention_mod=attention_mod, route=route)
+    _run_docblock_real_kernel_leak_check(
+        attention_mod=attention_mod,
+        route=route,
+        seq_len=seq_len,
+    )
 
 
-def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
+def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str, seq_len: int) -> None:
     from deberta.modeling.mask_utils import build_doc_block_mask, build_doc_segment_metadata
 
     torch.manual_seed(0)
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    seq_len = 1024
-    # Cross the 64/128-token kernel tile boundaries to exercise ragged tails.
-    boundary = 517
+    # Cross 64/128-token tile boundaries and cover heterogeneous rows without
+    # multiplying the quadratic long-sequence dense cases by batch size.
+    segment_layouts = {
+        1024: ((257, 193, 211), (129, 311, 173, 97)),
+        2048: ((517, 389, 421),),
+        4096: ((1025, 777, 901),),
+    }[seq_len]
     cfg = make_native_deberta_config(
         flash=True,
         vocab_size=64,
         hidden_size=64,
+        num_attention_heads=1,
         intermediate_size=128,
         max_position_embeddings=seq_len,
         type_vocab_size=0,
@@ -3770,13 +3893,22 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
 
     attention._eager_forward_fallback = _reject_eager
 
-    doc_ids = torch.cat(
-        (
-            torch.ones((1, boundary), dtype=torch.long),
-            torch.full((1, seq_len - boundary), 2, dtype=torch.long),
-        ),
-        dim=1,
-    )
+    doc_id_rows = []
+    for segment_lengths in segment_layouts:
+        row = torch.cat(
+            [
+                torch.full((length,), doc_id, dtype=torch.long)
+                for doc_id, length in enumerate(segment_lengths, start=1)
+            ]
+            + [
+                torch.zeros(
+                    (seq_len - sum(segment_lengths),),
+                    dtype=torch.long,
+                )
+            ]
+        )
+        doc_id_rows.append(row)
+    doc_ids = torch.stack(doc_id_rows)
     if route == "docblock_bias":
         attention_mask: torch.Tensor = build_doc_block_mask(doc_ids.to(device=device))
         flash_meta = FlashBatchMeta(
@@ -3800,7 +3932,11 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
             route_hint="docblock",
         )
 
-    hidden_states = torch.randn((1, seq_len, cfg.hidden_size), device=device, dtype=dtype).requires_grad_()
+    hidden_states = torch.randn(
+        (len(segment_layouts), seq_len, cfg.hidden_size),
+        device=device,
+        dtype=dtype,
+    ).requires_grad_()
     rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), device=device, dtype=dtype)
 
     output, _ = attention(
@@ -3810,15 +3946,17 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str) -> None:
         rel_embeddings=rel_embeddings,
         flash_meta=flash_meta,
     )
-    output[0, :boundary].float().square().sum().backward()
+    source_positions = doc_ids.eq(1).to(device=device)
+    output[source_positions].float().square().sum().backward()
 
     assert hidden_states.grad is not None
-    doc2_grad = hidden_states.grad[0, boundary:]
-    assert torch.all(doc2_grad == 0), (
-        f"cross-document gradient leak on {route}: max abs doc-2 grad {float(doc2_grad.abs().max()):.3e}"
+    isolated_grad = hidden_states.grad[doc_ids.ne(1).to(device=device)]
+    assert torch.all(isolated_grad == 0), (
+        f"cross-document gradient leak on {route} at S={seq_len}: "
+        f"max abs isolated grad {float(isolated_grad.abs().max()):.3e}"
     )
-    doc1_grad = hidden_states.grad[0, :boundary]
-    assert float(doc1_grad.abs().max()) > 0.0
+    source_grad = hidden_states.grad[source_positions]
+    assert float(source_grad.abs().max()) > 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for dense doc-block parity.")

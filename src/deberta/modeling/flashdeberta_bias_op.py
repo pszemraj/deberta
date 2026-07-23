@@ -2043,12 +2043,22 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         del grad_out, bucket_index, keep_mask, bias, out, lse, bias_scale, sm_scale
         del causal, has_keep_mask
         pos_shape = (q.shape[0], q.shape[1], q.shape[2])
+        dpos_key = (
+            torch.empty((*pos_shape, pos_key_num_buckets), device=q.device, dtype=q.dtype)
+            if pos_key_num_buckets > 0
+            else q.new_empty((0,))
+        )
+        dpos_query = (
+            torch.empty((*pos_shape, pos_query_num_buckets), device=q.device, dtype=q.dtype)
+            if pos_query_num_buckets > 0
+            else q.new_empty((0,))
+        )
         return (
             torch.empty(q.shape, device=q.device, dtype=q.dtype),
             torch.empty(k.shape, device=k.device, dtype=k.dtype),
             torch.empty(v.shape, device=v.device, dtype=v.dtype),
-            torch.empty((*pos_shape, pos_key_num_buckets), device=q.device, dtype=q.dtype),
-            torch.empty((*pos_shape, pos_query_num_buckets), device=q.device, dtype=q.dtype),
+            dpos_key,
+            dpos_query,
         )
 
     def _setup_context(

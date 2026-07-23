@@ -182,6 +182,10 @@ def _dense_bucket_range_cache_key(
 ) -> tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int]:
     """Return a tensor-stable cache key for one dense bucket map.
 
+    Cache hits also require the stored weak reference to resolve to this exact
+    owner, so delayed finalization or reuse of an expired owner's id cannot
+    return another tensor's ranges.
+
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
     :param int num_buckets: Positional-bias width.
     :return tuple[int, int, int, tuple[int, ...], tuple[int, ...], str, int]:
@@ -260,7 +264,7 @@ def _dense_bucket_ranges(
         include_self=True,
     )
 
-    if __debug__ and cache_key is not None:
+    if cache_key is not None:
         counts = torch.zeros_like(missing).scatter_add_(-1, bucket_ids, torch.ones_like(column_ids))
         spans = torch.where(end >= 0, end - start + 1, torch.zeros_like(end))
         if not torch.equal(counts, spans):

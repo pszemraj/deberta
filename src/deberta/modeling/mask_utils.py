@@ -277,7 +277,8 @@ def attention_mask_to_active_tokens(
     """Convert an optional keep mask into a 2D active-token mask.
 
     :param torch.Tensor input_ids: Input ids with shape ``(B,S)``.
-    :param torch.Tensor | None attention_mask: Optional keep mask in rank-2/3/4 layout.
+    :param torch.Tensor | None attention_mask: Optional keep mask in rank-2/3/4 layout. ``None``
+        means every input position is active, including positions whose token id equals the pad id.
     :return torch.Tensor: Boolean active-token mask with shape ``(B,S)``.
     """
 

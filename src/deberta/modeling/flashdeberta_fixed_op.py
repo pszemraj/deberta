@@ -5,10 +5,10 @@ wrapper with cached configuration lookup and Triton launch setup. That works
 correctly in eager mode, but it also leaves TorchDynamo tracing through Python
 helpers and guarding on the upstream wrapper object.
 
-This module mirrors the varlen integration strategy: it exposes fixed-length
-attention through an opaque CUDA custom op backed by the low-level Triton
-primitives. CPU and test-only environments fall back to the upstream eager
-wrapper so semantics stay unchanged when the low-level pieces are unavailable.
+This module exposes fixed-length attention through an opaque CUDA custom op
+backed by the low-level Triton primitives. Calls raise when that CUDA path is
+unavailable; eager attention fallback is selected by the higher-level adapter
+before reaching this module.
 """
 
 from __future__ import annotations
@@ -725,6 +725,8 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
             saved.append(pos_key)
         if pos_query is not None:
             saved.append(pos_query)
+        if hasattr(ctx, "mark_non_differentiable"):
+            ctx.mark_non_differentiable(lse)
         ctx.has_seq_lengths = seq_lengths is not None
         ctx.has_pos_key = pos_key is not None
         ctx.has_pos_query = pos_query is not None

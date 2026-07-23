@@ -593,6 +593,82 @@ def test_collator_emits_document_ids_when_packed(packed_doc_collator):
     assert torch.equal(batch["doc_context_index"], torch.tensor([[0, 0, 0, 3, 3, 3]]))
 
 
+def test_collator_pads_document_ids_independently_of_tokenizer(monkeypatch) -> None:
+    """Custom doc_ids must stay aligned when tokenizer.pad ignores custom fields."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    original_pad = tokenizer.pad
+
+    def _pad_without_custom_field_padding(features, **kwargs):
+        doc_id_rows = [feature["doc_ids"] for feature in features] if "doc_ids" in features[0] else None
+        standard_features = [
+            {key: value for key, value in feature.items() if key != "doc_ids"} for feature in features
+        ]
+        batch = original_pad(standard_features, **kwargs)
+        if doc_id_rows is not None:
+            batch["doc_ids"] = torch.tensor(doc_id_rows, dtype=torch.long)
+        return batch
+
+    monkeypatch.setattr(tokenizer, "pad", _pad_without_custom_field_padding)
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+        pad_to_multiple_of=8,
+    )
+    batch = collator(
+        [
+            {
+                "input_ids": [
+                    tokenizer.cls_token_id,
+                    11,
+                    tokenizer.sep_token_id,
+                    tokenizer.cls_token_id,
+                    12,
+                    tokenizer.sep_token_id,
+                ],
+                "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+                "doc_ids": [1, 1, 1, 2, 2, 2],
+            }
+        ]
+    )
+
+    assert tuple(batch["input_ids"].shape) == (1, 8)
+    assert torch.equal(batch["doc_ids"], torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]]))
+    assert torch.equal(batch["attention_mask"], torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]]))
+
+
+def test_collator_reports_missing_document_ids(packed_doc_collator) -> None:
+    tokenizer, collator = packed_doc_collator
+    feature = {
+        "input_ids": [tokenizer.cls_token_id, 11, tokenizer.sep_token_id],
+        "special_tokens_mask": [1, 0, 1],
+    }
+
+    with pytest.raises(ValueError, match="requires doc_ids on every feature"):
+        collator([feature])
+
+
+def test_collator_rejects_reused_noncontiguous_document_ids(packed_doc_collator) -> None:
+    tokenizer, collator = packed_doc_collator
+    feature = {
+        "input_ids": [
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+        ],
+        "special_tokens_mask": [1, 1, 1, 1, 1, 1],
+        "doc_ids": [1, 1, 2, 2, 1, 1],
+    }
+
+    with pytest.raises(ValueError, match="exactly one contiguous segment"):
+        collator([feature])
+
+
 def test_collator_rejects_legacy_packing_without_per_document_cls(packed_doc_collator):
     tok, coll = packed_doc_collator
 
