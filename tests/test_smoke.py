@@ -638,6 +638,48 @@ def test_collator_aligns_document_ids_with_tokenizer_padding_side(
     assert torch.equal(batch["attention_mask"], torch.tensor([expected_attention_mask]))
 
 
+def test_collator_rejects_left_padding_without_document_blocking() -> None:
+    """Left-padded rows must be refused when no doc_context_index will exist."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    tokenizer.padding_side = "left"
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2),
+        pad_to_multiple_of=8,
+    )
+    features = [
+        {
+            "input_ids": [tokenizer.cls_token_id, 11, tokenizer.sep_token_id],
+            "special_tokens_mask": [1, 0, 1],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="position 0 active"):
+        collator(features)
+
+
+def test_collator_rejects_prepadded_rows_with_inactive_first_position() -> None:
+    """Pre-padded features with a dead first position must be refused too."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2),
+    )
+    pad_id = tokenizer.pad_token_id
+    features = [
+        {
+            "input_ids": [pad_id, tokenizer.cls_token_id, 11, tokenizer.sep_token_id],
+            "attention_mask": [0, 1, 1, 1],
+            "special_tokens_mask": [1, 1, 0, 1],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="position 0 active"):
+        collator(features)
+
+
 def test_collator_reports_missing_document_ids(packed_doc_collator) -> None:
     tokenizer, collator = packed_doc_collator
     feature = {

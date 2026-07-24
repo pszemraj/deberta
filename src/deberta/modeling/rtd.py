@@ -374,7 +374,10 @@ class EnhancedMaskDecoder(nn.Module):
             # Match the original DeBERTa EMD outer-product convention.
             attn = expand_keep_mask_to_4d(attention_mask, pairwise_2d=True)
 
-        # Position ids default: 0..S-1.
+        # Position ids default: 0..S-1. Correct only for right-aligned rows;
+        # left padding would shift every content token's absolute position, so
+        # the shipped collator rejects left-padded rows outside doc-block
+        # packing (which supplies explicit document-local position_ids).
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=kv_states.device).unsqueeze(0).expand(bsz, -1)
         else:
@@ -510,6 +513,10 @@ class RTDHead(nn.Module):
                 raise RuntimeError(
                     "Packed RTD attention requires doc_context_index so each token uses its document CLS."
                 )
+            # Position 0 must hold each row's context token (CLS). Left-padded
+            # rows would read a PAD hidden state here; the shipped collator
+            # rejects them outside doc-block packing, and this compiled forward
+            # cannot re-validate per batch without a device sync.
             context = hidden_states[:, 0:1, :]
         else:
             gather_index = doc_context_index.to(device=hidden_states.device, dtype=torch.long)

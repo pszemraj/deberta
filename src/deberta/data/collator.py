@@ -185,6 +185,16 @@ class DebertaV3ElectraCollator:
                 )
                 if all_active:
                     batch.pop("attention_mask", None)
+                elif not bool(attn[:, 0].ne(0).all().item()):
+                    # The RTD and EMD heads read each row's first position as its
+                    # context token and assign absolute positions from index 0, so
+                    # rows padded on the left would silently train on garbage.
+                    raise ValueError(
+                        "Rows must keep position 0 active outside doc-block packing: "
+                        "the RTD/EMD heads read the first position as each row's "
+                        "context token. Use right padding, or enable "
+                        "block_cross_document_attention so rows carry doc_context_index."
+                    )
             if self._emit_flash_metadata:
                 self._attach_flash_padding_metadata(batch)
 

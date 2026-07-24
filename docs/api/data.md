@@ -29,6 +29,12 @@ For direct use with variable-length features, `pad_to_multiple_of` delegates to 
 follows its `padding_side`. The built-in training datasets already emit fixed-length, right-padded
 rows and use `data.packing.max_seq_length` as their single shape control.
 
+Outside doc-block packing, every row must keep position 0 active: the RTD and EMD heads read the
+first position as each row's context token and assign absolute positions from index 0. The collator
+rejects left-padded (or pre-padded) rows whose first position is inactive; left padding is only
+supported together with `block_cross_document_attention=true`, which carries explicit
+`doc_context_index` and document-local `position_ids`.
+
 Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
 those raw helper defaults for the selected backbone; see the [config reference](../../configs/config_reference.yaml).
 
