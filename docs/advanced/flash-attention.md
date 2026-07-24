@@ -13,10 +13,8 @@ The flash path has these constraints:
 - Hidden and attention-probability dropout must both be explicitly `0.0`; `null` may preserve
   nonzero backbone/checkpoint dropout and is rejected for flash.
 - Every materialized generator and discriminator attention head dimension (`hidden_size / num_attention_heads`) must be a power of two and at least `16`.
-- The materialized native config must use relative attention with positive position buckets and must not include the unsupported P2P attention term.
-- `max_relative_positions` must cover `max_position_embeddings`. The default `-1` derives a
-  compatible span. A shorter explicit span is rejected because eager and flash bucket distant
-  positions differently.
+- The materialized native config must use relative attention with at least `8` position buckets and must not include the unsupported P2P attention term. The effective relative span must be at least `position_buckets // 2 + 2`; smaller geometries do not preserve eager bucket indices in every fused Triton route.
+- `max_relative_positions` must cover `max_position_embeddings`. The default `-1` derives the span from `max_position_embeddings`. A shorter explicit span is rejected because eager and flash bucket distant positions differently.
 - CUDA is required. See [GPU support](gpu-support.md) for supported capabilities and off-table
   behavior.
 

@@ -521,7 +521,17 @@ def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
     ("updates", "message"),
     [
         ({"relative_attention": False}, "relative_attention=true"),
-        ({"position_buckets": 0}, "position_buckets > 0"),
+        ({"position_buckets": 0}, "position_buckets >= 8"),
+        ({"position_buckets": 2}, "position_buckets >= 8"),
+        ({"position_buckets": 4}, "position_buckets >= 8"),
+        (
+            {
+                "position_buckets": 256,
+                "max_relative_positions": 128,
+                "max_position_embeddings": 128,
+            },
+            "effective max_relative_positions >= position_buckets // 2 \\+ 2",
+        ),
         ({"pos_att_type": "p2c|p2p"}, "does not support pos_att_type"),
         ({"pos_att_type": "p2c,p2p"}, "does not support pos_att_type"),
         # External checkpoints may pin a short explicit span; eager clamps
