@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import time
+from collections.abc import Iterable, Iterator
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -102,6 +103,23 @@ from deberta.utils.log import setup_process_logging
 from deberta.utils.paths import validate_existing_output_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _replay_data_iterator_preserving_rng(
+    *,
+    train_iter: Iterator[dict[str, Any]],
+    replay_steps: Iterable[object],
+) -> None:
+    """Advance a data iterator without changing checkpoint-restored process RNG.
+
+    :param Iterator[dict[str, Any]] train_iter: Training iterator to advance.
+    :param Iterable[object] replay_steps: One item per discarded historical batch.
+    :return None: None.
+    """
+
+    with torch.random.fork_rng(devices=[]):
+        for _ in replay_steps:
+            _ = next(train_iter)
 
 
 def _resolve_entrypoint_profile_sections(
@@ -629,6 +647,8 @@ def run_pretraining(
 
     # Dataloader
     num_workers = int(train_cfg.dataloader.num_workers)
+    data_loader_generator = torch.Generator()
+    data_loader_generator.manual_seed(int(train_cfg.seed) + int(accelerator.process_index))
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(train_cfg.per_device_train_batch_size),
@@ -640,6 +660,7 @@ def run_pretraining(
         # batch would flip routes (and recompile) mid-epoch.
         drop_last=True,
         persistent_workers=(num_workers > 0),
+        generator=data_loader_generator,
     )
 
     # Instantiate backbones
@@ -1070,8 +1091,10 @@ def run_pretraining(
                         dynamic_ncols=True,
                         leave=False,
                     )
-                for _ in replay_iter:
-                    _ = next(train_iter)
+                _replay_data_iterator_preserving_rng(
+                    train_iter=train_iter,
+                    replay_steps=replay_iter,
+                )
             else:
                 logger.warning(
                     "Skipping data replay on resume (%s). "

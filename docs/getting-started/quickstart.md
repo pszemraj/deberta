@@ -41,7 +41,7 @@ Start from the source run's `config_resolved.yaml`, not a generic resume templat
 cp runs/<project>/<run>/config_resolved.yaml resume.yaml
 ```
 
-For same-directory continuation, increase `train.max_steps`, set `train.checkpoint.resume_from_checkpoint` to `auto`, and leave both output directories unchanged. Then run:
+For exact same-directory continuation, increase `train.max_steps`, set `train.checkpoint.resume_from_checkpoint` to `auto`, set `train.checkpoint.resume_data_strategy` to `replay`, and leave both output directories unchanged. Replay reconstructs loader/worker data position without consuming the checkpoint-restored process RNG. Then run:
 
 ```bash
 deberta train resume.yaml

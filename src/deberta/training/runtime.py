@@ -331,7 +331,15 @@ def _cycle_dataloader(
         set_epoch = getattr(dataset, "set_epoch", None)
         if callable(set_epoch):
             set_epoch(epoch)
-        yield from dl
+        produced_batch = False
+        for batch in dl:
+            produced_batch = True
+            yield batch
+        if not produced_batch:
+            raise RuntimeError(
+                "Training dataloader produced zero batches. The finite dataset may contain fewer "
+                "packed rows than per_device_train_batch_size while drop_last=True."
+            )
         epoch += 1
 
 

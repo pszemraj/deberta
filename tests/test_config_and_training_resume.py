@@ -17,6 +17,7 @@ from _config_factories import (
     make_train_config,
 )
 from _fakes import (
+    DummyTokenizer,
     FakeAccelerator,
     SimpleRTD,
     checkpoint_saving_accelerator,
@@ -33,6 +34,7 @@ from deberta.config import (
     load_config,
     load_model_config_snapshot,
 )
+from deberta.training.entrypoint import _replay_data_iterator_preserving_rng
 from deberta.training.run_config import _persist_or_validate_run_configs
 from deberta.training.run_management import (
     _checkpoint_weights_appear_valid,
@@ -62,6 +64,60 @@ def _write_resume_source_snapshots(run_dir: Path, *, train_cfg: TrainConfig) -> 
         resume_checkpoint=None,
         is_main_process=True,
     )
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_resume_replay_preserves_next_collator_draw(
+    num_workers: int,
+) -> None:
+    from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
+
+    feature = {
+        "input_ids": [1, *range(10, 30), 2],
+        "special_tokens_mask": [1, *([0] * 20), 1],
+    }
+
+    def _loader() -> torch.utils.data.DataLoader:
+        tokenizer = DummyTokenizer(vocab_size=64)
+        collator = DebertaV3ElectraCollator(
+            tokenizer=tokenizer,
+            cfg=MLMConfig(
+                mlm_probability=0.15,
+                mask_token_prob=1.0,
+                random_token_prob=0.0,
+                max_ngram=1,
+            ),
+        )
+        generator = torch.Generator().manual_seed(91)
+        return torch.utils.data.DataLoader(
+            [dict(feature) for _ in range(8)],
+            batch_size=1,
+            collate_fn=collator,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+            generator=generator,
+        )
+
+    torch.manual_seed(17)
+    uninterrupted_loader = _loader()
+    uninterrupted_iter = iter(uninterrupted_loader)
+    for _ in range(3):
+        _ = next(uninterrupted_iter)
+        _ = torch.rand(5)
+    checkpoint_rng = torch.get_rng_state().clone()
+    uninterrupted_next = next(uninterrupted_iter)["labels"].clone()
+
+    torch.set_rng_state(checkpoint_rng)
+    resumed_loader = _loader()
+    resumed_iter = iter(resumed_loader)
+    _replay_data_iterator_preserving_rng(
+        train_iter=resumed_iter,
+        replay_steps=range(3),
+    )
+    torch.testing.assert_close(torch.get_rng_state(), checkpoint_rng)
+    resumed_next = next(resumed_iter)["labels"]
+
+    torch.testing.assert_close(resumed_next, uninterrupted_next)
 
 
 def test_run_pretraining_resume_at_max_steps_skips_data_replay(

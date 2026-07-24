@@ -242,7 +242,7 @@
 # Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. For every scheduler except constant, this value must exceed `optim.scheduler.warmup_steps`. On resume, a value <= restored global step performs no optimization.
 
 # [train.per_device_train_batch_size] int = 4; must be >= 1.
-# Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Tune against VRAM before increasing accumulation.
+# Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Training uses `drop_last=true` for stable shapes and fails if a finite source yields no complete batch. Tune against VRAM before increasing accumulation.
 
 # [train.gradient_accumulation_steps] int = 1; must be >= 1.
 # Micro-batches per optimizer step. Exact resume requires this value to match the source train snapshot because it changes update semantics and saved data-progress interpretation.
@@ -328,7 +328,7 @@
 # "auto" uses the newest resumable checkpoint, skips incomplete newer ones, starts fresh only when the output directory is empty, and errors on non-empty output with no resumable checkpoint. Explicit paths expand `~`; resume is mutually exclusive with overwrite.
 
 # [train.checkpoint.resume_data_strategy] str = "auto"; values: "auto" | "replay" | "restart_epoch".
-# replay reconsumes saved micro-batches from epoch zero; restart_epoch starts a new epoch offset at restored global step; auto replays only when consumed micro-batches are <= `resume_replay_max_micro_batches`.
+# replay reconsumes saved micro-batches from epoch zero with deterministic worker seeding while preserving checkpoint-restored process RNG, reproducing the next stochastic batch; restart_epoch starts a new epoch offset at restored global step and is not exact data continuation; auto replays only when consumed micro-batches are <= `resume_replay_max_micro_batches`.
 
 # [train.checkpoint.resume_replay_max_micro_batches] int = 10000; must be >= 0.
 # Threshold used only by auto; larger caps improve data alignment but can make resume startup slow, while explicit replay ignores the cap.

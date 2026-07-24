@@ -159,6 +159,17 @@ def test_cycle_dataloader_advances_dataset_epoch_each_pass(start_epoch: int, cou
     assert ds.seen_epochs[:count] == expected
 
 
+def test_cycle_dataloader_rejects_empty_epochs() -> None:
+    loader = torch.utils.data.DataLoader(
+        [torch.tensor(1)],
+        batch_size=2,
+        drop_last=True,
+    )
+
+    with pytest.raises(RuntimeError, match="produced zero batches"):
+        next(_cycle_dataloader(loader))
+
+
 def test_resolve_data_resume_policy_auto_replays_when_small():
     cfg = make_train_config(
         checkpoint={"resume_data_strategy": "auto", "resume_replay_max_micro_batches": 100}
