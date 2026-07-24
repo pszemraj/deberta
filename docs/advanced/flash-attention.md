@@ -12,7 +12,7 @@ The flash path has these constraints:
 - `train.mixed_precision` must be `bf16`, and the CUDA device must support bf16.
 - Hidden and attention-probability dropout must both be explicitly `0.0`; `null` may preserve
   nonzero backbone/checkpoint dropout and is rejected for flash.
-- Every materialized generator and discriminator attention head dimension (`hidden_size / num_attention_heads`) must be a positive power of two.
+- Every materialized generator and discriminator attention head dimension (`hidden_size / num_attention_heads`) must be a power of two and at least `16`.
 - The materialized native config must use relative attention with positive position buckets and must not include the unsupported P2P attention term.
 - `max_relative_positions` must cover `max_position_embeddings`. The default `-1` derives a
   compatible span. A shorter explicit span is rejected because eager and flash bucket distant

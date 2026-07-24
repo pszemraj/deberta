@@ -595,10 +595,10 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
         if num_attention_heads > 0 and hidden_size % num_attention_heads == 0
         else 0
     )
-    if head_dim <= 0 or head_dim & (head_dim - 1):
+    if head_dim < 16 or head_dim & (head_dim - 1):
         raise ValueError(
             f"{component} flash attention requires hidden_size / num_attention_heads to be a "
-            "positive power of two; "
+            "positive power of two and at least 16; "
             f"got hidden_size={hidden_size}, num_attention_heads={num_attention_heads}, head_dim={head_dim}."
         )
     if not bool(getattr(cfg, "relative_attention", False)):

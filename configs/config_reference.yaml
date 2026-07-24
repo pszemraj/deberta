@@ -54,7 +54,7 @@
 # Selects native eager disentangled-bias math; `dynamic` uses einsum, while `cached_bmm` and `stable` currently use the same explicit batched-matmul path. It does not enable Flash.
 
 # [model.hf.attention_impl] str = "eager"; values: "eager" | "flash".
-# Flash is experimental and requires the `flash` extra, CUDA bf16 (`train.mixed_precision="bf16"`), both dropout values resolving to 0.0, and a positive power-of-two head dimension for each component.
+# Flash is experimental and requires the `flash` extra, CUDA bf16 (`train.mixed_precision="bf16"`), both dropout values resolving to 0.0, and a power-of-two head dimension of at least 16 for each component.
 # Materialized configs must also use relative attention with positive buckets, no P2P term, and a relative span covering the full position budget. Unsupported per-call masks may route to eager; build-time incompatibilities fail.
 
 # model.hf.flash — experimental and inactive unless `model.hf.attention_impl="flash"`; setting either child while Flash is inactive emits a warning.
