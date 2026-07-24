@@ -317,7 +317,7 @@
 # true recursively deletes the entire existing non-empty output directory before training; this is irreversible and mutually exclusive with resume. Keep false.
 
 # [train.checkpoint.save_steps] int = 1000; must be >= 0.
-# Periodic checkpoint interval in optimizer steps; 0 disables periodic saves. After a successful run with progress, failure to save the final step fails the command. A single-process crash also attempts a best-effort save without replacing the original crash; distributed crash-time saves are skipped because checkpoint collectives may deadlock after rank failure.
+# Periodic checkpoint interval in optimizer steps; 0 disables periodic saves. After a successful run with progress, failure to save the final step fails the command. A single-process crash attempts a best-effort save only while live model, optimizer, data, and RNG state still represent the last committed window; otherwise resume from the last periodic checkpoint. Distributed crash-time saves are skipped because checkpoint collectives may deadlock after rank failure.
 
 # [train.checkpoint.save_total_limit] int = 3; must be >= 0.
 # Retains newest committed `checkpoint-*` directories after each save and deletes older ones; 0 disables rotation and can consume unbounded disk. Deletion is irreversible.

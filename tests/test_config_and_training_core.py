@@ -1200,8 +1200,10 @@ def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None
     assert payload["train"]["token_weighted_gradient_accumulation"] is True
 
 
-def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_pretraining_keyboard_interrupt_skips_uncommitted_checkpoint_and_finishes_wandb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
@@ -1232,7 +1234,7 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
         compile={"enabled": False},
     )
 
-    with pytest.raises(KeyboardInterrupt):
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
             model_cfg=make_model_config(),
             data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
@@ -1248,10 +1250,8 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     assert rows[-1]["crash_type"] == "KeyboardInterrupt"
     assert int(rows[-1]["step"]) == 1
 
-    assert saved_checkpoints
-    assert saved_checkpoints[-1][0].endswith("checkpoint-1")
-    assert saved_checkpoints[-1][1] == 1
-    assert saved_checkpoints[-1][2] == "final"
+    assert saved_checkpoints == []
+    assert "last completed checkpoint is the recovery boundary" in caplog.text
 
     accel = FakeAccelerator.last_instance
     assert accel is not None
@@ -1276,19 +1276,17 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 def test_run_pretraining_logs_crash_save_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from _fakes import _PRETRAINING_BATCH
+    class _CrashAfterCommitAccelerator(FakeAccelerator):
+        def log(self, row: dict[str, Any], step: int | None = None) -> None:
+            if "loss" in row:
+                raise RuntimeError("tracker failed after committed step")
+            super().log(row, step=step)
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
+        accelerator_cls=_CrashAfterCommitAccelerator,
         save_checkpoint_fn=make_checkpoint_saver(fail_label="final", failure_message="disk full"),
     )
-
-    def _interrupt_cycle(_loader, *, start_epoch: int = 0):
-        del start_epoch
-        yield _PRETRAINING_BATCH
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
     train_cfg = make_train_config(
         checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
@@ -1302,7 +1300,7 @@ def test_run_pretraining_logs_crash_save_failure(
     )
 
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(RuntimeError, match="tracker failed after committed step"):
             pretrain_mod.run_pretraining(
                 model_cfg=make_model_config(),
                 data_cfg=make_data_config(
@@ -1310,13 +1308,16 @@ def test_run_pretraining_logs_crash_save_failure(
                 ),
                 train_cfg=train_cfg,
                 optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
+                logging_cfg=make_logging_config(logging_steps=1, wandb={"enabled": True}),
             )
 
     assert any("Final/crash-time checkpoint save failed" in rec.message for rec in caplog.records)
 
 
-def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_pretraining_crash_does_not_checkpoint_after_partial_next_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
@@ -1327,9 +1328,9 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
         save_checkpoint_fn=make_checkpoint_saver(calls=saved_checkpoints),
     )
 
-    # Complete one accumulation window (2 micro-batches), then interrupt in the next
-    # window after fetching one more micro-batch. Final checkpoint should persist only
-    # committed-step progress for checkpoint-{global_step}.
+    # Complete one accumulation window, then interrupt after the next window has
+    # consumed a stochastic micro-batch. The live RNG no longer represents the
+    # committed boundary, so a crash-time checkpoint would not resume exactly.
     def _interrupt_cycle(_loader, *, start_epoch: int = 0):
         del start_epoch
         yield _PRETRAINING_BATCH
@@ -1350,7 +1351,7 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
         compile={"enabled": False},
     )
 
-    with pytest.raises(KeyboardInterrupt):
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
             model_cfg=make_model_config(),
             data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
@@ -1358,7 +1359,5 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
             optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
         )
 
-    assert saved_checkpoints
-    assert saved_checkpoints[-1][0].endswith("checkpoint-1")
-    assert saved_checkpoints[-1][1] == 2
-    assert saved_checkpoints[-1][2] == "final"
+    assert saved_checkpoints == []
+    assert "last completed checkpoint is the recovery boundary" in caplog.text
