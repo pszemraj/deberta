@@ -2903,6 +2903,38 @@ def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
         )
 
 
+@pytest.mark.parametrize("embedding_sharing", ["es", "gdes"])
+def test_pretrainer_rejects_asymmetric_embedding_table_availability(
+    embedding_sharing: str,
+) -> None:
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    common = {
+        "vocab_size": 64,
+        "hidden_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "intermediate_size": 64,
+        "max_position_embeddings": 32,
+        "pad_token_id": 0,
+        "hidden_dropout_prob": 0.0,
+        "attention_probs_dropout_prob": 0.0,
+        "norm_arch": "post",
+    }
+    disc_cfg = DebertaRoPEConfig(**common, type_vocab_size=2)
+    gen_cfg = DebertaRoPEConfig(**common, type_vocab_size=0)
+
+    with pytest.raises(ValueError, match="token_type_embeddings"):
+        DebertaV3RTDPretrainer(
+            discriminator_backbone=DebertaRoPEModel(disc_cfg),
+            generator_backbone=DebertaRoPEModel(gen_cfg),
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
+            embedding_sharing=embedding_sharing,
+        )
+
+
 def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel

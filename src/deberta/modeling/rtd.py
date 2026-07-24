@@ -785,7 +785,12 @@ class DebertaV3RTDPretrainer(nn.Module):
             for attr in attrs:
                 gen_mod = getattr(gen_embeddings, attr, None)
                 disc_mod = getattr(disc_embeddings, attr, None)
-                if gen_mod is None or disc_mod is None:
+                if (gen_mod is None) != (disc_mod is None):
+                    raise ValueError(
+                        f"Cannot share embeddings for '{attr}': generator and discriminator "
+                        "must either both materialize the table or both omit it."
+                    )
+                if gen_mod is None:
                     continue
                 gw = _validate(attr, gen_mod, disc_mod)
                 # Keep a true Parameter alias for strict ES semantics; optimizer
@@ -797,7 +802,12 @@ class DebertaV3RTDPretrainer(nn.Module):
         for attr in attrs:
             gen_mod = getattr(gen_embeddings, attr, None)
             disc_mod = getattr(disc_embeddings, attr, None)
-            if gen_mod is None or disc_mod is None:
+            if (gen_mod is None) != (disc_mod is None):
+                raise ValueError(
+                    f"Cannot share embeddings for '{attr}': generator and discriminator "
+                    "must either both materialize the table or both omit it."
+                )
+            if gen_mod is None:
                 continue
             gw = _validate(attr, gen_mod, disc_mod)
 

@@ -26,7 +26,7 @@
 # false starts a new step-zero run from `model.pretrained.*`; it does not restore optimizer, scheduler, RNG, step, or data progress. Use checkpoint resume for exact continuation.
 
 # [model.embedding_sharing] str = "gdes"; values: "none" | "es" | "gdes".
-# `none` keeps independent embeddings; `es` aliases them and requires `train.decoupled_training=false` plus generator LR inheritance/equality; `gdes` uses a synchronized generator base plus trainable discriminator bias and is the recommended RTD default. Shared modes require matching embedding shapes.
+# `none` keeps independent embeddings; `es` aliases them and requires `train.decoupled_training=false` plus generator LR inheritance/equality; `gdes` uses a synchronized generator base plus trainable discriminator bias and is the recommended RTD default. Shared modes require the same embedding tables with matching shapes in both backbones.
 
 # [model.gradient_checkpointing] bool = false; values: true | false.
 # true checkpoints both backbones, reducing activation memory at the cost of recomputation; enable only after measuring the run's memory/throughput tradeoff.

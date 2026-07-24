@@ -26,7 +26,7 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 ## RTD architecture notes
 
 - discriminator and generator backbones are separate modules
-- `model.embedding_sharing` supports `none`, `es`, `gdes`
+- `model.embedding_sharing` supports `none`, `es`, `gdes`; ES/GDES require both backbones to materialize the same embedding tables with identical shapes
 - decoupled two-phase RTD updates are enabled by default (`train.decoupled_training=true`)
 - newly attached MLM and RTD heads use the owning backbone's `initializer_range`; backbone
   parameters are not reinitialized. Backbones and attached heads are separate initialization

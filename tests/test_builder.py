@@ -227,6 +227,7 @@ def test_build_backbone_configs_hf_deberta_loads_generator_config_only_when_expl
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=from_scratch,
+        embedding_sharing="none",
         pretrained={
             "discriminator_path": "disc_weights" if not from_scratch else "",
             "generator_path": pretrained_generator_path,
@@ -754,6 +755,7 @@ def test_build_backbone_configs_scratch_explicit_generator_model_is_authoritativ
     model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=True,
+        embedding_sharing="none",
         pretrained={"discriminator_path": "disc", "generator_path": "gen_model"},
         rope={
             "hidden_size": 768,
@@ -1154,6 +1156,7 @@ def test_build_backbones_uses_resolved_rope_weight_sources(monkeypatch: pytest.M
     model_cfg = make_model_config(
         backbone_type="rope",
         from_scratch=False,
+        embedding_sharing="none",
         pretrained={"discriminator_path": "disc_weights", "generator_path": "gen_weights"},
     )
     disc_cfg = builder_mod.DebertaRoPEConfig(hidden_size=768, num_hidden_layers=2)
@@ -1207,6 +1210,7 @@ def test_build_backbones_uses_resolved_hf_weight_sources(monkeypatch: pytest.Mon
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
+        embedding_sharing="none",
         pretrained={"discriminator_path": "disc_weights", "generator_path": "gen_weights"},
     )
     disc_cfg = BackboneConfigStub(hidden_size=768)
@@ -1250,6 +1254,7 @@ def test_build_backbones_pretrained_hf_does_not_fetch_external_config(monkeypatc
     model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
         from_scratch=False,
+        embedding_sharing="none",
         pretrained={"discriminator_path": "disc_weights", "generator_path": "gen_weights"},
     )
     disc_cfg = BackboneConfigStub(hidden_size=768, vocab_size=128100)
@@ -1351,6 +1356,62 @@ def test_build_backbone_configs_rejects_invalid_model_options_early():
             model_cfg=model_cfg,
             tokenizer=DummyTokenizer(vocab_size=50265),
             max_position_embeddings=128,
+        )
+
+
+@pytest.mark.parametrize("embedding_sharing", ["es", "gdes"])
+def test_build_backbone_configs_rejects_incompatible_shared_embedding_widths(
+    embedding_sharing: str,
+) -> None:
+    model_cfg = make_model_config(
+        backbone_type="rope",
+        from_scratch=True,
+        embedding_sharing=embedding_sharing,
+        rope={
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+        },
+        generator={
+            "hidden_size": 16,
+            "num_attention_heads": 4,
+            "intermediate_size": 32,
+        },
+    )
+
+    with pytest.raises(ValueError, match="requires identical generator and discriminator"):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=128),
+            max_position_embeddings=16,
+        )
+
+
+@pytest.mark.parametrize("embedding_sharing", ["es", "gdes"])
+def test_build_backbones_rejects_asymmetric_shared_embedding_tables_before_allocation(
+    embedding_sharing: str,
+) -> None:
+    common = {
+        "vocab_size": 128,
+        "hidden_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "intermediate_size": 64,
+        "max_position_embeddings": 16,
+    }
+    disc_cfg = builder_mod.DebertaRoPEConfig(**common, type_vocab_size=2)
+    gen_cfg = builder_mod.DebertaRoPEConfig(**common, type_vocab_size=0)
+    model_cfg = make_model_config(
+        backbone_type="rope",
+        from_scratch=True,
+        embedding_sharing=embedding_sharing,
+    )
+
+    with pytest.raises(ValueError, match="token_type_embeddings"):
+        builder_mod.build_backbones(
+            model_cfg=model_cfg,
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
         )
 
 

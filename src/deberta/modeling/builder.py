@@ -398,6 +398,69 @@ def _validate_required_max_positions(
         )
 
 
+def _embedding_table_shapes(cfg: Any, *, backbone_type: str) -> dict[str, tuple[int, int]]:
+    """Return materialized embedding-table shapes implied by one backbone config.
+
+    :param Any cfg: Materialized backbone config.
+    :param str backbone_type: Normalized backbone type.
+    :return dict[str, tuple[int, int]]: Embedding attribute to table shape.
+    """
+
+    width = int(getattr(cfg, "embedding_size", None) or cfg.hidden_size)
+    shapes = {
+        "word_embeddings": (int(cfg.vocab_size), width),
+    }
+
+    if backbone_type == "hf_deberta_v2" or bool(getattr(cfg, "use_absolute_position_embeddings", False)):
+        shapes["position_embeddings"] = (
+            int(cfg.max_position_embeddings),
+            width,
+        )
+
+    type_vocab_size = int(getattr(cfg, "type_vocab_size", 0) or 0)
+    if type_vocab_size > 0:
+        shapes["token_type_embeddings"] = (type_vocab_size, width)
+    return shapes
+
+
+def _validate_embedding_sharing_configs(
+    *,
+    model_cfg: ModelConfig,
+    disc_config: Any,
+    gen_config: Any,
+) -> None:
+    """Reject ES/GDES configs that cannot share every materialized embedding table.
+
+    :param ModelConfig model_cfg: User model configuration.
+    :param Any disc_config: Materialized discriminator config.
+    :param Any gen_config: Materialized generator config.
+    :raises ValueError: If shared embedding availability or shapes differ.
+    :return None: None.
+    """
+
+    mode = str(model_cfg.embedding_sharing).strip().lower()
+    if mode == "none":
+        return
+
+    backbone_type = str(model_cfg.backbone_type).strip().lower()
+    disc_shapes = _embedding_table_shapes(disc_config, backbone_type=backbone_type)
+    gen_shapes = _embedding_table_shapes(gen_config, backbone_type=backbone_type)
+    attrs = sorted(set(disc_shapes) | set(gen_shapes))
+    mismatches = {
+        attr: {
+            "discriminator": disc_shapes.get(attr),
+            "generator": gen_shapes.get(attr),
+        }
+        for attr in attrs
+        if disc_shapes.get(attr) != gen_shapes.get(attr)
+    }
+    if mismatches:
+        raise ValueError(
+            f"model.embedding_sharing='{mode}' requires identical generator and "
+            f"discriminator embedding tables; mismatches={mismatches}."
+        )
+
+
 def _scaled_swiglu_intermediate_size(value: int) -> int:
     """Return a SwiGLU intermediate size scaled to MLP-equivalent parameter budget.
 
@@ -862,6 +925,11 @@ def build_backbone_configs(
                 "set generator z_steps=0 when position_biased_input=false."
             )
 
+        _validate_embedding_sharing_configs(
+            model_cfg=model_cfg,
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
+        )
         return disc_cfg, gen_cfg
 
     # RoPE backbone
@@ -913,6 +981,11 @@ def build_backbone_configs(
         derived_from_discriminator=resolved.generator.derived_from_discriminator,
     )
 
+    _validate_embedding_sharing_configs(
+        model_cfg=model_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+    )
     return disc_cfg, gen_cfg
 
 
@@ -934,6 +1007,11 @@ def build_backbones(
     :return tuple[Any, Any]: Instantiated discriminator and generator modules.
     """
     validate_model_config(model_cfg)
+    _validate_embedding_sharing_configs(
+        model_cfg=model_cfg,
+        disc_config=disc_config,
+        gen_config=gen_config,
+    )
     bt = model_cfg.backbone_type.lower()
     resolved = _resolve_backbone_sources(model_cfg)
     model_cls, kind = (
