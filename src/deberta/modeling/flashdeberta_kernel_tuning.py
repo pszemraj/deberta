@@ -13,6 +13,7 @@ from typing import Any
 _DEFAULT_TUNING_PATH = Path(__file__).with_name("flashdeberta_kernel_tuning.json")
 _POLICY_KEY_PREFIX = "flash-policy:"
 _MATERIALIZED_POLICY_PAYLOADS: dict[str, dict[str, Any]] = {}
+_TRITON_MAX_TENSOR_NUMEL = 1_048_576
 
 # Shape-keyed lookups take per-batch values (total_tokens, batch_size) in their
 # cache keys, so those caches must be bounded LRUs: a long variably-packed run
@@ -226,6 +227,27 @@ def _require_positive_int(row: dict[str, Any], *, field_name: str, location: str
     return value
 
 
+def _require_nonempty_string(
+    row: dict[str, Any],
+    *,
+    field_name: str,
+    location: str,
+) -> str:
+    """Validate one required non-empty string field.
+
+    :param dict[str, Any] row: Candidate tuning row.
+    :param str field_name: Required field to validate.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If the field is absent or is not a non-empty string.
+    :return str: Stripped field value.
+    """
+
+    value = row.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{location}.{field_name} must be a non-empty string.")
+    return value.strip()
+
+
 def _require_power_of_two(row: dict[str, Any], *, field_name: str, location: str) -> int:
     """Validate one required power-of-two launch field.
 
@@ -310,6 +332,32 @@ def _validate_positive_int_range(
     return min_value, max_value
 
 
+def _validate_exact_positive_int_range(
+    row: dict[str, Any],
+    *,
+    field_name: str,
+    location: str,
+) -> None:
+    """Validate one optional exact integer against its optional range.
+
+    :param dict[str, Any] row: Candidate tuning row.
+    :param str field_name: Unprefixed exact and bounded field name.
+    :param str location: Human-readable payload location.
+    :raises ValueError: If the exact value cannot satisfy its declared range.
+    """
+
+    exact = _require_positive_int(row, field_name=field_name, location=location)
+    minimum, maximum = _validate_positive_int_range(
+        row,
+        field_name=field_name,
+        location=location,
+    )
+    if exact is not None and minimum is not None and exact < minimum:
+        raise ValueError(f"{location}.{field_name} must be >= min_{field_name}.")
+    if exact is not None and maximum is not None and exact > maximum:
+        raise ValueError(f"{location}.{field_name} must be <= max_{field_name}.")
+
+
 def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None:
     """Validate the override-table structure consumed by route and kernel lookup.
 
@@ -322,13 +370,13 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
     if unknown:
         raise ValueError(f"Unknown top-level field(s) in {source}: {', '.join(unknown)}.")
 
+    override_bucket_names: set[str] = set()
     for index, raw in enumerate(_require_rows(payload.get("seq_buckets", []), location="seq_buckets")):
         location = f"seq_buckets[{index}]"
         row = _require_mapping(raw, location=location)
         _reject_unknown_fields(row, allowed=_SEQ_BUCKET_FIELDS, location=location)
         _require_fields(row, required={"name"}, location=location)
-        if not str(row["name"]).strip():
-            raise ValueError(f"{location}.name must be non-empty.")
+        override_bucket_names.add(_require_nonempty_string(row, field_name="name", location=location))
         _validate_positive_int_range(row, field_name="seq_len", location=location)
         min_density = _require_unit_interval_number(
             row,
@@ -344,6 +392,19 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
             if min_density is not None and max_density is not None and min_density > max_density:
                 raise ValueError(f"{location}.min_density must be <= {max_name}.")
 
+    shipped_payload = _require_mapping(
+        _read_json(_DEFAULT_TUNING_PATH),
+        location=f"shipped tuning table at {_DEFAULT_TUNING_PATH}",
+    )
+    shipped_bucket_names = {
+        str(row["name"]).strip()
+        for row in _require_rows(
+            shipped_payload.get("seq_buckets", []),
+            location="shipped seq_buckets",
+        )
+    }
+    known_bucket_names = {"default", *shipped_bucket_names, *override_bucket_names}
+
     policies = _require_mapping(payload.get("route_policies", {}), location="route_policies")
     for policy, raw_rows in policies.items():
         choices = _ROUTE_POLICY_CHOICES.get(str(policy))
@@ -355,10 +416,23 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
             row = _require_mapping(raw, location=location)
             _reject_unknown_fields(row, allowed=_ROUTE_POLICY_FIELDS, location=location)
             _require_fields(row, required={"seq_bucket", "choice"}, location=location)
-            choice = str(row["choice"]).strip()
+            seq_bucket = _require_nonempty_string(
+                row,
+                field_name="seq_bucket",
+                location=location,
+            )
+            if seq_bucket not in known_bucket_names:
+                raise ValueError(f"{location}.seq_bucket references unknown bucket {seq_bucket!r}.")
+            choice = _require_nonempty_string(row, field_name="choice", location=location)
             if choice not in choices:
                 allowed = ", ".join(sorted(choices))
                 raise ValueError(f"{location}.choice must be one of: {allowed}. Got {choice!r}.")
+            if "compute_capability" in row:
+                _require_nonempty_string(
+                    row,
+                    field_name="compute_capability",
+                    location=location,
+                )
             _validate_positive_int_range(row, field_name="seq_len", location=location)
             _require_positive_int(row, field_name="max_batch_size", location=location)
 
@@ -379,13 +453,25 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
             },
             location=location,
         )
-        route = str(row["route"]).strip()
-        kind = str(row["kind"]).strip()
+        route = _require_nonempty_string(row, field_name="route", location=location)
+        kind = _require_nonempty_string(row, field_name="kind", location=location)
         kinds = _KERNEL_KIND_CHOICES.get(route)
         if kinds is None or kind not in kinds:
             raise ValueError(f"{location} has unsupported route/kind pair {route!r}/{kind!r}.")
-        for field_name in ("block_m", "block_n"):
-            _require_power_of_two(row, field_name=field_name, location=location)
+        seq_bucket = _require_nonempty_string(
+            row,
+            field_name="seq_bucket",
+            location=location,
+        )
+        if seq_bucket not in known_bucket_names:
+            raise ValueError(f"{location}.seq_bucket references unknown bucket {seq_bucket!r}.")
+        block_m = _require_power_of_two(row, field_name="block_m", location=location)
+        block_n = _require_power_of_two(row, field_name="block_n", location=location)
+        if route == "dense_bias" and block_m * block_n > _TRITON_MAX_TENSOR_NUMEL:
+            raise ValueError(
+                f"{location} dense_bias tile has {block_m * block_n} elements; "
+                f"Triton tensors support at most {_TRITON_MAX_TENSOR_NUMEL}."
+            )
         _require_positive_int(row, field_name="num_stages", location=location)
         num_warps = _require_power_of_two(row, field_name="num_warps", location=location)
         if num_warps not in {1, 2, 4, 8}:
@@ -393,8 +479,18 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
         if row.get("head_dim") != "*":
             _require_positive_int(row, field_name="head_dim", location=location)
         for field_name in ("batch_size", "query_len", "key_len", "num_heads"):
-            _require_positive_int(row, field_name=field_name, location=location)
-            _validate_positive_int_range(row, field_name=field_name, location=location)
+            _validate_exact_positive_int_range(
+                row,
+                field_name=field_name,
+                location=location,
+            )
+        for field_name in ("compute_capability", "dtype"):
+            if field_name in row:
+                _require_nonempty_string(
+                    row,
+                    field_name=field_name,
+                    location=location,
+                )
         _require_positive_int(row, field_name="att_span_min", location=location)
         for field_name in ("causal", "disentangled", "has_mask"):
             _require_bool(row, field_name=field_name, location=location)

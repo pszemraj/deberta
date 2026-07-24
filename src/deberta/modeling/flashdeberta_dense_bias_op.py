@@ -79,6 +79,8 @@ def _dense_bias_repo_tuned_config(
             kind="fwd",
             seq_len=seq_len,
             batch_size=batch_size,
+            query_len=seq_len,
+            key_len=seq_len,
             num_heads=num_heads,
             head_dim=0,
             dtype=_kernel_dtype_name(dtype),

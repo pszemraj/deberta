@@ -506,6 +506,96 @@ def test_flashdeberta_override_rejects_removed_docblock_route_policy(tmp_path) -
 
 
 @pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        (
+            {"seq_buckets": [{"name": ["not", "a", "string"]}]},
+            "name must be a non-empty string",
+        ),
+        (
+            {
+                "route_policies": {
+                    "padding": [{"seq_bucket": "2048_typo", "choice": "varlen"}],
+                }
+            },
+            "references unknown bucket",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "2048_typo",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 2,
+                    }
+                ]
+            },
+            "references unknown bucket",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "batch_size": 4,
+                        "min_batch_size": 5,
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 2,
+                    }
+                ]
+            },
+            "batch_size must be >= min_batch_size",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "dense_bias",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 2048,
+                        "block_n": 2048,
+                        "num_stages": 1,
+                        "num_warps": 2,
+                    }
+                ]
+            },
+            "Triton tensors support at most",
+        ),
+    ],
+    ids=(
+        "non-string-bucket",
+        "unknown-policy-bucket",
+        "unknown-kernel-bucket",
+        "contradictory-exact-range",
+        "oversized-dense-bias-tile",
+    ),
+)
+def test_flashdeberta_override_rejects_unexecutable_rows(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    match: str,
+) -> None:
+    from deberta.modeling.flashdeberta_kernel_tuning import (
+        validate_flashdeberta_kernel_overrides,
+    )
+
+    override_path = tmp_path / "invalid-policy.json"
+    override_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        validate_flashdeberta_kernel_overrides(str(override_path))
+
+
+@pytest.mark.parametrize(
     ("bound", "inside", "outside"),
     [
         (
@@ -4993,7 +5083,10 @@ def test_specialized_docblock_bias_backward_enables_new_seq_len_from_table(tmp_p
         assert _gate(512, policy_path=str(policy_path))
 
 
-def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     import deberta.modeling.flashdeberta_dense_bias_op as dense_bias_mod
 
     monkeypatch.setattr(dense_bias_mod, "device_compute_capability", lambda _device: (12, 0))
@@ -5018,6 +5111,40 @@ def test_dense_bias_repo_tuned_config_matches_sm120_docblock_1024(monkeypatch: p
         )
         is None
     )
+
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "kernels": [
+                {
+                    "compute_capability": "sm_120",
+                    "route": "dense_bias",
+                    "kind": "fwd",
+                    "seq_bucket": "1024_exact",
+                    "head_dim": "*",
+                    "batch_size": 4,
+                    "query_len": 1024,
+                    "key_len": 1024,
+                    "num_heads": 12,
+                    "dtype": "bfloat16",
+                    "has_mask": False,
+                    "block_m": 32,
+                    "block_n": 32,
+                    "num_stages": 1,
+                    "num_warps": 2,
+                }
+            ]
+        },
+    ) as policy_path:
+        assert dense_bias_mod._dense_bias_repo_tuned_config(
+            batch_size=4,
+            num_heads=12,
+            seq_len=1024,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            has_mask=False,
+            policy_path=str(policy_path),
+        ) == (32, 32, 1, 2)
     assert (
         dense_bias_mod._dense_bias_repo_tuned_config(
             batch_size=4,
