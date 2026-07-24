@@ -12,6 +12,7 @@ import argparse
 import gc
 import json
 import math
+import sys
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -247,11 +248,22 @@ def _assemble_eval_batch(rows: list[dict[str, Any]], *, backbone_type: str) -> d
         "doc_context_index",
         "doc_ids",
     )
-    batch = {
-        key: torch.cat([row[key] for row in rows])
-        for key in tensor_keys
-        if all(isinstance(row.get(key), torch.Tensor) for row in rows)
-    }
+    # attention_mask is exempt: the restoration block above already normalizes
+    # its presence across rows, so mixed presence there is expected, not a bug.
+    partial_presence_exempt = {"attention_mask"}
+    batch: dict[str, torch.Tensor] = {}
+    for key in tensor_keys:
+        present = [isinstance(row.get(key), torch.Tensor) for row in rows]
+        if all(present):
+            batch[key] = torch.cat([row[key] for row in rows])
+        elif any(present) and key not in partial_presence_exempt:
+            # Silently keeping only the rows that happen to carry this key
+            # would drop it from the batch without warning, the same failure
+            # class fixed for doc_ids in commit 2319fe1.
+            raise ValueError(
+                f"Key {key!r} is present on some collated rows but not others; "
+                "refusing to silently drop it from the evaluation batch."
+            )
     # Doc-block batches carry compact doc_ids that must become a pairwise
     # attention mask before any forward pass; otherwise checkpoints trained
     # with blocked cross-document attention are scored without it.
@@ -274,6 +286,67 @@ def _state_stats(model: torch.nn.Module) -> dict[str, int]:
     return {"tensors": len(state), "elements": elements, "nonfinite_elements": nonfinite}
 
 
+def _replacement_rate(disc_labels: torch.Tensor, masked_tokens: float) -> float:
+    """Fraction of masked positions where the generator sampled a replacement.
+
+    ``disc_labels`` marks replaced positions across the full ``(N, S)`` grid,
+    including padding and unmasked positions that were never eligible for
+    replacement. Dividing by ``masked_tokens`` (rather than ``disc_labels``'s
+    own element count, i.e. ``disc_labels.mean()``) is what makes this a rate
+    over masked positions instead of a rate over the whole padded batch.
+
+    :param torch.Tensor disc_labels: ``(N, S)`` 0/1 tensor marking replaced positions.
+    :param float masked_tokens: Count of MLM-masked positions across the batch.
+    :return float: ``replacements / max(masked_tokens, 1)``.
+    """
+    replacements = float(disc_labels.sum().item())
+    return replacements / max(float(masked_tokens), 1.0)
+
+
+def _precision_mismatch_warning(eval_precision: str, configured_mixed_precision: str) -> str | None:
+    """Flag when the requested eval precision disagrees with the run's training precision.
+
+    :param str eval_precision: CLI ``--precision`` choice (``bf16`` or ``fp32``).
+    :param str configured_mixed_precision: Normalized ``cfg.train.mixed_precision``
+        value (``bf16`` or ``no``).
+    :return str | None: A one-line warning message, or ``None`` when they agree.
+    """
+    expected_eval_precision = "bf16" if configured_mixed_precision == "bf16" else "fp32"
+    if eval_precision == expected_eval_precision:
+        return None
+    return (
+        f"--precision={eval_precision} does not match the run's "
+        f"train.mixed_precision={configured_mixed_precision!r} "
+        f"(expected --precision={expected_eval_precision})."
+    )
+
+
+def _evaluation_provenance(
+    *,
+    precision: str,
+    sampling_temperature: float,
+    configured_mixed_precision: str,
+) -> dict[str, Any]:
+    """Build the provenance block recording how a checkpoint was evaluated.
+
+    The tool always evaluates with eager attention regardless of how the run
+    trained, so that fact is recorded explicitly alongside the precision and
+    sampling temperature actually used.
+
+    :param str precision: Autocast precision used for evaluation (``bf16``/``fp32``).
+    :param float sampling_temperature: Generator sampling temperature used for evaluation.
+    :param str configured_mixed_precision: The run's configured ``train.mixed_precision``.
+    :return dict[str, Any]: Provenance block for the top-level JSON payload.
+    """
+    return {
+        "attention_impl": "eager",
+        "flash_enabled": False,
+        "precision": precision,
+        "sampling_temperature": float(sampling_temperature),
+        "configured_mixed_precision": configured_mixed_precision,
+    }
+
+
 @torch.no_grad()
 def _evaluate_checkpoint(
     model: DebertaV3RTDPretrainer,
@@ -282,6 +355,7 @@ def _evaluate_checkpoint(
     checkpoint: Path,
     batch_size: int,
     precision: str,
+    sampling_temperature: float,
     seed: int,
 ) -> dict[str, Any]:
     load_stats = load_model_state_with_compile_key_remap(model, checkpoint)
@@ -316,7 +390,7 @@ def _evaluate_checkpoint(
                 labels=labels[start:stop],
                 token_type_ids=token_type_ids[start:stop] if token_type_ids is not None else None,
                 position_ids=position_ids[start:stop] if position_ids is not None else None,
-                sampling_temperature=1.0,
+                sampling_temperature=sampling_temperature,
             )
         count = float(output.gen_token_count.item())
         gen_loss_numerator += float(output.gen_loss_raw.float().item()) * count
@@ -326,7 +400,7 @@ def _evaluate_checkpoint(
 
     corrupted = torch.cat(corrupted_batches)
     disc_labels = torch.cat(disc_label_batches)
-    replacement_rate = float(disc_labels.mean().item())
+    replacement_rate = _replacement_rate(disc_labels, masked_tokens)
 
     logits_batches: list[torch.Tensor] = []
     active_label_batches: list[torch.Tensor] = []
@@ -384,6 +458,12 @@ def main() -> None:
         raise RuntimeError("CUDA is required for checkpoint evaluation")
 
     cfg = load_config(args.config)
+    sampling_temperature = float(cfg.train.objective.sampling_temperature)
+    configured_mixed_precision = str(cfg.train.mixed_precision)
+    mismatch_warning = _precision_mismatch_warning(args.precision, configured_mixed_precision)
+    if mismatch_warning is not None:
+        print(f"WARNING: {mismatch_warning}", file=sys.stderr)
+
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer.name_or_path, use_fast=True)
     batch = _build_eval_batch(cfg, tokenizer, batches=args.batches, seed=args.seed)
     model = _build_model(cfg, tokenizer).to(torch.device("cuda")).eval()
@@ -397,6 +477,7 @@ def main() -> None:
             checkpoint=checkpoint,
             batch_size=int(cfg.train.per_device_train_batch_size),
             precision=args.precision,
+            sampling_temperature=sampling_temperature,
             seed=args.seed,
         )
         results[step] = result
@@ -427,6 +508,11 @@ def main() -> None:
     output = {
         "config": str(args.config.resolve()),
         "precision": args.precision,
+        "evaluation": _evaluation_provenance(
+            precision=args.precision,
+            sampling_temperature=sampling_temperature,
+            configured_mixed_precision=configured_mixed_precision,
+        ),
         "evaluation_data": {
             "dataset": cfg.data.source.dataset_name,
             "dataset_config": cfg.data.source.dataset_config_name,
