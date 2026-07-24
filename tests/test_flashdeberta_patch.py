@@ -1349,6 +1349,7 @@ def test_flash_attention_varlen_path_dispatches(monkeypatch: pytest.MonkeyPatch)
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        seq_bucket: str,
         policy_path: str,
     ) -> torch.Tensor:
         """Return zero output while recording padded-varlen wrapper inputs."""
@@ -1367,6 +1368,7 @@ def test_flash_attention_varlen_path_dispatches(monkeypatch: pytest.MonkeyPatch)
             policy_path,
         )
         seen["mask"] = attention_mask_2d
+        seen["seq_bucket"] = seq_bucket
         return torch.zeros_like(query_layer)
 
     monkeypatch.setattr(attention_mod, "flashdeberta_varlen_padded", _fake_varlen_wrapper)
@@ -1387,6 +1389,7 @@ def test_flash_attention_varlen_path_dispatches(monkeypatch: pytest.MonkeyPatch)
     assert tuple(seen["mask"].shape) == (1, 4)
     assert seen["mask"].dtype == torch.bool
     assert torch.equal(seen["mask"], attention_mask)
+    assert seen["seq_bucket"] == ""
 
 
 @pytest.mark.parametrize(
@@ -1474,6 +1477,7 @@ def test_flash_attention_fixed_path_dispatches(monkeypatch: pytest.MonkeyPatch) 
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        seq_bucket: str,
         policy_path: str,
     ) -> torch.Tensor:
         """Return zero output while recording fixed wrapper inputs."""
@@ -1490,6 +1494,7 @@ def test_flash_attention_fixed_path_dispatches(monkeypatch: pytest.MonkeyPatch) 
             policy_path,
         )
         seen["seq_lengths"] = seq_lengths
+        seen["seq_bucket"] = seq_bucket
         return torch.zeros_like(query_layer)
 
     monkeypatch.setattr(attention_mod, "flashdeberta_fixed", _fake_fixed_wrapper)
@@ -1507,6 +1512,7 @@ def test_flash_attention_fixed_path_dispatches(monkeypatch: pytest.MonkeyPatch) 
     assert probs is None
     assert tuple(output.shape) == (1, 4, cfg.hidden_size)
     assert seen["seq_lengths"] is None
+    assert seen["seq_bucket"] == ""
 
 
 def test_flash_attention_dense_local_bias_path_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2662,6 +2668,7 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert prepared_dense is dense_batch
     assert dense_meta is not None
     assert dense_meta.route_hint == "dense"
+    assert dense_meta.seq_bucket == "1024_exact"
 
     local_bias_batch = {"input_ids": torch.zeros((2, 1024), dtype=torch.long)}
     with monkeypatch.context() as patch:
@@ -2675,6 +2682,7 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     assert prepared_local_bias is local_bias_batch
     assert local_bias_meta is not None
     assert local_bias_meta.route_hint == "local_bias"
+    assert local_bias_meta.seq_bucket == "1024_exact"
 
     pairwise_batch = {
         "input_ids": torch.zeros((1, 4), dtype=torch.long),
@@ -2715,6 +2723,7 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     )
     assert fixed_meta is not None
     assert fixed_meta.route_hint == "fixed"
+    assert fixed_meta.seq_bucket == "1024_exact"
     assert "_flash_meta" not in prepared_fixed
     assert torch.equal(fixed_meta.seq_lengths, torch.tensor([1024, 768], dtype=torch.int32))
     assert int(fixed_meta.active_tokens_scalar) == 1792
@@ -2752,6 +2761,7 @@ def test_prepare_flash_attention_batch_metadata_routes_dense_pairwise_and_padded
     )
     assert varlen_meta is not None
     assert varlen_meta.route_hint == "varlen"
+    assert varlen_meta.seq_bucket == "2048_plus"
     assert "_flash_meta" not in prepared_varlen
     assert torch.equal(varlen_meta.seq_lengths, torch.tensor([1800, 1700], dtype=torch.int32))
     assert int(varlen_meta.active_tokens_scalar) == 3500
@@ -4814,6 +4824,157 @@ def test_varlen_repo_tuned_config_uses_density_bucket(monkeypatch: pytest.Monkey
 
     assert sparse_cfg == (64, 32, 2, 4)
     assert long_cfg == (64, 64, 3, 8)
+
+
+def test_padding_density_bucket_controls_fixed_and_compiled_varlen_configs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import deberta.modeling.flashdeberta_fixed_op as fixed_mod
+    import deberta.modeling.flashdeberta_varlen_op as varlen_mod
+    import deberta.training.compile as compile_mod
+
+    monkeypatch.setattr(fixed_mod, "device_compute_capability", lambda _device: (12, 0))
+    monkeypatch.setattr(varlen_mod, "device_compute_capability", lambda _device: (12, 0))
+
+    def _kernel_row(
+        *,
+        route: str,
+        kind: str,
+        seq_bucket: str,
+        block_m: int,
+    ) -> dict[str, Any]:
+        return {
+            "route": route,
+            "kind": kind,
+            "seq_bucket": seq_bucket,
+            "head_dim": 64,
+            "block_m": block_m,
+            "block_n": 16,
+            "num_stages": 1,
+            "num_warps": 2,
+        }
+
+    with _kernel_tuning_overrides(
+        tmp_path,
+        {
+            "seq_buckets": [
+                {
+                    "name": "sparse_2048",
+                    "min_seq_len": 2048,
+                    "max_seq_len": 2048,
+                    "max_density_exclusive": 0.5,
+                },
+                {
+                    "name": "dense_2048",
+                    "min_seq_len": 2048,
+                    "max_seq_len": 2048,
+                    "min_density": 0.5,
+                },
+            ],
+            "route_policies": {
+                "padding": [{"seq_bucket": "sparse_2048", "choice": "fixed"}],
+            },
+            "kernels": [
+                _kernel_row(
+                    route="fixed",
+                    kind="fwd",
+                    seq_bucket="sparse_2048",
+                    block_m=32,
+                ),
+                _kernel_row(
+                    route="varlen",
+                    kind="fwd",
+                    seq_bucket="sparse_2048",
+                    block_m=16,
+                ),
+                _kernel_row(
+                    route="varlen",
+                    kind="bwd_kv",
+                    seq_bucket="sparse_2048",
+                    block_m=32,
+                ),
+                _kernel_row(
+                    route="varlen",
+                    kind="fwd",
+                    seq_bucket="dense_2048",
+                    block_m=64,
+                ),
+                _kernel_row(
+                    route="varlen",
+                    kind="bwd_kv",
+                    seq_bucket="dense_2048",
+                    block_m=64,
+                ),
+            ],
+        },
+    ) as policy_path:
+        sparse_meta = FlashBatchMeta(
+            seq_lengths=torch.tensor([900, 900], dtype=torch.int32),
+            active_tokens_scalar=torch.tensor(1800, dtype=torch.int32),
+        )
+        _batch, prepared_meta = compile_mod.prepare_flash_attention_batch_metadata(
+            batch={
+                "input_ids": torch.zeros((2, 2048), dtype=torch.long),
+                "attention_mask": torch.arange(2048).unsqueeze(0) < torch.tensor([900, 900]).unsqueeze(1),
+                "_flash_meta": sparse_meta,
+            },
+            backbone_type="hf_deberta_v2",
+            flash_enabled=True,
+            flash_cfg=ModelHFFlashConfig(kernel_overrides_path=str(policy_path)),
+        )
+
+        assert prepared_meta is not None
+        assert prepared_meta.route_hint == "fixed"
+        assert prepared_meta.seq_bucket == "sparse_2048"
+        assert fixed_mod._fixed_repo_tuned_config(
+            kind="fwd",
+            batch_size=2,
+            num_heads=12,
+            query_len=2048,
+            key_len=2048,
+            head_dim=64,
+            causal=False,
+            disentangled=True,
+            att_span=256,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            has_mask=True,
+            policy_path=str(policy_path),
+            seq_bucket=prepared_meta.seq_bucket,
+        ) == (32, 16, 1, 2)
+        assert varlen_mod._varlen_repo_tuned_config(
+            kind="fwd",
+            seq_len=2048,
+            total_tokens=4096,
+            batch_size=2,
+            num_heads=12,
+            head_dim=64,
+            causal=False,
+            disentangled=True,
+            att_span=256,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            policy_path=str(policy_path),
+            seq_bucket=prepared_meta.seq_bucket,
+        ) == (16, 16, 1, 2)
+        assert varlen_mod._resolve_varlen_bwd_kernel_config(
+            kind="kv",
+            total_tokens_q=4096,
+            total_tokens_k=4096,
+            max_seqlen_q=2048,
+            max_seqlen_k=2048,
+            batch_size=2,
+            num_heads=12,
+            head_dim=64,
+            causal=False,
+            disentangled=True,
+            att_span=256,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            policy_path=str(policy_path),
+            seq_bucket=prepared_meta.seq_bucket,
+        ) == (32, 16, 1, 2)
 
 
 def test_fixed_repo_tuned_config_matches_sm120_dense_1024(monkeypatch: pytest.MonkeyPatch) -> None:

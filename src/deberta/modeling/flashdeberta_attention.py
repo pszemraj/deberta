@@ -318,6 +318,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         """
 
         seq_lengths = flash_meta.seq_lengths if flash_meta is not None else None
+        seq_bucket = flash_meta.seq_bucket if flash_meta is not None else ""
         return flashdeberta_fixed(
             query_layer=query_layer,
             key_layer=key_layer,
@@ -329,6 +330,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             sm_scale=sm_scale,
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
+            seq_bucket=seq_bucket,
             policy_path=self.flash_kernel_policy_key,
         )
 
@@ -481,6 +483,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
             causal=False,
+            seq_bucket=flash_meta.seq_bucket if flash_meta is not None else "",
             policy_path=self.flash_kernel_policy_key,
         )
         return out

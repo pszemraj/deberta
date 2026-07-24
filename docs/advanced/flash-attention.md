@@ -72,6 +72,8 @@ Defaults live in
 - `kernels` selects Triton launch configurations by route, operation, shape bucket, and compute
   capability.
 
+For ordinary padded batches, batch preparation resolves the sequence/density bucket once from active tokens divided by padded capacity. The same bucket controls route selection and every fixed or varlen forward/backward launch, including compiled fixed-capacity packing.
+
 Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, and `bias_docblock_specialized`. Without a matching row, fixed, varlen, doc-block, and generic bias kernels use the repo-owned conservative `(16, 16, 1, 4)` launch tile; the dense-bias builder uses `(64, 64, 2, 4)`; and specialized doc-block backward kernels remain disabled. These deterministic fallbacks ignore the upstream package's environment-variable tuning surface. Use `model.hf.flash.kernel_overrides_path` for auditable per-hardware choices; [GPU support](gpu-support.md) explains why measured overrides are capability-scoped.
 
 ### Retuning

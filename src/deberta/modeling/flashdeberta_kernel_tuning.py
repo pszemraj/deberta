@@ -94,6 +94,7 @@ class FlashKernelContext:
     kind: str
     seq_len: int
     head_dim: int
+    seq_bucket: str | None = None
     total_tokens: int | None = None
     batch_size: int | None = None
     query_len: int | None = None
@@ -894,12 +895,13 @@ def _entry_matches(
         return False
     if str(entry.get("kind", "")).strip().lower() != str(context.kind).strip().lower():
         return False
-    if str(entry.get("seq_bucket", "")).strip() != flash_seq_bucket(
+    seq_bucket = context.seq_bucket or flash_seq_bucket(
         seq_len=context.seq_len,
         total_tokens=context.total_tokens,
         batch_size=context.batch_size,
         policy_path=policy_path,
-    ):
+    )
+    if str(entry.get("seq_bucket", "")).strip() != seq_bucket:
         return False
     head_dim = entry.get("head_dim", "*")
     if head_dim != "*" and int(head_dim) != int(context.head_dim):

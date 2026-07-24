@@ -1309,6 +1309,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             return (
                 "dense_hs0",
                 flash_meta.route_hint if flash_meta is not None else None,
+                flash_meta.seq_bucket if flash_meta is not None else None,
                 flash_meta.kernel_policy_path if flash_meta is not None else None,
                 flash_meta.kernel_policy_key if flash_meta is not None else None,
             )
@@ -1318,6 +1319,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             return (
                 "dense_hs1",
                 flash_meta.route_hint if flash_meta is not None else None,
+                flash_meta.seq_bucket if flash_meta is not None else None,
                 flash_meta.kernel_policy_path if flash_meta is not None else None,
                 flash_meta.kernel_policy_key if flash_meta is not None else None,
             )
@@ -1327,6 +1329,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             return (
                 "masked_hs0",
                 flash_meta.route_hint,
+                flash_meta.seq_bucket,
                 flash_meta.kernel_policy_path,
                 flash_meta.kernel_policy_key,
             )
@@ -1336,6 +1339,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             return (
                 "masked_hs1",
                 flash_meta.route_hint,
+                flash_meta.seq_bucket,
                 flash_meta.kernel_policy_path,
                 flash_meta.kernel_policy_key,
             )
@@ -1359,6 +1363,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
                 output_hidden_states=hidden_states,
                 flash_meta=FlashBatchMeta(
                     route_hint=route,
+                    seq_bucket="sparse",
                     kernel_policy_path="/policy-b.json",
                     kernel_policy_key="policy-b-key",
                 ),
@@ -1366,6 +1371,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             assert result == (
                 f"dense_hs{int(hidden_states)}",
                 route,
+                "sparse",
                 "/policy-b.json",
                 "policy-b-key",
             )
@@ -1377,6 +1383,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
                 output_hidden_states=hidden_states,
                 flash_meta=FlashBatchMeta(
                     route_hint=route,
+                    seq_bucket="sparse",
                     kernel_policy_path="/policy-b.json",
                     kernel_policy_key="policy-b-key",
                 ),
@@ -1384,6 +1391,7 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
             assert result == (
                 f"masked_hs{int(hidden_states)}",
                 route,
+                "sparse",
                 "/policy-b.json",
                 "policy-b-key",
             )

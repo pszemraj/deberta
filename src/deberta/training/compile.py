@@ -12,7 +12,6 @@ import torch
 
 from deberta.config import ModelConfig, ModelHFFlashConfig, _normalize_sdpa_kernel
 from deberta.modeling.flashdeberta_kernel_tuning import (
-    flash_padding_route,
     flash_route_choice,
     flash_seq_bucket,
     materialize_flash_kernel_policy,
@@ -249,9 +248,15 @@ def prepare_flash_attention_batch_metadata(
 
     attention_mask = batch.get("attention_mask")
     if attention_mask is None:
+        seq_bucket = flash_seq_bucket(
+            seq_len=seq_len,
+            total_tokens=batch_size * seq_len,
+            batch_size=batch_size,
+            policy_path=policy_key,
+        )
         route_hint = flash_route_choice(
             policy="local_bias",
-            seq_bucket=flash_seq_bucket(seq_len=seq_len, policy_path=policy_key),
+            seq_bucket=seq_bucket,
             compute_capability=device_compute_capability(routing_device),
             seq_len=seq_len,
             batch_size=batch_size,
@@ -259,6 +264,7 @@ def prepare_flash_attention_batch_metadata(
         )
         return batch, FlashBatchMeta(
             route_hint="local_bias" if route_hint == "local_bias" else "dense",
+            seq_bucket=seq_bucket,
             kernel_policy_path=policy_path,
             kernel_policy_key=policy_key,
         )
@@ -269,16 +275,25 @@ def prepare_flash_attention_batch_metadata(
     if flash_meta is None or flash_meta.seq_lengths is None or flash_meta.active_tokens_scalar is None:
         return batch, None
 
-    route_hint = flash_padding_route(
+    active_tokens = int(flash_meta.active_tokens_scalar)
+    seq_bucket = flash_seq_bucket(
         seq_len=seq_len,
-        total_tokens=int(flash_meta.active_tokens_scalar),
+        total_tokens=active_tokens,
         batch_size=batch_size,
+        policy_path=policy_key,
+    )
+    route_hint = flash_route_choice(
+        policy="padding",
+        seq_bucket=seq_bucket,
         compute_capability=device_compute_capability(routing_device),
+        seq_len=seq_len,
+        batch_size=batch_size,
         policy_path=policy_key,
     )
     return batch, dataclasses.replace(
         flash_meta,
-        route_hint=route_hint,
+        route_hint=route_hint if route_hint in {"fixed", "varlen"} else "fixed",
+        seq_bucket=seq_bucket,
         kernel_policy_path=policy_path,
         kernel_policy_key=policy_key,
     )
