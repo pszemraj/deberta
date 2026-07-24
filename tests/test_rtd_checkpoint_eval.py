@@ -6,7 +6,10 @@ from pathlib import Path
 
 import torch
 
+from deberta.modeling.mask_utils import attention_mask_to_active_tokens
+
 _TOOL = runpy.run_path(str(Path(__file__).parents[1] / "tools" / "evaluate_rtd_checkpoint.py"))
+_assemble_eval_batch = _TOOL["_assemble_eval_batch"]
 _checkpoint_step = _TOOL["_checkpoint_step"]
 _discriminator_metrics = _TOOL["_discriminator_metrics"]
 _forward_discriminator_with_diagnostics = _TOOL["_forward_discriminator_with_diagnostics"]
@@ -126,3 +129,59 @@ def test_discriminator_diagnostics_use_shared_phase_path() -> None:
 
 def test_checkpoint_step_uses_directory_suffix() -> None:
     assert _checkpoint_step(Path("run/checkpoint-12000")) == 12000
+
+
+def test_assemble_eval_batch_converts_doc_ids_to_doc_block_mask() -> None:
+    rows = [
+        {
+            "input_ids": torch.tensor([[11, 12, 13, 14]]),
+            "labels": torch.tensor([[-100, 12, -100, -100]]),
+            "doc_ids": torch.tensor([[1, 1, 2, 0]]),
+        },
+        {
+            "input_ids": torch.tensor([[21, 22, 23, 24]]),
+            "labels": torch.tensor([[21, -100, -100, -100]]),
+            "doc_ids": torch.tensor([[1, 1, 1, 1]]),
+        },
+    ]
+
+    batch = _assemble_eval_batch(rows, backbone_type="hf_deberta_v2")
+
+    # doc_ids are consumed into a pairwise mask, mirroring the training loop.
+    assert "doc_ids" not in batch
+    mask = batch["attention_mask"]
+    assert mask.shape == (2, 4, 4)
+    assert mask.dtype == torch.bool
+
+    # Cross-document attention is blocked in both directions.
+    assert mask[0, 0, 2].item() is False
+    assert mask[0, 2, 0].item() is False
+
+    # Padding stays inactive and loss accounting sees the doc_ids liveness.
+    active = attention_mask_to_active_tokens(
+        input_ids=batch["input_ids"],
+        attention_mask=mask,
+    )
+    assert torch.equal(
+        active,
+        torch.tensor([[True, True, True, False], [True, True, True, True]]),
+    )
+
+
+def test_assemble_eval_batch_restores_dropped_all_ones_masks() -> None:
+    rows = [
+        {
+            "input_ids": torch.tensor([[11, 12, 13]]),
+            "labels": torch.tensor([[-100, 12, -100]]),
+            "attention_mask": torch.tensor([[1, 1, 0]]),
+        },
+        {
+            # The collator drops all-ones masks, so this row arrives without one.
+            "input_ids": torch.tensor([[21, 22, 23]]),
+            "labels": torch.tensor([[21, -100, -100]]),
+        },
+    ]
+
+    batch = _assemble_eval_batch(rows, backbone_type="hf_deberta_v2")
+
+    assert torch.equal(batch["attention_mask"], torch.tensor([[1, 1, 0], [1, 1, 1]]))

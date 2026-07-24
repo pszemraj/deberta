@@ -26,6 +26,7 @@ from deberta.config import load_config
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.mask_utils import attention_mask_to_active_tokens
+from deberta.training.compile import prepare_flash_attention_batch_metadata
 from deberta.training.runtime import _build_train_dataset_and_collator
 from deberta.utils.checkpoint import load_model_state_with_compile_key_remap
 
@@ -214,6 +215,29 @@ def _build_eval_batch(cfg: Any, tokenizer: Any, *, batches: int, seed: int) -> d
     torch.manual_seed(int(seed))
     iterator = iter(loader)
     rows = [next(iterator) for _ in range(int(batches))]
+    batch = _assemble_eval_batch(rows, backbone_type=str(cfg.model.backbone_type))
+    # Release streaming/PyArrow iterator state before model evaluation so its
+    # background callbacks cannot survive until interpreter shutdown.
+    del rows, iterator, loader, dataset, raw_train
+    gc.collect()
+    return batch
+
+
+def _assemble_eval_batch(rows: list[dict[str, Any]], *, backbone_type: str) -> dict[str, torch.Tensor]:
+    """Concatenate collated rows and apply training-path attention routing.
+
+    :param list[dict[str, Any]] rows: Collator output batches.
+    :param str backbone_type: Backbone type string for mask routing.
+    :return dict[str, torch.Tensor]: Evaluation batch with ``doc_ids`` converted
+        to a pairwise doc-block attention mask, mirroring the training loop.
+    """
+    # The collator drops all-ones masks per collate call, so restore them
+    # before concatenation when any row carries real padding.
+    rows = [dict(row) for row in rows]
+    if any(isinstance(row.get("attention_mask"), torch.Tensor) for row in rows):
+        for row in rows:
+            if not isinstance(row.get("attention_mask"), torch.Tensor):
+                row["attention_mask"] = torch.ones_like(row["input_ids"])
     tensor_keys = (
         "input_ids",
         "labels",
@@ -221,16 +245,21 @@ def _build_eval_batch(cfg: Any, tokenizer: Any, *, batches: int, seed: int) -> d
         "token_type_ids",
         "position_ids",
         "doc_context_index",
+        "doc_ids",
     )
     batch = {
         key: torch.cat([row[key] for row in rows])
         for key in tensor_keys
         if all(isinstance(row.get(key), torch.Tensor) for row in rows)
     }
-    # Release streaming/PyArrow iterator state before model evaluation so its
-    # background callbacks cannot survive until interpreter shutdown.
-    del rows, iterator, loader, dataset, raw_train
-    gc.collect()
+    # Doc-block batches carry compact doc_ids that must become a pairwise
+    # attention mask before any forward pass; otherwise checkpoints trained
+    # with blocked cross-document attention are scored without it.
+    batch, _ = prepare_flash_attention_batch_metadata(
+        batch=batch,
+        backbone_type=backbone_type,
+        flash_enabled=False,
+    )
     return batch
 
 
