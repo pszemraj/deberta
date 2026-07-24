@@ -54,10 +54,11 @@ from deberta.data.loading import load_hf_dataset  # noqa: E402
 from deberta.modeling import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
 from deberta.modeling.flashdeberta_kernel_tuning import (  # noqa: E402
+    FlashKernelPolicy,
     compute_capability_key,
     flash_seq_bucket,
+    materialize_flash_kernel_policy,
     normalize_flash_kernel_policy_path,
-    validate_flashdeberta_kernel_overrides,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability  # noqa: E402
 from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
@@ -169,30 +170,36 @@ def parse_candidate_specs(values: list[str]) -> list[tuple[str, str | None]]:
 def candidate_kernel_overrides(
     model: DebertaV2Model,
     path: str | None,
-) -> Iterator[str]:
+) -> Iterator[FlashKernelPolicy]:
     """Apply one model-scoped kernel policy for the duration of a tuning sweep.
 
     :param DebertaV2Model model: Backbone whose Flash attention layers are tuned.
     :param str | None path: Candidate override JSON, or None for the shipped table.
-    :return Iterator[str]: Context yielding the normalized candidate path.
+    :return Iterator[FlashKernelPolicy]: Context yielding the candidate policy.
     """
 
-    policy_path = normalize_flash_kernel_policy_path(path)
-    if policy_path:
-        validate_flashdeberta_kernel_overrides(policy_path)
+    policy = materialize_flash_kernel_policy(normalize_flash_kernel_policy_path(path))
     attention_modules = [module for module in model.modules() if hasattr(module, "flash_kernel_policy_path")]
-    previous_paths = [str(module.flash_kernel_policy_path) for module in attention_modules]
+    previous_policies = [
+        (
+            str(module.flash_kernel_policy_path),
+            str(module.flash_kernel_policy_key),
+        )
+        for module in attention_modules
+    ]
     for module in attention_modules:
-        module.flash_kernel_policy_path = policy_path
+        module.flash_kernel_policy_path = policy.source_path
+        module.flash_kernel_policy_key = policy.key
     try:
-        yield policy_path
+        yield policy
     finally:
-        for module, previous_path in zip(
+        for module, (previous_path, previous_key) in zip(
             attention_modules,
-            previous_paths,
+            previous_policies,
             strict=True,
         ):
             module.flash_kernel_policy_path = previous_path
+            module.flash_kernel_policy_key = previous_key
 
 
 def load_tool_config_and_loader(
@@ -612,7 +619,7 @@ def run_candidate_sweep(
 
     results: list[CandidateSweepResult] = []
     for candidate_name, candidate_path in candidates:
-        with candidate_kernel_overrides(model, candidate_path) as policy_path:
+        with candidate_kernel_overrides(model, candidate_path) as policy:
             for route in routes:
                 try:
                     timing = run_timed_candidate(
@@ -621,7 +628,8 @@ def run_candidate_sweep(
                         meta_fn=lambda sample, route=route: (
                             replace(
                                 metadata,
-                                kernel_policy_path=policy_path,
+                                kernel_policy_path=policy.source_path,
+                                kernel_policy_key=policy.key,
                             )
                             if (metadata := meta_fn(sample, route)) is not None
                             else None

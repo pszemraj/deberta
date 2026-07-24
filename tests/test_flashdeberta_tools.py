@@ -80,9 +80,11 @@ def test_bias_tuner_samples_ragged_docblock_before_local_dense_replay(
         def __init__(self) -> None:
             super().__init__()
             self.flash_kernel_policy_path = str((tmp_path / "original-policy.json").resolve())
+            self.flash_kernel_policy_key = "original-policy-key"
 
     model = torch.nn.Sequential(_FlashLayer())
     original_policy_path = model[0].flash_kernel_policy_path
+    original_policy_key = model[0].flash_kernel_policy_key
 
     def _run_timed_candidate(**kwargs: object) -> None:
         samples = kwargs["samples"]
@@ -95,7 +97,9 @@ def test_bias_tuner_samples_ragged_docblock_before_local_dense_replay(
         metadata = kwargs["meta_fn"](sample)
         assert metadata.route_hint == "docblock_bias"
         assert metadata.kernel_policy_path == ""
+        assert metadata.kernel_policy_key == ""
         assert model[0].flash_kernel_policy_path == ""
+        assert model[0].flash_kernel_policy_key == ""
         raise SweepReached
 
     monkeypatch.setattr(tune_mod, "_parse_args", lambda: args)
@@ -118,3 +122,4 @@ def test_bias_tuner_samples_ragged_docblock_before_local_dense_replay(
     with pytest.raises(SweepReached):
         tune_mod.main()
     assert model[0].flash_kernel_policy_path == original_policy_path
+    assert model[0].flash_kernel_policy_key == original_policy_key

@@ -249,7 +249,7 @@ def test_flashdeberta_kernel_tuning_table_resolves_default_policy() -> None:
     ) == (16, 32, 1, 4)
 
 
-def test_flashdeberta_kernel_policy_same_path_keeps_cache(monkeypatch) -> None:
+def test_flashdeberta_shipped_kernel_policy_keeps_cache(monkeypatch) -> None:
     from deberta.modeling import flashdeberta_kernel_tuning as tuning
 
     reads = {"count": 0}
@@ -261,7 +261,6 @@ def test_flashdeberta_kernel_policy_same_path_keeps_cache(monkeypatch) -> None:
 
     monkeypatch.setattr(tuning, "_read_json", _counting_read)
     tuning._load_tuning_payload.cache_clear()
-    tuning._load_override_payload.cache_clear()
     tuning.flash_seq_bucket.cache_clear()
     tuning.resolve_flash_kernel_config.cache_clear()
 
@@ -272,6 +271,70 @@ def test_flashdeberta_kernel_policy_same_path_keeps_cache(monkeypatch) -> None:
     for _ in range(5):
         assert tuning.flash_seq_bucket(seq_len=1024) == baseline_bucket
     assert reads["count"] == first_reads
+
+
+def test_flashdeberta_same_path_rewrite_materializes_new_immutable_policy(
+    tmp_path: Path,
+) -> None:
+    from deberta.modeling import flashdeberta_kernel_tuning as tuning
+
+    def _payload(block_m: int) -> dict[str, Any]:
+        return {
+            "kernels": [
+                {
+                    "route": "fixed",
+                    "kind": "fwd",
+                    "seq_bucket": "default",
+                    "compute_capability": "sm_120",
+                    "head_dim": 64,
+                    "batch_size": 1,
+                    "query_len": 128,
+                    "key_len": 128,
+                    "num_heads": 2,
+                    "dtype": "bfloat16",
+                    "causal": False,
+                    "disentangled": True,
+                    "att_span_min": 8,
+                    "has_mask": False,
+                    "block_m": block_m,
+                    "block_n": 16,
+                    "num_stages": 1,
+                    "num_warps": 2,
+                }
+            ]
+        }
+
+    context = tuning.FlashKernelContext(
+        compute_capability=(12, 0),
+        route="fixed",
+        kind="fwd",
+        seq_len=128,
+        head_dim=64,
+        batch_size=1,
+        query_len=128,
+        key_len=128,
+        num_heads=2,
+        dtype="bfloat16",
+        causal=False,
+        disentangled=True,
+        att_span=8,
+        has_mask=False,
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(_payload(32)), encoding="utf-8")
+    first = tuning.materialize_flash_kernel_policy(str(policy_path))
+    assert tuning.resolve_flash_kernel_config(context, policy_path=first.key) == (32, 16, 1, 2)
+
+    policy_path.write_text(json.dumps(_payload(64)), encoding="utf-8")
+    second = tuning.materialize_flash_kernel_policy(str(policy_path))
+    assert first.key != second.key
+    assert tuning.resolve_flash_kernel_config(context, policy_path=first.key) == (32, 16, 1, 2)
+    assert tuning.resolve_flash_kernel_config(context, policy_path=second.key) == (64, 16, 1, 2)
+    assert tuning.resolve_flash_kernel_config(context, policy_path=str(policy_path)) == (64, 16, 1, 2)
+
+    policy_path.write_text(json.dumps(_payload(3)), encoding="utf-8")
+    with pytest.raises(ValueError, match="power of two"):
+        tuning.validate_flashdeberta_kernel_overrides(str(policy_path))
 
 
 def test_flashdeberta_shape_keyed_tuning_caches_are_bounded() -> None:
@@ -608,19 +671,19 @@ def test_flash_kernel_and_route_policy_are_model_scoped(
             disentangled=True,
             has_mask=True,
         )
-        assert resolve_flash_kernel_config(context, policy_path=attention_a.flash_kernel_policy_path) == (
+        assert resolve_flash_kernel_config(context, policy_path=attention_a.flash_kernel_policy_key) == (
             32,
             16,
             1,
             2,
         )
-        assert resolve_flash_kernel_config(context, policy_path=attention_b.flash_kernel_policy_path) == (
+        assert resolve_flash_kernel_config(context, policy_path=attention_b.flash_kernel_policy_key) == (
             64,
             16,
             1,
             2,
         )
-        assert resolve_flash_kernel_config(context, policy_path=attention_a.flash_kernel_policy_path) == (
+        assert resolve_flash_kernel_config(context, policy_path=attention_a.flash_kernel_policy_key) == (
             32,
             16,
             1,
@@ -675,6 +738,8 @@ def test_flash_kernel_and_route_policy_are_model_scoped(
             "varlen",
             str(policy_b.resolve()),
         )
+        assert meta_a.kernel_policy_key == attention_a.flash_kernel_policy_key
+        assert meta_b.kernel_policy_key == attention_b.flash_kernel_policy_key
         hidden_states = torch.randn(1, 4, cfg_a.hidden_size)
         rel_embeddings = torch.randn(2 * cfg_a.position_buckets, cfg_a.hidden_size)
         attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
@@ -697,9 +762,9 @@ def test_flash_kernel_and_route_policy_are_model_scoped(
             flash_meta=meta_a,
         )
         assert seen_launches == [
-            ("fixed", str(policy_a.resolve())),
-            ("varlen", str(policy_b.resolve())),
-            ("fixed", str(policy_a.resolve())),
+            ("fixed", attention_a.flash_kernel_policy_key),
+            ("varlen", attention_b.flash_kernel_policy_key),
+            ("fixed", attention_a.flash_kernel_policy_key),
         ]
 
 
@@ -722,6 +787,7 @@ def test_flash_attention_rejects_metadata_from_another_policy(
             mismatched_meta,
             "dense",
             kernel_policy_path=str(policy_path.resolve()),
+            kernel_policy_key=attention.flash_kernel_policy_key,
         )
     with pytest.raises(RuntimeError, match="prepared for a different kernel policy"):
         attention(
@@ -3125,6 +3191,7 @@ def test_flash_attention_docblock_path_dispatches(
             doc_max_segment_length_scalar=torch.tensor(2, dtype=torch.int32),
             route_hint="docblock",
             kernel_policy_path=str(policy_path.resolve()),
+            kernel_policy_key=attention.flash_kernel_policy_key,
         ),
     )
 
@@ -3136,7 +3203,7 @@ def test_flash_attention_docblock_path_dispatches(
     assert seen["num_segments"].item() == 2
     assert seen["max_seqlen"].item() == 2
     assert seen["total_tokens"].item() == 3
-    assert seen["policy_path"] == str(policy_path.resolve())
+    assert seen["policy_path"] == attention.flash_kernel_policy_key
 
 
 def test_flash_attention_docblock_bias_path_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:

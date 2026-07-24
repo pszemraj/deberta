@@ -15,6 +15,7 @@ from deberta.modeling.flashdeberta_kernel_tuning import (
     flash_padding_route,
     flash_route_choice,
     flash_seq_bucket,
+    materialize_flash_kernel_policy,
     normalize_flash_kernel_policy_path,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
@@ -134,32 +135,43 @@ def _flash_meta_with_route(
     route_hint: str | None,
     *,
     kernel_policy_path: str,
+    kernel_policy_key: str,
 ) -> FlashBatchMeta | None:
     """Return metadata with a route hint override.
 
     :param FlashBatchMeta | None flash_meta: Existing metadata bundle.
     :param str | None route_hint: Route hint to install.
     :param str kernel_policy_path: Normalized model-scoped policy path.
+    :param str kernel_policy_key: Immutable materialized-policy key.
     :return FlashBatchMeta | None: Metadata bundle with the requested route.
     """
 
     if flash_meta is None:
         return (
-            FlashBatchMeta(route_hint=route_hint, kernel_policy_path=kernel_policy_path)
+            FlashBatchMeta(
+                route_hint=route_hint,
+                kernel_policy_path=kernel_policy_path,
+                kernel_policy_key=kernel_policy_key,
+            )
             if route_hint is not None
             else None
         )
-    if flash_meta.route_hint is not None and flash_meta.kernel_policy_path != kernel_policy_path:
+    if flash_meta.route_hint is not None and flash_meta.kernel_policy_key != kernel_policy_key:
         raise RuntimeError(
             "FlashDeBERTa route metadata was prepared for a different kernel policy: "
             f"metadata={flash_meta.kernel_policy_path!r}, model={kernel_policy_path!r}."
         )
-    if flash_meta.route_hint == route_hint and flash_meta.kernel_policy_path == kernel_policy_path:
+    if (
+        flash_meta.route_hint == route_hint
+        and flash_meta.kernel_policy_path == kernel_policy_path
+        and flash_meta.kernel_policy_key == kernel_policy_key
+    ):
         return flash_meta
     return dataclasses.replace(
         flash_meta,
         route_hint=route_hint,
         kernel_policy_path=kernel_policy_path,
+        kernel_policy_key=kernel_policy_key,
     )
 
 
@@ -170,6 +182,7 @@ def prepare_flash_attention_batch_metadata(
     flash_enabled: bool = False,
     flash_cfg: ModelHFFlashConfig | None = None,
     route_device: torch.device | None = None,
+    kernel_policy_key: str | None = None,
 ) -> tuple[dict[str, Any], FlashBatchMeta | None]:
     """Select the attention route from collator-built batch metadata.
 
@@ -179,6 +192,7 @@ def prepare_flash_attention_batch_metadata(
     :param ModelHFFlashConfig | None flash_cfg: Optional resolved flash config for route selection.
     :param torch.device | None route_device: Optional eventual activation device
         when preparing metadata before transfer.
+    :param str | None kernel_policy_key: Pre-materialized policy key for the active model.
     :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
     """
 
@@ -195,15 +209,26 @@ def prepare_flash_attention_batch_metadata(
     batch_size = int(input_ids.shape[0])
     routing_device = route_device if route_device is not None else input_ids.device
     flash_enabled = bool(flash_enabled)
-    policy_path = normalize_flash_kernel_policy_path(
-        flash_cfg.kernel_overrides_path if flash_cfg is not None else None
-    )
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
         if btype != "hf_deberta_v2" or not flash_enabled or flash_meta is None:
             batch["attention_mask"] = build_doc_block_mask(doc_ids)
             return batch, None
+
+    if btype != "hf_deberta_v2" or not flash_enabled:
+        return batch, None
+
+    policy_path = normalize_flash_kernel_policy_path(
+        flash_cfg.kernel_overrides_path if flash_cfg is not None else None
+    )
+    policy_key = (
+        str(kernel_policy_key)
+        if kernel_policy_key is not None
+        else materialize_flash_kernel_policy(policy_path).key
+    )
+
+    if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
         route_hint = _flash_route_hint_for_docblock_batch(
             seq_len=seq_len,
             batch_size=batch_size,
@@ -218,25 +243,24 @@ def prepare_flash_attention_batch_metadata(
                 doc_ids=doc_ids,
                 route_hint=route_hint,
                 kernel_policy_path=policy_path,
+                kernel_policy_key=policy_key,
             ),
         )
-
-    if btype != "hf_deberta_v2" or not flash_enabled:
-        return batch, None
 
     attention_mask = batch.get("attention_mask")
     if attention_mask is None:
         route_hint = flash_route_choice(
             policy="local_bias",
-            seq_bucket=flash_seq_bucket(seq_len=seq_len, policy_path=policy_path),
+            seq_bucket=flash_seq_bucket(seq_len=seq_len, policy_path=policy_key),
             compute_capability=device_compute_capability(routing_device),
             seq_len=seq_len,
             batch_size=batch_size,
-            policy_path=policy_path,
+            policy_path=policy_key,
         )
         return batch, FlashBatchMeta(
             route_hint="local_bias" if route_hint == "local_bias" else "dense",
             kernel_policy_path=policy_path,
+            kernel_policy_key=policy_key,
         )
     if not isinstance(attention_mask, torch.Tensor):
         return batch, None
@@ -250,12 +274,13 @@ def prepare_flash_attention_batch_metadata(
         total_tokens=int(flash_meta.active_tokens_scalar),
         batch_size=batch_size,
         compute_capability=device_compute_capability(routing_device),
-        policy_path=policy_path,
+        policy_path=policy_key,
     )
     return batch, dataclasses.replace(
         flash_meta,
         route_hint=route_hint,
         kernel_policy_path=policy_path,
+        kernel_policy_key=policy_key,
     )
 
 
@@ -485,16 +510,19 @@ def _install_stable_backbone_compile_dispatch(
     dense_hs1_fn = dense_hs1
     masked_hs0_fn = masked_hs0
     masked_hs1_fn = masked_hs1
-    policy_paths = {
-        str(submodule.flash_kernel_policy_path)
+    policy_snapshots = {
+        (
+            str(submodule.flash_kernel_policy_path),
+            str(getattr(submodule, "flash_kernel_policy_key", "")),
+        )
         for submodule in module.modules()
         if hasattr(submodule, "flash_kernel_policy_path")
     }
-    if len(policy_paths) > 1:
+    if len(policy_snapshots) > 1:
         raise RuntimeError(
-            f"{target} contains conflicting FlashDeBERTa kernel policies: {sorted(policy_paths)}."
+            f"{target} contains conflicting FlashDeBERTa kernel policies: {sorted(policy_snapshots)}."
         )
-    kernel_policy_path = next(iter(policy_paths), "")
+    kernel_policy_path, kernel_policy_key = next(iter(policy_snapshots), ("", ""))
 
     def _make_routed_dense_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
         """Bind a fixed flash route onto one stable dense entrypoint.
@@ -507,6 +535,7 @@ def _install_stable_backbone_compile_dispatch(
         routed_meta = FlashBatchMeta(
             route_hint=route,
             kernel_policy_path=kernel_policy_path,
+            kernel_policy_key=kernel_policy_key,
         )
 
         def _routed_dense_fn(
@@ -515,6 +544,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids: torch.Tensor | None = None,
             position_ids: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
+            flash_meta: FlashBatchMeta | None = None,
         ) -> Any:
             """Call the dense helper with a fixed flash route.
 
@@ -522,6 +552,7 @@ def _install_stable_backbone_compile_dispatch(
             :param torch.Tensor | None token_type_ids: Optional token type ids.
             :param torch.Tensor | None position_ids: Optional position ids.
             :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :param FlashBatchMeta | None flash_meta: Validated route metadata.
             :return Any: Dense-path backbone outputs.
             """
 
@@ -530,7 +561,7 @@ def _install_stable_backbone_compile_dispatch(
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_meta=routed_meta,
+                flash_meta=flash_meta if flash_meta is not None else routed_meta,
             )
 
         return _routed_dense_fn
@@ -576,6 +607,7 @@ def _install_stable_backbone_compile_dispatch(
                     flash_meta,
                     route,
                     kernel_policy_path=kernel_policy_path,
+                    kernel_policy_key=kernel_policy_key,
                 ),
             )
 
@@ -598,10 +630,11 @@ def _install_stable_backbone_compile_dispatch(
         True: torch.compile(dense_hs1_fn, **compile_kwargs),
     }
     compiled_dense_routed = {
-        "local_bias": {
-            False: torch.compile(_make_routed_dense_fn(dense_hs0_fn, "local_bias"), **compile_kwargs),
-            True: torch.compile(_make_routed_dense_fn(dense_hs1_fn, "local_bias"), **compile_kwargs),
+        route: {
+            False: torch.compile(_make_routed_dense_fn(dense_hs0_fn, route), **compile_kwargs),
+            True: torch.compile(_make_routed_dense_fn(dense_hs1_fn, route), **compile_kwargs),
         }
+        for route in ("dense", "local_bias")
     }
     compiled_masked = {
         False: torch.compile(masked_hs0_fn, **compile_kwargs),
@@ -652,6 +685,13 @@ def _install_stable_backbone_compile_dispatch(
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        route = flash_meta.route_hint if flash_meta is not None else None
+        routed_meta = _flash_meta_with_route(
+            flash_meta,
+            route,
+            kernel_policy_path=kernel_policy_path,
+            kernel_policy_key=kernel_policy_key,
+        )
         # The fast compiled path specializes on the fixed training contract:
         # return_dict=True, output_attentions=False, output_hidden_states in {False, True}.
         # Other combinations are correct but uncommon in training, so keep them
@@ -666,9 +706,8 @@ def _install_stable_backbone_compile_dispatch(
                 output_attentions=resolved_output_attentions,
                 output_hidden_states=resolved_output_hidden_states,
                 return_dict=resolved_return_dict,
-                flash_meta=flash_meta,
+                flash_meta=routed_meta,
             )
-        route = flash_meta.route_hint if flash_meta is not None else None
         if attention_mask is None:
             routed_dense = compiled_dense_routed.get(route) if route is not None else None
             if routed_dense is not None:
@@ -677,6 +716,7 @@ def _install_stable_backbone_compile_dispatch(
                     token_type_ids=token_type_ids,
                     position_ids=position_ids,
                     inputs_embeds=inputs_embeds,
+                    flash_meta=routed_meta,
                 )
             return compiled_dense[resolved_output_hidden_states](
                 input_ids=input_ids,
@@ -692,7 +732,7 @@ def _install_stable_backbone_compile_dispatch(
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_meta=flash_meta,
+                flash_meta=routed_meta,
             )
         return compiled_masked[resolved_output_hidden_states](
             input_ids=input_ids,
@@ -700,11 +740,7 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(
-                flash_meta,
-                route,
-                kernel_policy_path=kernel_policy_path,
-            ),
+            flash_meta=routed_meta,
         )
 
     module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]

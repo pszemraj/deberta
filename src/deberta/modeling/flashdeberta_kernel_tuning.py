@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 _DEFAULT_TUNING_PATH = Path(__file__).with_name("flashdeberta_kernel_tuning.json")
+_POLICY_KEY_PREFIX = "flash-policy:"
+_MATERIALIZED_POLICY_PAYLOADS: dict[str, dict[str, Any]] = {}
 
 # Shape-keyed lookups take per-batch values (total_tokens, batch_size) in their
 # cache keys, so those caches must be bounded LRUs: a long variably-packed run
@@ -100,6 +103,14 @@ class FlashKernelContext:
     disentangled: bool | None = None
     att_span: int | None = None
     has_mask: bool | None = None
+
+
+@dataclass(frozen=True)
+class FlashKernelPolicy:
+    """One validated, immutable FlashDeBERTa override-table snapshot."""
+
+    source_path: str
+    key: str
 
 
 def normalize_flash_kernel_policy_path(path: str | None) -> str:
@@ -406,9 +417,6 @@ def _load_override_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-_load_override_payload = cache(_load_override_payload)
-
-
 def validate_flashdeberta_kernel_overrides(path: str) -> None:
     """Validate one configured FlashDeBERTa kernel override table.
 
@@ -416,14 +424,13 @@ def validate_flashdeberta_kernel_overrides(path: str) -> None:
     :raises ValueError: If the file cannot be loaded or its required schema is invalid.
     """
 
-    policy_path = normalize_flash_kernel_policy_path(path)
-    if not policy_path:
+    policy = materialize_flash_kernel_policy(path)
+    if not policy.source_path:
         raise ValueError("FlashDeBERTa kernel override path must be non-empty.")
-    _load_override_payload(Path(policy_path))
 
 
-def _load_tuning_payload(policy_path: str) -> dict[str, Any]:
-    """Load the default table plus optional user override entries.
+def _merge_tuning_payload(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Merge one validated override payload onto the shipped tuning table.
 
     ``route_policies`` and ``kernels`` override rows append to the shipped
     rows rather than replacing them, so an override table can promote a
@@ -432,15 +439,11 @@ def _load_tuning_payload(policy_path: str) -> dict[str, Any]:
     same specificity. ``seq_buckets`` override rows prepend, and a row whose
     ``name`` matches a shipped bucket replaces that bucket entirely.
 
-    :param str policy_path: Normalized override path, or ``""`` for shipped policy.
+    :param dict[str, Any] overrides: Validated override-table payload.
     :return dict[str, Any]: Merged tuning payload.
     """
 
     payload = _read_json(_DEFAULT_TUNING_PATH)
-    if not policy_path:
-        return payload
-
-    overrides = _load_override_payload(Path(policy_path))
     merged: dict[str, Any] = dict(payload)
 
     override_buckets = overrides.get("seq_buckets", [])
@@ -454,6 +457,59 @@ def _load_tuning_payload(policy_path: str) -> dict[str, Any]:
     merged["route_policies"] = merged_policies
     merged["kernels"] = [*payload.get("kernels", []), *overrides.get("kernels", [])]
     return merged
+
+
+def materialize_flash_kernel_policy(path: str | None) -> FlashKernelPolicy:
+    """Load one override path into an immutable content-addressed policy snapshot.
+
+    :param str | None path: Optional override-table path.
+    :return FlashKernelPolicy: Normalized source path and immutable policy key.
+    """
+
+    source_path = normalize_flash_kernel_policy_path(path)
+    if not source_path:
+        return FlashKernelPolicy(source_path="", key="")
+
+    overrides = _load_override_payload(Path(source_path))
+    canonical = json.dumps(overrides, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    policy_key = f"{_POLICY_KEY_PREFIX}{hashlib.sha256(canonical).hexdigest()}"
+    if policy_key not in _MATERIALIZED_POLICY_PAYLOADS:
+        _MATERIALIZED_POLICY_PAYLOADS[policy_key] = _merge_tuning_payload(overrides)
+    return FlashKernelPolicy(source_path=source_path, key=policy_key)
+
+
+def _normalize_flash_kernel_policy_key(path_or_key: str | None) -> str:
+    """Return an immutable policy key from either a source path or existing key.
+
+    :param str | None path_or_key: Override path, immutable key, or None.
+    :raises ValueError: If an unknown immutable key is supplied.
+    :return str: Immutable policy key, or ``""`` for the shipped policy.
+    """
+
+    value = str(path_or_key).strip() if path_or_key is not None else ""
+    if not value:
+        return ""
+    if value.startswith(_POLICY_KEY_PREFIX):
+        if value not in _MATERIALIZED_POLICY_PAYLOADS:
+            raise ValueError(f"Unknown materialized FlashDeBERTa kernel policy key: {value}.")
+        return value
+    return materialize_flash_kernel_policy(value).key
+
+
+def _load_tuning_payload(policy_key: str) -> dict[str, Any]:
+    """Load the shipped table or one materialized immutable override snapshot.
+
+    :param str policy_key: Immutable policy key, or ``""`` for shipped policy.
+    :raises ValueError: If the key was not materialized in this process.
+    :return dict[str, Any]: Tuning payload.
+    """
+
+    if not policy_key:
+        return _read_json(_DEFAULT_TUNING_PATH)
+    payload = _MATERIALIZED_POLICY_PAYLOADS.get(policy_key)
+    if payload is None:
+        raise ValueError(f"Unknown materialized FlashDeBERTa kernel policy key: {policy_key}.")
+    return payload
 
 
 _load_tuning_payload = cache(_load_tuning_payload)
@@ -524,7 +580,7 @@ def flash_seq_bucket(
     """
 
     return _flash_seq_bucket(
-        policy_path=normalize_flash_kernel_policy_path(policy_path),
+        policy_path=_normalize_flash_kernel_policy_key(policy_path),
         seq_len=int(seq_len),
         total_tokens=total_tokens,
         batch_size=batch_size,
@@ -597,7 +653,7 @@ def flash_route_policy(
     """
 
     return _flash_route_policy(
-        policy_path=normalize_flash_kernel_policy_path(policy_path),
+        policy_path=_normalize_flash_kernel_policy_key(policy_path),
         policy=policy,
         seq_bucket=seq_bucket,
         compute_capability=compute_capability,
@@ -867,7 +923,7 @@ def resolve_flash_kernel_config(
 
     return _resolve_flash_kernel_config(
         context,
-        policy_path=normalize_flash_kernel_policy_path(policy_path),
+        policy_path=_normalize_flash_kernel_policy_key(policy_path),
     )
 
 

@@ -689,6 +689,16 @@ def run_pretraining(
         embedding_sharing=model_cfg.embedding_sharing,
         additional_forbidden_token_ids=getattr(tokenizer, "all_special_ids", []),
     )
+    flash_policy_keys = {
+        str(module.flash_kernel_policy_key)
+        for module in model.modules()
+        if hasattr(module, "flash_kernel_policy_key")
+    }
+    if len(flash_policy_keys) > 1:
+        raise RuntimeError(
+            f"Model contains conflicting FlashDeBERTa kernel policies: {sorted(flash_policy_keys)}."
+        )
+    flash_kernel_policy_key = next(iter(flash_policy_keys), None)
 
     effective_decoupled_training = bool(train_cfg.decoupled_training)
 
@@ -1323,6 +1333,7 @@ def run_pretraining(
                 backbone_type=str(model_cfg.backbone_type),
                 flash_enabled=_flash_attention_enabled_for_runtime(model_cfg),
                 flash_cfg=getattr(model_cfg.hf, "flash", None),
+                kernel_policy_key=flash_kernel_policy_key,
             )
             if compile_enabled:
                 _maybe_cudagraph_mark_step_begin()

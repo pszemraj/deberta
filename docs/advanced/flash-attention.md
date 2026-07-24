@@ -60,7 +60,7 @@ Per-call eager fallbacks preserve semantics:
 
 ## Configuration and overrides
 
-The optional override path lives under `model.hf.flash.kernel_overrides_path`; its exact semantics are defined in the [config reference](../../configs/config_reference.yaml). The selected table is loaded and validated with the training config, then carried as model-owned policy through batch routing and forward/backward kernel lookup. Constructing or running another model cannot replace it.
+The optional override path lives under `model.hf.flash.kernel_overrides_path`; its exact semantics are defined in the [config reference](../../configs/config_reference.yaml). The selected table is loaded and validated with the training config, then snapshotted when each model is constructed and carried as model-owned policy through batch routing and forward/backward kernel lookup. Rewriting the source file can affect a subsequently constructed model, but cannot mutate an existing model's policy.
 
 ## Tuning table
 

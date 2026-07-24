@@ -1290,23 +1290,55 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
     _fake_compile, compile_calls = fake_torch_compile()
     monkeypatch.setattr(torch, "compile", _fake_compile)
 
+    class _PolicyOwner(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flash_kernel_policy_path = "/policy-b.json"
+            self.flash_kernel_policy_key = "policy-b-key"
+
     class _StableBackbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.policy_owner = _PolicyOwner()
+
         def _resolve_forward_options(self, **kwargs):
             return False, bool(kwargs["output_hidden_states"]), True
 
         def _forward_dense_hs0(self, **kwargs):
             flash_meta = kwargs.get("flash_meta")
-            return "dense_hs0", flash_meta.route_hint if flash_meta is not None else None
+            return (
+                "dense_hs0",
+                flash_meta.route_hint if flash_meta is not None else None,
+                flash_meta.kernel_policy_path if flash_meta is not None else None,
+                flash_meta.kernel_policy_key if flash_meta is not None else None,
+            )
 
         def _forward_dense_hs1(self, **kwargs):
             flash_meta = kwargs.get("flash_meta")
-            return "dense_hs1", flash_meta.route_hint if flash_meta is not None else None
+            return (
+                "dense_hs1",
+                flash_meta.route_hint if flash_meta is not None else None,
+                flash_meta.kernel_policy_path if flash_meta is not None else None,
+                flash_meta.kernel_policy_key if flash_meta is not None else None,
+            )
 
         def _forward_masked_hs0(self, **kwargs):
-            return "masked_hs0", kwargs["flash_meta"].route_hint
+            flash_meta = kwargs["flash_meta"]
+            return (
+                "masked_hs0",
+                flash_meta.route_hint,
+                flash_meta.kernel_policy_path,
+                flash_meta.kernel_policy_key,
+            )
 
         def _forward_masked_hs1(self, **kwargs):
-            return "masked_hs1", kwargs["flash_meta"].route_hint
+            flash_meta = kwargs["flash_meta"]
+            return (
+                "masked_hs1",
+                flash_meta.route_hint,
+                flash_meta.kernel_policy_path,
+                flash_meta.kernel_policy_key,
+            )
 
         def _forward_resolved(self, **_kwargs):
             raise AssertionError("standard training options must use a compiled entrypoint")
@@ -1322,23 +1354,51 @@ def test_stable_backbone_compile_dispatch_preserves_flash_routes(
 
     mask = torch.ones((1, 4), dtype=torch.bool)
     for hidden_states in (False, True):
-        result = backbone(
-            output_hidden_states=hidden_states,
-            flash_meta=FlashBatchMeta(route_hint="local_bias"),
-        )
-        assert result == (f"dense_hs{int(hidden_states)}", "local_bias")
+        for route in ("dense", "local_bias"):
+            result = backbone(
+                output_hidden_states=hidden_states,
+                flash_meta=FlashBatchMeta(
+                    route_hint=route,
+                    kernel_policy_path="/policy-b.json",
+                    kernel_policy_key="policy-b-key",
+                ),
+            )
+            assert result == (
+                f"dense_hs{int(hidden_states)}",
+                route,
+                "/policy-b.json",
+                "policy-b-key",
+            )
 
     for route in ("fixed", "varlen", "docblock", "docblock_bias"):
         for hidden_states in (False, True):
             result = backbone(
                 attention_mask=mask,
                 output_hidden_states=hidden_states,
-                flash_meta=FlashBatchMeta(route_hint=route),
+                flash_meta=FlashBatchMeta(
+                    route_hint=route,
+                    kernel_policy_path="/policy-b.json",
+                    kernel_policy_key="policy-b-key",
+                ),
             )
-            assert result == (f"masked_hs{int(hidden_states)}", route)
+            assert result == (
+                f"masked_hs{int(hidden_states)}",
+                route,
+                "/policy-b.json",
+                "policy-b-key",
+            )
 
-    assert len(compile_calls) == 14
-    assert len(targets) == 14
+    with pytest.raises(RuntimeError, match="different kernel policy"):
+        backbone(
+            flash_meta=FlashBatchMeta(
+                route_hint="local_bias",
+                kernel_policy_path="/policy-a.json",
+                kernel_policy_key="policy-a-key",
+            )
+        )
+
+    assert len(compile_calls) == 16
+    assert len(targets) == 16
 
 
 def test_stabilize_compile_attention_mask_rope_doc_blocking():

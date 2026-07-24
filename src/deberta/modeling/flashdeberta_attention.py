@@ -47,8 +47,8 @@ from deberta.modeling.flashdeberta_fixed_op import (
 )
 from deberta.modeling.flashdeberta_kernel_tuning import (
     flash_padding_route,
+    materialize_flash_kernel_policy,
     normalize_flash_kernel_policy_path,
-    validate_flashdeberta_kernel_overrides,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.flashdeberta_varlen_op import (
@@ -192,10 +192,10 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         config = args[0] if args else kwargs.get("config")
         flash_config = getattr(config, "hf_flash", {}) if config is not None else {}
         policy_path = normalize_flash_kernel_policy_path(flash_config.get("kernel_overrides_path"))
-        if policy_path:
-            validate_flashdeberta_kernel_overrides(policy_path)
+        policy = materialize_flash_kernel_policy(policy_path)
         super().__init__(*args, **kwargs)
-        self.flash_kernel_policy_path = policy_path
+        self.flash_kernel_policy_path = policy.source_path
+        self.flash_kernel_policy_key = policy.key
 
     def _requires_eager_fallback(
         self,
@@ -329,7 +329,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             sm_scale=sm_scale,
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
-            policy_path=self.flash_kernel_policy_path,
+            policy_path=self.flash_kernel_policy_key,
         )
 
     def _should_use_local_bias(
@@ -404,7 +404,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             bias_scale=float(sm_scale),
             sm_scale=sm_scale,
             causal=False,
-            policy_path=self.flash_kernel_policy_path,
+            policy_path=self.flash_kernel_policy_key,
         )
         if keep_mask is None:
             return output
@@ -481,7 +481,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             position_buckets=int(self.position_buckets),
             max_relative_distance=int(self.max_relative_positions),
             causal=False,
-            policy_path=self.flash_kernel_policy_path,
+            policy_path=self.flash_kernel_policy_key,
         )
         return out
 
@@ -530,7 +530,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             max_seqlen=doc_max_segment_length,
             total_tokens=active_tokens,
             causal=False,
-            policy_path=self.flash_kernel_policy_path,
+            policy_path=self.flash_kernel_policy_key,
         )
         return out
 
@@ -680,7 +680,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         if (
             flash_meta is not None
             and flash_meta.route_hint is not None
-            and flash_meta.kernel_policy_path != self.flash_kernel_policy_path
+            and flash_meta.kernel_policy_key != self.flash_kernel_policy_key
         ):
             raise RuntimeError(
                 "FlashDeBERTa route metadata was prepared for a different kernel policy: "
@@ -745,7 +745,7 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             use_varlen = _should_use_varlen(
                 attention_mask=attention_mask,
                 seq_len=int(hidden_states.shape[-2]),
-                policy_path=self.flash_kernel_policy_path,
+                policy_path=self.flash_kernel_policy_key,
             )
 
         if use_docblock_bias:
