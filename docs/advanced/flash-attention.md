@@ -89,7 +89,15 @@ Kernel route names include `fixed`, `varlen`, `docblock`, `bias`, `dense_bias`, 
 - [`flashdeberta_parity_test.py`](../../tools/flashdeberta_parity_test.py) checks outputs and selected gradients against fp32 eager attention, requiring every Flash result to stay within three times the corresponding eager-bf16 error, subject only to `1e-7` max-error and `1e-8` mean-error numerical-noise floors. Its real-kernel cases cover head dimensions 16, 32, 64, and 128.
 The runnable Flash training example is [`pretrain_flashdeberta_1024.yaml`](../../configs/flashdeberta/pretrain_flashdeberta_1024.yaml). The tuning tools override its packing and route settings for their own sampled workloads.
 
-Before merging Flash changes, run `bash tools/premerge.sh`. It records the commit and dirty-tree state under `local-scratch/premerge/` while running lint, docstring checks, the full test suite, and CUDA parity.
+## Verifying Flash changes
+
+`pytest tests/` is the gate. `tests/test_flashdeberta_parity.py` runs the full route matrix above
+whenever a CUDA device is visible and skips on CPU-only CI, so no separate pre-merge script is
+needed. The `tools/` entry point remains for selecting a single route while debugging:
+
+```bash
+python tools/flashdeberta_parity_test.py --case local_bias
+```
 
 ## Runtime caveats
 
