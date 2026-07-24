@@ -328,7 +328,14 @@ def _scaled_grad_limits(reference: torch.Tensor, *, max_rel: float, mean_rel: fl
     return max(max_rel * max_scale, 5e-4), max(mean_rel * mean_scale, 5e-5)
 
 
-def _run_case(case: ParityCase, *, device: torch.device) -> None:
+def run_case(case: ParityCase, *, device: torch.device) -> None:
+    """Assert one route's forward/backward parity against the fp32 eager reference.
+
+    :param ParityCase case: Route scenario to execute.
+    :param torch.device device: CUDA device to run on.
+    :raises AssertionError: If flash error exceeds the eager-bf16 error envelope.
+    """
+
     cfg_ref = _build_tiny_config(seq_len=case.seq_len, flash=False, head_dim=case.head_dim)
     cfg_flash = _build_tiny_config(seq_len=case.seq_len, flash=True, head_dim=case.head_dim)
 
@@ -399,10 +406,17 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
         )
 
 
-def main() -> None:
-    """Run forward/backward parity checks on a CUDA device."""
+def parity_cases(*, include_docblock_bias: bool = True) -> list[ParityCase]:
+    """Return the full route-matrix parity suite.
 
-    args = _parse_args()
+    This is the single source of truth for parity coverage; ``tests/`` runs the
+    same list so ``pytest`` remains the authoritative gate.
+
+    :param bool include_docblock_bias: Whether to include memory-intensive dense
+        doc-block bias cases.
+    :return list[ParityCase]: Route scenarios to execute.
+    """
+
     cases = [
         ParityCase("dense", seq_len=256, batch_size=2, route_hint="dense"),
         ParityCase("dense_hd32", seq_len=256, batch_size=2, route_hint="dense", head_dim=32),
@@ -444,7 +458,7 @@ def main() -> None:
             docblock=True,
         ),
     ]
-    if bool(args.include_docblock_bias):
+    if bool(include_docblock_bias):
         cases.append(
             ParityCase("docblock_bias", seq_len=1024, batch_size=2, route_hint="docblock_bias", docblock=True)
         )
@@ -487,6 +501,21 @@ def main() -> None:
                 ),
             ]
         )
+    return cases
+
+
+def main() -> None:
+    """Run forward/backward parity checks on a CUDA device.
+
+    ``pytest tests/test_flashdeberta_parity.py`` runs the same cases; this CLI
+    exists for selecting and debugging individual routes.
+
+    :raises RuntimeError: If CUDA is unavailable.
+    :raises ValueError: If every case is filtered out.
+    """
+
+    args = _parse_args()
+    cases = parity_cases(include_docblock_bias=bool(args.include_docblock_bias))
     requested_cases = set(args.case)
     if requested_cases:
         cases = [case for case in cases if case.name in requested_cases]
@@ -497,7 +526,7 @@ def main() -> None:
 
     device = torch.device("cuda")
     for case in cases:
-        _run_case(case, device=device)
+        run_case(case, device=device)
     print("OK")
 
 
