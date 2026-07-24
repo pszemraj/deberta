@@ -3856,6 +3856,7 @@ def test_fixed_custom_op_marks_lse_non_differentiable() -> None:
         16,
         False,
         "",
+        "",
     )
 
     assert output.requires_grad is True
