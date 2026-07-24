@@ -208,18 +208,42 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
     }
 
 
-def _run(model: DebertaV2Model, payload: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Run one forward/backward pass and return selected gradients."""
+def _build_backward_cotangent(
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+    loss_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Build one deterministic nonuniform cotangent shared by all parity variants."""
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(17)
+    cotangent = torch.empty(shape, device=device, dtype=torch.float32).uniform_(
+        -2.0,
+        2.0,
+        generator=generator,
+    )
+    if isinstance(loss_mask, torch.Tensor):
+        cotangent.mul_(loss_mask.to(device=device, dtype=torch.bool).unsqueeze(-1))
+        active_elements = int(loss_mask.sum().item()) * int(shape[-1])
+    else:
+        active_elements = int(cotangent.numel())
+    return cotangent / max(active_elements, 1)
+
+
+def _run(
+    model: DebertaV2Model,
+    payload: dict[str, Any],
+    *,
+    cotangent: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Run one forward/backward pass with a shared cotangent and return selected gradients."""
 
     model.zero_grad(set_to_none=True)
     model_payload = dict(payload)
-    loss_mask = model_payload.pop("loss_mask", None)
+    model_payload.pop("loss_mask", None)
     out = model(**model_payload).last_hidden_state
-    if isinstance(loss_mask, torch.Tensor):
-        loss = out.float()[loss_mask.bool()].pow(2).mean()
-    else:
-        loss = out.float().pow(2).mean()
-    loss.backward()
+    (out.float() * cotangent).sum().backward()
     grads = {
         "word_embeddings": model.embeddings.word_embeddings.weight.grad,
         "rel_embeddings": model.encoder.rel_embeddings.weight.grad,
@@ -316,15 +340,20 @@ def _run_case(case: ParityCase, *, device: torch.device) -> None:
     _copy_weights(ref, flash)
 
     payload = _case_payload(case, cfg=cfg_ref, device=device)
+    cotangent = _build_backward_cotangent(
+        shape=(case.batch_size, case.seq_len, int(cfg_ref.hidden_size)),
+        device=device,
+        loss_mask=payload.get("loss_mask"),
+    )
     ref_payload = dict(payload)
     ref_payload.pop("flash_meta")
     if case.route_hint == "docblock":
         doc_ids = _doc_ids_for_case(case).to(device=device)
         ref_payload["attention_mask"] = build_doc_block_mask(doc_ids)
 
-    ref_out, ref_grads = _run(ref, ref_payload)
-    eager_out, eager_grads = _run(eager, ref_payload)
-    flash_out, flash_grads = _run(flash, payload)
+    ref_out, ref_grads = _run(ref, ref_payload, cotangent=cotangent)
+    eager_out, eager_grads = _run(eager, ref_payload, cotangent=cotangent)
+    flash_out, flash_grads = _run(flash, payload, cotangent=cotangent)
     compare_mask = payload.get("loss_mask")
     if isinstance(compare_mask, torch.Tensor):
         mask = compare_mask.bool()

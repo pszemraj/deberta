@@ -12,6 +12,32 @@ import torch
 from deberta.config import DataConfig, DataPackingConfig, ModelConfig, ModelHFConfig, ModelHFFlashConfig
 
 
+def test_parity_cotangent_is_deterministic_nonuniform_and_masks_inactive_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "tools"))
+    parity_mod = importlib.import_module("flashdeberta_parity_test")
+    loss_mask = torch.tensor([[True, True, False], [True, False, False]])
+
+    first = parity_mod._build_backward_cotangent(
+        shape=(2, 3, 4),
+        device=torch.device("cpu"),
+        loss_mask=loss_mask,
+    )
+    second = parity_mod._build_backward_cotangent(
+        shape=(2, 3, 4),
+        device=torch.device("cpu"),
+        loss_mask=loss_mask,
+    )
+
+    torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+    assert torch.count_nonzero(first[~loss_mask]).item() == 0
+    active = first[loss_mask]
+    assert torch.unique(active).numel() > 1
+    assert bool(active.lt(0).any())
+    assert bool(active.gt(0).any())
+
+
 def test_bias_tuner_samples_ragged_docblock_before_local_dense_replay(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
