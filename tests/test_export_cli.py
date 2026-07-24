@@ -548,7 +548,17 @@ def _install_export_fakes(
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_utils)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(export_cli, "build_backbone_configs", lambda **kwargs: (object(), object()))
+    materialized_configs = (BackboneConfigStub(), BackboneConfigStub())
+    monkeypatch.setattr(
+        export_cli,
+        "load_materialized_backbone_configs",
+        lambda **kwargs: materialized_configs,
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "materialized_tokenizer_path",
+        lambda run_dir: Path(run_dir) / "tokenizer",
+    )
 
     def _fake_build_backbones(*args: Any, **kwargs: Any) -> tuple[object, object]:
         del args
@@ -602,6 +612,49 @@ def test_run_export_meta_carries_no_local_absolute_paths(
     # Export directories ship to other machines and the Hub; provenance must
     # not leak the exporting machine's directory layout.
     assert str(tmp_path) not in json.dumps(meta)
+
+
+def test_run_export_uses_run_owned_materialized_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+    seen: dict[str, object] = {}
+
+    class _RecordingAutoTokenizer(AutoTokenizerStub):
+        @classmethod
+        def from_pretrained(cls, source: object, **kwargs: Any) -> DummyTokenizer:
+            seen["tokenizer_source"] = source
+            del kwargs
+            return DummyTokenizer()
+
+    sys.modules["transformers"].AutoTokenizer = _RecordingAutoTokenizer  # type: ignore[attr-defined]
+
+    def _load_configs(*, run_dir: Path, model_cfg: Any) -> tuple[Any, Any]:
+        seen["config_run_dir"] = run_dir
+        del model_cfg
+        return BackboneConfigStub(), BackboneConfigStub()
+
+    monkeypatch.setattr(export_cli, "load_materialized_backbone_configs", _load_configs)
+
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(tmp_path / "exported-owned"),
+        )
+    )
+
+    assert seen["tokenizer_source"] == run_dir / "tokenizer"
+    assert seen["config_run_dir"] == run_dir
 
 
 @pytest.mark.parametrize("block_cross_document_attention", [True, False])

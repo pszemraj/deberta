@@ -13,6 +13,9 @@ DATA_CONFIG_FILENAME = "data_config.json"
 TRAIN_CONFIG_FILENAME = "train_config.json"
 OPTIM_CONFIG_FILENAME = "optim_config.json"
 LOGGING_CONFIG_FILENAME = "logging_config.json"
+DISCRIMINATOR_CONFIG_FILENAME = "discriminator_config.json"
+GENERATOR_CONFIG_FILENAME = "generator_config.json"
+TOKENIZER_DIRNAME = "tokenizer"
 RESUME_SOURCE_FILENAME = "resume_source.json"
 RUN_SNAPSHOT_FILENAMES: tuple[str, ...] = (
     MODEL_CONFIG_FILENAME,

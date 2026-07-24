@@ -14,6 +14,7 @@ from _config_factories import (
     make_data_config,
     make_logging_config,
     make_model_config,
+    make_native_deberta_config,
     make_optim_config,
     make_train_config,
 )
@@ -35,6 +36,12 @@ from deberta.config import (
     load_config,
     load_data_config_snapshot,
     load_model_config_snapshot,
+)
+from deberta.modeling.builder import build_backbone_configs
+from deberta.run_artifacts import (
+    load_materialized_backbone_configs,
+    materialized_tokenizer_path,
+    persist_materialized_run_artifacts,
 )
 from deberta.training.entrypoint import _resolve_entrypoint_profile_sections
 from deberta.training.metrics import (
@@ -95,6 +102,65 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
         cfg.train = make_train_config(max_steps=2)  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("source_change", ["mutate", "delete"])
+def test_materialized_run_artifacts_do_not_depend_on_original_config_source(
+    tmp_path: Path,
+    source_change: str,
+) -> None:
+    source_dir = tmp_path / "mutable-source"
+    source_config = make_native_deberta_config(
+        vocab_size=64,
+        max_position_embeddings=32,
+        max_relative_positions=-1,
+        layer_norm_eps=1e-7,
+    )
+    source_config.save_pretrained(source_dir)
+    model_cfg = make_model_config(
+        from_scratch=False,
+        pretrained={
+            "discriminator_path": str(source_dir),
+            "generator_path": str(source_dir),
+        },
+        tokenizer={
+            "name_or_path": "original-tokenizer",
+            "allow_vocab_resize": False,
+            "vocab_target": None,
+            "vocab_multiple": 1,
+        },
+        dropout={"hidden_prob": None, "attention_probs_prob": None},
+    )
+    tokenizer = DummyTokenizer(vocab_size=64)
+    discriminator_config, generator_config = build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=32,
+    )
+    run_dir = tmp_path / "run"
+    persist_materialized_run_artifacts(
+        run_dir=run_dir,
+        tokenizer=tokenizer,
+        discriminator_config=discriminator_config,
+        generator_config=generator_config,
+    )
+
+    source_config_path = source_dir / "config.json"
+    if source_change == "mutate":
+        source_payload = json.loads(source_config_path.read_text(encoding="utf-8"))
+        source_payload["layer_norm_eps"] = 1e-3
+        source_config_path.write_text(json.dumps(source_payload), encoding="utf-8")
+    else:
+        source_config_path.unlink()
+
+    loaded_discriminator, loaded_generator = load_materialized_backbone_configs(
+        run_dir=run_dir,
+        model_cfg=model_cfg,
+    )
+
+    assert loaded_discriminator.layer_norm_eps == pytest.approx(1e-7)
+    assert loaded_generator.layer_norm_eps == pytest.approx(1e-7)
+    assert materialized_tokenizer_path(run_dir) == run_dir / "tokenizer"
 
 
 def test_entrypoint_delegates_omitted_sections_to_config_profile() -> None:

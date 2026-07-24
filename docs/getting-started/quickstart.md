@@ -33,6 +33,7 @@ Multi-GPU training is intentionally unsupported. [Distributed training](../advan
 ## 3) Resume exact training state
 
 Exact continuation restores model, optimizer, scheduler, RNG, global-step, and data-progress state. It is different from starting a new step-zero run with pretrained weights.
+The run directory owns the materialized generator/discriminator configs and tokenizer used for construction, so continuation does not depend on the original pretrained path or Hub repository remaining unchanged.
 
 Start from the source run's `config_resolved.yaml`, not a generic resume template:
 

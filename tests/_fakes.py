@@ -655,6 +655,21 @@ def setup_pretraining_mocks(
         "build_backbone_configs",
         lambda **kwargs: (BackboneConfigStub(pad_token_id=0), BackboneConfigStub()),
     )
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "load_materialized_backbone_configs",
+        lambda **kwargs: (BackboneConfigStub(pad_token_id=0), BackboneConfigStub()),
+    )
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "materialized_tokenizer_path",
+        lambda run_dir: Path(run_dir) / "tokenizer",
+    )
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "persist_materialized_run_artifacts",
+        lambda **kwargs: None,
+    )
     monkeypatch.setattr(entrypoint_mod, "build_backbones", build_backbones_fn)
     monkeypatch.setattr(entrypoint_mod, "DebertaV3RTDPretrainer", rtd_cls)
 

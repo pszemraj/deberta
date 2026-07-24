@@ -29,6 +29,12 @@ from deberta.config import (
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
 from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
+from deberta.run_artifacts import (
+    load_materialized_backbone_configs,
+    materialized_tokenizer_path,
+    persist_materialized_run_artifacts,
+)
+from deberta.run_layout import infer_run_dir_from_checkpoint
 from deberta.training.checkpointing import _resolve_data_resume_policy, _save_periodic_checkpoint_if_due
 from deberta.training.compile import (
     _bf16_runtime_sanity_check,
@@ -317,12 +323,14 @@ def run_pretraining_dry_run(
         raise RuntimeError("transformers is required for dry-run preflight.") from exc
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
+        tokenizer_source: str | Path = (
+            materialized_tokenizer_path(infer_run_dir_from_checkpoint(ckpt))
+            if ckpt is not None
+            else model_cfg.tokenizer.name_or_path
+        )
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
     except Exception as exc:
-        raise RuntimeError(
-            "Failed to load tokenizer from model.tokenizer.name_or_path="
-            f"{model_cfg.tokenizer.name_or_path!r}."
-        ) from exc
+        raise RuntimeError(f"Failed to load tokenizer from {str(tokenizer_source)!r}.") from exc
     if tokenizer.pad_token_id is None:
         raise RuntimeError(
             "Tokenizer preflight failed: tokenizer.pad_token_id is unset. "
@@ -381,11 +389,17 @@ def run_pretraining_dry_run(
         raise RuntimeError("Sample batch preflight failed: active token count is zero.")
 
     try:
-        disc_config, gen_config = build_backbone_configs(
-            model_cfg=model_cfg,
-            tokenizer=tokenizer,
-            max_position_embeddings=int(data_cfg.packing.max_seq_length),
-        )
+        if ckpt is not None:
+            disc_config, gen_config = load_materialized_backbone_configs(
+                run_dir=infer_run_dir_from_checkpoint(ckpt),
+                model_cfg=model_cfg,
+            )
+        else:
+            disc_config, gen_config = build_backbone_configs(
+                model_cfg=model_cfg,
+                tokenizer=tokenizer,
+                max_position_embeddings=int(data_cfg.packing.max_seq_length),
+            )
     except Exception as exc:
         raise RuntimeError(
             "Backbone config preflight failed. Check model/backbone/tokenizer settings and vocab alignment options."
@@ -564,12 +578,41 @@ def run_pretraining(
     # Suppress repeated fast-tokenizer advisory logs that add noise in multi-worker runs.
     with suppress(Exception):
         logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
+    materialized_source_run = infer_run_dir_from_checkpoint(ckpt) if ckpt is not None else None
+    tokenizer_source: str | Path = (
+        materialized_tokenizer_path(materialized_source_run)
+        if materialized_source_run is not None
+        else model_cfg.tokenizer.name_or_path
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
 
     # Sanity
     if tokenizer.pad_token_id is None:
         # Many DeBERTa tokenizers define PAD.
         raise ValueError("Tokenizer must have pad_token_id.")
+
+    if materialized_source_run is not None:
+        disc_config, gen_config = load_materialized_backbone_configs(
+            run_dir=materialized_source_run,
+            model_cfg=model_cfg,
+        )
+    else:
+        disc_config, gen_config = build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=tokenizer,
+            max_position_embeddings=int(data_cfg.packing.max_seq_length),
+        )
+
+    if accelerator.is_main_process and (
+        materialized_source_run is None or materialized_source_run != output_dir
+    ):
+        persist_materialized_run_artifacts(
+            run_dir=output_dir,
+            tokenizer=tokenizer,
+            discriminator_config=disc_config,
+            generator_config=gen_config,
+        )
+    accelerator.wait_for_everyone()
 
     # Data
     raw_train = load_hf_dataset(data_cfg)
@@ -597,11 +640,6 @@ def run_pretraining(
         # batch would flip routes (and recompile) mid-epoch.
         drop_last=True,
         persistent_workers=(num_workers > 0),
-    )
-
-    # Model
-    disc_config, gen_config = build_backbone_configs(
-        model_cfg=model_cfg, tokenizer=tokenizer, max_position_embeddings=int(data_cfg.packing.max_seq_length)
     )
 
     # Instantiate backbones

@@ -4,7 +4,7 @@
 
 Training checkpoints store the RTD pretrainer (generator + discriminator). Downstream tasks usually need only the discriminator as a standalone HF model.
 
-`deberta export` consolidates checkpoint state and writes standalone Hugging Face artifacts.
+`deberta export` consolidates checkpoint state and writes standalone Hugging Face artifacts. Training materializes the exact discriminator config, generator config, and tokenizer into the run directory; resume and export use those owned artifacts rather than resolving the original mutable local path or Hub ID again.
 
 ## Basic export
 
@@ -14,7 +14,7 @@ deberta export <run_dir>/checkpoint-<step> \
   --output-dir <run_dir>/exported_hf
 ```
 
-Export infers the run directory from the checkpoint parent and requires that directory's `model_config.json` and `data_config.json`. It validates `run_metadata.json` when that optional snapshot is present. If a checkpoint was moved elsewhere, pass `--run-dir <original-run-dir>` explicitly.
+Export infers the run directory from the checkpoint parent and requires that directory's high-level config snapshots, materialized component configs, and `tokenizer/` directory. It validates `run_metadata.json` when that optional snapshot is present. If a checkpoint was moved elsewhere, pass `--run-dir <original-run-dir>` explicitly.
 
 `--what` supports:
 

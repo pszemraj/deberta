@@ -23,13 +23,14 @@ from deberta.config import (
     validate_data_config,
     validate_model_config,
 )
-from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling import DebertaV3RTDPretrainer, build_backbones
 from deberta.modeling.export_utils import (
     clean_exported_config,
     merge_embeddings_into_export_backbone,
     split_pretrainer_state_dict,
     write_export_readme_and_license,
 )
+from deberta.run_artifacts import load_materialized_backbone_configs, materialized_tokenizer_path
 from deberta.run_layout import (
     DATA_CONFIG_FILENAME,
     MODEL_CONFIG_FILENAME,
@@ -524,7 +525,7 @@ def run_export(cfg: ExportConfig) -> None:
     strict_export_load = not bool(cfg.allow_partial_export)
 
     # Tokenizer (needed for configs, and we also export it)
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg.tokenizer.name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(materialized_tokenizer_path(run_dir), use_fast=True)
 
     # Flash attention adds no parameters, so export rebuilds the checkpoint
     # container with eager attention. This keeps consolidation independent of
@@ -534,12 +535,14 @@ def run_export(cfg: ExportConfig) -> None:
         hf=replace(model_cfg.hf, attention_impl="eager"),
     )
 
-    # Rebuild configs (must match training shapes and parameter names).
-    disc_config, gen_config = build_backbone_configs(
-        model_cfg=export_model_cfg,
-        tokenizer=tokenizer,
-        max_position_embeddings=int(data_cfg.packing.max_seq_length),
+    disc_config, gen_config = load_materialized_backbone_configs(
+        run_dir=run_dir,
+        model_cfg=model_cfg,
     )
+    if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
+        for component_config in (disc_config, gen_config):
+            component_config.hf_attention_impl = "eager"
+            component_config.hf_flash = {"kernel_overrides_path": None}
 
     # Build backbones + pretrainer container so accelerate.load_state can restore the exact structure.
     disc_backbone, gen_backbone = build_backbones(
