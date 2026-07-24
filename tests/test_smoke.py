@@ -2862,6 +2862,120 @@ def test_native_encoder_query_states_keep_tensor_memory_fixed() -> None:
     torch.testing.assert_close(output.hidden_states[2], query + 3.0)
 
 
+@pytest.mark.parametrize(
+    ("query_len", "key_len"),
+    [(3, 5), (7, 5)],
+    ids=["query_shorter", "query_longer"],
+)
+def test_native_encoder_query_states_real_layers_match_fixed_memory_and_backprop(
+    query_len: int,
+    key_len: int,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Encoder
+
+    torch.manual_seed(41)
+    config_kwargs = {
+        "hidden_size": 8,
+        "num_attention_heads": 2,
+        "intermediate_size": 16,
+        "num_hidden_layers": 2,
+        "max_position_embeddings": 8,
+        "max_relative_positions": 8,
+        "position_buckets": 8,
+        "relative_attention": True,
+        "pos_att_type": ["c2p", "p2c"],
+        "share_att_key": True,
+        "norm_rel_ebd": "layer_norm",
+    }
+    base_config = make_native_deberta_config(**config_kwargs)
+    base_config.hf_attention_kernel = "dynamic"
+    base_encoder = DebertaV2Encoder(base_config)
+    state = {name: value.detach().clone() for name, value in base_encoder.state_dict().items()}
+
+    memory_source = torch.randn((2, key_len, 8))
+    query_source = torch.randn((2, query_len, 8))
+    key_padding_mask = torch.ones((2, key_len), dtype=torch.bool)
+    key_padding_mask[0, -1] = False
+
+    outputs: dict[str, torch.Tensor] = {}
+    input_gradients: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for kernel in ("dynamic", "cached_bmm", "stable"):
+        config = make_native_deberta_config(**config_kwargs)
+        config.hf_attention_kernel = kernel
+        encoder = DebertaV2Encoder(config).train()
+        encoder.load_state_dict(state, strict=True)
+        memory = memory_source.detach().clone().requires_grad_()
+        query = query_source.detach().clone().requires_grad_()
+
+        with torch.no_grad():
+            manual_mask = encoder.get_attention_mask(key_padding_mask)
+            manual_relative_pos = encoder.get_rel_pos(memory, query_states=query)
+            manual_rel_embeddings = encoder.get_rel_embedding()
+            manual_output = query
+            for layer in encoder.layer:
+                manual_output, _ = layer(
+                    memory,
+                    manual_mask,
+                    query_states=manual_output,
+                    relative_pos=manual_relative_pos,
+                    rel_embeddings=manual_rel_embeddings,
+                )
+
+        result = encoder(
+            memory,
+            attention_mask=key_padding_mask,
+            query_states=query,
+            output_hidden_states=True,
+            output_attentions=True,
+            return_dict=True,
+        )
+
+        torch.testing.assert_close(result.last_hidden_state, manual_output)
+        assert result.hidden_states is not None
+        assert len(result.hidden_states) == 3
+        assert all(hidden_state.shape == (2, query_len, 8) for hidden_state in result.hidden_states)
+        assert result.attentions is not None
+        assert len(result.attentions) == 2
+        for probabilities in result.attentions:
+            assert probabilities.shape == (2, 2, query_len, key_len)
+            assert torch.count_nonzero(probabilities[0, ..., -1]) == 0
+            torch.testing.assert_close(
+                probabilities.sum(dim=-1),
+                torch.ones((2, 2, query_len)),
+            )
+
+        result.last_hidden_state.square().mean().backward()
+        assert memory.grad is not None
+        assert query.grad is not None
+        assert torch.isfinite(memory.grad).all()
+        assert torch.isfinite(query.grad).all()
+        assert torch.count_nonzero(memory.grad) > 0
+        assert torch.count_nonzero(query.grad) > 0
+        parameter_gradients = [
+            parameter.grad for parameter in encoder.parameters() if parameter.grad is not None
+        ]
+        assert parameter_gradients
+        assert all(torch.isfinite(gradient).all() for gradient in parameter_gradients)
+
+        outputs[kernel] = result.last_hidden_state.detach()
+        input_gradients[kernel] = (memory.grad.detach().clone(), query.grad.detach().clone())
+
+    for kernel in ("cached_bmm", "stable"):
+        torch.testing.assert_close(outputs[kernel], outputs["dynamic"], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            input_gradients[kernel][0],
+            input_gradients["dynamic"][0],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            input_gradients[kernel][1],
+            input_gradients["dynamic"][1],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
 def test_native_attention_accepts_rectangular_query_key_lengths_with_key_padding_mask() -> None:
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
