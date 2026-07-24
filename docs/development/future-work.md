@@ -2,6 +2,17 @@
 
 Parked improvements that are out of scope for the current branch but worth revisiting. Each entry states why it matters and what picking it up requires.
 
+## Decide whether flagship configs should enable cross-document attention blocking
+
+Every shipped config sets `data.packing.block_cross_document_attention: false` (matching the reference default), so the doc-block machinery — pairwise doc masks, per-document CLS conditioning via `doc_context_index`, document-local `position_ids`, and the flash `docblock`/`docblock_bias` kernels — is dormant in every shipped run, including the validated 50k FlashDeBERTa run.
+
+The naive-packing regime this leaves us in has two objective-side consequences (both inherent to packing without blocking, and both fixed by the `true` branch):
+
+- The RTD head conditions every token on the row's *first* CLS (`RTDHead.forward` fallback), so tokens from later packed documents are scored against another document's context vector.
+- EMD absolute positions continue across document boundaries, so a document packed at row offset 500 sees position embeddings 500+ where a standalone copy sees 0+.
+
+Naive packing is standard practice and may well be the right call (cross-document attention acts as benign noise at scale; blocking costs mask/metadata overhead), but today the setting reads as a default rather than a decision. Picking this up means: A/B a short run with blocking on (the flash `docblock` route keeps the cost story reasonable), compare discriminator metrics per document position within packed rows, and either flip the flagship configs or record here why `false` wins.
+
 ## Restrict EMD query axis to masked positions (exact, ~25% generator compute savings)
 
 `EnhancedMaskDecoder` (`src/deberta/modeling/rtd.py`) reruns the last generator layer twice over the full sequence, then gathers only the masked positions (~15% of tokens) from the final pass. For a 6-layer generator, those two extra full-width passes add roughly 1/3 extra generator compute per step.

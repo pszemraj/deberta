@@ -42,7 +42,11 @@ directly rather than combining it with a second training `pad_to_multiple_of` co
 `data.packing.block_cross_document_attention` controls attention masking across packed document
 boundaries. It is only valid with `data.packing.enabled=true`.
 
-- `false`: packed samples attend across document boundaries; no document mask is built
+- `false`: packed samples attend across document boundaries; no document mask is built. Two
+  objective-side consequences follow: the RTD head conditions every token on the row's *first*
+  CLS, and EMD absolute positions continue across document boundaries instead of restarting.
+  Both are the standard naive-packing tradeoff; the shipped configs currently accept it
+  (see `docs/development/future-work.md` for the open decision).
 - `true`: packed samples attend only within document segments. Every segment begins with its own CLS token.
 
 The collator also emits two fixed-shape objective tensors for blocked rows:
