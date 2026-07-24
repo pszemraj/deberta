@@ -27,6 +27,7 @@ class ParityCase:
     batch_size: int
     route_hint: str
     pad_tail: int = 0
+    pad_front: int = 0
     docblock: bool = False
     head_dim: int = 16
 
@@ -42,6 +43,7 @@ _PARITY_CASE_NAMES = (
     "docblock_1024",
     "docblock_2048",
     "docblock_4096",
+    "docblock_frontpad",
     "docblock_bias",
     "docbias_1024_b4",
     "docbias_1024",
@@ -94,13 +96,18 @@ def _copy_weights(src: torch.nn.Module, dst: torch.nn.Module) -> None:
 def _doc_ids_for_case(case: ParityCase) -> torch.Tensor:
     """Build packed document ids with at least three docs per active row.
 
+    Active tokens sit between ``case.pad_front`` leading padding positions
+    and ``case.pad_tail`` trailing padding positions, so a case can exercise
+    front padding, tail padding, or both in the same row.
+
     :param ParityCase case: Doc-block parity case.
     :return torch.Tensor: CPU doc ids in ``(B,S)`` layout.
     """
 
     if not case.docblock:
         raise ValueError("_doc_ids_for_case requires a doc-block case.")
-    active_len = int(case.seq_len) - int(case.pad_tail)
+    front = int(case.pad_front)
+    active_len = int(case.seq_len) - int(case.pad_tail) - front
     if active_len < 3:
         raise ValueError(f"Doc-block parity case needs at least three active tokens: {case}")
     first = max(1, active_len // 5)
@@ -113,15 +120,15 @@ def _doc_ids_for_case(case: ParityCase) -> torch.Tensor:
 
     doc_ids = torch.zeros((case.batch_size, case.seq_len), dtype=torch.long)
     for row in range(case.batch_size):
-        cursor = 0
+        cursor = front
         rotation = row % len(lengths)
         row_lengths = lengths[rotation:] + lengths[:rotation]
         for doc_idx, length in enumerate(row_lengths, start=1):
-            next_cursor = min(active_len, cursor + int(length))
+            next_cursor = min(front + active_len, cursor + int(length))
             doc_ids[row, cursor:next_cursor] = int(doc_idx)
             cursor = next_cursor
-        if cursor < active_len:
-            doc_ids[row, cursor:active_len] = len(row_lengths)
+        if cursor < front + active_len:
+            doc_ids[row, cursor : front + active_len] = len(row_lengths)
     return doc_ids
 
 
@@ -141,6 +148,8 @@ def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.devic
 
     if case.docblock:
         doc_ids_cpu = _doc_ids_for_case(case)
+        if case.pad_front > 0:
+            input_ids[:, : case.pad_front] = int(cfg.pad_token_id)
         if case.pad_tail > 0:
             input_ids[:, -case.pad_tail :] = int(cfg.pad_token_id)
         doc_ids = doc_ids_cpu.to(device=device)
@@ -373,6 +382,14 @@ def main() -> None:
         ParityCase("varlen", seq_len=256, batch_size=2, route_hint="varlen", pad_tail=64),
         ParityCase("local_bias", seq_len=1024, batch_size=2, route_hint="local_bias"),
         ParityCase("docblock", seq_len=256, batch_size=2, route_hint="docblock", pad_tail=32, docblock=True),
+        ParityCase(
+            "docblock_frontpad",
+            seq_len=256,
+            batch_size=2,
+            route_hint="docblock",
+            pad_front=32,
+            docblock=True,
+        ),
         ParityCase(
             "docblock_1024",
             seq_len=1024,

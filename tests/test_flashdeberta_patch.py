@@ -988,6 +988,23 @@ def test_mask_to_2d_keep_mask_rejects_length_mismatch() -> None:
         mask_to_2d_keep_mask(broadcast_too_long, seq_len=4)
 
 
+def test_build_doc_block_mask_seq_len_one_keeps_self_edge() -> None:
+    """S==1 is a documented degenerate exception: pin it so it stays that way.
+
+    ``build_doc_block_mask``'s docstring calls out S==1 explicitly: unlike
+    S>1 (where inactive queries redirect to an off-diagonal fallback key), a
+    single-position row has no off-diagonal key, so it keeps a diagonal
+    self-edge even when ``doc_id == 0``. Do not "fix" this into an all-False
+    row - an all-False softmax row produces NaN.
+    """
+
+    padding_mask = build_doc_block_mask(torch.tensor([[0]], dtype=torch.long))
+    assert torch.equal(padding_mask, torch.tensor([[[True]]]))
+
+    active_mask = build_doc_block_mask(torch.tensor([[1]], dtype=torch.long))
+    assert torch.equal(active_mask, torch.tensor([[[True]]]))
+
+
 def test_flash_attention_projected_qkv_dtype_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     attention_mod = _patch_flashdeberta_available(monkeypatch)
     cfg = _small_deberta_config()
@@ -2567,6 +2584,107 @@ def test_prepare_flash_attention_batch_metadata_routes_docblock() -> None:
         assert int(scalar) == expected
 
 
+def test_build_doc_segment_boundaries_and_metadata_left_padded_row() -> None:
+    """Left-padded rows must land segment starts/offsets on the real token positions."""
+    from deberta.modeling.mask_utils import build_doc_segment_boundaries, build_doc_segment_metadata
+
+    doc_ids = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    active, start_idx, end_idx = build_doc_segment_boundaries(doc_ids)
+
+    assert torch.equal(active, torch.tensor([[False, False, True, True, True, True]]))
+    assert torch.equal(start_idx, torch.tensor([[0, 2], [0, 4]]))
+    assert torch.equal(end_idx, torch.tensor([[0, 3], [0, 5]]))
+
+    segment_offsets, segment_lengths, cu_seqlens, total_tokens = build_doc_segment_metadata(
+        doc_ids, boundaries=(active, start_idx, end_idx)
+    )
+    # Offsets land on the actual token positions (2, 4), not on a
+    # front-padding-agnostic count as if the row were right-padded.
+    assert torch.equal(segment_offsets[:2], torch.tensor([2, 4], dtype=torch.int32))
+    assert torch.equal(segment_lengths[:2], torch.tensor([2, 2], dtype=torch.int32))
+    assert torch.equal(cu_seqlens[:3], torch.tensor([0, 2, 4], dtype=torch.int32))
+    assert torch.count_nonzero(segment_lengths[2:]).item() == 0
+    assert total_tokens == 4
+
+
+def test_build_doc_segment_boundaries_and_metadata_excludes_mid_row_gap() -> None:
+    """A padding gap between two documents must split them into two segments."""
+    from deberta.modeling.mask_utils import build_doc_segment_boundaries, build_doc_segment_metadata
+
+    doc_ids = torch.tensor([[1, 1, 0, 0, 2, 2]], dtype=torch.long)
+    active, start_idx, end_idx = build_doc_segment_boundaries(doc_ids)
+
+    assert torch.equal(active, torch.tensor([[True, True, False, False, True, True]]))
+    assert torch.equal(start_idx, torch.tensor([[0, 0], [0, 4]]))
+    assert torch.equal(end_idx, torch.tensor([[0, 1], [0, 5]]))
+
+    segment_offsets, segment_lengths, cu_seqlens, total_tokens = build_doc_segment_metadata(doc_ids)
+    assert torch.equal(segment_offsets[:2], torch.tensor([0, 4], dtype=torch.int32))
+    assert torch.equal(segment_lengths[:2], torch.tensor([2, 2], dtype=torch.int32))
+    assert torch.equal(cu_seqlens[:3], torch.tensor([0, 2, 4], dtype=torch.int32))
+    assert total_tokens == 4
+    # The gap positions (2, 3) are not part of either segment.
+    covered = set()
+    for offset, length in zip(segment_offsets[:2].tolist(), segment_lengths[:2].tolist(), strict=True):
+        covered.update(range(offset, offset + length))
+    assert covered == {0, 1, 4, 5}
+
+
+def test_build_doc_segment_metadata_all_padding_row_contributes_zero_segments() -> None:
+    """An all-padding row in a batch must not perturb another row's segments."""
+    from deberta.modeling.mask_utils import build_doc_segment_boundaries, build_doc_segment_metadata
+
+    doc_ids = torch.tensor(
+        [
+            [0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 2, 2],
+        ],
+        dtype=torch.long,
+    )
+    active, start_idx, end_idx = build_doc_segment_boundaries(doc_ids)
+
+    assert torch.equal(
+        active,
+        torch.tensor([[False] * 6, [True, True, False, False, True, True]]),
+    )
+    assert torch.equal(start_idx, torch.tensor([[1, 0], [1, 4]]))
+    assert torch.equal(end_idx, torch.tensor([[1, 1], [1, 5]]))
+
+    segment_offsets, segment_lengths, cu_seqlens, total_tokens = build_doc_segment_metadata(doc_ids)
+    # Row 0 (all padding) contributes no entries; row 1's offsets fold in its
+    # batch-row stride (row 1 * seq_len 6 == 6) and land on real positions.
+    assert torch.equal(segment_offsets[:2], torch.tensor([6, 10], dtype=torch.int32))
+    assert torch.equal(segment_lengths[:2], torch.tensor([2, 2], dtype=torch.int32))
+    assert torch.equal(cu_seqlens[:3], torch.tensor([0, 2, 4], dtype=torch.int32))
+    assert torch.count_nonzero(segment_lengths[2:]).item() == 0
+    assert total_tokens == 4
+
+
+def test_build_doc_segment_boundaries_all_zero_batch_returns_empty_early() -> None:
+    """The global all-padding batch takes the dedicated empty early-return branch."""
+    from deberta.modeling.mask_utils import build_doc_segment_boundaries, build_doc_segment_metadata
+
+    doc_ids = torch.zeros((2, 6), dtype=torch.long)
+    active, start_idx, end_idx = build_doc_segment_boundaries(doc_ids)
+
+    assert torch.equal(active, torch.zeros((2, 6), dtype=torch.bool))
+    assert start_idx.dtype == torch.long
+    assert end_idx.dtype == torch.long
+    assert torch.equal(start_idx, torch.empty((0, 2), dtype=torch.long))
+    assert torch.equal(end_idx, torch.empty((0, 2), dtype=torch.long))
+
+    segment_offsets, segment_lengths, cu_seqlens, total_tokens = build_doc_segment_metadata(
+        doc_ids, boundaries=(active, start_idx, end_idx)
+    )
+    assert tuple(segment_offsets.shape) == (12,)
+    assert tuple(segment_lengths.shape) == (12,)
+    assert tuple(cu_seqlens.shape) == (13,)
+    assert torch.count_nonzero(segment_offsets).item() == 0
+    assert torch.count_nonzero(segment_lengths).item() == 0
+    assert torch.count_nonzero(cu_seqlens).item() == 0
+    assert total_tokens == 0
+
+
 def test_prepare_flash_attention_batch_metadata_docblock_eager_ignores_flash_overrides(
     tmp_path,
 ) -> None:
@@ -3844,8 +3962,11 @@ def test_docblock_real_kernel_blocks_cross_document_gradients_on_cuda(
     Doc-1 query outputs must carry exactly zero gradient back to every other
     document and padding position. Any nonzero gradient means cross-document
     attention leaked. The test rejects eager fallback so only the selected
-    flash route can pass.
-
+    flash route can pass. For the ragged ``docblock`` route this also pins
+    forward-value parity against eager on active positions and an exact-zero
+    output on padding positions (the dense ``docblock_bias`` route already has
+    dedicated forward parity in
+    ``test_docblock_bias_dense_route_matches_eager_on_padded_batch``).
     """
 
     attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
@@ -3946,6 +4067,36 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str, seq_len: 
         rel_embeddings=rel_embeddings,
         flash_meta=flash_meta,
     )
+
+    if route == "docblock":
+        # The ragged route only had a gradient-isolation check here; pin
+        # forward-value parity against eager too (dense docblock_bias parity
+        # is already covered by test_docblock_bias_dense_route_matches_eager_on_padded_batch).
+        reference = attention_mod._EagerDisentangledSelfAttention(cfg)
+        reference.load_state_dict(attention.state_dict())
+        reference = reference.to(device=device, dtype=dtype).eval()
+        eager_mask = build_doc_block_mask(doc_ids.to(device=device)).unsqueeze(1)
+        with torch.no_grad():
+            eager_out, _ = reference(
+                hidden_states=hidden_states.detach(),
+                attention_mask=eager_mask,
+                output_attentions=False,
+                rel_embeddings=rel_embeddings,
+            )
+        active_positions = doc_ids.ne(0).to(device=device)
+        torch.testing.assert_close(
+            output.detach()[active_positions].float(),
+            eager_out[active_positions].float(),
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        padding_positions = doc_ids.eq(0).to(device=device)
+        padding_out = output.detach()[padding_positions]
+        assert torch.all(padding_out == 0), (
+            f"docblock padding query rows carry real values at S={seq_len}: "
+            f"max abs {float(padding_out.abs().max()):.3e}"
+        )
+
     source_positions = doc_ids.eq(1).to(device=device)
     output[source_positions].float().square().sum().backward()
 
@@ -3953,6 +4104,150 @@ def _run_docblock_real_kernel_leak_check(*, attention_mod, route: str, seq_len: 
     isolated_grad = hidden_states.grad[doc_ids.ne(1).to(device=device)]
     assert torch.all(isolated_grad == 0), (
         f"cross-document gradient leak on {route} at S={seq_len}: "
+        f"max abs isolated grad {float(isolated_grad.abs().max()):.3e}"
+    )
+    source_grad = hidden_states.grad[source_positions]
+    assert float(source_grad.abs().max()) > 0.0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for front-padding doc-block parity."
+)
+@pytest.mark.parametrize("route", ["docblock", "docblock_bias"])
+def test_docblock_front_padding_matches_eager_and_isolates_gradients_on_cuda(route: str) -> None:
+    """Left-padded (front-padding) doc-block batches must match eager on both real routes.
+
+    Sequence packing's left-padding collator contract (commit cad4651) can put
+    ``doc_id == 0`` padding at the FRONT of a row instead of the tail. This
+    pins active-position parity vs eager, exact-zero padding output, and
+    cross-document gradient isolation for a batch that mixes a front-padded
+    row with a tail-padded row, through both the ragged ``docblock`` route and
+    the dense ``docblock_bias`` route.
+    """
+
+    attention_mod = importlib.import_module("deberta.modeling.flashdeberta_attention")
+    if attention_mod.flashdeberta_fixed_import_error() is not None:
+        pytest.skip("FlashDeBERTa kernels are unavailable in this environment.")
+    _run_docblock_front_padding_check(attention_mod=attention_mod, route=route)
+
+
+def _run_docblock_front_padding_check(*, attention_mod, route: str) -> None:
+    from deberta.modeling.mask_utils import build_doc_block_mask, build_doc_segment_metadata
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    seq_len = 1024
+    front_pad = 224
+    tail_pad = 224
+    active_len = seq_len - front_pad
+    first_len = active_len // 2
+    second_len = active_len - first_len
+
+    # Row 0 is front-padded ([0]*front_pad + doc1 + doc2); row 1 is
+    # tail-padded (doc1 + doc2 + [0]*tail_pad) - a mixed batch pairing both
+    # padding sides, matching the left-padding collator contract.
+    front_row = torch.cat(
+        (
+            torch.zeros((front_pad,), dtype=torch.long),
+            torch.full((first_len,), 1, dtype=torch.long),
+            torch.full((second_len,), 2, dtype=torch.long),
+        )
+    )
+    tail_row = torch.cat(
+        (
+            torch.full((first_len,), 1, dtype=torch.long),
+            torch.full((second_len,), 2, dtype=torch.long),
+            torch.zeros((tail_pad,), dtype=torch.long),
+        )
+    )
+    doc_ids = torch.stack((front_row, tail_row)).to(device=device)
+
+    cfg = make_native_deberta_config(
+        flash=True,
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        max_position_embeddings=seq_len,
+        type_vocab_size=0,
+        relative_attention=True,
+        position_buckets=32,
+        max_relative_positions=seq_len,
+        pos_att_type=["c2p", "p2c"],
+        pad_token_id=0,
+        position_biased_input=False,
+    )
+    attention = attention_mod.FlashDisentangledSelfAttention(cfg).to(device=device, dtype=dtype).eval()
+
+    def _reject_eager(**_kwargs):
+        raise AssertionError(f"flash {route} route unexpectedly fell back to eager")
+
+    attention._eager_forward_fallback = _reject_eager
+    reference = attention_mod._EagerDisentangledSelfAttention(cfg)
+    reference.load_state_dict(attention.state_dict())
+    reference = reference.to(device=device, dtype=dtype).eval()
+
+    if route == "docblock_bias":
+        attention_mask: torch.Tensor = build_doc_block_mask(doc_ids)
+        flash_meta = FlashBatchMeta(doc_ids=doc_ids, route_hint="docblock_bias")
+    else:
+        segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(
+            doc_ids.cpu()
+        )
+        active_segment_lengths = segment_lengths[segment_lengths.ne(0)]
+        num_segments = int(active_segment_lengths.numel())
+        max_seqlen = int(active_segment_lengths.max()) if num_segments else 0
+        attention_mask = doc_ids.ne(0)
+        flash_meta = FlashBatchMeta(
+            doc_segment_offsets=segment_offsets.to(device=device),
+            doc_segment_lengths=segment_lengths.to(device=device),
+            doc_cu_seqlens=cu_seqlens.to(device=device),
+            doc_ids=doc_ids,
+            active_tokens_scalar=torch.tensor(active_tokens, dtype=torch.int32),
+            doc_num_segments_scalar=torch.tensor(num_segments, dtype=torch.int32),
+            doc_max_segment_length_scalar=torch.tensor(max_seqlen, dtype=torch.int32),
+            route_hint="docblock",
+        )
+
+    hidden_states = torch.randn((2, seq_len, cfg.hidden_size), device=device, dtype=dtype).requires_grad_()
+    rel_embeddings = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), device=device, dtype=dtype)
+
+    output, _ = attention(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        output_attentions=False,
+        rel_embeddings=rel_embeddings,
+        flash_meta=flash_meta,
+    )
+    eager_mask = build_doc_block_mask(doc_ids).unsqueeze(1)
+    with torch.no_grad():
+        eager_out, _ = reference(
+            hidden_states=hidden_states.detach(),
+            attention_mask=eager_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+
+    active_positions = doc_ids.ne(0)
+    torch.testing.assert_close(
+        output.detach()[active_positions].float(),
+        eager_out[active_positions].float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+    padding_positions = doc_ids.eq(0)
+    padding_out = output.detach()[padding_positions]
+    assert torch.all(padding_out == 0), (
+        f"{route} front/tail padding rows carry real values: max abs {float(padding_out.abs().max()):.3e}"
+    )
+
+    source_positions = doc_ids.eq(1)
+    output[source_positions].float().square().sum().backward()
+
+    assert hidden_states.grad is not None
+    isolated_grad = hidden_states.grad[doc_ids.ne(1)]
+    assert torch.all(isolated_grad == 0), (
+        f"cross-document gradient leak on {route} with front padding: "
         f"max abs isolated grad {float(isolated_grad.abs().max()):.3e}"
     )
     source_grad = hidden_states.grad[source_positions]
