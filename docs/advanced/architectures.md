@@ -6,13 +6,15 @@
 
 | Setting | `hf_deberta_v2` | `rope` |
 |---|---|---|
-| Attention | DeBERTa disentangled attention (C2C/C2P/P2C/P2P) | standard QKV + RoPE |
+| Attention | DeBERTa disentangled attention (C2C/C2P/P2C) | standard QKV + RoPE |
 | Position | relative-position buckets/embeddings | rotary; optional learned absolute input embeddings |
 | Norm | LayerNorm | RMSNorm |
 | FFN | MLP | MLP or SwiGLU |
 | Primary use | DeBERTa-v2/v3 parity path | experimental modernized path |
 
 For `hf_deberta_v2`, scratch runs synthesize backbone configs in-repo from `model.hf.model_size` + explicit overrides. Pretrained runs load discriminator config from `model.pretrained.discriminator_path`, and load generator config from `model.pretrained.generator_path` when provided (otherwise generator config is derived from discriminator config).
+
+Native relative attention supports C2P, P2C, or both. Unknown terms and P2P are rejected during configuration because the Microsoft P2P branch does not provide a valid, reference-testable model contract.
 
 ## HF-size presets (`model.hf.model_size`)
 

@@ -27,28 +27,57 @@ from deberta.modeling.mask_utils import (
     reduce_keep_mask_to_2d,
 )
 
+_SUPPORTED_POS_ATT_TYPES = frozenset({"c2p", "p2c"})
+
 
 def _normalize_pos_att_type(raw: Any) -> list[str]:
     """Normalize positional-attention type config into a canonical string list.
 
     :param Any raw: Raw ``config.pos_att_type`` value.
     :return list[str]: Normalized positional-attention tags.
+    :raises TypeError: If the value is not a string or sequence of strings.
     """
 
     if raw is None:
         return []
     if isinstance(raw, str):
-        chunks = raw.replace(",", "|").split("|")
+        items = (raw,)
     elif isinstance(raw, (list, tuple, set)):
-        chunks = [str(x) for x in raw]
+        items = raw
     else:
-        chunks = [str(raw)]
+        raise TypeError(f"pos_att_type must be a string or sequence of strings; got {type(raw).__name__}.")
+
     out: list[str] = []
-    for chunk in chunks:
-        value = str(chunk).strip().lower()
-        if value:
-            out.append(value)
+    for item in items:
+        for chunk in str(item).replace(",", "|").split("|"):
+            value = chunk.strip().lower()
+            if value and value not in out:
+                out.append(value)
     return out
+
+
+def _validate_pos_att_type(raw: Any, *, relative_attention: bool) -> list[str]:
+    """Return supported positional-attention terms or fail before construction.
+
+    :param Any raw: Raw ``config.pos_att_type`` value.
+    :param bool relative_attention: Whether relative attention is enabled.
+    :return list[str]: Normalized supported positional-attention terms.
+    :raises TypeError: If the value is not a string or sequence of strings.
+    :raises ValueError: If terms are unsupported or required terms are absent.
+    """
+
+    terms = _normalize_pos_att_type(raw)
+    unsupported = sorted(set(terms) - _SUPPORTED_POS_ATT_TYPES)
+    if unsupported:
+        raise ValueError(
+            "Native DeBERTa attention supports only c2p and p2c; "
+            f"unsupported positional-attention terms: {unsupported}. "
+            "p2p is intentionally disabled because the Microsoft implementation "
+            "does not provide a valid, reference-testable contract."
+        )
+    if relative_attention and not terms:
+        raise ValueError("relative_attention=true requires pos_att_type containing c2p, p2c, or both.")
+    return terms
 
 
 def _make_log_bucket_position(
@@ -175,7 +204,8 @@ class DisentangledSelfAttention(nn.Module):
         """Create attention projections and relative-position helpers.
 
         :param DebertaV2Config config: Backbone configuration.
-        :raises ValueError: If hidden-size/head-count are inconsistent.
+        :raises TypeError: If positional-attention terms have an invalid container type.
+        :raises ValueError: If dimensions or positional-attention terms violate the native contract.
         """
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -185,6 +215,13 @@ class DisentangledSelfAttention(nn.Module):
                 f"hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_heads})."
             )
 
+        self.share_att_key = bool(getattr(config, "share_att_key", False))
+        self.relative_attention = bool(getattr(config, "relative_attention", False))
+        self.pos_att_type = _validate_pos_att_type(
+            getattr(config, "pos_att_type", None),
+            relative_attention=self.relative_attention,
+        )
+
         self.num_attention_heads = num_heads
         self.attention_head_size = int(getattr(config, "attention_head_size", hidden_size // num_heads))
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -192,10 +229,6 @@ class DisentangledSelfAttention(nn.Module):
         self.query_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
         self.key_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
         self.value_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
-
-        self.share_att_key = bool(getattr(config, "share_att_key", False))
-        self.pos_att_type = _normalize_pos_att_type(getattr(config, "pos_att_type", None))
-        self.relative_attention = bool(getattr(config, "relative_attention", False))
 
         self.position_buckets = int(getattr(config, "position_buckets", -1))
         self.max_relative_positions = int(getattr(config, "max_relative_positions", -1))
@@ -210,11 +243,11 @@ class DisentangledSelfAttention(nn.Module):
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
 
         if self.relative_attention and (not self.share_att_key):
-            if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            if "c2p" in self.pos_att_type:
                 self.pos_key_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_key_proj = None
-            if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            if "p2c" in self.pos_att_type:
                 self.pos_query_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_query_proj = None
@@ -316,57 +349,6 @@ class DisentangledSelfAttention(nn.Module):
         projected = projected.view(2 * att_span, self.num_attention_heads, self.attention_head_size)
         return projected.permute(1, 0, 2).contiguous()
 
-    def _p2p_bias(
-        self,
-        *,
-        rel_pos: torch.Tensor,
-        pos_query_layer: torch.Tensor,
-        pos_key_layer: torch.Tensor,
-        bsz: int,
-        nheads: int,
-        query_len: int,
-        key_len: int,
-        att_span: int,
-        scale_factor: int,
-    ) -> torch.Tensor:
-        """Compute position-to-position (p2p) bias.
-
-        :param torch.Tensor rel_pos: Relative ids with shape ``(Q,K)``.
-        :param torch.Tensor pos_query_layer: Relative query projections ``(H,2A,D)``.
-        :param torch.Tensor pos_key_layer: Relative key projections ``(H,2A,D)``.
-        :param int bsz: Batch size.
-        :param int nheads: Number of attention heads.
-        :param int query_len: Query length.
-        :param int key_len: Key length.
-        :param int att_span: Relative-attention span ``A``.
-        :param int scale_factor: Attention scale factor.
-        :return torch.Tensor: p2p bias tensor with shape ``(B,H,Q,K)``.
-        """
-
-        # Mirror reference behavior: use positive-half relative query table.
-        pos_query = pos_query_layer[:, att_span:, :]  # (H, A, D)
-        if pos_query.shape[1] == 0:
-            return torch.zeros(
-                (bsz, nheads, query_len, key_len),
-                device=rel_pos.device,
-                dtype=pos_query_layer.dtype,
-            )
-
-        # (H, A, 2A)
-        p2p_table = torch.einsum("hqd,hkd->hqk", pos_query, pos_key_layer)
-
-        # Map runtime query positions to available p2p rows.
-        q_index = torch.arange(query_len, device=rel_pos.device, dtype=torch.long)
-        q_index = q_index.clamp(max=int(p2p_table.shape[1]) - 1)
-        p2p_query = p2p_table.index_select(1, q_index)  # (H, Q, 2A)
-
-        p2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)  # (Q, K)
-        p2p_idx = p2p_idx.unsqueeze(0).expand(nheads, query_len, key_len)
-        p2p_bias = p2p_query.gather(-1, p2p_idx)  # (H, Q, K)
-        p2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
-        p2p_bias = p2p_bias / p2p_scale
-        return p2p_bias.unsqueeze(0).expand(bsz, nheads, query_len, key_len)
-
     def disentangled_attention_bias(
         self,
         query_layer: torch.Tensor,
@@ -379,10 +361,9 @@ class DisentangledSelfAttention(nn.Module):
 
         The ``dynamic`` kernel scores c2p/p2c terms with einsum; the
         ``cached_bmm``/``stable`` kernels use explicit permute + batched matmul.
-        Index construction, scaling, p2p handling, and the zero fallback are
-        shared. Cross-call score caching is intentionally avoided: c2p/p2c
-        terms depend on runtime query/key activations and must be recomputed
-        every forward.
+        Index construction, scaling, and the zero fallback are shared. Cross-call
+        score caching is intentionally avoided: c2p/p2c terms depend on runtime
+        query/key activations and must be recomputed every forward.
 
         :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
         :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
@@ -409,16 +390,16 @@ class DisentangledSelfAttention(nn.Module):
         pos_key_layer: torch.Tensor | None = None
         pos_query_layer: torch.Tensor | None = None
 
-        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+        if "c2p" in self.pos_att_type:
             # Keep both kernels on the same explicit dtype contract as the
             # caller's query/key score path (fp32 in stabilized attention).
             pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
-        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+        if "p2c" in self.pos_att_type:
             pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
 
         if "c2p" in self.pos_att_type:
             if pos_key_layer is None:
-                raise RuntimeError("p2p/c2p path requires pos_key projection.")
+                raise RuntimeError("c2p path requires pos_key projection.")
             c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
             if use_bmm:
                 q_flat = query_layer.permute(1, 0, 2, 3).reshape(
@@ -437,7 +418,7 @@ class DisentangledSelfAttention(nn.Module):
 
         if "p2c" in self.pos_att_type:
             if pos_query_layer is None:
-                raise RuntimeError("p2p/p2c path requires pos_query projection.")
+                raise RuntimeError("p2c path requires pos_query projection.")
             p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
             if use_bmm:
                 k_flat = key_layer.permute(1, 0, 2, 3).reshape(
@@ -456,22 +437,6 @@ class DisentangledSelfAttention(nn.Module):
             p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
             p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
             score = p2c_bias if score is None else score + p2c_bias
-
-        if "p2p" in self.pos_att_type:
-            if pos_key_layer is None or pos_query_layer is None:
-                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
-            p2p_bias = self._p2p_bias(
-                rel_pos=rel_pos,
-                pos_query_layer=pos_query_layer,
-                pos_key_layer=pos_key_layer,
-                bsz=bsz,
-                nheads=nheads,
-                query_len=query_len,
-                key_len=key_len,
-                att_span=att_span,
-                scale_factor=scale_factor,
-            )
-            score = p2p_bias if score is None else score + p2p_bias
 
         if score is None:
             score = torch.zeros(
@@ -514,8 +479,6 @@ class DisentangledSelfAttention(nn.Module):
         if "c2p" in self.pos_att_type:
             scale_factor += 1
         if "p2c" in self.pos_att_type:
-            scale_factor += 1
-        if "p2p" in self.pos_att_type:
             scale_factor += 1
 
         scale = math.sqrt(float(self.attention_head_size * scale_factor))

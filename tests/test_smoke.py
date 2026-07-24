@@ -3202,12 +3202,78 @@ def test_native_attention_rejects_rectangular_mask_dimension_mismatches(
         )
 
 
+def test_positional_term_normalization_splits_sequence_items() -> None:
+    from deberta.modeling.deberta_v2_native import _normalize_pos_att_type
+
+    assert _normalize_pos_att_type(["c2p|p2c"]) == ["c2p", "p2c"]
+    assert _normalize_pos_att_type(["p2c,c2p", "P2C"]) == ["p2c", "c2p"]
+    with pytest.raises(TypeError, match="string or sequence of strings"):
+        _normalize_pos_att_type(1)
+
+
 @pytest.mark.parametrize(
-    ("pos_att_type", "seed"),
-    [("c2p|p2c", 123), ("c2p|p2c|p2p", 321)],
-    ids=["c2p_p2c", "with_p2p"],
+    "raw",
+    [
+        "p2p",
+        "c2p|p2p",
+        "p2c,p2p",
+        ["c2p", "p2p"],
+        "c2p|pc2",
+    ],
 )
-def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_type: str, seed: int):
+def test_native_attention_rejects_unsupported_positional_terms(
+    raw: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        relative_attention=True,
+        pos_att_type=raw,
+    )
+    allocations: list[tuple[object, ...]] = []
+    linear = torch.nn.Linear
+
+    def _track_linear(*args: object, **kwargs: object) -> torch.nn.Linear:
+        allocations.append(args)
+        return linear(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn, "Linear", _track_linear)
+
+    with pytest.raises(ValueError, match="supports only c2p and p2c"):
+        DisentangledSelfAttention(cfg)
+    assert allocations == []
+
+
+@pytest.mark.parametrize("raw", [None, "", [], [""]])
+def test_native_attention_requires_positional_terms_when_relative_attention_is_enabled(
+    raw: object,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        relative_attention=True,
+        pos_att_type=raw,
+    )
+
+    with pytest.raises(ValueError, match="relative_attention=true requires pos_att_type"):
+        DisentangledSelfAttention(cfg)
+
+
+def test_direct_flash_attention_uses_native_positional_term_contract() -> None:
+    from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        flash=True,
+        relative_attention=True,
+        pos_att_type="p2p",
+    )
+
+    with pytest.raises(ValueError, match="supports only c2p and p2c"):
+        FlashDisentangledSelfAttention(cfg)
+
+
+def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic() -> None:
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
     cfg = make_native_deberta_config(
@@ -3215,13 +3281,13 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic(pos_att_
         num_hidden_layers=2,
         max_position_embeddings=32,
         relative_attention=True,
-        pos_att_type=pos_att_type,
+        pos_att_type="c2p|p2c",
         type_vocab_size=0,
     )
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-    torch.manual_seed(seed)
+    torch.manual_seed(123)
     cfg.hf_attention_kernel = "dynamic"
     dynamic_model = DebertaV2Model(cfg).eval()
     snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
@@ -3618,51 +3684,6 @@ def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
 
     assert out.shape == (bsz, nheads, qlen, klen)
     assert {eq for eq, _ in einsum_dtypes} == {"bhqd,hkd->bhqk", "bhkd,hqd->bhkq"}
-
-
-def test_native_hf_deberta_v2_p2p_bias_is_finite_nonzero_and_respects_scale_factor():
-    import math
-
-    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
-
-    cfg = make_native_deberta_config(
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="p2p",
-    )
-    attn = DisentangledSelfAttention(cfg).eval()
-
-    bsz, nheads, qlen, klen = 2, 4, 8, 8
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
-    query = torch.randn(bsz, nheads, qlen, head_dim)
-    key = torch.randn(bsz, nheads, klen, head_dim)
-    rel_embeddings = torch.randn(2 * cfg.max_position_embeddings, cfg.hidden_size)
-
-    with torch.no_grad():
-        score_scale_2 = attn.disentangled_attention_bias(
-            query_layer=query,
-            key_layer=key,
-            relative_pos=None,
-            rel_embeddings=rel_embeddings,
-            scale_factor=2,
-        )
-        score_scale_8 = attn.disentangled_attention_bias(
-            query_layer=query,
-            key_layer=key,
-            relative_pos=None,
-            rel_embeddings=rel_embeddings,
-            scale_factor=8,
-        )
-
-    mean_abs_2 = float(score_scale_2.abs().mean().item())
-    mean_abs_8 = float(score_scale_8.abs().mean().item())
-    assert score_scale_2.shape == (bsz, nheads, qlen, klen)
-    assert torch.isfinite(score_scale_2).all()
-    assert torch.isfinite(score_scale_8).all()
-    assert mean_abs_2 > 0.0
-    assert mean_abs_8 > 0.0
-    ratio = mean_abs_2 / mean_abs_8
-    assert ratio == pytest.approx(math.sqrt(8.0 / 2.0), rel=1e-4, abs=1e-4)
 
 
 @pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])

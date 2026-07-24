@@ -524,8 +524,6 @@ def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
         ({"position_buckets": 0}, "position_buckets >= 8"),
         ({"position_buckets": 2}, "position_buckets >= 8"),
         ({"position_buckets": 4}, "position_buckets >= 8"),
-        ({"pos_att_type": "p2c|p2p"}, "does not support pos_att_type"),
-        ({"pos_att_type": "p2c,p2p"}, "does not support pos_att_type"),
         # External checkpoints may pin a short explicit span; eager clamps
         # relative positions to it before bucketing while the flash kernels
         # do not, so flash must refuse rather than silently diverge.
@@ -569,6 +567,48 @@ def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
     )
 
     with pytest.raises(ValueError, match=message):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=128100),
+            max_position_embeddings=64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("attention_impl", "pos_att_type"),
+    [
+        ("eager", "c2p|pc2"),
+        ("flash", ["c2p|p2p"]),
+    ],
+)
+def test_build_hf_configs_reject_unsupported_positional_terms(
+    monkeypatch: pytest.MonkeyPatch,
+    attention_impl: str,
+    pos_att_type: object,
+) -> None:
+    invalid_cfg = builder_mod._build_repo_hf_deberta_v2_config(
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2")
+    )
+    invalid_cfg.pos_att_type = pos_att_type
+
+    def _fake_from_pretrained(cls, src: str):
+        del cls
+        del src
+        return invalid_cfg
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+    model_cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained={"discriminator_path": "custom-deberta"},
+        hf={"attention_impl": attention_impl},
+    )
+
+    with pytest.raises(ValueError, match="supports only c2p and p2c"):
         builder_mod.build_backbone_configs(
             model_cfg=model_cfg,
             tokenizer=DummyTokenizer(vocab_size=128100),

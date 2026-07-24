@@ -10,7 +10,7 @@ from deberta.config import ModelConfig, validate_model_config
 from deberta.modeling.deberta_v2_native import (
     DebertaV2Config,
     DebertaV2Model,
-    _normalize_pos_att_type,
+    _validate_pos_att_type,
 )
 from deberta.modeling.flashdeberta_op_utils import (
     is_flash_attention_impl,
@@ -630,8 +630,6 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
             f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
             "to -1 (span follows max_position_embeddings) or use attention_impl=eager."
         )
-    if "p2p" in _normalize_pos_att_type(getattr(cfg, "pos_att_type", "")):
-        raise ValueError(f"{component} flash attention does not support pos_att_type containing 'p2p'.")
 
 
 def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Config:
@@ -858,6 +856,14 @@ def build_backbone_configs(
             gen_cfg,
             required_max_position_embeddings=int(max_position_embeddings),
             component="generator",
+        )
+        _validate_pos_att_type(
+            getattr(disc_cfg, "pos_att_type", None),
+            relative_attention=bool(getattr(disc_cfg, "relative_attention", False)),
+        )
+        _validate_pos_att_type(
+            getattr(gen_cfg, "pos_att_type", None),
+            relative_attention=bool(getattr(gen_cfg, "relative_attention", False)),
         )
         _validate_hf_flash_attention_config(disc_cfg, component="discriminator")
         _validate_hf_flash_attention_config(gen_cfg, component="generator")

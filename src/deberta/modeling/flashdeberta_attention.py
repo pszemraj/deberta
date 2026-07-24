@@ -223,8 +223,6 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
             flash_meta is None or (not flash_meta.is_cross_document() and flash_meta.seq_lengths is None)
         ):
             return True
-        if "p2p" in self.pos_att_type:
-            return True
         if self.training and dropout_p > 0.0:
             # Validated repo configs reject positive dropout with flash. Keep
             # this fallback for direct/custom module construction.
