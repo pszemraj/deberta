@@ -145,7 +145,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 8
+RUN_CONFIG_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -160,16 +160,8 @@ class ModelTokenizerConfig:
 
 @dataclass(frozen=True)
 class ModelHFFlashConfig:
-    """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention.
+    """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention."""
 
-    ``docblock_bias_seq_len`` forces the dense doc-block route at exactly that
-    sequence length on any GPU, bypassing the tuning table's
-    ``max_batch_size``/``max_seq_len`` safety bounds entirely - the dense
-    route saves a ``(B,H,S,S)`` bias for backward, so a forgotten knob plus a
-    larger batch can OOM.
-    """
-
-    docblock_bias_seq_len: int | None = field(default=None)
     kernel_overrides_path: str | None = field(default=None)
 
 
@@ -871,8 +863,6 @@ def validate_model_config(cfg: ModelConfig) -> None:
     _cfg_set(
         cfg.hf, "model_size", _ensure_choice("model.hf.model_size", cfg.hf.model_size, _HF_MODEL_SIZE_CHOICES)
     )
-    if cfg.hf.flash.docblock_bias_seq_len is not None:
-        _cfg_set(cfg.hf.flash, "docblock_bias_seq_len", int(cfg.hf.flash.docblock_bias_seq_len))
     if cfg.hf.flash.kernel_overrides_path is not None:
         _cfg_set(
             cfg.hf.flash, "kernel_overrides_path", str(cfg.hf.flash.kernel_overrides_path).strip() or None
@@ -958,8 +948,6 @@ def validate_model_config(cfg: ModelConfig) -> None:
         probability = float(value)
         if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
             raise ValueError(f"model.dropout.{field_name} must be finite and in [0, 1] or null.")
-    if cfg.hf.flash.docblock_bias_seq_len is not None and int(cfg.hf.flash.docblock_bias_seq_len) < 0:
-        raise ValueError("model.hf.flash.docblock_bias_seq_len must be >= 0.")
     if cfg.backbone_type != "hf_deberta_v2" and cfg.hf.attention_impl == "flash":
         raise ValueError(
             "model.hf.attention_impl='flash' is only supported with model.backbone_type='hf_deberta_v2'."
@@ -1624,6 +1612,8 @@ def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
             return "use logging.debug"
     if section == "model" and k == "profile":
         return "remove model.profile; configure model.backbone_type and explicit fields directly"
+    if section == "model.hf.flash" and k == "docblock_bias_seq_len":
+        return "remove model.hf.flash.docblock_bias_seq_len; packed training uses ragged docblock"
     if section == "logging" and k == "backend":
         return "remove logging.backend; only logging.wandb.enabled remains for optional tracking"
     return None

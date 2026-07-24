@@ -16,6 +16,8 @@ from typing import Any
 import _bench_common as bench
 import torch
 
+from deberta.modeling.mask_utils import build_doc_block_mask
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -44,34 +46,40 @@ def main() -> None:
         tool_name="flashdeberta_bias_tune.py",
         require_bf16=True,
     )
-    tuning_model_cfg = dataclasses.replace(
-        cfg.model,
-        hf=dataclasses.replace(
-            cfg.model.hf,
-            flash=dataclasses.replace(
-                cfg.model.hf.flash,
-                docblock_bias_seq_len=int(cfg.data.packing.max_seq_length),
-            ),
-        ),
-    )
     backbone_config, head_dim, att_span = bench.build_branch_backbone_config(
-        model_cfg=tuning_model_cfg,
+        model_cfg=cfg.model,
         data_cfg=cfg.data,
         tokenizer=tokenizer,
         branch=str(args.branch),
     )
-    samples = bench.sample_flash_batches(
+    ragged_samples = bench.sample_flash_batches(
         loader=loader,
-        model_cfg=tuning_model_cfg,
+        model_cfg=cfg.model,
         sample_batches=int(args.sample_batches),
         device=device,
         head_dim=head_dim,
         att_span=att_span,
-        route_hints={"docblock_bias"},
+        route_hints={"docblock"},
         require_attention_mask=True,
-        with_pair_density=True,
         empty_error="Failed to sample any dense doc-block flash batches.",
     )
+    samples: list[bench.BatchSample] = []
+    for sample in ragged_samples:
+        if sample.flash_meta is None or sample.flash_meta.doc_ids is None:
+            continue
+        pairwise_mask = build_doc_block_mask(sample.flash_meta.doc_ids)
+        pair_density = float(pairwise_mask.to(dtype=torch.int32).sum().item()) / float(
+            max(1, sample.batch_size * sample.seq_len * sample.seq_len)
+        )
+        samples.append(
+            dataclasses.replace(
+                sample,
+                attention_mask=pairwise_mask,
+                pair_density=pair_density,
+            )
+        )
+    if not samples:
+        raise RuntimeError("Failed to derive dense pairwise masks from sampled doc-block batches.")
     # Build once and reuse across candidates: override tables only change kernel
     # selection, and per-candidate rebuilds gave each sweep a different random
     # init (a drift from the varlen tuner) for pure GPU alloc/cast overhead.
@@ -103,7 +111,6 @@ def main() -> None:
         samples=samples,
         candidates=candidates,
         routes=["docblock_bias"],
-        restore_path=cfg.model.hf.flash.kernel_overrides_path,
         meta_fn=lambda sample, route: (
             dataclasses.replace(sample.flash_meta, route_hint=route)
             if sample.flash_meta is not None

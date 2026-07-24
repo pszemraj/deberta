@@ -104,6 +104,7 @@ def _bias_repo_tuned_config(
     causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str = "",
 ) -> tuple[int, int, int, int] | None:
     """Return repo-local tuned dense-bias configs for measured hot paths.
 
@@ -120,6 +121,7 @@ def _bias_repo_tuned_config(
     :param bool causal: Whether causal masking is enabled.
     :param torch.dtype dtype: Activation dtype.
     :param torch.device device: CUDA device.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
         or ``None`` when no repo-local override applies.
     """
@@ -145,7 +147,8 @@ def _bias_repo_tuned_config(
             head_dim=head_dim,
             dtype=_kernel_dtype_name(dtype),
             causal=causal,
-        )
+        ),
+        policy_path=policy_path,
     )
 
 
@@ -160,6 +163,7 @@ def _bias_config(
     causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str = "",
 ) -> tuple[int, int, int, int]:
     """Resolve a dense-bias Triton tile config.
 
@@ -172,6 +176,7 @@ def _bias_config(
     :param bool causal: Whether causal masking is enabled.
     :param torch.dtype dtype: Activation dtype.
     :param torch.device device: CUDA device.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
@@ -185,6 +190,7 @@ def _bias_config(
         causal=bool(causal),
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
     if tuned is not None:
         return tuned
@@ -202,6 +208,7 @@ def _resolve_bias_bwd_kernel_config(
     causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str = "",
 ) -> tuple[int, int, int, int]:
     """Resolve one dense-bias backward kernel config.
 
@@ -218,6 +225,7 @@ def _resolve_bias_bwd_kernel_config(
     :param bool causal: Whether causal masking is enabled.
     :param torch.dtype dtype: Activation dtype.
     :param torch.device device: CUDA device.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :raises ValueError: If ``kind`` is unsupported.
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
@@ -236,6 +244,7 @@ def _resolve_bias_bwd_kernel_config(
         causal=bool(causal),
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
     if repo_tuned is not None:
         return repo_tuned
@@ -250,6 +259,7 @@ def _resolve_bias_bwd_kernel_config(
         causal=bool(causal),
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
 
 
@@ -260,6 +270,7 @@ def _should_use_specialized_docblock_bias_backward(
     v: torch.Tensor,
     bias: torch.Tensor,
     causal: bool,
+    policy_path: str = "",
 ) -> bool:
     """Return whether the repo-local short doc-block bias backward should run.
 
@@ -276,6 +287,7 @@ def _should_use_specialized_docblock_bias_backward(
     :param torch.Tensor v: Forward value tensor in ``(B,H,S,D)`` layout.
     :param torch.Tensor bias: Dense additive bias tensor in ``(B,H,S,S)`` layout.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return bool: True when the exact-match specialized backward should run.
     """
 
@@ -305,7 +317,8 @@ def _should_use_specialized_docblock_bias_backward(
             dtype=_kernel_dtype_name(q.dtype),
             causal=bool(causal),
             has_mask=True,
-        )
+        ),
+        policy_path=policy_path,
     )
     if policy is None:
         return False
@@ -333,6 +346,7 @@ def _resolve_docblock_specialized_bwd_kernel_config(
     causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str = "",
 ) -> tuple[int, int, int, int]:
     """Resolve the short doc-block dense-bias backward launch tuple.
 
@@ -351,6 +365,7 @@ def _resolve_docblock_specialized_bwd_kernel_config(
     :param bool causal: Whether causal masking is enabled.
     :param torch.dtype dtype: Activation dtype.
     :param torch.device device: CUDA device.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :raises ValueError: If ``kind`` is unsupported.
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
@@ -378,7 +393,8 @@ def _resolve_docblock_specialized_bwd_kernel_config(
             FlashKernelContext(
                 kind=table_kind,
                 **context_kwargs,
-            )
+            ),
+            policy_path=policy_path,
         )
         if table_config is not None:
             return table_config
@@ -393,6 +409,7 @@ def _resolve_docblock_specialized_bwd_kernel_config(
         causal=causal,
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
 
 
@@ -834,6 +851,7 @@ def _resolve_docblock1024_bwd_configs(
     head_dim: int,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str = "",
 ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
     """Resolve KV/Q launch configs for the specialized docblock1024 backward.
 
@@ -844,6 +862,7 @@ def _resolve_docblock1024_bwd_configs(
     :param int head_dim: Head dimension.
     :param torch.dtype dtype: Input dtype.
     :param torch.device device: CUDA device.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
         ``(kv_config, q_config)`` when the specialized kernels can run for this
         shape, otherwise ``None`` (caller falls back to the generic path).
@@ -859,6 +878,7 @@ def _resolve_docblock1024_bwd_configs(
         causal=False,
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
     q_config = _resolve_docblock_specialized_bwd_kernel_config(
         kind="q",
@@ -870,6 +890,7 @@ def _resolve_docblock1024_bwd_configs(
         causal=False,
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
     kv_block_m, kv_block_n, _, _ = kv_config
     q_block_m, q_block_n, _, _ = q_config
@@ -1140,6 +1161,7 @@ def _bias_specialized_docblock_backward_impl(
     out: torch.Tensor,
     lse: torch.Tensor,
     sm_scale: float,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the repo-local specialized dense-bias backward for short doc-block batches.
 
@@ -1151,6 +1173,7 @@ def _bias_specialized_docblock_backward_impl(
     :param torch.Tensor out: Forward output tensor.
     :param torch.Tensor lse: Forward LSE tensor.
     :param float sm_scale: Softmax scale.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Gradients for q/k/v and bias.
     """
@@ -1165,6 +1188,7 @@ def _bias_specialized_docblock_backward_impl(
         head_dim=head_dim,
         dtype=q.dtype,
         device=q.device,
+        policy_path=policy_path,
     )
     if configs is None:
         return _bias_generic_backward_impl(
@@ -1177,6 +1201,7 @@ def _bias_specialized_docblock_backward_impl(
             lse=lse,
             sm_scale=sm_scale,
             causal=False,
+            policy_path=policy_path,
         )
 
     kv_config, q_config = configs
@@ -1212,6 +1237,7 @@ def _should_use_specialized_docblock_position_bias_backward(
     pos_key_num_buckets: int,
     pos_query_num_buckets: int,
     causal: bool,
+    policy_path: str = "",
 ) -> bool:
     """Return whether dense doc-block bias backward can accumulate positional grads directly.
 
@@ -1223,10 +1249,18 @@ def _should_use_specialized_docblock_position_bias_backward(
     :param int pos_key_num_buckets: c2p bucket count, or zero when absent.
     :param int pos_query_num_buckets: p2c bucket count, or zero when absent.
     :param bool causal: Whether causal masking is active.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return bool: True when the direct positional-gradient specialization should run.
     """
 
-    if not _should_use_specialized_docblock_bias_backward(q=q, k=k, v=v, bias=bias, causal=causal):
+    if not _should_use_specialized_docblock_bias_backward(
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        causal=causal,
+        policy_path=policy_path,
+    ):
         return False
     seq_len = int(q.shape[-2])
     if bucket_index.device.type != "cuda" or tuple(bucket_index.shape) != (seq_len, seq_len):
@@ -1249,6 +1283,7 @@ def _position_bias_specialized_docblock_backward_impl(
     keep_mask: torch.Tensor | None,
     bias_scale: float,
     sm_scale: float,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run short doc-block dense-bias backward with fused positional-gradient accumulation.
 
@@ -1271,6 +1306,7 @@ def _position_bias_specialized_docblock_backward_impl(
     :param torch.Tensor | None keep_mask: Optional keep mask.
     :param float bias_scale: Scale applied to positional-bias gradients.
     :param float sm_scale: Attention score scale.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Gradients for q/k/v and optional c2p/p2c positional tensors.
     """
@@ -1285,6 +1321,7 @@ def _position_bias_specialized_docblock_backward_impl(
         head_dim=head_dim,
         dtype=q.dtype,
         device=q.device,
+        policy_path=policy_path,
     )
     if configs is None:
         bias_dq, bias_dk, bias_dv, d_bias = _bias_generic_backward_impl(
@@ -1297,6 +1334,7 @@ def _position_bias_specialized_docblock_backward_impl(
             lse=lse,
             sm_scale=sm_scale,
             causal=False,
+            policy_path=policy_path,
         )
         dpos_key, dpos_query = _position_bias_backward_from_dense_grad(
             d_bias=d_bias,
@@ -1357,6 +1395,7 @@ def _bias_eager_forward_impl(
     bias: torch.Tensor,
     sm_scale: float,
     causal: bool,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run dense bias attention through the low-level CUDA launcher.
 
@@ -1366,6 +1405,7 @@ def _bias_eager_forward_impl(
     :param torch.Tensor bias: Additive bias in ``(B, H, S, S)`` layout.
     :param float sm_scale: Softmax scale.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor]: Output and LSE tensors.
     """
 
@@ -1384,6 +1424,7 @@ def _bias_eager_forward_impl(
         causal=bool(causal),
         dtype=q.dtype,
         device=q.device,
+        policy_path=policy_path,
     )
     out, lse = _flash_attn_v2_fwd_bias_lowlevel(
         q,
@@ -1411,6 +1452,7 @@ def _bias_generic_backward_impl(
     lse: torch.Tensor,
     sm_scale: float,
     causal: bool,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense bias backward through the generic low-level CUDA launcher.
 
@@ -1423,6 +1465,7 @@ def _bias_generic_backward_impl(
     :param torch.Tensor lse: Forward LSE tensor.
     :param float sm_scale: Softmax scale.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Gradients for q/k/v and the additive bias tensor.
     """
@@ -1440,6 +1483,7 @@ def _bias_generic_backward_impl(
             causal=bool(causal),
             dtype=q.dtype,
             device=q.device,
+            policy_path=policy_path,
         )
         dq, dk, dv, d_bias = _flash_attn_v2_bwd_bias_lowlevel(
             out,
@@ -1468,6 +1512,7 @@ def _bias_generic_backward_impl(
         causal=bool(causal),
         dtype=q.dtype,
         device=q.device,
+        policy_path=policy_path,
     )
     q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_bias_bwd_kernel_config(
         kind="q",
@@ -1479,6 +1524,7 @@ def _bias_generic_backward_impl(
         causal=bool(causal),
         dtype=q.dtype,
         device=q.device,
+        policy_path=policy_path,
     )
 
     bias_batch_stride = bias.stride(0)
@@ -1652,6 +1698,7 @@ def _bias_eager_backward_impl(
     lse: torch.Tensor,
     sm_scale: float,
     causal: bool,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense bias backward, dispatching to repo-local special cases when applicable.
 
@@ -1664,6 +1711,7 @@ def _bias_eager_backward_impl(
     :param torch.Tensor lse: Forward LSE tensor.
     :param float sm_scale: Softmax scale.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Gradients for q/k/v and the additive bias tensor.
     """
@@ -1671,7 +1719,14 @@ def _bias_eager_backward_impl(
     if _flash_attn_v2_bwd_bias_lowlevel is None:
         raise RuntimeError("FlashDeBERTa local-bias backward is unavailable.")
 
-    if _should_use_specialized_docblock_bias_backward(q=q, k=k, v=v, bias=bias, causal=causal):
+    if _should_use_specialized_docblock_bias_backward(
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        causal=causal,
+        policy_path=policy_path,
+    ):
         return _bias_specialized_docblock_backward_impl(
             grad_out=grad_out,
             q=q,
@@ -1681,6 +1736,7 @@ def _bias_eager_backward_impl(
             out=out,
             lse=lse,
             sm_scale=sm_scale,
+            policy_path=policy_path,
         )
 
     return _bias_generic_backward_impl(
@@ -1693,6 +1749,7 @@ def _bias_eager_backward_impl(
         lse=lse,
         sm_scale=sm_scale,
         causal=causal,
+        policy_path=policy_path,
     )
 
 
@@ -1703,6 +1760,7 @@ def _position_bias_forward_impl(
     bucket_index: torch.Tensor,
     keep_mask: torch.Tensor | None,
     scale: float,
+    policy_path: str = "",
 ) -> torch.Tensor:
     """Materialize dense positional bias for one attention launch.
 
@@ -1711,6 +1769,7 @@ def _position_bias_forward_impl(
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
     :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the additive position bias.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return torch.Tensor: Dense additive bias in ``(B,H,S,S)`` layout.
     """
 
@@ -1724,6 +1783,7 @@ def _position_bias_forward_impl(
             bucket_index=bucket_index,
             keep_mask=keep_mask,
             scale=float(scale),
+            policy_path=policy_path,
         )
     return _dense_bias_forward_fallback(
         pos_key=pos_key,
@@ -1800,7 +1860,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor pos_key, Tensor pos_query, Tensor bucket_index, "
             "Tensor keep_mask, float bias_scale, float sm_scale, bool causal, bool has_pos_key, "
-            "bool has_pos_query, bool has_keep_mask) -> (Tensor, Tensor, Tensor)"
+            "bool has_pos_query, bool has_keep_mask, str policy_path) -> (Tensor, Tensor, Tensor)"
         ),
     )
     def _forward_op(
@@ -1817,6 +1877,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         has_pos_key: bool,
         has_pos_query: bool,
         has_keep_mask: bool,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run position-bias attention and return dense bias as autograd-owned aux.
 
@@ -1833,6 +1894,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param bool has_pos_key: Whether ``pos_key`` is active.
         :param bool has_pos_query: Whether ``pos_query`` is active.
         :param bool has_keep_mask: Whether ``keep_mask`` is active.
+        :param str policy_path: Normalized model-scoped kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Output, LSE, and dense bias aux.
         """
 
@@ -1842,6 +1904,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             bucket_index=bucket_index,
             keep_mask=keep_mask if bool(has_keep_mask) else None,
             scale=float(bias_scale),
+            policy_path=policy_path,
         )
         out, lse = _bias_eager_forward_impl(
             q=q,
@@ -1850,6 +1913,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             bias=bias,
             sm_scale=float(sm_scale),
             causal=bool(causal),
+            policy_path=policy_path,
         )
         return out, lse, bias
 
@@ -1868,6 +1932,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         has_pos_key: bool,
         has_pos_query: bool,
         has_keep_mask: bool,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return fake position-bias attention outputs with static shapes.
 
@@ -1884,11 +1949,12 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param bool has_pos_key: Fake c2p presence flag.
         :param bool has_pos_query: Fake p2c presence flag.
         :param bool has_keep_mask: Fake keep-mask presence flag.
+        :param str policy_path: Fake normalized model-scoped kernel-policy path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Fake output, LSE, and dense bias aux.
         """
 
         del v, pos_key, pos_query, bucket_index, keep_mask, bias_scale
-        del sm_scale, causal, has_pos_key, has_pos_query, has_keep_mask
+        del sm_scale, causal, has_pos_key, has_pos_query, has_keep_mask, policy_path
         lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         bias = torch.empty(
             (q.shape[0], q.shape[1], q.shape[2], k.shape[2]),
@@ -1904,7 +1970,8 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor bucket_index, Tensor keep_mask, "
             "Tensor bias, Tensor out, Tensor lse, float bias_scale, float sm_scale, bool causal, "
-            "int pos_key_num_buckets, int pos_query_num_buckets, bool has_keep_mask) "
+            "int pos_key_num_buckets, int pos_query_num_buckets, bool has_keep_mask, "
+            "str policy_path) "
             "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
     )
@@ -1924,6 +1991,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         pos_key_num_buckets: int,
         pos_query_num_buckets: int,
         has_keep_mask: bool,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run position-bias attention backward with saved dense bias.
 
@@ -1942,6 +2010,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param int pos_key_num_buckets: c2p bucket count, or zero when absent.
         :param int pos_query_num_buckets: p2c bucket count, or zero when absent.
         :param bool has_keep_mask: Whether ``keep_mask`` is active.
+        :param str policy_path: Normalized model-scoped kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             Gradients for q/k/v/pos_key/pos_query.
         """
@@ -1956,6 +2025,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             pos_key_num_buckets=int(pos_key_num_buckets),
             pos_query_num_buckets=int(pos_query_num_buckets),
             causal=bool(causal),
+            policy_path=policy_path,
         ):
             dq, dk, dv, dpos_key, dpos_query = _position_bias_specialized_docblock_backward_impl(
                 grad_out=grad_out,
@@ -1971,6 +2041,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
                 keep_mask=keep_mask_tensor,
                 bias_scale=float(bias_scale),
                 sm_scale=float(sm_scale),
+                policy_path=policy_path,
             )
         else:
             dq, dk, dv, d_bias = _bias_eager_backward_impl(
@@ -1983,6 +2054,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
                 lse=lse,
                 sm_scale=float(sm_scale),
                 causal=bool(causal),
+                policy_path=policy_path,
             )
             dpos_key, dpos_query = _position_bias_backward_from_dense_grad(
                 d_bias=d_bias,
@@ -2018,6 +2090,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         pos_key_num_buckets: int,
         pos_query_num_buckets: int,
         has_keep_mask: bool,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return fake position-bias backward outputs with static shapes.
 
@@ -2036,12 +2109,13 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         :param int pos_key_num_buckets: Fake c2p bucket count.
         :param int pos_query_num_buckets: Fake p2c bucket count.
         :param bool has_keep_mask: Fake keep-mask presence flag.
+        :param str policy_path: Fake normalized model-scoped kernel-policy path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             Fake gradients for q/k/v/pos_key/pos_query.
         """
 
         del grad_out, bucket_index, keep_mask, bias, out, lse, bias_scale, sm_scale
-        del causal, has_keep_mask
+        del causal, has_keep_mask, policy_path
         pos_shape = (q.shape[0], q.shape[1], q.shape[2])
         dpos_key = (
             torch.empty((*pos_shape, pos_key_num_buckets), device=q.device, dtype=q.dtype)
@@ -2087,6 +2161,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             has_pos_key,
             has_pos_query,
             has_keep_mask,
+            policy_path,
         ) = inputs
         out, lse, bias = output
         ctx.mark_non_differentiable(lse, bias)
@@ -2099,6 +2174,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
         ctx.pos_key_num_buckets = int(pos_key.shape[-1]) if ctx.has_pos_key else 0
         ctx.pos_query_num_buckets = int(pos_query.shape[-1]) if ctx.has_pos_query else 0
         ctx.has_keep_mask = bool(has_keep_mask)
+        ctx.policy_path = str(policy_path)
 
     def _backward(
         ctx: Any,
@@ -2134,6 +2210,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             ctx.pos_key_num_buckets,
             ctx.pos_query_num_buckets,
             ctx.has_keep_mask,
+            ctx.policy_path,
         )
         return (
             dq,
@@ -2141,6 +2218,7 @@ def _build_position_bias_custom_ops() -> tuple[Any | None, Any | None]:
             dv,
             dpos_key if ctx.has_pos_key else None,
             dpos_query if ctx.has_pos_query else None,
+            None,
             None,
             None,
             None,
@@ -2172,6 +2250,7 @@ def flashdeberta_bias_from_positions(
     bias_scale: float,
     sm_scale: float,
     causal: bool,
+    policy_path: str = "",
 ) -> torch.Tensor:
     """Run local-bias attention from compact position-bias ingredients.
 
@@ -2185,6 +2264,7 @@ def flashdeberta_bias_from_positions(
     :param float bias_scale: Scale applied to the additive position bias.
     :param float sm_scale: Softmax scale applied to content scores.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :raises RuntimeError: If both positional terms are missing.
     :return torch.Tensor: Attention output in ``(B,H,S,D)`` layout.
     """
@@ -2239,6 +2319,7 @@ def flashdeberta_bias_from_positions(
             pos_key is not None,
             pos_query is not None,
             keep_mask is not None,
+            str(policy_path),
         )
         return output
 
@@ -2252,9 +2333,11 @@ def flashdeberta_bias_from_positions(
             bucket_index=bucket_index,
             keep_mask=keep_mask,
             scale=float(bias_scale),
+            policy_path=policy_path,
         ),
         sm_scale=sm_scale,
         causal=causal,
+        policy_path=policy_path,
     )
     return output
 

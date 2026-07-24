@@ -157,12 +157,14 @@ def _varlen_repo_tuned_config(
     seq_len: int,
     total_tokens: int,
     batch_size: int,
+    num_heads: int,
     head_dim: int,
     causal: bool,
     disentangled: bool,
     att_span: int,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str,
 ) -> tuple[int, int, int, int] | None:
     """Return a table-driven varlen kernel config, if one matches.
 
@@ -171,12 +173,14 @@ def _varlen_repo_tuned_config(
     :param int seq_len: Padded sequence length.
     :param int total_tokens: Total active tokens in the packed batch.
     :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
     :param int head_dim: Attention head dimension.
     :param bool causal: Whether causal masking is enabled.
     :param bool disentangled: Whether c2p/p2c position terms are active.
     :param int att_span: Effective relative-position span.
     :param torch.dtype dtype: Kernel dtype.
     :param torch.device device: Launch device.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
         or ``None`` when no table row applies.
     """
@@ -190,12 +194,17 @@ def _varlen_repo_tuned_config(
             seq_len=seq_len,
             total_tokens=total_tokens,
             batch_size=batch_size,
+            query_len=seq_len,
+            key_len=seq_len,
+            num_heads=num_heads,
             head_dim=head_dim,
             dtype=_kernel_dtype_name(dtype),
             causal=causal,
             disentangled=disentangled,
             att_span=att_span,
-        )
+            has_mask=True,
+        ),
+        policy_path=policy_path,
     )
 
 
@@ -215,6 +224,7 @@ def _run_packed_varlen_forward(
     max_relative_distance: int,
     causal: bool,
     att_span: int,
+    policy_path: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one already-packed varlen forward pass.
 
@@ -232,6 +242,7 @@ def _run_packed_varlen_forward(
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
     :param int att_span: Effective relative-position span.
+    :param str policy_path: Normalized kernel-policy override path.
     :raises RuntimeError: If the low-level varlen forward implementation is unavailable.
     :return tuple[torch.Tensor, torch.Tensor]: Packed output and LSE.
     """
@@ -243,12 +254,14 @@ def _run_packed_varlen_forward(
             seq_len=max_seqlen,
             total_tokens=int(q_unpad.shape[0]),
             batch_size=batch_size,
+            num_heads=int(q_unpad.shape[1]),
             head_dim=int(q_unpad.shape[-1]),
             causal=bool(causal),
             disentangled=True,
             att_span=att_span,
             dtype=q_unpad.dtype,
             device=q_unpad.device,
+            policy_path=policy_path,
         )
         block_m, block_n, num_stages, num_warps = (
             table_config if table_config is not None else CONSERVATIVE_FLASH_KERNEL_CONFIG
@@ -291,12 +304,14 @@ def _resolve_varlen_bwd_kernel_config(
     max_seqlen_q: int,
     max_seqlen_k: int,
     batch_size: int,
+    num_heads: int,
     head_dim: int,
     causal: bool,
     disentangled: bool,
     att_span: int,
     dtype: torch.dtype,
     device: torch.device,
+    policy_path: str,
 ) -> tuple[int, int, int, int]:
     """Resolve one repo-local varlen backward kernel config.
 
@@ -307,12 +322,14 @@ def _resolve_varlen_bwd_kernel_config(
     :param int max_seqlen_q: Maximum query sequence length.
     :param int max_seqlen_k: Maximum key sequence length.
     :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
     :param int head_dim: Attention head dimension.
     :param bool causal: Whether causal masking is enabled.
     :param bool disentangled: Whether c2p/p2c position terms are active.
     :param int att_span: Effective relative-position span.
     :param torch.dtype dtype: Kernel dtype.
     :param torch.device device: Launch device.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[int, int, int, int]: Resolved ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
@@ -322,12 +339,14 @@ def _resolve_varlen_bwd_kernel_config(
         seq_len=max(max_seqlen_q, max_seqlen_k),
         total_tokens=max(total_tokens_q, total_tokens_k),
         batch_size=batch_size,
+        num_heads=num_heads,
         head_dim=head_dim,
         causal=causal,
         disentangled=disentangled,
         att_span=att_span,
         dtype=dtype,
         device=device,
+        policy_path=policy_path,
     )
     if repo_tuned is not None:
         return repo_tuned
@@ -757,6 +776,7 @@ def _varlen_backward_raw_impl(
     causal: bool,
     dense_mid_tensors: bool,
     route: str = "varlen",
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Launch raw varlen backward Triton kernels over already packed tensors.
 
@@ -779,6 +799,7 @@ def _varlen_backward_raw_impl(
     :param bool causal: Whether causal masking is enabled.
     :param bool dense_mid_tensors: Whether to build fixed-capacity dense mid tensors.
     :param str route: Tuning-table route namespace.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Packed gradients for q/k/v and optional positional tensors.
     """
@@ -792,12 +813,14 @@ def _varlen_backward_raw_impl(
         max_seqlen_q=int(seq_bound),
         max_seqlen_k=int(seq_bound),
         batch_size=int(batch_size),
+        num_heads=int(q_unpad.shape[1]),
         head_dim=int(q_unpad.shape[-1]),
         causal=bool(causal),
         disentangled=True,
         att_span=att_span,
         dtype=q_unpad.dtype,
         device=q_unpad.device,
+        policy_path=policy_path,
     )
     q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_varlen_bwd_kernel_config(
         route=route,
@@ -807,12 +830,14 @@ def _varlen_backward_raw_impl(
         max_seqlen_q=int(seq_bound),
         max_seqlen_k=int(seq_bound),
         batch_size=int(batch_size),
+        num_heads=int(q_unpad.shape[1]),
         head_dim=int(q_unpad.shape[-1]),
         causal=bool(causal),
         disentangled=True,
         att_span=att_span,
         dtype=q_unpad.dtype,
         device=q_unpad.device,
+        policy_path=policy_path,
     )
 
     if dense_mid_tensors:
@@ -843,6 +868,8 @@ def _varlen_backward_raw_impl(
     dq_unpad = torch.empty_like(q_unpad)
     dk_unpad = torch.empty_like(k_unpad)
     dv_unpad = torch.empty_like(v_unpad)
+    # Match pinned FlashDeBERTa 0.0.7: positional atomic destinations use the
+    # model dtype; CUDA bf16 atomics are supported on the repo floor (sm80+).
     dpos_key_unpad = torch.zeros_like(pos_key_unpad) if pos_key_unpad is not None else None
     dpos_query_unpad = torch.zeros_like(pos_query_unpad) if pos_query_unpad is not None else None
 
@@ -987,6 +1014,7 @@ def _varlen_padded_backward_impl(
     pos_key_unpad: torch.Tensor | None,
     pos_query_unpad: torch.Tensor | None,
     dense_mid_tensors: bool = False,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run padded varlen backward, optionally reusing forward-side packed tensors.
 
@@ -1014,6 +1042,7 @@ def _varlen_padded_backward_impl(
     :param torch.Tensor | None pos_key_unpad: Optional cached unpadded c2p tensor.
     :param torch.Tensor | None pos_query_unpad: Optional cached unpadded p2c tensor.
     :param bool dense_mid_tensors: Build fixed-capacity midpoint metadata for compile-visible launches.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Gradients in the same padded layouts as the forward inputs.
     """
@@ -1113,6 +1142,7 @@ def _varlen_padded_backward_impl(
             max_relative_distance=max_relative_distance,
             causal=causal,
             dense_mid_tensors=dense_mid_tensors,
+            policy_path=policy_path,
         )
 
     return run_packed_backward(
@@ -1154,6 +1184,7 @@ def _varlen_triton_forward_impl(
     causal: bool,
     seqlens: torch.Tensor | None = None,
     token_capacity: int | None = None,
+    policy_path: str = "",
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1180,6 +1211,7 @@ def _varlen_triton_forward_impl(
     :param bool causal: Whether causal masking is enabled.
     :param torch.Tensor | None seqlens: Optional precomputed active prefix lengths.
     :param int | None token_capacity: Optional exact packed-token capacity.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, ...]:
         Padded output, padded LSE, cumulative sequence lengths, packed q/k/v,
         packed output/LSE, and optional packed positional tensors encoded as
@@ -1223,12 +1255,14 @@ def _varlen_triton_forward_impl(
         seq_len=seq_len,
         total_tokens=capacity_tokens,
         batch_size=batch_size,
+        num_heads=num_heads,
         head_dim=head_dim,
         causal=bool(causal),
         disentangled=True,
         att_span=att_span,
         dtype=q.dtype,
         device=q.device,
+        policy_path=policy_path,
     )
     if table_config is not None:
         block_m, block_n, num_stages, num_warps = table_config
@@ -1349,6 +1383,7 @@ def _varlen_triton_backward_impl(
     pos_key_unpad: torch.Tensor | None = None,
     pos_query_unpad: torch.Tensor | None = None,
     token_capacity: int | None = None,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run compile-visible padded varlen backward with fixed-capacity packed buffers.
 
@@ -1374,6 +1409,7 @@ def _varlen_triton_backward_impl(
     :param torch.Tensor | None pos_key_unpad: Optional cached packed c2p tensor.
     :param torch.Tensor | None pos_query_unpad: Optional cached packed p2c tensor.
     :param int | None token_capacity: Optional exact packed-token capacity.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Padded gradients for q/k/v and optional positional tensors.
     """
@@ -1416,6 +1452,7 @@ def _varlen_triton_backward_impl(
         pos_key_unpad=pos_key_unpad,
         pos_query_unpad=pos_query_unpad,
         dense_mid_tensors=True,
+        policy_path=policy_path,
     )
 
 
@@ -1433,7 +1470,8 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         mutates_args=(),
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor mask, Tensor? pos_key, Tensor? pos_query, "
-            "float sm_scale, int position_buckets, int max_relative_distance, bool causal) -> "
+            "float sm_scale, int position_buckets, int max_relative_distance, bool causal, "
+            "str policy_path) -> "
             "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
     )
@@ -1448,6 +1486,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        policy_path: str,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1472,6 +1511,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
         :param bool causal: Whether causal masking is enabled.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, ...]:
             Padded output, padded LSE, cumulative sequence lengths, packed q/k/v,
             packed output/LSE, and optional packed positional tensors.
@@ -1488,6 +1528,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
             causal=causal,
+            policy_path=policy_path,
         )
 
     @torch.library.triton_op(
@@ -1498,7 +1539,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
             "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, "
             "int max_relative_distance, bool causal, Tensor cu_seqlens, Tensor q_unpad, Tensor k_unpad, "
             "Tensor v_unpad, Tensor out_unpad, Tensor lse_unpad, Tensor? pos_key_unpad, "
-            "Tensor? pos_query_unpad) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+            "Tensor? pos_query_unpad, str policy_path) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
     )
     def _backward_op(
@@ -1523,6 +1564,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         lse_unpad: torch.Tensor,
         pos_key_unpad: torch.Tensor | None,
         pos_query_unpad: torch.Tensor | None,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run compile-visible padded varlen backward.
 
@@ -1547,6 +1589,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor lse_unpad: Cached packed forward LSE.
         :param torch.Tensor | None pos_key_unpad: Cached packed c2p tensor.
         :param torch.Tensor | None pos_query_unpad: Cached packed p2c tensor.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             Padded q/k/v gradients plus positional gradients with empty sentinels
             for absent positional inputs.
@@ -1574,6 +1617,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
             lse_unpad=lse_unpad,
             pos_key_unpad=pos_key_unpad,
             pos_query_unpad=pos_query_unpad,
+            policy_path=policy_path,
         )
         if dpos_key is None:
             dpos_key = q.new_empty((0,))
@@ -1604,7 +1648,19 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         :param tuple[torch.Tensor, ...] output: Forward Triton-op outputs.
         """
 
-        q, k, v, mask, pos_key, pos_query, sm_scale, position_buckets, max_relative_distance, causal = inputs
+        (
+            q,
+            k,
+            v,
+            mask,
+            pos_key,
+            pos_query,
+            sm_scale,
+            position_buckets,
+            max_relative_distance,
+            causal,
+            policy_path,
+        ) = inputs
         (
             out,
             lse,
@@ -1649,6 +1705,7 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
         ctx.position_buckets = int(position_buckets)
         ctx.max_relative_distance = int(max_relative_distance)
         ctx.causal = bool(causal)
+        ctx.policy_path = str(policy_path)
 
     def _backward(
         ctx: Any,
@@ -1720,12 +1777,13 @@ def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
             lse_unpad,
             pos_key_unpad if bool(ctx.has_pos_key) else None,
             pos_query_unpad if bool(ctx.has_pos_query) else None,
+            ctx.policy_path,
         )
         if not bool(ctx.has_pos_key):
             dpos_key = None
         if not bool(ctx.has_pos_query):
             dpos_query = None
-        return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None
+        return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None, None
 
     torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
     return _forward_op, _backward_op
@@ -1752,6 +1810,7 @@ class _EagerVarlen(torch.autograd.Function):
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        policy_path: str,
     ) -> torch.Tensor:
         """Run eager padded-varlen forward and save packed tensors for backward.
 
@@ -1768,6 +1827,7 @@ class _EagerVarlen(torch.autograd.Function):
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
         :param bool causal: Whether causal masking is enabled.
+        :param str policy_path: Normalized kernel-policy override path.
         :return torch.Tensor: Padded attention output.
         """
 
@@ -1795,6 +1855,7 @@ class _EagerVarlen(torch.autograd.Function):
             causal=causal,
             seqlens=seqlens,
             token_capacity=active_tokens,
+            policy_path=policy_path,
         )
         pos_key_saved = pos_key if pos_key is not None else q.new_empty((0,))
         pos_query_saved = pos_query if pos_query is not None else q.new_empty((0,))
@@ -1823,6 +1884,7 @@ class _EagerVarlen(torch.autograd.Function):
         ctx.position_buckets = int(position_buckets)
         ctx.max_relative_distance = int(max_relative_distance)
         ctx.causal = bool(causal)
+        ctx.policy_path = str(policy_path)
         return out
 
     @staticmethod
@@ -1879,8 +1941,23 @@ class _EagerVarlen(torch.autograd.Function):
             pos_key_unpad=dpos_key_unpad,
             pos_query_unpad=dpos_query_unpad,
             token_capacity=ctx.active_tokens,
+            policy_path=ctx.policy_path,
         )
-        return dq, dk, dv, None, None, dpos_key, dpos_query, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            dpos_key,
+            dpos_query,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flashdeberta_varlen_padded(
@@ -1897,6 +1974,7 @@ def flashdeberta_varlen_padded(
     position_buckets: int,
     max_relative_distance: int,
     causal: bool,
+    policy_path: str = "",
 ) -> torch.Tensor:
     """Run padded varlen FlashDeBERTa attention.
 
@@ -1916,6 +1994,7 @@ def flashdeberta_varlen_padded(
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized kernel-policy override path.
     :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
     """
 
@@ -1935,6 +2014,7 @@ def flashdeberta_varlen_padded(
             int(position_buckets),
             int(max_relative_distance),
             bool(causal),
+            str(policy_path),
         )
         return output
 
@@ -1960,6 +2040,7 @@ def flashdeberta_varlen_padded(
             int(position_buckets),
             int(max_relative_distance),
             bool(causal),
+            str(policy_path),
         )
 
     detail = flashdeberta_varlen_import_error()

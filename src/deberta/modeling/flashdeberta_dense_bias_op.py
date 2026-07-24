@@ -52,6 +52,7 @@ def _dense_bias_repo_tuned_config(
     dtype: torch.dtype,
     device: torch.device,
     has_mask: bool,
+    policy_path: str = "",
 ) -> tuple[int, int, int, int] | None:
     """Return repo-local dense-bias builder configs for measured hot paths.
 
@@ -64,6 +65,7 @@ def _dense_bias_repo_tuned_config(
     :param torch.dtype dtype: Input/output dtype.
     :param torch.device device: CUDA device hosting the builder tensors.
     :param bool has_mask: Whether the keep mask is active.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
         or ``None`` when no measured config is promoted.
     """
@@ -81,7 +83,8 @@ def _dense_bias_repo_tuned_config(
             head_dim=0,
             dtype=_kernel_dtype_name(dtype),
             has_mask=has_mask,
-        )
+        ),
+        policy_path=policy_path,
     )
 
 
@@ -93,6 +96,7 @@ def _dense_bias_kernel_config(
     dtype: torch.dtype,
     device: torch.device,
     has_mask: bool,
+    policy_path: str = "",
 ) -> tuple[int, int, int, int]:
     """Resolve the fused dense-bias builder launch config.
 
@@ -102,6 +106,7 @@ def _dense_bias_kernel_config(
     :param torch.dtype dtype: Input/output dtype.
     :param torch.device device: CUDA device hosting the builder tensors.
     :param bool has_mask: Whether the keep mask is active.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
@@ -112,6 +117,7 @@ def _dense_bias_kernel_config(
         dtype=dtype,
         device=device,
         has_mask=has_mask,
+        policy_path=policy_path,
     )
     if tuned is not None:
         return tuned
@@ -493,6 +499,7 @@ def _dense_bias_forward_cuda(
     bucket_index: torch.Tensor,
     keep_mask: torch.Tensor | None,
     scale: float,
+    policy_path: str = "",
 ) -> torch.Tensor:
     """Build scaled dense flash bias with the fused Triton forward kernel.
 
@@ -501,6 +508,7 @@ def _dense_bias_forward_cuda(
     :param torch.Tensor bucket_index: Dense bucket map in ``(S,S)`` layout.
     :param torch.Tensor | None keep_mask: Optional keep mask in ``(B,1,S,S)`` or per-head ``(B,H,S,S)`` layout.
     :param float scale: Scale applied to the final additive bias.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return torch.Tensor: Scaled dense additive bias in ``(B,H,S,S)`` layout.
     """
 
@@ -531,6 +539,7 @@ def _dense_bias_forward_cuda(
         dtype=reference.dtype,
         device=reference.device,
         has_mask=keep_mask is not None,
+        policy_path=policy_path,
     )
     mask_stride_b, _, mask_stride_s, mask_stride_n = strides_or_zeros(keep_mask, 4)
 

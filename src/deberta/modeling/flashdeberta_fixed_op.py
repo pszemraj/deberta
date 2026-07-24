@@ -91,6 +91,8 @@ def _cdiv(a: int, b: int) -> int:
 def _fixed_repo_tuned_config(
     *,
     kind: str,
+    batch_size: int,
+    num_heads: int,
     query_len: int,
     key_len: int,
     head_dim: int,
@@ -99,10 +101,14 @@ def _fixed_repo_tuned_config(
     att_span: int,
     dtype: torch.dtype,
     device: torch.device,
+    has_mask: bool,
+    policy_path: str,
 ) -> tuple[int, int, int, int] | None:
     """Return repo-local tuned kernel configs for measured hot paths.
 
     :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
     :param int query_len: Query sequence length.
     :param int key_len: Key sequence length.
     :param int head_dim: Attention head dimension.
@@ -111,6 +117,8 @@ def _fixed_repo_tuned_config(
     :param int att_span: Effective relative-position span.
     :param torch.dtype dtype: Kernel dtype.
     :param torch.device device: CUDA device for the kernel launch.
+    :param bool has_mask: Whether explicit sequence lengths are active.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
         or ``None`` when no repo-local override applies.
     """
@@ -122,14 +130,18 @@ def _fixed_repo_tuned_config(
             route="fixed",
             kind=normalized_kind,
             seq_len=max(query_len, key_len),
+            batch_size=batch_size,
             query_len=query_len,
             key_len=key_len,
+            num_heads=num_heads,
             head_dim=head_dim,
             dtype=_kernel_dtype_name(dtype),
             causal=causal,
             disentangled=disentangled,
             att_span=att_span,
-        )
+            has_mask=has_mask,
+        ),
+        policy_path=policy_path,
     )
 
 
@@ -171,6 +183,8 @@ def _materialize_fixed_seq_lengths(
 def _fixed_config(
     *,
     kind: str,
+    batch_size: int,
+    num_heads: int,
     query_len: int,
     key_len: int,
     head_dim: int,
@@ -180,10 +194,14 @@ def _fixed_config(
     dtype: torch.dtype,
     device: torch.device,
     has_pos: bool,
+    has_mask: bool,
+    policy_path: str,
 ) -> tuple[int, int, int, int]:
     """Resolve a fixed forward or backward Triton tile config.
 
     :param str kind: Either ``"fwd"`` or ``"bwd"``.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
     :param int query_len: Query sequence length.
     :param int key_len: Key sequence length.
     :param int head_dim: Per-head hidden size.
@@ -193,12 +211,16 @@ def _fixed_config(
     :param torch.dtype dtype: Activation dtype.
     :param torch.device device: CUDA device.
     :param bool has_pos: Whether any disentangled positional term is active.
+    :param bool has_mask: Whether explicit sequence lengths are active.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[int, int, int, int]: ``(BLOCK_M, BLOCK_N, stages, warps)``.
     """
 
     att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     tuned = _fixed_repo_tuned_config(
         kind=kind,
+        batch_size=batch_size,
+        num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
@@ -207,6 +229,8 @@ def _fixed_config(
         att_span=att_span,
         dtype=dtype,
         device=device,
+        has_mask=has_mask,
+        policy_path=policy_path,
     )
     if tuned is not None:
         return tuned
@@ -224,6 +248,7 @@ def _fixed_triton_forward_impl(
     position_buckets: int,
     max_relative_distance: int,
     causal: bool,
+    policy_path: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the raw fixed forward Triton kernel through ``wrap_triton``.
 
@@ -237,6 +262,7 @@ def _fixed_triton_forward_impl(
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor]: Output tensor and padded LSE tensor.
     """
 
@@ -251,6 +277,8 @@ def _fixed_triton_forward_impl(
     att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     block_m, block_n, num_stages, num_warps = _fixed_config(
         kind="fwd",
+        batch_size=batch_size,
+        num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
@@ -260,6 +288,8 @@ def _fixed_triton_forward_impl(
         dtype=q.dtype,
         device=q.device,
         has_pos=(pos_key is not None or pos_query is not None),
+        has_mask=seq_lengths is not None,
+        policy_path=policy_path,
     )
 
     seq_lengths_full = _materialize_fixed_seq_lengths(
@@ -351,6 +381,7 @@ def _fixed_triton_backward_impl(
     position_buckets: int,
     max_relative_distance: int,
     causal: bool,
+    policy_path: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Launch the raw fixed backward Triton kernels through ``wrap_triton``.
 
@@ -367,6 +398,7 @@ def _fixed_triton_backward_impl(
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Gradients for q/k/v and optional positional tensors.
     """
@@ -382,6 +414,8 @@ def _fixed_triton_backward_impl(
     att_span = disentangled_attention_span(position_buckets, max_relative_distance)
     block_m, block_n, num_stages, num_warps = _fixed_config(
         kind="bwd",
+        batch_size=batch_size,
+        num_heads=num_heads,
         query_len=query_len,
         key_len=key_len,
         head_dim=head_dim,
@@ -391,6 +425,8 @@ def _fixed_triton_backward_impl(
         dtype=q.dtype,
         device=q.device,
         has_pos=(pos_key is not None or pos_query is not None),
+        has_mask=seq_lengths is not None,
+        policy_path=policy_path,
     )
 
     seq_lengths_full = _materialize_fixed_seq_lengths(
@@ -410,6 +446,8 @@ def _fixed_triton_backward_impl(
         dq = torch.zeros_like(q)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
+    # Match pinned FlashDeBERTa 0.0.7: positional atomic destinations use the
+    # model dtype; CUDA bf16 atomics are supported on the repo floor (sm80+).
     dk_pos = torch.zeros_like(pos_key) if pos_key is not None else None
     dq_pos = torch.zeros_like(pos_query) if pos_query is not None else None
 
@@ -585,7 +623,8 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         mutates_args=(),
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor? seq_lengths, Tensor? pos_key, Tensor? pos_query, "
-            "float sm_scale, int position_buckets, int max_relative_distance, bool causal) -> (Tensor, Tensor)"
+            "float sm_scale, int position_buckets, int max_relative_distance, bool causal, "
+            "str policy_path) -> (Tensor, Tensor)"
         ),
     )
     def _forward_op(
@@ -599,6 +638,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run fixed-length attention as one opaque CUDA op.
 
@@ -612,6 +652,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
         :param bool causal: Whether causal masking is enabled.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor]: Fixed-length output and LSE tensors.
         """
 
@@ -626,6 +667,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
             causal=causal,
+            policy_path=policy_path,
         )
 
     @torch.library.triton_op(
@@ -634,7 +676,8 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor? seq_lengths, Tensor out, Tensor lse, "
             "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, "
-            "int max_relative_distance, bool causal) -> (Tensor, Tensor, Tensor, Tensor?, Tensor?)"
+            "int max_relative_distance, bool causal, str policy_path) -> "
+            "(Tensor, Tensor, Tensor, Tensor?, Tensor?)"
         ),
     )
     def _backward_op(
@@ -651,6 +694,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         position_buckets: int,
         max_relative_distance: int,
         causal: bool,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run fixed-length backward as one compile-visible Triton op.
 
@@ -667,6 +711,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         :param int position_buckets: Relative-position bucket count.
         :param int max_relative_distance: Maximum relative distance.
         :param bool causal: Whether causal masking is enabled.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             Gradients for q/k/v and positional tensors, with empty tensor sentinels
             when the corresponding positional input is absent.
@@ -686,6 +731,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
             position_buckets=position_buckets,
             max_relative_distance=max_relative_distance,
             causal=causal,
+            policy_path=policy_path,
         )
         if dpos_key is None:
             dpos_key = q.new_empty((0,))
@@ -716,6 +762,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
             position_buckets,
             max_relative_distance,
             causal,
+            policy_path,
         ) = inputs
         out, lse = output
         saved: list[torch.Tensor] = [q, k, v, out, lse]
@@ -735,6 +782,7 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
         ctx.position_buckets = int(position_buckets)
         ctx.max_relative_distance = int(max_relative_distance)
         ctx.causal = bool(causal)
+        ctx.policy_path = str(policy_path)
 
     def _backward(
         ctx: Any,
@@ -775,12 +823,13 @@ def _build_fixed_triton_ops() -> tuple[Any | None, Any | None]:
             ctx.position_buckets,
             ctx.max_relative_distance,
             ctx.causal,
+            ctx.policy_path,
         )
         if not bool(ctx.has_pos_key):
             dpos_key = None
         if not bool(ctx.has_pos_query):
             dpos_query = None
-        return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None
+        return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None, None
 
     torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
     return _forward_op, _backward_op
@@ -801,6 +850,7 @@ def flashdeberta_fixed(
     position_buckets: int,
     max_relative_distance: int,
     causal: bool,
+    policy_path: str = "",
 ) -> torch.Tensor:
     """Run fixed-length FlashDeBERTa attention.
 
@@ -817,6 +867,7 @@ def flashdeberta_fixed(
     :param int position_buckets: Relative-position bucket count.
     :param int max_relative_distance: Maximum relative distance.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized kernel-policy override path.
     :return torch.Tensor: Attention output in ``(B, H, S, D)`` layout.
     """
 
@@ -832,6 +883,7 @@ def flashdeberta_fixed(
             int(position_buckets),
             int(max_relative_distance),
             bool(causal),
+            str(policy_path),
         )
         return output
 

@@ -473,7 +473,6 @@ def test_build_hf_configs_propagates_flash_runtime_policy(tmp_path: Path):
             "attention_impl": "flash",
             "model_size": "xsmall",
             "flash": {
-                "docblock_bias_seq_len": 0,
                 "kernel_overrides_path": str(override_path),
             },
         },
@@ -488,17 +487,12 @@ def test_build_hf_configs_propagates_flash_runtime_policy(tmp_path: Path):
 
     for built_cfg in (disc_cfg, gen_cfg):
         assert built_cfg.hf_attention_impl == "flash"
-        assert built_cfg.hf_flash["docblock_bias_seq_len"] == 0
         assert built_cfg.hf_flash["kernel_overrides_path"] == str(override_path)
 
     from deberta.modeling.deberta_v2_native import DebertaV2Attention
     from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
-    from deberta.modeling.flashdeberta_kernel_tuning import configure_flashdeberta_kernel_overrides
 
-    try:
-        assert isinstance(DebertaV2Attention(disc_cfg).self, FlashDisentangledSelfAttention)
-    finally:
-        configure_flashdeberta_kernel_overrides(None)
+    assert isinstance(DebertaV2Attention(disc_cfg).self, FlashDisentangledSelfAttention)
 
 
 def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:

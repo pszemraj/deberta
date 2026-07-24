@@ -567,14 +567,7 @@ def _apply_hf_config_normalization(
     _apply_dropout_overrides(cfg, model_cfg)
     cfg.hf_attention_kernel = str(model_cfg.hf.attention_kernel)
     cfg.hf_attention_impl = str(model_cfg.hf.attention_impl)
-    flash_cfg = model_cfg.hf.flash
-
-    cfg.hf_flash = {
-        "docblock_bias_seq_len": (
-            None if flash_cfg.docblock_bias_seq_len is None else int(flash_cfg.docblock_bias_seq_len)
-        ),
-        "kernel_overrides_path": flash_cfg.kernel_overrides_path,
-    }
+    cfg.hf_flash = {"kernel_overrides_path": model_cfg.hf.flash.kernel_overrides_path}
     cfg.use_rmsnorm_heads = False
 
 

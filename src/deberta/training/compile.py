@@ -12,10 +12,10 @@ import torch
 
 from deberta.config import ModelConfig, ModelHFFlashConfig, _normalize_sdpa_kernel
 from deberta.modeling.flashdeberta_kernel_tuning import (
-    configure_flashdeberta_kernel_overrides,
     flash_padding_route,
     flash_route_choice,
     flash_seq_bucket,
+    normalize_flash_kernel_policy_path,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability
 from deberta.modeling.mask_utils import (
@@ -116,58 +116,51 @@ def _flash_route_hint_for_docblock_batch(
     flash_cfg: ModelHFFlashConfig | None = None,
     device: torch.device | None = None,
 ) -> str:
-    """Select the doc-block flash backend for one packed batch.
-
-    The default policy comes from the repo-local JSON route table. Measured
-    packed RTD sequence buckets choose dense ``docblock_bias`` on GPUs with
-    matching capability-scoped rows (shipped: ``sm_120``); other hardware
-    defaults to the segment-aware ragged ``docblock`` route. The dense rows
-    carry ``max_seq_len``/``max_batch_size`` bounds because the route saves a
-    ``(B,H,S,S)`` bias for backward; out-of-bounds batches stay ragged. Set
-    ``docblock_bias_seq_len`` to force dense at one exact length on any GPU
-    regardless of bounds, or ``0`` to force ragged for ablations.
+    """Select the segment-aware ragged backend for one packed batch.
 
     :param int seq_len: Packed sequence length.
-    :param int | None batch_size: Packed batch size, when known.
-    :param ModelHFFlashConfig | None flash_cfg: Optional resolved flash config.
-    :param torch.device | None device: Batch device for capability-scoped table rows.
-    :return str: Either ``docblock_bias`` or ``docblock``.
+    :param int | None batch_size: Unused packed batch size.
+    :param ModelHFFlashConfig | None flash_cfg: Unused resolved flash config.
+    :param torch.device | None device: Unused batch device.
+    :return str: ``"docblock"``.
     """
 
-    override_bias_seq_len = flash_cfg.docblock_bias_seq_len if flash_cfg is not None else None
-    if override_bias_seq_len is not None:
-        if int(override_bias_seq_len) > 0 and int(seq_len) == int(override_bias_seq_len):
-            return "docblock_bias"
-        return "docblock"
-
-    seq_bucket = flash_seq_bucket(seq_len=int(seq_len))
-    table_route = flash_route_choice(
-        policy="docblock",
-        seq_bucket=seq_bucket,
-        compute_capability=device_compute_capability(device) if device is not None else None,
-        seq_len=int(seq_len),
-        batch_size=int(batch_size) if batch_size is not None else None,
-    )
-    if table_route in {"docblock", "docblock_bias"}:
-        return table_route
+    del seq_len, batch_size, flash_cfg, device
     return "docblock"
 
 
 def _flash_meta_with_route(
-    flash_meta: FlashBatchMeta | None, route_hint: str | None
+    flash_meta: FlashBatchMeta | None,
+    route_hint: str | None,
+    *,
+    kernel_policy_path: str,
 ) -> FlashBatchMeta | None:
     """Return metadata with a route hint override.
 
     :param FlashBatchMeta | None flash_meta: Existing metadata bundle.
     :param str | None route_hint: Route hint to install.
+    :param str kernel_policy_path: Normalized model-scoped policy path.
     :return FlashBatchMeta | None: Metadata bundle with the requested route.
     """
 
     if flash_meta is None:
-        return FlashBatchMeta(route_hint=route_hint) if route_hint is not None else None
-    if flash_meta.route_hint == route_hint:
+        return (
+            FlashBatchMeta(route_hint=route_hint, kernel_policy_path=kernel_policy_path)
+            if route_hint is not None
+            else None
+        )
+    if flash_meta.route_hint is not None and flash_meta.kernel_policy_path != kernel_policy_path:
+        raise RuntimeError(
+            "FlashDeBERTa route metadata was prepared for a different kernel policy: "
+            f"metadata={flash_meta.kernel_policy_path!r}, model={kernel_policy_path!r}."
+        )
+    if flash_meta.route_hint == route_hint and flash_meta.kernel_policy_path == kernel_policy_path:
         return flash_meta
-    return dataclasses.replace(flash_meta, route_hint=route_hint)
+    return dataclasses.replace(
+        flash_meta,
+        route_hint=route_hint,
+        kernel_policy_path=kernel_policy_path,
+    )
 
 
 def prepare_flash_attention_batch_metadata(
@@ -202,8 +195,9 @@ def prepare_flash_attention_batch_metadata(
     batch_size = int(input_ids.shape[0])
     routing_device = route_device if route_device is not None else input_ids.device
     flash_enabled = bool(flash_enabled)
-    if flash_enabled and btype == "hf_deberta_v2" and flash_cfg is not None:
-        configure_flashdeberta_kernel_overrides(flash_cfg.kernel_overrides_path)
+    policy_path = normalize_flash_kernel_policy_path(
+        flash_cfg.kernel_overrides_path if flash_cfg is not None else None
+    )
 
     doc_ids = batch.pop("doc_ids", None)
     if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
@@ -216,12 +210,15 @@ def prepare_flash_attention_batch_metadata(
             flash_cfg=flash_cfg,
             device=routing_device,
         )
-        batch["attention_mask"] = (
-            build_doc_block_mask(doc_ids) if route_hint == "docblock_bias" else doc_ids.ne(0)
-        )
+        batch["attention_mask"] = doc_ids.ne(0)
         return (
             batch,
-            dataclasses.replace(flash_meta, doc_ids=doc_ids, route_hint=route_hint),
+            dataclasses.replace(
+                flash_meta,
+                doc_ids=doc_ids,
+                route_hint=route_hint,
+                kernel_policy_path=policy_path,
+            ),
         )
 
     if btype != "hf_deberta_v2" or not flash_enabled:
@@ -231,12 +228,16 @@ def prepare_flash_attention_batch_metadata(
     if attention_mask is None:
         route_hint = flash_route_choice(
             policy="local_bias",
-            seq_bucket=flash_seq_bucket(seq_len=seq_len),
+            seq_bucket=flash_seq_bucket(seq_len=seq_len, policy_path=policy_path),
             compute_capability=device_compute_capability(routing_device),
             seq_len=seq_len,
             batch_size=batch_size,
+            policy_path=policy_path,
         )
-        return batch, FlashBatchMeta(route_hint="local_bias" if route_hint == "local_bias" else "dense")
+        return batch, FlashBatchMeta(
+            route_hint="local_bias" if route_hint == "local_bias" else "dense",
+            kernel_policy_path=policy_path,
+        )
     if not isinstance(attention_mask, torch.Tensor):
         return batch, None
     if is_pairwise_mask(attention_mask, query_len=seq_len, key_len=seq_len):
@@ -249,8 +250,13 @@ def prepare_flash_attention_batch_metadata(
         total_tokens=int(flash_meta.active_tokens_scalar),
         batch_size=batch_size,
         compute_capability=device_compute_capability(routing_device),
+        policy_path=policy_path,
     )
-    return batch, dataclasses.replace(flash_meta, route_hint=route_hint)
+    return batch, dataclasses.replace(
+        flash_meta,
+        route_hint=route_hint,
+        kernel_policy_path=policy_path,
+    )
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:
@@ -479,6 +485,16 @@ def _install_stable_backbone_compile_dispatch(
     dense_hs1_fn = dense_hs1
     masked_hs0_fn = masked_hs0
     masked_hs1_fn = masked_hs1
+    policy_paths = {
+        str(submodule.flash_kernel_policy_path)
+        for submodule in module.modules()
+        if hasattr(submodule, "flash_kernel_policy_path")
+    }
+    if len(policy_paths) > 1:
+        raise RuntimeError(
+            f"{target} contains conflicting FlashDeBERTa kernel policies: {sorted(policy_paths)}."
+        )
+    kernel_policy_path = next(iter(policy_paths), "")
 
     def _make_routed_dense_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
         """Bind a fixed flash route onto one stable dense entrypoint.
@@ -488,7 +504,10 @@ def _install_stable_backbone_compile_dispatch(
         :return Callable[..., Any]: Route-bound dense entrypoint.
         """
 
-        routed_meta = FlashBatchMeta(route_hint=route)
+        routed_meta = FlashBatchMeta(
+            route_hint=route,
+            kernel_policy_path=kernel_policy_path,
+        )
 
         def _routed_dense_fn(
             *,
@@ -553,7 +572,11 @@ def _install_stable_backbone_compile_dispatch(
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                flash_meta=_flash_meta_with_route(flash_meta, route),
+                flash_meta=_flash_meta_with_route(
+                    flash_meta,
+                    route,
+                    kernel_policy_path=kernel_policy_path,
+                ),
             )
 
         return _routed_masked_fn
@@ -677,7 +700,11 @@ def _install_stable_backbone_compile_dispatch(
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            flash_meta=_flash_meta_with_route(flash_meta, route),
+            flash_meta=_flash_meta_with_route(
+                flash_meta,
+                route,
+                kernel_policy_path=kernel_policy_path,
+            ),
         )
 
     module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]

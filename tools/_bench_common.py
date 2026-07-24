@@ -18,7 +18,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,8 +55,9 @@ from deberta.modeling import build_backbone_configs  # noqa: E402
 from deberta.modeling.deberta_v2_native import DebertaV2Model  # noqa: E402
 from deberta.modeling.flashdeberta_kernel_tuning import (  # noqa: E402
     compute_capability_key,
-    configure_flashdeberta_kernel_overrides,
     flash_seq_bucket,
+    normalize_flash_kernel_policy_path,
+    validate_flashdeberta_kernel_overrides,
 )
 from deberta.modeling.flashdeberta_op_utils import device_compute_capability  # noqa: E402
 from deberta.modeling.mask_utils import FlashBatchMeta  # noqa: E402
@@ -166,22 +167,32 @@ def parse_candidate_specs(values: list[str]) -> list[tuple[str, str | None]]:
 
 @contextmanager
 def candidate_kernel_overrides(
+    model: DebertaV2Model,
     path: str | None,
-    *,
-    restore_path: str | None,
-) -> Iterator[None]:
-    """Apply one kernel override table for the duration of a tuning sweep.
+) -> Iterator[str]:
+    """Apply one model-scoped kernel policy for the duration of a tuning sweep.
 
+    :param DebertaV2Model model: Backbone whose Flash attention layers are tuned.
     :param str | None path: Candidate override JSON, or None for the shipped table.
-    :param str | None restore_path: Override path to restore afterward.
-    :return Iterator[None]: Context that restores prior values on exit.
+    :return Iterator[str]: Context yielding the normalized candidate path.
     """
 
-    configure_flashdeberta_kernel_overrides(path)
+    policy_path = normalize_flash_kernel_policy_path(path)
+    if policy_path:
+        validate_flashdeberta_kernel_overrides(policy_path)
+    attention_modules = [module for module in model.modules() if hasattr(module, "flash_kernel_policy_path")]
+    previous_paths = [str(module.flash_kernel_policy_path) for module in attention_modules]
+    for module in attention_modules:
+        module.flash_kernel_policy_path = policy_path
     try:
-        yield
+        yield policy_path
     finally:
-        configure_flashdeberta_kernel_overrides(restore_path)
+        for module, previous_path in zip(
+            attention_modules,
+            previous_paths,
+            strict=True,
+        ):
+            module.flash_kernel_policy_path = previous_path
 
 
 def load_tool_config_and_loader(
@@ -437,6 +448,7 @@ def sample_flash_batches(
                 seq_len=seq_len,
                 total_tokens=active_tokens,
                 batch_size=batch_size,
+                policy_path=getattr(model_cfg.hf.flash, "kernel_overrides_path", None),
             )
         pair_density: float | None = None
         if with_pair_density and isinstance(attention_mask, torch.Tensor):
@@ -582,7 +594,6 @@ def run_candidate_sweep(
     samples: list[BatchSample],
     candidates: list[tuple[str, str | None]],
     routes: list[str],
-    restore_path: str | None,
     meta_fn: Callable[[BatchSample, str], FlashBatchMeta | None],
     warmup: int,
     steps: int,
@@ -593,7 +604,6 @@ def run_candidate_sweep(
     :param list[BatchSample] samples: Sampled real batches.
     :param list[tuple[str, str | None]] candidates: Named override-table candidates.
     :param list[str] routes: Explicit route names to benchmark.
-    :param str | None restore_path: Configured override path restored after each candidate.
     :param Callable meta_fn: Metadata builder receiving one sample and route.
     :param int warmup: Warmup sweeps per candidate/route pair.
     :param int steps: Timed sweeps per candidate/route pair.
@@ -602,13 +612,20 @@ def run_candidate_sweep(
 
     results: list[CandidateSweepResult] = []
     for candidate_name, candidate_path in candidates:
-        with candidate_kernel_overrides(candidate_path, restore_path=restore_path):
+        with candidate_kernel_overrides(model, candidate_path) as policy_path:
             for route in routes:
                 try:
                     timing = run_timed_candidate(
                         model=model,
                         samples=samples,
-                        meta_fn=lambda sample, route=route: meta_fn(sample, route),
+                        meta_fn=lambda sample, route=route: (
+                            replace(
+                                metadata,
+                                kernel_policy_path=policy_path,
+                            )
+                            if (metadata := meta_fn(sample, route)) is not None
+                            else None
+                        ),
                         warmup=warmup,
                         steps=steps,
                     )

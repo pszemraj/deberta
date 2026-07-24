@@ -201,7 +201,6 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
                 "  hf:",
                 "    attention_impl: flash",
                 "    flash:",
-                "      docblock_bias_seq_len: 0",
                 f"      kernel_overrides_path: {override_path}",
                 "data:",
                 "  source:",
@@ -214,7 +213,6 @@ def test_load_yaml_hf_flash_config(tmp_path: Path):
     cfg = load_config(config_path)
 
     assert cfg.model.hf.attention_impl == "flash"
-    assert cfg.model.hf.flash.docblock_bias_seq_len == 0
     assert cfg.model.hf.flash.kernel_overrides_path == str(override_path)
     assert cfg.optim.lr.base == pytest.approx(1e-4)
 
@@ -306,6 +304,30 @@ def test_load_config_explains_removed_keys(
     bad.write_text(json.dumps({section: {removed_key: value}}), encoding="utf-8")
 
     with pytest.raises(ValueError, match=match):
+        load_config(bad)
+
+
+def test_load_config_explains_removed_dense_docblock_route(tmp_path: Path) -> None:
+    bad = tmp_path / "removed-flash-key.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "model": {
+                    "hf": {
+                        "flash": {
+                            "docblock_bias_seq_len": 1024,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"docblock_bias_seq_len \(remove model\.hf\.flash\.docblock_bias_seq_len",
+    ):
         load_config(bad)
 
 

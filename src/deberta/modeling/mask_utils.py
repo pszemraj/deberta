@@ -32,6 +32,7 @@ class FlashBatchMeta:
     :param torch.Tensor | None doc_num_segments_scalar: Optional CPU scalar segment-count tensor for compiled routes.
     :param torch.Tensor | None doc_max_segment_length_scalar: Optional CPU scalar max-segment tensor for compiled routes.
     :param str | None route_hint: Optional flash route hint.
+    :param str kernel_policy_path: Normalized model-scoped kernel-policy override path.
     """
 
     seq_lengths: torch.Tensor | None = None
@@ -43,6 +44,7 @@ class FlashBatchMeta:
     doc_num_segments_scalar: torch.Tensor | None = None
     doc_max_segment_length_scalar: torch.Tensor | None = None
     route_hint: str | None = None
+    kernel_policy_path: str = ""
 
     def is_cross_document(self) -> bool:
         """Return whether this batch carries packed cross-document semantics.

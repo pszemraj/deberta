@@ -108,7 +108,6 @@ def main() -> None:
         samples=samples,
         candidates=candidates,
         routes=routes,
-        restore_path=cfg.model.hf.flash.kernel_overrides_path,
         meta_fn=_route_meta,
         warmup=int(args.warmup),
         steps=int(args.steps),

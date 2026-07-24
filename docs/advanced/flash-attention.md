@@ -31,17 +31,15 @@ The adapter selects one route per batch:
 | `fixed` | dense batches and padded sequences below `2048` under the shipped policy | fixed-length disentangled flash kernels |
 | `varlen` | padded sequences at `2048+` under the shipped policy | prefix-packed variable-length kernels |
 | `local_bias` | small, dense training batches where enabled | dense relative bias with flash-with-bias kernels |
-| `docblock_bias` | packed doc-block batches where enabled | document masking folded into a dense attention bias |
+| `docblock_bias` | benchmark/parity coverage only | document masking folded into a dense attention bias |
 | `docblock` | packed doc-block batches using the ragged path | document spans repacked and processed independently by varlen kernels |
 
 Every route uses the same canonical signed relative bucket `query_position - key_position` for
 both C2P and P2C terms. Route changes must not change the encoder's attention function.
 
-Route selection comes from `route_policies` in the JSON tuning table. Upstream FlashDeBERTa environment-variable routing is not consulted. Capability-scoped doc-block and local-bias behavior is described in [GPU support](gpu-support.md).
+Route selection comes from `route_policies` in the JSON tuning table. Upstream FlashDeBERTa environment-variable routing is not consulted. Capability-scoped local-bias behavior is described in [GPU support](gpu-support.md).
 
-Dense `docblock_bias` is faster on measured shapes but saves a quadratic `(B,H,S,S)` bias for
-backward. Ragged `docblock` avoids that allocation and is the conservative choice for hardware or
-shapes without a measured dense policy.
+Normal packed training always uses ragged `docblock`. Dense `docblock_bias` is retained for benchmark and parity coverage, but it saves one quadratic `(B,H,S,S)` bias per live attention call and cannot be selected safely from sequence and batch dimensions alone.
 
 ## Mask and metadata contracts
 
@@ -62,13 +60,7 @@ Per-call eager fallbacks preserve semantics:
 
 ## Configuration and overrides
 
-All route and override fields live under `model.hf.flash.*`. Their exact null, zero, and
-exact-length semantics are defined on each field in the
-[config reference](../../configs/config_reference.yaml).
-
-An explicit `docblock_bias_seq_len` can bypass table safety bounds and is therefore an opt-in to the dense memory cost. An active `kernel_overrides_path` is loaded and validated with the training config, then merged with the shipped table for route and kernel lookups.
-
-Do not force dense `docblock_bias` above sequence length 4096 until its backward path can recompute rather than save the quadratic bias; use ragged `docblock` for longer contexts.
+The optional override path lives under `model.hf.flash.kernel_overrides_path`; its exact semantics are defined in the [config reference](../../configs/config_reference.yaml). The selected table is loaded and validated with the training config, then carried as model-owned policy through batch routing and forward/backward kernel lookup. Constructing or running another model cannot replace it.
 
 ## Tuning table
 
@@ -76,7 +68,7 @@ Defaults live in
 [`flashdeberta_kernel_tuning.json`](../../src/deberta/modeling/flashdeberta_kernel_tuning.json):
 
 - `seq_buckets` names sequence-length and density regimes.
-- `route_policies` selects routes in the `padding`, `docblock`, and `local_bias` namespaces.
+- `route_policies` selects routes in the `padding` and `local_bias` namespaces.
 - `kernels` selects Triton launch configurations by route, operation, shape bucket, and compute
   capability.
 
@@ -99,7 +91,6 @@ Before merging Flash changes, run `bash tools/premerge.sh`. It records the commi
 
 ## Runtime caveats
 
-- The shipped `sm_120` specialized dense doc-block backward atomically accumulates position gradients and is not bitwise reproducible. Comparisons involving that route must use numeric tolerances; the trainer does not run a separate numerical-drift detector.
-- Training uses `drop_last=True` because doc-block route choice depends on batch shape; allowing a
-  smaller final batch could change routes and trigger recompilation mid-epoch.
+- The benchmark-only `sm_120` specialized dense doc-block backward atomically accumulates position gradients and is not bitwise reproducible. Comparisons involving that route must use numeric tolerances; the trainer does not run a separate numerical-drift detector.
+- Training uses `drop_last=True` to keep batch-dependent padding/local-bias routing and compiled shapes stable; a smaller final batch could change routes and trigger recompilation mid-epoch.
 - Multi-GPU validation status is tracked in [Distributed training](distributed-training.md#flashdeberta-with-compile).

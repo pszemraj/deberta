@@ -174,6 +174,7 @@ def _docblock_forward_impl(
     max_seqlen: int,
     total_tokens: int,
     aux_capacity: int | None = None,
+    policy_path: str = "",
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -204,6 +205,7 @@ def _docblock_forward_impl(
     :param int total_tokens: Host-side total active token count.
     :param int | None aux_capacity: Optional fixed packed-buffer capacity for
         compile-stable auxiliary outputs.
+    :param str policy_path: Normalized kernel-policy override path.
     :raises RuntimeError: If the low-level varlen kernels are unavailable.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -307,6 +309,7 @@ def _docblock_forward_impl(
         max_relative_distance=max_relative_distance,
         causal=causal,
         att_span=att_span,
+        policy_path=policy_path,
     )
 
     out_padded = segment_unpack_padded_rows(
@@ -364,6 +367,7 @@ def _docblock_backward_impl(
     lse_unpad: torch.Tensor | None,
     pos_key_unpad: torch.Tensor | None,
     pos_query_unpad: torch.Tensor | None,
+    policy_path: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run doc-block backward and scatter packed gradients back to padded layout.
 
@@ -392,6 +396,7 @@ def _docblock_backward_impl(
     :param torch.Tensor | None lse_unpad: Optional cached packed forward LSE.
     :param torch.Tensor | None pos_key_unpad: Optional cached packed c2p tensor.
     :param torch.Tensor | None pos_query_unpad: Optional cached packed p2c tensor.
+    :param str policy_path: Normalized kernel-policy override path.
     :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         Gradients in the same padded layouts as the forward inputs.
     """
@@ -495,6 +500,7 @@ def _docblock_backward_impl(
             # of num_segments * ceil(max_segment_length / block_size).
             dense_mid_tensors=False,
             route="docblock",
+            policy_path=policy_path,
         )
 
     dq, dk, dv, dpos_key, dpos_query = run_packed_backward(
@@ -550,7 +556,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         schema=(
             "(Tensor q, Tensor k, Tensor v, Tensor segment_offsets, Tensor segment_lengths, Tensor cu_seqlens, "
             "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, int max_relative_distance, "
-            "Tensor num_segments, Tensor max_seqlen, Tensor total_tokens, bool causal) -> "
+            "Tensor num_segments, Tensor max_seqlen, Tensor total_tokens, bool causal, str policy_path) -> "
             "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
         ),
     )
@@ -570,6 +576,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         max_seqlen: torch.Tensor,
         total_tokens: torch.Tensor,
         causal: bool,
+        policy_path: str,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -598,6 +605,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor max_seqlen: Host-side maximum document segment length.
         :param torch.Tensor total_tokens: Host-side active token count.
         :param bool causal: Whether causal masking is enabled.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, ...]: Padded output/LSE plus packed forward auxiliaries.
         """
 
@@ -624,6 +632,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
                 total_tokens=total_tokens_int,
                 causal=causal,
                 aux_capacity=int(q.shape[0]) * int(q.shape[1]),
+                policy_path=policy_path,
             )
         )
         return (
@@ -655,6 +664,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         max_seqlen: torch.Tensor,
         total_tokens: torch.Tensor,
         causal: bool,
+        policy_path: str,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -683,6 +693,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor max_seqlen: Fake host-side maximum document segment length.
         :param torch.Tensor total_tokens: Fake host-side active token count.
         :param bool causal: Fake causal flag.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, ...]: Fake padded outputs and packed auxiliaries.
         """
 
@@ -697,6 +708,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             max_seqlen,
             total_tokens,
             causal,
+            policy_path,
         )
         capacity = q.shape[0] * q.shape[1]
         packed_shape = (capacity, q.shape[2], q.shape[3])
@@ -739,7 +751,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             "Tensor cu_seqlens, Tensor out, Tensor lse, Tensor? pos_key, Tensor? pos_query, float sm_scale, "
             "int position_buckets, int max_relative_distance, Tensor num_segments, Tensor max_seqlen, "
             "Tensor total_tokens, bool causal, Tensor q_unpad, Tensor k_unpad, Tensor v_unpad, Tensor out_unpad, "
-            "Tensor lse_unpad, Tensor? pos_key_unpad, Tensor? pos_query_unpad) -> "
+            "Tensor lse_unpad, Tensor? pos_key_unpad, Tensor? pos_query_unpad, str policy_path) -> "
             "(Tensor, Tensor, Tensor, Tensor?, Tensor?)"
         ),
     )
@@ -769,6 +781,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         lse_unpad: torch.Tensor,
         pos_key_unpad: torch.Tensor | None,
         pos_query_unpad: torch.Tensor | None,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Run doc-block-aware backward as one opaque CUDA op.
 
@@ -797,6 +810,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor lse_unpad: Packed forward LSE.
         :param torch.Tensor | None pos_key_unpad: Optional packed c2p tensor.
         :param torch.Tensor | None pos_query_unpad: Optional packed p2c tensor.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
             Padded gradients for q/k/v and optional positional tensors.
         """
@@ -832,6 +846,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             lse_unpad=lse_unpad,
             pos_key_unpad=pos_key_unpad,
             pos_query_unpad=pos_query_unpad,
+            policy_path=policy_path,
         )
 
     @torch.library.register_fake(_backward_op)
@@ -861,6 +876,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         lse_unpad: torch.Tensor,
         pos_key_unpad: torch.Tensor | None,
         pos_query_unpad: torch.Tensor | None,
+        policy_path: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Return fake backward outputs with static padded shapes.
 
@@ -889,6 +905,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         :param torch.Tensor lse_unpad: Fake packed LSE auxiliary.
         :param torch.Tensor | None pos_key_unpad: Fake packed c2p auxiliary.
         :param torch.Tensor | None pos_query_unpad: Fake packed p2c auxiliary.
+        :param str policy_path: Normalized kernel-policy override path.
         :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
             Fake padded gradients for q/k/v and optional positional tensors.
         """
@@ -914,6 +931,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             max_seqlen,
             total_tokens,
             causal,
+            policy_path,
         )
         dpos_key = (
             torch.empty(pos_key.shape, device=pos_key.device, dtype=pos_key.dtype)
@@ -971,6 +989,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             max_seqlen,
             total_tokens,
             causal,
+            policy_path,
         ) = inputs
         out, lse, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad, pos_key_unpad, pos_query_unpad = output
         saved: list[torch.Tensor] = [
@@ -1011,6 +1030,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
         ctx.position_buckets = int(position_buckets)
         ctx.max_relative_distance = int(max_relative_distance)
         ctx.causal = bool(causal)
+        ctx.policy_path = str(policy_path)
 
     def _backward(
         ctx: Any,
@@ -1109,6 +1129,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             lse_unpad,
             pos_key_unpad,
             pos_query_unpad,
+            ctx.policy_path,
         )
         return (
             dq,
@@ -1119,6 +1140,7 @@ def _build_docblock_custom_ops() -> tuple[Any | None, Any | None]:
             None,
             dpos_key,
             dpos_query,
+            None,
             None,
             None,
             None,
@@ -1152,6 +1174,7 @@ def flashdeberta_docblock(
     max_seqlen: torch.Tensor,
     total_tokens: torch.Tensor,
     causal: bool,
+    policy_path: str = "",
 ) -> torch.Tensor:
     """Run doc-block-aware FlashDeBERTa attention.
 
@@ -1170,6 +1193,7 @@ def flashdeberta_docblock(
     :param torch.Tensor max_seqlen: Host-side maximum segment length scalar.
     :param torch.Tensor total_tokens: Host-side total active token count scalar.
     :param bool causal: Whether causal masking is enabled.
+    :param str policy_path: Normalized model-scoped kernel-policy override path.
     :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
     """
 
@@ -1192,6 +1216,7 @@ def flashdeberta_docblock(
         max_seqlen,
         total_tokens,
         bool(causal),
+        str(policy_path),
     )
     return output
 

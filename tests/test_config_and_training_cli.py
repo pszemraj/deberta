@@ -537,18 +537,18 @@ def test_validate_model_config_normalizes_hf_attention_kernel_alias():
 def test_validate_model_config_normalizes_hf_flash_config():
     cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        hf={"attention_impl": "flash", "flash": {"docblock_bias_seq_len": "4096"}},
+        hf={"attention_impl": "flash", "flash": {"kernel_overrides_path": "  "}},
     )
     validate_model_config(cfg)
 
     assert cfg.hf.attention_impl == "flash"
-    assert cfg.hf.flash.docblock_bias_seq_len == 4096
+    assert cfg.hf.flash.kernel_overrides_path is None
 
 
 def test_validate_model_config_warns_when_flash_options_are_inactive() -> None:
     cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        hf={"flash": {"docblock_bias_seq_len": 1024}},
+        hf={"flash": {"kernel_overrides_path": "custom.json"}},
     )
 
     with pytest.warns(UserWarning, match=r"model\.hf\.flash\.\* has no effect"):
@@ -599,6 +599,71 @@ def test_validate_model_config_warns_when_flash_options_are_inactive() -> None:
             },
             r"kernels\[0\]\.max_query_len must be a positive integer",
         ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 3,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 4,
+                    }
+                ]
+            },
+            r"kernels\[0\]\.block_m must be a positive power of two",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 16,
+                        "block_n": 24,
+                        "num_stages": 1,
+                        "num_warps": 4,
+                    }
+                ]
+            },
+            r"kernels\[0\]\.block_n must be a positive power of two",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 3,
+                    }
+                ]
+            },
+            r"kernels\[0\]\.num_warps must be a positive power of two",
+        ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 16,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 4,
+                        "num_head": 12,
+                    }
+                ]
+            },
+            r"kernels\[0\] has unknown field\(s\): num_head",
+        ),
     ],
     ids=[
         "missing_file",
@@ -607,6 +672,10 @@ def test_validate_model_config_warns_when_flash_options_are_inactive() -> None:
         "out_of_range_density",
         "non_positive_policy_bound",
         "malformed_kernel_bound",
+        "non_power_of_two_block",
+        "non_power_of_two_block_n",
+        "illegal_num_warps",
+        "unknown_kernel_constraint",
     ],
 )
 def test_validate_model_config_rejects_invalid_flash_kernel_overrides(
@@ -938,14 +1007,14 @@ def test_build_run_metadata_records_flash_attention(monkeypatch: pytest.MonkeyPa
         lambda name: "0.0.7" if str(name) == "flashdeberta" else "0.0.0",
     )
     model_cfg = make_model_config(
-        hf={"attention_impl": "flash", "flash": {"docblock_bias_seq_len": 1024}},
+        hf={"attention_impl": "flash"},
     )
     validate_model_config(model_cfg)
 
     meta = _build_run_metadata(model_cfg=model_cfg)
 
     assert meta["flash_attention"]["requested_attention_impl"] == "flash"
-    assert meta["flash_attention"]["requested_flash_config"]["docblock_bias_seq_len"] == 1024
+    assert meta["flash_attention"]["requested_flash_config"]["kernel_overrides_path"] is None
     assert meta["flash_attention"]["flashdeberta_version"] == "0.0.7"
 
 
