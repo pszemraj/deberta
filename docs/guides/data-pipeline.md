@@ -102,6 +102,8 @@ Mask replacement controls:
 
 Replacement probabilities are conditional on token selection and must sum to at most one; the remainder keeps the original token.
 
+Masking uses `attention_mask` liveness captured before padding metadata is simplified. Inactive positions are never corruption targets and keep `labels=-100`. Each row's target budget uses its active length, including active special tokens, rather than the padded batch width; special tokens are then excluded from candidate selection. Whole-word masking applies a complete selected word before checking the budget, so it may overshoot the nominal target by one word.
+
 Unmasked labels are `-100`; masked labels keep original token ids.
 
 ## Performance path for unpadded batches

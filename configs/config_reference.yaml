@@ -291,7 +291,7 @@
 # train.objective
 
 # [train.objective.mlm_probability] float = 0.15; must be finite and in (0, 1).
-# Fraction of active eligible tokens selected for MLM/RTD corruption; 0.15 is the parity default.
+# Sets each row's target budget from active length, including active special tokens; candidate selection then excludes special and inactive positions. Whole-word masking may exceed the nominal budget by one complete word. 0.15 is the parity default.
 
 # [train.objective.mask_token_prob] float; schema default 1.0; omission is 1.0 for native and 0.8 for RoPE.
 # Must be finite and >= 0; sum with `random_token_prob` must be <= 1. It is the conditional selected-token probability of replacing with MASK; leftover probability keeps the original token.

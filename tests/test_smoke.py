@@ -977,33 +977,67 @@ def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: py
     monkeypatch.setattr(torch, "randint", fake_randint)
     monkeypatch.setattr(torch, "multinomial", fake_multinomial)
 
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([input_ids.shape[1]]),
+        max_ngram=3,
+    )
 
     # Windowed DeBERTa selection can cover each local context once under deterministic
     # sampling, yielding four masked lexical tokens in this toy sequence.
     assert int(labels.ne(-100).sum().item()) == 4
 
 
-def test_ngram_masking_does_not_split_selected_word_groups():
+def test_ngram_masking_applies_complete_word_before_budget_stop(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(
         vocab_size=128,
-        token_map={10: "hello", 11: "##world"},
+        token_map={10: "hello", 11: "##world", 12: "another", 13: "##word"},
         tokenize_output=["hello", "##world"],
         default_token_prefix="tok",
     )
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
-        # S=4 and p=0.2 -> num_to_predict=1 token budget. Whole-word masking must
-        # still mask the full two-piece word group (allowing bounded overshoot).
-        cfg=MLMConfig(mlm_probability=0.2, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
+        cfg=MLMConfig(mlm_probability=0.3, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
     )
-    input_ids = torch.tensor([[tok.cls_token_id, 10, 11, tok.sep_token_id]], dtype=torch.long)
-    special = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
+    input_ids = torch.tensor(
+        [
+            [
+                tok.cls_token_id,
+                10,
+                11,
+                12,
+                13,
+                tok.sep_token_id,
+                tok.sep_token_id,
+                tok.sep_token_id,
+                tok.sep_token_id,
+                tok.sep_token_id,
+            ]
+        ],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, 0, 0, 0, 0, 1, 1, 1, 1, 1]], dtype=torch.bool)
 
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
-    assert int(labels.ne(-100).sum().item()) == 2
-    assert masked[0, 1].item() == tok.mask_token_id
-    assert masked[0, 2].item() == tok.mask_token_id
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda input, num_samples, replacement=False: torch.tensor([1], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, **kwargs: torch.tensor([0], dtype=torch.long),
+    )
+
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([input_ids.shape[1]]),
+        max_ngram=3,
+    )
+    assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1, 2, 3, 4]))
+    assert torch.equal(masked[0, 1:5], torch.full((4,), tok.mask_token_id))
 
 
 def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pytest.MonkeyPatch):
@@ -1029,7 +1063,12 @@ def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pyte
         return torch.tensor([50, 51], dtype=torch.long)[:n]
 
     monkeypatch.setattr(coll, "_sample_random_words", _sample_random)
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([input_ids.shape[1]]),
+        max_ngram=3,
+    )
 
     assert calls["n"] == 1
     assert int(labels.ne(-100).sum().item()) == 2
@@ -1050,7 +1089,12 @@ def test_ngram_masking_respects_specials():
     )
     special = torch.tensor([[1, 0, 0, 1, 0, 1, 1]], dtype=torch.bool)
 
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([5]),
+        max_ngram=3,
+    )
 
     # Never compute loss on specials.
     assert labels[0, 0].item() == -100
@@ -1061,6 +1105,37 @@ def test_ngram_masking_respects_specials():
     assert masked[0, 0].item() == tok.cls_token_id
     assert masked[0, 3].item() == tok.sep_token_id
     assert masked[0, 5].item() == tok.pad_token_id
+
+
+def test_collator_never_masks_inactive_nonpad_tokens():
+    from deberta.training.loop_utils import _count_rtd_tokens_for_batch
+
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.999,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=1,
+        ),
+    )
+
+    batch = coll(
+        [
+            {
+                "input_ids": [tok.cls_token_id, 10, 42, tok.sep_token_id],
+                "attention_mask": [1, 1, 0, 1],
+                "special_tokens_mask": [1, 0, 0, 1],
+            }
+        ]
+    )
+
+    assert batch["input_ids"][0, 1].item() == tok.mask_token_id
+    assert batch["labels"][0, 1].item() == 10
+    assert batch["input_ids"][0, 2].item() == 42
+    assert batch["labels"][0, 2].item() == -100
+    assert _count_rtd_tokens_for_batch(batch) == (1.0, 3.0)
 
 
 def test_token_level_masking_uses_fixed_budget_per_sequence():
@@ -1076,7 +1151,11 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
     counts = []
     for seed in range(10):
         torch.manual_seed(seed)
-        _, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
+        _, labels = coll._mask_tokens_unigram_windowed(
+            input_ids,
+            special_tokens_mask=special,
+            row_lengths=torch.tensor([input_ids.shape[1]]),
+        )
         counts.append(int(labels.ne(-100).sum().item()))
 
     assert set(counts) == {1}
@@ -1091,8 +1170,13 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytes
 
     calls = {"windowed": 0}
 
-    def _windowed(_input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor):
-        del special_tokens_mask
+    def _windowed(
+        _input_ids: torch.Tensor,
+        *,
+        special_tokens_mask: torch.Tensor,
+        row_lengths: torch.Tensor,
+    ):
+        del special_tokens_mask, row_lengths
         calls["windowed"] += 1
         labels = torch.full_like(_input_ids, -100)
         return _input_ids.clone(), labels
@@ -1104,28 +1188,63 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytes
     monkeypatch.setattr(coll, "_mask_tokens_unigram_windowed", _windowed)
     monkeypatch.setattr(coll, "_mask_tokens_ngram", _ngram)
 
-    _ = coll._mask_tokens(input_ids, special_tokens_mask=special)
+    _ = coll._mask_tokens(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([input_ids.shape[1]]),
+    )
     assert int(calls["windowed"]) == 1
 
 
-def test_token_level_masking_uses_fixed_budget_for_variable_length_batch():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.4, max_ngram=1))
-
-    features = [
-        {
-            "input_ids": [tok.cls_token_id, 10, 11, 12, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 0, 0, 1],
+@pytest.mark.parametrize(("max_ngram", "seed"), [(1, 17), (3, 0)])
+def test_masking_budget_is_invariant_to_padding_and_batch_peers(max_ngram: int, seed: int):
+    tok = DummyTokenizer(
+        vocab_size=256,
+        token_map={
+            10: "alpha",
+            11: "##a",
+            12: "beta",
+            13: "##b",
+            14: "gamma",
+            15: "##c",
         },
-        {"input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-    ]
-    batch = coll(features)
-    labels = batch["labels"]
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
+    if max_ngram == 1:
+        token_ids = [tok.cls_token_id, *range(10, 30), tok.sep_token_id]
+    else:
+        token_ids = [tok.cls_token_id, 10, 11, 12, 13, 14, 15, tok.sep_token_id]
+    feature = {
+        "input_ids": token_ids,
+        "special_tokens_mask": [1, *([0] * (len(token_ids) - 2)), 1],
+    }
+    cfg = MLMConfig(
+        mlm_probability=0.15,
+        mask_token_prob=1.0,
+        random_token_prob=0.0,
+        max_ngram=max_ngram,
+    )
 
-    masked_counts = labels.ne(-100).sum(dim=1).tolist()
-    # DeBERTa budget uses full sequence length (including specials/pad) before applying
-    # eligibility filtering. In this padded batch that yields [2, 1].
-    assert masked_counts == [2, 1]
+    torch.manual_seed(seed)
+    baseline = DebertaV3ElectraCollator(tokenizer=tok, cfg=cfg)([feature])["labels"][0]
+
+    torch.manual_seed(seed)
+    padded = DebertaV3ElectraCollator(tokenizer=tok, cfg=cfg, pad_to_multiple_of=128)([feature])["labels"][
+        0, : len(token_ids)
+    ]
+
+    long_peer = {
+        "input_ids": [tok.cls_token_id, *([50] * 125), tok.sep_token_id],
+        "special_tokens_mask": [1, *([0] * 125), 1],
+    }
+    torch.manual_seed(seed)
+    beside_peer = DebertaV3ElectraCollator(tokenizer=tok, cfg=cfg)([feature, long_peer])["labels"][
+        0, : len(token_ids)
+    ]
+
+    torch.testing.assert_close(padded, baseline, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(beside_peer, baseline, rtol=0.0, atol=0.0)
 
 
 def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
@@ -1307,7 +1426,11 @@ def test_collator_random_replacement_uses_full_non_special_tokenizer_vocab():
     torch.manual_seed(42)
     input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
     special = torch.zeros_like(input_ids, dtype=torch.bool)
-    masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
+    masked, labels = coll._mask_tokens_unigram_windowed(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([input_ids.shape[1]]),
+    )
     changed = labels.ne(-100)
     assert bool(changed.any().item())
     replaced = masked[changed]
