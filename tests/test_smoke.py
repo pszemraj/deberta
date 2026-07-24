@@ -2807,6 +2807,164 @@ def test_native_hf_deberta_v2_forward_smoke():
     torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
 
 
+def test_native_encoder_query_states_keep_tensor_memory_fixed() -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Encoder
+
+    class _QueryMemorySpy(torch.nn.Module):
+        def __init__(self, delta: float) -> None:
+            super().__init__()
+            self.delta = float(delta)
+            self.kv_seen: list[torch.Tensor] = []
+            self.query_seen: list[torch.Tensor] = []
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            query_states: torch.Tensor | None = None,
+            **_: object,
+        ) -> tuple[torch.Tensor, None]:
+            del attention_mask
+            assert query_states is not None
+            self.kv_seen.append(hidden_states.detach().clone())
+            self.query_seen.append(query_states.detach().clone())
+            return query_states + self.delta, None
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        relative_attention=False,
+    )
+    encoder = DebertaV2Encoder(cfg)
+    first = _QueryMemorySpy(1.0)
+    second = _QueryMemorySpy(2.0)
+    encoder.layer = torch.nn.ModuleList([first, second])
+
+    memory = torch.randn((2, 5, 8))
+    query = torch.randn((2, 3, 8))
+    output = encoder(
+        memory,
+        attention_mask=torch.ones((2, 5), dtype=torch.bool),
+        query_states=query,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    torch.testing.assert_close(first.kv_seen[0], memory)
+    torch.testing.assert_close(second.kv_seen[0], memory)
+    torch.testing.assert_close(second.query_seen[0], query + 1.0)
+    torch.testing.assert_close(output.last_hidden_state, query + 3.0)
+    assert output.hidden_states is not None
+    torch.testing.assert_close(output.hidden_states[0], query)
+    torch.testing.assert_close(output.hidden_states[1], query + 1.0)
+    torch.testing.assert_close(output.hidden_states[2], query + 3.0)
+
+
+def test_native_attention_accepts_rectangular_query_key_lengths_with_key_padding_mask() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        relative_attention=False,
+    )
+    attention = DisentangledSelfAttention(cfg).eval()
+
+    memory = torch.randn((2, 5, 8))
+    query = torch.randn((2, 3, 8))
+    key_padding_mask = torch.tensor(
+        [
+            [[[True, True, True, True, False]]],
+            [[[False, False, False, False, False]]],
+        ]
+    )
+
+    output, probabilities = attention(
+        hidden_states=memory,
+        query_states=query,
+        attention_mask=key_padding_mask,
+        output_attentions=True,
+    )
+
+    assert output.shape == (2, 3, 8)
+    assert probabilities is not None
+    assert probabilities.shape == (2, 2, 3, 5)
+    assert torch.count_nonzero(probabilities[..., -1]) == 0
+    assert torch.count_nonzero(probabilities[1]) == 0
+    assert torch.count_nonzero(output[1]) == 0
+
+
+def test_native_attention_uses_row_liveness_for_rectangular_pairwise_masks() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        relative_attention=False,
+    )
+    attention = DisentangledSelfAttention(cfg).eval()
+
+    memory = torch.randn((1, 5, 8))
+    query = torch.randn((1, 3, 8))
+    pairwise_mask = torch.tensor(
+        [
+            [
+                [
+                    [False, True, False, False, False],
+                    [False, False, True, False, False],
+                    [False, False, False, True, False],
+                ]
+            ]
+        ]
+    )
+
+    _, probabilities = attention(
+        hidden_states=memory,
+        query_states=query,
+        attention_mask=pairwise_mask,
+        output_attentions=True,
+    )
+
+    assert probabilities is not None
+    torch.testing.assert_close(
+        probabilities.sum(dim=-1),
+        torch.ones((1, 2, 3)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mask_shape", "message"),
+    [
+        ((1, 1, 1, 4), "key length mismatch"),
+        ((1, 1, 2, 5), "query length mismatch"),
+    ],
+)
+def test_native_attention_rejects_rectangular_mask_dimension_mismatches(
+    mask_shape: tuple[int, ...],
+    message: str,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        relative_attention=False,
+    )
+    attention = DisentangledSelfAttention(cfg).eval()
+
+    with pytest.raises(ValueError, match=message):
+        attention(
+            hidden_states=torch.randn((1, 5, 8)),
+            query_states=torch.randn((1, 3, 8)),
+            attention_mask=torch.ones(mask_shape, dtype=torch.bool),
+        )
+
+
 @pytest.mark.parametrize(
     ("pos_att_type", "seed"),
     [("c2p|p2c", 123), ("c2p|p2c|p2p", 321)],
@@ -2972,6 +3130,112 @@ def test_native_attention_matches_transformers_reference_on_active_tokens() -> N
         )
 
     torch.testing.assert_close(native_out[keep_mask], reference_out[keep_mask], rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 4, 4),
+        (1, 2, 4, 4),
+        (2, 1, 4, 4),
+    ],
+)
+def test_native_relative_pos_rejects_non_singleton_batch_or_head_axes(
+    shape: tuple[int, ...],
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+    )
+    attention = DisentangledSelfAttention(cfg)
+
+    with pytest.raises(ValueError, match="specific relative_pos"):
+        attention._normalize_relative_pos(
+            torch.zeros(shape, dtype=torch.long),
+            query_len=4,
+            key_len=4,
+            device=torch.device("cpu"),
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (3, 4),
+        (4, 3),
+        (5, 4),
+        (4, 5),
+    ],
+)
+def test_native_relative_pos_rejects_query_key_shape_mismatch(
+    shape: tuple[int, int],
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+    )
+    attention = DisentangledSelfAttention(cfg)
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        attention._normalize_relative_pos(
+            torch.zeros(shape, dtype=torch.long),
+            query_len=4,
+            key_len=4,
+            device=torch.device("cpu"),
+        )
+
+
+def test_native_relative_pos_accepts_singleton_wrappers_without_changing_values() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+    )
+    attention = DisentangledSelfAttention(cfg)
+    base = torch.arange(16, dtype=torch.long).reshape(4, 4)
+
+    rank2 = attention._normalize_relative_pos(
+        base,
+        query_len=4,
+        key_len=4,
+        device=torch.device("cpu"),
+    )
+    rank3 = attention._normalize_relative_pos(
+        base.unsqueeze(0),
+        query_len=4,
+        key_len=4,
+        device=torch.device("cpu"),
+    )
+    rank4 = attention._normalize_relative_pos(
+        base.unsqueeze(0).unsqueeze(0),
+        query_len=4,
+        key_len=4,
+        device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(rank2, base)
+    torch.testing.assert_close(rank3, base)
+    torch.testing.assert_close(rank4, base)
 
 
 @pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])

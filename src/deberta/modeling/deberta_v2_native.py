@@ -243,13 +243,14 @@ class DisentangledSelfAttention(nn.Module):
         key_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Resolve a canonical 2D relative-position matrix for attention bias.
+        """Resolve one shared relative-position map with exact shape ``(Q, K)``.
 
         :param torch.Tensor | None relative_pos: Optional user-provided relative-position ids.
         :param int query_len: Query length.
         :param int key_len: Key length.
         :param torch.device device: Runtime device.
-        :return torch.Tensor: Relative-position ids shaped ``(query_len, key_len)``.
+        :raises ValueError: If the map has unsupported leading axes or query/key dimensions.
+        :return torch.Tensor: Shared relative-position ids shaped ``(query_len, key_len)``.
         """
 
         if relative_pos is None:
@@ -262,15 +263,32 @@ class DisentangledSelfAttention(nn.Module):
             )
 
         rp = relative_pos.to(device=device, dtype=torch.long)
-        if rp.ndim == 4:
-            rp = rp[0, 0]
+        if rp.ndim == 2:
+            pass
         elif rp.ndim == 3:
+            if int(rp.shape[0]) != 1:
+                raise ValueError(
+                    "Batch-specific relative_pos maps are not supported; "
+                    f"expected shape (1,Q,K), got {tuple(rp.shape)}"
+                )
             rp = rp[0]
-        elif rp.ndim != 2:
-            raise ValueError(f"relative_pos must be rank-2/3/4, got rank={rp.ndim}")
+        elif rp.ndim == 4:
+            if int(rp.shape[0]) != 1 or int(rp.shape[1]) != 1:
+                raise ValueError(
+                    "Batch/head-specific relative_pos maps are not supported; "
+                    f"expected shape (1,1,Q,K), got {tuple(rp.shape)}"
+                )
+            rp = rp[0, 0]
+        else:
+            raise ValueError(
+                "relative_pos must have shape (Q,K), (1,Q,K), or (1,1,Q,K); "
+                f"got rank={rp.ndim}, shape={tuple(rp.shape)}"
+            )
 
-        if rp.shape[0] != query_len or rp.shape[1] != key_len:
-            rp = rp[:query_len, :key_len]
+        expected = (int(query_len), int(key_len))
+        actual = tuple(int(x) for x in rp.shape)
+        if actual != expected:
+            raise ValueError(f"relative_pos query/key shape mismatch: expected {expected}, got {actual}")
         return rp
 
     def _project_rel(
@@ -521,18 +539,51 @@ class DisentangledSelfAttention(nn.Module):
             keep_mask = normalize_keep_mask(attention_mask)
             if keep_mask.ndim != 4:
                 raise ValueError(
-                    f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
+                    "attention_mask must be rank-4 [B,1,Q,K] or [B,1,1,K]; "
+                    f"got shape={tuple(keep_mask.shape)}"
                 )
+
+            query_len = int(attention_scores.shape[-2])
+            key_len = int(attention_scores.shape[-1])
+            if int(keep_mask.shape[-1]) != key_len:
+                raise ValueError(
+                    "attention_mask key length mismatch: "
+                    f"expected K={key_len}, got shape={tuple(keep_mask.shape)}"
+                )
+
+            mask_query_len = int(keep_mask.shape[-2])
+            if mask_query_len == 1:
+                if query_len == key_len:
+                    live_queries = keep_mask.transpose(-2, -1)
+                else:
+                    # A key-padding mask contains no per-query padding
+                    # information, but an empty key set leaves no live rows.
+                    live_queries = keep_mask.any(dim=-1, keepdim=True).expand(
+                        -1,
+                        -1,
+                        query_len,
+                        -1,
+                    )
+            elif mask_query_len == query_len:
+                if query_len == key_len:
+                    # Packed masks may give inactive queries an off-diagonal
+                    # fallback edge, so their diagonal remains the liveness source.
+                    live_queries = torch.diagonal(
+                        keep_mask,
+                        dim1=-2,
+                        dim2=-1,
+                    ).unsqueeze(-1)
+                else:
+                    live_queries = keep_mask.any(dim=-1, keepdim=True)
+            else:
+                raise ValueError(
+                    "attention_mask query length mismatch: "
+                    f"expected Q={query_len} or a broadcast query axis, "
+                    f"got shape={tuple(keep_mask.shape)}"
+                )
+
             mask_fill_value = torch.finfo(attention_scores.dtype).min
             attention_scores = attention_scores.masked_fill(~keep_mask, mask_fill_value)
-            # For broadcast padding masks (B,1,1,S), query activity equals key activity —
-            # transpose the key dim to get per-query (B,1,S,1). For pairwise masks
-            # (B,1,S,S), query activity is encoded on the diagonal (inactive queries
-            # may still keep an off-diagonal fallback edge to avoid all-False rows).
-            if keep_mask.shape[-2] == 1:
-                live_queries = keep_mask.transpose(-2, -1)  # (B,1,S,1)
-            else:
-                live_queries = torch.diagonal(keep_mask, dim1=-2, dim2=-1).unsqueeze(-1)  # (B,1,S,1)
             attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
         probs = torch.softmax(attention_scores, dim=-1)
@@ -941,7 +992,8 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor | None attention_mask: Input attention mask or ``None`` for unpadded batches.
         :param bool output_hidden_states: Whether to return hidden states.
         :param bool output_attentions: Whether to return attentions.
-        :param torch.Tensor | None query_states: Optional query states.
+        :param torch.Tensor | None query_states: Optional iterative query stream; ``hidden_states``
+            remains the fixed key/value memory when provided.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param bool return_dict: Whether to return HF output dataclass.
         :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
@@ -952,19 +1004,20 @@ class DebertaV2Encoder(nn.Module):
         rel_pos = self.get_rel_pos(hidden_states, query_states=query_states, relative_pos=relative_pos)
         rel_embeddings = self.get_rel_embedding()
 
+        current_query = query_states
+        next_kv = hidden_states
+        output_states = current_query if current_query is not None else next_kv
+
         capture_hidden_states = bool(output_hidden_states)
         compile_snapshot_hidden_states = bool(capture_hidden_states and is_torch_compiling())
-        initial_hidden_state = hidden_states.clone() if compile_snapshot_hidden_states else hidden_states
+        initial_stream_state = output_states.clone() if compile_snapshot_hidden_states else output_states
         all_hidden_states: tuple[torch.Tensor, ...] | None = (
-            (initial_hidden_state,) if capture_hidden_states else None
+            (initial_stream_state,) if capture_hidden_states else None
         )
         all_attentions: tuple[torch.Tensor, ...] | None = () if output_attentions else None
 
-        next_kv = hidden_states
-        output_states = hidden_states
-
         for layer_module in self.layer:
-            if self.gradient_checkpointing and self.training and query_states is None:
+            if self.gradient_checkpointing and self.training and current_query is None:
 
                 def _custom_forward(
                     hs: torch.Tensor,
@@ -1004,7 +1057,7 @@ class DebertaV2Encoder(nn.Module):
                 output_states, attn_weights = layer_module(
                     next_kv,
                     attn_mask,
-                    query_states=query_states,
+                    query_states=current_query,
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
                     output_attentions=output_attentions,
@@ -1022,9 +1075,10 @@ class DebertaV2Encoder(nn.Module):
                 )
                 all_hidden_states = all_hidden_states + (hidden_state_snapshot,)
 
-            if query_states is not None:
-                query_states = output_states
-            next_kv = output_states
+            if current_query is None:
+                next_kv = output_states
+            else:
+                current_query = output_states
 
         if not return_dict:
             return tuple(v for v in (output_states, all_hidden_states, all_attentions) if v is not None)

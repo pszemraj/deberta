@@ -56,7 +56,7 @@ Packed doc-block batches accept only metadata prepared through the contract desc
 Per-call eager fallbacks preserve semantics:
 
 - `output_attentions=true` uses eager attention to return `(B,H,S,S)` probabilities.
-- An explicit `relative_pos` tensor is forwarded through eager attention unchanged.
+- An explicit shared `relative_pos` map in exact `(Q,K)`, `(1,Q,K)`, or `(1,1,Q,K)` form is forwarded through eager attention. Batch/head-specific maps and query/key length mismatches raise.
 - A doc-block fallback requires an explicit pairwise mask or the original compact `doc_ids` from
   which it can rebuild one; it never degrades to a padding-only mask.
 
