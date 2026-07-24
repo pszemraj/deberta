@@ -17,7 +17,7 @@ from _config_factories import (
     make_native_deberta_config,
     make_train_config,
 )
-from _fakes import AutoTokenizerStub, BackboneConfigStub, FakeAccelerator
+from _fakes import AutoTokenizerStub, BackboneConfigStub, DummyTokenizer, FakeAccelerator
 
 import deberta.export_cli as export_cli
 from deberta.config import RUN_CONFIG_SCHEMA_VERSION
@@ -369,6 +369,59 @@ def test_native_vs_export_backbone_full_model_output_parity(export_what: str) ->
             input_ids=padded_ids, attention_mask=attention_mask, return_dict=True
         ).last_hidden_state
     torch.testing.assert_close(native_padded[keep].float(), export_padded[keep].float(), rtol=2e-5, atol=2e-6)
+
+
+def test_builder_normalized_positional_terms_preserve_native_export_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.modeling.builder as builder_mod
+    from deberta.modeling.deberta_v2_native import DebertaV2Model as NativeDebertaV2Model
+
+    source_config = _shipped_regime_native_config(pos_att_type=["c2p|p2c"])
+
+    def _fake_from_pretrained(cls, src: str):
+        del cls
+        del src
+        return source_config
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+    model_cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained={"discriminator_path": "custom-deberta"},
+    )
+    disc_config, _ = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=DummyTokenizer(vocab_size=48),
+        max_position_embeddings=16,
+    )
+    assert disc_config.pos_att_type == ["c2p", "p2c"]
+
+    torch.manual_seed(2468)
+    native_model = NativeDebertaV2Model(disc_config).eval()
+    export_model, _ = export_cli._build_export_backbone(
+        model_cfg,
+        disc_config,
+        disc_config,
+        "discriminator",
+    )
+    export_state = export_cli._drop_training_only_state_for_strict_load(
+        export_model=export_model,
+        state_dict=native_model.state_dict(),
+        strict_export_load=True,
+    )
+    export_model.load_state_dict(export_state, strict=True)
+    export_model.eval()
+
+    input_ids = torch.tensor([[1, 7, 9, 11, 13, 2]])
+    with torch.inference_mode():
+        native_out = native_model(input_ids=input_ids, return_dict=True).last_hidden_state
+        export_out = export_model(input_ids=input_ids, return_dict=True).last_hidden_state
+    torch.testing.assert_close(native_out.float(), export_out.float(), rtol=2e-5, atol=2e-6)
 
 
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:

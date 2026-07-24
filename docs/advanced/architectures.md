@@ -15,6 +15,7 @@
 For `hf_deberta_v2`, scratch runs synthesize backbone configs in-repo from `model.hf.model_size` + explicit overrides. Pretrained runs load discriminator config from `model.pretrained.discriminator_path`, and load generator config from `model.pretrained.generator_path` when provided (otherwise generator config is derived from discriminator config).
 
 Native relative attention supports C2P, P2C, or both. Unknown terms and P2P are rejected during configuration because the Microsoft P2P branch does not provide a valid, reference-testable model contract.
+Accepted delimiter forms are canonicalized on the materialized config so native training and stock Hugging Face export interpret the same positional branches. Bucketed configs must use a relative span covering their advertised maximum position range because shorter spans do not have identical native and stock-HF bucket semantics.
 
 ## HF-size presets (`model.hf.model_size`)
 

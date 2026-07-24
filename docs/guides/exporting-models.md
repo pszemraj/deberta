@@ -42,6 +42,7 @@ Default output path is `<run_dir>/exported_hf` and must be empty if it already e
 
 Native `hf_deberta_v2` exports load through stock Hugging Face `AutoModel` APIs. RoPE exports are
 standalone artifacts but require this package's `DebertaRoPEModel` implementation.
+Native config materialization canonicalizes positional-attention terms and rejects bucketed relative spans that stock Hugging Face would interpret differently, so a strict state load cannot hide an attention-function mismatch.
 
 Flash-trained checkpoints are reconstructed with eager attention during consolidation, so export does not require the optional FlashDeBERTa runtime.
 

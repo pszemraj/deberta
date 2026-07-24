@@ -569,6 +569,28 @@ def _apply_hf_config_normalization(
     cfg.hf_attention_impl = str(model_cfg.hf.attention_impl)
     cfg.hf_flash = {"kernel_overrides_path": model_cfg.hf.flash.kernel_overrides_path}
     cfg.use_rmsnorm_heads = False
+    cfg.pos_att_type = _validate_pos_att_type(
+        getattr(cfg, "pos_att_type", None),
+        relative_attention=bool(getattr(cfg, "relative_attention", False)),
+    )
+
+    if bool(getattr(cfg, "relative_attention", False)) and int(getattr(cfg, "position_buckets", 0) or 0) > 0:
+        max_relative_positions = int(getattr(cfg, "max_relative_positions", -1) or -1)
+        max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 0) or 0)
+        if max_relative_positions > 0 and max_position_embeddings <= 0:
+            raise ValueError(
+                f"{component} bucketed relative attention cannot verify max_relative_positions="
+                f"{max_relative_positions} covers the position range because "
+                "max_position_embeddings is missing or non-positive."
+            )
+        if 0 < max_relative_positions < max_position_embeddings:
+            raise ValueError(
+                f"{component} bucketed relative attention requires max_relative_positions to cover "
+                f"max_position_embeddings so native training and stock Hugging Face export use "
+                f"identical position buckets; got max_relative_positions={max_relative_positions} < "
+                f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
+                "to -1 or at least max_position_embeddings."
+            )
 
 
 def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND) -> None:
@@ -601,27 +623,6 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
         raise ValueError(
             f"{component} flash attention requires position_buckets >= 8 so fused Triton "
             f"routes preserve eager relative-position buckets; got position_buckets={position_buckets}."
-        )
-    max_relative_positions = int(getattr(cfg, "max_relative_positions", -1) or -1)
-    max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 0) or 0)
-    if max_relative_positions > 0 and max_position_embeddings <= 0:
-        # A pinned span with no known position range cannot be proven to
-        # cover every sequence length, so fail fast instead of silently
-        # skipping the coverage check below.
-        raise ValueError(
-            f"{component} flash attention cannot verify max_relative_positions="
-            f"{max_relative_positions} covers the position range: "
-            "max_position_embeddings is missing or non-positive on this config."
-        )
-    if 0 < max_relative_positions < max_position_embeddings:
-        # Eager attention clamps relative positions to the span before
-        # log-bucketing; the FlashDeBERTa kernels bucket unclamped positions,
-        # so the two silently disagree once seq_len exceeds the span.
-        raise ValueError(
-            f"{component} flash attention requires max_relative_positions to cover "
-            f"max_position_embeddings; got max_relative_positions={max_relative_positions} < "
-            f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
-            "to -1 (span follows max_position_embeddings) or use attention_impl=eager."
         )
 
 
@@ -849,14 +850,6 @@ def build_backbone_configs(
             gen_cfg,
             required_max_position_embeddings=int(max_position_embeddings),
             component="generator",
-        )
-        _validate_pos_att_type(
-            getattr(disc_cfg, "pos_att_type", None),
-            relative_attention=bool(getattr(disc_cfg, "relative_attention", False)),
-        )
-        _validate_pos_att_type(
-            getattr(gen_cfg, "pos_att_type", None),
-            relative_attention=bool(getattr(gen_cfg, "relative_attention", False)),
         )
         _validate_hf_flash_attention_config(disc_cfg, component="discriminator")
         _validate_hf_flash_attention_config(gen_cfg, component="generator")

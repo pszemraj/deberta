@@ -518,18 +518,6 @@ def test_shipped_flash_configs_activate_flash_for_both_backbones() -> None:
         ({"position_buckets": 0}, "position_buckets >= 8"),
         ({"position_buckets": 2}, "position_buckets >= 8"),
         ({"position_buckets": 4}, "position_buckets >= 8"),
-        # External checkpoints may pin a short explicit span; eager clamps
-        # relative positions to it before bucketing while the flash kernels
-        # do not, so flash must refuse rather than silently diverge.
-        ({"max_relative_positions": 128}, "max_relative_positions to cover"),
-        # A pinned span with no known position range must fail fast rather
-        # than let the coverage check silently no-op. (A zero value is
-        # already rejected earlier by _validate_required_max_positions;
-        # None skips that check and must be caught here.)
-        (
-            {"max_relative_positions": 128, "max_position_embeddings": None},
-            "cannot verify max_relative_positions",
-        ),
     ],
 )
 def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
@@ -566,6 +554,97 @@ def test_build_hf_configs_reject_flash_unsupported_materialized_configs(
             tokenizer=DummyTokenizer(vocab_size=128100),
             max_position_embeddings=64,
         )
+
+
+@pytest.mark.parametrize("attention_impl", ["eager", "flash"])
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"max_relative_positions": 32}, "requires max_relative_positions to cover"),
+        (
+            {"max_relative_positions": 32, "max_position_embeddings": None},
+            "cannot verify max_relative_positions",
+        ),
+    ],
+)
+def test_build_hf_configs_reject_export_incompatible_relative_span(
+    monkeypatch: pytest.MonkeyPatch,
+    attention_impl: str,
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    invalid_cfg = builder_mod._build_repo_hf_deberta_v2_config(
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2")
+    )
+    for key, value in updates.items():
+        setattr(invalid_cfg, key, value)
+
+    def _fake_from_pretrained(cls, src: str):
+        del cls
+        del src
+        return invalid_cfg
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+    model_cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained={"discriminator_path": "custom-deberta"},
+        hf={"attention_impl": attention_impl},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        builder_mod.build_backbone_configs(
+            model_cfg=model_cfg,
+            tokenizer=DummyTokenizer(vocab_size=128100),
+            max_position_embeddings=64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (["c2p|p2c"], ["c2p", "p2c"]),
+        (["P2C,c2p", "p2c"], ["p2c", "c2p"]),
+    ],
+)
+def test_build_hf_configs_store_canonical_positional_terms(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: object,
+    expected: list[str],
+) -> None:
+    source_cfg = builder_mod._build_repo_hf_deberta_v2_config(
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2")
+    )
+    source_cfg.pos_att_type = raw
+
+    def _fake_from_pretrained(cls, src: str):
+        del cls
+        del src
+        return source_cfg
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+    model_cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained={"discriminator_path": "custom-deberta"},
+    )
+
+    disc_cfg, gen_cfg = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=DummyTokenizer(vocab_size=128100),
+        max_position_embeddings=64,
+    )
+
+    assert disc_cfg.pos_att_type == expected
+    assert gen_cfg.pos_att_type == expected
 
 
 @pytest.mark.parametrize(
