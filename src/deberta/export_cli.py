@@ -663,6 +663,15 @@ def run_export(cfg: ExportConfig) -> None:
         "strict_state_load": bool(strict_export_load),
         "includes_rtd_head": False,
         "embedding_materialization": embedding_materialization,
+        # Downstream consumers need the pretraining attention regime: whether
+        # sequences were packed and, if so, whether cross-document attention was
+        # blocked. The exported model itself only ever consumes standard 2D
+        # attention masks at inference regardless of this setting.
+        "pretraining_packing": {
+            "enabled": bool(data_cfg.packing.enabled),
+            "block_cross_document_attention": bool(data_cfg.packing.block_cross_document_attention),
+            "max_seq_length": int(data_cfg.packing.max_seq_length),
+        },
     }
 
     try:

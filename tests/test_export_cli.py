@@ -142,7 +142,52 @@ def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_pa
     text = (out_dir / "README.md").read_text(encoding="utf-8")
     assert "# hf_deberta_v2-768h-6L-12H" in text
     assert "| Max sequence length | 4096 |" in text
+    assert "| Packed-sequence pretraining | unknown |" in text
+    assert "| Cross-document attention blocking | unknown |" in text
+    assert "packing/attention-blocking configuration is unavailable" in text
     assert (out_dir / "LICENSE").exists()
+
+
+@pytest.mark.parametrize(
+    ("packing_enabled", "block_cross_document_attention", "expected_phrase"),
+    [
+        (True, True, "cross-document attention blocking enabled"),
+        (True, False, "without cross-document attention blocking"),
+        (False, False, "without sequence packing"),
+    ],
+    ids=["packed-blocked", "packed-unblocked", "unpacked"],
+)
+def test_write_export_readme_discloses_pretraining_packing_regime(
+    tmp_path: Path,
+    packing_enabled: bool,
+    block_cross_document_attention: bool,
+    expected_phrase: str,
+) -> None:
+    out_dir = tmp_path / "packing-export"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_cfg = make_data_config(
+        packing={
+            "max_seq_length": 64,
+            "enabled": packing_enabled,
+            "block_cross_document_attention": block_cross_document_attention,
+        }
+    )
+
+    write_export_readme_and_license(
+        out_dir,
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
+        data_cfg=data_cfg,
+        train_cfg=make_train_config(max_steps=10),
+        embedding_sharing="none",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    packed_str = "yes" if packing_enabled else "no"
+    blocked_str = "yes" if block_cross_document_attention else "no"
+    assert f"| Packed-sequence pretraining | {packed_str} |" in text
+    assert f"| Cross-document attention blocking | {blocked_str} |" in text
+    assert expected_phrase in text
+    assert "standard 2D attention masks at inference" in text
 
 
 def test_verify_staged_encoder_output_parity_checks_reloaded_config(tmp_path: Path) -> None:
@@ -224,6 +269,106 @@ def test_verify_staged_encoder_output_parity_supports_real_export_backbones(
         export_model=model,
         component_dir=component_dir,
     )
+
+
+def _shipped_regime_native_config(**overrides: Any) -> Any:
+    """Build a tiny ``transformers.DebertaV2Config`` at the shipped pretraining attention regime.
+
+    Mirrors the relative-attention knobs ``deberta.modeling.builder._build_repo_hf_deberta_v2_config``
+    sets for shipped runs (``position_buckets>0``, ``relative_attention=True``, ``share_att_key=True``,
+    ``norm_rel_ebd="layer_norm"``, ``pos_att_type=["p2c", "c2p"]``, ``position_biased_input=False``),
+    with small dimensions for fast CPU tests.
+
+    :param Any overrides: Config field overrides layered on top of the shipped-regime defaults.
+    :return Any: Small ``transformers.DebertaV2Config`` instance.
+    """
+    defaults = {
+        "vocab_size": 48,
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "intermediate_size": 64,
+        "max_position_embeddings": 16,
+        "position_buckets": 8,
+        "max_relative_positions": -1,
+        "relative_attention": True,
+        "position_biased_input": False,
+        "share_att_key": True,
+        "norm_rel_ebd": "layer_norm",
+        "pos_att_type": ["p2c", "c2p"],
+        "type_vocab_size": 0,
+        "hidden_dropout_prob": 0.0,
+        "attention_probs_dropout_prob": 0.0,
+        "layer_norm_eps": 1e-7,
+        "pad_token_id": 0,
+    }
+    return make_native_deberta_config(**(defaults | overrides))
+
+
+@pytest.mark.parametrize("export_what", ["discriminator", "generator"])
+def test_native_vs_export_backbone_full_model_output_parity(export_what: str) -> None:
+    """Native training encoder and export-side ``transformers.AutoModel`` encoder must match.
+
+    Training uses ``deberta.modeling.deberta_v2_native.DebertaV2Model`` for the ``hf_deberta_v2``
+    backbone; export instead rebuilds the checkpoint via ``transformers.AutoModel.from_config``
+    (see ``_build_export_backbone``) — an independent implementation. This drives the REAL export
+    seams directly: ``_build_export_backbone`` builds the export model from the exact config object
+    used at training time, and ``_drop_training_only_state_for_strict_load`` performs the same
+    native -> export state-dict adaptation ``_export_component`` applies before its strict load.
+
+    ``_build_export_backbone`` routes both components through the identical ``AutoModel.from_config``
+    branch for backbone_type='hf_deberta_v2' (no discriminator/generator-specific code path), so
+    parametrizing over both components exercises the same code with independently seeded weights.
+    """
+    from deberta.modeling.deberta_v2_native import DebertaV2Model as NativeDebertaV2Model
+
+    torch.manual_seed(1234 if export_what == "discriminator" else 5678)
+    config = _shipped_regime_native_config()
+    model_cfg = make_model_config(backbone_type="hf_deberta_v2")
+
+    native_model = NativeDebertaV2Model(config).eval()
+    export_disc, export_gen = export_cli._build_export_backbone(model_cfg, config, config, export_what)
+    export_model, other = (
+        (export_disc, export_gen) if export_what == "discriminator" else (export_gen, export_disc)
+    )
+    assert other is None
+    export_model = export_model.eval()
+
+    native_state = native_model.state_dict()
+    prepared_state = export_cli._drop_training_only_state_for_strict_load(
+        export_model=export_model,
+        state_dict=native_state,
+        strict_export_load=True,
+    )
+    export_model.load_state_dict(prepared_state, strict=True)
+
+    vocab_size = int(config.vocab_size)
+    pad_id = int(config.pad_token_id)
+
+    # (a) Unpadded batch: no attention mask, every position active.
+    unpadded_ids = (torch.arange(12).reshape(2, 6) % (vocab_size - 1)) + 1
+    with torch.inference_mode():
+        native_out = native_model(input_ids=unpadded_ids, return_dict=True).last_hidden_state
+        export_out = export_model(input_ids=unpadded_ids, return_dict=True).last_hidden_state
+    torch.testing.assert_close(native_out.float(), export_out.float(), rtol=2e-5, atol=2e-6)
+
+    # (b) Right-padded batch with a 2D attention mask; compare active positions only.
+    padded_ids = unpadded_ids.clone()
+    padded_ids[0, 4:] = pad_id
+    padded_ids[1, 5:] = pad_id
+    attention_mask = torch.ones_like(padded_ids)
+    attention_mask[0, 4:] = 0
+    attention_mask[1, 5:] = 0
+    keep = attention_mask.bool()
+
+    with torch.inference_mode():
+        native_padded = native_model(
+            input_ids=padded_ids, attention_mask=attention_mask, return_dict=True
+        ).last_hidden_state
+        export_padded = export_model(
+            input_ids=padded_ids, attention_mask=attention_mask, return_dict=True
+        ).last_hidden_state
+    torch.testing.assert_close(native_padded[keep].float(), export_padded[keep].float(), rtol=2e-5, atol=2e-6)
 
 
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
@@ -396,9 +541,60 @@ def test_run_export_meta_carries_no_local_absolute_paths(
     assert meta["strict_state_load"] is True
     assert meta["includes_rtd_head"] is False
     assert meta["embedding_materialization"] == {"discriminator": "discriminator_checkpoint"}
+    assert meta["pretraining_packing"] == {
+        "enabled": True,
+        "block_cross_document_attention": False,
+        "max_seq_length": 32,
+    }
     # Export directories ship to other machines and the Hub; provenance must
     # not leak the exporting machine's directory layout.
     assert str(tmp_path) not in json.dumps(meta)
+
+
+@pytest.mark.parametrize("block_cross_document_attention", [True, False])
+def test_run_export_meta_discloses_pretraining_packing_regime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    block_cross_document_attention: bool,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    data_cfg = make_data_config(
+        source={"dataset_name": "dummy-dataset"},
+        packing={
+            "max_seq_length": 96,
+            "enabled": True,
+            "block_cross_document_attention": block_cross_document_attention,
+        },
+    )
+    (run_dir / "data_config.json").write_text(json.dumps(asdict(data_cfg)), encoding="utf-8")
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=_new_export_call_counters(),
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+        )
+    )
+
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["pretraining_packing"] == {
+        "enabled": True,
+        "block_cross_document_attention": block_cross_document_attention,
+        "max_seq_length": 96,
+    }
+
+    readme = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "| Packed-sequence pretraining | yes |" in readme
+    blocked_str = "yes" if block_cross_document_attention else "no"
+    assert f"| Cross-document attention blocking | {blocked_str} |" in readme
 
 
 @pytest.mark.parametrize("parity_fails", [False, True], ids=["success", "failure"])

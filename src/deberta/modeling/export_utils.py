@@ -81,6 +81,16 @@ def write_export_readme_and_license(
                 continue
         return 0
 
+    def _yes_no_or_unknown(value: bool | None) -> str:
+        """Render an optional boolean as a README-friendly ``yes``/``no``/``unknown`` token.
+
+        :param bool | None value: Boolean to render, or ``None`` when unavailable.
+        :return str: ``"yes"``, ``"no"``, or ``"unknown"``.
+        """
+        if value is None:
+            return "unknown"
+        return "yes" if value else "no"
+
     backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
     runtime_cfg = export_config if export_config is not None else model_cfg
     configured_arch = model_cfg.rope if backbone == "rope" else None
@@ -91,6 +101,43 @@ def write_export_readme_and_license(
     if seq_len == 0:
         seq_len = _first_int_attr(runtime_cfg, configured_arch, attr="max_position_embeddings")
     steps = int(getattr(train_cfg, "max_steps", 0) or 0)
+
+    # Downstream users need to know whether pretraining packed multiple documents
+    # per sequence and, if so, whether cross-document attention was blocked —
+    # this changes what the encoder learned about document boundaries even though
+    # the exported model itself only ever consumes a standard 2D attention mask.
+    packing_cfg = getattr(data_cfg, "packing", None) if data_cfg is not None else None
+    packing_enabled = bool(getattr(packing_cfg, "enabled", False)) if packing_cfg is not None else None
+    block_cross_document_attention = (
+        bool(getattr(packing_cfg, "block_cross_document_attention", False))
+        if packing_cfg is not None
+        else None
+    )
+    packed_pretraining_str = _yes_no_or_unknown(packing_enabled)
+    block_cross_document_attention_str = _yes_no_or_unknown(block_cross_document_attention)
+
+    if packing_cfg is None:
+        packing_sentence = (
+            "Pretraining packing/attention-blocking configuration is unavailable for this export; "
+            "the exported model consumes standard 2D attention masks at inference."
+        )
+    elif packing_enabled and block_cross_document_attention:
+        packing_sentence = (
+            "Pretrained on packed sequences (multiple documents per sequence) with cross-document "
+            "attention blocking enabled, so tokens could not attend across document boundaries during "
+            "training; the exported model consumes standard 2D attention masks at inference."
+        )
+    elif packing_enabled:
+        packing_sentence = (
+            "Pretrained on packed sequences (multiple documents per sequence) without cross-document "
+            "attention blocking, so tokens could attend across document boundaries during training; "
+            "the exported model consumes standard 2D attention masks at inference."
+        )
+    else:
+        packing_sentence = (
+            "Pretrained without sequence packing (one document per sequence); the exported model "
+            "consumes standard 2D attention masks at inference."
+        )
 
     if backbone == "rope":
         arch_desc = "RoPE encoder (RMSNorm, SwiGLU, rotary embeddings)"
@@ -136,11 +183,15 @@ RTD-pretrained encoder ({arch_desc}).
 | Max sequence length | {seq_len} |
 | Embedding sharing | `{embedding_sharing}` |
 | Training steps | {steps} |
+| Packed-sequence pretraining | {packed_pretraining_str} |
+| Cross-document attention blocking | {block_cross_document_attention_str} |
 
 ## Training
 
 Pretrained with replaced-token detection (RTD / ELECTRA-style) using
 [pszemraj/deberta]({_REPO_URL}).
+
+{packing_sentence}
 
 ## Usage
 
