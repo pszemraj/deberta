@@ -1154,6 +1154,20 @@ class DebertaV3RTDPretrainer(nn.Module):
             sampling_temperature=sampling_temperature,
             flash_meta=flash_meta,
         )
+        if float(disc_loss_weight) == 0.0:
+            disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+            total = float(gen_loss_weight) * gen_phase.gen_loss_raw
+            return RTDOutput(
+                loss=total,
+                gen_loss=gen_phase.gen_loss_raw.detach(),
+                disc_loss=disc_zero.detach(),
+                disc_accuracy=disc_zero.detach(),
+                gen_token_count=gen_phase.gen_token_count.detach(),
+                disc_token_count=disc_zero.detach(),
+                disc_positive_count=disc_zero.detach(),
+                gen_loss_raw=gen_phase.gen_loss_raw,
+                disc_loss_raw=disc_zero,
+            )
         if not bool(gen_phase.has_masked_targets):
             disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
             total = float(gen_loss_weight) * gen_phase.gen_loss_raw
@@ -1180,10 +1194,11 @@ class DebertaV3RTDPretrainer(nn.Module):
             flash_meta=flash_meta,
         )
 
-        total = (
-            float(gen_loss_weight) * gen_phase.gen_loss_raw
-            + float(disc_loss_weight) * disc_phase.disc_loss_raw
-        )
+        total = disc_phase.disc_loss_raw.new_zeros(())
+        if float(gen_loss_weight) != 0.0:
+            total = total + float(gen_loss_weight) * gen_phase.gen_loss_raw
+        if float(disc_loss_weight) != 0.0:
+            total = total + float(disc_loss_weight) * disc_phase.disc_loss_raw
 
         return RTDOutput(
             loss=total,

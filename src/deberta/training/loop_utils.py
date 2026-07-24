@@ -68,9 +68,14 @@ def _token_weighted_micro_objective(
     :param float disc_loss_weight: Discriminator loss weight.
     :return torch.Tensor: Unscaled microbatch objective contribution.
     """
-    gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
-    disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
-    return float(gen_loss_weight) * gen_scale * gen_loss + float(disc_loss_weight) * disc_scale * disc_loss
+    objective = gen_loss.new_zeros(())
+    if float(gen_loss_weight) != 0.0:
+        gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
+        objective = objective + float(gen_loss_weight) * gen_scale * gen_loss
+    if float(disc_loss_weight) != 0.0:
+        disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
+        objective = objective + float(disc_loss_weight) * disc_scale * disc_loss
+    return objective
 
 
 def _resolve_window_token_denominators(

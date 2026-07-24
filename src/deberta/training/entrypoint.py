@@ -84,6 +84,7 @@ from deberta.training.runtime import (
     _validate_training_configs,
 )
 from deberta.training.steps import (
+    _NONFINITE_LR_MULT_FLOOR,
     _NONFINITE_LR_MULT_RECOVERY,
     _any_rank_flag_true,
     _apply_lr_mult,
@@ -91,7 +92,6 @@ from deberta.training.steps import (
     _collect_ga_window,
     _global_grad_l2_norm,
     _move_batch_to_device,
-    _optimizer_has_stepped,
     _record_unscaled_lrs,
     _resolve_window_token_weights,
     _scheduler_current_lr,
@@ -799,6 +799,7 @@ def run_pretraining(
     lr_mult = 1.0
     nonfinite_skip_total = 0
     nonfinite_skip_streak = 0
+    uncommitted_training_window = False
     crash_type: str | None = None
     crash_reason: str | None = None
     crash_step: int | None = None
@@ -1345,8 +1346,10 @@ def run_pretraining(
             """
 
             nonlocal global_step, consumed_micro_batches_committed
+            nonlocal uncommitted_training_window
             global_step += 1
             consumed_micro_batches_committed = int(consumed_micro_batches)
+            uncommitted_training_window = False
             if train_progress is not None:
                 train_progress.update(1)
 
@@ -1366,23 +1369,31 @@ def run_pretraining(
             optimizer_phases: list[tuple[Any, Any, bool]],
             reason: str | None,
             debug_path: Path | None,
-            last_saved_step: int,
-        ) -> int:
-            """Recover, report, and checkpoint one skipped accumulation window.
+        ) -> None:
+            """Recover from one pre-step non-finite accumulation window.
 
             :param list[tuple[Any, Any, bool]] optimizer_phases: Optimizer, scheduler,
                 and whether that phase already stepped in this window.
             :param str | None reason: Recorded nonfinite failure reason.
             :param Path | None debug_path: Optional written debug artifact.
-            :param int last_saved_step: Most recent checkpoint step.
-            :return int: Updated most recent checkpoint step.
+            :raises RuntimeError: If a phase already stepped or recovery is exhausted.
+            :return None: None.
             """
 
             nonlocal lr_mult
-            for phase_optimizer, phase_scheduler, did_step in optimizer_phases:
-                if not did_step and _optimizer_has_stepped(phase_optimizer):
-                    with suppress(Exception):
-                        phase_scheduler.step()
+            stepped_phases = [
+                index for index, (_, _, did_step) in enumerate(optimizer_phases) if bool(did_step)
+            ]
+            if stepped_phases:
+                raise RuntimeError(
+                    "A decoupled RTD phase became non-finite after an earlier phase optimizer "
+                    "step. The accumulation window is not atomic and will not be checkpointed; "
+                    "resume from the last completed checkpoint. "
+                    f"reason={reason or 'unknown'}, stepped_phase_indices={stepped_phases}."
+                )
+
+            previous_lr_mult = float(lr_mult)
+            for phase_optimizer, phase_scheduler, _ in optimizer_phases:
                 _record_unscaled_lrs(phase_optimizer, phase_scheduler)
 
             lr_mult, reset_state = _apply_nonfinite_recovery(
@@ -1395,7 +1406,6 @@ def run_pretraining(
                     with suppress(Exception):
                         phase_optimizer.state.clear()
 
-            _commit_training_window()
             if report_to != "none":
                 _log_tracker_metrics(
                     {
@@ -1409,9 +1419,10 @@ def run_pretraining(
                 )
             if accelerator.is_main_process:
                 logger.warning(
-                    "step=%d | nonfinite_window_skipped=1 | reason=%s | streak=%d | total_skips=%d | "
+                    "attempted_step=%d | nonfinite_window_skipped=1 | reason=%s | "
+                    "streak=%d | total_skips=%d | "
                     "lr_mult=%.4f | opt_state_reset=%s | debug=%s",
-                    int(global_step),
+                    int(global_step + 1),
                     str(reason or "unknown"),
                     int(nonfinite_skip_streak),
                     int(nonfinite_skip_total),
@@ -1419,12 +1430,13 @@ def run_pretraining(
                     bool(reset_state),
                     str(debug_path) if debug_path is not None else "n/a",
                 )
-            return _save_checkpoint_if_due(
-                global_step=global_step,
-                consumed_micro_batches_committed=consumed_micro_batches_committed,
-                lr_mult=lr_mult,
-                last_saved_step=last_saved_step,
-            )
+            if previous_lr_mult <= float(_NONFINITE_LR_MULT_FLOOR) and not reset_state:
+                raise RuntimeError(
+                    "Non-finite recovery is exhausted: the learning-rate multiplier is already "
+                    f"at its floor ({float(_NONFINITE_LR_MULT_FLOOR):.4f}) and the latest retry "
+                    "did not trigger an optimizer-state reset. Resume from the last completed "
+                    "checkpoint after correcting the numerical failure."
+                )
 
         if effective_decoupled_training:
             if gen_optimizer is None or disc_optimizer is None:
@@ -1433,6 +1445,7 @@ def run_pretraining(
                 raise RuntimeError("Decoupled training requires generator/discriminator schedulers.")
 
             while global_step < int(train_cfg.max_steps):
+                uncommitted_training_window = True
                 (
                     window,
                     gen_window_tokens_per_rank,
@@ -1490,7 +1503,10 @@ def run_pretraining(
                             gen_obj = gen_loss
 
                         offending: str | None = None
-                        if not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all():
+                        if (
+                            gen_phase_enabled
+                            and not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all()
+                        ):
                             offending = "gen_loss_raw"
 
                         backward_loss: torch.Tensor | None = None
@@ -1535,11 +1551,12 @@ def run_pretraining(
                         if offending is not None:
                             continue
 
-                        micro_gen_token_count = gen_phase_out.gen_token_count.detach().float()
-                        gen_token_count_window = gen_token_count_window + micro_gen_token_count
-                        gen_loss_num = gen_loss_num + (
-                            gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
-                        )
+                        if gen_phase_enabled:
+                            micro_gen_token_count = gen_phase_out.gen_token_count.detach().float()
+                            gen_token_count_window = gen_token_count_window + micro_gen_token_count
+                            gen_loss_num = gen_loss_num + (
+                                gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
+                            )
                         # Keep discriminator micro-step counts aligned across ranks:
                         # when local generator targets are absent we still run the
                         # corresponding discriminator pass with zero objective weight.
@@ -1563,7 +1580,6 @@ def run_pretraining(
 
                     if is_sync_step and not skipped_window_due_nonfinite:
                         if not gen_phase_enabled:
-                            did_gen_optimizer_step = True
                             continue
                         grad_norm_reason, _ = _clip_gradients_and_find_nonfinite(
                             accelerator=accelerator,
@@ -1587,7 +1603,7 @@ def run_pretraining(
                         _sync_discriminator_embeddings_if_available(model, accelerator=accelerator)
 
                 window_has_global_disc_targets = False
-                if not skipped_window_due_nonfinite and disc_phase_inputs:
+                if disc_phase_enabled and not skipped_window_due_nonfinite and disc_phase_inputs:
                     window_has_local_disc_targets = any(
                         float(payload.get("disc_objective_weight", 0.0)) > 0.0
                         for payload in disc_phase_inputs
@@ -1605,7 +1621,8 @@ def run_pretraining(
 
                 # Phase 2: discriminator update from cached corruption targets.
                 if (
-                    not skipped_window_due_nonfinite
+                    disc_phase_enabled
+                    and not skipped_window_due_nonfinite
                     and disc_phase_inputs
                     and bool(window_has_global_disc_targets)
                 ):
@@ -1643,7 +1660,7 @@ def run_pretraining(
                                 offending = "disc_loss_raw"
 
                             backward_loss: torch.Tensor | None = None
-                            if offending is None and disc_phase_enabled:
+                            if offending is None:
                                 weighted_disc_obj = disc_obj * disc_loss_weight
                                 backward_loss = _scale_loss_for_backward(
                                     loss=weighted_disc_obj,
@@ -1705,9 +1722,6 @@ def run_pretraining(
                                 accelerator.backward(backward_loss)
 
                         if is_sync_step and not skipped_window_due_nonfinite:
-                            if not disc_phase_enabled:
-                                did_disc_optimizer_step = True
-                                continue
                             grad_norm_reason, _ = _clip_gradients_and_find_nonfinite(
                                 accelerator=accelerator,
                                 model=model,
@@ -1728,28 +1742,31 @@ def run_pretraining(
                             disc_optimizer.zero_grad(set_to_none=True)
                             did_disc_optimizer_step = True
 
-                if not skipped_window_due_nonfinite and (
-                    not disc_phase_inputs or not bool(window_has_global_disc_targets)
-                ):
-                    # No generator-supervised tokens were produced in this window, so there are
-                    # no discriminator targets to train on.
-                    did_disc_optimizer_step = True
-
-                did_optimizer_step = bool(did_gen_optimizer_step and did_disc_optimizer_step)
-                if not did_optimizer_step:
+                gen_phase_complete = bool(not gen_phase_enabled or did_gen_optimizer_step)
+                disc_phase_complete = bool(
+                    not disc_phase_enabled
+                    or did_disc_optimizer_step
+                    or not disc_phase_inputs
+                    or not window_has_global_disc_targets
+                )
+                if not (gen_phase_complete and disc_phase_complete):
                     if skipped_window_due_nonfinite:
-                        last_saved_step = _finalize_nonfinite_skip(
+                        _finalize_nonfinite_skip(
                             optimizer_phases=[
                                 (gen_optimizer, gen_lr_scheduler, did_gen_optimizer_step),
                                 (disc_optimizer, disc_lr_scheduler, did_disc_optimizer_step),
                             ],
                             reason=nonfinite_reason,
                             debug_path=nonfinite_debug_path,
-                            last_saved_step=last_saved_step,
                         )
                         continue
                     raise RuntimeError(
                         "Decoupled accumulation window produced no synchronized optimization step."
+                    )
+                if not (did_gen_optimizer_step or did_disc_optimizer_step):
+                    raise RuntimeError(
+                        "Decoupled accumulation window had no active optimizer step. The enabled "
+                        "objective produced no trainable targets."
                     )
 
                 _record_successful_optimizer_window()
@@ -1773,6 +1790,7 @@ def run_pretraining(
                 )
 
         while not effective_decoupled_training and global_step < int(train_cfg.max_steps):
+            uncommitted_training_window = True
             (
                 window,
                 gen_window_tokens_per_rank,
@@ -1794,6 +1812,8 @@ def run_pretraining(
             nonfinite_reason: str | None = None
             nonfinite_debug_path: Path | None = None
             window_nonfinite = _NonfiniteWindowObservation()
+            gen_phase_enabled = float(train_cfg.objective.gen_loss_weight) != 0.0
+            disc_phase_enabled = float(train_cfg.objective.disc_loss_weight) != 0.0
 
             for step_idx, (batch, gen_count, disc_count) in enumerate(window):
                 batch, flash_meta = _prepare_training_batch(batch)
@@ -1838,9 +1858,9 @@ def run_pretraining(
                         token_weighted_ga=token_weighted_ga,
                     )
                     offending: str | None = None
-                    if not torch.isfinite(out.gen_loss_raw.detach()).all():
+                    if gen_phase_enabled and not torch.isfinite(out.gen_loss_raw.detach()).all():
                         offending = "gen_loss_raw"
-                    elif not torch.isfinite(out.disc_loss_raw.detach()).all():
+                    elif disc_phase_enabled and not torch.isfinite(out.disc_loss_raw.detach()).all():
                         offending = "disc_loss_raw"
                     elif not torch.isfinite(out.loss.detach()).all():
                         offending = "forward_loss"
@@ -1886,16 +1906,18 @@ def run_pretraining(
                         break
                     if offending is not None:
                         continue
-                    micro_gen_tokens = out.gen_token_count.detach().float()
-                    micro_disc_tokens = out.disc_token_count.detach().float()
-                    gen_token_count_window = gen_token_count_window + micro_gen_tokens
-                    disc_token_count_window = disc_token_count_window + micro_disc_tokens
-                    disc_positive_count_window = (
-                        disc_positive_count_window + out.disc_positive_count.detach().float()
-                    )
-                    gen_loss_num = gen_loss_num + out.gen_loss.detach().float() * micro_gen_tokens
-                    disc_loss_num = disc_loss_num + out.disc_loss.detach().float() * micro_disc_tokens
-                    disc_acc_num = disc_acc_num + out.disc_accuracy.detach().float() * micro_disc_tokens
+                    if gen_phase_enabled:
+                        micro_gen_tokens = out.gen_token_count.detach().float()
+                        gen_token_count_window = gen_token_count_window + micro_gen_tokens
+                        gen_loss_num = gen_loss_num + out.gen_loss.detach().float() * micro_gen_tokens
+                    if disc_phase_enabled:
+                        micro_disc_tokens = out.disc_token_count.detach().float()
+                        disc_token_count_window = disc_token_count_window + micro_disc_tokens
+                        disc_positive_count_window = (
+                            disc_positive_count_window + out.disc_positive_count.detach().float()
+                        )
+                        disc_loss_num = disc_loss_num + out.disc_loss.detach().float() * micro_disc_tokens
+                        disc_acc_num = disc_acc_num + out.disc_accuracy.detach().float() * micro_disc_tokens
                     accelerator.backward(backward_loss)
 
                 if is_sync_step:
@@ -1944,11 +1966,10 @@ def run_pretraining(
 
             if not did_optimizer_step:
                 if skipped_window_due_nonfinite:
-                    last_saved_step = _finalize_nonfinite_skip(
+                    _finalize_nonfinite_skip(
                         optimizer_phases=[(optimizer, lr_scheduler, False)],
                         reason=nonfinite_reason,
                         debug_path=nonfinite_debug_path,
-                        last_saved_step=last_saved_step,
                     )
                     continue
                 raise RuntimeError("Accumulation window produced no synchronized optimization step.")
@@ -2004,7 +2025,12 @@ def run_pretraining(
         final_checkpoint_error: Exception | None = None
         final_step = int(global_step)
         should_try_crash_save = (crash_reason is None) or int(getattr(accelerator, "num_processes", 1)) == 1
-        if final_step > 0 and final_step != int(last_saved_step) and should_try_crash_save:
+        if (
+            final_step > 0
+            and final_step != int(last_saved_step)
+            and should_try_crash_save
+            and not uncommitted_training_window
+        ):
             try:
                 final_ckpt = output_dir / f"checkpoint-{final_step}"
                 _save_training_checkpoint(
@@ -2032,12 +2058,19 @@ def run_pretraining(
                     int(last_saved_step),
                     exc_info=True,
                 )
-        elif crash_reason is not None and not should_try_crash_save and accelerator.is_main_process:
-            logger.warning(
-                "Skipping crash-time final checkpoint save on distributed run "
-                "(num_processes=%s) to avoid potential collective deadlocks after failure.",
-                getattr(accelerator, "num_processes", "unknown"),
-            )
+        elif crash_reason is not None and accelerator.is_main_process:
+            if uncommitted_training_window:
+                logger.warning(
+                    "Skipping crash-time final checkpoint save because the current accumulation "
+                    "window was not fully committed. The last completed checkpoint is the "
+                    "recovery boundary."
+                )
+            elif not should_try_crash_save:
+                logger.warning(
+                    "Skipping crash-time final checkpoint save on distributed run "
+                    "(num_processes=%s) to avoid potential collective deadlocks after failure.",
+                    getattr(accelerator, "num_processes", "unknown"),
+                )
 
         final_export_error: Exception | None = None
         if (

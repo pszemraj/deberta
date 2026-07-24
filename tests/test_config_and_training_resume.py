@@ -332,6 +332,7 @@ def test_run_pretraining_keeps_resolved_yaml_roundtrippable_for_resume(
         "token_weighted_scaling",
         "branch_loss_weights",
         "skip_generator_step",
+        "skip_discriminator_phase",
         "partial_disc_window_sync",
     ],
 )
@@ -417,6 +418,24 @@ def test_run_pretraining_decoupled_integration(
             gradient_accumulation_steps=1,
             token_weighted_gradient_accumulation=False,
             objective={"gen_loss_weight": 0.0, "disc_loss_weight": 1.0},
+            compile={"enabled": False},
+            decoupled_training=True,
+        )
+    elif scenario == "skip_discriminator_phase":
+        behavior = {
+            "generator_phase_loss_scale": 2.0,
+            "discriminator_phase_loss_scale": float("nan"),
+        }
+        train_cfg = make_train_config(
+            checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
+            max_steps=1,
+            mixed_precision="no",
+            tf32=False,
+            dataloader={"num_workers": 0},
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            token_weighted_gradient_accumulation=False,
+            objective={"gen_loss_weight": 1.0, "disc_loss_weight": 0.0},
             compile={"enabled": False},
             decoupled_training=True,
         )
@@ -518,6 +537,12 @@ def test_run_pretraining_decoupled_integration(
     elif scenario == "skip_generator_step":
         assert step_counts == {"gen": 0, "disc": 1}
         assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
+    elif scenario == "skip_discriminator_phase":
+        assert step_counts == {"gen": 1, "disc": 0}
+        assert accel.calls["backward"] == pytest.approx([2.0], rel=0.0, abs=1e-6)
+        model = SimpleRTD.last_instance
+        assert model is not None
+        assert model.calls["forward_discriminator_phase"] == []
     elif scenario == "partial_disc_window_sync":
         assert step_counts == {"gen": 1, "disc": 1}
         model = SimpleRTD.last_instance
@@ -577,12 +602,13 @@ def test_run_pretraining_nonfinite_all_reduce_only_on_sync_microstep(
     assert int(call_count["value"]) == int(expected_nonfinite_checks)
 
 
-def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_scheduler(
+def test_run_pretraining_decoupled_nonfinite_disc_fails_after_generator_step(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     scheduler_steps = {"gen": 0, "disc": 0}
+    checkpoint_calls: list[tuple[str, int, str]] = []
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
@@ -594,6 +620,7 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
             },
             **kwargs,
         ),
+        save_checkpoint_fn=make_checkpoint_saver(calls=checkpoint_calls),
     )
 
     scheduler_build_count = 0
@@ -627,7 +654,13 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
         decoupled_training=True,
     )
 
-    with caplog.at_level(logging.WARNING):
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(
+            RuntimeError,
+            match="not atomic and will not be checkpointed",
+        ),
+    ):
         pretrain_mod.run_pretraining(
             model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
             data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
@@ -636,7 +669,64 @@ def test_run_pretraining_decoupled_nonfinite_disc_does_not_double_step_gen_sched
 
     assert scheduler_steps["gen"] == 1
     assert scheduler_steps["disc"] == 0
-    assert "nonfinite_window_skipped=1" in caplog.text
+    assert checkpoint_calls == []
+    assert "last completed checkpoint is the recovery boundary" in caplog.text
+
+
+def test_run_pretraining_decoupled_late_crash_does_not_checkpoint_partial_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    checkpoint_calls: list[tuple[str, int, str]] = []
+
+    def _raise_on_second_discriminator(_model: torch.nn.Module, call_idx: int) -> None:
+        if int(call_idx) == 2:
+            raise RuntimeError("late discriminator failure")
+
+    setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={"on_discriminator_phase": _raise_on_second_discriminator},
+            **kwargs,
+        ),
+        save_checkpoint_fn=make_checkpoint_saver(calls=checkpoint_calls),
+    )
+    train_cfg = make_train_config(
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
+        max_steps=2,
+        mixed_precision="no",
+        tf32=False,
+        dataloader={"num_workers": 0},
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        compile={"enabled": False},
+        decoupled_training=True,
+    )
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(
+            RuntimeError,
+            match="late discriminator failure",
+        ),
+    ):
+        from deberta.training.entrypoint import run_pretraining
+
+        run_pretraining(
+            model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
+            train_cfg=train_cfg,
+        )
+
+    model = SimpleRTD.last_instance
+    assert model is not None
+    assert len(model.calls["forward_generator_phase"]) == 2
+    assert len(model.calls["forward_discriminator_phase"]) == 2
+    assert checkpoint_calls == []
+    assert "last completed checkpoint is the recovery boundary" in caplog.text
 
 
 def test_run_pretraining_decoupled_skips_discriminator_for_zero_generator_tokens(
@@ -1132,12 +1222,13 @@ def test_run_pretraining_hf_deberta_auto_scope_compiles_backbones(
     assert getattr(compile_calls[1][0], "__self__", None) is instance.discriminator
 
 
-def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
+def test_run_pretraining_transient_nonfinite_does_not_spend_optimizer_step(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     opt_ref: dict[str, Any] = {}
+    norm_calls = 0
 
     class _CountingSGD(torch.optim.SGD):
         def __init__(self, params: Any, lr: float) -> None:
@@ -1154,10 +1245,15 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
         opt_ref["opt"] = opt
         return opt
 
+    def _one_nonfinite_norm(_model: torch.nn.Module) -> float:
+        nonlocal norm_calls
+        norm_calls += 1
+        return float("inf") if norm_calls == 1 else 0.0
+
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         extra_patches={
-            "_global_grad_l2_norm": lambda _model: float("inf"),
+            "_global_grad_l2_norm": _one_nonfinite_norm,
             "_build_optimizer": _build_optimizer,
         },
     )
@@ -1182,8 +1278,45 @@ def test_run_pretraining_nonfinite_grad_norm_never_steps_optimizer(
         )
     opt = opt_ref.get("opt")
     assert isinstance(opt, _CountingSGD)
-    assert int(opt.step_calls) == 0
+    assert int(opt.step_calls) == 1
     assert "nonfinite_window_skipped=1" in caplog.text
+
+
+def test_run_pretraining_persistent_nonfinite_fails_without_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_calls: list[tuple[str, int, str]] = []
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        rtd_cls=lambda **kwargs: SimpleRTD(
+            behavior={"generator_phase_loss_scale": float("nan")},
+            **kwargs,
+        ),
+        save_checkpoint_fn=make_checkpoint_saver(calls=checkpoint_calls),
+    )
+    train_cfg = make_train_config(
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
+        max_steps=1,
+        mixed_precision="no",
+        tf32=False,
+        dataloader={"num_workers": 0},
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        decoupled_training=True,
+        compile={"enabled": False},
+    )
+
+    with pytest.raises(RuntimeError, match="Non-finite recovery is exhausted"):
+        pretrain_mod.run_pretraining(
+            model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
+            train_cfg=train_cfg,
+        )
+
+    assert checkpoint_calls == []
 
 
 def test_apply_nonfinite_recovery_ratchets_lr_mult_and_resets_state_on_interval() -> None:

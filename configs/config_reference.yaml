@@ -303,7 +303,7 @@
 # Softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random. Use 1.0 unless measuring replacement entropy.
 
 # [train.objective.gen_loss_weight] float = 1.0; must be finite and >= 0; at least one objective weight must be > 0.
-# Multiplies generator MLM loss; in decoupled mode 0 skips the generator phase. Exact resume requires this value to match the source train snapshot.
+# Multiplies generator MLM loss; in decoupled mode 0 skips generator backward/optimization, while its forward still samples the corruptions required by the discriminator. Exact resume requires this value to match the source train snapshot.
 
 # [train.objective.disc_loss_weight] float; schema default 10.0; omission is 10.0 for native and 50.0 for RoPE.
 # Must be finite and >= 0; at least one objective weight must be > 0. Multiplies RTD loss; in decoupled mode 0 skips the discriminator phase. Exact resume requires this value to match the source train snapshot.

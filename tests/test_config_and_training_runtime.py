@@ -565,6 +565,35 @@ def test_token_weighted_micro_objective_matches_full_batch_normalization():
     torch.testing.assert_close(combined, expected)
 
 
+@pytest.mark.parametrize(
+    ("gen_loss_weight", "disc_loss_weight", "expected"),
+    [
+        (0.0, 2.0, 6.0),
+        (3.0, 0.0, 6.0),
+    ],
+)
+def test_token_weighted_micro_objective_ignores_disabled_nonfinite_branch(
+    gen_loss_weight: float,
+    disc_loss_weight: float,
+    expected: float,
+) -> None:
+    gen_loss = torch.tensor(float("nan") if gen_loss_weight == 0.0 else 2.0)
+    disc_loss = torch.tensor(float("nan") if disc_loss_weight == 0.0 else 3.0)
+
+    objective = _token_weighted_micro_objective(
+        gen_loss=gen_loss,
+        disc_loss=disc_loss,
+        gen_count=1.0,
+        disc_count=1.0,
+        gen_window_tokens_per_rank=1.0,
+        disc_window_tokens_per_rank=1.0,
+        gen_loss_weight=gen_loss_weight,
+        disc_loss_weight=disc_loss_weight,
+    )
+
+    torch.testing.assert_close(objective, torch.tensor(expected))
+
+
 def test_resolve_window_token_denominators_clamps_and_flags_zero_windows():
     gen_denom, disc_denom, gen_zero, disc_zero = _resolve_window_token_denominators(
         gen_window_tokens_per_rank_raw=8.0,

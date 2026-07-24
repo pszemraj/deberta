@@ -1702,6 +1702,52 @@ def test_pretrainer_forward_smoke():
     assert out.disc_accuracy.ndim == 0
 
 
+def test_pretrainer_zero_discriminator_weight_skips_discriminator_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+        pad_token_id=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    )
+
+    def _unexpected_discriminator_forward(**_kwargs: object) -> None:
+        raise AssertionError("disabled discriminator objective must not execute")
+
+    monkeypatch.setattr(model, "forward_discriminator_phase", _unexpected_discriminator_forward)
+    input_ids = torch.tensor([[1, 7, 8, 2]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, 1] = input_ids[0, 1]
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        gen_loss_weight=1.0,
+        disc_loss_weight=0.0,
+    )
+
+    assert torch.isfinite(out.loss)
+    torch.testing.assert_close(out.disc_token_count, torch.tensor(0.0))
+
+
 def test_pretrainer_sampler_avoids_configured_special_ids():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
