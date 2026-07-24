@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 
 @pytest.fixture
@@ -25,7 +27,8 @@ def mock_checkpoint(tmp_path: Path):
         ckpt = parent / str(name)
         ckpt.mkdir(parents=True, exist_ok=True)
         if with_weights:
-            (ckpt / "model.safetensors").write_bytes(b"weights")
+            # A real payload: checkpoint validation parses the safetensors header.
+            save_file({"weight": torch.zeros(4)}, str(ckpt / "model.safetensors"))
         if with_data_state:
             try:
                 global_step = int(str(name).rsplit("-", 1)[1])

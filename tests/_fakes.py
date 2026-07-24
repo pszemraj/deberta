@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors.torch import save_file
 
 from deberta.modeling.rtd import RTDDiscriminatorPhaseOutput, RTDGeneratorPhaseOutput, RTDOutput
 
@@ -716,7 +717,8 @@ def checkpoint_saving_accelerator(
         p = Path(output_dir)
         p.mkdir(parents=True, exist_ok=True)
         if write_weights:
-            (p / "model.safetensors").write_bytes(b"weights")
+            # A real payload: checkpoint validation parses the safetensors header.
+            save_file({"weight": torch.zeros(4)}, str(p / "model.safetensors"))
         marker = "main" if accel.is_main_process else "worker"
         (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
 

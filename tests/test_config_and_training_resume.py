@@ -24,6 +24,7 @@ from _fakes import (
     make_checkpoint_saver,
     setup_pretraining_mocks,
 )
+from safetensors.torch import save_file
 
 from deberta.config import (
     RUN_CONFIG_SCHEMA_VERSION,
@@ -34,6 +35,7 @@ from deberta.config import (
 )
 from deberta.training.run_config import _persist_or_validate_run_configs
 from deberta.training.run_management import (
+    _checkpoint_weights_appear_valid,
     _load_checkpoint_progress_metadata,
     _save_training_checkpoint,
 )
@@ -1789,3 +1791,38 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
 
     assert old_ckpt.exists()
     assert not new_ckpt.exists()
+
+
+def test_checkpoint_weights_appear_valid_accepts_real_safetensors_file(tmp_path: Path) -> None:
+    ckpt = tmp_path / "checkpoint-1"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    save_file({"weight": torch.zeros(8)}, str(ckpt / "model.safetensors"))
+
+    assert _checkpoint_weights_appear_valid(ckpt) is True
+
+
+def test_checkpoint_weights_appear_valid_rejects_truncated_safetensors_file(tmp_path: Path) -> None:
+    ckpt = tmp_path / "checkpoint-1"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    safetensors_path = ckpt / "model.safetensors"
+    save_file({"weight": torch.zeros(64)}, str(safetensors_path))
+    data = safetensors_path.read_bytes()
+    safetensors_path.write_bytes(data[:-10])
+
+    assert _checkpoint_weights_appear_valid(ckpt) is False
+
+
+def test_checkpoint_weights_appear_valid_rejects_garbage_safetensors_file(tmp_path: Path) -> None:
+    ckpt = tmp_path / "checkpoint-1"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    (ckpt / "model.safetensors").write_bytes(b"not a safetensors file, just some garbage bytes")
+
+    assert _checkpoint_weights_appear_valid(ckpt) is False
+
+
+def test_checkpoint_weights_appear_valid_accepts_nonempty_bin_file(tmp_path: Path) -> None:
+    ckpt = tmp_path / "checkpoint-1"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    (ckpt / "pytorch_model.bin").write_bytes(b"not a real torch checkpoint, but nonempty")
+
+    assert _checkpoint_weights_appear_valid(ckpt) is True

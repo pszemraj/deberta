@@ -266,14 +266,45 @@ def _select_latest_checkpoint(checkpoints: list[tuple[int, Path]]) -> Path | Non
     return max(checkpoints, key=lambda item: item[0])[1]
 
 
+def _safetensors_header_is_consistent(path: Path) -> bool:
+    """Cheaply validate a ``.safetensors`` file's header against its actual size.
+
+    Opens the file with :func:`safetensors.safe_open`, which parses the
+    little-endian u64 header-length prefix and the JSON header that follows it,
+    then verifies every tensor's ``data_offsets`` are covered by the file's
+    remaining bytes (i.e. ``file_size == 8 + header_len + max(data_offsets[1])``
+    per the safetensors format spec; the ``__metadata__`` key carries no
+    offsets and is ignored). Tensor payloads are never read or deserialized,
+    so the check stays cheap even for multi-gigabyte checkpoints.
+
+    :param Path path: Candidate ``.safetensors`` file.
+    :return bool: ``True`` when the header parses as JSON and the declared
+        tensor layout matches the file's actual size; ``False`` on any parse
+        failure or size mismatch.
+    """
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt") as handle:
+            handle.keys()
+    except Exception:
+        return False
+    return True
+
+
 def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
-    """Return whether a checkpoint has non-empty model-weight payloads.
+    """Return whether a checkpoint has non-empty, structurally sound model-weight payloads.
 
     This is a structural check intended to catch common crash artifacts
-    (missing/zero-byte model files), not a full deserialization validation.
+    (missing/zero-byte model files, truncated or corrupt ``.safetensors``
+    headers), not a full tensor deserialization validation. FSDP shards and
+    ``.bin`` files only get the existence/size check, since deserializing them
+    cheaply is not possible (``.bin`` is an arbitrary-code-execution risk via
+    ``torch.load``, and DCP shards have no equivalent lightweight header).
 
     :param Path checkpoint_dir: Candidate checkpoint directory.
-    :return bool: ``True`` when model-weight files appear present and non-empty.
+    :return bool: ``True`` when model-weight files appear present, non-empty, and
+        (for ``.safetensors`` files) structurally consistent.
     """
     root_patterns = (
         "*model*.safetensors",
@@ -283,9 +314,14 @@ def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
         for candidate in checkpoint_dir.glob(pattern):
             if not candidate.is_file():
                 continue
+            size_ok = False
             with suppress(OSError):
-                if int(candidate.stat().st_size) > 0:
-                    return True
+                size_ok = int(candidate.stat().st_size) > 0
+            if not size_ok:
+                continue
+            if candidate.suffix == ".safetensors" and not _safetensors_header_is_consistent(candidate):
+                continue
+            return True
 
     # FSDP sharded model-state directories written by accelerate/torch DCP.
     for subdir in checkpoint_dir.glob("pytorch_model_fsdp*"):
