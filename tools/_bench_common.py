@@ -327,6 +327,7 @@ def build_synthetic_backbone_config(
     """
 
     model_cfg = ModelConfig(
+        embedding_sharing="none",
         hf=ModelHFConfig(
             attention_impl=str(mode),
             max_position_embeddings=int(seq_len),
