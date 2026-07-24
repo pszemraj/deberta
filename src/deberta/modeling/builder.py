@@ -630,17 +630,6 @@ def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND)
             f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
             "to -1 (span follows max_position_embeddings) or use attention_impl=eager."
         )
-    effective_max_relative_positions = (
-        max_relative_positions if max_relative_positions > 0 else max_position_embeddings
-    )
-    minimum_relative_span = position_buckets // 2 + 2
-    if effective_max_relative_positions < minimum_relative_span:
-        raise ValueError(
-            f"{component} flash attention requires effective max_relative_positions >= "
-            "position_buckets // 2 + 2 so fused Triton routes preserve eager "
-            f"relative-position buckets; got effective max_relative_positions="
-            f"{effective_max_relative_positions}, position_buckets={position_buckets}."
-        )
     if "p2p" in _normalize_pos_att_type(getattr(cfg, "pos_att_type", "")):
         raise ValueError(f"{component} flash attention does not support pos_att_type containing 'p2p'.")
 

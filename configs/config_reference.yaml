@@ -55,7 +55,7 @@
 
 # [model.hf.attention_impl] str = "eager"; values: "eager" | "flash".
 # Flash is experimental and requires the `flash` extra, CUDA bf16 (`train.mixed_precision="bf16"`), both dropout values resolving to 0.0, and a power-of-two head dimension of at least 16 for each component.
-# Materialized configs must also use relative attention with at least 8 buckets, no P2P term, and an effective relative span of at least `position_buckets // 2 + 2` covering the full position budget. The default relative span is `max_position_embeddings`. Unsupported per-call masks may route to eager; build-time incompatibilities fail.
+# Materialized configs must also use relative attention with at least 8 buckets, no P2P term, and a relative span covering the full position budget. The default relative span is `max_position_embeddings`. Unsupported per-call masks may route to eager; build-time incompatibilities fail.
 
 # model.hf.flash — experimental and inactive unless `model.hf.attention_impl="flash"`; setting either child while Flash is inactive emits a warning.
 
