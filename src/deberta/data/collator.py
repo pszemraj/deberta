@@ -796,9 +796,20 @@ class DebertaV3ElectraCollator:
 
             mask_grams = [False] * len(groups)
             offset = 0
+            marked_any = False
             while offset < len(groups):
                 gram_n = int(torch.multinomial(probs, 1).item()) + 1
-                ctx_size = min(gram_n * mask_window, len(groups) - offset)
+                span = gram_n * mask_window
+                remaining = len(groups) - offset
+                if remaining < span and marked_any:
+                    # A trailing partial context window still marks a full n-gram, which
+                    # would mask the last groups far above the 1 / mask_window rate. Take
+                    # it with probability proportional to its width instead. The first
+                    # window is always taken so every row keeps at least one masked span.
+                    if float(torch.rand(1, device=input_ids.device).item()) * span >= remaining:
+                        break
+
+                ctx_size = min(span, remaining)
                 if ctx_size <= 0:
                     break
 
@@ -808,20 +819,30 @@ class DebertaV3ElectraCollator:
                 offset = max(offset + ctx_size, end)
                 for i in range(start, end):
                     mask_grams[i] = True
+                marked_any = True
+
+            # Marked groups form contiguous n-gram spans. Consume whole spans in random
+            # order so that stopping at the budget drops an arbitrary span rather than
+            # always the highest-index ones.
+            spans: list[list[int]] = []
+            for i, do_mask in enumerate(mask_grams):
+                if not do_mask:
+                    continue
+                if spans and spans[-1][-1] == i - 1:
+                    spans[-1].append(i)
+                else:
+                    spans.append([i])
 
             selected_positions: list[int] = []
             used = 0
-            for do_mask, group in zip(mask_grams, groups, strict=True):
-                if not do_mask:
-                    continue
-                g_len = len(group)
-                if g_len <= 0:
-                    continue
-                selected_positions.extend(group)
-                used += g_len
+            for s in torch.randperm(len(spans), device=input_ids.device).tolist():
+                for i in spans[s]:
+                    selected_positions.extend(groups[i])
+                    used += len(groups[i])
                 if used >= num_to_predict:
                     break
 
+            selected_positions.sort()
             selected = torch.tensor(selected_positions, device=input_ids.device, dtype=torch.long)
             self._apply_mask_replacement_policy(
                 input_ids,

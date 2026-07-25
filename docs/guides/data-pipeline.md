@@ -106,6 +106,8 @@ Masking uses `attention_mask` liveness captured before padding metadata is simpl
 
 Windowed unigram selection sizes its windows from that budget: the candidate positions are split into exactly `num_to_predict` contiguous windows of near-equal size and one position is drawn uniformly from each. This keeps the selection count exact and every candidate position equally likely. Sizing windows from `int(1 / mlm_probability)` instead over-produces whenever the reciprocal is not an integer, and trimming the sorted excess back to the budget silently leaves the tail of every sequence unmasked.
 
+Whole-word n-gram selection walks context windows of `n * int(1 / mlm_probability)` word groups. A trailing window narrower than that is taken with probability proportional to its width, and marked spans are consumed in random order when stopping at the budget. Both are needed for a positionally uniform mask rate: always marking a full n-gram in a narrow trailing window over-masks the last groups, and always dropping the highest-index spans at the budget under-masks them.
+
 Unmasked labels are `-100`; masked labels keep original token ids.
 
 ## Performance path for unpadded batches

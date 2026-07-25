@@ -1194,6 +1194,36 @@ def test_windowed_unigram_masking_covers_every_candidate_position():
     assert bool(covered[1:-1].all().item())
 
 
+def test_ngram_masking_rate_is_positionally_uniform():
+    seq_len, rows = 128, 1500
+    tok = DummyTokenizer(
+        vocab_size=256,
+        # Alternating word/continuation ids, so every whole word spans two tokens and the
+        # token budget is reached before every marked group is consumed.
+        token_map={t: (f"w{t}" if t % 2 == 0 else f"##w{t}") for t in range(10, 110)},
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.15, max_ngram=3))
+    input_ids, special, row_lengths = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
+
+    torch.manual_seed(0)
+    _, labels = coll._mask_tokens_ngram(
+        input_ids, special_tokens_mask=special, row_lengths=row_lengths, max_ngram=3
+    )
+
+    # A trailing partial context window used to mark a full n-gram regardless of its
+    # width, while the budget stop always cut the highest-index groups. The two biases
+    # ran in opposite directions and did not cancel, leaving the tail of a sequence
+    # masked at roughly two thirds the rate of the head.
+    rate = labels.ne(-100).float().mean(dim=0)[1:-1]
+    decile = rate.numel() // 10
+    head = float(rate[:decile].mean())
+    tail = float(rate[-decile:].mean())
+    assert 0.8 < tail / head < 1.25, f"positional mask-rate skew: head={head:.4f} tail={tail:.4f}"
+    assert float(rate.min()) > 0.5 * float(rate.mean())
+
+
 def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
