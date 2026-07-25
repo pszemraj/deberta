@@ -1161,6 +1161,39 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
     assert set(counts) == {1}
 
 
+def _coverage_inputs(tok: DummyTokenizer, *, seq_len: int, rows: int):
+    """Build a batch of identical rows with only CLS/SEP marked special."""
+    ids = [tok.cls_token_id, *(10 + (i % 100) for i in range(seq_len - 2)), tok.sep_token_id]
+    input_ids = torch.tensor([ids] * rows, dtype=torch.long)
+    special = torch.zeros((rows, seq_len), dtype=torch.bool)
+    special[:, 0] = True
+    special[:, -1] = True
+    return input_ids, special, torch.full((rows,), seq_len, dtype=torch.long)
+
+
+def test_windowed_unigram_masking_covers_every_candidate_position():
+    seq_len, rows = 64, 128
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.15, max_ngram=1))
+    input_ids, special, row_lengths = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
+
+    torch.manual_seed(0)
+    _, labels = coll._mask_tokens_unigram_windowed(
+        input_ids, special_tokens_mask=special, row_lengths=row_lengths
+    )
+    labelled = labels.ne(-100)
+
+    # Windows are sized from the budget, so selection hits it exactly rather than
+    # over-producing at int(1 / 0.15) == 6 and trimming the excess.
+    assert set(labelled.sum(dim=1).tolist()) == {max(1, round(seq_len * 0.15))}
+
+    # Every candidate must stay reachable. Trimming a sorted selection to the budget
+    # deterministically starved the tail of every sequence.
+    covered = labelled.any(dim=0)
+    assert not bool(covered[0].item()) and not bool(covered[-1].item())
+    assert bool(covered[1:-1].all().item())
+
+
 def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))

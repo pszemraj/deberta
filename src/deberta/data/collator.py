@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -591,30 +590,34 @@ class DebertaV3ElectraCollator:
         )
 
     @staticmethod
-    def _sample_windowed_unigram_indices(maskable_idx: torch.Tensor, *, mask_window: int) -> torch.Tensor:
+    def _sample_windowed_unigram_indices(maskable_idx: torch.Tensor, *, num_to_predict: int) -> torch.Tensor:
         """Sample one mask position per DeBERTa window from sorted candidate indices.
 
+        Candidates are split into ``num_to_predict`` contiguous windows of near-equal
+        size and one position is drawn uniformly from each. Sizing the windows from
+        the budget rather than from ``int(1 / mlm_probability)`` keeps the selection
+        count exact, so no candidate has to be trimmed afterwards; trimming a sorted
+        selection would starve the tail of every sequence.
+
         :param torch.Tensor maskable_idx: 1D sorted token positions.
-        :param int mask_window: Window size ``int(1 / mlm_probability)``.
+        :param int num_to_predict: Target number of positions to select.
         :return torch.Tensor: Selected token positions.
         """
         count = int(maskable_idx.numel())
-        if count <= 0:
+        n_windows = min(int(num_to_predict), count)
+        if n_windows <= 0:
             return maskable_idx.new_empty((0,), dtype=torch.long)
-        if mask_window <= 1:
+        if n_windows == count:
             return maskable_idx
 
-        n_windows = int(math.ceil(float(count) / float(mask_window)))
-        starts = torch.arange(n_windows, device=maskable_idx.device, dtype=torch.long) * int(mask_window)
-        sizes = torch.clamp(
-            torch.full((n_windows,), int(mask_window), device=maskable_idx.device, dtype=torch.long),
-            max=count - starts,
+        device = maskable_idx.device
+        edges = torch.arange(n_windows + 1, device=device, dtype=torch.long) * count // n_windows
+        starts = edges[:-1]
+        sizes = edges[1:] - starts
+        offsets = torch.floor(torch.rand(n_windows, device=device, dtype=torch.float32) * sizes.float()).to(
+            torch.long
         )
-        offsets = torch.floor(
-            torch.rand(n_windows, device=maskable_idx.device, dtype=torch.float32) * sizes.float()
-        ).to(torch.long)
-        selected_offsets = starts + offsets
-        return maskable_idx.index_select(0, selected_offsets)
+        return maskable_idx.index_select(0, starts + offsets)
 
     def _resolve_masking_hyperparams(self, *, mlm_prob: float) -> tuple[float, float, float, int]:
         """Resolve the shared DeBERTa masking hyperparameters for one batch.
@@ -696,7 +699,7 @@ class DebertaV3ElectraCollator:
         mask_token_id = int(self.tokenizer.mask_token_id)
         mlm_prob = float(self.cfg.mlm_probability)
 
-        mask_prob, random_prob, keep_prob, mask_window = self._resolve_masking_hyperparams(mlm_prob=mlm_prob)
+        mask_prob, random_prob, keep_prob, _ = self._resolve_masking_hyperparams(mlm_prob=mlm_prob)
 
         for b in range(batch):
             spec = special_tokens_mask[b].to(dtype=torch.bool)
@@ -709,11 +712,9 @@ class DebertaV3ElectraCollator:
             if int(maskable_idx.numel()) == 0:
                 continue
 
-            selected = self._sample_windowed_unigram_indices(maskable_idx, mask_window=mask_window)
+            selected = self._sample_windowed_unigram_indices(maskable_idx, num_to_predict=num_to_predict)
             if int(selected.numel()) == 0:
                 continue
-            if int(selected.numel()) > int(num_to_predict):
-                selected = selected[: int(num_to_predict)]
 
             self._apply_mask_replacement_policy(
                 input_ids,
