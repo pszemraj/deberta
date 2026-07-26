@@ -35,6 +35,36 @@ What it takes:
 
 Non-goals: no change to EMD semantics, pass count, or which positions are supervised.
 
+## Harden positional-gradient atomic accumulation in the vendored flash backward kernels
+
+The pinned `flashDeBERTa==0.0.7` backward kernels accumulate the c2p/p2c positional-bias
+gradients with `tl.atomic_add` in ways our first-party kernels already avoid
+(`flashdeberta_bias_op.py` and `flashdeberta_dense_bias_op.py` upcast to fp32 accumulator
+tensors and downcast once at the end). Two distinct issues, both confirmed by direct read of
+the installed package:
+
+- **bf16 atomic destinations (fixed, varlen, and docblock routes).** The kernels downcast
+  `ds * sm_scale` to the model dtype before `atomic_add`
+  (`flashdeberta/ops/flash_attention.py:781,789,927`;
+  `flash_attention_varlen.py:915,924,930`), and our wrappers allocate the destination
+  tables with `torch.zeros_like(pos_*)` — bf16 in training
+  (`flashdeberta_fixed_op.py:463`, `flashdeberta_varlen_op.py:886`). Hundreds of
+  nondeterministically ordered bf16 additions per bucket slot cost real mantissa and make
+  `dpos_*` run-to-run nondeterministic. This matches upstream 0.0.7 deliberately (comment at
+  `flashdeberta_fixed_op.py:461-462`). Fix needs no kernel edit: allocate the destination
+  tables as fp32 and downcast after the launch — Triton casts the atomic operand to the
+  pointer element type, so the unmodified vendored kernels accumulate in fp32. Requires
+  GPU parity + throughput re-runs; do not land mid-timing-campaign.
+- **`scope="cta"` on cross-CTA atomics (fixed route only).** `flash_attention.py:789-791`
+  and `927-929` use `sem="relaxed", scope="cta"`, but colliding writers are different CTAs
+  (grid axis 0 is the tile index; every tile of a batch/head hits the same bucket slots).
+  The PTX memory model only guarantees RMW atomicity within the declared scope; current
+  hardware (sm_80 through sm_120, incl. H100/B200) serializes global atomics at L2
+  regardless, so this works today but is formally unspecified. The varlen kernels omit
+  `scope` (defaults to `"gpu"`, correct), as do our first-party kernels. Fix belongs
+  upstream (`scope="gpu"`), or falls out for free if the fp32-accumulator change above is
+  ever paired with vendoring the two backward kernels.
+
 ## Evaluate Adam-atan2 to drop eps tuning in dual-model RTD training
 
 Dual-model RTD training (generator + discriminator, GDES sync, decoupled optimizers) is finicky: the two backbones have different gradient scales, and the backbone profiles already disagree on Adam epsilon (`hf_deberta_v2`: 1e-6, `rope`: 1e-8) — evidence that eps is a live tuning knob here rather than a solved constant.
