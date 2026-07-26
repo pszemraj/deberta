@@ -53,14 +53,19 @@ jobs:
         run: python -m pytest tests/ -q
 
   flash-extra:
-    name: flash extra resolves and imports
+    name: flash extra resolves, imports, and passes flash contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install flash extra on a clean CPU-only machine
-        run: python -m pip install -e '.[flash]'
+      - name: Install dev and flash extras on a clean CPU-only machine
+        run: python -m pip install -e '.[dev,flash]'
       - name: Import package and flash dependency
         run: python -c "import deberta, flashdeberta"
+      # The Triton specialization guard inspects kernels that only exist when
+      # the flash extra is installed; cpu-tests runs without it, so this job is
+      # the sole automated coverage of the upstream FlashDeBERTa kernels.
+      - name: Run flash contract tests against the installed extra
+        run: python -m pytest tests/test_flashdeberta_patch.py -q
