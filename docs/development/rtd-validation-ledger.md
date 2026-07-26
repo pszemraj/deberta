@@ -98,7 +98,9 @@ Measure steady state from `input_tokens_seen` deltas between steps 100 and 250. 
 |---|---:|
 | `fc80aac`, before the regression | 43,497 |
 | `ddabf47` through `ac4454a` | 35,877 |
-| `81b46e9`, after the fix | 48,188 |
+| `81b46e9`, after the fix | 47,262 |
+
+Timestamps in the trainer log have one-second resolution, so a 150-step window carries an error floor near 1% and repeat runs of one tree spread by roughly 2%. Only differences much larger than that mean anything here; the regression itself is 17.5%.
 
 A binary search over the commits touching `src/` between those endpoints reached `ddabf47`, and reverting `flashdeberta_dense_bias_op.py` alone to its parent restored the throughput. Isolating the op showed the forward kernel itself at 1.235 ms against 0.209 ms for the same shapes and the same launch config, with byte-identical output; the compiled kernel had dropped from 32,768 bytes of shared memory to zero.
 
