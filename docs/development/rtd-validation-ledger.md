@@ -67,3 +67,23 @@ Wikitext transfer confirms a calibration limitation rather than collapse. Agains
 The automatic final Hugging Face artifact loaded through `AutoModel`. Comparison with checkpoint 50k over 26,880 active hidden-state elements measured maximum absolute error `8.52e-6`, mean absolute error `7.46e-7`, and cosine similarity indistinguishable from 1.0.
 
 Decision: accept checkpoint 50k and its `final_hf` export as the successful production outcome. The generator improves, discriminator ranking strengthens through the end of training, representations remain diverse, downstream mean-pooled quality improves, and export is faithful. Treat cross-domain RTD calibration as a downstream product concern, not a pretraining defect.
+
+## Collator masking fix rerun
+
+The run above trained on windowed-unigram masking that sized its windows from `int(1 / 0.15) = 6`. That over-produced candidates against the 15% budget and trimmed the sorted excess, so the last roughly 9.6% of every 1024-token row was never a masking target. The rerun repeats the same recipe on the fixed collator, differing only in logging, and is the reference production run from this point forward.
+
+It completed 1.638B input tokens in 12h39m18s at approximately 36.0k tok/s. The throughput drop relative to the run above is environmental, not a regression: the box moved from driver `575.64.03` to `595.71.05` / CUDA 13.2 between the two runs, and the GPU stayed compute-bound at 97-98% utilization throughout. All ten checkpoints and the `final_hf` export committed successfully, with zero non-finite elements. The final training window reported generator CE `1.791`, discriminator BCE `0.1945`, prior gain `0.0609`, and replacement rate `0.0707`.
+
+Both runs' checkpoints were then scored under one identical evaluation: the same config, seed `20260720`, 16 sequences, 16,384 active tokens, and 2,464 masked tokens, with eager attention and flash disabled. Only the loaded weights differ.
+
+| Step | Generator CE | Discriminator BCE | Gain over prior | ROC-AUC | AP |
+|---:|---:|---:|---:|---:|---:|
+| 5,000 | 3.382 -> 3.379 | 0.3817 -> 0.2816 | -0.0463 -> 0.0527 | 0.712 -> 0.773 | 0.298 -> 0.328 |
+| 15,000 | 2.700 -> 2.697 | 0.3622 -> 0.2494 | -0.0551 -> 0.0522 | 0.726 -> 0.798 | 0.252 -> 0.296 |
+| 25,000 | 2.459 -> 2.467 | 0.3416 -> 0.2402 | -0.0466 -> 0.0529 | 0.741 -> 0.803 | 0.259 -> 0.298 |
+| 35,000 | 2.353 -> 2.336 | 0.3353 -> 0.2289 | -0.0472 -> 0.0587 | 0.745 -> 0.819 | 0.265 -> 0.331 |
+| 50,000 | 2.259 -> 2.253 | 0.3317 -> 0.2220 | -0.0477 -> 0.0630 | 0.749 -> 0.834 | 0.280 -> 0.346 |
+
+Generator cross-entropy is unchanged, so the fix neither eased nor hardened the MLM task. The discriminator carries the entire difference. Scored on positionally uniform masking, the old checkpoints land below the constant class-prior predictor at every stage, with logit standard deviation `4.22` against the rerun's `2.71`: confidently wrong on the tail positions they never saw corrupted. The rerun also beats the old run's own numbers from its home distribution above (gain `0.0611`, ROC-AUC `0.828`, AP `0.323` at 50k), so the improvement is not an artifact of scoring the old weights off-distribution.
+
+Two measurement notes for anyone rereading the older tables. The evaluator's `replacement_rate` now divides by masked-token count, whereas the 50k table above predates that change and reports the share of all tokens; the two differ by roughly the masking rate. And because the evaluator masks its own batches with the current collator, numbers produced before the fix are not comparable to numbers produced after it. Rescore both sides whenever the collator changes.
