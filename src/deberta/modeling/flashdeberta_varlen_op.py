@@ -881,10 +881,17 @@ def _varlen_backward_raw_impl(
     dq_unpad = torch.empty_like(q_unpad)
     dk_unpad = torch.empty_like(k_unpad)
     dv_unpad = torch.empty_like(v_unpad)
-    # Match pinned FlashDeBERTa 0.0.7: positional atomic destinations use the
-    # model dtype; CUDA bf16 atomics are supported on the repo floor (sm80+).
-    dpos_key_unpad = torch.zeros_like(pos_key_unpad) if pos_key_unpad is not None else None
-    dpos_query_unpad = torch.zeros_like(pos_query_unpad) if pos_query_unpad is not None else None
+    # Positional atomic destinations accumulate in fp32: Triton casts the
+    # kernel's bf16 addend to the pointer element type, so fp32 buffers remove
+    # the order-sensitive bf16 accumulation loss without touching the vendored
+    # kernels. zeros_like keeps pos_* strides, which the kernel shares with
+    # these buffers; the grads are downcast to the model dtype on return.
+    dpos_key_unpad = (
+        torch.zeros_like(pos_key_unpad, dtype=torch.float32) if pos_key_unpad is not None else None
+    )
+    dpos_query_unpad = (
+        torch.zeros_like(pos_query_unpad, dtype=torch.float32) if pos_query_unpad is not None else None
+    )
 
     stride_pk0, stride_pk1, stride_pk2 = strides_or_zeros(pos_key_unpad, 3)
     stride_pq0, stride_pq1, stride_pq2 = strides_or_zeros(pos_query_unpad, 3)
@@ -998,6 +1005,10 @@ def _varlen_backward_raw_impl(
         num_warps=q_num_warps,
         num_stages=q_num_stages,
     )
+    if dpos_key_unpad is not None:
+        dpos_key_unpad = dpos_key_unpad.to(pos_key_unpad.dtype)
+    if dpos_query_unpad is not None:
+        dpos_query_unpad = dpos_query_unpad.to(pos_query_unpad.dtype)
     return dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad
 
 

@@ -35,35 +35,22 @@ What it takes:
 
 Non-goals: no change to EMD semantics, pass count, or which positions are supervised.
 
-## Harden positional-gradient atomic accumulation in the vendored flash backward kernels
+## Keep the vendored positional-gradient addend in fp32 (upstream kernel change)
 
-The pinned `flashDeBERTa==0.0.7` backward kernels accumulate the c2p/p2c positional-bias
-gradients with `tl.atomic_add` in ways our first-party kernels already avoid
-(`flashdeberta_bias_op.py` and `flashdeberta_dense_bias_op.py` upcast to fp32 accumulator
-tensors and downcast once at the end). Two distinct issues, both confirmed by direct read of
-the installed package:
+The pinned `flashDeBERTa==0.0.7` backward kernels round `ds * sm_scale` to the model dtype
+*before* the positional-gradient `tl.atomic_add` (`flashdeberta/ops/flash_attention.py:781`;
+`flash_attention_varlen.py:915`). The wrappers now allocate the atomic destinations as fp32
+(`flashdeberta_fixed_op.py`, `flashdeberta_varlen_op.py` — Triton casts the addend to the
+pointer element type), which removes the dominant order-sensitive accumulation loss, but the
+one-rounding-per-contribution of the bf16 addend itself remains. Fixing that needs the
+kernels to skip the pre-atomic downcast — an upstream PR or vendoring the two backward
+kernels. Low value on its own (~2^-9 relative, unbiased); pick up only if the kernels get
+vendored for another reason.
 
-- **bf16 atomic destinations (fixed, varlen, and docblock routes).** The kernels downcast
-  `ds * sm_scale` to the model dtype before `atomic_add`
-  (`flashdeberta/ops/flash_attention.py:781,789,927`;
-  `flash_attention_varlen.py:915,924,930`), and our wrappers allocate the destination
-  tables with `torch.zeros_like(pos_*)` — bf16 in training
-  (`flashdeberta_fixed_op.py:463`, `flashdeberta_varlen_op.py:886`). Hundreds of
-  nondeterministically ordered bf16 additions per bucket slot cost real mantissa and make
-  `dpos_*` run-to-run nondeterministic. This matches upstream 0.0.7 deliberately (comment at
-  `flashdeberta_fixed_op.py:461-462`). Fix needs no kernel edit: allocate the destination
-  tables as fp32 and downcast after the launch — Triton casts the atomic operand to the
-  pointer element type, so the unmodified vendored kernels accumulate in fp32. Requires
-  GPU parity + throughput re-runs; do not land mid-timing-campaign.
-- **`scope="cta"` on cross-CTA atomics (fixed route only).** `flash_attention.py:789-791`
-  and `927-929` use `sem="relaxed", scope="cta"`, but colliding writers are different CTAs
-  (grid axis 0 is the tile index; every tile of a batch/head hits the same bucket slots).
-  The PTX memory model only guarantees RMW atomicity within the declared scope; current
-  hardware (sm_80 through sm_120, incl. H100/B200) serializes global atomics at L2
-  regardless, so this works today but is formally unspecified. The varlen kernels omit
-  `scope` (defaults to `"gpu"`, correct), as do our first-party kernels. Fix belongs
-  upstream (`scope="gpu"`), or falls out for free if the fp32-accumulator change above is
-  ever paired with vendoring the two backward kernels.
+Verified non-issue while auditing this: the atomics' `scope="cta"` in the fixed-route
+kernels is correct — `DKPOS`/`DQPOS` writes are always CTA-local (grid axis 0 partitions the
+written rows; batch/head base offsets are disjoint), and the varlen kernel, whose combined
+kv-side atomics do collide across CTAs, uses the default `"gpu"` scope.
 
 ## Evaluate Adam-atan2 to drop eps tuning in dual-model RTD training
 

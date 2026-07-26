@@ -458,10 +458,13 @@ def _fixed_triton_backward_impl(
         dq = torch.zeros_like(q)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
-    # Match pinned FlashDeBERTa 0.0.7: positional atomic destinations use the
-    # model dtype; CUDA bf16 atomics are supported on the repo floor (sm80+).
-    dk_pos = torch.zeros_like(pos_key) if pos_key is not None else None
-    dq_pos = torch.zeros_like(pos_query) if pos_query is not None else None
+    # Positional atomic destinations accumulate in fp32: Triton casts the
+    # kernel's bf16 addend to the pointer element type, so fp32 buffers remove
+    # the order-sensitive bf16 accumulation loss without touching the vendored
+    # kernels. zeros_like keeps pos_* strides, which the kernels share with
+    # these buffers; the grads are downcast to the model dtype on return.
+    dk_pos = torch.zeros_like(pos_key, dtype=torch.float32) if pos_key is not None else None
+    dq_pos = torch.zeros_like(pos_query, dtype=torch.float32) if pos_query is not None else None
 
     stride_pk0, stride_pk1, stride_pk2, stride_pk3 = strides_or_zeros(pos_key, 4)
     stride_pq0, stride_pq1, stride_pq2, stride_pq3 = strides_or_zeros(pos_query, 4)
@@ -618,6 +621,10 @@ def _fixed_triton_backward_impl(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if dk_pos is not None:
+        dk_pos = dk_pos.to(pos_key.dtype)
+    if dq_pos is not None:
+        dq_pos = dq_pos.to(pos_query.dtype)
     return dq, dk, dv, dk_pos, dq_pos
 
 
