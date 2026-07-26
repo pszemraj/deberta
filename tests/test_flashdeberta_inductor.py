@@ -191,6 +191,95 @@ def test_real_docblock_flash_metadata_values_do_not_recompile() -> None:
     assert counters["stats"]["unique_graphs"] == compiled_graphs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for real Inductor coverage.")
+def test_real_fixed_flash_seq_bucket_crossing_recompiles_and_stays_correct() -> None:
+    """A tuning-bucket change must recompile through Dynamo guards, never reuse the old graph.
+
+    The density bucket is resolved host-side and crosses the compile boundary as
+    ``FlashBatchMeta.seq_bucket``; the kernel launch config is looked up from it
+    inside the custom op. If Dynamo ever stopped guarding on the string, a batch
+    in a new bucket would silently run the previous bucket's graph.
+    """
+
+    from torch._dynamo.utils import counters
+
+    from deberta.modeling.flashdeberta_attention import (
+        FlashDisentangledSelfAttention,
+        flashdeberta_fixed_import_error,
+    )
+    from deberta.modeling.mask_utils import FlashBatchMeta
+
+    if flashdeberta_fixed_import_error() is not None:
+        pytest.skip("FlashDeBERTa fixed kernels are unavailable in this environment.")
+
+    cfg = make_native_deberta_config(
+        flash=True,
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        type_vocab_size=0,
+        relative_attention=True,
+        position_buckets=8,
+        max_relative_positions=16,
+        pos_att_type=["c2p", "p2c"],
+        pad_token_id=0,
+        position_biased_input=False,
+    )
+    attention = FlashDisentangledSelfAttention(cfg).to(device="cuda", dtype=torch.bfloat16)
+
+    def _reject_eager(**_kwargs):
+        raise AssertionError("bucket-crossing coverage must not fall back to eager")
+
+    attention._eager_forward_fallback = _reject_eager
+
+    def _forward(
+        hidden_states: torch.Tensor,
+        rel_embeddings: torch.Tensor,
+        meta: FlashBatchMeta,
+    ) -> torch.Tensor:
+        output, _ = attention(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            rel_embeddings=rel_embeddings,
+            flash_meta=meta,
+        )
+        return output
+
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(_forward, backend="inductor", fullgraph=True, dynamic=False)
+    base_hidden = torch.randn((1, 16, cfg.hidden_size), device="cuda", dtype=torch.bfloat16)
+    base_rel = torch.randn((cfg.position_buckets * 2, cfg.hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    def _run(seq_bucket: str) -> torch.Tensor:
+        hidden_states = base_hidden.clone().requires_grad_(True)
+        rel_embeddings = base_rel.clone().requires_grad_(True)
+        output = compiled(
+            hidden_states,
+            rel_embeddings,
+            FlashBatchMeta(route_hint="fixed", seq_bucket=seq_bucket),
+        )
+        output.float().square().mean().backward()
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+        return output
+
+    first = _run("default")
+    graphs_after_first = counters["stats"]["unique_graphs"]
+    assert graphs_after_first > 0
+
+    crossed = _run("1024_exact")
+    graphs_after_crossing = counters["stats"]["unique_graphs"]
+    assert graphs_after_crossing > graphs_after_first
+
+    assert torch.isfinite(first).all()
+    # The bucket only selects launch geometry; the math must not move.
+    torch.testing.assert_close(crossed.float(), first.float(), rtol=5e-2, atol=5e-2)
+
+    replay = _run("default")
+    assert counters["stats"]["unique_graphs"] == graphs_after_crossing
+    torch.testing.assert_close(replay.float(), first.float(), rtol=0.0, atol=0.0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the Flash microbench.")
 def test_flash_microbench_runs_flash_mode() -> None:
     result = subprocess.run(
