@@ -5416,14 +5416,57 @@ def test_triton_kernels_keep_runtime_value_specialization() -> None:
     offenders: dict[str, list[str]] = {}
     for module_info in pkgutil.walk_packages(deberta.__path__, "deberta."):
         module = importlib.import_module(module_info.name)
-        for attribute in vars(module).values():
-            if not isinstance(attribute, jit_module.JITFunction):
+        for attribute_name, attribute in vars(module).items():
+            kernel = attribute
+            # An ``@triton.autotune``/``@triton.heuristics`` wrapper is not a
+            # JITFunction instance; it chains to the wrapped kernel through
+            # ``fn``. Unwrap so a wrapped kernel cannot escape this guard.
+            for _ in range(8):
+                if isinstance(kernel, jit_module.JITFunction) or kernel is None:
+                    break
+                kernel = getattr(kernel, "fn", None)
+            if not isinstance(kernel, jit_module.JITFunction):
                 continue
-            annotated = kernel_runtime_parameter_annotations(attribute)
+            annotated = kernel_runtime_parameter_annotations(kernel)
             if annotated:
-                offenders[f"{module_info.name}.{attribute.__name__}"] = annotated
+                offenders[f"{module_info.name}.{attribute_name}"] = annotated
 
     assert offenders == {}, (
         "Triton kernels must annotate runtime parameters ``None`` so value specialization "
         f"stays enabled; give a real type only to tl.constexpr parameters. Offenders: {offenders}"
+    )
+
+
+def test_no_triton_kernels_outside_the_deberta_package() -> None:
+    """Assert tools/ and tests/ define no Triton kernels of their own.
+
+    ``test_triton_kernels_keep_runtime_value_specialization`` walks the installed
+    ``deberta`` package, so a kernel defined under tools/ or tests/ would never be
+    inspected. Keeping kernels inside the package also keeps the tuning tools
+    honest: they must measure the kernels they ship, not private copies whose
+    codegen can drift from production.
+    """
+
+    import ast
+    import re
+
+    repo_root = Path(__file__).resolve().parent.parent
+    offenders: list[str] = []
+    for directory in ("tools", "tests"):
+        for path in sorted((repo_root / directory).rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for decorator in node.decorator_list:
+                    # Only the decorator's callable target matters; a pytest
+                    # mark whose condition mentions triton is not a kernel.
+                    target_node = decorator.func if isinstance(decorator, ast.Call) else decorator
+                    target = ast.unparse(target_node)
+                    if re.search(r"(^|\.)(jit|autotune|heuristics)$", target) or "triton_jit" in target:
+                        offenders.append(f"{path.relative_to(repo_root)}:{node.lineno} {node.name}")
+
+    assert offenders == [], (
+        "Triton kernels must live under src/deberta where the specialization guard "
+        f"walks them. Offenders: {offenders}"
     )
