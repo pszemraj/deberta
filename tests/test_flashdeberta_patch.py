@@ -5411,10 +5411,10 @@ def test_triton_kernels_keep_runtime_value_specialization() -> None:
     jit_module = pytest.importorskip("triton.runtime.jit")
     import pkgutil
 
-    import deberta.modeling
+    import deberta
 
     offenders: dict[str, list[str]] = {}
-    for module_info in pkgutil.walk_packages(deberta.modeling.__path__, "deberta.modeling."):
+    for module_info in pkgutil.walk_packages(deberta.__path__, "deberta."):
         module = importlib.import_module(module_info.name)
         for attribute in vars(module).values():
             if not isinstance(attribute, jit_module.JITFunction):
