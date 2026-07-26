@@ -5375,3 +5375,55 @@ def test_docblock_varlen_backward_uses_docblock_tuning_namespace(monkeypatch: py
         policy_path="",
     ) == (16, 32, 1, 4)
     assert seen == {"route": "docblock", "kind": "bwd_kv"}
+
+
+def kernel_runtime_parameter_annotations(kernel: Any) -> list[str]:
+    """Return non-constexpr kernel parameters whose annotation disables specialization.
+
+    Triton canonicalizes an annotation such as ``int`` to ``i32`` and then pins the
+    argument type from that annotation instead of specializing on the value actually
+    passed (``create_function_from_signature`` in ``triton/runtime/jit.py``). Value
+    specialization is what tells Triton that a stride is divisible by 16, or exactly 1;
+    without it the compiler cannot prove contiguity and stops emitting vectorized loads.
+
+    Quoting used to hide the annotation from Triton entirely: under
+    ``from __future__ import annotations`` the source text ``"int"`` is stored as
+    ``"'int'"``, which never matches a canonical type name. Rewriting those quoted
+    annotations to real types therefore switched specialization off silently, and cost
+    ``_dense_bias_fwd_kernel`` 1.235 ms against 0.216 ms at the 1024-token production
+    shape - a 17.5% end-to-end pretraining throughput regression.
+
+    Kernel parameters are therefore annotated ``None``, which Triton does not
+    canonicalize and which its AST walker accepts as a keyword constant. Dropping the
+    annotation entirely also works but fails ``doc_check``, and ``Any`` fails to compile
+    because Triton refuses to resolve non-constexpr globals inside a kernel body.
+
+    :param Any kernel: A ``triton.runtime.jit.JITFunction``.
+    :return list[str]: Names of offending parameters, empty when the kernel is clean.
+    """
+
+    return [param.name for param in kernel.params if not param.is_constexpr and param.annotation_type]
+
+
+def test_triton_kernels_keep_runtime_value_specialization() -> None:
+    """Assert no shipped Triton kernel gives a runtime parameter a canonicalized type."""
+
+    jit_module = pytest.importorskip("triton.runtime.jit")
+    import pkgutil
+
+    import deberta.modeling
+
+    offenders: dict[str, list[str]] = {}
+    for module_info in pkgutil.walk_packages(deberta.modeling.__path__, "deberta.modeling."):
+        module = importlib.import_module(module_info.name)
+        for attribute in vars(module).values():
+            if not isinstance(attribute, jit_module.JITFunction):
+                continue
+            annotated = kernel_runtime_parameter_annotations(attribute)
+            if annotated:
+                offenders[f"{module_info.name}.{attribute.__name__}"] = annotated
+
+    assert offenders == {}, (
+        "Triton kernels must annotate runtime parameters ``None`` so value specialization "
+        f"stays enabled; give a real type only to tl.constexpr parameters. Offenders: {offenders}"
+    )
