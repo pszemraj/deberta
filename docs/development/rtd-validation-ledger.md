@@ -90,9 +90,9 @@ Two measurement notes for anyone rereading the older tables. The evaluator's `re
 
 ## Triton throughput regression
 
-The 44.7k -> 36.0k tok/s drop between the two 50,000-step runs was a code regression, not the driver and kernel upgrade that happened to land between them. Both runs were rebenchmarked on one host and one driver with `configs/flashdeberta/bench_flashdeberta_1024.yaml`, which matches the production recipe in every field that affects per-step cost.
+The throughput drop between the two 50,000-step runs was a code regression, not the driver and kernel upgrade that happened to land between them. The trees on both sides were rebenchmarked on one host and one driver with `configs/flashdeberta/bench_flashdeberta_1024.yaml`, which matches the production recipe in every field that affects per-step cost.
 
-Measure steady state from `input_tokens_seen` deltas between steps 100 and 250. The trainer's own `tok/s` column is a cumulative average and is contaminated by startup and Triton autotune.
+The bench table below is not directly comparable to the 44.7k and 36.0k figures quoted for the production runs. Those are whole-run averages over 50,000 steps including startup; these are steady-state rates measured from `input_tokens_seen` deltas between steps 100 and 250, which is the only honest way to read this log, since the trainer's own `tok/s` column is a cumulative average contaminated by startup and Triton autotune. The rerun's whole-run average agrees with its bench figure to 0.2%; the first run's cannot be checked, because only its checkpoints were kept and no training log survives.
 
 | Tree | tok/s |
 |---|---:|
@@ -102,11 +102,21 @@ Measure steady state from `input_tokens_seen` deltas between steps 100 and 250. 
 
 Timestamps in the trainer log have one-second resolution, so a 150-step window carries an error floor near 1% and repeat runs of one tree spread by roughly 2%. Only differences much larger than that mean anything here; the regression itself is 17.5%.
 
-A binary search over the commits touching `src/` between those endpoints reached `ddabf47`, and reverting `flashdeberta_dense_bias_op.py` alone to its parent restored the throughput. Isolating the op showed the forward kernel itself at 1.235 ms against 0.209 ms for the same shapes and the same launch config, with byte-identical output; the compiled kernel had dropped from 32,768 bytes of shared memory to zero.
+A binary search over the commits touching `src/` between those endpoints reached `ddabf47`, and reverting `flashdeberta_dense_bias_op.py` alone to its parent restored the throughput. Timing the op alone on the shapes a live step actually passes it, `(4,12,1024,512)` bf16 positional terms against a `(1024,1024)` int64 bucket map, isolated it further:
+
+| Tree | ms/call | Shared memory | Register spills |
+|---|---:|---:|---:|
+| `788c203`, before `ddabf47` | 0.2087 | 32,768 | 22 |
+| `ac4454a`, regressed | 1.2347 | 0 | 0 |
+| `81b46e9`, after the fix | 0.2158 | 32,768 | 0 |
+
+All three produce a byte-identical checksum under the same launch config, so this is purely a code-generation difference: the regressed kernel had lost its shared-memory staging entirely.
 
 The cause is Triton argument specialization. Annotating a kernel parameter with a real type makes Triton canonicalize the annotation to `i32` or `fp32` and pin the argument type from it, instead of specializing on the value passed. That specialization is what tells Triton a stride is divisible by 16 or exactly 1, so losing it costs the compiler its contiguity proof and its vectorized loads. These annotations had been quoted, and under `from __future__ import annotations` a quoted `"int"` is stored as `"'int'"`, which never matches a canonical type name and so stayed inert. `ddabf47` rewrote them to real types and switched the mechanism on.
 
-Six repo-defined kernels across five modules carried the same defect, 152 parameters in total. They are now annotated `None`, which Triton does not canonicalize; `test_triton_kernels_keep_runtime_value_specialization` fails if any of them regains a real type. The fixed tree beats the pre-regression baseline because `ddabf47` also added bucket bounds masks that removed 22 register spills, which is worth its 3% kernel cost.
+Six repo-defined kernels across five modules carried the same defect, 152 parameters in total. They are now annotated `None`, which Triton does not canonicalize; `test_triton_kernels_keep_runtime_value_specialization` fails if any of them regains a real type.
+
+The fixed kernel is 3.4% slower than the pre-regression one, which is the cost of the bucket bounds masks `ddabf47` added alongside the annotation change and which are worth keeping. End to end the fixed tree still clears the pre-regression baseline by roughly 9%, so the commit range between them contains real throughput work whose benefit the kernel regression had been masking. That work was not attributed to individual commits and should not be credited to this fix.
 
 ## Sources
 
@@ -116,6 +126,7 @@ Six repo-defined kernels across five modules carried the same defect, 152 parame
 | 50,000-step production run | `runs/flashdeberta/20260720_205652_pretrain_flashdeberta_1024/`, `configs/flashdeberta/pretrain_flashdeberta_1024.yaml` |
 | Per-checkpoint evaluation, SST-2 probe, Wikitext transfer, export parity | `local-scratch/flashdeberta-production-50k/` (`eval-history-4b.json`, `eval-final-16b.json`, `frozen-sst2.json`, `wikitext-transfer.json`, `export-parity.json`) |
 | Collator-fix rerun and both-sides rescoring | `runs/flashdeberta/20260725_053746_flashdeberta-1024-50k-maskfix/`, `local-scratch/flashdeberta-1024-50k-maskfix/` (`train.log`, `eval-baseline-recheck.json`, `eval-maskfix.json`) |
-| Throughput bisect | `local-scratch/throughput-bisect/` |
+| Throughput bisect, tok/s per tree | `local-scratch/throughput-bisect/*.log` (`fc80aac.log`, `bisect-ddabf47*.log`, `81b46e9-verify.log`) |
+| Per-kernel ms, shared memory, spills | `local-scratch/throughput-bisect/kernel-microbench.jsonl`, produced by `microbench_dense_bias.py` beside it |
 
 Checkpoint evaluations were produced with `tools/evaluate_rtd_checkpoint.py`.
