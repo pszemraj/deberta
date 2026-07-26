@@ -47,7 +47,10 @@ wandb = ["wandb>=0.17.0"]
 flash = ["flashdeberta==0.0.7", "triton"]
 
 # Dev quality-of-life
-dev = ["ruff>=0.6.0", "pytest>=8.0.0"]
+# ruff is pinned exactly so CI and local runs agree byte-for-byte; formatter
+# behavior changes between releases (0.16.0 began formatting Markdown code
+# blocks), so bump the pin deliberately and reformat in the same commit.
+dev = ["ruff==0.16.0", "pytest>=8.0.0"]
 
 [project.scripts]
 # Unified subcommand-style CLI entrypoint

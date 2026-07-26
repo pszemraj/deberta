@@ -211,7 +211,7 @@ DebertaV2Config(
     num_hidden_layers=24,
     num_attention_heads=24,
     intermediate_size=6144,
-    hidden_act='gelu',
+    hidden_act="gelu",
     hidden_dropout_prob=0.1,
     attention_probs_dropout_prob=0.1,
     max_position_embeddings=512,
@@ -224,7 +224,7 @@ DebertaV2Config(
     position_biased_input=True,
     pos_att_type=None,
     pooler_dropout=0,
-    pooler_hidden_act='gelu',
+    pooler_hidden_act="gelu",
     legacy=True,
     **kwargs,
 )
