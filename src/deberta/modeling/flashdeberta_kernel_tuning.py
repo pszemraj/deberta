@@ -468,6 +468,11 @@ def _validate_override_payload(payload: dict[str, Any], *, source: Path) -> None
             raise ValueError(f"{location}.seq_bucket references unknown bucket {seq_bucket!r}.")
         block_m = _require_power_of_two(row, field_name="block_m", location=location)
         block_n = _require_power_of_two(row, field_name="block_n", location=location)
+        if block_m < 16 or block_n < 16:
+            raise ValueError(
+                f"{location}.block_m and block_n must be at least 16; Triton's tl.dot "
+                "requires 16 per dimension, so a smaller tile crashes at kernel compile."
+            )
         if route == "dense_bias" and block_m * block_n > _TRITON_MAX_TENSOR_NUMEL:
             raise ValueError(
                 f"{location} dense_bias tile has {block_m * block_n} elements; "

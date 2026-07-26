@@ -570,6 +570,22 @@ def test_flashdeberta_override_rejects_removed_docblock_route_policy(tmp_path) -
             },
             "Triton tensors support at most",
         ),
+        (
+            {
+                "kernels": [
+                    {
+                        "route": "fixed",
+                        "kind": "fwd",
+                        "seq_bucket": "default",
+                        "block_m": 8,
+                        "block_n": 16,
+                        "num_stages": 1,
+                        "num_warps": 2,
+                    }
+                ]
+            },
+            "must be at least 16",
+        ),
     ],
     ids=(
         "non-string-bucket",
@@ -577,6 +593,7 @@ def test_flashdeberta_override_rejects_removed_docblock_route_policy(tmp_path) -
         "unknown-kernel-bucket",
         "contradictory-exact-range",
         "oversized-dense-bias-tile",
+        "sub-dot-minimum-tile",
     ),
 )
 def test_flashdeberta_override_rejects_unexecutable_rows(
