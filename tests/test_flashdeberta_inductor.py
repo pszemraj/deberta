@@ -41,6 +41,7 @@ def test_real_fixed_flash_attention_compiles_with_inductor_and_backward() -> Non
     cfg = make_native_deberta_config(
         flash=True,
         vocab_size=64,
+        num_attention_heads=2,
         type_vocab_size=0,
         relative_attention=True,
         position_buckets=8,

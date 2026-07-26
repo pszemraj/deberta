@@ -728,10 +728,10 @@ def test_flash_kernel_and_route_policy_are_model_scoped(
             filename="policy-b.json",
         ) as policy_b,
     ):
-        cfg_a = _small_deberta_config(hidden_size=16, num_attention_heads=2)
+        cfg_a = _small_deberta_config(hidden_size=16, num_attention_heads=1)
         cfg_a.hf_flash["kernel_overrides_path"] = str(policy_a)
         attention_a = attention_mod.FlashDisentangledSelfAttention(cfg_a)
-        cfg_b = _small_deberta_config(hidden_size=16, num_attention_heads=2)
+        cfg_b = _small_deberta_config(hidden_size=16, num_attention_heads=1)
         cfg_b.hf_flash["kernel_overrides_path"] = str(policy_b)
         attention_b = attention_mod.FlashDisentangledSelfAttention(cfg_b)
         for attention in (attention_a, attention_b):
@@ -946,7 +946,7 @@ def test_flash_padding_route_shared_resolver() -> None:
 def _small_deberta_config(
     *,
     hidden_size: int = 32,
-    num_attention_heads: int = 4,
+    num_attention_heads: int = 2,
     intermediate_size: int = 64,
     max_position_embeddings: int = 16,
     position_buckets: int = 8,
@@ -978,7 +978,7 @@ def _docblock_attention_config(*, seq_len: int):
     """Build a tiny native DeBERTa config for doc-block attention tests."""
 
     return _small_deberta_config(
-        hidden_size=8,
+        hidden_size=16,
         num_attention_heads=1,
         intermediate_size=16,
         max_position_embeddings=int(seq_len),

@@ -194,6 +194,17 @@ class FlashDisentangledSelfAttention(_EagerDisentangledSelfAttention):
         policy_path = normalize_flash_kernel_policy_path(flash_config.get("kernel_overrides_path"))
         policy = materialize_flash_kernel_policy(policy_path)
         super().__init__(*args, **kwargs)
+        # Mirror builder-time validation here so directly constructed modules
+        # (tools, notebooks) fail with this message instead of a Triton compile
+        # error: every flash route passes head_dim to tl.arange, which requires
+        # a power of two, and tl.dot needs at least 16 per dimension.
+        head_dim = int(self.attention_head_size)
+        if head_dim < 16 or head_dim & (head_dim - 1):
+            raise ValueError(
+                "Flash attention requires a power-of-two head_dim of at least 16; "
+                f"got head_dim={head_dim}. Adjust hidden_size/num_attention_heads "
+                "or use attention_impl='eager'."
+            )
         self.flash_kernel_policy_path = policy.source_path
         self.flash_kernel_policy_key = policy.key
 
