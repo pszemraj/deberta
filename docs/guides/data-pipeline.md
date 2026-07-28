@@ -36,6 +36,8 @@ Both dataset wrappers emit exactly `data.packing.max_seq_length` positions. Inco
 the tokenizer's `pad_token_id` on the right and emit a prefix-shaped attention mask. This setting is
 the sole training row-length and padding target; choose a hardware- and kernel-friendly length
 directly rather than combining it with a second training `pad_to_multiple_of` control.
+For unblocked packing, a structural separator is inserted only when two documents share a row; the
+row's outer SEP already supplies the boundary when the next document starts in a new row.
 
 ## Cross-document attention blocking
 

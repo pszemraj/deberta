@@ -352,46 +352,35 @@ class PackedStreamingDataset(torch.utils.data.IterableDataset):
                 buffer_start = 0
 
         for ids in self._iter_tokenized_documents():
+            buffered = len(buffer) - buffer_start
+            if buffered == block_len - 1:
+                # A separator would consume the last content slot without allowing
+                # any token from the next document into this row. The outer SEP
+                # already closes the row, so flush the lexical remainder instead.
+                chunk = buffer[buffer_start:]
+                buffer = []
+                buffer_start = 0
+                yield self._build_example_from_chunk(chunk=chunk, max_seq=max_seq)
+                buffered = 0
+            if buffered > 0:
+                # Insert a separator only when both documents actually share a row.
+                buffer.append(sep_id)
             buffer.extend(ids)
-            # Explicit doc separator to reduce cross-doc leakage.
-            buffer.append(sep_id)
 
             # Emit fixed-length blocks.
             # We reserve 2 spots for [CLS] and final [SEP].
             while (len(buffer) - buffer_start) >= block_len:
                 chunk = buffer[buffer_start : buffer_start + block_len]
                 buffer_start += block_len
-                # Strip leading separator tokens left over from previous document
-                # boundaries to avoid degenerate [CLS, SEP, ...] empty-document
-                # starts under doc-blocking.
-                lead = 0
-                while lead < len(chunk) and chunk[lead] == sep_id:
-                    lead += 1
-                if lead > 0:
-                    chunk = chunk[lead:]
-                if not chunk:
-                    _compact_buffer_if_needed()
-                    continue
                 yield self._build_example_from_chunk(chunk=chunk, max_seq=max_seq)
                 _compact_buffer_if_needed()
 
         # Flush trailing remainder instead of silently dropping it.
-        #
-        # We append one explicit document separator after each document, so the final
-        # buffer commonly ends with SEP. Emitting that SEP-only tail would produce a
-        # degenerate [CLS, SEP, SEP, PAD...] example with no training signal.
         if buffer_start > 0:
             buffer = buffer[buffer_start:]
             buffer_start = 0
-        while buffer and buffer[-1] == sep_id:
-            buffer.pop()
         if buffer:
-            chunk = buffer[:block_len]
-            lead = 0
-            while lead < len(chunk) and chunk[lead] == sep_id:
-                lead += 1
-            if lead < len(chunk):
-                yield self._build_example_from_chunk(chunk=chunk[lead:], max_seq=max_seq)
+            yield self._build_example_from_chunk(chunk=buffer[:block_len], max_seq=max_seq)
 
 
 class SequentialStreamingDataset(PackedStreamingDataset):

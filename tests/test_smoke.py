@@ -56,7 +56,7 @@ def packed_doc_collator() -> tuple[DummyTokenizer, DebertaV3ElectraCollator]:
 def test_packed_streaming_marks_internal_sep_as_special():
     tok = DummyTokenizer(vocab_size=64)
 
-    # Two docs, each 2 tokens. With max_seq=8, block_len=6, chunk will include internal seps.
+    # Two docs, each 2 tokens. The shared row includes one internal separator.
     hf_dataset = [{"text": "a b"}, {"text": "c d"}]
 
     ds = PackedStreamingDataset(
@@ -68,7 +68,7 @@ def test_packed_streaming_marks_internal_sep_as_special():
     )
 
     ex = next(iter(ds))
-    assert "attention_mask" not in ex
+    assert ex["attention_mask"] == [1, 1, 1, 1, 1, 1, 1, 0]
     input_ids = ex["input_ids"]
     stm = ex["special_tokens_mask"]
 
@@ -245,27 +245,7 @@ def test_packed_streaming_does_not_emit_separator_tail_chunk():
     assert ex["special_tokens_mask"] == [1, 0, 0, 0, 0, 0, 0, 1]
 
 
-def test_packed_streaming_flush_strips_all_trailing_separators(monkeypatch: pytest.MonkeyPatch):
-    import deberta.data.streaming as streaming_mod
-
-    class _NoopLock:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    class _DummySharedInt:
-        def __init__(self, _typecode: str, value: int) -> None:
-            self.value = int(value)
-            self._lock = _NoopLock()
-
-        def get_lock(self) -> _NoopLock:
-            return self._lock
-
-    monkeypatch.setattr(streaming_mod.mp, "Value", _DummySharedInt)
-
+def test_packed_streaming_preserves_tokenized_separator_ids(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a"}, {"text": "b"}]
 
@@ -277,28 +257,21 @@ def test_packed_streaming_flush_strips_all_trailing_separators(monkeypatch: pyte
         num_processes=1,
     )
 
-    # Pathological tokenizer output: lexical stream itself is separator-only.
-    # Final flush should drop the entire trailing separator run.
+    # A tokenizer can emit a registered special token from raw text even with
+    # add_special_tokens=False. Structural separators must not cause that source
+    # token to be stripped from the rolling buffer.
     monkeypatch.setattr(ds, "_tokenize_text", lambda _raw: [tok.sep_token_id])
     rows = list(ds)
-    assert rows == []
+    assert len(rows) == 1
+    assert rows[0]["input_ids"][1:4] == [tok.sep_token_id] * 3
 
 
-def test_packed_streaming_strips_leading_sep_from_chunk():
+def test_packed_streaming_does_not_carry_separator_into_next_row():
     tok = DummyTokenizer(vocab_size=64)
-    # max_seq=8 => block_len=6.
-    # Doc1 has 5 tokens, so buffer after doc1 = [t1..t5, SEP] (len=6).
-    # First chunk = [t1..t5, SEP] — consumed exactly.
-    # Doc2 has 7 tokens, buffer = [t6..t12, SEP] (len=8).
-    # Second chunk = [t6..t11] (len=6), buffer remainder = [t12, SEP].
-    # But we want to test the case where SEP lands at the start of a chunk.
-    # Doc1 with exactly block_len-1=5 tokens: buffer = [t1..t5, SEP] (len=6).
-    # That's one chunk: [t1..t5, SEP]. After _build_example_from_chunk, SEP is
-    # internal and valid.
-    # Better scenario: doc1 has block_len tokens (6). Buffer = [t1..t6, SEP] (7).
-    # chunk1 = buffer[:6] = [t1..t6], buffer = [SEP].
-    # Doc2 has block_len tokens (6). Buffer = [SEP, t7..t12, SEP] (8).
-    # chunk2 = buffer[:6] = [SEP, t7..t11], which starts with SEP — exactly the bug.
+    # max_seq=8 => six content slots. A separator retained after the first
+    # exactly-full document used to occupy the first slot of the second chunk.
+    # Stripping it happened after consumption, so the second row padded despite
+    # another lexical token still waiting in the source buffer.
     hf_dataset = [{"text": "a b c d e f"}, {"text": "g h i j k l"}]
 
     ds = PackedStreamingDataset(
@@ -310,14 +283,10 @@ def test_packed_streaming_strips_leading_sep_from_chunk():
     )
     rows = list(ds)
 
-    for row in rows:
-        content = row["input_ids"]
-        # After CLS (pos 0), the first content token must not be SEP.
-        assert content[0] == tok.cls_token_id
-        if len(content) > 2:
-            assert content[1] != tok.sep_token_id, (
-                f"Chunk starts with [CLS, SEP, ...]: degenerate empty doc start. ids={content}"
-            )
+    assert len(rows) == 2
+    assert all("attention_mask" not in row for row in rows)
+    assert [sum(value == 0 for value in row["special_tokens_mask"]) for row in rows] == [6, 6]
+    assert all(row["input_ids"][1] != tok.sep_token_id for row in rows)
 
 
 def test_packed_streaming_epoch_changes_shuffle_seed():
