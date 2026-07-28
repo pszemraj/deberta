@@ -129,4 +129,5 @@ The fixed kernel is 3.4% slower than the pre-regression one, which is the cost o
 | Throughput bisect, tok/s per tree | `local-scratch/throughput-bisect/*.log` (`fc80aac.log`, `bisect-ddabf47*.log`, `81b46e9-verify.log`) |
 | Per-kernel ms, shared memory, spills | `local-scratch/throughput-bisect/kernel-microbench.jsonl`, produced by `microbench_dense_bias.py` beside it |
 
-Checkpoint evaluations were produced with `tools/evaluate_rtd_checkpoint.py`.
+Checkpoint evaluations were produced with `tools/evaluate_rtd_checkpoint.py`; see
+[Evaluating checkpoints](../guides/evaluating-checkpoints.md) for the tool and its metrics.

@@ -9,6 +9,7 @@
 
 - complete per-key training config contract: [Config reference](../configs/config_reference.yaml)
 - dataset loading and packing, doc-block masking, and collator behavior: [Guides / Data Pipeline](guides/data-pipeline.md)
+- checkpoint scoring and metric interpretation: [Guides / Evaluating Checkpoints](guides/evaluating-checkpoints.md)
 - checkpoint consolidation and Hugging Face export: [Guides / Exporting Models](guides/exporting-models.md)
 
 ## Advanced
@@ -22,6 +23,7 @@
 ## Development
 
 - pretraining acceptance criteria and staged validation evidence: [RTD validation ledger](development/rtd-validation-ledger.md)
+- parked improvements and open decisions: [Future work](development/future-work.md)
 
 ## API reference
 

@@ -35,4 +35,6 @@ deberta train --help
 deberta export --help
 ```
 
+`python -m deberta` is an equivalent entry point when the console script is not on `PATH`.
+
 Continue with the [Quickstart](quickstart.md).
