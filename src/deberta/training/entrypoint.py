@@ -340,12 +340,12 @@ def run_pretraining_dry_run(
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("transformers is required for dry-run preflight.") from exc
 
+    tokenizer_source: str | Path = (
+        materialized_tokenizer_path(infer_run_dir_from_checkpoint(ckpt))
+        if ckpt is not None
+        else model_cfg.tokenizer.name_or_path
+    )
     try:
-        tokenizer_source: str | Path = (
-            materialized_tokenizer_path(infer_run_dir_from_checkpoint(ckpt))
-            if ckpt is not None
-            else model_cfg.tokenizer.name_or_path
-        )
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
     except Exception as exc:
         raise RuntimeError(f"Failed to load tokenizer from {str(tokenizer_source)!r}.") from exc

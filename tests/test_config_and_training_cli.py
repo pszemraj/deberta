@@ -248,6 +248,47 @@ def test_run_pretraining_dry_run_fails_fast_for_nonempty_output_dir(tmp_path: Pa
         )
 
 
+def test_run_pretraining_dry_run_preserves_missing_resume_tokenizer_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "checkpoint-1"
+    checkpoint.mkdir(parents=True)
+    missing_tokenizer = run_dir / "tokenizer"
+    missing_artifact_error = FileNotFoundError(
+        f"Run is missing required materialized tokenizer directory: {missing_tokenizer}"
+    )
+
+    def _missing_materialized_tokenizer(_run_dir: Path) -> Path:
+        raise missing_artifact_error
+
+    entrypoint_mod = setup_pretraining_mocks(
+        monkeypatch,
+        extra_patches={
+            "_resolve_resume_checkpoint": lambda **_kwargs: str(checkpoint),
+            "_persist_or_validate_run_configs": lambda **_kwargs: None,
+            "materialized_tokenizer_path": _missing_materialized_tokenizer,
+        },
+    )
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        entrypoint_mod.run_pretraining_dry_run(
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(source={"dataset_name": "dummy-dataset"}),
+            train_cfg=make_train_config(
+                checkpoint={
+                    "output_dir": str(run_dir),
+                    "resume_from_checkpoint": str(checkpoint),
+                },
+                max_steps=5,
+            ),
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
+        )
+
+    assert exc_info.value is missing_artifact_error
+
+
 def test_run_pretraining_dry_run_rejects_missing_flash_extra_before_dataset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
