@@ -35,11 +35,12 @@ checkpoints (it may still download and cache tokenizer/dataset assets).
 Training prints one metrics line per logging interval:
 
 ```text
-step=200 | lr=9.800e-05 | loss=8.1035 | gen=6.4413 | disc=0.0332 | gain=0.0114 | acc=0.9862 | pos=0.0139 | tok/s=44712.3 | tok_seen=104857600
+step=200 | gen_lr=9.800e-05 | disc_lr=9.800e-05 | loss=8.1035 | gen=6.4413 | disc=0.0332 | gain=0.0114 | acc=0.9862 | pos=0.0139 | tok/s=44712.3 | tok_seen=104857600
 ```
 
 `gen` and `disc` are the per-objective losses and `loss` their weighted sum over enabled
-objectives. `gain` is the number to watch for discriminator health: it is the BCE improvement over
+objectives (with the default decoupled training, each enabled objective reports its own learning
+rate; combined training reports a single `lr`). `gain` is the number to watch for discriminator health: it is the BCE improvement over
 a constant class-prior predictor, and stays at or below zero when the discriminator collapses. Raw
 `acc` is dominated by the unreplaced-token majority class, and `pos` is the fraction of scored
 tokens the generator actually replaced. The same reasoning drives offline checkpoint scoring; see
