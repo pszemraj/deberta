@@ -7,11 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _config_factories import make_model_config
 
 from deberta.modeling.mask_utils import attention_mask_to_active_tokens
 
 _TOOL = runpy.run_path(str(Path(__file__).parents[1] / "tools" / "evaluate_rtd_checkpoint.py"))
 _assemble_eval_batch = _TOOL["_assemble_eval_batch"]
+_build_model = _TOOL["_build_model"]
 _checkpoint_step = _TOOL["_checkpoint_step"]
 _discriminator_metrics = _TOOL["_discriminator_metrics"]
 _evaluate_checkpoint = _TOOL["_evaluate_checkpoint"]
@@ -21,6 +23,7 @@ _load_checkpoint_artifacts = _TOOL["_load_checkpoint_artifacts"]
 _precision_mismatch_warning = _TOOL["_precision_mismatch_warning"]
 _ranking_metrics = _TOOL["_ranking_metrics"]
 _replacement_rate = _TOOL["_replacement_rate"]
+_shared_run_dir = _TOOL["_shared_run_dir"]
 
 
 def test_ranking_metrics_match_hand_calculation() -> None:
@@ -182,6 +185,50 @@ def test_load_checkpoint_artifacts_uses_run_owned_tokenizer_and_configs(
         "config_run_dir": run_dir,
         "model_cfg": model_cfg,
     }
+
+
+def test_shared_run_dir_rejects_checkpoints_from_different_runs(tmp_path: Path) -> None:
+    first = tmp_path / "run-a" / "checkpoint-100"
+    second = tmp_path / "run-b" / "checkpoint-200"
+
+    with pytest.raises(ValueError, match="same run"):
+        _shared_run_dir([first, second])
+
+
+def test_build_model_overrides_materialized_flash_configs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = SimpleNamespace(
+        model=make_model_config(
+            backbone_type="hf_deberta_v2",
+            hf={"attention_impl": "flash"},
+        )
+    )
+    tokenizer = SimpleNamespace(all_special_ids=[0, 1, 2])
+    disc_cfg = SimpleNamespace(hf_attention_impl="flash", hf_flash={"kernel_overrides_path": "disc"})
+    gen_cfg = SimpleNamespace(hf_attention_impl="flash", hf_flash={"kernel_overrides_path": "gen"})
+    seen: dict[str, object] = {}
+
+    def _build_backbones(**kwargs: object) -> tuple[object, object]:
+        seen["model_cfg"] = kwargs["model_cfg"]
+        seen["disc_config"] = kwargs["disc_config"]
+        seen["gen_config"] = kwargs["gen_config"]
+        return object(), object()
+
+    def _pretrainer(**kwargs: object) -> object:
+        seen["pretrainer"] = kwargs
+        return object()
+
+    monkeypatch.setitem(_build_model.__globals__, "build_backbones", _build_backbones)
+    monkeypatch.setitem(_build_model.__globals__, "DebertaV3RTDPretrainer", _pretrainer)
+
+    _build_model(cfg, tokenizer, disc_cfg=disc_cfg, gen_cfg=gen_cfg)
+
+    assert seen["model_cfg"].hf.attention_impl == "eager"
+    assert disc_cfg.hf_attention_impl == "eager"
+    assert gen_cfg.hf_attention_impl == "eager"
+    assert disc_cfg.hf_flash == {"kernel_overrides_path": None}
+    assert gen_cfg.hf_flash == {"kernel_overrides_path": None}
 
 
 def test_replacement_rate_divides_by_masked_tokens_not_all_positions() -> None:

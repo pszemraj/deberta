@@ -178,6 +178,19 @@ def _load_checkpoint_artifacts(cfg: Any, checkpoint: Path) -> tuple[Any, Any, An
     return tokenizer, disc_cfg, gen_cfg
 
 
+def _shared_run_dir(checkpoints: list[Path]) -> Path:
+    """Return the common run directory for a checkpoint trajectory."""
+    run_dir = infer_run_dir_from_checkpoint(checkpoints[0])
+    for checkpoint in checkpoints[1:]:
+        checkpoint_run_dir = infer_run_dir_from_checkpoint(checkpoint)
+        if checkpoint_run_dir != run_dir:
+            raise ValueError(
+                "All evaluated checkpoints must belong to the same run; "
+                f"got '{run_dir}' and '{checkpoint_run_dir}'."
+            )
+    return run_dir
+
+
 def _build_model(
     cfg: Any,
     tokenizer: Any,
@@ -186,6 +199,10 @@ def _build_model(
     gen_cfg: Any,
 ) -> DebertaV3RTDPretrainer:
     model_cfg = replace(cfg.model, hf=replace(cfg.model.hf, attention_impl="eager"))
+    if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
+        for component_config in (disc_cfg, gen_cfg):
+            component_config.hf_attention_impl = "eager"
+            component_config.hf_flash = {"kernel_overrides_path": None}
     disc, gen = build_backbones(
         model_cfg=model_cfg,
         disc_config=disc_cfg,
@@ -478,6 +495,7 @@ def main() -> None:
         print(f"WARNING: {mismatch_warning}", file=sys.stderr)
 
     checkpoints = sorted(args.checkpoints, key=_checkpoint_step)
+    _shared_run_dir(checkpoints)
     tokenizer, disc_cfg, gen_cfg = _load_checkpoint_artifacts(cfg, checkpoints[0])
     batch = _build_eval_batch(cfg, tokenizer, batches=args.batches, seed=args.seed)
     model = (
