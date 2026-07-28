@@ -240,15 +240,14 @@ def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str
 def _effective_train_config_for_resume_compare(cfg: TrainConfig) -> dict[str, Any]:
     """Build a normalized train snapshot for resume compatibility checks.
 
-    Training semantics remain strict. Duration and run-local checkpoint/resume controls are
-    excluded because they do not change the restored model or optimizer update semantics.
+    Training semantics remain strict. Run-local checkpoint/resume controls are excluded because
+    they do not change the restored model or optimizer update semantics.
 
     :param TrainConfig cfg: Train config to canonicalize.
     :return dict[str, Any]: Normalized dict payload suitable for equality checks.
     """
     payload = asdict_without_private(cfg)
     defaults = asdict_without_private(TrainConfig())
-    payload["max_steps"] = defaults["max_steps"]
     payload["dataloader"]["pin_memory"] = defaults["dataloader"]["pin_memory"]
     payload["compile"]["scope"] = defaults["compile"]["scope"]
     # Worker count remains strict: it controls source sharding in the iterable training

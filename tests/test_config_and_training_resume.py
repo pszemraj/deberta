@@ -1455,6 +1455,7 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
 @pytest.mark.parametrize(
     "changed_train",
     [
+        make_train_config(max_steps=20_000),
         make_train_config(gradient_accumulation_steps=2),
         make_train_config(objective={"gen_loss_weight": 2.0}),
         make_train_config(objective={"disc_loss_weight": 20.0}),
@@ -1462,6 +1463,7 @@ def test_persist_or_validate_run_configs_rejects_resume_model_data_mismatch(tmp_
         make_train_config(dataloader={"num_workers": 0}),
     ],
     ids=[
+        "max-steps",
         "gradient-accumulation",
         "generator-loss-weight",
         "discriminator-loss-weight",
@@ -1580,12 +1582,11 @@ def test_persist_or_validate_run_configs_tracks_resume_source_when_output_dir_di
 
     new_output_dir = tmp_path / "new-run"
     new_output_dir.mkdir(parents=True, exist_ok=True)
-    changed_train_cfg = make_train_config(max_steps=25)
     _persist_or_validate_run_configs(
         output_dir=new_output_dir,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
-        train_cfg=changed_train_cfg,
+        train_cfg=train_cfg,
         resume_checkpoint=str(checkpoint_dir),
         is_main_process=True,
     )
@@ -1806,12 +1807,11 @@ def test_persist_or_validate_run_configs_preserves_existing_snapshots_on_matchin
     )
     original_train_snapshot = json.loads((out / "train_config.json").read_text(encoding="utf-8"))
 
-    changed_train_cfg = make_train_config(max_steps=20)
     _persist_or_validate_run_configs(
         output_dir=out,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
-        train_cfg=changed_train_cfg,
+        train_cfg=train_cfg,
         resume_checkpoint=str(out / "checkpoint-10"),
         is_main_process=True,
     )

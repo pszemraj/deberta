@@ -239,7 +239,7 @@
 # Seeds initialization, corruption, and data-order setup; exact results still depend on topology, workers, source behavior, and nondeterministic kernels.
 
 # [train.max_steps] int = 10000; must be >= 1.
-# Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. For every scheduler except constant, this value must exceed `optim.scheduler.warmup_steps`. On resume, a value <= restored global step performs no optimization.
+# Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. For every scheduler except constant, this value must exceed `optim.scheduler.warmup_steps`. Exact resume requires the source value because it defines the scheduler horizon; a checkpoint already at this step performs no optimization.
 
 # [train.per_device_train_batch_size] int = 4; must be >= 1.
 # Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Training uses `drop_last=true` for stable shapes and fails if a finite source yields no complete batch. Tune against VRAM before increasing accumulation.
@@ -324,7 +324,7 @@
 
 # [train.checkpoint.resume_from_checkpoint] str | None = null; blank/null starts fresh, "auto" searches `output_dir`, otherwise value must name an existing committed `checkpoint-*` directory.
 # Resume restores model, optimizer, scheduler, RNG, global step, recovery multiplier, and data progress. The checkpoint must contain `.complete`, current `data_state.json`, and non-empty weights; its source run must contain model/data/train/optim/logging snapshots plus the exact materialized discriminator config, generator config, and tokenizer directory. Resume uses those run-owned artifacts instead of resolving the original mutable pretrained/tokenizer source; run metadata is validated when present.
-# Compatibility checks require model, data, optim, logging, and training-semantics snapshots to match, except `logging.output_dir`, documented inert model fields, `train.max_steps`, `train.dataloader.pin_memory`, `train.compile.scope`, and `train.checkpoint.*`. Start from the source `config_resolved.yaml` and change only documented resume-compatible runtime or checkpoint plumbing.
+# Compatibility checks require model, data, optim, logging, and training-semantics snapshots to match, except `logging.output_dir`, documented inert model fields, `train.dataloader.pin_memory`, `train.compile.scope`, and `train.checkpoint.*`. Start from the source `config_resolved.yaml` and change only documented resume-compatible runtime or checkpoint plumbing.
 # "auto" uses the newest resumable checkpoint, skips incomplete newer ones, starts fresh only when the output directory is empty, and errors on non-empty output with no resumable checkpoint. Explicit paths expand `~`; resume is mutually exclusive with overwrite.
 
 # [train.checkpoint.resume_data_strategy] str = "auto"; values: "auto" | "replay" | "restart_epoch".
