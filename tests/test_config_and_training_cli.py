@@ -513,30 +513,52 @@ def test_validate_training_workflow_options_rejects_flashdeberta_without_bf16() 
         )
 
 
-def test_validate_training_workflow_options_rejects_es_with_divergent_gen_lr():
+@pytest.mark.parametrize(
+    "lr",
+    [
+        pytest.param(
+            {"base": 5e-4, "generator": 3e-4, "discriminator": -1.0},
+            id="generator-override",
+        ),
+        pytest.param(
+            {"base": 5e-4, "generator": -1.0, "discriminator": 2e-4},
+            id="discriminator-override",
+        ),
+    ],
+)
+def test_validate_training_workflow_options_rejects_es_with_divergent_effective_lrs(
+    lr: dict[str, float],
+) -> None:
     with pytest.raises(ValueError, match="embedding_sharing='es'"):
         validate_training_workflow_options(
             data_cfg=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
-            train_cfg=make_train_config(),
+            train_cfg=make_train_config(decoupled_training=False),
             model_cfg=make_model_config(embedding_sharing="es"),
-            optim_cfg=make_optim_config(lr={"base": 5e-4, "generator": 3e-4}),
+            optim_cfg=make_optim_config(lr=lr),
         )
 
 
-def test_validate_training_workflow_options_allows_es_with_matching_gen_lr():
-    # Explicit gen LR matching disc LR — should pass.
+@pytest.mark.parametrize(
+    "lr",
+    [
+        pytest.param(
+            {"base": 5e-4, "generator": -1.0, "discriminator": -1.0},
+            id="both-inherit",
+        ),
+        pytest.param(
+            {"base": 5e-4, "generator": 3e-4, "discriminator": 3e-4},
+            id="matching-overrides",
+        ),
+    ],
+)
+def test_validate_training_workflow_options_allows_es_with_matching_effective_lrs(
+    lr: dict[str, float],
+) -> None:
     validate_training_workflow_options(
         data_cfg=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
         train_cfg=make_train_config(decoupled_training=False),
         model_cfg=make_model_config(embedding_sharing="es"),
-        optim_cfg=make_optim_config(lr={"base": 5e-4, "generator": 5e-4}),
-    )
-    # Inherited gen LR (-1) — should pass.
-    validate_training_workflow_options(
-        data_cfg=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
-        train_cfg=make_train_config(decoupled_training=False),
-        model_cfg=make_model_config(embedding_sharing="es"),
-        optim_cfg=make_optim_config(lr={"base": 5e-4, "generator": -1.0}),
+        optim_cfg=make_optim_config(lr=lr),
     )
 
 

@@ -1428,12 +1428,18 @@ def validate_training_workflow_options(
             )
         embed_sharing = str(model_cfg.embedding_sharing).strip().lower()
         local_optim = optim_cfg or OptimConfig()
-        gen_lr = float(local_optim.lr.generator)
-        if embed_sharing == "es" and gen_lr > 0 and gen_lr != float(local_optim.lr.base):
+        base_lr = float(local_optim.lr.base)
+        gen_lr_raw = float(local_optim.lr.generator)
+        disc_lr_raw = float(local_optim.lr.discriminator)
+        gen_lr = gen_lr_raw if gen_lr_raw > 0 else base_lr
+        disc_lr = disc_lr_raw if disc_lr_raw > 0 else base_lr
+        if embed_sharing == "es" and gen_lr != disc_lr:
             raise ValueError(
                 f"model.embedding_sharing='es' shares embedding parameters between generator and discriminator, "
-                f"but optim.lr.generator ({gen_lr}) differs from optim.lr.base ({local_optim.lr.base}). "
-                "Set optim.lr.generator=-1 (inherit) or match it to optim.lr.base, "
+                f"but their effective learning rates differ "
+                f"(generator={gen_lr}, discriminator={disc_lr}). "
+                "Set optim.lr.generator and optim.lr.discriminator to the same value "
+                "(or use -1 to inherit optim.lr.base), "
                 "or switch to embedding_sharing='gdes'/'none'."
             )
         if bool(train_cfg.decoupled_training) and embed_sharing == "es":
