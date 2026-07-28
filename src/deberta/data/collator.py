@@ -783,7 +783,7 @@ class DebertaV3ElectraCollator:
             num_candidates = sum(len(group) for group in groups)
             num_to_predict = max(1, int(round(float(num_candidates) * mlm_prob)))
 
-            mask_grams = [False] * len(groups)
+            candidate_spans: list[list[int]] = []
             segment_start = 0
             while segment_start < len(groups):
                 segment_end = segment_start + 1
@@ -819,24 +819,11 @@ class DebertaV3ElectraCollator:
                     start = offset + m
                     end = min(offset + m + gram_n, segment_end)
                     offset = max(offset + ctx_size, end)
-                    for i in range(start, end):
-                        mask_grams[i] = True
+                    candidate_spans.append(list(range(start, end)))
 
                 segment_start = segment_end
 
-            # Marked groups form contiguous n-gram spans. Consume whole spans in random
-            # order so that stopping at the budget drops an arbitrary span rather than
-            # always the highest-index ones.
-            spans: list[list[int]] = []
-            for i, do_mask in enumerate(mask_grams):
-                if not do_mask:
-                    continue
-                if spans and spans[-1][-1] == i - 1 and groups[i - 1][-1] + 1 == groups[i][0]:
-                    spans[-1].append(i)
-                else:
-                    spans.append([i])
-
-            if not spans:
+            if not candidate_spans:
                 fallback = int(
                     torch.randint(
                         low=0,
@@ -845,12 +832,15 @@ class DebertaV3ElectraCollator:
                         device=input_ids.device,
                     ).item()
                 )
-                spans.append([fallback])
+                candidate_spans.append([fallback])
 
             selected_positions: list[int] = []
             used = 0
-            for s in torch.randperm(len(spans), device=input_ids.device).tolist():
-                for i in spans[s]:
+            # Consume independently sampled n-grams in random order. Adjacent
+            # candidates must remain separate budget units: merging them can
+            # create arbitrarily long spans that exceed max_ngram.
+            for s in torch.randperm(len(candidate_spans), device=input_ids.device).tolist():
+                for i in candidate_spans[s]:
                     selected_positions.extend(groups[i])
                     used += len(groups[i])
                 if used >= num_to_predict:

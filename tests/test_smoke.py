@@ -952,9 +952,9 @@ def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: py
         max_ngram=3,
     )
 
-    # Windowed DeBERTa selection can cover each local context once under deterministic
-    # sampling, yielding four masked lexical tokens in this toy sequence.
-    assert int(labels.ne(-100).sum().item()) == 4
+    # Four lexical candidates at p=0.75 produce a three-token budget. Each
+    # deterministic unigram remains an independent budget unit.
+    assert int(labels.ne(-100).sum().item()) == 3
 
 
 def test_ngram_masking_keeps_fallback_word_intact(monkeypatch: pytest.MonkeyPatch):
@@ -1309,6 +1309,56 @@ def test_ngram_masking_does_not_privilege_first_packed_document():
 
     rates = labels.ne(-100).float().mean(dim=0)[lexical_positions]
     assert float(rates.max() / rates.min()) < 1.25
+
+
+def test_ngram_budget_keeps_adjacent_samples_separate(monkeypatch: pytest.MonkeyPatch):
+    tok = DummyTokenizer(
+        vocab_size=128,
+        tokenize_output=["hello", "world"],
+        default_token_prefix="tok",
+    )
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.2,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=2,
+        ),
+    )
+    input_ids = torch.tensor(
+        [[tok.cls_token_id, *range(10, 22), tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, *([0] * 12), 1]], dtype=torch.bool)
+    randint_results = iter((8, 0))
+
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda input, num_samples, replacement=False: torch.tensor([1], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, **kwargs: torch.tensor(
+            [next(randint_results)],
+            dtype=torch.long,
+        ),
+    )
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *size, **kwargs: torch.zeros(size, dtype=torch.float32),
+    )
+
+    _, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=2,
+    )
+
+    assert int(labels.ne(-100).sum()) == 2
 
 
 def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytest.MonkeyPatch):

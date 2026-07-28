@@ -288,7 +288,7 @@
 # train.objective
 
 # [train.objective.mlm_probability] float = 0.15; must be finite and in (0, 1).
-# Sets each row's target budget from eligible lexical tokens, excluding special and inactive positions so padding and packed-document boundary count cannot alter the corruption rate. Unigram selection splits the candidates into exactly that many near-equal windows and draws one position per window, so it meets the budget exactly and masks every candidate position at the same rate for any probability. Whole-word masking may exceed the nominal budget by one complete word. 0.15 is the parity default.
+# Sets each row's target budget from eligible lexical tokens, excluding special and inactive positions so padding and packed-document boundary count cannot alter the corruption rate. Unigram selection splits the candidates into exactly that many near-equal windows and draws one position per window, so it meets the budget exactly and masks every candidate position at the same rate for any probability. Whole-word masking may exceed the nominal budget by the remaining tokens in one selected n-gram. 0.15 is the parity default.
 
 # [train.objective.mask_token_prob] float; schema default 1.0; omission is 1.0 for native and 0.8 for RoPE.
 # Must be finite and >= 0; sum with `random_token_prob` must be <= 1. It is the conditional selected-token probability of replacing with MASK; leftover probability keeps the original token.
@@ -297,7 +297,7 @@
 # Must be finite and >= 0; sum with `mask_token_prob` must be <= 1. It is the conditional selected-token probability of random replacement; special/control IDs are excluded.
 
 # [train.objective.mlm_max_ngram] int = 1; must be >= 1.
-# Maximum DeBERTa windowed masking span; values > 1 request whole-word n-grams, with unsupported tokenizer boundary schemes falling back to conservative token groups with a warning. Special tokens split n-gram windows and spans, so masking never crosses a packed-document boundary. Every partial context window is taken proportionally to its width; if all are rejected, one word group is chosen uniformly across the row. Marked spans are consumed in random order when the token budget stops selection, keeping the rate positionally uniform while every row retains a masked span.
+# Maximum DeBERTa windowed masking span; values > 1 request whole-word n-grams, with unsupported tokenizer boundary schemes falling back to conservative token groups with a warning. Special tokens split n-gram windows and sampled spans, so masking never crosses a packed-document boundary. Every partial context window is taken proportionally to its width; if all are rejected, one word group is chosen uniformly across the row. Independently sampled n-grams remain separate budget units and are consumed in random order when the token budget stops selection, keeping the rate positionally uniform while every row retains a masked span.
 
 # [train.objective.sampling_temperature] float = 1.0; must be finite and > 0.
 # Softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random. Use 1.0 unless measuring replacement entropy.
