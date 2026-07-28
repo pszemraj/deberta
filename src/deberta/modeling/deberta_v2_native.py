@@ -105,12 +105,16 @@ def _make_log_bucket_position(
     abs_pos = rel.abs().clamp_min(1)
     near = abs_pos < mid
 
-    # Match HF semantics while avoiding scripted helper branches in forward.
-    log_base = math.log(max(float(max_position - 1), float(mid + 1)) / float(mid))
-    if log_base <= 0.0:
-        return rel
-
-    log_pos = torch.ceil(torch.log(abs_pos.float() / float(mid)) / log_base * float(mid - 1)) + float(mid)
+    # Keep the denominator in the same float32 tensor arithmetic as stock HF.
+    # A Python-double denominator can round an exact boundary into the next
+    # bucket when the quotient is passed through ceil().
+    abs_pos_float = abs_pos.float()
+    log_base = torch.log(
+        abs_pos_float.new_tensor(float(max_position - 1) / float(mid)),
+    )
+    log_pos = torch.ceil(
+        torch.log(abs_pos_float / float(mid)) / log_base * float(mid - 1),
+    ) + float(mid)
     bucket = torch.where(near, abs_pos.to(log_pos.dtype), log_pos)
     bucket = bucket * sign.to(bucket.dtype)
     return bucket.to(torch.long)

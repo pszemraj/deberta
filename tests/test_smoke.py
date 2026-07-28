@@ -4021,6 +4021,27 @@ def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
     assert bucket[-2].item() == pos_edge
 
 
+def test_native_hf_deberta_v2_log_bucket_matches_stock_hf_rounding():
+    from transformers.models.deberta_v2.modeling_deberta_v2 import make_log_bucket_position
+
+    from deberta.modeling.deberta_v2_native import _make_log_bucket_position
+
+    relative_pos = torch.arange(-14, 15, dtype=torch.long)
+    expected = make_log_bucket_position(
+        relative_pos,
+        bucket_size=8,
+        max_position=15,
+    ).long()
+    actual = _make_log_bucket_position(
+        relative_pos,
+        bucket_size=8,
+        max_position=15,
+    )
+
+    assert int(expected[0].item()) == -7
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
