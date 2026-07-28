@@ -43,7 +43,7 @@
 # Growth requires `allow_vocab_resize=true`, is rounded again by `vocab_multiple`, and cannot exceed pretrained checkpoint vocabulary size.
 
 # [model.tokenizer.vocab_multiple] int = 1; must be >= 1.
-# Rounds vocabulary upward; any growth requires `allow_vocab_resize=true`. Use 128 only when deliberate vocabulary padding justifies changing tokenizer size.
+# Rounds vocabulary upward; any growth requires `allow_vocab_resize=true` and registers the added placeholder rows as special tokens so masking and RTD sampling cannot select them. Use 128 only when deliberate vocabulary padding justifies changing tokenizer size.
 
 # model.hf — applies to `model.backbone_type="hf_deberta_v2"`; non-default size/kernel/position settings with RoPE are ignored with warnings, while Flash with RoPE is invalid.
 

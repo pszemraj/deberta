@@ -111,7 +111,7 @@ def _resize_tokenizer_to_vocab_size(
     component: _COMPONENT_KIND,
     allow_resize: bool,
 ) -> None:
-    """Grow tokenizer vocabulary to ``target_size`` by adding inert placeholder tokens.
+    """Grow tokenizer vocabulary to ``target_size`` with reserved special tokens.
 
     :param Any tokenizer: Tokenizer instance.
     :param int target_size: Desired tokenizer vocabulary size.
@@ -129,16 +129,21 @@ def _resize_tokenizer_to_vocab_size(
             "but model.tokenizer.allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
         )
 
-    add_tokens = getattr(tokenizer, "add_tokens", None)
-    if not callable(add_tokens):
+    add_special_tokens = getattr(tokenizer, "add_special_tokens", None)
+    if not callable(add_special_tokens):
         raise ValueError(
-            f"{component} tokenizer does not support add_tokens(...), cannot grow vocab from "
+            f"{component} tokenizer does not support add_special_tokens(...), cannot grow vocab from "
             f"{current} to {target_size}."
         )
 
     needed = int(target_size) - int(current)
     extra_tokens = [_EXTRA_TOKEN_TEMPLATE.format(idx=idx) for idx in range(int(current), int(target_size))]
-    added = int(add_tokens(extra_tokens, special_tokens=False))
+    added = int(
+        add_special_tokens(
+            {"additional_special_tokens": extra_tokens},
+            replace_additional_special_tokens=False,
+        )
+    )
     final_size = _tokenizer_vocab_size(tokenizer)
     if added != needed or final_size != int(target_size):
         raise RuntimeError(

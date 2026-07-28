@@ -1083,6 +1083,7 @@ def test_build_backbone_configs_scratch_can_pad_tokenizer_vocab_to_multiple():
     assert len(tokenizer) == 512
     assert int(disc_cfg.vocab_size) == 512
     assert int(gen_cfg.vocab_size) == 512
+    assert set(range(500, 512)).issubset(tokenizer.all_special_ids)
 
 
 def test_build_backbone_configs_scratch_rejects_vocab_growth_without_resize_permission():

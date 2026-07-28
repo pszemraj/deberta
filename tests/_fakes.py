@@ -128,6 +128,7 @@ class DummyTokenizer:
         self.eos_token_id = 5
         self.all_special_ids = [self.pad_token_id, self.cls_token_id, self.sep_token_id, self.mask_token_id]
         self.all_special_tokens = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+        self.additional_special_tokens: list[str] = []
         self._id_to_tok = {
             self.pad_token_id: "[PAD]",
             self.cls_token_id: "[CLS]",
@@ -235,6 +236,33 @@ class DummyTokenizer:
             self._id_to_tok[self.vocab_size] = str(token)
             self.vocab_size += 1
             added += 1
+        return int(added)
+
+    def add_special_tokens(
+        self,
+        special_tokens_dict: dict[str, list[str]],
+        replace_additional_special_tokens: bool = True,
+    ) -> int:
+        """Register additional special tokens and grow the vocabulary.
+
+        :param dict[str, list[str]] special_tokens_dict: Special-token mapping.
+        :param bool replace_additional_special_tokens: Whether to replace the current additional tokens.
+        :return int: Number of tokens added to the vocabulary.
+        """
+        tokens = list(special_tokens_dict.get("additional_special_tokens", []))
+        if replace_additional_special_tokens:
+            self.additional_special_tokens = []
+
+        added = self.add_tokens(tokens)
+        token_to_id = {token: token_id for token_id, token in self._id_to_tok.items()}
+        for token in tokens:
+            token_id = token_to_id[token]
+            if token not in self.additional_special_tokens:
+                self.additional_special_tokens.append(token)
+            if token not in self.all_special_tokens:
+                self.all_special_tokens.append(token)
+            if token_id not in self.all_special_ids:
+                self.all_special_ids.append(token_id)
         return int(added)
 
     def save_pretrained(self, path: str) -> None:
