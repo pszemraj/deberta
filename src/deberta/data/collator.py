@@ -784,7 +784,6 @@ class DebertaV3ElectraCollator:
             num_to_predict = max(1, int(round(float(num_candidates) * mlm_prob)))
 
             mask_grams = [False] * len(groups)
-            marked_any = False
             segment_start = 0
             while segment_start < len(groups):
                 segment_end = segment_start + 1
@@ -796,11 +795,12 @@ class DebertaV3ElectraCollator:
                     gram_n = int(torch.multinomial(probs, 1).item()) + 1
                     span = gram_n * mask_window
                     remaining = segment_end - offset
-                    if remaining < span and marked_any:
+                    if remaining < span:
                         # A trailing partial context window still marks a full n-gram, which
-                        # would mask the last groups far above the 1 / mask_window rate. Take
-                        # it with probability proportional to its width instead. The first
-                        # window is always taken so every row keeps at least one masked span.
+                        # would mask short segments far above the 1 / mask_window rate. Take
+                        # every partial window with probability proportional to its width;
+                        # a row-level fallback below handles the all-rejected case without
+                        # privileging the first packed document.
                         if float(torch.rand(1, device=input_ids.device).item()) * span >= remaining:
                             break
 
@@ -821,7 +821,6 @@ class DebertaV3ElectraCollator:
                     offset = max(offset + ctx_size, end)
                     for i in range(start, end):
                         mask_grams[i] = True
-                    marked_any = True
 
                 segment_start = segment_end
 
@@ -836,6 +835,17 @@ class DebertaV3ElectraCollator:
                     spans[-1].append(i)
                 else:
                     spans.append([i])
+
+            if not spans:
+                fallback = int(
+                    torch.randint(
+                        low=0,
+                        high=len(groups),
+                        size=(1,),
+                        device=input_ids.device,
+                    ).item()
+                )
+                spans.append([fallback])
 
             selected_positions: list[int] = []
             used = 0

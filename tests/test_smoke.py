@@ -957,7 +957,7 @@ def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: py
     assert int(labels.ne(-100).sum().item()) == 4
 
 
-def test_ngram_masking_applies_complete_word_before_budget_stop(monkeypatch: pytest.MonkeyPatch):
+def test_ngram_masking_keeps_fallback_word_intact(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(
         vocab_size=128,
         token_map={10: "hello", 11: "##world", 12: "another", 13: "##word"},
@@ -997,14 +997,19 @@ def test_ngram_masking_applies_complete_word_before_budget_stop(monkeypatch: pyt
         "randint",
         lambda low, high, size, **kwargs: torch.tensor([0], dtype=torch.long),
     )
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *size, **kwargs: torch.ones(size, dtype=torch.float32),
+    )
 
     masked, labels = coll._mask_tokens_ngram(
         input_ids,
         special_tokens_mask=special,
         max_ngram=3,
     )
-    assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1, 2, 3, 4]))
-    assert torch.equal(masked[0, 1:5], torch.full((4,), tok.mask_token_id))
+    assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1, 2]))
+    assert torch.equal(masked[0, 1:3], torch.full((2,), tok.mask_token_id))
 
 
 def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pytest.MonkeyPatch):
@@ -1265,6 +1270,45 @@ def test_ngram_masking_rate_is_positionally_uniform():
     tail = float(rate[-decile:].mean())
     assert 0.8 < tail / head < 1.25, f"positional mask-rate skew: head={head:.4f} tail={tail:.4f}"
     assert float(rate.min()) > 0.5 * float(rate.mean())
+
+
+def test_ngram_masking_does_not_privilege_first_packed_document():
+    rows = 2000
+    num_documents = 8
+    tok = DummyTokenizer(
+        vocab_size=256,
+        tokenize_output=["hello", "world"],
+        default_token_prefix="tok",
+    )
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.15,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=3,
+        ),
+    )
+
+    row: list[int] = []
+    special: list[int] = []
+    lexical_positions: list[int] = []
+    for document_index in range(num_documents):
+        row.extend([tok.cls_token_id, 10 + document_index, tok.sep_token_id])
+        special.extend([1, 0, 1])
+        lexical_positions.append(3 * document_index + 1)
+
+    input_ids = torch.tensor([row] * rows, dtype=torch.long)
+    special_tokens_mask = torch.tensor([special] * rows, dtype=torch.bool)
+    torch.manual_seed(0)
+    _, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special_tokens_mask,
+        max_ngram=3,
+    )
+
+    rates = labels.ne(-100).float().mean(dim=0)[lexical_positions]
+    assert float(rates.max() / rates.min()) < 1.25
 
 
 def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytest.MonkeyPatch):
