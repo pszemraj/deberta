@@ -144,7 +144,6 @@ class DebertaV3ElectraCollator:
             if attention_mask is None
             else attention_mask.ne(0)
         )
-        row_lengths = active_tokens.sum(dim=-1, dtype=torch.long)
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         inferred_special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
@@ -209,7 +208,6 @@ class DebertaV3ElectraCollator:
         input_ids, labels = self._mask_tokens(
             batch["input_ids"],
             special_tokens_mask=special_tokens_mask,
-            row_lengths=row_lengths,
         )
 
         batch["input_ids"] = input_ids
@@ -567,25 +565,21 @@ class DebertaV3ElectraCollator:
         input_ids: torch.Tensor,
         *,
         special_tokens_mask: torch.Tensor,
-        row_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply DeBERTa-style masking based on configured n-gram width.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
-        :param torch.Tensor row_lengths: Active-token count for each batch row.
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
         if int(self.cfg.max_ngram) <= 1:
             return self._mask_tokens_unigram_windowed(
                 input_ids,
                 special_tokens_mask=special_tokens_mask,
-                row_lengths=row_lengths,
             )
         return self._mask_tokens_ngram(
             input_ids,
             special_tokens_mask=special_tokens_mask,
-            row_lengths=row_lengths,
             max_ngram=int(self.cfg.max_ngram),
         )
 
@@ -680,13 +674,11 @@ class DebertaV3ElectraCollator:
         input_ids: torch.Tensor,
         *,
         special_tokens_mask: torch.Tensor,
-        row_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply DeBERTa windowed-unigram masking for ``max_ngram=1``.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
-        :param torch.Tensor row_lengths: Active-token count for each batch row.
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
         if input_ids.dtype != torch.long:
@@ -706,11 +698,10 @@ class DebertaV3ElectraCollator:
             if bool(spec.all().item()):
                 continue
 
-            effective_len = int(row_lengths[b].item())
-            num_to_predict = max(1, int(round(float(effective_len) * mlm_prob)))
             maskable_idx = torch.nonzero(~spec, as_tuple=False).squeeze(-1)
             if int(maskable_idx.numel()) == 0:
                 continue
+            num_to_predict = max(1, int(round(float(maskable_idx.numel()) * mlm_prob)))
 
             selected = self._sample_windowed_unigram_indices(maskable_idx, num_to_predict=num_to_predict)
             if int(selected.numel()) == 0:
@@ -734,7 +725,6 @@ class DebertaV3ElectraCollator:
         input_ids: torch.Tensor,
         *,
         special_tokens_mask: torch.Tensor,
-        row_lengths: torch.Tensor,
         max_ngram: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply DeBERTa NGramMaskGenerator-style masking.
@@ -742,12 +732,11 @@ class DebertaV3ElectraCollator:
         Selection matches the original DeBERTa policy:
           - n-gram length sampled with p(n) ∝ 1/n
           - windowed selection with ``mask_window = int(1 / mlm_probability)``
-          - sequence-level target budget derived from active row length
+          - sequence-level target budget derived from eligible lexical tokens
         For ``max_ngram > 1``, word groups are built from tokenizer boundary heuristics.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
         :param torch.Tensor special_tokens_mask: Special-token mask of shape (B, S).
-        :param torch.Tensor row_lengths: Active-token count for each batch row.
         :param int max_ngram: Maximum n-gram width.
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
@@ -783,8 +772,6 @@ class DebertaV3ElectraCollator:
             if bool(spec.all().item()):
                 continue
 
-            effective_len = int(row_lengths[b].item())
-            num_to_predict = max(1, int(round(float(effective_len) * mlm_prob)))
             ids = input_ids[b].tolist()
             spec_list = spec.tolist()
 
@@ -793,6 +780,8 @@ class DebertaV3ElectraCollator:
 
             if not groups:
                 continue
+            num_candidates = sum(len(group) for group in groups)
+            num_to_predict = max(1, int(round(float(num_candidates) * mlm_prob)))
 
             mask_grams = [False] * len(groups)
             marked_any = False

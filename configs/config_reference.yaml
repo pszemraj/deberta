@@ -288,7 +288,7 @@
 # train.objective
 
 # [train.objective.mlm_probability] float = 0.15; must be finite and in (0, 1).
-# Sets each row's target budget from active length, including active special tokens; candidate selection then excludes special and inactive positions. Unigram selection splits the candidates into exactly that many near-equal windows and draws one position per window, so it meets the budget exactly and masks every candidate position at the same rate for any probability. Whole-word masking may exceed the nominal budget by one complete word. 0.15 is the parity default.
+# Sets each row's target budget from eligible lexical tokens, excluding special and inactive positions so padding and packed-document boundary count cannot alter the corruption rate. Unigram selection splits the candidates into exactly that many near-equal windows and draws one position per window, so it meets the budget exactly and masks every candidate position at the same rate for any probability. Whole-word masking may exceed the nominal budget by one complete word. 0.15 is the parity default.
 
 # [train.objective.mask_token_prob] float; schema default 1.0; omission is 1.0 for native and 0.8 for RoPE.
 # Must be finite and >= 0; sum with `random_token_prob` must be <= 1. It is the conditional selected-token probability of replacing with MASK; leftover probability keeps the original token.

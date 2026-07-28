@@ -104,7 +104,7 @@ Mask replacement controls:
 
 Replacement probabilities are conditional on token selection and must sum to at most one; the remainder keeps the original token.
 
-Masking uses `attention_mask` liveness captured before padding metadata is simplified. Inactive positions are never corruption targets and keep `labels=-100`. Each row's target budget uses its active length, including active special tokens, rather than the padded batch width; special tokens are then excluded from candidate selection. Whole-word masking applies a complete selected word before checking the budget, so it may overshoot the nominal target by one word.
+Masking uses `attention_mask` liveness captured before padding metadata is simplified. Inactive and special positions are never corruption targets and keep `labels=-100`. Each row's target budget is computed from its eligible lexical tokens, so padding and the number of packed CLS/SEP boundaries cannot change the lexical corruption rate. Whole-word masking applies a complete selected word before checking the budget, so it may overshoot the nominal target by one word.
 
 Windowed unigram selection sizes its windows from that budget: the candidate positions are split into exactly `num_to_predict` contiguous windows of near-equal size and one position is drawn uniformly from each. This keeps the selection count exact and every candidate position equally likely. Sizing windows from `int(1 / mlm_probability)` instead over-produces whenever the reciprocal is not an integer, and trimming the sorted excess back to the budget silently leaves the tail of every sequence unmasked.
 

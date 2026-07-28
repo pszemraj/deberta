@@ -949,7 +949,6 @@ def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: py
     masked, labels = coll._mask_tokens_ngram(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([input_ids.shape[1]]),
         max_ngram=3,
     )
 
@@ -1002,7 +1001,6 @@ def test_ngram_masking_applies_complete_word_before_budget_stop(monkeypatch: pyt
     masked, labels = coll._mask_tokens_ngram(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([input_ids.shape[1]]),
         max_ngram=3,
     )
     assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1, 2, 3, 4]))
@@ -1035,7 +1033,6 @@ def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pyte
     masked, labels = coll._mask_tokens_ngram(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([input_ids.shape[1]]),
         max_ngram=3,
     )
 
@@ -1061,7 +1058,6 @@ def test_ngram_masking_respects_specials():
     masked, labels = coll._mask_tokens_ngram(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([5]),
         max_ngram=3,
     )
 
@@ -1114,7 +1110,6 @@ def test_ngram_masking_stops_at_special_token_boundaries(
     masked, labels = coll._mask_tokens_ngram(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([input_ids.shape[1]]),
         max_ngram=2,
     )
 
@@ -1170,11 +1165,47 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
         _, labels = coll._mask_tokens_unigram_windowed(
             input_ids,
             special_tokens_mask=special,
-            row_lengths=torch.tensor([input_ids.shape[1]]),
         )
         counts.append(int(labels.ne(-100).sum().item()))
 
     assert set(counts) == {1}
+
+
+def test_unigram_budget_ignores_packed_document_specials():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.2,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=1,
+        ),
+    )
+    compact = torch.tensor(
+        [[tok.cls_token_id, 10, 11, 12, 13, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    compact_special = torch.tensor([[1, 0, 0, 0, 0, 1]], dtype=torch.bool)
+    segmented = torch.tensor(
+        [[tok.cls_token_id, 10, 11, tok.sep_token_id, tok.cls_token_id, 12, 13, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    segmented_special = torch.tensor([[1, 0, 0, 1, 1, 0, 0, 1]], dtype=torch.bool)
+
+    torch.manual_seed(7)
+    _, compact_labels = coll._mask_tokens_unigram_windowed(
+        compact,
+        special_tokens_mask=compact_special,
+    )
+    torch.manual_seed(7)
+    _, segmented_labels = coll._mask_tokens_unigram_windowed(
+        segmented,
+        special_tokens_mask=segmented_special,
+    )
+
+    assert int(compact_labels.ne(-100).sum()) == 1
+    assert int(segmented_labels.ne(-100).sum()) == 1
 
 
 def _coverage_inputs(tok: DummyTokenizer, *, seq_len: int, rows: int):
@@ -1184,24 +1215,22 @@ def _coverage_inputs(tok: DummyTokenizer, *, seq_len: int, rows: int):
     special = torch.zeros((rows, seq_len), dtype=torch.bool)
     special[:, 0] = True
     special[:, -1] = True
-    return input_ids, special, torch.full((rows,), seq_len, dtype=torch.long)
+    return input_ids, special
 
 
 def test_windowed_unigram_masking_covers_every_candidate_position():
     seq_len, rows = 64, 128
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.15, max_ngram=1))
-    input_ids, special, row_lengths = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
+    input_ids, special = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
 
     torch.manual_seed(0)
-    _, labels = coll._mask_tokens_unigram_windowed(
-        input_ids, special_tokens_mask=special, row_lengths=row_lengths
-    )
+    _, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
     labelled = labels.ne(-100)
 
     # Windows are sized from the budget, so selection hits it exactly rather than
     # over-producing at int(1 / 0.15) == 6 and trimming the excess.
-    assert set(labelled.sum(dim=1).tolist()) == {max(1, round(seq_len * 0.15))}
+    assert set(labelled.sum(dim=1).tolist()) == {max(1, round((seq_len - 2) * 0.15))}
 
     # Every candidate must stay reachable. Trimming a sorted selection to the budget
     # deterministically starved the tail of every sequence.
@@ -1221,12 +1250,10 @@ def test_ngram_masking_rate_is_positionally_uniform():
         default_token_prefix="tok",
     )
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.15, max_ngram=3))
-    input_ids, special, row_lengths = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
+    input_ids, special = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
 
     torch.manual_seed(0)
-    _, labels = coll._mask_tokens_ngram(
-        input_ids, special_tokens_mask=special, row_lengths=row_lengths, max_ngram=3
-    )
+    _, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
 
     # A trailing partial context window used to mark a full n-gram regardless of its
     # width, while the budget stop always cut the highest-index groups. The two biases
@@ -1253,9 +1280,8 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytes
         _input_ids: torch.Tensor,
         *,
         special_tokens_mask: torch.Tensor,
-        row_lengths: torch.Tensor,
     ):
-        del special_tokens_mask, row_lengths
+        del special_tokens_mask
         calls["windowed"] += 1
         labels = torch.full_like(_input_ids, -100)
         return _input_ids.clone(), labels
@@ -1270,7 +1296,6 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytes
     _ = coll._mask_tokens(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([input_ids.shape[1]]),
     )
     assert int(calls["windowed"]) == 1
 
@@ -1508,7 +1533,6 @@ def test_collator_random_replacement_uses_full_non_special_tokenizer_vocab():
     masked, labels = coll._mask_tokens_unigram_windowed(
         input_ids,
         special_tokens_mask=special,
-        row_lengths=torch.tensor([input_ids.shape[1]]),
     )
     changed = labels.ne(-100)
     assert bool(changed.any().item())
