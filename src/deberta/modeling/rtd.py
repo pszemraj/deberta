@@ -878,7 +878,7 @@ class DebertaV3RTDPretrainer(nn.Module):
         if temp <= 0:
             raise ValueError("sampling_temperature must be > 0")
 
-        x = logits.float() / temp
+        x = logits.float()
         if forbidden_vocab_mask is not None and forbidden_vocab_mask.numel() != 0:
             if forbidden_vocab_mask.device != x.device:
                 forbidden_vocab_mask = forbidden_vocab_mask.to(device=x.device)
@@ -888,11 +888,12 @@ class DebertaV3RTDPretrainer(nn.Module):
                     "forbidden_vocab_mask must have shape (vocab_size,); "
                     f"got {tuple(mask.shape)} for vocabulary size {int(x.shape[-1])}."
                 )
-            x = x.masked_fill(mask, -1e9)
+            x = x.masked_fill(mask, float("-inf"))
 
-        # Gumbel noise
-        u = torch.rand_like(x).clamp_(min=1e-6, max=1.0 - 1e-6)
-        g = -torch.log(-torch.log(u))
+        # Center before temperature scaling so accepted positive temperatures cannot
+        # overflow the winning logit. Exponential noise is an unclipped Gumbel draw.
+        x = (x - x.amax(dim=-1, keepdim=True)) / temp
+        g = -torch.empty_like(x).exponential_().log()
         return torch.argmax(x + g, dim=-1)
 
     # ------------------------------

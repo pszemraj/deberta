@@ -1992,6 +1992,63 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
         assert not bool((sampled == int(sid)).any().item())
 
 
+@pytest.mark.parametrize(
+    ("logits", "temperature", "forbidden_mask", "exponential_draws", "expected"),
+    [
+        pytest.param(
+            [0.0, -20.0, -21.0],
+            1e-8,
+            [True, False, False],
+            [1.0, 1.0, 1.0],
+            1,
+            id="forbidden-id-at-low-temperature",
+        ),
+        pytest.param(
+            [1.0, 2.0, -1.0],
+            1e-40,
+            None,
+            [1.0, 1.0, 1.0],
+            1,
+            id="unique-argmax-at-overflowing-temperature",
+        ),
+        pytest.param(
+            [0.0, -15.0],
+            1.0,
+            None,
+            [-math.log(0.5), -math.log(1.0 - 1e-7)],
+            1,
+            id="unclipped-gumbel-tail",
+        ),
+    ],
+)
+def test_pretrainer_gumbel_sampler_preserves_masked_categorical_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    logits: list[float],
+    temperature: float,
+    forbidden_mask: list[bool] | None,
+    exponential_draws: list[float],
+    expected: int,
+) -> None:
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    def _fixed_exponential_(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        del args, kwargs
+        return tensor.copy_(
+            torch.tensor(exponential_draws, device=tensor.device, dtype=tensor.dtype),
+        )
+
+    monkeypatch.setattr(torch.Tensor, "exponential_", _fixed_exponential_)
+    sampled = DebertaV3RTDPretrainer._gumbel_sample(
+        torch.tensor([logits], dtype=torch.float32),
+        temperature=temperature,
+        forbidden_vocab_mask=(
+            torch.tensor(forbidden_mask, dtype=torch.bool) if forbidden_mask is not None else None
+        ),
+    )
+
+    assert sampled.item() == expected
+
+
 def test_pretrainer_rejects_z_steps_as_enhanced_mask_decoder_substitute() -> None:
 
     from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
