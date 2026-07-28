@@ -795,31 +795,46 @@ class DebertaV3ElectraCollator:
                 continue
 
             mask_grams = [False] * len(groups)
-            offset = 0
             marked_any = False
-            while offset < len(groups):
-                gram_n = int(torch.multinomial(probs, 1).item()) + 1
-                span = gram_n * mask_window
-                remaining = len(groups) - offset
-                if remaining < span and marked_any:
-                    # A trailing partial context window still marks a full n-gram, which
-                    # would mask the last groups far above the 1 / mask_window rate. Take
-                    # it with probability proportional to its width instead. The first
-                    # window is always taken so every row keeps at least one masked span.
-                    if float(torch.rand(1, device=input_ids.device).item()) * span >= remaining:
+            segment_start = 0
+            while segment_start < len(groups):
+                segment_end = segment_start + 1
+                while segment_end < len(groups) and groups[segment_end - 1][-1] + 1 == groups[segment_end][0]:
+                    segment_end += 1
+
+                offset = segment_start
+                while offset < segment_end:
+                    gram_n = int(torch.multinomial(probs, 1).item()) + 1
+                    span = gram_n * mask_window
+                    remaining = segment_end - offset
+                    if remaining < span and marked_any:
+                        # A trailing partial context window still marks a full n-gram, which
+                        # would mask the last groups far above the 1 / mask_window rate. Take
+                        # it with probability proportional to its width instead. The first
+                        # window is always taken so every row keeps at least one masked span.
+                        if float(torch.rand(1, device=input_ids.device).item()) * span >= remaining:
+                            break
+
+                    ctx_size = min(span, remaining)
+                    if ctx_size <= 0:
                         break
 
-                ctx_size = min(span, remaining)
-                if ctx_size <= 0:
-                    break
+                    m = int(
+                        torch.randint(
+                            low=0,
+                            high=ctx_size,
+                            size=(1,),
+                            device=input_ids.device,
+                        ).item()
+                    )
+                    start = offset + m
+                    end = min(offset + m + gram_n, segment_end)
+                    offset = max(offset + ctx_size, end)
+                    for i in range(start, end):
+                        mask_grams[i] = True
+                    marked_any = True
 
-                m = int(torch.randint(low=0, high=ctx_size, size=(1,), device=input_ids.device).item())
-                start = offset + m
-                end = min(offset + m + gram_n, len(groups))
-                offset = max(offset + ctx_size, end)
-                for i in range(start, end):
-                    mask_grams[i] = True
-                marked_any = True
+                segment_start = segment_end
 
             # Marked groups form contiguous n-gram spans. Consume whole spans in random
             # order so that stopping at the budget drops an arbitrary span rather than
@@ -828,7 +843,7 @@ class DebertaV3ElectraCollator:
             for i, do_mask in enumerate(mask_grams):
                 if not do_mask:
                     continue
-                if spans and spans[-1][-1] == i - 1:
+                if spans and spans[-1][-1] == i - 1 and groups[i - 1][-1] + 1 == groups[i][0]:
                     spans[-1].append(i)
                 else:
                     spans.append([i])

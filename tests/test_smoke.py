@@ -1107,6 +1107,53 @@ def test_ngram_masking_respects_specials():
     assert masked[0, 5].item() == tok.pad_token_id
 
 
+def test_ngram_masking_stops_at_special_token_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.5,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=2,
+        ),
+    )
+    input_ids = torch.tensor(
+        [[tok.cls_token_id, 10, tok.sep_token_id, tok.cls_token_id, 11, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, 0, 1, 1, 0, 1]], dtype=torch.bool)
+
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda input, num_samples, replacement=False: torch.tensor([1], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, **kwargs: torch.tensor([0], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *size, **kwargs: torch.ones(size, dtype=torch.float32),
+    )
+
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        row_lengths=torch.tensor([input_ids.shape[1]]),
+        max_ngram=2,
+    )
+
+    assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1]))
+    assert masked[0, 1].item() == tok.mask_token_id
+    assert masked[0, 4].item() == 11
+
+
 def test_collator_never_masks_inactive_nonpad_tokens():
     from deberta.training.loop_utils import _count_rtd_tokens_for_batch
 

@@ -297,7 +297,7 @@
 # Must be finite and >= 0; sum with `mask_token_prob` must be <= 1. It is the conditional selected-token probability of random replacement; special/control IDs are excluded.
 
 # [train.objective.mlm_max_ngram] int = 1; must be >= 1.
-# Maximum DeBERTa windowed masking span; values > 1 request whole-word n-grams, with unsupported tokenizer boundary schemes falling back to conservative token groups with a warning. Marked spans are consumed in random order when the token budget stops selection, and a trailing partial context window is taken proportionally to its width, so the mask rate stays positionally uniform; every row still keeps at least one masked span.
+# Maximum DeBERTa windowed masking span; values > 1 request whole-word n-grams, with unsupported tokenizer boundary schemes falling back to conservative token groups with a warning. Special tokens split n-gram windows and spans, so masking never crosses a packed-document boundary. Marked spans are consumed in random order when the token budget stops selection, and a trailing partial context window is taken proportionally to its width, so the mask rate stays positionally uniform; every row still keeps at least one masked span.
 
 # [train.objective.sampling_temperature] float = 1.0; must be finite and > 0.
 # Softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random. Use 1.0 unless measuring replacement entropy.
