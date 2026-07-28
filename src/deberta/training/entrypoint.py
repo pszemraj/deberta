@@ -1123,25 +1123,23 @@ def run_pretraining(
 
         def _maybe_log_training_metrics(
             *,
-            lr_scheduler: Any,
             gen_loss_num: torch.Tensor,
             gen_token_count_window: torch.Tensor,
             disc_loss_num: torch.Tensor,
             disc_acc_num: torch.Tensor,
             disc_token_count_window: torch.Tensor,
             disc_positive_count_window: torch.Tensor,
-            loss_override: float | None = None,
+            loss_override: torch.Tensor | None = None,
         ) -> None:
             """Emit per-window metrics when ``logging_steps`` interval is reached.
 
-            :param Any lr_scheduler: Scheduler used for LR reporting.
             :param torch.Tensor gen_loss_num: Window numerator for generator loss.
             :param torch.Tensor gen_token_count_window: Window denominator for generator loss.
             :param torch.Tensor disc_loss_num: Window numerator for discriminator loss.
             :param torch.Tensor disc_acc_num: Window numerator for discriminator accuracy.
             :param torch.Tensor disc_token_count_window: Window denominator for discriminator metrics.
             :param torch.Tensor disc_positive_count_window: Window numerator for discriminator positive fraction.
-            :param float | None loss_override: Optional explicit loss scalar for metrics.
+            :param torch.Tensor | None loss_override: Optional explicit loss scalar for metrics.
             :return None: None.
             """
             nonlocal local_input_tokens_since_log
@@ -1167,8 +1165,17 @@ def run_pretraining(
             local_input_tokens_since_log = 0.0
             last_log_started_at = log_now
 
-            lr_raw = _scheduler_current_lr(lr_scheduler)
-            lr = float(lr_raw) if lr_raw is not None else float("nan")
+            lr_metrics: dict[str, float] = {}
+            if effective_decoupled_training:
+                if float(train_cfg.objective.gen_loss_weight) > 0.0:
+                    gen_lr_raw = _scheduler_current_lr(gen_lr_scheduler)
+                    lr_metrics["gen_lr"] = float(gen_lr_raw) if gen_lr_raw is not None else float("nan")
+                if float(train_cfg.objective.disc_loss_weight) > 0.0:
+                    disc_lr_raw = _scheduler_current_lr(disc_lr_scheduler)
+                    lr_metrics["disc_lr"] = float(disc_lr_raw) if disc_lr_raw is not None else float("nan")
+            else:
+                lr_raw = _scheduler_current_lr(lr_scheduler)
+                lr_metrics["lr"] = float(lr_raw) if lr_raw is not None else float("nan")
             weighted_metrics = accelerator.reduce(
                 torch.stack(
                     [
@@ -1214,7 +1221,7 @@ def run_pretraining(
             if disc_loss_weight > 0.0:
                 loss += disc_loss_weight * float(disc_loss_window)
             if loss_override is not None:
-                loss = float(loss_override)
+                loss = float(accelerator.gather(loss_override.detach().float().reshape(1)).mean().item())
 
             zero_metrics = {
                 "zero_gen_window_total": float(zero_gen_window_total),
@@ -1224,7 +1231,7 @@ def run_pretraining(
             }
             metrics = {
                 "step": int(global_step),
-                "lr": float(lr),
+                **lr_metrics,
                 "loss": float(loss),
                 "gen_loss": float(gen_loss_window),
                 "disc_loss": float(disc_loss_window),
@@ -1241,7 +1248,11 @@ def run_pretraining(
                     " | ".join(
                         [
                             f"step={int(metrics['step'])}",
-                            f"lr={metrics['lr']:.3e}",
+                            *[
+                                f"{key}={metrics[key]:.3e}"
+                                for key in ("lr", "gen_lr", "disc_lr")
+                                if key in metrics
+                            ],
                             f"loss={metrics['loss']:.4f}",
                             f"gen={metrics['gen_loss']:.4f}",
                             f"disc={metrics['disc_loss']:.4f}",
@@ -1476,6 +1487,7 @@ def run_pretraining(
                 gen_token_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 disc_token_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 disc_positive_count_window = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+                loss_for_metrics = torch.zeros((), device=accelerator.device, dtype=torch.float32)
                 skipped_window_due_nonfinite = False
                 nonfinite_reason: str | None = None
                 nonfinite_debug_path: Path | None = None
@@ -1569,6 +1581,8 @@ def run_pretraining(
                             gen_loss_num = gen_loss_num + (
                                 gen_phase_out.gen_loss_raw.detach().float() * micro_gen_token_count
                             )
+                        if backward_loss is not None:
+                            loss_for_metrics = loss_for_metrics + weighted_gen_obj.detach().float()
                         # Keep discriminator micro-step counts aligned across ranks:
                         # when local generator targets are absent we still run the
                         # corresponding discriminator pass with zero objective weight.
@@ -1731,6 +1745,7 @@ def run_pretraining(
                                 disc_phase_out.disc_accuracy.detach().float() * micro_disc_token_count
                             )
                             if backward_loss is not None:
+                                loss_for_metrics = loss_for_metrics + weighted_disc_obj.detach().float()
                                 accelerator.backward(backward_loss)
 
                         if is_sync_step and not skipped_window_due_nonfinite:
@@ -1782,17 +1797,22 @@ def run_pretraining(
                         "objective produced no trainable targets."
                     )
 
+                loss_for_metrics = _finalize_window_metric_loss(
+                    accumulated_loss=loss_for_metrics,
+                    ga_steps=ga_steps,
+                    token_weighted_ga=token_weighted_ga,
+                )
                 _record_successful_optimizer_window()
                 _commit_training_window()
 
                 _maybe_log_training_metrics(
-                    lr_scheduler=disc_lr_scheduler,
                     gen_loss_num=gen_loss_num,
                     gen_token_count_window=gen_token_count_window,
                     disc_loss_num=disc_loss_num,
                     disc_acc_num=disc_acc_num,
                     disc_token_count_window=disc_token_count_window,
                     disc_positive_count_window=disc_positive_count_window,
+                    loss_override=loss_for_metrics,
                 )
 
                 last_saved_step = _save_checkpoint_if_due(
@@ -1996,16 +2016,13 @@ def run_pretraining(
             _commit_training_window()
 
             _maybe_log_training_metrics(
-                lr_scheduler=lr_scheduler,
                 gen_loss_num=gen_loss_num,
                 gen_token_count_window=gen_token_count_window,
                 disc_loss_num=disc_loss_num,
                 disc_acc_num=disc_acc_num,
                 disc_token_count_window=disc_token_count_window,
                 disc_positive_count_window=disc_positive_count_window,
-                loss_override=float(
-                    accelerator.gather(loss_for_metrics.detach().float().reshape(1)).mean().item()
-                ),
+                loss_override=loss_for_metrics,
             )
 
             last_saved_step = _save_checkpoint_if_due(

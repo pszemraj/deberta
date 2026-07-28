@@ -284,6 +284,9 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
     assert step_rows
     metrics = step_rows[-1]
+    assert "lr" in metrics
+    assert "gen_lr" not in metrics
+    assert "disc_lr" not in metrics
     assert metrics["gen_loss"] == pytest.approx(8.2, rel=0.0, abs=1e-6)
     assert metrics["disc_loss"] == pytest.approx(104.0 / 12.0, rel=0.0, abs=1e-6)
     disc_prior_loss = -(2.0 / 3.0 * math.log(2.0 / 3.0) + 1.0 / 3.0 * math.log(1.0 / 3.0))
@@ -334,6 +337,7 @@ def test_run_pretraining_keeps_resolved_yaml_roundtrippable_for_resume(
         "skip_generator_step",
         "skip_discriminator_phase",
         "partial_disc_window_sync",
+        "unweighted_metric_objective",
     ],
 )
 def test_run_pretraining_decoupled_integration(
@@ -343,6 +347,7 @@ def test_run_pretraining_decoupled_integration(
     step_counts = {"gen": 0, "disc": 0}
     behavior: dict[str, Any] = {}
     extra_patches: dict[str, Any] | None = None
+    optim_cfg: OptimConfig | None = None
 
     if scenario == "steps_and_sync":
         behavior = {
@@ -458,6 +463,28 @@ def test_run_pretraining_decoupled_integration(
             compile={"enabled": False},
             decoupled_training=True,
         )
+    elif scenario == "unweighted_metric_objective":
+        behavior = {
+            "generator_phase_loss_scale": [1.0, 3.0],
+            "generator_phase_token_count": [1.0, 3.0],
+        }
+        train_cfg = make_train_config(
+            checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
+            max_steps=1,
+            mixed_precision="no",
+            tf32=False,
+            dataloader={"num_workers": 0},
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            token_weighted_gradient_accumulation=False,
+            objective={"gen_loss_weight": 1.0, "disc_loss_weight": 0.0},
+            compile={"enabled": False},
+            decoupled_training=True,
+        )
+        optim_cfg = make_optim_config(
+            lr={"base": 1e-3, "generator": 1e-2, "discriminator": 1e-3},
+            scheduler={"type": "constant", "warmup_steps": 0},
+        )
     else:  # pragma: no cover
         raise AssertionError(f"Unsupported scenario: {scenario}")
 
@@ -492,11 +519,17 @@ def test_run_pretraining_decoupled_integration(
 
     monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
 
-    log_metrics = scenario in {"steps_and_sync", "skip_generator_step", "skip_discriminator_phase"}
+    log_metrics = scenario in {
+        "steps_and_sync",
+        "skip_generator_step",
+        "skip_discriminator_phase",
+        "unweighted_metric_objective",
+    }
     pretrain_mod.run_pretraining(
         model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
         data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
         train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
         logging_cfg=make_logging_config(
             wandb={
                 "enabled": log_metrics,
@@ -520,6 +553,9 @@ def test_run_pretraining_decoupled_integration(
         step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
         assert step_rows
         assert "decoupled_training" not in step_rows[-1]
+        assert "lr" not in step_rows[-1]
+        assert "gen_lr" in step_rows[-1]
+        assert "disc_lr" in step_rows[-1]
     elif scenario == "token_weighted_scaling":
         assert step_counts == {"gen": 1, "disc": 1}
         assert accel.calls["backward"] == pytest.approx(
@@ -540,11 +576,17 @@ def test_run_pretraining_decoupled_integration(
         assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
         step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
         assert step_rows[-1]["loss"] == pytest.approx(3.0)
+        assert "lr" not in step_rows[-1]
+        assert "gen_lr" not in step_rows[-1]
+        assert "disc_lr" in step_rows[-1]
     elif scenario == "skip_discriminator_phase":
         assert step_counts == {"gen": 1, "disc": 0}
         assert accel.calls["backward"] == pytest.approx([2.0], rel=0.0, abs=1e-6)
         step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
         assert step_rows[-1]["loss"] == pytest.approx(2.0)
+        assert "lr" not in step_rows[-1]
+        assert "gen_lr" in step_rows[-1]
+        assert "disc_lr" not in step_rows[-1]
         model = SimpleRTD.last_instance
         assert model is not None
         assert model.calls["forward_discriminator_phase"] == []
@@ -554,6 +596,15 @@ def test_run_pretraining_decoupled_integration(
         assert model is not None
         assert len(model.calls["forward_discriminator_phase"]) == 2
         assert accel.calls["backward"] == pytest.approx([2.0, 2.0, 0.0, 3.0], rel=0.0, abs=1e-6)
+    elif scenario == "unweighted_metric_objective":
+        assert step_counts == {"gen": 1, "disc": 0}
+        assert accel.calls["backward"] == pytest.approx([1.0, 3.0], rel=0.0, abs=1e-6)
+        step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+        assert step_rows[-1]["loss"] == pytest.approx(2.0)
+        assert step_rows[-1]["gen_loss"] == pytest.approx(2.5)
+        assert step_rows[-1]["gen_lr"] == pytest.approx(1e-2)
+        assert "lr" not in step_rows[-1]
+        assert "disc_lr" not in step_rows[-1]
 
 
 @pytest.mark.parametrize(
