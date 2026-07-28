@@ -1287,18 +1287,22 @@ def test_run_pretraining_transient_nonfinite_does_not_spend_optimizer_step(
     assert "nonfinite_window_skipped=1" in caplog.text
 
 
-def test_run_pretraining_persistent_nonfinite_fails_without_checkpoint(
+@pytest.mark.parametrize("decoupled_training", [True, False])
+def test_run_pretraining_rejects_nonfinite_generator_used_for_discriminator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    decoupled_training: bool,
 ) -> None:
     checkpoint_calls: list[tuple[str, int, str]] = []
+    behavior = (
+        {"generator_phase_loss_scale": float("nan")}
+        if decoupled_training
+        else {"loss": 1.0, "gen_loss": float("nan"), "disc_loss": 1.0}
+    )
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         accelerator_cls=FakeAccelerator,
-        rtd_cls=lambda **kwargs: SimpleRTD(
-            behavior={"generator_phase_loss_scale": float("nan")},
-            **kwargs,
-        ),
+        rtd_cls=lambda **kwargs: SimpleRTD(behavior=behavior, **kwargs),
         save_checkpoint_fn=make_checkpoint_saver(calls=checkpoint_calls),
     )
     train_cfg = make_train_config(
@@ -1310,7 +1314,8 @@ def test_run_pretraining_persistent_nonfinite_fails_without_checkpoint(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         token_weighted_gradient_accumulation=False,
-        decoupled_training=True,
+        decoupled_training=decoupled_training,
+        objective={"gen_loss_weight": 0.0, "disc_loss_weight": 1.0},
         compile={"enabled": False},
     )
 

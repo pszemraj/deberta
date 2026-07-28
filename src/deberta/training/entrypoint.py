@@ -1518,10 +1518,7 @@ def run_pretraining(
                             gen_obj = gen_loss
 
                         offending: str | None = None
-                        if (
-                            gen_phase_enabled
-                            and not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all()
-                        ):
+                        if not torch.isfinite(gen_phase_out.gen_loss_raw.detach()).all():
                             offending = "gen_loss_raw"
 
                         backward_loss: torch.Tensor | None = None
@@ -1757,6 +1754,17 @@ def run_pretraining(
                             disc_optimizer.zero_grad(set_to_none=True)
                             did_disc_optimizer_step = True
 
+                if skipped_window_due_nonfinite:
+                    _finalize_nonfinite_skip(
+                        optimizer_phases=[
+                            (gen_optimizer, gen_lr_scheduler, did_gen_optimizer_step),
+                            (disc_optimizer, disc_lr_scheduler, did_disc_optimizer_step),
+                        ],
+                        reason=nonfinite_reason,
+                        debug_path=nonfinite_debug_path,
+                    )
+                    continue
+
                 gen_phase_complete = bool(not gen_phase_enabled or did_gen_optimizer_step)
                 disc_phase_complete = bool(
                     not disc_phase_enabled
@@ -1765,16 +1773,6 @@ def run_pretraining(
                     or not window_has_global_disc_targets
                 )
                 if not (gen_phase_complete and disc_phase_complete):
-                    if skipped_window_due_nonfinite:
-                        _finalize_nonfinite_skip(
-                            optimizer_phases=[
-                                (gen_optimizer, gen_lr_scheduler, did_gen_optimizer_step),
-                                (disc_optimizer, disc_lr_scheduler, did_disc_optimizer_step),
-                            ],
-                            reason=nonfinite_reason,
-                            debug_path=nonfinite_debug_path,
-                        )
-                        continue
                     raise RuntimeError(
                         "Decoupled accumulation window produced no synchronized optimization step."
                     )
@@ -1873,7 +1871,7 @@ def run_pretraining(
                         token_weighted_ga=token_weighted_ga,
                     )
                     offending: str | None = None
-                    if gen_phase_enabled and not torch.isfinite(out.gen_loss_raw.detach()).all():
+                    if not torch.isfinite(out.gen_loss_raw.detach()).all():
                         offending = "gen_loss_raw"
                     elif disc_phase_enabled and not torch.isfinite(out.disc_loss_raw.detach()).all():
                         offending = "disc_loss_raw"
