@@ -103,14 +103,14 @@ python tools/flashdeberta_parity_test.py --case local_bias
 
 The vendored `flashdeberta==0.0.7` backward kernels scatter the disentangled positional gradients (`grad_pos_key` / `grad_pos_query`) into shared tables with `tl.atomic_add`. The repo wrappers (`flashdeberta_fixed_op.py`, `flashdeberta_varlen_op.py`, and the doc-block route via the shared varlen implementation) allocate those atomic destinations in fp32 and downcast to the model dtype on return. Triton casts the atomic operand to the pointer's element type, so this upgrades the accumulation without modifying the vendored kernels.
 
-This is primarily a numerics fix — it removes the order-sensitive bf16 round-off across the many contributions each table slot receives — but it also turned out to be a large speedup: bf16 global atomics take a slow path on current hardware, while fp32 atomic adds use the native hardware reduction. Measured with `tools/flashdeberta_microbench.py` (forward+backward) on an RTX 5090, idle GPU, and confirmed with the A/B run order reversed (both sides reproduce within 0.4%):
+This is primarily a numerics fix - it removes the order-sensitive bf16 round-off across the many contributions each table slot receives - but it also turned out to be a large speedup: bf16 global atomics take a slow path on current hardware, while fp32 atomic adds use the native hardware reduction. Measured with `tools/flashdeberta_microbench.py` (forward+backward) on an RTX 5090, idle GPU, and confirmed with the A/B run order reversed (both sides reproduce within 0.4%):
 
 | Config | bf16 destinations | fp32 destinations | delta |
 |---|---|---|---|
 | fixed route, dense 1024x8 | 89.5 ms / 91.5k tok/s | 55.2 ms / 148.4k tok/s | -38% step time |
 | varlen route, 2048x4, pad 0.35 | 100.5 ms / 53.0k active tok/s | 57.4 ms / 92.7k active tok/s | -43% step time |
 
-Peak memory cost is +0.28 GiB on the fixed route (the fp32 tables) and unmeasurable on varlen. The magnitude of the speedup is hardware- and Triton-version-dependent (measured on sm_120, Triton 3.5.1), but the direction holds wherever bf16 global atomics lack a fast native path. The remaining rounding — the kernels downcast `ds * sm_scale` to bf16 before the atomic — is per-contribution, unbiased, and ~2^-9 relative; fixing it requires an upstream kernel change and is parked in [future work](../development/future-work.md#keep-the-vendored-positional-gradient-addend-in-fp32-upstream-kernel-change).
+Peak memory cost is +0.28 GiB on the fixed route (the fp32 tables) and unmeasurable on varlen. The magnitude of the speedup is hardware- and Triton-version-dependent (measured on sm_120, Triton 3.5.1), but the direction holds wherever bf16 global atomics lack a fast native path. The remaining rounding - the kernels downcast `ds * sm_scale` to bf16 before the atomic - is per-contribution, unbiased, and ~2^-9 relative; fixing it requires an upstream kernel change and is parked in [future work](../development/future-work.md#keep-the-vendored-positional-gradient-addend-in-fp32-upstream-kernel-change).
 
 ## Runtime caveats
 

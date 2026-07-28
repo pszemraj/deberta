@@ -4,7 +4,7 @@ Parked improvements that are out of scope for the current branch but worth revis
 
 ## Decide whether flagship configs should enable cross-document attention blocking
 
-Every shipped config sets `data.packing.block_cross_document_attention: false` (matching the reference default), so the doc-block machinery — pairwise doc masks, per-document CLS conditioning via `doc_context_index`, document-local `position_ids`, and the flash `docblock`/`docblock_bias` kernels — is dormant in every shipped run, including the validated 50k FlashDeBERTa run. The two objective-side consequences of running unblocked (first-CLS RTD conditioning and row-continuous EMD positions) are described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking); both are fixed by the `true` branch.
+Every shipped config sets `data.packing.block_cross_document_attention: false` (matching the reference default), so the doc-block machinery - pairwise doc masks, per-document CLS conditioning via `doc_context_index`, document-local `position_ids`, and the flash `docblock`/`docblock_bias` kernels - is dormant in every shipped run, including the validated 50k FlashDeBERTa run. The two objective-side consequences of running unblocked (first-CLS RTD conditioning and row-continuous EMD positions) are described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking); both are fixed by the `true` branch.
 
 Naive packing is standard practice and may well be the right call (cross-document attention acts as benign noise at scale; blocking costs mask/metadata overhead), but today the setting reads as a default rather than a decision. Picking this up means: A/B a short run with blocking on (the flash `docblock` route keeps the cost story reasonable), compare discriminator metrics per document position within packed rows, and either flip the flagship configs or record here why `false` wins.
 
@@ -18,7 +18,7 @@ Restricting the query axis to masked positions across both EMD passes is mathema
 - Pass-2 queries are pass-1 outputs row-wise: a masked position's pass-2 output depends only on its own pass-1 query row plus the full, unchanged KV.
 - The residual/FFN in `DebertaV2Layer` operate per-position.
 
-Only the masked query rows ever contribute to the MLM loss, so the remaining query-side attention and FFN work in the two extra passes is dead compute. Expected effect: EMD overhead drops from ~33% of generator cost to ~5–8% at `mlm_probability=0.15` with a 6-layer generator.
+Only the masked query rows ever contribute to the MLM loss, so the remaining query-side attention and FFN work in the two extra passes is dead compute. Expected effect: EMD overhead drops from ~33% of generator cost to ~5-8% at `mlm_probability=0.15` with a 6-layer generator.
 
 What it takes:
 
@@ -38,22 +38,22 @@ which removed the dominant order-sensitive accumulation loss. What remains: the 
 `flashDeBERTa==0.0.7` backward kernels round `ds * sm_scale` to the model dtype *before* the
 positional-gradient `tl.atomic_add` (`flashdeberta/ops/flash_attention.py:781`;
 `flash_attention_varlen.py:915`), one rounding per contribution. Fixing that needs the kernels to
-skip the pre-atomic downcast — an upstream PR or vendoring the two backward kernels. Low value on
+skip the pre-atomic downcast - an upstream PR or vendoring the two backward kernels. Low value on
 its own (~2^-9 relative, unbiased); pick up only if the kernels get vendored for another reason.
 
 Verified non-issue while auditing this: the atomics' `scope="cta"` in the fixed-route
-kernels is correct — `DKPOS`/`DQPOS` writes are always CTA-local (grid axis 0 partitions the
+kernels is correct - `DKPOS`/`DQPOS` writes are always CTA-local (grid axis 0 partitions the
 written rows; batch/head base offsets are disjoint), and the varlen kernel, whose combined
 kv-side atomics do collide across CTAs, uses the default `"gpu"` scope.
 
 ## Evaluate Adam-atan2 to drop eps tuning in dual-model RTD training
 
-Dual-model RTD training (generator + discriminator, GDES sync, decoupled optimizers) is finicky: the two backbones have different gradient scales, and the backbone profiles already disagree on Adam epsilon (`hf_deberta_v2`: 1e-6, `rope`: 1e-8) — evidence that eps is a live tuning knob here rather than a solved constant.
+Dual-model RTD training (generator + discriminator, GDES sync, decoupled optimizers) is finicky: the two backbones have different gradient scales, and the backbone profiles already disagree on Adam epsilon (`hf_deberta_v2`: 1e-6, `rope`: 1e-8) - evidence that eps is a live tuning knob here rather than a solved constant.
 
 Adam-atan2 ("Scaling Exponents Across Parameterizations and Optimizers", Everett et al., arXiv:2407.05872) replaces Adam's `m / (sqrt(v) + eps)` update with `atan2(m, sqrt(v))`, which:
 
 - removes the eps hyperparameter entirely, along with its scale-sensitivity across model widths and backbones;
-- is bounded, so tiny-`v` states cannot produce update blow-ups — relevant to the non-finite-window skip machinery the training loop maintains;
+- is bounded, so tiny-`v` states cannot produce update blow-ups - relevant to the non-finite-window skip machinery the training loop maintains;
 - would let both backbone profiles share one optimizer config instead of per-profile eps values.
 
 Scope when picked up:
