@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import runpy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ _discriminator_metrics = _TOOL["_discriminator_metrics"]
 _evaluate_checkpoint = _TOOL["_evaluate_checkpoint"]
 _evaluation_provenance = _TOOL["_evaluation_provenance"]
 _forward_discriminator_with_diagnostics = _TOOL["_forward_discriminator_with_diagnostics"]
+_load_checkpoint_artifacts = _TOOL["_load_checkpoint_artifacts"]
 _precision_mismatch_warning = _TOOL["_precision_mismatch_warning"]
 _ranking_metrics = _TOOL["_ranking_metrics"]
 _replacement_rate = _TOOL["_replacement_rate"]
@@ -134,6 +136,52 @@ def test_discriminator_diagnostics_use_shared_phase_path() -> None:
 
 def test_checkpoint_step_uses_directory_suffix() -> None:
     assert _checkpoint_step(Path("run/checkpoint-12000")) == 12000
+
+
+def test_load_checkpoint_artifacts_uses_run_owned_tokenizer_and_configs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "checkpoint-12000"
+    checkpoint.mkdir(parents=True)
+    tokenizer_dir = run_dir / "tokenizer"
+    tokenizer_dir.mkdir()
+    model_cfg = SimpleNamespace(tokenizer=SimpleNamespace(name_or_path="mutable-external-tokenizer"))
+    cfg = SimpleNamespace(model=model_cfg)
+    tokenizer = object()
+    disc_cfg = object()
+    gen_cfg = object()
+    seen: dict[str, object] = {}
+
+    class _AutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, source: Path, *, use_fast: bool) -> object:
+            seen["tokenizer_source"] = source
+            seen["use_fast"] = use_fast
+            return tokenizer
+
+    def _load_configs(*, run_dir: Path, model_cfg: object) -> tuple[object, object]:
+        seen["config_run_dir"] = run_dir
+        seen["model_cfg"] = model_cfg
+        return disc_cfg, gen_cfg
+
+    monkeypatch.setitem(_load_checkpoint_artifacts.__globals__, "AutoTokenizer", _AutoTokenizer)
+    monkeypatch.setitem(
+        _load_checkpoint_artifacts.__globals__,
+        "load_materialized_backbone_configs",
+        _load_configs,
+    )
+
+    loaded = _load_checkpoint_artifacts(cfg, checkpoint)
+
+    assert loaded == (tokenizer, disc_cfg, gen_cfg)
+    assert seen == {
+        "tokenizer_source": tokenizer_dir,
+        "use_fast": True,
+        "config_run_dir": run_dir,
+        "model_cfg": model_cfg,
+    }
 
 
 def test_replacement_rate_divides_by_masked_tokens_not_all_positions() -> None:

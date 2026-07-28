@@ -25,8 +25,10 @@ from transformers import AutoTokenizer
 
 from deberta.config import load_config
 from deberta.data.loading import load_hf_dataset
-from deberta.modeling import DebertaV3RTDPretrainer, build_backbone_configs, build_backbones
+from deberta.modeling import DebertaV3RTDPretrainer, build_backbones
 from deberta.modeling.mask_utils import attention_mask_to_active_tokens
+from deberta.run_artifacts import load_materialized_backbone_configs, materialized_tokenizer_path
+from deberta.run_layout import infer_run_dir_from_checkpoint
 from deberta.training.compile import prepare_flash_attention_batch_metadata
 from deberta.training.runtime import _build_train_dataset_and_collator
 from deberta.utils.checkpoint import load_model_state_with_compile_key_remap
@@ -166,13 +168,24 @@ def _discriminator_metrics(
     }
 
 
-def _build_model(cfg: Any, tokenizer: Any) -> DebertaV3RTDPretrainer:
-    model_cfg = replace(cfg.model, hf=replace(cfg.model.hf, attention_impl="eager"))
-    disc_cfg, gen_cfg = build_backbone_configs(
-        model_cfg=model_cfg,
-        tokenizer=tokenizer,
-        max_position_embeddings=int(cfg.data.packing.max_seq_length),
+def _load_checkpoint_artifacts(cfg: Any, checkpoint: Path) -> tuple[Any, Any, Any]:
+    run_dir = infer_run_dir_from_checkpoint(checkpoint)
+    tokenizer = AutoTokenizer.from_pretrained(materialized_tokenizer_path(run_dir), use_fast=True)
+    disc_cfg, gen_cfg = load_materialized_backbone_configs(
+        run_dir=run_dir,
+        model_cfg=cfg.model,
     )
+    return tokenizer, disc_cfg, gen_cfg
+
+
+def _build_model(
+    cfg: Any,
+    tokenizer: Any,
+    *,
+    disc_cfg: Any,
+    gen_cfg: Any,
+) -> DebertaV3RTDPretrainer:
+    model_cfg = replace(cfg.model, hf=replace(cfg.model.hf, attention_impl="eager"))
     disc, gen = build_backbones(
         model_cfg=model_cfg,
         disc_config=disc_cfg,
@@ -464,12 +477,22 @@ def main() -> None:
     if mismatch_warning is not None:
         print(f"WARNING: {mismatch_warning}", file=sys.stderr)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer.name_or_path, use_fast=True)
+    checkpoints = sorted(args.checkpoints, key=_checkpoint_step)
+    tokenizer, disc_cfg, gen_cfg = _load_checkpoint_artifacts(cfg, checkpoints[0])
     batch = _build_eval_batch(cfg, tokenizer, batches=args.batches, seed=args.seed)
-    model = _build_model(cfg, tokenizer).to(torch.device("cuda")).eval()
+    model = (
+        _build_model(
+            cfg,
+            tokenizer,
+            disc_cfg=disc_cfg,
+            gen_cfg=gen_cfg,
+        )
+        .to(torch.device("cuda"))
+        .eval()
+    )
 
     results: dict[str, Any] = {}
-    for checkpoint in sorted(args.checkpoints, key=_checkpoint_step):
+    for checkpoint in checkpoints:
         step = str(_checkpoint_step(checkpoint))
         result = _evaluate_checkpoint(
             model,
