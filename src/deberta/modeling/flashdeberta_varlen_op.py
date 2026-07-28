@@ -1,0 +1,2111 @@
+"""Compile-safe wrappers for padded FlashDeBERTa varlen attention.
+
+FlashDeBERTa's upstream varlen path is implemented as a Python/Triton wrapper
+that TorchDynamo tries to trace through. That wrapper contains CPU-side cache
+construction and Triton launch setup which is fine in eager mode, but it is a
+poor match for ``torch.compile``.
+
+Compiled execution uses a Triton custom operator so Dynamo does not trace the
+launcher. Eager execution calls the same raw kernels through a small autograd
+wrapper and reuses batch metadata prepared by the collator.
+"""
+
+from __future__ import annotations
+
+import weakref
+from dataclasses import dataclass
+from functools import partial
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+
+try:  # pragma: no cover - optional Triton dependency
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except Exception:  # pragma: no cover - optional Triton dependency
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
+
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    CONSERVATIVE_FLASH_KERNEL_CONFIG,
+    FlashKernelContext,
+    resolve_flash_kernel_config,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    device_compute_capability,
+    disentangled_attention_span,
+    strides_or_zeros,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    kernel_dtype_name as _kernel_dtype_name,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    optional_triton_jit as _optional_triton_jit,
+)
+from deberta.modeling.flashdeberta_packed_backward import (
+    PackedBackwardInputs,
+    run_packed_backward,
+)
+from deberta.modeling.flashdeberta_prefix_pack import (
+    prefix_pack_optional_pair,
+    prefix_pack_padded_rows,
+    prefix_pack_padded_rows_pair,
+    prefix_pack_padded_rows_triple,
+    prefix_unpack_optional_pair,
+    prefix_unpack_padded_rows,
+    prefix_unpack_padded_rows_triple,
+)
+from deberta.modeling.mask_utils import is_torch_compiling
+
+try:
+    from flashdeberta.ops.flash_attention_varlen import (
+        _bwd_kv_dise_kernel_varlen as _bwd_kv_dise_kernel_varlen_raw,
+    )
+    from flashdeberta.ops.flash_attention_varlen import (
+        _bwd_q_dise_kernel_varlen as _bwd_q_dise_kernel_varlen_raw,
+    )
+    from flashdeberta.ops.flash_attention_varlen import (
+        _fwd_kernel_deberta_disentangled_attention as _fwd_kernel_varlen_raw,
+    )
+    from flashdeberta.ops.flash_attention_varlen import (
+        flash_attn_v2_bwd_dise_varlen as _flash_attn_v2_bwd_dise_varlen_lowlevel,
+    )
+    from flashdeberta.ops.flash_attention_varlen import (
+        flash_attn_v2_fwd_dise as _flash_attn_v2_fwd_dise_lowlevel,
+    )
+
+    _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - optional import
+    _bwd_kv_dise_kernel_varlen_raw = None
+    _bwd_q_dise_kernel_varlen_raw = None
+    _fwd_kernel_varlen_raw = None
+    _flash_attn_v2_bwd_dise_varlen_lowlevel = None
+    _flash_attn_v2_fwd_dise_lowlevel = None
+    _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR = exc
+
+_VARLEN_OP_NAMESPACE = "deberta"
+_VARLEN_FWD_OP_NAME = "flashdeberta_varlen_padded"
+_VARLEN_BWD_OP_NAME = "flashdeberta_varlen_padded_backward"
+_GRAD_PACK_DELTA_BLOCK_ROWS = 32
+
+
+@dataclass
+class _CuSeqlensHostCacheEntry:
+    """Cached host tuple for one cumulative-seqlens tensor."""
+
+    cu_ref: weakref.ReferenceType[torch.Tensor]
+    cu_seqlens_host: tuple[int, ...]
+
+
+@dataclass
+class _MidTensorCacheEntry:
+    """Cached varlen tile-metadata tensors for one cumulative-seqlens tensor."""
+
+    cu_ref: weakref.ReferenceType[torch.Tensor]
+    mid_batch: torch.Tensor
+    mid_start: torch.Tensor
+    mn: int
+
+
+_CU_SEQLENS_HOST_CACHE: dict[int, _CuSeqlensHostCacheEntry] = {}
+_MID_TENSOR_CACHE: dict[tuple[int, int, str, int | None], _MidTensorCacheEntry] = {}
+
+
+def flashdeberta_varlen_import_error() -> Exception | None:
+    """Return the most relevant import failure for varlen support.
+
+    :return Exception | None: Import failure or ``None`` when varlen kernels are available.
+    """
+    if _flash_attn_v2_fwd_dise_lowlevel is not None and _flash_attn_v2_bwd_dise_varlen_lowlevel is not None:
+        return None
+    return _FLASH_VARLEN_LOWLEVEL_IMPORT_ERROR
+
+
+def flashdeberta_compiled_varlen_available() -> bool:
+    """Return whether the compile-visible padded-varlen Triton op is available.
+
+    :return bool: True when the Triton-op based CUDA path is registered.
+    """
+
+    return _FLASHDEBERTA_VARLEN_TRITON_OP is not None and _FLASHDEBERTA_VARLEN_TRITON_BWD_OP is not None
+
+
+def _varlen_use_triton_op() -> bool:
+    """Return whether the compile-visible Triton varlen path is available.
+
+    :return bool: True when raw varlen kernels and ``torch.library.triton_op`` are available.
+    """
+
+    return (
+        _TRITON_AVAILABLE
+        and triton is not None
+        and tl is not None
+        and _fwd_kernel_varlen_raw is not None
+        and _bwd_kv_dise_kernel_varlen_raw is not None
+        and _bwd_q_dise_kernel_varlen_raw is not None
+    )
+
+
+def _varlen_repo_tuned_config(
+    *,
+    route: str = "varlen",
+    kind: str,
+    seq_len: int,
+    total_tokens: int,
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    causal: bool,
+    disentangled: bool,
+    att_span: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    policy_path: str,
+    seq_bucket: str | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Return a table-driven varlen kernel config, if one matches.
+
+    :param str route: Tuning-table route namespace.
+    :param str kind: One of ``"fwd"``, ``"bwd_kv"``, or ``"bwd_q"``.
+    :param int seq_len: Padded sequence length.
+    :param int total_tokens: Total active tokens in the packed batch.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int head_dim: Attention head dimension.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool disentangled: Whether c2p/p2c position terms are active.
+    :param int att_span: Effective relative-position span.
+    :param torch.dtype dtype: Kernel dtype.
+    :param torch.device device: Launch device.
+    :param str policy_path: Normalized kernel-policy override path.
+    :param str | None seq_bucket: Batch-resolved tuning-table bucket.
+    :return tuple[int, int, int, int] | None: Tuned ``(BLOCK_M, BLOCK_N, stages, warps)``
+        or ``None`` when no table row applies.
+    """
+
+    normalized_kind = str(kind).strip().lower()
+    return resolve_flash_kernel_config(
+        FlashKernelContext(
+            compute_capability=device_compute_capability(device),
+            route=route,
+            kind=normalized_kind,
+            seq_len=seq_len,
+            seq_bucket=seq_bucket,
+            total_tokens=total_tokens,
+            batch_size=batch_size,
+            query_len=seq_len,
+            key_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=_kernel_dtype_name(dtype),
+            causal=causal,
+            disentangled=disentangled,
+            att_span=att_span,
+            has_mask=True,
+        ),
+        policy_path=policy_path,
+    )
+
+
+def _run_packed_varlen_forward(
+    *,
+    route: str,
+    q_unpad: torch.Tensor,
+    k_unpad: torch.Tensor,
+    v_unpad: torch.Tensor,
+    pos_key_unpad: torch.Tensor | None,
+    pos_query_unpad: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    batch_size: int,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    att_span: int,
+    policy_path: str,
+    seq_bucket: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one already-packed varlen forward pass.
+
+    :param str route: Tuning-table route namespace.
+    :param torch.Tensor q_unpad: Packed queries.
+    :param torch.Tensor k_unpad: Packed keys.
+    :param torch.Tensor v_unpad: Packed values.
+    :param torch.Tensor | None pos_key_unpad: Optional packed c2p tensor.
+    :param torch.Tensor | None pos_query_unpad: Optional packed p2c tensor.
+    :param torch.Tensor cu_seqlens: Packed cumulative sequence lengths.
+    :param int max_seqlen: Maximum packed sequence length.
+    :param int batch_size: Number of packed sequences used for tuning.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param int att_span: Effective relative-position span.
+    :param str policy_path: Normalized kernel-policy override path.
+    :param str | None seq_bucket: Batch-resolved tuning-table bucket.
+    :raises RuntimeError: If the low-level varlen forward implementation is unavailable.
+    :return tuple[torch.Tensor, torch.Tensor]: Packed output and LSE.
+    """
+
+    if _flash_attn_v2_fwd_dise_lowlevel is not None:
+        table_config = _varlen_repo_tuned_config(
+            route=route,
+            kind="fwd",
+            seq_len=max_seqlen,
+            total_tokens=int(q_unpad.shape[0]),
+            batch_size=batch_size,
+            num_heads=int(q_unpad.shape[1]),
+            head_dim=int(q_unpad.shape[-1]),
+            causal=bool(causal),
+            disentangled=True,
+            att_span=att_span,
+            dtype=q_unpad.dtype,
+            device=q_unpad.device,
+            policy_path=policy_path,
+            seq_bucket=seq_bucket,
+        )
+        block_m, block_n, num_stages, num_warps = (
+            table_config if table_config is not None else CONSERVATIVE_FLASH_KERNEL_CONFIG
+        )
+        return _flash_attn_v2_fwd_dise_lowlevel(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            bool(causal),
+            float(sm_scale),
+            block_m,
+            block_n,
+            int(position_buckets),
+            int(max_relative_distance),
+            num_warps,
+            num_stages,
+            att_span,
+        )
+
+    detail = flashdeberta_varlen_import_error()
+    raise RuntimeError(
+        "FlashDeBERTa varlen attention is unavailable."
+        if detail is None
+        else f"FlashDeBERTa varlen attention is unavailable ({detail})."
+    )
+
+
+def _resolve_varlen_bwd_kernel_config(
+    *,
+    route: str = "varlen",
+    kind: str,
+    total_tokens_q: int,
+    total_tokens_k: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    causal: bool,
+    disentangled: bool,
+    att_span: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    policy_path: str,
+    seq_bucket: str | None = None,
+) -> tuple[int, int, int, int]:
+    """Resolve one repo-local varlen backward kernel config.
+
+    :param str route: Tuning-table route namespace.
+    :param str kind: Either ``"kv"`` or ``"q"``.
+    :param int total_tokens_q: Total query tokens.
+    :param int total_tokens_k: Total key tokens.
+    :param int max_seqlen_q: Maximum query sequence length.
+    :param int max_seqlen_k: Maximum key sequence length.
+    :param int batch_size: Batch size.
+    :param int num_heads: Number of attention heads.
+    :param int head_dim: Attention head dimension.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool disentangled: Whether c2p/p2c position terms are active.
+    :param int att_span: Effective relative-position span.
+    :param torch.dtype dtype: Kernel dtype.
+    :param torch.device device: Launch device.
+    :param str policy_path: Normalized kernel-policy override path.
+    :param str | None seq_bucket: Batch-resolved tuning-table bucket.
+    :return tuple[int, int, int, int]: Resolved ``(BLOCK_M, BLOCK_N, stages, warps)``.
+    """
+
+    repo_tuned = _varlen_repo_tuned_config(
+        route=route,
+        kind=f"bwd_{kind}",
+        seq_len=max(max_seqlen_q, max_seqlen_k),
+        total_tokens=max(total_tokens_q, total_tokens_k),
+        batch_size=batch_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        causal=causal,
+        disentangled=disentangled,
+        att_span=att_span,
+        dtype=dtype,
+        device=device,
+        policy_path=policy_path,
+        seq_bucket=seq_bucket,
+    )
+    if repo_tuned is not None:
+        return repo_tuned
+    return CONSERVATIVE_FLASH_KERNEL_CONFIG
+
+
+def _register_cu_seqlens_host_tuple(
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...],
+) -> None:
+    """Register a host tuple for one cumulative-seqlens tensor.
+
+    :param torch.Tensor cu_seqlens: Device cumulative-seqlens tensor.
+    :param tuple[int, ...] cu_seqlens_host: Host cumulative lengths.
+    """
+
+    cache_key = id(cu_seqlens)
+
+    def _cleanup(_ref: object, key: int = cache_key) -> None:
+        """Remove cached host and mid tensors when ``cu_seqlens`` is released.
+
+        :param object _ref: Weakref callback payload from the released tensor.
+        :param int key: Cache key associated with the released tensor.
+        :return None: This callback mutates the module-local caches in place.
+        """
+
+        _CU_SEQLENS_HOST_CACHE.pop(key, None)
+        stale_keys = [mid_key for mid_key in _MID_TENSOR_CACHE if mid_key[0] == key]
+        for stale_key in stale_keys:
+            _MID_TENSOR_CACHE.pop(stale_key, None)
+
+    cu_ref = weakref.ref(cu_seqlens, _cleanup)
+
+    _CU_SEQLENS_HOST_CACHE[cache_key] = _CuSeqlensHostCacheEntry(
+        cu_ref=cu_ref,
+        cu_seqlens_host=tuple(int(value) for value in cu_seqlens_host),
+    )
+
+
+def _cu_seqlens_host_tuple(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
+    """Return a cached host copy of one cumulative-seqlens tensor.
+
+    :param torch.Tensor cu_seqlens: Device cumulative-seqlens tensor.
+    :return tuple[int, ...]: Host cumulative lengths.
+    """
+
+    cache_key = id(cu_seqlens)
+    cached = _CU_SEQLENS_HOST_CACHE.get(cache_key)
+    if cached is not None:
+        cached_tensor = cached.cu_ref()
+        if cached_tensor is cu_seqlens:
+            return cached.cu_seqlens_host
+        _CU_SEQLENS_HOST_CACHE.pop(cache_key, None)
+        stale_keys = [mid_key for mid_key in _MID_TENSOR_CACHE if mid_key[0] == cache_key]
+        for stale_key in stale_keys:
+            _MID_TENSOR_CACHE.pop(stale_key, None)
+
+    cu_seqlens_host = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    _register_cu_seqlens_host_tuple(cu_seqlens=cu_seqlens, cu_seqlens_host=cu_seqlens_host)
+    return cu_seqlens_host
+
+
+def _build_mid_host_tuples(
+    *,
+    cu_seqlens_host: tuple[int, ...],
+    block_m: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+    """Build host-side varlen tile metadata for one cumulative-seqlens tuple.
+
+    :param tuple[int, ...] cu_seqlens_host: Host cumulative lengths with shape ``(B+1,)``.
+    :param int block_m: Query tile height.
+    :return tuple[tuple[int, ...], tuple[int, ...], int]:
+        Batch ids, start offsets, and total tile count.
+    """
+
+    mid_batch: list[int] = []
+    mid_start: list[int] = []
+    mn = 0
+    for batch_idx in range(max(0, len(cu_seqlens_host) - 1)):
+        q_start = int(cu_seqlens_host[batch_idx])
+        q_end = int(cu_seqlens_host[batch_idx + 1])
+        n_batch_blocks = max(0, (q_end - q_start + int(block_m) - 1) // int(block_m))
+        mn += int(n_batch_blocks)
+        for block_idx in range(int(n_batch_blocks)):
+            mid_batch.append(int(batch_idx))
+            mid_start.append(int(q_start + block_idx * int(block_m)))
+    return tuple(mid_batch), tuple(mid_start), int(mn)
+
+
+def _get_mid_tensors_cached(
+    *,
+    cu_seqlens: torch.Tensor,
+    block_m: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return cached varlen mid tensors for one cumulative-seqlens tensor.
+
+    :param torch.Tensor cu_seqlens: Device cumulative-seqlens tensor.
+    :param int block_m: Query tile height.
+    :param torch.device device: Device where the returned tensors should live.
+    :return tuple[torch.Tensor, torch.Tensor, int]: ``(mid_batch, mid_start, mn)``.
+    """
+
+    cache_key = (id(cu_seqlens), int(block_m), str(device.type), device.index)
+    cached = _MID_TENSOR_CACHE.get(cache_key)
+    if cached is not None:
+        cached_tensor = cached.cu_ref()
+        if cached_tensor is cu_seqlens:
+            return cached.mid_batch, cached.mid_start, cached.mn
+        _MID_TENSOR_CACHE.pop(cache_key, None)
+
+    cu_seqlens_host = _cu_seqlens_host_tuple(cu_seqlens)
+    mid_batch_host, mid_start_host, mn = _build_mid_host_tuples(
+        cu_seqlens_host=cu_seqlens_host,
+        block_m=int(block_m),
+    )
+    mid_batch = torch.tensor(mid_batch_host, dtype=torch.long, device=device)
+    mid_start = torch.tensor(mid_start_host, dtype=torch.long, device=device)
+
+    _MID_TENSOR_CACHE[cache_key] = _MidTensorCacheEntry(
+        cu_ref=weakref.ref(cu_seqlens),
+        mid_batch=mid_batch,
+        mid_start=mid_start,
+        mn=int(mn),
+    )
+    return mid_batch, mid_start, int(mn)
+
+
+def _build_dense_mid_tensors(
+    *,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build compile-friendly tile metadata without Python-side caches.
+
+    The compile-visible varlen path uses fixed-capacity packed buffers of size
+    ``B*S``. That means the number of tiles per batch is also fixed by the
+    padded sequence length, even though the actual token counts still come from
+    ``cu_seqlens``.
+
+    :param torch.Tensor cu_seqlens: Cumulative active lengths tensor ``(B+1,)``.
+    :param int batch_size: Batch size.
+    :param int seq_len: Padded sequence length.
+    :param int block_size: Tile size for the corresponding kernel axis.
+    :return tuple[torch.Tensor, torch.Tensor, int]: Device ``(mid_batch, mid_start, tile_count)``.
+    """
+
+    tiles_per_batch = max(1, (int(seq_len) + int(block_size) - 1) // int(block_size))
+    tile_offsets = torch.arange(tiles_per_batch, device=cu_seqlens.device, dtype=torch.long) * int(block_size)
+    starts = cu_seqlens[:-1].to(dtype=torch.long)
+    mid_start = (starts[:, None] + tile_offsets[None, :]).reshape(-1)
+    mid_batch = torch.arange(batch_size, device=cu_seqlens.device, dtype=torch.long).repeat_interleave(
+        tiles_per_batch
+    )
+    return mid_batch, mid_start, int(batch_size * tiles_per_batch)
+
+
+@_optional_triton_jit
+def _pack_grad_and_delta_prefix_kernel(
+    grad_padded_ptr: None,
+    out_unpad_ptr: None,
+    grad_unpad_ptr: None,
+    delta_ptr: None,
+    seqlens_ptr: None,
+    cu_seqlens_ptr: None,
+    stride_gb: None,
+    stride_gs: None,
+    stride_gh: None,
+    stride_gd: None,
+    stride_oz: None,
+    stride_oh: None,
+    stride_od: None,
+    stride_guz: None,
+    stride_guh: None,
+    stride_gud: None,
+    stride_dz: None,
+    stride_dh: None,
+    head_dim: None,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+) -> None:
+    """Pack padded output gradients and compute delta in one Triton pass.
+
+    :param Any grad_padded_ptr: Pointer to padded output gradients.
+    :param Any out_unpad_ptr: Pointer to packed forward outputs.
+    :param Any grad_unpad_ptr: Pointer to packed output gradients.
+    :param Any delta_ptr: Pointer to packed delta tensor.
+    :param Any seqlens_ptr: Pointer to per-example active lengths.
+    :param Any cu_seqlens_ptr: Pointer to cumulative sequence lengths.
+    :param Any stride_gb: Batch stride for padded gradients.
+    :param Any stride_gs: Sequence stride for padded gradients.
+    :param Any stride_gh: Head stride for padded gradients.
+    :param Any stride_gd: Feature stride for padded gradients.
+    :param Any stride_oz: Token stride for packed forward outputs.
+    :param Any stride_oh: Head stride for packed forward outputs.
+    :param Any stride_od: Feature stride for packed forward outputs.
+    :param Any stride_guz: Token stride for packed output gradients.
+    :param Any stride_guh: Head stride for packed output gradients.
+    :param Any stride_gud: Feature stride for packed output gradients.
+    :param Any stride_dz: Token stride for packed delta.
+    :param Any stride_dh: Head stride for packed delta.
+    :param Any head_dim: Runtime head dimension.
+    :param Any BLOCK_ROWS: Row tile size.
+    :param Any BLOCK_DMODEL: Feature tile size.
+    :return None: This Triton kernel writes in place.
+    """
+
+    batch_idx = tl.program_id(0)
+    tile_row = tl.program_id(1)
+    head_idx = tl.program_id(2)
+
+    row_offsets = tile_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    d_offsets = tl.arange(0, BLOCK_DMODEL)
+
+    seqlen = tl.load(seqlens_ptr + batch_idx)
+    packed_base = tl.load(cu_seqlens_ptr + batch_idx)
+    packed_rows = packed_base + row_offsets
+    mask_rows = row_offsets < seqlen
+    mask_d = d_offsets < head_dim
+    mask = mask_rows[:, None] & mask_d[None, :]
+
+    grad_ptrs = grad_padded_ptr + (
+        batch_idx * stride_gb
+        + row_offsets[:, None] * stride_gs
+        + head_idx * stride_gh
+        + d_offsets[None, :] * stride_gd
+    )
+    out_ptrs = out_unpad_ptr + (
+        packed_rows[:, None] * stride_oz + head_idx * stride_oh + d_offsets[None, :] * stride_od
+    )
+    grad_unpad_ptrs = grad_unpad_ptr + (
+        packed_rows[:, None] * stride_guz + head_idx * stride_guh + d_offsets[None, :] * stride_gud
+    )
+
+    grad = tl.load(grad_ptrs, mask=mask, other=0.0)
+    out = tl.load(out_ptrs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(grad_unpad_ptrs, grad, mask=mask)
+
+    delta = tl.sum(out * grad.to(tl.float32), axis=1)
+    delta_ptrs = delta_ptr + packed_rows * stride_dz + head_idx * stride_dh
+    tl.store(delta_ptrs, delta, mask=mask_rows)
+
+
+def _packed_delta_fallback(
+    *,
+    out_unpad: torch.Tensor,
+    grad_unpad: torch.Tensor,
+    total_tokens: int,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``delta = sum(out * grad, dim=-1)`` with safe inactive-tail handling.
+
+    :param torch.Tensor out_unpad: Packed forward output tensor.
+    :param torch.Tensor grad_unpad: Packed output gradient tensor.
+    :param int total_tokens: Packed-token capacity.
+    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
+    :return torch.Tensor: Packed delta tensor in ``(NNZ, H)`` layout.
+    """
+
+    delta = torch.zeros(
+        (int(total_tokens), int(out_unpad.shape[1])),
+        device=out_unpad.device,
+        dtype=torch.float32,
+    )
+    if int(total_tokens) == 0 or int(cu_seqlens.numel()) == 0:
+        return delta
+    active_tokens = int(cu_seqlens[-1].detach().cpu().item())
+    if active_tokens > 0:
+        delta[:active_tokens] = (
+            out_unpad[:active_tokens].to(dtype=torch.float32)
+            * grad_unpad[:active_tokens].to(dtype=torch.float32)
+        ).sum(dim=-1)
+    return delta
+
+
+def _pack_grad_and_delta_from_padded(
+    *,
+    grad_output: torch.Tensor,
+    output_padded: torch.Tensor,
+    out_unpad: torch.Tensor | None,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    total_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack padded output gradients and build packed delta.
+
+    :param torch.Tensor grad_output: Padded output gradient in ``(B, S, H, D)`` layout.
+    :param torch.Tensor output_padded: Padded forward output in ``(B, S, H, D)`` layout.
+    :param torch.Tensor | None out_unpad: Optional cached packed forward output.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
+    :param int max_seqlen: Sequence bound used for prefix-pack grids.
+    :param int total_tokens: Packed-token count or fixed-capacity packed size.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        Packed forward output, packed output gradient, and packed delta tensor.
+    """
+
+    total_tokens = int(total_tokens)
+    if total_tokens == 0:
+        empty_grad = grad_output.new_empty((0, *grad_output.shape[2:]))
+        empty_delta = grad_output.new_empty((0, int(grad_output.shape[2])), dtype=torch.float32)
+        empty_out = empty_grad if out_unpad is None else out_unpad
+        return empty_out, empty_grad, empty_delta
+
+    if out_unpad is None:
+        out_unpad, grad_unpad = prefix_pack_padded_rows_pair(
+            output_padded,
+            grad_output,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+        delta = _packed_delta_fallback(
+            out_unpad=out_unpad,
+            grad_unpad=grad_unpad,
+            total_tokens=total_tokens,
+            cu_seqlens=cu_seqlens,
+        )
+        return out_unpad, grad_unpad, delta
+
+    can_use_triton = (
+        _TRITON_AVAILABLE
+        and grad_output.device.type == "cuda"
+        and out_unpad.device.type == "cuda"
+        and seqlens.device == grad_output.device
+        and cu_seqlens.device == grad_output.device
+    )
+    if not can_use_triton:
+        grad_unpad = prefix_pack_padded_rows(
+            grad_output,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+        delta = _packed_delta_fallback(
+            out_unpad=out_unpad,
+            grad_unpad=grad_unpad,
+            total_tokens=total_tokens,
+            cu_seqlens=cu_seqlens,
+        )
+        return out_unpad, grad_unpad, delta
+
+    head_dim = int(grad_output.shape[-1])
+    if head_dim > 256:
+        grad_unpad = prefix_pack_padded_rows(
+            grad_output,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+        delta = _packed_delta_fallback(
+            out_unpad=out_unpad,
+            grad_unpad=grad_unpad,
+            total_tokens=total_tokens,
+            cu_seqlens=cu_seqlens,
+        )
+        return out_unpad, grad_unpad, delta
+    block_dmodel = max(16, triton.next_power_of_2(head_dim))
+    grad_unpad = torch.empty(
+        (total_tokens, int(grad_output.shape[2]), head_dim),
+        device=grad_output.device,
+        dtype=grad_output.dtype,
+    )
+    delta = torch.zeros(
+        (total_tokens, int(grad_output.shape[2])),
+        device=grad_output.device,
+        dtype=torch.float32,
+    )
+    grid = (
+        int(grad_output.shape[0]),
+        triton.cdiv(int(max_seqlen), _GRAD_PACK_DELTA_BLOCK_ROWS),
+        int(grad_output.shape[2]),
+    )
+    torch.library.wrap_triton(_pack_grad_and_delta_prefix_kernel)[grid](
+        grad_output,
+        out_unpad,
+        grad_unpad,
+        delta,
+        seqlens,
+        cu_seqlens,
+        grad_output.stride(0),
+        grad_output.stride(1),
+        grad_output.stride(2),
+        grad_output.stride(3),
+        out_unpad.stride(0),
+        out_unpad.stride(1),
+        out_unpad.stride(2),
+        grad_unpad.stride(0),
+        grad_unpad.stride(1),
+        grad_unpad.stride(2),
+        delta.stride(0),
+        delta.stride(1),
+        head_dim,
+        BLOCK_ROWS=_GRAD_PACK_DELTA_BLOCK_ROWS,
+        BLOCK_DMODEL=block_dmodel,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out_unpad, grad_unpad, delta
+
+
+def _varlen_backward_raw_impl(
+    *,
+    q_unpad: torch.Tensor,
+    k_unpad: torch.Tensor,
+    v_unpad: torch.Tensor,
+    out_unpad: torch.Tensor,
+    grad_unpad: torch.Tensor,
+    lse_unpad: torch.Tensor,
+    delta: torch.Tensor,
+    pos_key_unpad: torch.Tensor | None,
+    pos_query_unpad: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    batch_size: int,
+    seq_bound: int,
+    token_capacity: int,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    dense_mid_tensors: bool,
+    route: str = "varlen",
+    policy_path: str = "",
+    seq_bucket: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Launch raw varlen backward Triton kernels over already packed tensors.
+
+    :param torch.Tensor q_unpad: Packed queries.
+    :param torch.Tensor k_unpad: Packed keys.
+    :param torch.Tensor v_unpad: Packed values.
+    :param torch.Tensor out_unpad: Packed forward output.
+    :param torch.Tensor grad_unpad: Packed output gradient.
+    :param torch.Tensor lse_unpad: Packed forward log-sum-exp tensor.
+    :param torch.Tensor delta: Packed delta tensor.
+    :param torch.Tensor | None pos_key_unpad: Optional packed c2p tensor.
+    :param torch.Tensor | None pos_query_unpad: Optional packed p2c tensor.
+    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
+    :param int batch_size: Batch size.
+    :param int seq_bound: Sequence bound used for config and tile construction.
+    :param int token_capacity: Packed-token count or fixed-capacity size.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param bool dense_mid_tensors: Whether to build fixed-capacity dense mid tensors.
+    :param str route: Tuning-table route namespace.
+    :param str policy_path: Normalized kernel-policy override path.
+    :param str | None seq_bucket: Batch-resolved tuning-table bucket.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Packed gradients for q/k/v and optional positional tensors.
+    """
+
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
+    kv_block_m, kv_block_n, kv_num_stages, kv_num_warps = _resolve_varlen_bwd_kernel_config(
+        route=route,
+        kind="kv",
+        total_tokens_q=int(token_capacity),
+        total_tokens_k=int(token_capacity),
+        max_seqlen_q=int(seq_bound),
+        max_seqlen_k=int(seq_bound),
+        batch_size=int(batch_size),
+        num_heads=int(q_unpad.shape[1]),
+        head_dim=int(q_unpad.shape[-1]),
+        causal=bool(causal),
+        disentangled=True,
+        att_span=att_span,
+        dtype=q_unpad.dtype,
+        device=q_unpad.device,
+        policy_path=policy_path,
+        seq_bucket=seq_bucket,
+    )
+    q_block_m, q_block_n, q_num_stages, q_num_warps = _resolve_varlen_bwd_kernel_config(
+        route=route,
+        kind="q",
+        total_tokens_q=int(token_capacity),
+        total_tokens_k=int(token_capacity),
+        max_seqlen_q=int(seq_bound),
+        max_seqlen_k=int(seq_bound),
+        batch_size=int(batch_size),
+        num_heads=int(q_unpad.shape[1]),
+        head_dim=int(q_unpad.shape[-1]),
+        causal=bool(causal),
+        disentangled=True,
+        att_span=att_span,
+        dtype=q_unpad.dtype,
+        device=q_unpad.device,
+        policy_path=policy_path,
+        seq_bucket=seq_bucket,
+    )
+
+    if dense_mid_tensors:
+        mid_m_batch, mid_m_start, m_tile_count = _build_dense_mid_tensors(
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=int(seq_bound),
+            block_size=q_block_m,
+        )
+        mid_n_batch, mid_n_start, n_tile_count = _build_dense_mid_tensors(
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_len=int(seq_bound),
+            block_size=kv_block_n,
+        )
+    else:
+        mid_m_batch, mid_m_start, m_tile_count = _get_mid_tensors_cached(
+            cu_seqlens=cu_seqlens,
+            block_m=q_block_m,
+            device=q_unpad.device,
+        )
+        mid_n_batch, mid_n_start, n_tile_count = _get_mid_tensors_cached(
+            cu_seqlens=cu_seqlens,
+            block_m=kv_block_n,
+            device=q_unpad.device,
+        )
+
+    dq_unpad = torch.empty_like(q_unpad)
+    dk_unpad = torch.empty_like(k_unpad)
+    dv_unpad = torch.empty_like(v_unpad)
+    # Positional atomic destinations accumulate in fp32: Triton casts the
+    # kernel's bf16 addend to the pointer element type, so fp32 buffers remove
+    # the order-sensitive bf16 accumulation loss without touching the vendored
+    # kernels. zeros_like keeps pos_* strides, which the kernel shares with
+    # these buffers; the grads are downcast to the model dtype on return.
+    dpos_key_unpad = (
+        torch.zeros_like(pos_key_unpad, dtype=torch.float32) if pos_key_unpad is not None else None
+    )
+    dpos_query_unpad = (
+        torch.zeros_like(pos_query_unpad, dtype=torch.float32) if pos_query_unpad is not None else None
+    )
+
+    stride_pk0, stride_pk1, stride_pk2 = strides_or_zeros(pos_key_unpad, 3)
+    stride_pq0, stride_pq1, stride_pq2 = strides_or_zeros(pos_query_unpad, 3)
+
+    grid_kv = (n_tile_count, int(q_unpad.shape[1]))
+    torch.library.wrap_triton(_bwd_kv_dise_kernel_varlen_raw)[grid_kv](
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        pos_key_unpad if pos_key_unpad is not None else k_unpad,
+        pos_query_unpad if pos_query_unpad is not None else v_unpad,
+        float(sm_scale),
+        grad_unpad,
+        dk_unpad,
+        dv_unpad,
+        dpos_key_unpad if dpos_key_unpad is not None else k_unpad,
+        dpos_query_unpad if dpos_query_unpad is not None else v_unpad,
+        lse_unpad,
+        delta,
+        cu_seqlens,
+        cu_seqlens,
+        mid_n_batch,
+        mid_n_start,
+        q_unpad.stride(0),
+        q_unpad.stride(1),
+        q_unpad.stride(2),
+        k_unpad.stride(0),
+        k_unpad.stride(1),
+        k_unpad.stride(2),
+        v_unpad.stride(0),
+        v_unpad.stride(1),
+        v_unpad.stride(2),
+        grad_unpad.stride(0),
+        grad_unpad.stride(1),
+        grad_unpad.stride(2),
+        dk_unpad.stride(0),
+        dk_unpad.stride(1),
+        dk_unpad.stride(2),
+        dv_unpad.stride(0),
+        dv_unpad.stride(1),
+        dv_unpad.stride(2),
+        stride_pk0,
+        stride_pk1,
+        stride_pk2,
+        stride_pq0,
+        stride_pq1,
+        stride_pq2,
+        batch_size,
+        int(q_unpad.shape[1]),
+        BLOCK_M=kv_block_m,
+        BLOCK_DMODEL=int(q_unpad.shape[-1]),
+        BLOCK_N=kv_block_n,
+        CAUSAL=bool(causal),
+        HAS_C2P=bool(pos_key_unpad is not None),
+        HAS_P2C=bool(pos_query_unpad is not None),
+        ATT_SPAN=att_span,
+        NUM_BUCKETS=int(position_buckets),
+        MAX_DISTANCE=int(max_relative_distance),
+        num_warps=kv_num_warps,
+        num_stages=kv_num_stages,
+    )
+
+    grid_q = (m_tile_count, int(q_unpad.shape[1]))
+    torch.library.wrap_triton(_bwd_q_dise_kernel_varlen_raw)[grid_q](
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        pos_key_unpad if pos_key_unpad is not None else q_unpad,
+        pos_query_unpad if pos_query_unpad is not None else k_unpad,
+        float(sm_scale),
+        grad_unpad,
+        dq_unpad,
+        lse_unpad,
+        delta,
+        cu_seqlens,
+        cu_seqlens,
+        mid_m_batch,
+        mid_m_start,
+        q_unpad.stride(0),
+        q_unpad.stride(1),
+        q_unpad.stride(2),
+        k_unpad.stride(0),
+        k_unpad.stride(1),
+        k_unpad.stride(2),
+        v_unpad.stride(0),
+        v_unpad.stride(1),
+        v_unpad.stride(2),
+        grad_unpad.stride(0),
+        grad_unpad.stride(1),
+        grad_unpad.stride(2),
+        dq_unpad.stride(0),
+        dq_unpad.stride(1),
+        dq_unpad.stride(2),
+        stride_pk0,
+        stride_pk1,
+        stride_pk2,
+        stride_pq0,
+        stride_pq1,
+        stride_pq2,
+        batch_size,
+        int(q_unpad.shape[1]),
+        BLOCK_M=q_block_m,
+        BLOCK_DMODEL=int(q_unpad.shape[-1]),
+        BLOCK_N=q_block_n,
+        CAUSAL=bool(causal),
+        HAS_C2P=bool(pos_key_unpad is not None),
+        HAS_P2C=bool(pos_query_unpad is not None),
+        ATT_SPAN=att_span,
+        NUM_BUCKETS=int(position_buckets),
+        MAX_DISTANCE=int(max_relative_distance),
+        num_warps=q_num_warps,
+        num_stages=q_num_stages,
+    )
+    if dpos_key_unpad is not None:
+        dpos_key_unpad = dpos_key_unpad.to(pos_key_unpad.dtype)
+    if dpos_query_unpad is not None:
+        dpos_query_unpad = dpos_query_unpad.to(pos_query_unpad.dtype)
+    return dq_unpad, dk_unpad, dv_unpad, dpos_key_unpad, dpos_query_unpad
+
+
+def _varlen_padded_backward_impl(
+    *,
+    grad_output: torch.Tensor,
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    output_padded: torch.Tensor,
+    lse_padded: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    total_tokens: int,
+    q_unpad: torch.Tensor | None,
+    k_unpad: torch.Tensor | None,
+    v_unpad: torch.Tensor | None,
+    out_unpad: torch.Tensor | None,
+    lse_unpad: torch.Tensor | None,
+    pos_key_unpad: torch.Tensor | None,
+    pos_query_unpad: torch.Tensor | None,
+    dense_mid_tensors: bool = False,
+    policy_path: str = "",
+    seq_bucket: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run padded varlen backward, optionally reusing forward-side packed tensors.
+
+    :param torch.Tensor grad_output: Gradient of padded output in ``(B, S, H, D)`` layout.
+    :param torch.Tensor query_layer: Forward queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Forward keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Forward values in ``(B, S, H, D)`` layout.
+    :param torch.Tensor output_padded: Forward output in ``(B, S, H, D)`` layout.
+    :param torch.Tensor lse_padded: Forward padded LSE in ``(B, S, H)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.Tensor seqlens: Per-example active lengths.
+    :param torch.Tensor cu_seqlens: Cumulative sequence lengths.
+    :param int max_seqlen: Maximum active length in batch.
+    :param int total_tokens: Total active tokens in batch.
+    :param torch.Tensor | None q_unpad: Optional cached unpadded query tensor.
+    :param torch.Tensor | None k_unpad: Optional cached unpadded key tensor.
+    :param torch.Tensor | None v_unpad: Optional cached unpadded value tensor.
+    :param torch.Tensor | None out_unpad: Optional cached unpadded output tensor.
+    :param torch.Tensor | None lse_unpad: Optional cached unpadded LSE tensor.
+    :param torch.Tensor | None pos_key_unpad: Optional cached unpadded c2p tensor.
+    :param torch.Tensor | None pos_query_unpad: Optional cached unpadded p2c tensor.
+    :param bool dense_mid_tensors: Build fixed-capacity midpoint metadata for compile-visible launches.
+    :param str policy_path: Normalized kernel-policy override path.
+    :param str | None seq_bucket: Batch-resolved tuning-table bucket.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Gradients in the same padded layouts as the forward inputs.
+    """
+
+    batch_size = int(query_layer.shape[0])
+    seq_len = int(query_layer.shape[1])
+
+    if total_tokens == 0:
+        dq = torch.zeros_like(query_layer)
+        dk = torch.zeros_like(key_layer)
+        dv = torch.zeros_like(value_layer)
+        # Compiled autograd retains only packed positional auxiliaries; use their bucket
+        # dimensions to reconstruct the padded input-gradient shapes.
+        dpos_key = (
+            torch.zeros_like(pos_key)
+            if pos_key is not None
+            else pos_key_unpad.new_zeros(
+                (batch_size, seq_len, int(query_layer.shape[2]), int(pos_key_unpad.shape[-1]))
+            )
+            if pos_key_unpad is not None
+            else None
+        )
+        dpos_query = (
+            torch.zeros_like(pos_query)
+            if pos_query is not None
+            else pos_query_unpad.new_zeros(
+                (batch_size, seq_len, int(query_layer.shape[2]), int(pos_query_unpad.shape[-1]))
+            )
+            if pos_query_unpad is not None
+            else None
+        )
+        return dq, dk, dv, dpos_key, dpos_query
+
+    pack_kwargs = {
+        "seqlens": seqlens,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+        "total_tokens": total_tokens,
+    }
+    unpack_kwargs = {
+        "seqlens": seqlens,
+        "cu_seqlens": cu_seqlens,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+    }
+
+    def _pack_grad(grad: torch.Tensor, packed_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack the output gradient and compute its softmax delta.
+
+        :param torch.Tensor grad: Padded output gradient.
+        :param torch.Tensor packed_output: Packed forward output.
+        :return tuple[torch.Tensor, torch.Tensor]: Packed gradient and fp32 delta.
+        """
+
+        _, packed_grad, delta = _pack_grad_and_delta_from_padded(
+            grad_output=grad,
+            output_padded=output_padded,
+            out_unpad=packed_output,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+        )
+        return packed_grad, delta
+
+    def _launch(
+        packed: PackedBackwardInputs,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Launch the shared raw varlen backward implementation.
+
+        :param PackedBackwardInputs packed: Packed backward inputs.
+        :return tuple: Packed q/k/v and optional positional gradients.
+        """
+
+        return _varlen_backward_raw_impl(
+            q_unpad=packed.query,
+            k_unpad=packed.key,
+            v_unpad=packed.value,
+            out_unpad=packed.output,
+            grad_unpad=packed.grad_output,
+            lse_unpad=packed.lse,
+            delta=packed.delta,
+            pos_key_unpad=packed.pos_key,
+            pos_query_unpad=packed.pos_query,
+            cu_seqlens=cu_seqlens,
+            batch_size=batch_size,
+            seq_bound=max_seqlen,
+            token_capacity=total_tokens,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            dense_mid_tensors=dense_mid_tensors,
+            policy_path=policy_path,
+            seq_bucket=seq_bucket,
+        )
+
+    return run_packed_backward(
+        grad_output=grad_output,
+        query=query_layer,
+        key=key_layer,
+        value=value_layer,
+        output=output_padded,
+        lse=lse_padded,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        query_packed=q_unpad,
+        key_packed=k_unpad,
+        value_packed=v_unpad,
+        output_packed=out_unpad,
+        lse_packed=lse_unpad,
+        pos_key_packed=pos_key_unpad,
+        pos_query_packed=pos_query_unpad,
+        pack_rows=partial(prefix_pack_padded_rows, **pack_kwargs),
+        pack_triple=partial(prefix_pack_padded_rows_triple, **pack_kwargs),
+        pack_optional_pair=partial(prefix_pack_optional_pair, **pack_kwargs),
+        pack_grad_and_delta=_pack_grad,
+        launch_backward=_launch,
+        unpack_triple=partial(prefix_unpack_padded_rows_triple, **unpack_kwargs),
+        unpack_optional_pair=partial(prefix_unpack_optional_pair, **unpack_kwargs),
+    )
+
+
+def _varlen_triton_forward_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    seqlens: torch.Tensor | None = None,
+    token_capacity: int | None = None,
+    seq_bucket: str = "",
+    policy_path: str = "",
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run compile-visible padded varlen forward with fixed-capacity packed buffers.
+
+    :param torch.Tensor q: Queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor k: Keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor v: Values in ``(B, S, H, D)`` layout.
+    :param torch.Tensor mask: Boolean keep mask in ``(B, S)`` layout.
+    :param torch.Tensor | None pos_key: Optional c2p tensor.
+    :param torch.Tensor | None pos_query: Optional p2c tensor.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.Tensor | None seqlens: Optional precomputed active prefix lengths.
+    :param int | None token_capacity: Optional exact packed-token capacity.
+    :param str seq_bucket: Batch-resolved tuning-table bucket.
+    :param str policy_path: Normalized kernel-policy override path.
+    :return tuple[torch.Tensor, ...]:
+        Padded output, padded LSE, cumulative sequence lengths, packed q/k/v,
+        packed output/LSE, and optional packed positional tensors encoded as
+        empty sentinels when absent.
+    """
+
+    if not _varlen_use_triton_op():
+        raise RuntimeError("Compile-visible FlashDeBERTa varlen Triton support is unavailable.")
+
+    batch_size = int(q.shape[0])
+    seq_len = int(q.shape[1])
+    num_heads = int(q.shape[2])
+    head_dim = int(q.shape[3])
+    capacity_tokens = int(token_capacity) if token_capacity is not None else int(batch_size * seq_len)
+    att_span = disentangled_attention_span(position_buckets, max_relative_distance)
+
+    if seqlens is None:
+        seqlens = mask.sum(dim=-1, dtype=torch.int32)
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+
+    q_unpad, k_unpad, v_unpad = prefix_pack_padded_rows_triple(
+        q,
+        k,
+        v,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=seq_len,
+        total_tokens=capacity_tokens,
+    )
+    pos_key_unpad, pos_query_unpad = prefix_pack_optional_pair(
+        pos_key,
+        pos_query,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=seq_len,
+        total_tokens=capacity_tokens,
+    )
+
+    table_config = _varlen_repo_tuned_config(
+        kind="fwd",
+        seq_len=seq_len,
+        total_tokens=capacity_tokens,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        causal=bool(causal),
+        disentangled=True,
+        att_span=att_span,
+        dtype=q.dtype,
+        device=q.device,
+        policy_path=policy_path,
+        seq_bucket=seq_bucket or None,
+    )
+    if table_config is not None:
+        block_m, block_n, num_stages, num_warps = table_config
+    else:
+        block_m, block_n, num_stages, num_warps = CONSERVATIVE_FLASH_KERNEL_CONFIG
+
+    mid_batch, mid_start, tile_count = _build_dense_mid_tensors(
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        block_size=block_m,
+    )
+    out_unpad = torch.empty_like(q_unpad)
+    lse_unpad = torch.empty((capacity_tokens, num_heads), device=q.device, dtype=torch.float32)
+
+    stride_pk0, stride_pk1, stride_pk2 = strides_or_zeros(pos_key_unpad, 3)
+    stride_pq0, stride_pq1, stride_pq2 = strides_or_zeros(pos_query_unpad, 3)
+
+    grid = (tile_count, num_heads)
+    torch.library.wrap_triton(_fwd_kernel_varlen_raw)[grid](
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        pos_key_unpad,
+        pos_query_unpad,
+        lse_unpad,
+        out_unpad,
+        float(sm_scale),
+        cu_seqlens,
+        cu_seqlens,
+        mid_batch,
+        mid_start,
+        q_unpad.stride(0),
+        q_unpad.stride(1),
+        q_unpad.stride(2),
+        k_unpad.stride(0),
+        k_unpad.stride(1),
+        k_unpad.stride(2),
+        v_unpad.stride(0),
+        v_unpad.stride(1),
+        v_unpad.stride(2),
+        out_unpad.stride(0),
+        out_unpad.stride(1),
+        out_unpad.stride(2),
+        stride_pk0,
+        stride_pk1,
+        stride_pk2,
+        stride_pq0,
+        stride_pq1,
+        stride_pq2,
+        batch_size,
+        num_heads,
+        seq_len,
+        seq_len,
+        BLOCK_M=block_m,
+        BLOCK_DMODEL=head_dim,
+        BLOCK_N=block_n,
+        IS_CAUSAL=bool(causal),
+        HAS_C2P=bool(pos_key_unpad is not None),
+        HAS_P2C=bool(pos_query_unpad is not None),
+        ATT_SPAN=att_span,
+        NUM_BUCKETS=int(position_buckets),
+        MAX_DISTANCE=int(max_relative_distance),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    out_padded = prefix_unpack_padded_rows(
+        out_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
+    lse_padded = prefix_unpack_padded_rows(
+        lse_unpad,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    ).contiguous()
+    pos_key_saved = pos_key_unpad if pos_key_unpad is not None else q.new_empty((0,))
+    pos_query_saved = pos_query_unpad if pos_query_unpad is not None else q.new_empty((0,))
+    return (
+        out_padded,
+        lse_padded,
+        cu_seqlens,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        pos_key_saved,
+        pos_query_saved,
+    )
+
+
+def _varlen_triton_backward_impl(
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    q_unpad: torch.Tensor | None = None,
+    k_unpad: torch.Tensor | None = None,
+    v_unpad: torch.Tensor | None = None,
+    out_unpad: torch.Tensor | None = None,
+    lse_unpad: torch.Tensor | None = None,
+    pos_key_unpad: torch.Tensor | None = None,
+    pos_query_unpad: torch.Tensor | None = None,
+    token_capacity: int | None = None,
+    seq_bucket: str = "",
+    policy_path: str = "",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run compile-visible padded varlen backward with fixed-capacity packed buffers.
+
+    :param torch.Tensor grad_out: Gradient of padded output.
+    :param torch.Tensor q: Forward padded queries.
+    :param torch.Tensor k: Forward padded keys.
+    :param torch.Tensor v: Forward padded values.
+    :param torch.Tensor mask: Boolean keep mask in ``(B, S)`` layout.
+    :param torch.Tensor out: Forward padded output.
+    :param torch.Tensor lse: Forward padded LSE tensor.
+    :param torch.Tensor | None pos_key: Optional c2p tensor.
+    :param torch.Tensor | None pos_query: Optional p2c tensor.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param torch.Tensor | None cu_seqlens: Optional cached cumulative sequence lengths.
+    :param torch.Tensor | None q_unpad: Optional cached packed queries.
+    :param torch.Tensor | None k_unpad: Optional cached packed keys.
+    :param torch.Tensor | None v_unpad: Optional cached packed values.
+    :param torch.Tensor | None out_unpad: Optional cached packed forward output.
+    :param torch.Tensor | None lse_unpad: Optional cached packed forward LSE.
+    :param torch.Tensor | None pos_key_unpad: Optional cached packed c2p tensor.
+    :param torch.Tensor | None pos_query_unpad: Optional cached packed p2c tensor.
+    :param int | None token_capacity: Optional exact packed-token capacity.
+    :param str seq_bucket: Batch-resolved tuning-table bucket.
+    :param str policy_path: Normalized kernel-policy override path.
+    :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        Padded gradients for q/k/v and optional positional tensors.
+    """
+
+    if not _varlen_use_triton_op():
+        raise RuntimeError("Compile-visible FlashDeBERTa varlen Triton support is unavailable.")
+
+    batch_size = int(q.shape[0])
+    seq_len = int(q.shape[1])
+    capacity_tokens = int(token_capacity) if token_capacity is not None else int(batch_size * seq_len)
+
+    if cu_seqlens is None:
+        seqlens = mask.sum(dim=-1, dtype=torch.int32)
+        cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    else:
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+
+    return _varlen_padded_backward_impl(
+        grad_output=grad_out,
+        query_layer=q,
+        key_layer=k,
+        value_layer=v,
+        output_padded=out,
+        lse_padded=lse,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        sm_scale=sm_scale,
+        position_buckets=position_buckets,
+        max_relative_distance=max_relative_distance,
+        causal=causal,
+        seqlens=seqlens,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=seq_len,
+        total_tokens=capacity_tokens,
+        q_unpad=q_unpad,
+        k_unpad=k_unpad,
+        v_unpad=v_unpad,
+        out_unpad=out_unpad,
+        lse_unpad=lse_unpad,
+        pos_key_unpad=pos_key_unpad,
+        pos_query_unpad=pos_query_unpad,
+        dense_mid_tensors=True,
+        policy_path=policy_path,
+        seq_bucket=seq_bucket or None,
+    )
+
+
+def _build_varlen_triton_ops() -> tuple[Any | None, Any | None]:
+    """Register compile-visible padded-varlen Triton ops.
+
+    :return tuple[Any | None, Any | None]: Forward and backward Triton-op handles.
+    """
+
+    if not _varlen_use_triton_op():
+        return None, None
+
+    @torch.library.triton_op(
+        f"{_VARLEN_OP_NAMESPACE}::{_VARLEN_FWD_OP_NAME}_triton",
+        mutates_args=(),
+        schema=(
+            "(Tensor q, Tensor k, Tensor v, Tensor mask, Tensor? pos_key, Tensor? pos_query, "
+            "float sm_scale, int position_buckets, int max_relative_distance, bool causal, "
+            "str seq_bucket, str policy_path) -> "
+            "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+        ),
+    )
+    def _forward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+        seq_bucket: str,
+        policy_path: str,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run compile-visible padded varlen forward.
+
+        :param torch.Tensor q: Padded queries in ``(B, S, H, D)`` layout.
+        :param torch.Tensor k: Padded keys in ``(B, S, H, D)`` layout.
+        :param torch.Tensor v: Padded values in ``(B, S, H, D)`` layout.
+        :param torch.Tensor mask: Boolean keep mask in ``(B, S)`` layout.
+        :param torch.Tensor | None pos_key: Optional c2p tensor.
+        :param torch.Tensor | None pos_query: Optional p2c tensor.
+        :param float sm_scale: Softmax scale.
+        :param int position_buckets: Relative-position bucket count.
+        :param int max_relative_distance: Maximum relative distance.
+        :param bool causal: Whether causal masking is enabled.
+        :param str seq_bucket: Batch-resolved tuning-table bucket.
+        :param str policy_path: Normalized kernel-policy override path.
+        :return tuple[torch.Tensor, ...]:
+            Padded output, padded LSE, cumulative sequence lengths, packed q/k/v,
+            packed output/LSE, and optional packed positional tensors.
+        """
+
+        return _varlen_triton_forward_impl(
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            seq_bucket=seq_bucket,
+            policy_path=policy_path,
+        )
+
+    @torch.library.triton_op(
+        f"{_VARLEN_OP_NAMESPACE}::{_VARLEN_BWD_OP_NAME}_triton",
+        mutates_args=(),
+        schema=(
+            "(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor mask, Tensor out, Tensor lse, "
+            "Tensor? pos_key, Tensor? pos_query, float sm_scale, int position_buckets, "
+            "int max_relative_distance, bool causal, Tensor cu_seqlens, Tensor q_unpad, Tensor k_unpad, "
+            "Tensor v_unpad, Tensor out_unpad, Tensor lse_unpad, Tensor? pos_key_unpad, "
+            "Tensor? pos_query_unpad, str seq_bucket, str policy_path) -> "
+            "(Tensor, Tensor, Tensor, Tensor, Tensor)"
+        ),
+    )
+    def _backward_op(
+        grad_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+        cu_seqlens: torch.Tensor,
+        q_unpad: torch.Tensor,
+        k_unpad: torch.Tensor,
+        v_unpad: torch.Tensor,
+        out_unpad: torch.Tensor,
+        lse_unpad: torch.Tensor,
+        pos_key_unpad: torch.Tensor | None,
+        pos_query_unpad: torch.Tensor | None,
+        seq_bucket: str,
+        policy_path: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run compile-visible padded varlen backward.
+
+        :param torch.Tensor grad_out: Gradient of padded output.
+        :param torch.Tensor q: Forward padded queries.
+        :param torch.Tensor k: Forward padded keys.
+        :param torch.Tensor v: Forward padded values.
+        :param torch.Tensor mask: Boolean keep mask in ``(B, S)`` layout.
+        :param torch.Tensor out: Forward padded output.
+        :param torch.Tensor lse: Forward padded LSE tensor.
+        :param torch.Tensor | None pos_key: Optional c2p tensor.
+        :param torch.Tensor | None pos_query: Optional p2c tensor.
+        :param float sm_scale: Softmax scale.
+        :param int position_buckets: Relative-position bucket count.
+        :param int max_relative_distance: Maximum relative distance.
+        :param bool causal: Whether causal masking is enabled.
+        :param torch.Tensor cu_seqlens: Cached cumulative sequence lengths.
+        :param torch.Tensor q_unpad: Cached packed queries.
+        :param torch.Tensor k_unpad: Cached packed keys.
+        :param torch.Tensor v_unpad: Cached packed values.
+        :param torch.Tensor out_unpad: Cached packed forward output.
+        :param torch.Tensor lse_unpad: Cached packed forward LSE.
+        :param torch.Tensor | None pos_key_unpad: Cached packed c2p tensor.
+        :param torch.Tensor | None pos_query_unpad: Cached packed p2c tensor.
+        :param str seq_bucket: Batch-resolved tuning-table bucket.
+        :param str policy_path: Normalized kernel-policy override path.
+        :return tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            Padded q/k/v gradients plus positional gradients with empty sentinels
+            for absent positional inputs.
+        """
+
+        dq, dk, dv, dpos_key, dpos_query = _varlen_triton_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            out=out,
+            lse=lse,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            cu_seqlens=cu_seqlens,
+            q_unpad=q_unpad,
+            k_unpad=k_unpad,
+            v_unpad=v_unpad,
+            out_unpad=out_unpad,
+            lse_unpad=lse_unpad,
+            pos_key_unpad=pos_key_unpad,
+            pos_query_unpad=pos_query_unpad,
+            seq_bucket=seq_bucket,
+            policy_path=policy_path,
+        )
+        if dpos_key is None:
+            dpos_key = q.new_empty((0,))
+        if dpos_query is None:
+            dpos_query = q.new_empty((0,))
+        return dq, dk, dv, dpos_key, dpos_query
+
+    def _setup_context(
+        ctx: Any,
+        inputs: tuple[Any, ...],
+        output: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+    ) -> None:
+        """Save forward inputs and outputs needed by compile-visible varlen backward.
+
+        :param Any ctx: Autograd context object.
+        :param tuple[Any, ...] inputs: Forward Triton-op inputs.
+        :param tuple[torch.Tensor, ...] output: Forward Triton-op outputs.
+        """
+
+        (
+            q,
+            k,
+            v,
+            mask,
+            pos_key,
+            pos_query,
+            sm_scale,
+            position_buckets,
+            max_relative_distance,
+            causal,
+            seq_bucket,
+            policy_path,
+        ) = inputs
+        (
+            out,
+            lse,
+            cu_seqlens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+        ) = output
+        saved: list[torch.Tensor] = [
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            cu_seqlens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+        ]
+        ctx.has_pos_key = pos_key is not None
+        ctx.has_pos_query = pos_query is not None
+        if bool(ctx.has_pos_key):
+            saved.append(pos_key_unpad)
+        if bool(ctx.has_pos_query):
+            saved.append(pos_query_unpad)
+        if hasattr(ctx, "mark_non_differentiable"):
+            non_diff = [lse, cu_seqlens, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad]
+            if bool(ctx.has_pos_key):
+                non_diff.append(pos_key_unpad)
+            if bool(ctx.has_pos_query):
+                non_diff.append(pos_query_unpad)
+            ctx.mark_non_differentiable(*non_diff)
+        ctx.save_for_backward(*saved)
+        ctx.sm_scale = float(sm_scale)
+        ctx.position_buckets = int(position_buckets)
+        ctx.max_relative_distance = int(max_relative_distance)
+        ctx.causal = bool(causal)
+        ctx.seq_bucket = str(seq_bucket)
+        ctx.policy_path = str(policy_path)
+
+    def _backward(
+        ctx: Any,
+        grad_out: torch.Tensor | None,
+        grad_lse: torch.Tensor | None,
+        grad_cu_seqlens: torch.Tensor | None,
+        grad_q_unpad: torch.Tensor | None,
+        grad_k_unpad: torch.Tensor | None,
+        grad_v_unpad: torch.Tensor | None,
+        grad_out_unpad: torch.Tensor | None,
+        grad_lse_unpad: torch.Tensor | None,
+        grad_pos_key_unpad: torch.Tensor | None,
+        grad_pos_query_unpad: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Dispatch backward through compile-visible padded varlen backward.
+
+        :param Any ctx: Autograd context populated by ``_setup_context``.
+        :param torch.Tensor | None grad_out: Gradient of padded output.
+        :param torch.Tensor | None grad_lse: Gradient of padded LSE tensor.
+        :param torch.Tensor | None grad_cu_seqlens: Ignored gradient of cached cumulative lengths.
+        :param torch.Tensor | None grad_q_unpad: Ignored gradient of cached packed queries.
+        :param torch.Tensor | None grad_k_unpad: Ignored gradient of cached packed keys.
+        :param torch.Tensor | None grad_v_unpad: Ignored gradient of cached packed values.
+        :param torch.Tensor | None grad_out_unpad: Ignored gradient of cached packed outputs.
+        :param torch.Tensor | None grad_lse_unpad: Ignored gradient of cached packed LSE values.
+        :param torch.Tensor | None grad_pos_key_unpad: Ignored gradient of cached packed c2p tensor.
+        :param torch.Tensor | None grad_pos_query_unpad: Ignored gradient of cached packed p2c tensor.
+        :return tuple[torch.Tensor | None, ...]: Gradients for the forward inputs.
+        """
+
+        del (
+            grad_lse,
+            grad_cu_seqlens,
+            grad_q_unpad,
+            grad_k_unpad,
+            grad_v_unpad,
+            grad_out_unpad,
+            grad_lse_unpad,
+            grad_pos_key_unpad,
+            grad_pos_query_unpad,
+        )
+        saved = list(ctx.saved_tensors)
+        q, k, v, mask, out, lse, cu_seqlens, q_unpad, k_unpad, v_unpad, out_unpad, lse_unpad = saved[:12]
+        next_idx = 12
+        pos_key_unpad = saved[next_idx] if bool(ctx.has_pos_key) else None
+        if bool(ctx.has_pos_key):
+            next_idx += 1
+        pos_query_unpad = saved[next_idx] if bool(ctx.has_pos_query) else None
+        grad = grad_out if grad_out is not None else torch.zeros_like(out)
+        dq, dk, dv, dpos_key, dpos_query = _backward_op(
+            grad,
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            None,
+            None,
+            ctx.sm_scale,
+            ctx.position_buckets,
+            ctx.max_relative_distance,
+            ctx.causal,
+            cu_seqlens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad if bool(ctx.has_pos_key) else None,
+            pos_query_unpad if bool(ctx.has_pos_query) else None,
+            ctx.seq_bucket,
+            ctx.policy_path,
+        )
+        if not bool(ctx.has_pos_key):
+            dpos_key = None
+        if not bool(ctx.has_pos_query):
+            dpos_query = None
+        return dq, dk, dv, None, dpos_key, dpos_query, None, None, None, None, None, None
+
+    torch.library.register_autograd(_forward_op, _backward, setup_context=_setup_context)
+    return _forward_op, _backward_op
+
+
+_FLASHDEBERTA_VARLEN_TRITON_OP, _FLASHDEBERTA_VARLEN_TRITON_BWD_OP = _build_varlen_triton_ops()
+
+
+class _EagerVarlen(torch.autograd.Function):
+    """Run the raw varlen kernels eagerly with autograd-aware packing."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        seqlens: torch.Tensor,
+        pos_key: torch.Tensor | None,
+        pos_query: torch.Tensor | None,
+        active_tokens: int,
+        sm_scale: float,
+        position_buckets: int,
+        max_relative_distance: int,
+        causal: bool,
+        seq_bucket: str,
+        policy_path: str,
+    ) -> torch.Tensor:
+        """Run eager padded-varlen forward and save packed tensors for backward.
+
+        :param Any ctx: Autograd context.
+        :param torch.Tensor q: Padded queries.
+        :param torch.Tensor k: Padded keys.
+        :param torch.Tensor v: Padded values.
+        :param torch.Tensor mask: Boolean prefix keep mask.
+        :param torch.Tensor seqlens: Per-example active prefix lengths.
+        :param torch.Tensor | None pos_key: Optional packed c2p source.
+        :param torch.Tensor | None pos_query: Optional packed p2c source.
+        :param int active_tokens: Exact packed-token capacity.
+        :param float sm_scale: Softmax scale.
+        :param int position_buckets: Relative-position bucket count.
+        :param int max_relative_distance: Maximum relative distance.
+        :param bool causal: Whether causal masking is enabled.
+        :param str seq_bucket: Batch-resolved tuning-table bucket.
+        :param str policy_path: Normalized kernel-policy override path.
+        :return torch.Tensor: Padded attention output.
+        """
+
+        (
+            out,
+            lse,
+            cu_seqlens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+        ) = _varlen_triton_forward_impl(
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=sm_scale,
+            position_buckets=position_buckets,
+            max_relative_distance=max_relative_distance,
+            causal=causal,
+            seqlens=seqlens,
+            token_capacity=active_tokens,
+            seq_bucket=seq_bucket,
+            policy_path=policy_path,
+        )
+        pos_key_saved = pos_key if pos_key is not None else q.new_empty((0,))
+        pos_query_saved = pos_query if pos_query is not None else q.new_empty((0,))
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            pos_key_saved,
+            pos_query_saved,
+            cu_seqlens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+        )
+        ctx.has_pos_key = pos_key is not None
+        ctx.has_pos_query = pos_query is not None
+        ctx.active_tokens = int(active_tokens)
+        ctx.sm_scale = float(sm_scale)
+        ctx.position_buckets = int(position_buckets)
+        ctx.max_relative_distance = int(max_relative_distance)
+        ctx.causal = bool(causal)
+        ctx.seq_bucket = str(seq_bucket)
+        ctx.policy_path = str(policy_path)
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        """Run eager padded-varlen backward from saved packed tensors.
+
+        :param Any ctx: Autograd context populated by :meth:`forward`.
+        :param torch.Tensor grad_out: Gradient of the padded output.
+        :return tuple[torch.Tensor | None, ...]: Gradients for the forward inputs.
+        """
+
+        (
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            pos_key_saved,
+            pos_query_saved,
+            cu_seqlens,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            out_unpad,
+            lse_unpad,
+            pos_key_unpad,
+            pos_query_unpad,
+        ) = ctx.saved_tensors
+        pos_key = pos_key_saved if bool(ctx.has_pos_key) else None
+        pos_query = pos_query_saved if bool(ctx.has_pos_query) else None
+        dpos_key_unpad = pos_key_unpad if bool(ctx.has_pos_key) else None
+        dpos_query_unpad = pos_query_unpad if bool(ctx.has_pos_query) else None
+        dq, dk, dv, dpos_key, dpos_query = _varlen_triton_backward_impl(
+            grad_out=grad_out,
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            out=out,
+            lse=lse,
+            pos_key=pos_key,
+            pos_query=pos_query,
+            sm_scale=ctx.sm_scale,
+            position_buckets=ctx.position_buckets,
+            max_relative_distance=ctx.max_relative_distance,
+            causal=ctx.causal,
+            cu_seqlens=cu_seqlens,
+            q_unpad=q_unpad,
+            k_unpad=k_unpad,
+            v_unpad=v_unpad,
+            out_unpad=out_unpad,
+            lse_unpad=lse_unpad,
+            pos_key_unpad=dpos_key_unpad,
+            pos_query_unpad=dpos_query_unpad,
+            token_capacity=ctx.active_tokens,
+            seq_bucket=ctx.seq_bucket,
+            policy_path=ctx.policy_path,
+        )
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            dpos_key,
+            dpos_query,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def flashdeberta_varlen_padded(
+    *,
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    attention_mask_2d: torch.Tensor,
+    seq_lengths: torch.Tensor | None = None,
+    active_tokens: torch.Tensor | int | None = None,
+    pos_key: torch.Tensor | None,
+    pos_query: torch.Tensor | None,
+    sm_scale: float,
+    position_buckets: int,
+    max_relative_distance: int,
+    causal: bool,
+    seq_bucket: str = "",
+    policy_path: str = "",
+) -> torch.Tensor:
+    """Run padded varlen FlashDeBERTa attention.
+
+    Compiled execution uses the compile-visible Triton operator. Eager CUDA
+    execution uses the same kernels with exact-capacity packed buffers and
+    saves packed forward tensors for backward.
+
+    :param torch.Tensor query_layer: Queries in ``(B, S, H, D)`` layout.
+    :param torch.Tensor key_layer: Keys in ``(B, S, H, D)`` layout.
+    :param torch.Tensor value_layer: Values in ``(B, S, H, D)`` layout.
+    :param torch.Tensor attention_mask_2d: Boolean keep mask in ``(B, S)`` layout.
+    :param torch.Tensor | None seq_lengths: Optional precomputed active prefix lengths.
+    :param torch.Tensor | int | None active_tokens: Optional precomputed active-token count.
+    :param torch.Tensor | None pos_key: Optional c2p tensor in ``(B, S, H, P)`` layout.
+    :param torch.Tensor | None pos_query: Optional p2c tensor in ``(B, S, H, P)`` layout.
+    :param float sm_scale: Softmax scale.
+    :param int position_buckets: Relative-position bucket count.
+    :param int max_relative_distance: Maximum relative distance.
+    :param bool causal: Whether causal masking is enabled.
+    :param str seq_bucket: Batch-resolved tuning-table bucket.
+    :param str policy_path: Normalized kernel-policy override path.
+    :return torch.Tensor: Attention output in ``(B, S, H, D)`` layout.
+    """
+
+    if (
+        is_torch_compiling()
+        and _FLASHDEBERTA_VARLEN_TRITON_OP is not None
+        and query_layer.device.type == "cuda"
+    ):
+        output, *_ = _FLASHDEBERTA_VARLEN_TRITON_OP(
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_mask_2d,
+            pos_key,
+            pos_query,
+            float(sm_scale),
+            int(position_buckets),
+            int(max_relative_distance),
+            bool(causal),
+            str(seq_bucket),
+            str(policy_path),
+        )
+        return output
+
+    if _varlen_use_triton_op() and query_layer.device.type == "cuda":
+        resolved_seqlens = (
+            seq_lengths if seq_lengths is not None else attention_mask_2d.sum(dim=-1, dtype=torch.int32)
+        )
+        resolved_active_tokens = (
+            int(active_tokens)
+            if active_tokens is not None
+            else int(resolved_seqlens.sum(dtype=torch.int32).detach().cpu().item())
+        )
+        return _EagerVarlen.apply(
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_mask_2d,
+            resolved_seqlens,
+            pos_key,
+            pos_query,
+            resolved_active_tokens,
+            float(sm_scale),
+            int(position_buckets),
+            int(max_relative_distance),
+            bool(causal),
+            str(seq_bucket),
+            str(policy_path),
+        )
+
+    detail = flashdeberta_varlen_import_error()
+    raise RuntimeError(
+        "FlashDeBERTa varlen Triton support is unavailable."
+        if detail is None
+        else f"FlashDeBERTa varlen Triton support is unavailable ({detail})."
+    )
+
+
+__all__ = [
+    "flashdeberta_compiled_varlen_available",
+    "flashdeberta_varlen_import_error",
+    "flashdeberta_varlen_padded",
+]

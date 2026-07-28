@@ -1,0 +1,71 @@
+name: FlashDeBERTa Imports
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "configs/**"
+      - "pyproject.toml"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/flashdeberta-imports.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "configs/**"
+      - "pyproject.toml"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/flashdeberta-imports.yml"
+
+# CI covers lint, the CPU regression suite without FlashDeBERTa, and a clean
+# resolve of the flash extra. CUDA-gated tests (including the FlashDeBERTa route
+# parity suite) skip here and run from the same `pytest tests/` on a GPU box.
+jobs:
+  lint:
+    name: ruff check and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: ruff check
+        run: python -m ruff check .
+      - name: ruff format --check
+        run: python -m ruff format --check .
+
+  cpu-tests:
+    name: CPU regression suite without FlashDeBERTa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev dependencies without flash extra
+        run: python -m pip install -e '.[dev]'
+      - name: Run CPU regression suite
+        run: python -m pytest tests/ -q
+
+  flash-extra:
+    name: flash extra resolves, imports, and passes flash contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev and flash extras on a clean CPU-only machine
+        run: python -m pip install -e '.[dev,flash]'
+      - name: Import package and flash dependency
+        run: python -c "import deberta, flashdeberta"
+      # The Triton specialization guard inspects kernels that only exist when
+      # the flash extra is installed; cpu-tests runs without it, so this job is
+      # the sole automated coverage of the upstream FlashDeBERTa kernels.
+      - name: Run flash contract tests against the installed extra
+        run: python -m pytest tests/test_flashdeberta_patch.py -q

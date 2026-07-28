@@ -8,19 +8,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutput
 
 from deberta.modeling.activations import get_act_fn
 from deberta.modeling.mask_utils import normalize_keep_mask
-from deberta.modeling.norm import RMSNorm
+from deberta.modeling.norms import MixedPrecisionRMSNorm
 from deberta.modeling.rope import RotaryEmbedding
-
-try:
-    from transformers import PretrainedConfig, PreTrainedModel
-    from transformers.modeling_outputs import BaseModelOutput
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "transformers is required for the RoPE backbone (PreTrainedModel/PretrainedConfig)."
-    ) from e
 
 
 class DebertaRoPEConfig(PretrainedConfig):
@@ -127,7 +121,6 @@ class DebertaRoPEEmbeddings(nn.Module):
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.config = config
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
@@ -142,14 +135,21 @@ class DebertaRoPEEmbeddings(nn.Module):
         else:
             self.position_embeddings = None
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids: torch.Tensor, token_type_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Embed token ids and apply normalization/dropout.
 
         :param torch.Tensor input_ids: Input token ids.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :param torch.Tensor | None position_ids: Optional learned absolute-position ids.
+        :raises ValueError: If explicit position ids do not match ``input_ids``.
         :return torch.Tensor: Embedded hidden states.
         """
         bsz, seq_len = input_ids.shape
@@ -161,9 +161,19 @@ class DebertaRoPEEmbeddings(nn.Module):
             x = x + self.token_type_embeddings(token_type_ids)
 
         if self.position_embeddings is not None:
-            position_ids = (
-                torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
-            )
+            if position_ids is None:
+                position_ids = (
+                    torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(bsz, -1)
+                )
+            elif tuple(position_ids.shape) != (bsz, seq_len):
+                raise ValueError(
+                    "position_ids must match input_ids (B,S); "
+                    f"got {tuple(position_ids.shape)} for {(bsz, seq_len)}."
+                )
+            else:
+                position_ids = position_ids.to(device=input_ids.device, dtype=torch.long)
             x = x + self.position_embeddings(position_ids)
 
         x = self.norm(x)
@@ -180,7 +190,6 @@ class DebertaRoPESelfAttention(nn.Module):
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.config = config
         self.hidden_size = int(config.hidden_size)
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = self.hidden_size // self.num_heads
@@ -194,7 +203,6 @@ class DebertaRoPESelfAttention(nn.Module):
 
         rotary_dim = int(self.head_dim * float(config.rotary_pct))
         rotary_dim = rotary_dim - (rotary_dim % 2)  # ensure even
-        self.rotary_dim = rotary_dim
         self.rope = (
             RotaryEmbedding(rotary_dim, base=float(config.rope_theta), full_dim=self.head_dim)
             if rotary_dim > 0
@@ -215,9 +223,9 @@ class DebertaRoPESelfAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, nh, S, hd)
 
         if self.rope is not None:
-            q, k = self.rope.apply(q, k)
+            q, k = self.rope.apply_rotary(q, k)
 
-        use_sdpa = self.attn_impl == "sdpa" and hasattr(F, "scaled_dot_product_attention")
+        use_sdpa = self.attn_impl == "sdpa"
         sdpa_attn_mask = None
         eager_attn_mask = None
         query_keep: torch.Tensor | None = None
@@ -237,8 +245,8 @@ class DebertaRoPESelfAttention(nn.Module):
             elif mask.ndim == 3:
                 # 3D pairwise keep mask (B,S,S), used for packed doc-boundary blocking.
                 # Diagonal encodes query activity: active rows are True, inactive/pad rows
-                # are False. Inactive rows still carry a single keep edge to CLS to avoid
-                # all-False SDPA rows.
+                # are False. Inactive rows still carry a single off-diagonal keep edge to
+                # avoid all-False SDPA rows.
                 pair_keep = mask
                 query_keep = torch.diagonal(pair_keep, dim1=1, dim2=2)
 
@@ -357,7 +365,6 @@ class _KEELAlpha(nn.Module):
             self.alpha = nn.Parameter(torch.tensor(float(init), dtype=torch.float32))
         else:
             self.register_buffer("alpha", torch.tensor(float(init), dtype=torch.float32), persistent=False)
-        self.learnable = bool(learnable)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return alpha cast to the runtime dtype.
@@ -383,22 +390,21 @@ class DebertaRoPELayer(nn.Module):
         :param float alpha_init: KEEL alpha initial value.
         """
         super().__init__()
-        self.config = config
         self.norm_arch = str(config.norm_arch)
 
         self.attn = DebertaRoPESelfAttention(config)
         self.mlp = DebertaRoPEMLP(config)
 
         if self.norm_arch == "post":
-            self.norm1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.norm2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.norm1 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.norm2 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
         else:
             # KEEL: inner norm + outer norm per sublayer
-            self.inner_norm1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.outer_norm1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.inner_norm2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-            self.outer_norm2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.inner_norm1 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.outer_norm1 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.inner_norm2 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.outer_norm2 = MixedPrecisionRMSNorm(config.hidden_size, eps=config.norm_eps)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
             self.alpha1 = _KEELAlpha(alpha_init, learnable=config.keel_alpha_learnable)
@@ -438,8 +444,6 @@ class DebertaRoPEEncoder(nn.Module):
         :param DebertaRoPEConfig config: Backbone configuration.
         """
         super().__init__()
-        self.config = config
-
         if config.keel_alpha_init is not None:
             alpha_init = float(config.keel_alpha_init)
         else:
@@ -500,7 +504,7 @@ class DebertaRoPEPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, RMSNorm):
+        elif isinstance(module, nn.RMSNorm):
             if getattr(module, "weight", None) is not None:
                 module.weight.data.fill_(1.0)
 
@@ -546,6 +550,7 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
         output_attentions: bool | None = None,
         return_dict: bool | None = None,
@@ -556,9 +561,14 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
         :param torch.Tensor | None attention_mask: Optional attention mask. ``None`` means
             unpadded input (fast path); callers must pass a mask when padding exists.
         :param torch.Tensor | None token_type_ids: Optional segment ids.
+        :param torch.Tensor | None position_ids: Optional learned absolute-position ids. Packed
+            document rows use local ids; rotary attention itself is invariant to each isolated
+            segment's constant row offset.
         :param bool | None output_hidden_states: Optional hidden-state output flag.
-        :param bool | None output_attentions: Optional attention output flag.
+        :param bool | None output_attentions: Optional attention-output flag. Attention maps are
+            unsupported; resolving this flag to ``True`` raises ``NotImplementedError``.
         :param bool | None return_dict: Optional return-dataclass flag.
+        :raises NotImplementedError: If attention-map output is requested.
         :return BaseModelOutput | tuple[torch.Tensor, ...]: Model output container/tuple.
         """
         output_hidden_states = (
@@ -580,24 +590,16 @@ class DebertaRoPEModel(DebertaRoPEPreTrainedModel):
                 "DebertaRoPEModel does not currently expose attention maps; set output_attentions=False."
             )
 
-        x = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-        if output_hidden_states:
-            encoder_outputs = self.encoder(
-                x,
-                attention_mask,
-                output_hidden_states=True,
-            )
-        else:
-            # Keep compatibility with injected/wrapped encoders that implement
-            # the historical ``forward(x, attention_mask)`` contract.
-            encoder_outputs = self.encoder(x, attention_mask)
-
-        if isinstance(encoder_outputs, tuple):
-            x = encoder_outputs[0]
-            all_hidden_states = encoder_outputs[1] if len(encoder_outputs) > 1 else None
-        else:
-            x = encoder_outputs
-            all_hidden_states = None
+        x = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+        )
+        x, all_hidden_states = self.encoder(
+            x,
+            attention_mask,
+            output_hidden_states=output_hidden_states,
+        )
 
         if not return_dict:
             outputs: tuple[torch.Tensor, ...] = (x,)

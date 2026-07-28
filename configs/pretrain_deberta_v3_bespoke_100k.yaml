@@ -1,0 +1,64 @@
+# Native DeBERTa-v3-style RTD pretraining with the BEE-spoke 32k tokenizer.
+# Usage:
+#   deberta train configs/pretrain_deberta_v3_bespoke_100k.yaml
+
+model:
+  backbone_type: hf_deberta_v2
+  from_scratch: true
+  embedding_sharing: gdes
+  tokenizer:
+    name_or_path: BEE-spoke-data/wordpiece-tokenizer-32k-en_code-msp
+    # The tokenizer has 31,999 entries; round it to a tensor-core-friendly 32,000.
+    allow_vocab_resize: true
+    vocab_multiple: 128
+  hf:
+    model_size: base
+    attention_impl: eager
+    max_position_embeddings: 512
+  # Match the DeBERTa-v3-base regularization profile. FlashDeBERTa instead requires 0.0.
+  dropout:
+    hidden_prob: 0.1
+    attention_probs_prob: 0.1
+
+data:
+  source:
+    dataset_name: EleutherAI/SmolLM2-1.7B-stage-4-100B
+    dataset_config_name: default
+    train_split: train
+    text_column_name: text
+    streaming: true
+    shuffle_buffer_size: 10000
+  packing:
+    enabled: true
+    max_seq_length: 512
+    block_cross_document_attention: false
+
+train:
+  max_steps: 100000
+  # Measured at 22.8 GiB peak reserved VRAM on an RTX 5090 while preserving an effective batch of 64.
+  per_device_train_batch_size: 32
+  gradient_accumulation_steps: 2
+  mixed_precision: bf16
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+  compile:
+    enabled: false
+  checkpoint:
+    output_dir: null
+    save_steps: 1000
+    save_total_limit: 5
+    export_hf_final: true
+
+optim:
+  lr:
+    base: 1.0e-4
+  scheduler:
+    type: linear
+    warmup_steps: 5000
+
+logging:
+  project_name: deberta-v3-bespoke
+  logging_steps: 25
+  wandb:
+    enabled: false

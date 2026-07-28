@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from deberta.config import TrainConfig
+from deberta.training.loop_utils import _sum_local_scalar
 from deberta.training.run_management import _save_training_checkpoint
 
 
@@ -32,8 +33,8 @@ def _resolve_data_resume_policy(
     if consumed <= 0:
         return 0, False, "fresh-start"
 
-    strategy = str(getattr(train_cfg, "resume_data_strategy", "auto") or "auto").strip().lower()
-    max_replay = max(0, int(getattr(train_cfg, "resume_replay_max_micro_batches", 10_000) or 10_000))
+    strategy = str(train_cfg.checkpoint.resume_data_strategy or "auto").strip().lower()
+    max_replay = max(0, int(train_cfg.checkpoint.resume_replay_max_micro_batches))
 
     if strategy == "replay":
         return 0, True, "resume_data_strategy=replay"
@@ -50,39 +51,6 @@ def _resolve_data_resume_policy(
     )
 
 
-def _normalize_resume_consumed_micro_batches(
-    *,
-    consumed_micro_batches: int,
-    global_step: int,
-    gradient_accumulation_steps: int,
-) -> tuple[int, str | None]:
-    """Normalize legacy resume data progress to committed optimizer-step boundaries.
-
-    Legacy checkpoints may contain micro-batch progress ahead of ``global_step`` when
-    a crash happened mid-accumulation window. Detect this pattern and clamp to the
-    last committed window boundary.
-
-    :param int consumed_micro_batches: Restored consumed micro-batch count.
-    :param int global_step: Resumed optimizer step from checkpoint path.
-    :param int gradient_accumulation_steps: Accumulation steps used to interpret saved progress.
-    :return tuple[int, str | None]: ``(normalized_consumed, reason_or_none)``.
-    """
-    consumed = max(0, int(consumed_micro_batches))
-    step = max(0, int(global_step))
-    ga_steps = max(1, int(gradient_accumulation_steps))
-
-    # Non-standard checkpoint names can parse as step=0; avoid clamping in that case.
-    if step <= 0:
-        return int(consumed), None
-
-    expected_committed = int(step * ga_steps)
-    if consumed > expected_committed:
-        delta = int(consumed - expected_committed)
-        if 0 < delta < ga_steps:
-            return int(expected_committed), f"clamped_legacy_partial_accumulation_delta={delta}"
-    return int(consumed), None
-
-
 def _save_periodic_checkpoint_if_due(
     *,
     accelerator: Any,
@@ -90,34 +58,43 @@ def _save_periodic_checkpoint_if_due(
     output_dir: Path,
     global_step: int,
     consumed_micro_batches_committed: int,
+    local_input_tokens_seen: float,
+    resumed_input_tokens_seen: float,
     lr_mult: float,
     optimizer_param_digest: str | dict[str, str],
     gradient_accumulation_steps: int,
     last_saved_step: int,
 ) -> int:
-    """Persist a periodic checkpoint when ``global_step`` hits ``train.save_steps``.
+    """Persist a periodic checkpoint when ``global_step`` hits ``train.checkpoint.save_steps``.
 
     :param Any accelerator: Accelerator runtime.
     :param TrainConfig train_cfg: Training config.
     :param Path output_dir: Output directory containing checkpoints.
     :param int global_step: Current global step.
     :param int consumed_micro_batches_committed: Committed micro-batch progress.
+    :param float local_input_tokens_seen: Active input tokens processed by this rank since startup.
+    :param float resumed_input_tokens_seen: Global active input tokens restored from the checkpoint.
     :param float lr_mult: Persistent recovery LR multiplier.
     :param str | dict[str, str] optimizer_param_digest: Trainable-parameter digest payload.
     :param int gradient_accumulation_steps: Active accumulation steps.
     :param int last_saved_step: Last checkpoint step already saved.
     :return int: Updated ``last_saved_step`` value.
     """
-    if not train_cfg.save_steps or (global_step % int(train_cfg.save_steps) != 0):
+    if not train_cfg.checkpoint.save_steps or (global_step % int(train_cfg.checkpoint.save_steps) != 0):
         return int(last_saved_step)
 
+    input_tokens_seen = float(resumed_input_tokens_seen) + _sum_local_scalar(
+        accelerator=accelerator,
+        x=local_input_tokens_seen,
+    )
     ckpt_dir = output_dir / f"checkpoint-{int(global_step)}"
     _save_training_checkpoint(
         accelerator=accelerator,
         checkpoint_dir=ckpt_dir,
         output_dir=output_dir,
         consumed_micro_batches=consumed_micro_batches_committed,
-        save_total_limit=int(train_cfg.save_total_limit),
+        input_tokens_seen=input_tokens_seen,
+        save_total_limit=int(train_cfg.checkpoint.save_total_limit),
         log_label="periodic",
         lr_mult=float(lr_mult),
         optimizer_param_digest=optimizer_param_digest,

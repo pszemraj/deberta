@@ -1,22 +1,26 @@
 # deberta: a modern refresh
 
-PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The default path is `backbone_type=hf_deberta_v2` (native DeBERTa-v2/v3 architecture in this repo) with optional `rope` experiments.
+PyTorch-first DeBERTa pretraining focused on DeBERTa-v3 RTD workflows. The default path is
+`model.backbone_type=hf_deberta_v2` (the native DeBERTa-v2/v3 architecture in this repo), with an
+optional experimental `rope` backbone.
 
-## Install
+What's in the box:
 
-Use [Getting Started / Installation](docs/getting-started/installation.md).
+- native DeBERTa-v2/v3 RTD pretraining (generator + discriminator, GDES embedding sharing,
+  enhanced mask decoding) driven by a single YAML config
+- optional Triton [FlashDeBERTa attention](docs/advanced/flash-attention.md) for the native
+  backbone, including packed doc-block routing
+- exact training resume, [checkpoint evaluation](docs/guides/evaluating-checkpoints.md), and
+  strict [Hugging Face export](docs/guides/exporting-models.md) of the standalone discriminator
 
-## Train and export
+## Get started
 
-Use [Getting Started / Quickstart](docs/getting-started/quickstart.md) for first runs and
-[Guides / Exporting Models](docs/guides/exporting-models.md) for checkpoint consolidation and HF artifacts.
+Use [Installation](docs/getting-started/installation.md), then follow the
+[Quickstart](docs/getting-started/quickstart.md).
 
 ## Docs
 
-Start with [`docs/index.md`](docs/index.md), then use:
-- [Getting Started / Installation](docs/getting-started/installation.md)
-- [Getting Started / Quickstart](docs/getting-started/quickstart.md)
-- [Guides / Configuration](docs/guides/configuration.md)
+The complete documentation index is at [`docs/index.md`](docs/index.md).
 
 ## Citation
 

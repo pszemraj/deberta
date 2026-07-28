@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +19,12 @@ from deberta.config import (
     load_logging_config_snapshot,
     load_model_config_snapshot,
     load_optim_config_snapshot,
+    load_train_config_snapshot,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
     validate_optim_config,
+    validate_train_config,
 )
 from deberta.run_layout import (
     DATA_CONFIG_FILENAME,
@@ -42,11 +45,13 @@ logger = logging.getLogger(__name__)
 
 def _build_run_metadata(
     *,
+    model_cfg: ModelConfig | None = None,
     effective_compile_scope: str | None = None,
     compile_scope_reason: str | None = None,
 ) -> dict[str, Any]:
     """Build run-metadata payload stored alongside config snapshots.
 
+    :param ModelConfig | None model_cfg: Optional resolved model config.
     :param str | None effective_compile_scope: Resolved compile scope after auto-resolution.
     :param str | None compile_scope_reason: Reason for scope selection when auto-resolved.
     :return dict[str, Any]: Metadata mapping.
@@ -61,21 +66,52 @@ def _build_run_metadata(
         meta["effective_compile_scope"] = str(effective_compile_scope)
     if compile_scope_reason is not None:
         meta["compile_scope_reason"] = str(compile_scope_reason)
+    if model_cfg is not None and str(model_cfg.hf.attention_impl).strip().lower() == "flash":
+        try:
+            flashdeberta_version = metadata.version("flashdeberta")
+        except metadata.PackageNotFoundError:
+            flashdeberta_version = None
+
+        meta["flash_attention"] = {
+            # Routing and eager fallbacks are per batch/call, so this artifact records the
+            # configured policy rather than claiming one runtime implementation for every call.
+            "requested_attention_impl": str(model_cfg.hf.attention_impl),
+            "requested_flash_config": asdict_without_private(model_cfg.hf.flash),
+            "flashdeberta_version": flashdeberta_version,
+        }
     return meta
 
 
+def _refresh_resume_flashdeberta_version(
+    *,
+    path: Path,
+    current_run_meta: dict[str, Any],
+) -> None:
+    """Refresh the FlashDeBERTa version for the latest training invocation.
+
+    :param Path path: Output run-metadata path.
+    :param dict[str, Any] current_run_meta: Metadata built from the current environment.
+    """
+
+    current_flash = current_run_meta.get("flash_attention")
+    if not isinstance(current_flash, dict):
+        return
+    saved_meta = load_json_mapping(path)
+    saved_flash = saved_meta.get("flash_attention")
+    refreshed_flash = dict(saved_flash) if isinstance(saved_flash, dict) else dict(current_flash)
+    refreshed_flash["flashdeberta_version"] = current_flash.get("flashdeberta_version")
+    saved_meta["flash_attention"] = refreshed_flash
+    dump_json(saved_meta, path)
+
+
 def _dump_yaml_mapping(payload: dict[str, Any], path: Path) -> None:
-    """Write a mapping payload to YAML, with JSON fallback if PyYAML is unavailable.
+    """Write a mapping payload to YAML.
 
     :param dict[str, Any] payload: Mapping payload.
     :param Path path: Destination path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        dump_json(payload, path)
-        return
+    import yaml
 
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=True, default_flow_style=False, allow_unicode=False)
@@ -139,6 +175,12 @@ def _persist_config_yaml_snapshots(
         optim_cfg=optim_cfg,
         logging_cfg=logging_cfg,
     )
+    source_text: str | None = None
+    if config_path is not None:
+        source = Path(config_path).expanduser().resolve()
+        if source.exists():
+            source_text = source.read_text(encoding="utf-8")
+
     resolved_path = logging_output_dir / "config_resolved.yaml"
     _dump_yaml_mapping(resolved_payload, resolved_path)
 
@@ -147,9 +189,8 @@ def _persist_config_yaml_snapshots(
         _dump_yaml_mapping(resolved_payload, original_path)
         return
 
-    source = Path(config_path).expanduser().resolve()
-    if source.exists():
-        original_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    if source_text is not None:
+        original_path.write_text(source_text, encoding="utf-8")
         return
 
     # Backfill with resolved payload when source path is unavailable.
@@ -196,6 +237,61 @@ def _effective_logging_config_for_resume_compare(cfg: LoggingConfig) -> dict[str
     return payload
 
 
+def _effective_train_config_for_resume_compare(cfg: TrainConfig) -> dict[str, Any]:
+    """Build a normalized train snapshot for resume compatibility checks.
+
+    Training semantics remain strict. Run-local checkpoint/resume controls are excluded because
+    they do not change the restored model or optimizer update semantics.
+
+    :param TrainConfig cfg: Train config to canonicalize.
+    :return dict[str, Any]: Normalized dict payload suitable for equality checks.
+    """
+    payload = asdict_without_private(cfg)
+    defaults = asdict_without_private(TrainConfig())
+    payload["dataloader"]["pin_memory"] = defaults["dataloader"]["pin_memory"]
+    payload["compile"]["scope"] = defaults["compile"]["scope"]
+    # Worker count remains strict: it controls source sharding in the iterable training
+    # datasets and can therefore change replayed samples after resume.
+    for field_name in (
+        "output_dir",
+        "overwrite_output_dir",
+        "save_steps",
+        "save_total_limit",
+        "resume_from_checkpoint",
+        "resume_data_strategy",
+        "resume_replay_max_micro_batches",
+        "export_hf_final",
+    ):
+        payload["checkpoint"][field_name] = defaults["checkpoint"][field_name]
+    return payload
+
+
+def _resume_snapshot_files_match(*, source: Path, target: Path) -> bool:
+    """Compare copied resume snapshots while allowing the refreshed runtime version.
+
+    :param Path source: Snapshot in the source run directory.
+    :param Path target: Existing snapshot in the resumed output directory.
+    :return bool: Whether the snapshots carry equivalent provenance.
+    """
+
+    source_text = source.read_text(encoding="utf-8")
+    target_text = target.read_text(encoding="utf-8")
+    if source_text == target_text:
+        return True
+    if source.name != RUN_METADATA_FILENAME or target.name != RUN_METADATA_FILENAME:
+        return False
+
+    source_meta = load_json_mapping(source)
+    target_meta = load_json_mapping(target)
+    for payload in (source_meta, target_meta):
+        flash_meta = payload.get("flash_attention")
+        if isinstance(flash_meta, dict):
+            normalized_flash = dict(flash_meta)
+            normalized_flash.pop("flashdeberta_version", None)
+            payload["flash_attention"] = normalized_flash
+    return source_meta == target_meta
+
+
 def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_dir: Path) -> None:
     """Raise when output_dir contains conflicting copied snapshots for resume provenance.
 
@@ -211,13 +307,34 @@ def _validate_resume_output_snapshot_conflicts(*, source_run_dir: Path, output_d
         if not dst.exists():
             continue
 
-        src_text = src.read_text(encoding="utf-8")
-        dst_text = dst.read_text(encoding="utf-8")
-        if dst_text != src_text:
+        if not _resume_snapshot_files_match(source=src, target=dst):
             raise ValueError(
                 "Output directory contains conflicting run snapshot while resuming from "
                 f"a different source run. Conflicting file: {dst}"
             )
+
+
+def _require_resume_config_match(*, label: str, saved: Any, current: Any) -> None:
+    """Reject one incompatible saved/current resume configuration pair.
+
+    :param str label: Snapshot filename used in the diagnostic.
+    :param Any saved: Normalized saved configuration value.
+    :param Any current: Normalized current configuration value.
+    :raises ValueError: If the values differ.
+    """
+
+    if saved != current:
+        kind = {
+            "model_config.json": "model",
+            "data_config.json": "data",
+            "train_config.json": "training",
+            "optim_config.json": "optimizer",
+            "logging_config.json": "logging",
+        }[label]
+        raise ValueError(
+            f"Resume configuration mismatch for {label}. "
+            f"Refusing to overwrite run metadata with incompatible {kind} settings."
+        )
 
 
 def _persist_or_validate_run_configs(
@@ -230,7 +347,6 @@ def _persist_or_validate_run_configs(
     optim_cfg: OptimConfig | None = None,
     logging_cfg: LoggingConfig | None = None,
     resume_checkpoint: str | None,
-    resume_run_dir: Path | None = None,
     config_path: str | Path | None = None,
     is_main_process: bool,
     preflight_only: bool = False,
@@ -247,7 +363,6 @@ def _persist_or_validate_run_configs(
     :param OptimConfig optim_cfg: Current optim config.
     :param LoggingConfig logging_cfg: Current logging config.
     :param str | None resume_checkpoint: Resolved checkpoint path, if resuming.
-    :param Path | None resume_run_dir: Optional explicit source run directory for resume validation.
     :param str | Path | None config_path: Optional original config-file path.
     :param bool is_main_process: Whether this process owns writes.
     :param bool preflight_only: When True, perform full validation without writing/updating files.
@@ -263,15 +378,12 @@ def _persist_or_validate_run_configs(
     source_run_dir: Path | None = None
     snapshot_dir = output_dir
     if resume_checkpoint is not None:
-        source_run_dir = (
-            resume_run_dir.expanduser().resolve()
-            if resume_run_dir is not None
-            else infer_run_dir_from_checkpoint(resume_checkpoint)
-        )
+        source_run_dir = infer_run_dir_from_checkpoint(resume_checkpoint)
         snapshot_dir = source_run_dir
 
     model_cfg_path = snapshot_dir / MODEL_CONFIG_FILENAME
     data_cfg_path = snapshot_dir / DATA_CONFIG_FILENAME
+    train_cfg_path = snapshot_dir / TRAIN_CONFIG_FILENAME
     optim_cfg_path = snapshot_dir / OPTIM_CONFIG_FILENAME
     logging_cfg_path = snapshot_dir / LOGGING_CONFIG_FILENAME
     run_meta_path = snapshot_dir / RUN_METADATA_FILENAME
@@ -283,6 +395,7 @@ def _persist_or_validate_run_configs(
     output_run_meta_path = output_dir / RUN_METADATA_FILENAME
 
     run_meta = _build_run_metadata(
+        model_cfg=model_cfg,
         effective_compile_scope=effective_compile_scope,
         compile_scope_reason=compile_scope_reason,
     )
@@ -290,18 +403,20 @@ def _persist_or_validate_run_configs(
     has_saved_required = (
         model_cfg_path.exists()
         and data_cfg_path.exists()
+        and train_cfg_path.exists()
         and optim_cfg_path.exists()
         and logging_cfg_path.exists()
     )
     if resume_checkpoint is not None and not has_saved_required:
         raise ValueError(
             "Resume checkpoint source run directory is missing required config snapshots. "
-            "Expected model_config.json, data_config.json, optim_config.json, and logging_config.json under "
+            "Expected model_config.json, data_config.json, train_config.json, optim_config.json, and "
+            "logging_config.json under "
             f"{snapshot_dir}."
         )
     if resume_checkpoint is not None and has_saved_required:
         if run_meta_path.exists():
-            validate_run_metadata_file(snapshot_dir, required=False)
+            validate_run_metadata_file(snapshot_dir)
             if is_main_process and effective_compile_scope is not None:
                 saved_meta = load_json_mapping(run_meta_path)
                 saved_scope = saved_meta.get("effective_compile_scope")
@@ -318,6 +433,9 @@ def _persist_or_validate_run_configs(
         saved_data_cfg = load_data_config_snapshot(
             load_json_mapping(data_cfg_path), source=str(data_cfg_path)
         )
+        saved_train_cfg = load_train_config_snapshot(
+            load_json_mapping(train_cfg_path), source=str(train_cfg_path)
+        )
         saved_optim_cfg = load_optim_config_snapshot(
             load_json_mapping(optim_cfg_path), source=str(optim_cfg_path)
         )
@@ -327,33 +445,35 @@ def _persist_or_validate_run_configs(
         )
         validate_model_config(saved_model_cfg)
         validate_data_config(saved_data_cfg)
+        validate_train_config(saved_train_cfg)
         validate_optim_config(saved_optim_cfg)
         validate_logging_config(saved_logging_cfg)
 
-        if _effective_model_config_for_resume_compare(
-            saved_model_cfg
-        ) != _effective_model_config_for_resume_compare(model_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for model_config.json. "
-                "Refusing to overwrite run metadata with incompatible model settings."
-            )
-        if asdict_without_private(saved_data_cfg) != asdict_without_private(data_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for data_config.json. "
-                "Refusing to overwrite run metadata with incompatible data settings."
-            )
-        if asdict_without_private(saved_optim_cfg) != asdict_without_private(resolved_optim_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for optim_config.json. "
-                "Refusing to overwrite run metadata with incompatible optimizer settings."
-            )
-        if _effective_logging_config_for_resume_compare(
-            saved_logging_cfg
-        ) != _effective_logging_config_for_resume_compare(resolved_logging_cfg):
-            raise ValueError(
-                "Resume configuration mismatch for logging_config.json. "
-                "Refusing to overwrite run metadata with incompatible logging settings."
-            )
+        _require_resume_config_match(
+            label="model_config.json",
+            saved=_effective_model_config_for_resume_compare(saved_model_cfg),
+            current=_effective_model_config_for_resume_compare(model_cfg),
+        )
+        _require_resume_config_match(
+            label="data_config.json",
+            saved=asdict_without_private(saved_data_cfg),
+            current=asdict_without_private(data_cfg),
+        )
+        _require_resume_config_match(
+            label="train_config.json",
+            saved=_effective_train_config_for_resume_compare(saved_train_cfg),
+            current=_effective_train_config_for_resume_compare(train_cfg),
+        )
+        _require_resume_config_match(
+            label="optim_config.json",
+            saved=asdict_without_private(saved_optim_cfg),
+            current=asdict_without_private(resolved_optim_cfg),
+        )
+        _require_resume_config_match(
+            label="logging_config.json",
+            saved=_effective_logging_config_for_resume_compare(saved_logging_cfg),
+            current=_effective_logging_config_for_resume_compare(resolved_logging_cfg),
+        )
 
         if source_run_dir is not None and source_run_dir != output_dir_abs:
             _validate_resume_output_snapshot_conflicts(
@@ -376,8 +496,7 @@ def _persist_or_validate_run_configs(
                 dst = output_dir / filename
                 src_text = src.read_text(encoding="utf-8")
                 if dst.exists():
-                    dst_text = dst.read_text(encoding="utf-8")
-                    if dst_text != src_text:
+                    if not _resume_snapshot_files_match(source=src, target=dst):
                         raise RuntimeError(f"Unexpected snapshot conflict after pre-validation: {dst}")
                 else:
                     dst.write_text(src_text, encoding="utf-8")
@@ -395,6 +514,11 @@ def _persist_or_validate_run_configs(
             )
         elif is_main_process:
             logger.info("Resume mode: preserving existing config snapshots in output_dir.")
+        if is_main_process:
+            _refresh_resume_flashdeberta_version(
+                path=output_run_meta_path,
+                current_run_meta=run_meta,
+            )
         _persist_config_yaml_snapshots(
             logging_output_dir=resolved_logging_output_dir,
             model_cfg=model_cfg,
@@ -417,14 +541,6 @@ def _persist_or_validate_run_configs(
         dump_json(asdict_without_private(resolved_optim_cfg), output_optim_cfg_path)
         dump_json(asdict_without_private(resolved_logging_cfg), output_logging_cfg_path)
         dump_json(run_meta, output_run_meta_path)
-        if resume_checkpoint is not None and source_run_dir is not None and source_run_dir != output_dir_abs:
-            dump_json(
-                {
-                    "resume_checkpoint": str(Path(resume_checkpoint).expanduser().resolve()),
-                    "resume_run_dir": str(source_run_dir),
-                },
-                output_dir / RESUME_SOURCE_FILENAME,
-            )
     _persist_config_yaml_snapshots(
         logging_output_dir=resolved_logging_output_dir,
         model_cfg=model_cfg,
@@ -441,6 +557,7 @@ __all__ = [
     "_build_run_metadata",
     "_dump_yaml_mapping",
     "_effective_model_config_for_resume_compare",
+    "_effective_train_config_for_resume_compare",
     "_persist_config_yaml_snapshots",
     "_persist_or_validate_run_configs",
     "_resolved_config_payload",

@@ -6,18 +6,15 @@ from typing import Any
 
 import torch
 
-from deberta.modeling.rtd import attention_mask_to_active_tokens
+from deberta.modeling.mask_utils import attention_mask_to_active_tokens
 
 
 def _count_rtd_tokens_for_batch(
     batch: dict[str, torch.Tensor],
-    *,
-    pad_token_id: int | None,
 ) -> tuple[float, float]:
     """Return generator/discriminator active-token counts for one microbatch.
 
     :param dict[str, torch.Tensor] batch: Microbatch tensors.
-    :param int | None pad_token_id: Padding token id.
     :return tuple[float, float]: (generator_count, discriminator_count).
     """
     labels = batch["labels"]
@@ -25,7 +22,6 @@ def _count_rtd_tokens_for_batch(
     disc_active = attention_mask_to_active_tokens(
         input_ids=batch["input_ids"],
         attention_mask=batch.get("attention_mask"),
-        pad_token_id=pad_token_id,
     )
     disc_count = float(disc_active.sum().item())
     return gen_count, disc_count
@@ -45,7 +41,6 @@ def _count_input_tokens_for_batch(batch: dict[str, torch.Tensor]) -> float:
     active = attention_mask_to_active_tokens(
         input_ids=input_ids,
         attention_mask=batch.get("attention_mask"),
-        pad_token_id=None,
     )
     return float(active.detach().sum().item())
 
@@ -73,9 +68,14 @@ def _token_weighted_micro_objective(
     :param float disc_loss_weight: Discriminator loss weight.
     :return torch.Tensor: Unscaled microbatch objective contribution.
     """
-    gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
-    disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
-    return float(gen_loss_weight) * gen_scale * gen_loss + float(disc_loss_weight) * disc_scale * disc_loss
+    objective = gen_loss.new_zeros(())
+    if float(gen_loss_weight) != 0.0:
+        gen_scale = float(gen_count) / max(float(gen_window_tokens_per_rank), 1.0)
+        objective = objective + float(gen_loss_weight) * gen_scale * gen_loss
+    if float(disc_loss_weight) != 0.0:
+        disc_scale = float(disc_count) / max(float(disc_window_tokens_per_rank), 1.0)
+        objective = objective + float(disc_loss_weight) * disc_scale * disc_loss
+    return objective
 
 
 def _resolve_window_token_denominators(
@@ -125,14 +125,13 @@ def _scale_loss_for_backward(*, loss: torch.Tensor, ga_steps: int, token_weighte
     return loss if not token_weighted_ga else (loss * float(max(1, int(ga_steps))))
 
 
-def _should_clip_gradients(*, sync_gradients: bool, max_grad_norm: float | int | None) -> bool:
-    """Return whether gradient clipping should run for this micro-step.
+def _should_clip_gradients(max_grad_norm: float | int | None) -> bool:
+    """Return whether gradient clipping is enabled.
 
-    :param bool sync_gradients: Whether gradients are synchronized this step.
     :param float | int | None max_grad_norm: Configured clipping norm.
     :return bool: ``True`` when clipping should be applied.
     """
-    return bool(sync_gradients) and max_grad_norm is not None and float(max_grad_norm) > 0.0
+    return max_grad_norm is not None and float(max_grad_norm) > 0.0
 
 
 def _sum_local_scalar(*, accelerator: Any, x: float) -> float:

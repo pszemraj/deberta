@@ -3,96 +3,57 @@
 #   deberta train configs/tiny_cpu_smoke.yaml
 
 model:
-  profile: modern
   backbone_type: rope
   from_scratch: true
   embedding_sharing: gdes
-  gradient_checkpointing: false
   tokenizer:
     name_or_path: microsoft/deberta-v3-base
-    allow_vocab_resize: false
-    vocab_target: null
-    vocab_multiple: 1
+  generator:
+    num_hidden_layers: 1
   rope:
+    hidden_size: 64
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    intermediate_size: 128
+    type_vocab_size: 0
     norm_arch: post
 
-# For a true CPU smoke test, use a tiny local text file dataset.
-# Create e.g. ./data/tiny.txt with a few lines.
 data:
   source:
-    dataset_name: text
-    dataset_config_name: null
-    load_from_disk: null
     data_files: ./data/tiny.txt
-    train_split: train
     streaming: true
-    text_column_name: text
-    shuffle_buffer_size: 1000
+    shuffle_buffer_size: 0
   packing:
     enabled: true
     block_cross_document_attention: false
-    max_seq_length: 128
+    max_seq_length: 32
 
 train:
-  seed: 42
-  max_steps: 50
+  max_steps: 10
   per_device_train_batch_size: 2
-  gradient_accumulation_steps: 1
-  token_weighted_gradient_accumulation: true
-  mixed_precision: no
+  # Quoted: YAML would otherwise parse a bare `no` as boolean false.
+  mixed_precision: "no"
   tf32: false
-  sdpa_kernel: auto
-  decoupled_training: true
   dataloader:
     num_workers: 0
     pin_memory: false
   compile:
     enabled: false
-    mode: default
-    scope: auto
-    backend: inductor
-  objective:
-    mlm_probability: 0.15
-    mlm_max_ngram: 1
-    mask_token_prob: 0.8
-    random_token_prob: 0.1
-    sampling_temperature: 1.0
-    gen_loss_weight: 1.0
-    disc_loss_weight: 50.0
   checkpoint:
-    output_dir: runs/tiny_cpu
-    overwrite_output_dir: true
-    save_steps: 10
+    output_dir: null
+    save_steps: 0
     save_total_limit: 1
-    resume_from_checkpoint: null
-    resume_data_strategy: auto
-    resume_replay_max_micro_batches: 10000
     export_hf_final: false
 
 optim:
   lr:
     base: 1.0e-3
-    generator: -1.0
-    discriminator: -1.0
-  adam:
-    beta1: 0.9
-    beta2: 0.999
-    epsilon: 1.0e-8
   scheduler:
-    type: linear
+    type: constant
     warmup_steps: 0
-  weight_decay: 0.01
-  max_grad_norm: 1.0
 
 logging:
   project_name: deberta-smoke
-  run_name: null
-  output_dir: null
-  logging_steps: 5
-  backend: none
+  logging_steps: 1
   wandb:
     enabled: false
-    watch: gradients
-    watch_log_freq: 100
-  debug:
-    metrics: false

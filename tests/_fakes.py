@@ -10,10 +10,98 @@ import sys
 import types as _types
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors.torch import save_file
+
+from deberta.modeling.rtd import RTDDiscriminatorPhaseOutput, RTDGeneratorPhaseOutput, RTDOutput
+
+
+@dataclass
+class AcceleratorStateStub:
+    """Typed accelerator state used by unit tests."""
+
+    is_main_process: bool = True
+    num_processes: int = 1
+
+
+@dataclass
+class BackboneConfigStub:
+    """Explicit small backbone-config surface used by unit tests."""
+
+    vocab_size: int = 128
+    hidden_size: int = 32
+    embedding_size: int | None = None
+    intermediate_size: int = 64
+    num_hidden_layers: int = 1
+    num_attention_heads: int = 4
+    hidden_act: str = "gelu"
+    hidden_dropout_prob: float = 0.0
+    attention_probs_dropout_prob: float = 0.0
+    max_position_embeddings: int = 512
+    layer_norm_eps: float = 1e-6
+    norm_eps: float = 1e-6
+    use_rmsnorm_heads: bool = False
+    position_biased_input: bool = True
+    pad_token_id: int = 0
+    cls_token_id: int = 1
+    sep_token_id: int = 2
+    mask_token_id: int = 3
+    payload: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.embedding_size is None:
+            self.embedding_size = int(self.hidden_size)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return an explicit serialization payload for tracker tests."""
+
+        if self.payload is not None:
+            return dict(self.payload)
+        return {
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+        }
+
+
+@dataclass
+class BackboneOutputStub:
+    """Typed backbone output used by RTD tests."""
+
+    last_hidden_state: torch.Tensor
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+
+
+class EmbeddingsStub(torch.nn.Module):
+    """Embedding container matching the backbone attribute contract."""
+
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.word_embeddings = torch.nn.Embedding(vocab_size, hidden_size)
+
+
+class AutoTokenizerStub:
+    """Transformers-style tokenizer factory for import fakes."""
+
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any) -> DummyTokenizer:
+        """Return the shared dummy tokenizer."""
+
+        del args, kwargs
+        return DummyTokenizer()
+
+
+class DistributedDataParallelKwargsStub:
+    """Accept and retain Accelerate DDP keyword-handler values."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = dict(kwargs)
 
 
 class DummyTokenizer:
@@ -31,6 +119,7 @@ class DummyTokenizer:
     ) -> None:
         self.vocab_type = str(vocab_type).strip().lower()
         self.vocab_size = vocab_size
+        self.padding_side = "right"
         self.pad_token_id = 0
         self.cls_token_id = 1
         self.sep_token_id = 2
@@ -39,6 +128,7 @@ class DummyTokenizer:
         self.eos_token_id = 5
         self.all_special_ids = [self.pad_token_id, self.cls_token_id, self.sep_token_id, self.mask_token_id]
         self.all_special_tokens = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+        self.additional_special_tokens: list[str] = []
         self._id_to_tok = {
             self.pad_token_id: "[PAD]",
             self.cls_token_id: "[CLS]",
@@ -116,7 +206,9 @@ class DummyTokenizer:
                     pad_val = 0
                     if k == "special_tokens_mask":
                         pad_val = 1
-                    batch[k].append(v + [pad_val] * (max_len - len(v)))
+                    padding = [pad_val] * (max_len - len(v))
+                    padded = padding + v if self.padding_side == "left" else v + padding
+                    batch[k].append(padded)
                 else:
                     raise TypeError(f"Unsupported feature type for {k}: {type(v)}")
 
@@ -144,6 +236,33 @@ class DummyTokenizer:
             self._id_to_tok[self.vocab_size] = str(token)
             self.vocab_size += 1
             added += 1
+        return int(added)
+
+    def add_special_tokens(
+        self,
+        special_tokens_dict: dict[str, list[str]],
+        replace_additional_special_tokens: bool = True,
+    ) -> int:
+        """Register additional special tokens and grow the vocabulary.
+
+        :param dict[str, list[str]] special_tokens_dict: Special-token mapping.
+        :param bool replace_additional_special_tokens: Whether to replace the current additional tokens.
+        :return int: Number of tokens added to the vocabulary.
+        """
+        tokens = list(special_tokens_dict.get("additional_special_tokens", []))
+        if replace_additional_special_tokens:
+            self.additional_special_tokens = []
+
+        added = self.add_tokens(tokens)
+        token_to_id = {token: token_id for token_id, token in self._id_to_tok.items()}
+        for token in tokens:
+            token_id = token_to_id[token]
+            if token not in self.additional_special_tokens:
+                self.additional_special_tokens.append(token)
+            if token not in self.all_special_tokens:
+                self.all_special_tokens.append(token)
+            if token_id not in self.all_special_ids:
+                self.all_special_ids.append(token_id)
         return int(added)
 
     def save_pretrained(self, path: str) -> None:
@@ -298,8 +417,6 @@ class FakeAccelerator:
 class SimpleRTD(torch.nn.Module):
     """Minimal RTD-like module for ``run_pretraining`` integration tests.
 
-    Provides both ``_forbidden_sample_token_ids`` (set) and
-    ``_forbidden_sample_token_mask`` (tensor) so it works with all code paths.
     Tracks the last instantiated instance via ``last_instance``.
     """
 
@@ -311,9 +428,7 @@ class SimpleRTD(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(1))
         self.generator = torch.nn.Linear(2, 2)
         self.discriminator = torch.nn.Linear(2, 2)
-        self._forbidden_sample_token_ids = {0, 1, 2, 3}
-        self._forbidden_sample_token_mask = torch.zeros(32, dtype=torch.bool)
-        self.disc_config = _types.SimpleNamespace(pad_token_id=0)
+        self.disc_config = BackboneConfigStub(pad_token_id=0)
         self.calls: dict[str, list[Any]] = defaultdict(list)
         self._forward_calls = 0
         self._generator_phase_calls = 0
@@ -372,7 +487,7 @@ class SimpleRTD(torch.nn.Module):
         t = anchor + base
         gen_loss_raw = anchor + gen_loss_v
         disc_loss_raw = anchor + disc_loss_v
-        return _types.SimpleNamespace(
+        return RTDOutput(
             loss=t,
             gen_loss=gen_loss_raw.detach(),
             disc_loss=disc_loss_raw.detach(),
@@ -410,7 +525,7 @@ class SimpleRTD(torch.nn.Module):
         gen_scale = self._behavior_value("generator_phase_loss_scale", 1.0, call_idx=call_idx)
         gen_loss = self._loss_anchor(self.generator, self.weight) * gen_scale
         gen_token_count = self._behavior_value("generator_phase_token_count", 1.0, call_idx=call_idx)
-        return _types.SimpleNamespace(
+        return RTDGeneratorPhaseOutput(
             gen_loss_raw=gen_loss,
             gen_token_count=torch.tensor(gen_token_count),
             corrupted_input_ids=input_ids.detach().clone(),
@@ -441,7 +556,7 @@ class SimpleRTD(torch.nn.Module):
             "discriminator_phase_positive_count", 1.0, call_idx=call_idx
         )
         disc_accuracy = self._behavior_value("discriminator_phase_accuracy", 1.0, call_idx=call_idx)
-        return _types.SimpleNamespace(
+        return RTDDiscriminatorPhaseOutput(
             disc_loss_raw=disc_loss,
             disc_accuracy=torch.tensor(disc_accuracy),
             disc_token_count=torch.tensor(disc_token_count),
@@ -515,21 +630,49 @@ def setup_pretraining_mocks(
 
     fake_accelerate = _types.ModuleType("accelerate")
     fake_accelerate.Accelerator = accelerator_cls
+    fake_accelerate.DistributedDataParallelKwargs = DistributedDataParallelKwargsStub
     fake_accelerate_utils = _types.ModuleType("accelerate.utils")
     fake_accelerate_utils.set_seed = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_accelerate_utils)
 
     fake_transformers = _types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = _types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
+    fake_transformers.AutoTokenizer = AutoTokenizerStub
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
+    # Integration tests replace Accelerate's tracker with ``FakeAccelerator`` and must not
+    # require the optional W&B dependency merely to exercise W&B-enabled config paths.
+    fake_wandb = _types.ModuleType("wandb")
+    fake_wandb.run = None
+    fake_wandb.save = None
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    resolve_profile_sections = entrypoint_mod._resolve_entrypoint_profile_sections
+
+    def _resolve_fake_scheduler_profile(*, model_cfg: Any, train_cfg: Any, optim_cfg: Any) -> Any:
+        resolved_train, resolved_optim = resolve_profile_sections(
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            optim_cfg=optim_cfg,
+        )
+        if optim_cfg is None:
+            resolved_optim = replace(
+                resolved_optim,
+                scheduler=replace(resolved_optim.scheduler, type="constant"),
+            )
+        return resolved_train, resolved_optim
+
+    # The shared fake scheduler is constant, so omitted optimizer sections must resolve to the
+    # same policy for cross-section validation and persisted test snapshots.
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "_resolve_entrypoint_profile_sections",
+        _resolve_fake_scheduler_profile,
+    )
     monkeypatch.setattr(entrypoint_mod, "_bf16_runtime_sanity_check", lambda: True)
     monkeypatch.setattr(entrypoint_mod, "_maybe_enable_tf32", lambda *args, **kwargs: None)
     monkeypatch.setattr(entrypoint_mod, "_maybe_configure_sdpa_kernels", lambda *args, **kwargs: None)
-    monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda **kwargs: [{"text": "hello"}])
+    monkeypatch.setattr(entrypoint_mod, "load_hf_dataset", lambda _cfg: [{"text": "hello"}])
     monkeypatch.setattr(
         entrypoint_mod,
         "_build_train_dataset_and_collator",
@@ -538,19 +681,44 @@ def setup_pretraining_mocks(
     monkeypatch.setattr(
         entrypoint_mod,
         "build_backbone_configs",
-        lambda **kwargs: (_types.SimpleNamespace(pad_token_id=0), _types.SimpleNamespace()),
+        lambda **kwargs: (BackboneConfigStub(pad_token_id=0), BackboneConfigStub()),
+    )
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "load_materialized_backbone_configs",
+        lambda **kwargs: (BackboneConfigStub(pad_token_id=0), BackboneConfigStub()),
+    )
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "materialized_tokenizer_path",
+        lambda run_dir: Path(run_dir) / "tokenizer",
+    )
+    monkeypatch.setattr(
+        entrypoint_mod,
+        "persist_materialized_run_artifacts",
+        lambda **kwargs: None,
     )
     monkeypatch.setattr(entrypoint_mod, "build_backbones", build_backbones_fn)
     monkeypatch.setattr(entrypoint_mod, "DebertaV3RTDPretrainer", rtd_cls)
+
+    def _build_fake_optimizer(
+        model: torch.nn.Module,
+        _cfg: Any,
+        **_kwargs: Any,
+    ) -> torch.optim.Optimizer:
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        optimizer._param_order_digest = "test-param-order"
+        return optimizer
+
     monkeypatch.setattr(
         entrypoint_mod,
         "_build_optimizer",
-        lambda model, _cfg, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
+        _build_fake_optimizer,
     )
     monkeypatch.setattr(
         entrypoint_mod,
         "_build_scheduler",
-        lambda optimizer, _cfg: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
+        lambda optimizer, **_kwargs: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0),
     )
     monkeypatch.setattr(entrypoint_mod, "_cycle_dataloader", cycle_fn)
     monkeypatch.setattr(entrypoint_mod, "_move_batch_to_device", lambda b, _device: b)
@@ -570,3 +738,111 @@ def setup_pretraining_mocks(
             monkeypatch.setattr(entrypoint_mod, attr, val)
 
     return entrypoint_mod
+
+
+def checkpoint_saving_accelerator(
+    *,
+    is_main_process: bool,
+    write_weights: bool = True,
+) -> FakeAccelerator:
+    """Build a fake accelerator whose ``save_state`` writes checkpoint-like files.
+
+    :param bool is_main_process: Whether the fake rank is the main process.
+    :param bool write_weights: Whether ``save_state`` writes a weights file.
+    :return FakeAccelerator: Accelerator with a checkpoint-writing save hook.
+    """
+
+    accel = FakeAccelerator(is_main_process=bool(is_main_process))
+
+    def _save_state(output_dir: str | None) -> None:
+        if output_dir is None:
+            return
+        p = Path(output_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        if write_weights:
+            # A real payload: checkpoint validation parses the safetensors header.
+            save_file({"weight": torch.zeros(4)}, str(p / "model.safetensors"))
+        marker = "main" if accel.is_main_process else "worker"
+        (p / f"{marker}.txt").write_text("ok", encoding="utf-8")
+
+    accel.save_state_hook = _save_state
+    return accel
+
+
+def make_checkpoint_saver(
+    *,
+    calls: list[tuple[str, int, str]] | None = None,
+    create_checkpoint_dir: bool = False,
+    fail_label: str | None = None,
+    failure_message: str = "checkpoint save failed",
+) -> Any:
+    """Build a checkpoint-save fake with optional recording and failure behavior.
+
+    :param list[tuple[str, int, str]] | None calls: Optional call-record destination.
+    :param bool create_checkpoint_dir: Whether to materialize the checkpoint directory.
+    :param str | None fail_label: Log label that should raise, defaults to None.
+    :param str failure_message: Raised error message when ``fail_label`` matches.
+    :return Any: Callable matching ``_save_training_checkpoint``.
+    """
+
+    def _save_checkpoint(
+        *,
+        accelerator: Any,
+        checkpoint_dir: Path,
+        output_dir: Path,
+        consumed_micro_batches: int,
+        save_total_limit: int,
+        log_label: str,
+        **kwargs: Any,
+    ) -> None:
+        """Record or emulate one checkpoint save."""
+
+        del accelerator, output_dir, save_total_limit, kwargs
+        if calls is not None:
+            calls.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
+        if fail_label is not None and str(log_label) == str(fail_label):
+            raise RuntimeError(str(failure_message))
+        if create_checkpoint_dir:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    return _save_checkpoint
+
+
+def capture_run_pretraining_kwargs(monkeypatch: Any, cli_module: Any) -> dict[str, Any]:
+    """Monkeypatch the CLI's run_pretraining with a kwargs recorder.
+
+    :param Any monkeypatch: Pytest monkeypatch fixture.
+    :param Any cli_module: The ``deberta.cli`` module object.
+    :return dict[str, Any]: Dict populated with the captured kwargs on call.
+    """
+
+    seen: dict[str, Any] = {}
+
+    def _fake_run_pretraining(*, model_cfg, data_cfg, train_cfg, optim_cfg, logging_cfg, config_path=None):
+        seen["model_cfg"] = model_cfg
+        seen["data_cfg"] = data_cfg
+        seen["train_cfg"] = train_cfg
+        seen["optim_cfg"] = optim_cfg
+        seen["logging_cfg"] = logging_cfg
+        seen["config_path"] = config_path
+
+    monkeypatch.setattr(cli_module, "run_pretraining", _fake_run_pretraining)
+    return seen
+
+
+def fake_torch_compile() -> tuple[Any, list[tuple[Any, dict[str, Any]]]]:
+    """Return an identity torch.compile stub plus its recorded call list.
+
+    :return tuple[Any, list[tuple[Any, dict[str, Any]]]]: The stub callable and
+        the list it appends ``(target, {mode, backend, dynamic})`` entries to.
+    """
+
+    compiled: list[tuple[Any, dict[str, Any]]] = []
+
+    def _fake_compile(
+        target: Any, *, mode: str = "default", backend: str = "inductor", dynamic: bool | None = None
+    ) -> Any:
+        compiled.append((target, {"mode": str(mode), "backend": str(backend), "dynamic": dynamic}))
+        return target
+
+    return _fake_compile, compiled

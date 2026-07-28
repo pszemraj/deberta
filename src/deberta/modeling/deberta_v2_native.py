@@ -13,16 +13,21 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import DebertaV2Config, PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutput
 
 from deberta.config import _normalize_hf_attention_kernel
-from deberta.modeling.mask_utils import normalize_keep_mask
+from deberta.modeling.activations import get_act_fn
+from deberta.modeling.flashdeberta_op_utils import is_flash_attention_impl
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    expand_keep_mask_to_4d,
+    is_torch_compiling,
+    normalize_keep_mask,
+    reduce_keep_mask_to_2d,
+)
 
-try:
-    from transformers import DebertaV2Config, PreTrainedModel
-    from transformers.activations import ACT2FN
-    from transformers.modeling_outputs import BaseModelOutput
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("transformers is required for the hf_deberta_v2 backbone.") from e
+_SUPPORTED_POS_ATT_TYPES = frozenset({"c2p", "p2c"})
 
 
 def _normalize_pos_att_type(raw: Any) -> list[str]:
@@ -30,22 +35,49 @@ def _normalize_pos_att_type(raw: Any) -> list[str]:
 
     :param Any raw: Raw ``config.pos_att_type`` value.
     :return list[str]: Normalized positional-attention tags.
+    :raises TypeError: If the value is not a string or sequence of strings.
     """
 
     if raw is None:
         return []
     if isinstance(raw, str):
-        chunks = raw.replace(",", "|").split("|")
+        items = (raw,)
     elif isinstance(raw, (list, tuple, set)):
-        chunks = [str(x) for x in raw]
+        items = raw
     else:
-        chunks = [str(raw)]
+        raise TypeError(f"pos_att_type must be a string or sequence of strings; got {type(raw).__name__}.")
+
     out: list[str] = []
-    for chunk in chunks:
-        value = str(chunk).strip().lower()
-        if value:
-            out.append(value)
+    for item in items:
+        for chunk in str(item).replace(",", "|").split("|"):
+            value = chunk.strip().lower()
+            if value and value not in out:
+                out.append(value)
     return out
+
+
+def _validate_pos_att_type(raw: Any, *, relative_attention: bool) -> list[str]:
+    """Return supported positional-attention terms or fail before construction.
+
+    :param Any raw: Raw ``config.pos_att_type`` value.
+    :param bool relative_attention: Whether relative attention is enabled.
+    :return list[str]: Normalized supported positional-attention terms.
+    :raises TypeError: If the value is not a string or sequence of strings.
+    :raises ValueError: If terms are unsupported or required terms are absent.
+    """
+
+    terms = _normalize_pos_att_type(raw)
+    unsupported = sorted(set(terms) - _SUPPORTED_POS_ATT_TYPES)
+    if unsupported:
+        raise ValueError(
+            "Native DeBERTa attention supports only c2p and p2c; "
+            f"unsupported positional-attention terms: {unsupported}. "
+            "p2p is intentionally disabled because the Microsoft implementation "
+            "does not provide a valid, reference-testable contract."
+        )
+    if relative_attention and not terms:
+        raise ValueError("relative_attention=true requires pos_att_type containing c2p, p2c, or both.")
+    return terms
 
 
 def _make_log_bucket_position(
@@ -73,12 +105,16 @@ def _make_log_bucket_position(
     abs_pos = rel.abs().clamp_min(1)
     near = abs_pos < mid
 
-    # Match HF semantics while avoiding scripted helper branches in forward.
-    log_base = math.log(max(float(max_position - 1), float(mid + 1)) / float(mid))
-    if log_base <= 0.0:
-        return rel
-
-    log_pos = torch.ceil(torch.log(abs_pos.float() / float(mid)) / log_base * float(mid - 1)) + float(mid)
+    # Keep the denominator in the same float32 tensor arithmetic as stock HF.
+    # A Python-double denominator can round an exact boundary into the next
+    # bucket when the quotient is passed through ceil().
+    abs_pos_float = abs_pos.float()
+    log_base = torch.log(
+        abs_pos_float.new_tensor(float(max_position - 1) / float(mid)),
+    )
+    log_pos = torch.ceil(
+        torch.log(abs_pos_float / float(mid)) / log_base * float(mid - 1),
+    ) + float(mid)
     bucket = torch.where(near, abs_pos.to(log_pos.dtype), log_pos)
     bucket = bucket * sign.to(bucket.dtype)
     return bucket.to(torch.long)
@@ -172,7 +208,8 @@ class DisentangledSelfAttention(nn.Module):
         """Create attention projections and relative-position helpers.
 
         :param DebertaV2Config config: Backbone configuration.
-        :raises ValueError: If hidden-size/head-count are inconsistent.
+        :raises TypeError: If positional-attention terms have an invalid container type.
+        :raises ValueError: If dimensions or positional-attention terms violate the native contract.
         """
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -182,6 +219,13 @@ class DisentangledSelfAttention(nn.Module):
                 f"hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_heads})."
             )
 
+        self.share_att_key = bool(getattr(config, "share_att_key", False))
+        self.relative_attention = bool(getattr(config, "relative_attention", False))
+        self.pos_att_type = _validate_pos_att_type(
+            getattr(config, "pos_att_type", None),
+            relative_attention=self.relative_attention,
+        )
+
         self.num_attention_heads = num_heads
         self.attention_head_size = int(getattr(config, "attention_head_size", hidden_size // num_heads))
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -189,10 +233,6 @@ class DisentangledSelfAttention(nn.Module):
         self.query_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
         self.key_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
         self.value_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
-
-        self.share_att_key = bool(getattr(config, "share_att_key", False))
-        self.pos_att_type = _normalize_pos_att_type(getattr(config, "pos_att_type", None))
-        self.relative_attention = bool(getattr(config, "relative_attention", False))
 
         self.position_buckets = int(getattr(config, "position_buckets", -1))
         self.max_relative_positions = int(getattr(config, "max_relative_positions", -1))
@@ -207,11 +247,11 @@ class DisentangledSelfAttention(nn.Module):
         self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
 
         if self.relative_attention and (not self.share_att_key):
-            if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            if "c2p" in self.pos_att_type:
                 self.pos_key_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_key_proj = None
-            if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
+            if "p2c" in self.pos_att_type:
                 self.pos_query_proj = nn.Linear(hidden_size, self.all_head_size, bias=True)
             else:
                 self.pos_query_proj = None
@@ -240,13 +280,14 @@ class DisentangledSelfAttention(nn.Module):
         key_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Resolve a canonical 2D relative-position matrix for attention bias.
+        """Resolve one shared relative-position map with exact shape ``(Q, K)``.
 
         :param torch.Tensor | None relative_pos: Optional user-provided relative-position ids.
         :param int query_len: Query length.
         :param int key_len: Key length.
         :param torch.device device: Runtime device.
-        :return torch.Tensor: Relative-position ids shaped ``(query_len, key_len)``.
+        :raises ValueError: If the map has unsupported leading axes or query/key dimensions.
+        :return torch.Tensor: Shared relative-position ids shaped ``(query_len, key_len)``.
         """
 
         if relative_pos is None:
@@ -259,15 +300,32 @@ class DisentangledSelfAttention(nn.Module):
             )
 
         rp = relative_pos.to(device=device, dtype=torch.long)
-        if rp.ndim == 4:
-            rp = rp[0, 0]
+        if rp.ndim == 2:
+            pass
         elif rp.ndim == 3:
+            if int(rp.shape[0]) != 1:
+                raise ValueError(
+                    "Batch-specific relative_pos maps are not supported; "
+                    f"expected shape (1,Q,K), got {tuple(rp.shape)}"
+                )
             rp = rp[0]
-        elif rp.ndim != 2:
-            raise ValueError(f"relative_pos must be rank-2/3/4, got rank={rp.ndim}")
+        elif rp.ndim == 4:
+            if int(rp.shape[0]) != 1 or int(rp.shape[1]) != 1:
+                raise ValueError(
+                    "Batch/head-specific relative_pos maps are not supported; "
+                    f"expected shape (1,1,Q,K), got {tuple(rp.shape)}"
+                )
+            rp = rp[0, 0]
+        else:
+            raise ValueError(
+                "relative_pos must have shape (Q,K), (1,Q,K), or (1,1,Q,K); "
+                f"got rank={rp.ndim}, shape={tuple(rp.shape)}"
+            )
 
-        if rp.shape[0] != query_len or rp.shape[1] != key_len:
-            rp = rp[:query_len, :key_len]
+        expected = (int(query_len), int(key_len))
+        actual = tuple(int(x) for x in rp.shape)
+        if actual != expected:
+            raise ValueError(f"relative_pos query/key shape mismatch: expected {expected}, got {actual}")
         return rp
 
     def _project_rel(
@@ -295,238 +353,6 @@ class DisentangledSelfAttention(nn.Module):
         projected = projected.view(2 * att_span, self.num_attention_heads, self.attention_head_size)
         return projected.permute(1, 0, 2).contiguous()
 
-    def _p2p_bias(
-        self,
-        *,
-        rel_pos: torch.Tensor,
-        pos_query_layer: torch.Tensor,
-        pos_key_layer: torch.Tensor,
-        bsz: int,
-        nheads: int,
-        query_len: int,
-        key_len: int,
-        att_span: int,
-        scale_factor: int,
-    ) -> torch.Tensor:
-        """Compute position-to-position (p2p) bias.
-
-        :param torch.Tensor rel_pos: Relative ids with shape ``(Q,K)``.
-        :param torch.Tensor pos_query_layer: Relative query projections ``(H,2A,D)``.
-        :param torch.Tensor pos_key_layer: Relative key projections ``(H,2A,D)``.
-        :param int bsz: Batch size.
-        :param int nheads: Number of attention heads.
-        :param int query_len: Query length.
-        :param int key_len: Key length.
-        :param int att_span: Relative-attention span ``A``.
-        :param int scale_factor: Attention scale factor.
-        :return torch.Tensor: p2p bias tensor with shape ``(B,H,Q,K)``.
-        """
-
-        # Mirror reference behavior: use positive-half relative query table.
-        pos_query = pos_query_layer[:, att_span:, :]  # (H, A, D)
-        if pos_query.shape[1] == 0:
-            return torch.zeros(
-                (bsz, nheads, query_len, key_len),
-                device=rel_pos.device,
-                dtype=pos_query_layer.dtype,
-            )
-
-        # (H, A, 2A)
-        p2p_table = torch.einsum("hqd,hkd->hqk", pos_query, pos_key_layer)
-
-        # Map runtime query positions to available p2p rows.
-        q_index = torch.arange(query_len, device=rel_pos.device, dtype=torch.long)
-        q_index = q_index.clamp(max=int(p2p_table.shape[1]) - 1)
-        p2p_query = p2p_table.index_select(1, q_index)  # (H, Q, 2A)
-
-        p2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)  # (Q, K)
-        p2p_idx = p2p_idx.unsqueeze(0).expand(nheads, query_len, key_len)
-        p2p_bias = p2p_query.gather(-1, p2p_idx)  # (H, Q, K)
-        p2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
-        p2p_bias = p2p_bias / p2p_scale
-        return p2p_bias.unsqueeze(0).expand(bsz, nheads, query_len, key_len)
-
-    def _disentangled_attention_bias_dynamic(
-        self,
-        query_layer: torch.Tensor,
-        key_layer: torch.Tensor,
-        relative_pos: torch.Tensor | None,
-        rel_embeddings: torch.Tensor,
-        scale_factor: int,
-    ) -> torch.Tensor:
-        """Compute disentangled positional bias via einsum + gather.
-
-        :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
-        :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
-        :param torch.Tensor | None relative_pos: Optional relative-position ids.
-        :param torch.Tensor rel_embeddings: Relative embedding table.
-        :param int scale_factor: Attention scale factor.
-        :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
-        """
-
-        bsz, nheads, query_len, _ = query_layer.shape
-        _, _, key_len, _ = key_layer.shape
-        rel_pos = self._normalize_relative_pos(
-            relative_pos,
-            query_len=query_len,
-            key_len=key_len,
-            device=query_layer.device,
-        )
-
-        att_span = int(self.pos_ebd_size)
-        rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
-
-        score: torch.Tensor | None = None
-        pos_key_layer: torch.Tensor | None = None
-        pos_query_layer: torch.Tensor | None = None
-
-        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
-            # Keep dynamic path on the same explicit dtype contract as cached_bmm/stable.
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
-        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
-
-        if "c2p" in self.pos_att_type:
-            if pos_key_layer is None:
-                raise RuntimeError("p2p/c2p path requires pos_key projection.")
-            c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
-            c2p_att = torch.einsum("bhqd,hkd->bhqk", query_layer, pos_key_layer)
-
-            c2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)
-            c2p_idx = c2p_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, query_len, key_len)
-            c2p_bias = c2p_att.gather(-1, c2p_idx) / c2p_scale
-            score = c2p_bias if score is None else score + c2p_bias
-
-        if "p2c" in self.pos_att_type:
-            if pos_query_layer is None:
-                raise RuntimeError("p2p/p2c path requires pos_query projection.")
-            p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
-            p2c_att = torch.einsum("bhkd,hqd->bhkq", key_layer, pos_query_layer)
-
-            # Convert [Q,K] relative ids into [K,Q] gather indices for p2c.
-            p2c_idx = (-rel_pos.transpose(0, 1) + att_span).clamp(min=0, max=(2 * att_span) - 1)
-            p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
-            p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
-            score = p2c_bias if score is None else score + p2c_bias
-
-        if "p2p" in self.pos_att_type:
-            if pos_key_layer is None or pos_query_layer is None:
-                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
-            p2p_bias = self._p2p_bias(
-                rel_pos=rel_pos,
-                pos_query_layer=pos_query_layer,
-                pos_key_layer=pos_key_layer,
-                bsz=bsz,
-                nheads=nheads,
-                query_len=query_len,
-                key_len=key_len,
-                att_span=att_span,
-                scale_factor=scale_factor,
-            )
-            score = p2p_bias if score is None else score + p2p_bias
-
-        if score is None:
-            score = torch.zeros(
-                (bsz, nheads, query_len, key_len), device=query_layer.device, dtype=query_layer.dtype
-            )
-        return score
-
-    def _disentangled_attention_bias_cached_bmm(
-        self,
-        query_layer: torch.Tensor,
-        key_layer: torch.Tensor,
-        relative_pos: torch.Tensor | None,
-        rel_embeddings: torch.Tensor,
-        scale_factor: int,
-    ) -> torch.Tensor:
-        """Compute disentangled positional bias via cached ids + batched matmul.
-
-        :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
-        :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
-        :param torch.Tensor | None relative_pos: Optional relative-position ids.
-        :param torch.Tensor rel_embeddings: Relative embedding table.
-        :param int scale_factor: Attention scale factor.
-        :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
-        """
-
-        # Intentionally avoid cross-call score caching here: c2p/p2c terms depend
-        # on runtime query/key activations and must be recomputed every forward.
-        bsz, nheads, query_len, _ = query_layer.shape
-        _, _, key_len, _ = key_layer.shape
-        rel_pos = self._normalize_relative_pos(
-            relative_pos,
-            query_len=query_len,
-            key_len=key_len,
-            device=query_layer.device,
-        )
-
-        att_span = int(self.pos_ebd_size)
-        rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
-        score: torch.Tensor | None = None
-        pos_key_layer: torch.Tensor | None = None
-        pos_query_layer: torch.Tensor | None = None
-
-        if ("c2p" in self.pos_att_type) or ("p2p" in self.pos_att_type):
-            # Keep relative-bias kernels on the same dtype contract as the caller's
-            # query/key score path (fp32 in stabilized attention forward).
-            pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
-        if ("p2c" in self.pos_att_type) or ("p2p" in self.pos_att_type):
-            pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
-
-        if "c2p" in self.pos_att_type:
-            if pos_key_layer is None:
-                raise RuntimeError("p2p/c2p path requires pos_key projection.")
-            c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
-
-            q_flat = query_layer.permute(1, 0, 2, 3).reshape(
-                nheads, bsz * query_len, self.attention_head_size
-            )
-            pos_key_t = pos_key_layer.transpose(1, 2).contiguous()  # (H,D,2A)
-            c2p_att = torch.bmm(q_flat, pos_key_t).reshape(nheads, bsz, query_len, 2 * att_span)
-            c2p_att = c2p_att.permute(1, 0, 2, 3).contiguous()  # (B,H,Q,2A)
-
-            c2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)
-            c2p_idx = c2p_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, query_len, key_len)
-            c2p_bias = c2p_att.gather(-1, c2p_idx) / c2p_scale
-            score = c2p_bias if score is None else score + c2p_bias
-
-        if "p2c" in self.pos_att_type:
-            if pos_query_layer is None:
-                raise RuntimeError("p2p/p2c path requires pos_query projection.")
-            p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
-
-            k_flat = key_layer.permute(1, 0, 2, 3).reshape(nheads, bsz * key_len, self.attention_head_size)
-            pos_query_t = pos_query_layer.transpose(1, 2).contiguous()  # (H,D,2A)
-            p2c_att = torch.bmm(k_flat, pos_query_t).reshape(nheads, bsz, key_len, 2 * att_span)
-            p2c_att = p2c_att.permute(1, 0, 2, 3).contiguous()  # (B,H,K,2A)
-
-            p2c_idx = (-rel_pos.transpose(0, 1) + att_span).clamp(min=0, max=(2 * att_span) - 1)
-            p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
-            p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
-            score = p2c_bias if score is None else score + p2c_bias
-
-        if "p2p" in self.pos_att_type:
-            if pos_key_layer is None or pos_query_layer is None:
-                raise RuntimeError("p2p path requires both pos_key and pos_query projections.")
-            p2p_bias = self._p2p_bias(
-                rel_pos=rel_pos,
-                pos_query_layer=pos_query_layer,
-                pos_key_layer=pos_key_layer,
-                bsz=bsz,
-                nheads=nheads,
-                query_len=query_len,
-                key_len=key_len,
-                att_span=att_span,
-                scale_factor=scale_factor,
-            )
-            score = p2p_bias if score is None else score + p2p_bias
-
-        if score is None:
-            score = torch.zeros(
-                (bsz, nheads, query_len, key_len), device=query_layer.device, dtype=query_layer.dtype
-            )
-        return score
-
     def disentangled_attention_bias(
         self,
         query_layer: torch.Tensor,
@@ -537,6 +363,12 @@ class DisentangledSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """Compute DeBERTa disentangled positional attention bias.
 
+        The ``dynamic`` kernel scores c2p/p2c terms with einsum; the
+        ``cached_bmm``/``stable`` kernels use explicit permute + batched matmul.
+        Index construction, scaling, and the zero fallback are shared. Cross-call
+        score caching is intentionally avoided: c2p/p2c terms depend on runtime
+        query/key activations and must be recomputed every forward.
+
         :param torch.Tensor query_layer: Query tensor shaped ``(B,H,Q,D)``.
         :param torch.Tensor key_layer: Key tensor shaped ``(B,H,K,D)``.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
@@ -545,21 +377,76 @@ class DisentangledSelfAttention(nn.Module):
         :return torch.Tensor: Relative bias tensor shaped ``(B,H,Q,K)``.
         """
 
-        if self.attn_kernel in {"cached_bmm", "stable"}:
-            return self._disentangled_attention_bias_cached_bmm(
-                query_layer,
-                key_layer,
-                relative_pos,
-                rel_embeddings,
-                scale_factor,
-            )
-        return self._disentangled_attention_bias_dynamic(
-            query_layer,
-            key_layer,
+        use_bmm = self.attn_kernel in {"cached_bmm", "stable"}
+        bsz, nheads, query_len, _ = query_layer.shape
+        _, _, key_len, _ = key_layer.shape
+        rel_pos = self._normalize_relative_pos(
             relative_pos,
-            rel_embeddings,
-            scale_factor,
+            query_len=query_len,
+            key_len=key_len,
+            device=query_layer.device,
         )
+
+        att_span = int(self.pos_ebd_size)
+        rel_pos = rel_pos.clamp(min=-att_span, max=att_span)
+
+        score: torch.Tensor | None = None
+        pos_key_layer: torch.Tensor | None = None
+        pos_query_layer: torch.Tensor | None = None
+
+        if "c2p" in self.pos_att_type:
+            # Keep both kernels on the same explicit dtype contract as the
+            # caller's query/key score path (fp32 in stabilized attention).
+            pos_key_layer = self._project_rel(rel_embeddings, use_query=False).to(dtype=query_layer.dtype)
+        if "p2c" in self.pos_att_type:
+            pos_query_layer = self._project_rel(rel_embeddings, use_query=True).to(dtype=query_layer.dtype)
+
+        if "c2p" in self.pos_att_type:
+            if pos_key_layer is None:
+                raise RuntimeError("c2p path requires pos_key projection.")
+            c2p_scale = math.sqrt(float(self.attention_head_size * scale_factor))
+            if use_bmm:
+                q_flat = query_layer.permute(1, 0, 2, 3).reshape(
+                    nheads, bsz * query_len, self.attention_head_size
+                )
+                pos_key_t = pos_key_layer.transpose(1, 2).contiguous()  # (H,D,2A)
+                c2p_att = torch.bmm(q_flat, pos_key_t).reshape(nheads, bsz, query_len, 2 * att_span)
+                c2p_att = c2p_att.permute(1, 0, 2, 3).contiguous()  # (B,H,Q,2A)
+            else:
+                c2p_att = torch.einsum("bhqd,hkd->bhqk", query_layer, pos_key_layer)
+
+            c2p_idx = (rel_pos + att_span).clamp(min=0, max=(2 * att_span) - 1)
+            c2p_idx = c2p_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, query_len, key_len)
+            c2p_bias = c2p_att.gather(-1, c2p_idx) / c2p_scale
+            score = c2p_bias if score is None else score + c2p_bias
+
+        if "p2c" in self.pos_att_type:
+            if pos_query_layer is None:
+                raise RuntimeError("p2c path requires pos_query projection.")
+            p2c_scale = math.sqrt(float(self.attention_head_size * scale_factor))
+            if use_bmm:
+                k_flat = key_layer.permute(1, 0, 2, 3).reshape(
+                    nheads, bsz * key_len, self.attention_head_size
+                )
+                pos_query_t = pos_query_layer.transpose(1, 2).contiguous()  # (H,D,2A)
+                p2c_att = torch.bmm(k_flat, pos_query_t).reshape(nheads, bsz, key_len, 2 * att_span)
+                p2c_att = p2c_att.permute(1, 0, 2, 3).contiguous()  # (B,H,K,2A)
+            else:
+                p2c_att = torch.einsum("bhkd,hqd->bhkq", key_layer, pos_query_layer)
+
+            # Convert canonical signed buckets from query-major [Q,K] to the
+            # key-major [K,Q] layout of p2c_att without reversing their sign.
+            # Entry [k,q] must still select bucket(q-k).
+            p2c_idx = (rel_pos.transpose(0, 1) + att_span).clamp(min=0, max=(2 * att_span) - 1)
+            p2c_idx = p2c_idx.unsqueeze(0).unsqueeze(0).expand(bsz, nheads, key_len, query_len)
+            p2c_bias = p2c_att.gather(-1, p2c_idx).transpose(-1, -2) / p2c_scale
+            score = p2c_bias if score is None else score + p2c_bias
+
+        if score is None:
+            score = torch.zeros(
+                (bsz, nheads, query_len, key_len), device=query_layer.device, dtype=query_layer.dtype
+            )
+        return score
 
     def forward(
         self,
@@ -569,6 +456,7 @@ class DisentangledSelfAttention(nn.Module):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run disentangled self-attention.
 
@@ -578,8 +466,10 @@ class DisentangledSelfAttention(nn.Module):
         :param torch.Tensor | None query_states: Optional query states (for iterative decoding).
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative-position embedding table.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle, ignored by eager attention.
         :return tuple[torch.Tensor, torch.Tensor | None]: Attention output and optional probs.
         """
+        del flash_meta
 
         if query_states is None:
             query_states = hidden_states
@@ -593,8 +483,6 @@ class DisentangledSelfAttention(nn.Module):
         if "c2p" in self.pos_att_type:
             scale_factor += 1
         if "p2c" in self.pos_att_type:
-            scale_factor += 1
-        if "p2p" in self.pos_att_type:
             scale_factor += 1
 
         scale = math.sqrt(float(self.attention_head_size * scale_factor))
@@ -618,18 +506,51 @@ class DisentangledSelfAttention(nn.Module):
             keep_mask = normalize_keep_mask(attention_mask)
             if keep_mask.ndim != 4:
                 raise ValueError(
-                    f"attention_mask must be rank-4 [B,1,Q,K]; got shape={tuple(keep_mask.shape)}"
+                    "attention_mask must be rank-4 [B,1,Q,K] or [B,1,1,K]; "
+                    f"got shape={tuple(keep_mask.shape)}"
                 )
+
+            query_len = int(attention_scores.shape[-2])
+            key_len = int(attention_scores.shape[-1])
+            if int(keep_mask.shape[-1]) != key_len:
+                raise ValueError(
+                    "attention_mask key length mismatch: "
+                    f"expected K={key_len}, got shape={tuple(keep_mask.shape)}"
+                )
+
+            mask_query_len = int(keep_mask.shape[-2])
+            if mask_query_len == 1:
+                if query_len == key_len:
+                    live_queries = keep_mask.transpose(-2, -1)
+                else:
+                    # A key-padding mask contains no per-query padding
+                    # information, but an empty key set leaves no live rows.
+                    live_queries = keep_mask.any(dim=-1, keepdim=True).expand(
+                        -1,
+                        -1,
+                        query_len,
+                        -1,
+                    )
+            elif mask_query_len == query_len:
+                if query_len == key_len:
+                    # Packed masks may give inactive queries an off-diagonal
+                    # fallback edge, so their diagonal remains the liveness source.
+                    live_queries = torch.diagonal(
+                        keep_mask,
+                        dim1=-2,
+                        dim2=-1,
+                    ).unsqueeze(-1)
+                else:
+                    live_queries = keep_mask.any(dim=-1, keepdim=True)
+            else:
+                raise ValueError(
+                    "attention_mask query length mismatch: "
+                    f"expected Q={query_len} or a broadcast query axis, "
+                    f"got shape={tuple(keep_mask.shape)}"
+                )
+
             mask_fill_value = torch.finfo(attention_scores.dtype).min
             attention_scores = attention_scores.masked_fill(~keep_mask, mask_fill_value)
-            # For broadcast padding masks (B,1,1,S), query activity equals key activity —
-            # transpose the key dim to get per-query (B,1,S,1). For pairwise masks
-            # (B,1,S,S), query activity is encoded on the diagonal (inactive queries
-            # may still keep a CLS fallback edge to avoid all-False rows).
-            if keep_mask.shape[-2] == 1:
-                live_queries = keep_mask.transpose(-2, -1)  # (B,1,S,1)
-            else:
-                live_queries = torch.diagonal(keep_mask, dim1=-2, dim2=-1).unsqueeze(-1)  # (B,1,S,1)
             attention_scores = torch.where(live_queries, attention_scores, torch.zeros_like(attention_scores))
 
         probs = torch.softmax(attention_scores, dim=-1)
@@ -661,7 +582,12 @@ class DebertaV2Attention(nn.Module):
         :param DebertaV2Config config: Backbone configuration.
         """
         super().__init__()
-        self.self = DisentangledSelfAttention(config)
+        if is_flash_attention_impl(getattr(config, "hf_attention_impl", "eager")):
+            from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
+
+            self.self = FlashDisentangledSelfAttention(config)
+        else:
+            self.self = DisentangledSelfAttention(config)
         self.output = DebertaV2SelfOutput(config)
 
     def forward(
@@ -672,6 +598,7 @@ class DebertaV2Attention(nn.Module):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run attention and post-attention projection.
 
@@ -681,6 +608,7 @@ class DebertaV2Attention(nn.Module):
         :param torch.Tensor | None query_states: Optional query states.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Layer outputs.
         """
 
@@ -691,6 +619,7 @@ class DebertaV2Attention(nn.Module):
             query_states=query_states,
             relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
         )
         if query_states is None:
             query_states = hidden_states
@@ -710,11 +639,7 @@ class DebertaV2Intermediate(nn.Module):
         """
         super().__init__()
         self.dense = nn.Linear(int(config.hidden_size), int(config.intermediate_size))
-        hidden_act = config.hidden_act
-        if isinstance(hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[hidden_act]
-        else:
-            self.intermediate_act_fn = hidden_act
+        self.intermediate_act_fn = get_act_fn(config.hidden_act)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project then activate hidden states.
@@ -779,6 +704,7 @@ class DebertaV2Layer(nn.Module):
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
         output_attentions: bool = False,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run one transformer layer.
 
@@ -788,6 +714,7 @@ class DebertaV2Layer(nn.Module):
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param torch.Tensor | None rel_embeddings: Optional relative embedding table.
         :param bool output_attentions: Whether to emit attention probs.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return tuple[torch.Tensor, torch.Tensor | None]: Layer output and optional attentions.
         """
 
@@ -798,6 +725,7 @@ class DebertaV2Layer(nn.Module):
             query_states=query_states,
             relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
+            flash_meta=flash_meta,
         )
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
@@ -805,59 +733,6 @@ class DebertaV2Layer(nn.Module):
         if output_attentions:
             return layer_output, attn_probs
         return layer_output, None
-
-
-class ConvLayer(nn.Module):
-    """Optional convolutional refinement layer used by some DeBERTa variants."""
-
-    def __init__(self, config: DebertaV2Config) -> None:
-        """Create optional 1D convolution block.
-
-        :param DebertaV2Config config: Backbone configuration.
-        """
-        super().__init__()
-        hidden_size = int(config.hidden_size)
-        kernel_size = int(getattr(config, "conv_kernel_size", 3))
-        groups = int(getattr(config, "conv_groups", 1))
-        self.conv_act = str(getattr(config, "conv_act", "tanh"))
-
-        self.conv = nn.Conv1d(
-            hidden_size,
-            hidden_size,
-            kernel_size,
-            padding=(kernel_size - 1) // 2,
-            groups=groups,
-        )
-        self.LayerNorm = nn.LayerNorm(hidden_size, eps=float(config.layer_norm_eps))
-        self.dropout = nn.Dropout(float(config.hidden_dropout_prob))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual_states: torch.Tensor,
-        input_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Run convolutional refinement over hidden states.
-
-        :param torch.Tensor hidden_states: Conv input states.
-        :param torch.Tensor residual_states: Residual tensor to combine with conv output.
-        :param torch.Tensor | None input_mask: Optional token keep mask.
-        :return torch.Tensor: Updated hidden states.
-        """
-
-        out = self.conv(hidden_states.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
-
-        if input_mask is not None:
-            keep = normalize_keep_mask(input_mask, name="input_mask")
-            out = out.masked_fill(~keep.unsqueeze(-1), 0)
-
-        out = ACT2FN[self.conv_act](self.dropout(out))
-        layer_norm_input = residual_states + out
-        output = self.LayerNorm(layer_norm_input)
-
-        if input_mask is None:
-            return output
-        return output * input_mask.to(dtype=output.dtype).unsqueeze(-1)
 
 
 class DebertaV2Embeddings(nn.Module):
@@ -907,32 +782,6 @@ class DebertaV2Embeddings(nn.Module):
             persistent=False,
         )
 
-    def _extract_token_mask(self, mask: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Extract a 2D token keep mask from attention-mask variants.
-
-        :param torch.Tensor mask: Mask in rank-2/3/4 layout.
-        :param int seq_len: Current sequence length.
-        :return torch.Tensor: Token keep mask with shape ``(B,S)``.
-        """
-
-        m = mask
-        if m.ndim == 4:
-            if m.shape[1] != 1:
-                m = m.any(dim=1)
-            else:
-                m = m[:, 0]
-        if m.ndim == 3:
-            if m.shape[-2] == 1:
-                # Broadcast padding mask path: (B,1,1,S) -> (B,1,S), keep full sequence axis.
-                m = m[:, 0, :]
-            else:
-                m = torch.diagonal(m, dim1=-2, dim2=-1)
-        if m.ndim != 2:
-            raise ValueError(f"mask must be rank-2/3/4 for embeddings; got rank={m.ndim}")
-        if m.shape[-1] != seq_len:
-            m = m[:, :seq_len]
-        return normalize_keep_mask(m)
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -976,7 +825,7 @@ class DebertaV2Embeddings(nn.Module):
 
         embeddings = inputs_embeds
 
-        if self.position_embeddings is not None and self.position_biased_input:
+        if self.position_biased_input:
             embeddings = embeddings + self.position_embeddings(position_ids.long())
 
         if self.token_type_embeddings is not None:
@@ -988,7 +837,7 @@ class DebertaV2Embeddings(nn.Module):
         embeddings = self.LayerNorm(embeddings)
 
         if mask is not None:
-            keep = self._extract_token_mask(mask, seq_len).to(dtype=embeddings.dtype)
+            keep = reduce_keep_mask_to_2d(mask, seq_len=seq_len).to(dtype=embeddings.dtype)
             embeddings = embeddings * keep.unsqueeze(-1)
 
         embeddings = self.dropout(embeddings)
@@ -1020,18 +869,20 @@ class DebertaV2Encoder(nn.Module):
         else:
             self.rel_embeddings = None
 
-        self.norm_rel_ebd = [
-            x.strip() for x in str(getattr(config, "norm_rel_ebd", "none")).lower().split("|")
-        ]
-        if "layer_norm" in self.norm_rel_ebd:
+        norm_rel_ebd = [x.strip() for x in str(getattr(config, "norm_rel_ebd", "none")).lower().split("|")]
+        if "layer_norm" in norm_rel_ebd:
             self.LayerNorm = nn.LayerNorm(int(config.hidden_size), eps=float(config.layer_norm_eps))
         else:
             self.LayerNorm = None
 
-        conv_kernel_size = getattr(config, "conv_kernel_size", 0)
-        self.conv = ConvLayer(config) if conv_kernel_size and int(conv_kernel_size) > 0 else None
+        conv_kernel_size = int(getattr(config, "conv_kernel_size", 0) or 0)
+        if conv_kernel_size > 0:
+            raise ValueError(
+                "conv_kernel_size > 0 is not supported by the native DeBERTa-v2 backbone; "
+                "DeBERTa-v2 conv-refinement checkpoints (e.g. v2-xlarge/xxlarge) are out of scope."
+            )
         self.gradient_checkpointing = False
-        self.attn_kernel = _normalize_hf_attention_kernel(getattr(config, "hf_attention_kernel", "dynamic"))
+        self.flash_attention_enabled = is_flash_attention_impl(getattr(config, "hf_attention_impl", "eager"))
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         """Return optionally normalized relative embedding table.
@@ -1056,35 +907,7 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor attention_mask: Input mask tensor.
         :return torch.Tensor: Keep mask ``(B, 1, 1, S)`` or ``(B, 1, S, S)``.
         """
-        mask = normalize_keep_mask(attention_mask)
-        if mask.ndim <= 2:
-            return mask[:, None, None, :]  # (B,1,1,S) — broadcast across queries
-        if mask.ndim == 3:
-            return mask.unsqueeze(1)
-        if mask.ndim == 4:
-            if mask.shape[1] == 1:
-                return mask
-            return mask.any(dim=1, keepdim=True)
-        raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
-
-    def _input_mask_for_conv(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Extract a 2D token keep mask for optional convolution.
-
-        :param torch.Tensor attention_mask: Raw attention mask.
-        :return torch.Tensor: Token keep mask with shape ``(B,S)``.
-        """
-        mask = normalize_keep_mask(attention_mask)
-        if mask.ndim <= 2:
-            return mask
-        if mask.ndim == 3:
-            return torch.diagonal(mask, dim1=-2, dim2=-1)
-        if mask.ndim == 4:
-            m = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-            # Broadcast padding masks have shape (B,1,1,S) → (B,1,S) after head squeeze.
-            if m.shape[-2] == 1:
-                return m[:, 0, :]
-            return torch.diagonal(m, dim1=-2, dim2=-1)
-        raise ValueError(f"attention_mask must be rank-2/3/4; got rank={mask.ndim}")
+        return expand_keep_mask_to_4d(attention_mask)
 
     def get_rel_pos(
         self,
@@ -1103,6 +926,8 @@ class DebertaV2Encoder(nn.Module):
             return None
         if relative_pos is not None:
             return relative_pos
+        if self.flash_attention_enabled:
+            return None
 
         key_len = int(hidden_states.shape[-2])
         query_len = int(query_states.shape[-2]) if query_states is not None else key_len
@@ -1123,6 +948,7 @@ class DebertaV2Encoder(nn.Module):
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         return_dict: bool = True,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> (
         BaseModelOutput
         | tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, tuple[torch.Tensor, ...] | None]
@@ -1133,31 +959,32 @@ class DebertaV2Encoder(nn.Module):
         :param torch.Tensor | None attention_mask: Input attention mask or ``None`` for unpadded batches.
         :param bool output_hidden_states: Whether to return hidden states.
         :param bool output_attentions: Whether to return attentions.
-        :param torch.Tensor | None query_states: Optional query states.
+        :param torch.Tensor | None query_states: Optional iterative query stream; ``hidden_states``
+            remains the fixed key/value memory when provided.
         :param torch.Tensor | None relative_pos: Optional relative-position ids.
         :param bool return_dict: Whether to return HF output dataclass.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return BaseModelOutput | tuple: Encoder outputs.
         """
 
-        if attention_mask is not None:
-            input_mask = self._input_mask_for_conv(attention_mask)
-            attn_mask = self.get_attention_mask(attention_mask)
-        else:
-            input_mask = None
-            attn_mask = None
+        attn_mask = self.get_attention_mask(attention_mask) if attention_mask is not None else None
         rel_pos = self.get_rel_pos(hidden_states, query_states=query_states, relative_pos=relative_pos)
         rel_embeddings = self.get_rel_embedding()
 
+        current_query = query_states
+        next_kv = hidden_states
+        output_states = current_query if current_query is not None else next_kv
+
+        capture_hidden_states = bool(output_hidden_states)
+        compile_snapshot_hidden_states = bool(capture_hidden_states and is_torch_compiling())
+        initial_stream_state = output_states.clone() if compile_snapshot_hidden_states else output_states
         all_hidden_states: tuple[torch.Tensor, ...] | None = (
-            (hidden_states,) if output_hidden_states else None
+            (initial_stream_state,) if capture_hidden_states else None
         )
         all_attentions: tuple[torch.Tensor, ...] | None = () if output_attentions else None
 
-        next_kv = hidden_states
-        output_states = hidden_states
-
-        for idx, layer_module in enumerate(self.layer):
-            if self.gradient_checkpointing and self.training and query_states is None:
+        for layer_module in self.layer:
+            if self.gradient_checkpointing and self.training and current_query is None:
 
                 def _custom_forward(
                     hs: torch.Tensor,
@@ -1182,6 +1009,7 @@ class DebertaV2Encoder(nn.Module):
                         relative_pos=rp,
                         rel_embeddings=re,
                         output_attentions=output_attentions,
+                        flash_meta=flash_meta,
                     )
 
                 output_states, attn_weights = torch.utils.checkpoint.checkpoint(
@@ -1196,10 +1024,11 @@ class DebertaV2Encoder(nn.Module):
                 output_states, attn_weights = layer_module(
                     next_kv,
                     attn_mask,
-                    query_states=query_states,
+                    query_states=current_query,
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
                     output_attentions=output_attentions,
+                    flash_meta=flash_meta,
                 )
 
             if output_attentions and all_attentions is not None:
@@ -1207,21 +1036,23 @@ class DebertaV2Encoder(nn.Module):
                     attn_weights = torch.empty(0, device=output_states.device)
                 all_attentions = all_attentions + (attn_weights,)
 
-            if idx == 0 and self.conv is not None:
-                output_states = self.conv(hidden_states, output_states, input_mask)
+            if capture_hidden_states and all_hidden_states is not None:
+                hidden_state_snapshot = (
+                    output_states.clone() if compile_snapshot_hidden_states else output_states
+                )
+                all_hidden_states = all_hidden_states + (hidden_state_snapshot,)
 
-            if output_hidden_states and all_hidden_states is not None:
-                all_hidden_states = all_hidden_states + (output_states,)
-
-            if query_states is not None:
-                query_states = output_states
-            next_kv = output_states
+            if current_query is None:
+                next_kv = output_states
+            else:
+                current_query = output_states
 
         if not return_dict:
             return tuple(v for v in (output_states, all_hidden_states, all_attentions) if v is not None)
 
+        last_hidden_state = output_states.clone() if compile_snapshot_hidden_states else output_states
         return BaseModelOutput(
-            last_hidden_state=output_states,
+            last_hidden_state=last_hidden_state,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
@@ -1293,64 +1124,54 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
 
         self.embeddings.word_embeddings = new_embeddings  # type: ignore[assignment]
 
-    def _default_output_attentions(self) -> bool:
-        """Return configured default for ``output_attentions``.
-
-        :return bool: Default flag.
-        """
-
-        return bool(getattr(self.config, "output_attentions", False))
-
-    def _default_output_hidden_states(self) -> bool:
-        """Return configured default for ``output_hidden_states``.
-
-        :return bool: Default flag.
-        """
-
-        return bool(getattr(self.config, "output_hidden_states", False))
-
-    def _default_return_dict(self) -> bool:
-        """Return configured default for ``return_dict``.
-
-        :return bool: Default flag.
-        """
-
-        return bool(getattr(self.config, "use_return_dict", True))
-
-    def forward(
+    def _resolve_forward_options(
         self,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
-    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
-        """Run DeBERTa-v2 encoder forward pass.
+        *,
+        output_attentions: bool | None,
+        output_hidden_states: bool | None,
+        return_dict: bool | None,
+    ) -> tuple[bool, bool, bool]:
+        """Resolve optional public forward flags into stable booleans.
 
-        :param torch.Tensor | None input_ids: Optional input token ids.
-        :param torch.Tensor | None attention_mask: Optional attention mask.
-        :param torch.Tensor | None token_type_ids: Optional token type ids.
-        :param torch.Tensor | None position_ids: Optional position ids.
-        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        Keeping this logic in a dedicated helper lets compile-time dispatchers
+        normalize Python optionals before entering compiled code.
+
         :param bool | None output_attentions: Optional attention-output flag.
         :param bool | None output_hidden_states: Optional hidden-state-output flag.
         :param bool | None return_dict: Optional return-format flag.
-        :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
-        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        :return tuple[bool, bool, bool]: Resolved ``(output_attentions, output_hidden_states, return_dict)``.
         """
 
-        output_attentions = (
-            self._default_output_attentions() if output_attentions is None else bool(output_attentions)
+        resolved_attentions = bool(
+            getattr(self.config, "output_attentions", False)
+            if output_attentions is None
+            else output_attentions
         )
-        output_hidden_states = (
-            self._default_output_hidden_states()
+        resolved_hidden_states = (
+            bool(getattr(self.config, "output_hidden_states", False))
             if output_hidden_states is None
             else bool(output_hidden_states)
         )
-        return_dict = self._default_return_dict() if return_dict is None else bool(return_dict)
+        resolved_return_dict = bool(
+            getattr(self.config, "use_return_dict", True) if return_dict is None else return_dict
+        )
+        return resolved_attentions, resolved_hidden_states, resolved_return_dict
+
+    def _resolve_forward_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Validate mutually exclusive inputs and materialize token-type ids.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
+        :return torch.Tensor: Supplied or materialized token-type ids.
+        """
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time.")
@@ -1367,6 +1188,46 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
+        return token_type_ids
+
+    def _forward_resolved(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run forward with already-resolved boolean output flags.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool output_attentions: Resolved attention-output flag.
+        :param bool output_hidden_states: Resolved hidden-state-output flag.
+        :param bool return_dict: Resolved return-format flag.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        output_attentions = bool(output_attentions)
+        output_hidden_states = bool(output_hidden_states)
+        return_dict = bool(return_dict)
+
+        token_type_ids = self._resolve_forward_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            token_type_ids=token_type_ids,
+        )
+
         embedding_output = self.embeddings(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
@@ -1382,6 +1243,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             output_hidden_states=(output_hidden_states or need_hidden_states_for_z),
             output_attentions=output_attentions,
             return_dict=True,
+            flash_meta=flash_meta,
         )
 
         sequence_output = encoder_outputs.last_hidden_state
@@ -1392,21 +1254,22 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
                 raise RuntimeError("z_steps>1 requires encoder hidden states.")
             z_base_states = hidden_states[-2]
             z_query_states = hidden_states[-1]
-            layers = [self.encoder.layer[-1] for _ in range(int(self.z_steps))]
+            last_layer = self.encoder.layer[-1]
             rel_embeddings = self.encoder.get_rel_embedding()
             attn_mask = (
                 self.encoder.get_attention_mask(attention_mask) if attention_mask is not None else None
             )
             rel_pos = self.encoder.get_rel_pos(embedding_output)
             z_extras: list[torch.Tensor] = []
-            for layer in layers[1:]:
-                z_query_states, _ = layer(
+            for _ in range(int(self.z_steps) - 1):
+                z_query_states, _ = last_layer(
                     z_base_states,
                     attn_mask,
                     output_attentions=False,
                     query_states=z_query_states,
                     relative_pos=rel_pos,
                     rel_embeddings=rel_embeddings,
+                    flash_meta=flash_meta,
                 )
                 z_extras.append(z_query_states)
             sequence_output = z_query_states
@@ -1425,6 +1288,259 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
             last_hidden_state=sequence_output,
             hidden_states=hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions if output_attentions else None,
+        )
+
+    def _forward_dense_resolved(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run forward on the dense no-mask path with resolved flags.
+
+        Ordinary dense batches carry no Flash metadata. The optional bundle is
+        reserved for the route-bound ``local_bias`` compile specialization.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool output_attentions: Resolved attention-output flag.
+        :param bool output_hidden_states: Resolved hidden-state-output flag.
+        :param bool return_dict: Resolved return-format flag.
+        :param FlashBatchMeta | None flash_meta: Optional route-bound FlashDeBERTa metadata.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_resolved(
+            input_ids=input_ids,
+            attention_mask=None,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            flash_meta=flash_meta,
+        )
+
+    def _forward_masked_resolved(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run forward on the masked path with resolved flags.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Attention mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool output_attentions: Resolved attention-output flag.
+        :param bool output_hidden_states: Resolved hidden-state-output flag.
+        :param bool return_dict: Resolved return-format flag.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_resolved(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            flash_meta=flash_meta,
+        )
+
+    def _forward_dense_hs0(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the dense training fast path with hidden-state outputs disabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param FlashBatchMeta | None flash_meta: Optional route-bound FlashDeBERTa metadata.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_dense_resolved(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            flash_meta=flash_meta,
+        )
+
+    def _forward_dense_hs1(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the dense training fast path with hidden-state outputs enabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param FlashBatchMeta | None flash_meta: Optional route-bound FlashDeBERTa metadata.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_dense_resolved(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+            flash_meta=flash_meta,
+        )
+
+    def _forward_masked_hs0(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the masked training fast path with hidden-state outputs disabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Attention mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_masked_resolved(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            flash_meta=flash_meta,
+        )
+
+    def _forward_masked_hs1(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run the masked training fast path with hidden-state outputs enabled.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor attention_mask: Attention mask tensor.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        return self._forward_masked_resolved(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+            flash_meta=flash_meta,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> BaseModelOutput | tuple[torch.Tensor, ...]:
+        """Run DeBERTa-v2 encoder forward pass.
+
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool | None output_attentions: Optional attention-output flag.
+        :param bool | None output_hidden_states: Optional hidden-state-output flag.
+        :param bool | None return_dict: Optional return-format flag.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :raises ValueError: If both/neither ``input_ids`` and ``inputs_embeds`` are set.
+        :return BaseModelOutput | tuple[torch.Tensor, ...]: Model outputs.
+        """
+
+        (
+            resolved_output_attentions,
+            resolved_output_hidden_states,
+            resolved_return_dict,
+        ) = self._resolve_forward_options(
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        return self._forward_resolved(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=resolved_output_attentions,
+            output_hidden_states=resolved_output_hidden_states,
+            return_dict=resolved_return_dict,
+            flash_meta=flash_meta,
         )
 
 

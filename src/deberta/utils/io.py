@@ -41,6 +41,7 @@ def load_json_mapping(path: Path) -> dict[str, Any]:
     :raises ValueError: If parsed payload is not a JSON object.
     :return dict[str, Any]: Parsed mapping.
     """
+
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, dict):

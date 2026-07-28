@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import types
+from collections.abc import Callable
 from typing import Any
 
 import torch
 
-from deberta.config import ModelConfig, _normalize_sdpa_kernel
+from deberta.config import ModelConfig, ModelHFFlashConfig, _normalize_sdpa_kernel
+from deberta.modeling.flashdeberta_kernel_tuning import (
+    flash_route_choice,
+    flash_seq_bucket,
+    materialize_flash_kernel_policy,
+    normalize_flash_kernel_policy_path,
+)
+from deberta.modeling.flashdeberta_op_utils import device_compute_capability
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    build_doc_block_mask,
+    is_pairwise_mask,
+)
 
 logger = logging.getLogger(__name__)
-_DOC_BLOCK_EYE_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
-_DOC_BLOCK_CLS_KEY_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 
 
 def _maybe_enable_tf32(enabled: bool) -> None:
@@ -96,20 +109,194 @@ def _bf16_runtime_sanity_check() -> bool:
         return False
 
 
-def _resolve_compile_enabled_or_raise(requested: bool) -> bool:
-    """Return compile-enabled flag, raising when torch.compile is unavailable.
+def _flash_route_hint_for_docblock_batch(
+    *,
+    seq_len: int,
+    batch_size: int | None = None,
+    flash_cfg: ModelHFFlashConfig | None = None,
+    device: torch.device | None = None,
+) -> str:
+    """Select the segment-aware ragged backend for one packed batch.
 
-    :param bool requested: Whether compile was requested by config.
-    :raises RuntimeError: If compile was requested but torch.compile is unavailable.
-    :return bool: True when compile should be enabled.
+    :param int seq_len: Packed sequence length.
+    :param int | None batch_size: Unused packed batch size.
+    :param ModelHFFlashConfig | None flash_cfg: Unused resolved flash config.
+    :param torch.device | None device: Unused batch device.
+    :return str: ``"docblock"``.
     """
-    if not bool(requested):
-        return False
-    if not hasattr(torch, "compile"):
-        raise RuntimeError(
-            "train.torch_compile=true requested but this PyTorch build does not expose torch.compile."
+
+    del seq_len, batch_size, flash_cfg, device
+    return "docblock"
+
+
+def _flash_meta_with_route(
+    flash_meta: FlashBatchMeta | None,
+    route_hint: str | None,
+    *,
+    kernel_policy_path: str,
+    kernel_policy_key: str,
+) -> FlashBatchMeta | None:
+    """Return metadata with a route hint override.
+
+    :param FlashBatchMeta | None flash_meta: Existing metadata bundle.
+    :param str | None route_hint: Route hint to install.
+    :param str kernel_policy_path: Normalized model-scoped policy path.
+    :param str kernel_policy_key: Immutable materialized-policy key.
+    :return FlashBatchMeta | None: Metadata bundle with the requested route.
+    """
+
+    if flash_meta is None:
+        return (
+            FlashBatchMeta(
+                route_hint=route_hint,
+                kernel_policy_path=kernel_policy_path,
+                kernel_policy_key=kernel_policy_key,
+            )
+            if route_hint is not None
+            else None
         )
-    return True
+    if flash_meta.route_hint is not None and flash_meta.kernel_policy_key != kernel_policy_key:
+        raise RuntimeError(
+            "FlashDeBERTa route metadata was prepared for a different kernel policy: "
+            f"metadata={flash_meta.kernel_policy_path!r}, model={kernel_policy_path!r}."
+        )
+    if (
+        flash_meta.route_hint == route_hint
+        and flash_meta.kernel_policy_path == kernel_policy_path
+        and flash_meta.kernel_policy_key == kernel_policy_key
+    ):
+        return flash_meta
+    return dataclasses.replace(
+        flash_meta,
+        route_hint=route_hint,
+        kernel_policy_path=kernel_policy_path,
+        kernel_policy_key=kernel_policy_key,
+    )
+
+
+def prepare_flash_attention_batch_metadata(
+    *,
+    batch: dict[str, Any],
+    backbone_type: str,
+    flash_enabled: bool = False,
+    flash_cfg: ModelHFFlashConfig | None = None,
+    route_device: torch.device | None = None,
+    kernel_policy_key: str | None = None,
+) -> tuple[dict[str, Any], FlashBatchMeta | None]:
+    """Select the attention route from collator-built batch metadata.
+
+    :param dict[str, Any] batch: Device-local batch mapping.
+    :param str backbone_type: Backbone type string.
+    :param bool flash_enabled: Whether the active backend can consume flash metadata.
+    :param ModelHFFlashConfig | None flash_cfg: Optional resolved flash config for route selection.
+    :param torch.device | None route_device: Optional eventual activation device
+        when preparing metadata before transfer.
+    :param str | None kernel_policy_key: Pre-materialized policy key for the active model.
+    :return tuple[dict[str, Any], FlashBatchMeta | None]: Updated batch and optional metadata.
+    """
+
+    flash_meta = batch.pop("_flash_meta", None)
+    if not isinstance(flash_meta, FlashBatchMeta):
+        flash_meta = None
+
+    input_ids = batch.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
+        return batch, None
+
+    btype = str(backbone_type).strip().lower()
+    seq_len = int(input_ids.shape[-1])
+    batch_size = int(input_ids.shape[0])
+    routing_device = route_device if route_device is not None else input_ids.device
+    flash_enabled = bool(flash_enabled)
+
+    doc_ids = batch.pop("doc_ids", None)
+    if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
+        if btype != "hf_deberta_v2" or not flash_enabled or flash_meta is None:
+            batch["attention_mask"] = build_doc_block_mask(doc_ids)
+            return batch, None
+
+    if btype != "hf_deberta_v2" or not flash_enabled:
+        return batch, None
+
+    policy_path = normalize_flash_kernel_policy_path(
+        flash_cfg.kernel_overrides_path if flash_cfg is not None else None
+    )
+    policy_key = (
+        str(kernel_policy_key)
+        if kernel_policy_key is not None
+        else materialize_flash_kernel_policy(policy_path).key
+    )
+
+    if isinstance(doc_ids, torch.Tensor) and doc_ids.ndim == 2:
+        route_hint = _flash_route_hint_for_docblock_batch(
+            seq_len=seq_len,
+            batch_size=batch_size,
+            flash_cfg=flash_cfg,
+            device=routing_device,
+        )
+        batch["attention_mask"] = doc_ids.ne(0)
+        return (
+            batch,
+            dataclasses.replace(
+                flash_meta,
+                doc_ids=doc_ids,
+                route_hint=route_hint,
+                kernel_policy_path=policy_path,
+                kernel_policy_key=policy_key,
+            ),
+        )
+
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None:
+        seq_bucket = flash_seq_bucket(
+            seq_len=seq_len,
+            total_tokens=batch_size * seq_len,
+            batch_size=batch_size,
+            policy_path=policy_key,
+        )
+        route_hint = flash_route_choice(
+            policy="local_bias",
+            seq_bucket=seq_bucket,
+            compute_capability=device_compute_capability(routing_device),
+            seq_len=seq_len,
+            batch_size=batch_size,
+            policy_path=policy_key,
+        )
+        return batch, FlashBatchMeta(
+            route_hint="local_bias" if route_hint == "local_bias" else "dense",
+            seq_bucket=seq_bucket,
+            kernel_policy_path=policy_path,
+            kernel_policy_key=policy_key,
+        )
+    if not isinstance(attention_mask, torch.Tensor):
+        return batch, None
+    if is_pairwise_mask(attention_mask, query_len=seq_len, key_len=seq_len):
+        return batch, None
+    if flash_meta is None or flash_meta.seq_lengths is None or flash_meta.active_tokens_scalar is None:
+        return batch, None
+
+    active_tokens = int(flash_meta.active_tokens_scalar)
+    seq_bucket = flash_seq_bucket(
+        seq_len=seq_len,
+        total_tokens=active_tokens,
+        batch_size=batch_size,
+        policy_path=policy_key,
+    )
+    route_hint = flash_route_choice(
+        policy="padding",
+        seq_bucket=seq_bucket,
+        compute_capability=device_compute_capability(routing_device),
+        seq_len=seq_len,
+        batch_size=batch_size,
+        policy_path=policy_key,
+    )
+    return batch, dataclasses.replace(
+        flash_meta,
+        route_hint=route_hint if route_hint in {"fixed", "varlen"} else "fixed",
+        seq_bucket=seq_bucket,
+        kernel_policy_path=policy_path,
+        kernel_policy_key=policy_key,
+    )
 
 
 def _maybe_cudagraph_mark_step_begin() -> None:
@@ -151,6 +338,33 @@ def _resolve_compile_scope(
     return "backbones", None
 
 
+def _resolve_effective_compile_scope(
+    *,
+    train_cfg: Any,
+    model_cfg: ModelConfig,
+    data_cfg: Any,
+    compile_enabled: bool,
+) -> tuple[str, str, str | None]:
+    """Resolve requested and effective compile scope for one training run.
+
+    :param Any train_cfg: Train config carrying ``torch_compile_scope``.
+    :param ModelConfig model_cfg: Model configuration.
+    :param Any data_cfg: Data config carrying ``block_cross_document_attention``.
+    :param bool compile_enabled: Whether torch.compile is enabled.
+    :return tuple[str, str, str | None]: Requested scope, effective scope, and
+        optional downgrade reason (effective == requested when compile is off).
+    """
+    requested_scope = str(train_cfg.compile.scope).strip().lower()
+    if not compile_enabled:
+        return requested_scope, requested_scope, None
+    scope, reason = _resolve_compile_scope(
+        requested_scope=requested_scope,
+        model_cfg=model_cfg,
+        block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
+    )
+    return requested_scope, scope, reason
+
+
 def _compile_backbones_for_scope(
     *,
     unwrapped_model: torch.nn.Module,
@@ -180,6 +394,13 @@ def _compile_backbones_for_scope(
         :param torch.nn.Module module: Module whose forward should be compiled.
         :param str target: Human-readable target name for logs.
         """
+        if _install_stable_backbone_compile_dispatch(
+            module=module,
+            compile_kwargs=compile_kwargs,
+            target=target,
+            compiled_targets=compiled_targets,
+        ):
+            return
         forward = getattr(module, "forward", None)
         if not callable(forward):
             raise RuntimeError(f"{target}.forward is required for compile scope.")
@@ -240,7 +461,7 @@ def _compile_backbones_for_scope(
     if compile_scope == "backbones":
         _compile_module_forward(module=generator, target="generator")
         _compile_module_forward(module=discriminator, target="discriminator")
-        return ["generator", "discriminator"]
+        return compiled_targets
 
     if compile_scope in {"encoder", "gen_encoder"}:
         gen_encoder = getattr(generator, "encoder", None)
@@ -265,6 +486,300 @@ def _compile_backbones_for_scope(
     return compiled_targets
 
 
+def _install_stable_backbone_compile_dispatch(
+    *,
+    module: torch.nn.Module,
+    compile_kwargs: dict[str, Any],
+    target: str,
+    compiled_targets: list[str],
+) -> bool:
+    """Install a stable compiled dense/masked dispatcher when supported.
+
+    Native HF DeBERTa backbones accept Python optionals in ``forward`` for
+    ``attention_mask`` and output flags. Compiling that public ``forward``
+    directly encourages Dynamo to guard on ``None``/bool optionals. When the
+    backbone exposes resolved dense/masked helpers, compile those stable
+    entrypoints instead and leave ``forward`` as a tiny Python dispatcher.
+
+    :param torch.nn.Module module: Candidate backbone module.
+    :param dict[str, Any] compile_kwargs: Keyword arguments passed to ``torch.compile``.
+    :param str target: Human-readable target name for logs.
+    :param list[str] compiled_targets: Accumulator for compiled target labels.
+    :return bool: True when a stable dispatcher was installed.
+    """
+
+    resolve_options = getattr(module, "_resolve_forward_options", None)
+    dense_hs0 = getattr(module, "_forward_dense_hs0", None)
+    dense_hs1 = getattr(module, "_forward_dense_hs1", None)
+    masked_hs0 = getattr(module, "_forward_masked_hs0", None)
+    masked_hs1 = getattr(module, "_forward_masked_hs1", None)
+    if not (
+        callable(resolve_options)
+        and callable(dense_hs0)
+        and callable(dense_hs1)
+        and callable(masked_hs0)
+        and callable(masked_hs1)
+    ):
+        return False
+    dense_hs0_fn = dense_hs0
+    dense_hs1_fn = dense_hs1
+    masked_hs0_fn = masked_hs0
+    masked_hs1_fn = masked_hs1
+    policy_snapshots = {
+        (
+            str(submodule.flash_kernel_policy_path),
+            str(getattr(submodule, "flash_kernel_policy_key", "")),
+        )
+        for submodule in module.modules()
+        if hasattr(submodule, "flash_kernel_policy_path")
+    }
+    if len(policy_snapshots) > 1:
+        raise RuntimeError(
+            f"{target} contains conflicting FlashDeBERTa kernel policies: {sorted(policy_snapshots)}."
+        )
+    kernel_policy_path, kernel_policy_key = next(iter(policy_snapshots), ("", ""))
+
+    def _make_routed_dense_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
+        """Bind a fixed flash route onto one stable dense entrypoint.
+
+        :param Callable[..., Any] base_fn: Stable dense helper to wrap.
+        :param str route: Flash route literal stamped onto static metadata.
+        :return Callable[..., Any]: Route-bound dense entrypoint.
+        """
+
+        routed_meta = FlashBatchMeta(
+            route_hint=route,
+            kernel_policy_path=kernel_policy_path,
+            kernel_policy_key=kernel_policy_key,
+        )
+
+        def _routed_dense_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            flash_meta: FlashBatchMeta | None = None,
+        ) -> Any:
+            """Call the dense helper with a fixed flash route.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :param FlashBatchMeta | None flash_meta: Validated route metadata.
+            :return Any: Dense-path backbone outputs.
+            """
+
+            return base_fn(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                flash_meta=flash_meta if flash_meta is not None else routed_meta,
+            )
+
+        return _routed_dense_fn
+
+    def _make_routed_masked_fn(base_fn: Callable[..., Any], route: str) -> Callable[..., Any]:
+        """Bind a fixed flash route onto one stable masked entrypoint.
+
+        Each returned closure is a distinct function object, so ``torch.compile``
+        keeps one compiled artifact per (route, hidden-states) combination.
+
+        :param Callable[..., Any] base_fn: Stable masked helper to wrap.
+        :param str route: Flash route literal stamped onto ``flash_meta``.
+        :return Callable[..., Any]: Route-bound masked entrypoint.
+        """
+
+        def _routed_masked_fn(
+            *,
+            input_ids: torch.Tensor | None = None,
+            attention_mask: torch.Tensor,
+            token_type_ids: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            flash_meta: FlashBatchMeta | None = None,
+        ) -> Any:
+            """Call the masked helper with a fixed flash route.
+
+            :param torch.Tensor | None input_ids: Optional input token ids.
+            :param torch.Tensor attention_mask: Attention mask tensor.
+            :param torch.Tensor | None token_type_ids: Optional token type ids.
+            :param torch.Tensor | None position_ids: Optional position ids.
+            :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+            :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+            :return Any: Masked-path backbone outputs.
+            """
+
+            return base_fn(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                flash_meta=_flash_meta_with_route(
+                    flash_meta,
+                    route,
+                    kernel_policy_path=kernel_policy_path,
+                    kernel_policy_key=kernel_policy_key,
+                ),
+            )
+
+        return _routed_masked_fn
+
+    def _compile_routed_masked_pair(route: str) -> dict[bool, Any]:
+        """Compile the hs0/hs1 masked entrypoints bound to one flash route.
+
+        :param str route: Flash route literal.
+        :return dict[bool, Any]: Compiled entrypoints keyed by ``output_hidden_states``.
+        """
+
+        return {
+            False: torch.compile(_make_routed_masked_fn(masked_hs0_fn, route), **compile_kwargs),
+            True: torch.compile(_make_routed_masked_fn(masked_hs1_fn, route), **compile_kwargs),
+        }
+
+    compiled_dense = {
+        False: torch.compile(dense_hs0_fn, **compile_kwargs),
+        True: torch.compile(dense_hs1_fn, **compile_kwargs),
+    }
+    compiled_dense_routed = {
+        route: {
+            False: torch.compile(_make_routed_dense_fn(dense_hs0_fn, route), **compile_kwargs),
+            True: torch.compile(_make_routed_dense_fn(dense_hs1_fn, route), **compile_kwargs),
+        }
+        for route in ("dense", "local_bias")
+    }
+    compiled_masked = {
+        False: torch.compile(masked_hs0_fn, **compile_kwargs),
+        True: torch.compile(masked_hs1_fn, **compile_kwargs),
+    }
+    # Routes with a dedicated compiled specialization; adding a route family
+    # means adding one entry here. Hints outside this mapping (or None) run the
+    # generic masked entrypoint with the hint re-attached, so the model-side
+    # adapter still resolves them.
+    compiled_masked_routed = {
+        route: _compile_routed_masked_pair(route)
+        for route in ("fixed", "varlen", "docblock", "docblock_bias")
+    }
+
+    def _dispatch_forward(
+        self: torch.nn.Module,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> Any:
+        """Normalize public options, then dispatch into stable compiled entrypoints.
+
+        :param torch.nn.Module self: Backbone module instance.
+        :param torch.Tensor | None input_ids: Optional input token ids.
+        :param torch.Tensor | None attention_mask: Optional attention mask.
+        :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional position ids.
+        :param torch.Tensor | None inputs_embeds: Optional precomputed embeddings.
+        :param bool | None output_attentions: Optional attention-output flag.
+        :param bool | None output_hidden_states: Optional hidden-state-output flag.
+        :param bool | None return_dict: Optional return-format flag.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return Any: Module outputs from either a compiled fast path or the generic resolved path.
+        """
+
+        (
+            resolved_output_attentions,
+            resolved_output_hidden_states,
+            resolved_return_dict,
+        ) = self._resolve_forward_options(  # type: ignore[attr-defined]
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        route = flash_meta.route_hint if flash_meta is not None else None
+        routed_meta = _flash_meta_with_route(
+            flash_meta,
+            route,
+            kernel_policy_path=kernel_policy_path,
+            kernel_policy_key=kernel_policy_key,
+        )
+        # The fast compiled path specializes on the fixed training contract:
+        # return_dict=True, output_attentions=False, output_hidden_states in {False, True}.
+        # Other combinations are correct but uncommon in training, so keep them
+        # on the uncompiled resolved path instead of exploding compile variants.
+        if resolved_output_attentions or not resolved_return_dict:
+            return self._forward_resolved(  # type: ignore[attr-defined]
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=resolved_output_attentions,
+                output_hidden_states=resolved_output_hidden_states,
+                return_dict=resolved_return_dict,
+                flash_meta=routed_meta,
+            )
+        if attention_mask is None:
+            routed_dense = compiled_dense_routed.get(route) if route is not None else None
+            if routed_dense is not None:
+                return routed_dense[resolved_output_hidden_states](
+                    input_ids=input_ids,
+                    token_type_ids=token_type_ids,
+                    position_ids=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    flash_meta=routed_meta,
+                )
+            return compiled_dense[resolved_output_hidden_states](
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+        routed = compiled_masked_routed.get(route) if route is not None else None
+        if routed is not None:
+            return routed[resolved_output_hidden_states](
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                flash_meta=routed_meta,
+            )
+        return compiled_masked[resolved_output_hidden_states](
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            flash_meta=routed_meta,
+        )
+
+    module.forward = types.MethodType(_dispatch_forward, module)  # type: ignore[assignment]
+    compiled_targets.extend(
+        [
+            f"{target}[dense_hs0]",
+            f"{target}[dense_hs1]",
+            *(
+                f"{target}[dense_{route}_hs{int(hs)}]"
+                for route in compiled_dense_routed
+                for hs in (False, True)
+            ),
+            f"{target}[masked_hs0]",
+            f"{target}[masked_hs1]",
+            *(
+                f"{target}[masked_{route}_hs{int(hs)}]"
+                for route in compiled_masked_routed
+                for hs in (False, True)
+            ),
+        ]
+    )
+    return True
+
+
 def _dtype_for_mixed_precision(mode: str) -> torch.dtype:
     """Map configured mixed-precision mode to runtime compute dtype.
 
@@ -274,8 +789,6 @@ def _dtype_for_mixed_precision(mode: str) -> torch.dtype:
     normalized = str(mode).strip().lower()
     if normalized == "bf16":
         return torch.bfloat16
-    if normalized in {"fp16", "float16"}:
-        return torch.float16
     return torch.float32
 
 
@@ -305,48 +818,6 @@ def _prefill_rotary_caches_for_compile(
             prefill(int(seq_len), device=device, dtype=dtype)
             prefilled += 1
     return prefilled
-
-
-def _build_doc_block_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-    """Build a pairwise ``(B, S, S)`` keep-mask from document ids on-device.
-
-    Contract:
-
-    - Active tokens (``doc_id != 0``) attend only within the same document.
-    - The diagonal encodes query activity (active ``True``, pad/inactive ``False``).
-    - Inactive/pad queries get a single keep-edge to the CLS key (position 0) so SDPA
-      never sees all-False rows.
-
-    :param torch.Tensor doc_ids: Document id tensor ``(B, S)`` with 0 for padding.
-    :return torch.Tensor: Bool keep-mask ``(B, S, S)``.
-    """
-    if doc_ids.ndim != 2:
-        raise ValueError(f"doc_ids must be rank-2 (B,S); got shape={tuple(doc_ids.shape)}")
-
-    bsz, seq_len = int(doc_ids.shape[0]), int(doc_ids.shape[1])
-    device = doc_ids.device
-
-    key = (seq_len, str(device.type), int(device.index) if device.index is not None else None)
-    eye = _DOC_BLOCK_EYE_CACHE.get(key)
-    if eye is None or eye.device != device or eye.shape != (seq_len, seq_len):
-        eye = torch.eye(seq_len, dtype=torch.bool, device=device)
-        _DOC_BLOCK_EYE_CACHE[key] = eye
-
-    cls_key = _DOC_BLOCK_CLS_KEY_CACHE.get(key)
-    if cls_key is None or cls_key.device != device or cls_key.shape != (seq_len,):
-        cls_key = torch.zeros(seq_len, dtype=torch.bool, device=device)
-        cls_key[0] = True
-        _DOC_BLOCK_CLS_KEY_CACHE[key] = cls_key
-
-    active = doc_ids.ne(0)  # (B,S)
-    same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])  # (B,S,S)
-    keep = same_doc & active[:, :, None] & active[:, None, :]
-    keep = keep | ((~active)[:, :, None] & cls_key[None, None, :])
-    keep = (keep & ~eye[None, :, :]) | (eye[None, :, :] & active[:, :, None])
-
-    if int(keep.shape[0]) != bsz:
-        raise RuntimeError("doc-block mask batch dimension mismatch.")
-    return keep
 
 
 def _stabilize_compile_attention_mask(

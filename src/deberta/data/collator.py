@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    build_doc_segment_boundaries,
+    build_doc_segment_metadata,
+    build_validated_prefix_lengths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +23,9 @@ logger = logging.getLogger(__name__)
 class MLMConfig:
     """Masking configuration.
 
-    Notes:
-      - Mask selection uses DeBERTa's windowed n-gram policy for all max_ngram>=1.
-      - max_ngram == 1 corresponds to DeBERTa windowed unigram masking (not BERT iid masking).
-      - max_ngram > 1 enables whole-word n-gram grouping.
-      - Replacement probabilities are conditional on *being selected for masking*.
-        (i.e., they should sum to <= 1; remainder keeps the original token).
+    Mask selection uses DeBERTa's windowed policy: ``max_ngram=1`` selects windowed unigrams and
+    larger values enable whole-word n-grams. Replacement probabilities are conditional on token
+    selection and must sum to at most one; the remainder keeps the original token.
     """
 
     mlm_probability: float
@@ -34,17 +37,14 @@ class MLMConfig:
 class DebertaV3ElectraCollator:
     """Dynamic MLM masking collator suitable for RTD/ELECTRA-style pretraining.
 
-    Produces:
-      - input_ids (masked)
-      - labels (original token ids at masked positions, -100 elsewhere)
-      - attention_mask (optional; omitted for fully-unpadded batches)
-      - token_type_ids (if present)
+    Produces masked ``input_ids``, MLM ``labels``, and optional attention/token-type tensors.
+    Packed doc-block batches carry ``doc_ids``; ``emit_flash_metadata=True`` additionally emits
+    the compact metadata consumed by FlashDeBERTa. See
+    [Data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking) for the complete
+    batch-preparation contract.
 
-    Notes:
-      - If `special_tokens_mask` is provided, we merge it with tokenizer-inferred
-        special ids so upstream partial masks cannot unprotect tokenizer specials.
-      - Default behavior mirrors BERT's 80/10/10 replacement.
-      - Supports optional whole-word n-gram masking (max_ngram > 1) as used by DeBERTa.
+    Replacement probabilities come from ``MLMConfig``. Training config resolution may replace
+    those raw helper defaults for the selected backbone; see ``configs/config_reference.yaml``.
     """
 
     def __init__(
@@ -54,6 +54,7 @@ class DebertaV3ElectraCollator:
         cfg: MLMConfig,
         packed_sequences: bool = False,
         block_cross_document_attention: bool = True,
+        emit_flash_metadata: bool = True,
         pad_to_multiple_of: int | None = None,
     ) -> None:
         """Initialize collator state.
@@ -61,14 +62,16 @@ class DebertaV3ElectraCollator:
         :param Any tokenizer: HF tokenizer.
         :param MLMConfig cfg: Masking configuration.
         :param bool packed_sequences: Whether inputs are pre-packed with internal separators.
-        :param bool block_cross_document_attention: Whether to emit 3D doc-block masks for packed inputs.
-        :param int | None pad_to_multiple_of: Optional right-padding multiple.
+        :param bool block_cross_document_attention: Whether to emit compact document metadata for packed inputs.
+        :param bool emit_flash_metadata: Whether to build Flash routing metadata.
+        :param int | None pad_to_multiple_of: Optional padding multiple.
         """
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.pad_to_multiple_of = pad_to_multiple_of
         self._packed_sequences = bool(packed_sequences)
         self._block_cross_document_attention = bool(block_cross_document_attention)
+        self._emit_flash_metadata = bool(emit_flash_metadata)
 
         if self.tokenizer.mask_token_id is None:
             raise ValueError("Tokenizer must define a mask token for MLM masking.")
@@ -102,8 +105,17 @@ class DebertaV3ElectraCollator:
                 "whole-word n-gram masking will degrade to conservative token-level groups."
             )
 
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         features = self._harmonize_optional_attention_masks(features)
+        needs_padding = self._needs_padding(features)
+        doc_id_rows = None
+        if self._packed_sequences and self._block_cross_document_attention:
+            if any("doc_ids" not in feature for feature in features):
+                raise ValueError("Packed document blocking requires doc_ids on every feature.")
+            doc_id_rows = [feature["doc_ids"] for feature in features]
+            features = [
+                {key: value for key, value in feature.items() if key != "doc_ids"} for feature in features
+            ]
 
         # Let tokenizer handle padding for non-packed datasets.
         pad_kwargs: dict[str, Any] = {
@@ -112,23 +124,26 @@ class DebertaV3ElectraCollator:
         }
         # If no padding is needed and the dataset does not provide attention_mask, avoid
         # materializing an all-ones mask.
-        if not any("attention_mask" in f for f in features) and not self._needs_padding(features):
+        if not any("attention_mask" in f for f in features) and not needs_padding:
             pad_kwargs["return_attention_mask"] = False
-        try:
-            batch = self.tokenizer.pad(features, **pad_kwargs)
-        except TypeError:
-            # Some minimal tokenizer stubs do not accept return_attention_mask.
-            pad_kwargs.pop("return_attention_mask", None)
-            batch = self.tokenizer.pad(features, **pad_kwargs)
+        batch = self.tokenizer.pad(features, **pad_kwargs)
 
-        # Safety fallback: if tokenizer did not emit an attention mask, infer one from
-        # padded input_ids when pad tokens are present.
-        if "attention_mask" not in batch:
-            pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-            if pad_token_id is not None:
-                attn = batch["input_ids"].ne(int(pad_token_id))
-                if not bool(attn.all().item()):
-                    batch["attention_mask"] = attn.long()
+        batch.pop("doc_context_index", None)
+        if self._packed_sequences and self._block_cross_document_attention:
+            batch.pop("position_ids", None)
+
+        if "attention_mask" not in batch and needs_padding:
+            raise ValueError(
+                "tokenizer.pad must return attention_mask when it adds padding; "
+                "token IDs are not a valid substitute for token liveness."
+            )
+
+        attention_mask = batch.get("attention_mask")
+        active_tokens = (
+            torch.ones_like(batch["input_ids"], dtype=torch.bool)
+            if attention_mask is None
+            else attention_mask.ne(0)
+        )
 
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         inferred_special_tokens_mask = self._infer_special_tokens_mask(batch["input_ids"])
@@ -139,38 +154,187 @@ class DebertaV3ElectraCollator:
             # structural specials (CLS/SEP/PAD). Union with tokenizer-level specials
             # so corruption targets stay aligned with forbidden sampling ids.
             special_tokens_mask = special_tokens_mask.bool() | inferred_special_tokens_mask
+        special_tokens_mask = special_tokens_mask.bool() | ~active_tokens
 
-        doc_ids = (
-            self._compute_document_ids(
-                input_ids=batch["input_ids"],
-                special_tokens_mask=special_tokens_mask,
-                attention_mask=batch.get("attention_mask"),
-            )
-            if self._packed_sequences and self._block_cross_document_attention
-            else None
-        )
+        doc_ids = None
+        if doc_id_rows is not None:
+            doc_ids = torch.zeros_like(batch["input_ids"], dtype=torch.long)
+            padding_side = str(getattr(self.tokenizer, "padding_side", "right")).strip().lower()
+            for row_index, row_doc_ids in enumerate(doc_id_rows):
+                row_tensor = torch.as_tensor(row_doc_ids, dtype=torch.long)
+                row_length = int(row_tensor.numel())
+                # doc_ids bypass tokenizer.pad, so mirror its per-row padding offset.
+                row_start = int(doc_ids.shape[1]) - row_length if padding_side == "left" else 0
+                doc_ids[row_index, row_start : row_start + row_length] = row_tensor
+        else:
+            batch.pop("doc_ids", None)
         if doc_ids is not None:
             batch["doc_ids"] = doc_ids
+            boundaries = build_doc_segment_boundaries(doc_ids)
+            self._attach_document_objective_metadata(
+                batch=batch,
+                doc_ids=doc_ids,
+                boundaries=boundaries,
+            )
+            if self._emit_flash_metadata:
+                self._attach_flash_doc_metadata(
+                    batch=batch,
+                    doc_ids=doc_ids,
+                    boundaries=boundaries,
+                )
         else:
             # Packed/unpadded pretraining examples often have all-ones attention masks.
             # Drop all-ones masks so downstream can pass attention_mask=None to SDPA.
             attn = batch.get("attention_mask")
             if attn is not None:
-                try:
-                    if attn.dtype == torch.bool:
-                        all_active = bool(attn.all().item())
-                    else:
-                        all_active = bool((attn == 1).all().item())
-                    if all_active:
-                        batch.pop("attention_mask", None)
-                except Exception:
-                    pass
+                all_active = (
+                    bool(attn.all().item()) if attn.dtype == torch.bool else bool((attn == 1).all().item())
+                )
+                if all_active:
+                    batch.pop("attention_mask", None)
+                elif not bool(attn[:, 0].ne(0).all().item()):
+                    # The RTD and EMD heads read each row's first position as its
+                    # context token and assign absolute positions from index 0, so
+                    # rows padded on the left would silently train on garbage.
+                    raise ValueError(
+                        "Rows must keep position 0 active outside doc-block packing: "
+                        "the RTD/EMD heads read the first position as each row's "
+                        "context token. Use right padding, or enable "
+                        "block_cross_document_attention so rows carry doc_context_index."
+                    )
+            if self._emit_flash_metadata:
+                self._attach_flash_padding_metadata(batch)
 
-        input_ids, labels = self._mask_tokens(batch["input_ids"], special_tokens_mask=special_tokens_mask)
+        input_ids, labels = self._mask_tokens(
+            batch["input_ids"],
+            special_tokens_mask=special_tokens_mask,
+        )
 
         batch["input_ids"] = input_ids
         batch["labels"] = labels
         return batch
+
+    @staticmethod
+    def _attach_flash_doc_metadata(
+        *,
+        batch: dict[str, Any],
+        doc_ids: torch.Tensor,
+        boundaries: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Attach CPU-built flash metadata for compact doc-block batches.
+
+        :param dict[str, Any] batch: Collated batch mapping.
+        :param torch.Tensor doc_ids: Compact document ids in ``(B,S)`` layout.
+        :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] boundaries: Precomputed
+            active-token mask and segment start/end indices.
+        """
+
+        segment_offsets, segment_lengths, cu_seqlens, active_tokens = build_doc_segment_metadata(
+            doc_ids,
+            boundaries=boundaries,
+        )
+        active_segment_lengths = segment_lengths[segment_lengths.ne(0)]
+        num_segments = int(active_segment_lengths.numel())
+        max_segment_length = int(active_segment_lengths.max()) if num_segments else 0
+        batch["_flash_meta"] = FlashBatchMeta(
+            doc_segment_offsets=segment_offsets,
+            doc_segment_lengths=segment_lengths,
+            doc_cu_seqlens=cu_seqlens,
+            active_tokens_scalar=torch.tensor(active_tokens, dtype=torch.int32),
+            doc_num_segments_scalar=torch.tensor(num_segments, dtype=torch.int32),
+            doc_max_segment_length_scalar=torch.tensor(max_segment_length, dtype=torch.int32),
+        )
+
+    def _attach_document_objective_metadata(
+        self,
+        *,
+        batch: dict[str, Any],
+        doc_ids: torch.Tensor,
+        boundaries: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Attach document-local positions and per-token CLS context indices.
+
+        :param dict[str, Any] batch: Collated batch mapping.
+        :param torch.Tensor doc_ids: Validated document ids in ``(B,S)`` layout.
+        :param tuple[torch.Tensor, torch.Tensor, torch.Tensor] boundaries: Precomputed
+            active-token mask and segment start/end indices.
+        :raises ValueError: If document ids or standalone CLS/SEP boundaries are invalid.
+        """
+
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        active, start_idx, end_idx = boundaries
+        expected_active = (
+            attention_mask.to(dtype=torch.bool)
+            if isinstance(attention_mask, torch.Tensor)
+            else torch.ones_like(doc_ids, dtype=torch.bool)
+        )
+        if not torch.equal(active, expected_active):
+            raise ValueError("Packed doc_ids liveness disagrees with attention_mask.")
+
+        batch_size, seq_len = doc_ids.shape
+        for row_index in range(batch_size):
+            row_start_idx = start_idx[start_idx[:, 0].eq(row_index), 1]
+            segment_doc_ids = doc_ids[row_index, row_start_idx]
+            if int(torch.unique(segment_doc_ids).numel()) != int(segment_doc_ids.numel()):
+                raise ValueError(
+                    "Each nonzero doc_id must occupy exactly one contiguous segment per packed row."
+                )
+
+        positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        start_positions = torch.zeros_like(positions)
+        start_positions[start_idx[:, 0], start_idx[:, 1]] = positions[start_idx[:, 0], start_idx[:, 1]]
+        doc_context_index = torch.cummax(start_positions, dim=-1).values
+
+        cls_token_id = getattr(self.tokenizer, "cls_token_id", None)
+        if cls_token_id is None:
+            raise ValueError("Packed document segments require tokenizer.cls_token_id.")
+        context_tokens = input_ids.gather(1, doc_context_index)
+        if bool((active & context_tokens.ne(int(cls_token_id))).any().item()):
+            raise ValueError("Every packed document segment must begin with its own CLS token.")
+
+        sep_token_id = getattr(self.tokenizer, "sep_token_id", None)
+        if sep_token_id is None:
+            raise ValueError("Packed document segments require tokenizer.sep_token_id.")
+        if bool(input_ids[end_idx[:, 0], end_idx[:, 1]].ne(int(sep_token_id)).any().item()):
+            raise ValueError("Every packed document segment must end with its own SEP token.")
+
+        position_ids = (positions - doc_context_index).masked_fill(~active, 0)
+        batch["position_ids"] = position_ids
+        batch["doc_context_index"] = doc_context_index.masked_fill(~active, 0)
+
+    @staticmethod
+    def _attach_flash_padding_metadata(batch: dict[str, Any]) -> None:
+        """Attach cheap flash metadata for standard padded batches.
+
+        :param dict[str, Any] batch: Collated batch mapping.
+        """
+
+        attention_mask = batch.get("attention_mask")
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            return
+        if attention_mask.shape != batch["input_ids"].shape:
+            raise ValueError(
+                "attention_mask must match input_ids before flash metadata is built; "
+                f"got mask={tuple(attention_mask.shape)}, "
+                f"input_ids={tuple(batch['input_ids'].shape)}."
+            )
+        try:
+            seq_lengths = build_validated_prefix_lengths(
+                attention_mask,
+                seq_len=int(batch["input_ids"].shape[-1]),
+            )
+        except ValueError as exc:
+            # Arbitrary legal keep masks remain eager. Do not publish a lossy
+            # length summary for them.
+            if "right-padded prefix mask" not in str(exc):
+                raise
+            return
+        active_tokens = int(seq_lengths.sum(dtype=torch.int32))
+        batch["_flash_meta"] = FlashBatchMeta(
+            seq_lengths=seq_lengths,
+            active_tokens_scalar=torch.tensor(active_tokens, dtype=torch.int32),
+        )
 
     def _harmonize_optional_attention_masks(self, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Ensure optional ``attention_mask`` keys are consistent before tokenizer padding.
@@ -362,15 +526,7 @@ class DebertaV3ElectraCollator:
             tok = str(tok)
             if not tok or tok in special_tokens:
                 continue
-            if tok.startswith("##"):
-                continuation[i] = True
-                continue
-            if scheme == "sentencepiece":
-                continuation[i] = not tok.startswith("▁")
-            elif scheme == "gpt2":
-                continuation[i] = not tok.startswith("Ġ")
-            elif scheme == "wordpiece":
-                continuation[i] = False
+            continuation[i] = self._is_word_continuation_token(tok, scheme=scheme)
         return continuation
 
     def _infer_word_boundary_scheme_from_tokens(self, tokens: Sequence[str]) -> str:
@@ -387,71 +543,28 @@ class DebertaV3ElectraCollator:
             return "gpt2"
         return "none"
 
-    def _compute_document_ids(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        special_tokens_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        """Compute per-token document ids for cross-document attention blocking.
+    @staticmethod
+    def _is_word_continuation_token(token: str, *, scheme: str | None) -> bool:
+        """Return whether a token string continues the preceding word.
 
-        Returns a compact ``(B, S)`` long tensor of document ids (1-based for active
-        tokens, 0 for padding) instead of a dense ``(B, S, S)`` pairwise mask.  The
-        pairwise mask is constructed on-device in the training loop to avoid CPU→GPU
-        transfer of O(B*S²) data.
-
-        :param torch.Tensor input_ids: Batch token ids of shape (B, S).
-        :param torch.Tensor special_tokens_mask: Boolean special-token mask (B, S).
-        :param torch.Tensor | None attention_mask: Optional 2D active-token mask (B, S).
-        :return torch.Tensor | None: Document ids ``(B, S)`` long, or ``None`` when unnecessary.
+        :param str token: Token string from the tokenizer vocabulary.
+        :param str | None scheme: Detected tokenizer boundary scheme.
+        :return bool: True when the token should join the preceding word group.
         """
-        if input_ids.ndim != 2:
-            return None
-        if special_tokens_mask.ndim != 2 or special_tokens_mask.shape != input_ids.shape:
-            return None
 
-        sep_id = getattr(self.tokenizer, "sep_token_id", None)
-        if sep_id is None or input_ids.shape[1] < 3:
-            return None
-        sep_id = int(sep_id)
-
-        sep_positions = input_ids.eq(sep_id) & special_tokens_mask
-
-        pad_id = getattr(self.tokenizer, "pad_token_id", None)
-        if attention_mask is not None and attention_mask.ndim == 2:
-            active = attention_mask.to(dtype=torch.bool)
-        elif pad_id is not None:
-            active = input_ids.ne(int(pad_id))
-        else:
-            active = torch.ones_like(input_ids, dtype=torch.bool)
-
-        # Packed batches that contain only single-document chunks have no internal
-        # separators and do not need doc-blocking metadata.
-        internal_sep_positions = sep_positions[:, 1:-1] & active[:, 1:-1]
-        if not bool(internal_sep_positions.any().item()):
-            return None
-
-        # Collapse contiguous separator runs into one boundary increment so packed
-        # "... [SEP] [SEP] ..." tails do not create phantom empty-document segments.
-        sep_prev = torch.zeros_like(sep_positions)
-        sep_prev[:, 1:] = sep_positions[:, :-1]
-        sep_boundaries = sep_positions & (~sep_prev)
-        sep_before = sep_boundaries.long().cumsum(dim=1) - sep_boundaries.long()
-        doc_ids = sep_before + 1
-
-        cls_id = getattr(self.tokenizer, "cls_token_id", None)
-        if cls_id is not None:
-            cls_positions = input_ids.eq(int(cls_id)) & active
-            # Keep CLS in document 1 so strict packed doc-blocking stays block-diagonal.
-            doc_ids = doc_ids.masked_fill(cls_positions, 1)
-        if pad_id is not None:
-            doc_ids = doc_ids.masked_fill(input_ids.eq(int(pad_id)), 0)
-
-        return doc_ids
+        if token.startswith("##"):
+            return True
+        if scheme == "sentencepiece":
+            return not token.startswith("▁")
+        if scheme == "gpt2":
+            return not token.startswith("Ġ")
+        return False
 
     def _mask_tokens(
-        self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        *,
+        special_tokens_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply DeBERTa-style masking based on configured n-gram width.
 
@@ -460,39 +573,107 @@ class DebertaV3ElectraCollator:
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
         if int(self.cfg.max_ngram) <= 1:
-            return self._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special_tokens_mask)
+            return self._mask_tokens_unigram_windowed(
+                input_ids,
+                special_tokens_mask=special_tokens_mask,
+            )
         return self._mask_tokens_ngram(
-            input_ids, special_tokens_mask=special_tokens_mask, max_ngram=int(self.cfg.max_ngram)
+            input_ids,
+            special_tokens_mask=special_tokens_mask,
+            max_ngram=int(self.cfg.max_ngram),
         )
 
     @staticmethod
-    def _sample_windowed_unigram_indices(maskable_idx: torch.Tensor, *, mask_window: int) -> torch.Tensor:
+    def _sample_windowed_unigram_indices(maskable_idx: torch.Tensor, *, num_to_predict: int) -> torch.Tensor:
         """Sample one mask position per DeBERTa window from sorted candidate indices.
 
+        Candidates are split into ``num_to_predict`` contiguous windows of near-equal
+        size and one position is drawn uniformly from each. Sizing the windows from
+        the budget rather than from ``int(1 / mlm_probability)`` keeps the selection
+        count exact, so no candidate has to be trimmed afterwards; trimming a sorted
+        selection would starve the tail of every sequence.
+
         :param torch.Tensor maskable_idx: 1D sorted token positions.
-        :param int mask_window: Window size ``int(1 / mlm_probability)``.
+        :param int num_to_predict: Target number of positions to select.
         :return torch.Tensor: Selected token positions.
         """
         count = int(maskable_idx.numel())
-        if count <= 0:
+        n_windows = min(int(num_to_predict), count)
+        if n_windows <= 0:
             return maskable_idx.new_empty((0,), dtype=torch.long)
-        if mask_window <= 1:
+        if n_windows == count:
             return maskable_idx
 
-        n_windows = int(math.ceil(float(count) / float(mask_window)))
-        starts = torch.arange(n_windows, device=maskable_idx.device, dtype=torch.long) * int(mask_window)
-        sizes = torch.clamp(
-            torch.full((n_windows,), int(mask_window), device=maskable_idx.device, dtype=torch.long),
-            max=count - starts,
+        device = maskable_idx.device
+        edges = torch.arange(n_windows + 1, device=device, dtype=torch.long) * count // n_windows
+        starts = edges[:-1]
+        sizes = edges[1:] - starts
+        offsets = torch.floor(torch.rand(n_windows, device=device, dtype=torch.float32) * sizes.float()).to(
+            torch.long
         )
-        offsets = torch.floor(
-            torch.rand(n_windows, device=maskable_idx.device, dtype=torch.float32) * sizes.float()
-        ).to(torch.long)
-        selected_offsets = starts + offsets
-        return maskable_idx.index_select(0, selected_offsets)
+        return maskable_idx.index_select(0, starts + offsets)
+
+    def _resolve_masking_hyperparams(self, *, mlm_prob: float) -> tuple[float, float, float, int]:
+        """Resolve the shared DeBERTa masking hyperparameters for one batch.
+
+        :param float mlm_prob: Effective MLM probability.
+        :return tuple[float, float, float, int]: Mask/random/keep probabilities and window size.
+        """
+        mask_prob = float(self.cfg.mask_token_prob)
+        random_prob = float(self.cfg.random_token_prob)
+        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
+        mask_window = max(1, int(1.0 / mlm_prob))
+        return mask_prob, random_prob, keep_prob, mask_window
+
+    def _apply_mask_replacement_policy(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        row: int,
+        selected: torch.Tensor,
+        *,
+        mask_prob: float,
+        random_prob: float,
+        keep_prob: float,
+        mask_token_id: int,
+    ) -> None:
+        """Apply the mask/random/keep replacement policy to selected positions.
+
+        Mutates ``input_ids`` and ``labels`` for one batch row in place. RNG
+        draw order matches the historical inline implementation exactly (one
+        uniform roll per selection, then one random-word draw when needed).
+
+        :param torch.Tensor input_ids: Mutable input ids of shape (B, S).
+        :param torch.Tensor labels: Mutable MLM labels of shape (B, S).
+        :param int row: Batch row index.
+        :param torch.Tensor selected: Selected position indices for this row.
+        :param float mask_prob: Probability of replacing with the mask token.
+        :param float random_prob: Probability of replacing with a random token.
+        :param float keep_prob: Probability of keeping the original token.
+        :param int mask_token_id: Mask token id.
+        """
+        originals = input_ids[row].index_select(0, selected)
+        labels[row].scatter_(0, selected, originals)
+
+        if mask_prob >= 1.0 and random_prob <= 0.0:
+            input_ids[row, selected] = mask_token_id
+            return
+
+        roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
+        mask_sel = roll < mask_prob
+        rand_sel = roll >= (mask_prob + keep_prob)
+
+        if bool(mask_sel.any().item()):
+            input_ids[row, selected[mask_sel]] = mask_token_id
+        if random_prob > 0.0 and bool(rand_sel.any().item()):
+            rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
+            input_ids[row, selected[rand_sel]] = rand_ids
 
     def _mask_tokens_unigram_windowed(
-        self, input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        *,
+        special_tokens_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply DeBERTa windowed-unigram masking for ``max_ngram=1``.
 
@@ -506,50 +687,36 @@ class DebertaV3ElectraCollator:
         input_ids = input_ids.clone()
         labels = torch.full_like(input_ids, -100)
 
-        batch, seq_len = input_ids.shape
+        batch = int(input_ids.shape[0])
         mask_token_id = int(self.tokenizer.mask_token_id)
         mlm_prob = float(self.cfg.mlm_probability)
-        if mlm_prob <= 0.0:
-            return input_ids, labels
 
-        mask_prob = float(self.cfg.mask_token_prob)
-        random_prob = float(self.cfg.random_token_prob)
-        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
-        mask_window = max(1, int(1.0 / mlm_prob))
-        max_preds_per_seq = int(math.ceil(float(seq_len) * mlm_prob / 10.0) * 10)
+        mask_prob, random_prob, keep_prob, _ = self._resolve_masking_hyperparams(mlm_prob=mlm_prob)
 
         for b in range(batch):
             spec = special_tokens_mask[b].to(dtype=torch.bool)
             if bool(spec.all().item()):
                 continue
 
-            num_to_predict = min(max_preds_per_seq, max(1, int(round(float(seq_len) * mlm_prob))))
             maskable_idx = torch.nonzero(~spec, as_tuple=False).squeeze(-1)
             if int(maskable_idx.numel()) == 0:
                 continue
+            num_to_predict = max(1, int(round(float(maskable_idx.numel()) * mlm_prob)))
 
-            selected = self._sample_windowed_unigram_indices(maskable_idx, mask_window=mask_window)
+            selected = self._sample_windowed_unigram_indices(maskable_idx, num_to_predict=num_to_predict)
             if int(selected.numel()) == 0:
                 continue
-            if int(selected.numel()) > int(num_to_predict):
-                selected = selected[: int(num_to_predict)]
 
-            originals = input_ids[b].index_select(0, selected)
-            labels[b].scatter_(0, selected, originals)
-
-            if mask_prob >= 1.0 and random_prob <= 0.0:
-                input_ids[b, selected] = mask_token_id
-                continue
-
-            roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
-            mask_sel = roll < mask_prob
-            rand_sel = roll >= (mask_prob + keep_prob)
-
-            if bool(mask_sel.any().item()):
-                input_ids[b, selected[mask_sel]] = mask_token_id
-            if random_prob > 0.0 and bool(rand_sel.any().item()):
-                rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
-                input_ids[b, selected[rand_sel]] = rand_ids
+            self._apply_mask_replacement_policy(
+                input_ids,
+                labels,
+                b,
+                selected,
+                mask_prob=mask_prob,
+                random_prob=random_prob,
+                keep_prob=keep_prob,
+                mask_token_id=mask_token_id,
+            )
 
         return input_ids, labels
 
@@ -565,7 +732,7 @@ class DebertaV3ElectraCollator:
         Selection matches the original DeBERTa policy:
           - n-gram length sampled with p(n) ∝ 1/n
           - windowed selection with ``mask_window = int(1 / mlm_probability)``
-          - sequence-level target budget derived from full sequence length
+          - sequence-level target budget derived from eligible lexical tokens
         For ``max_ngram > 1``, word groups are built from tokenizer boundary heuristics.
 
         :param torch.Tensor input_ids: Input token ids of shape (B, S).
@@ -574,23 +741,16 @@ class DebertaV3ElectraCollator:
         :return tuple[torch.Tensor, torch.Tensor]: Masked ids and MLM labels.
         """
 
-        if int(max_ngram) <= 1:
-            return self._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special_tokens_mask)
-
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
 
         input_ids = input_ids.clone()
         labels = torch.full_like(input_ids, -100)
 
-        B, S = input_ids.shape
+        batch = int(input_ids.shape[0])
         mask_token_id = int(self.tokenizer.mask_token_id)
         mlm_prob = float(self.cfg.mlm_probability)
-        if mlm_prob <= 0.0:
-            return input_ids, labels
-        mask_prob = float(self.cfg.mask_token_prob)
-        random_prob = float(self.cfg.random_token_prob)
-        keep_prob = max(0.0, 1.0 - mask_prob - random_prob)
+        mask_prob, random_prob, keep_prob, mask_window = self._resolve_masking_hyperparams(mlm_prob=mlm_prob)
 
         # n-gram sampling distribution: p(n) ∝ 1/n
         cache_key = (
@@ -607,15 +767,11 @@ class DebertaV3ElectraCollator:
             probs = probs / probs.sum().clamp(min=1e-12)
             self._ngram_prob_cache[cache_key] = probs
 
-        mask_window = max(1, int(1.0 / mlm_prob))
-        max_preds_per_seq = int(math.ceil(float(S) * mlm_prob / 10.0) * 10)
-
-        for b in range(B):
+        for b in range(batch):
             spec = special_tokens_mask[b].to(dtype=torch.bool)
             if bool(spec.all().item()):
                 continue
 
-            num_to_predict = min(max_preds_per_seq, max(1, int(round(float(S) * mlm_prob))))
             ids = input_ids[b].tolist()
             spec_list = spec.tolist()
 
@@ -624,76 +780,84 @@ class DebertaV3ElectraCollator:
 
             if not groups:
                 continue
+            num_candidates = sum(len(group) for group in groups)
+            num_to_predict = max(1, int(round(float(num_candidates) * mlm_prob)))
 
-            mask_grams = [False] * len(groups)
-            offset = 0
-            while offset < len(groups):
-                gram_n = int(torch.multinomial(probs, 1).item()) + 1
-                ctx_size = min(gram_n * mask_window, len(groups) - offset)
-                if ctx_size <= 0:
-                    break
+            candidate_spans: list[list[int]] = []
+            segment_start = 0
+            while segment_start < len(groups):
+                segment_end = segment_start + 1
+                while segment_end < len(groups) and groups[segment_end - 1][-1] + 1 == groups[segment_end][0]:
+                    segment_end += 1
 
-                m = int(torch.randint(low=0, high=ctx_size, size=(1,), device=input_ids.device).item())
-                start = offset + m
-                end = min(offset + m + gram_n, len(groups))
-                offset = max(offset + ctx_size, end)
-                for i in range(start, end):
-                    mask_grams[i] = True
+                offset = segment_start
+                while offset < segment_end:
+                    gram_n = int(torch.multinomial(probs, 1).item()) + 1
+                    span = gram_n * mask_window
+                    remaining = segment_end - offset
+                    if remaining < span:
+                        # A trailing partial context window still marks a full n-gram, which
+                        # would mask short segments far above the 1 / mask_window rate. Take
+                        # every partial window with probability proportional to its width;
+                        # a row-level fallback below handles the all-rejected case without
+                        # privileging the first packed document.
+                        if float(torch.rand(1, device=input_ids.device).item()) * span >= remaining:
+                            break
+
+                    ctx_size = min(span, remaining)
+                    if ctx_size <= 0:
+                        break
+
+                    m = int(
+                        torch.randint(
+                            low=0,
+                            high=ctx_size,
+                            size=(1,),
+                            device=input_ids.device,
+                        ).item()
+                    )
+                    start = offset + m
+                    end = min(offset + m + gram_n, segment_end)
+                    offset = max(offset + ctx_size, end)
+                    candidate_spans.append(list(range(start, end)))
+
+                segment_start = segment_end
+
+            if not candidate_spans:
+                fallback = int(
+                    torch.randint(
+                        low=0,
+                        high=len(groups),
+                        size=(1,),
+                        device=input_ids.device,
+                    ).item()
+                )
+                candidate_spans.append([fallback])
 
             selected_positions: list[int] = []
-            budget = int(num_to_predict)
-            max_budget = int(max_preds_per_seq)
             used = 0
-            for do_mask, group in zip(mask_grams, groups, strict=True):
-                if not do_mask:
-                    continue
-                g_len = len(group)
-                if g_len <= 0:
-                    continue
-                # Keep whole-word integrity: never partially mask one word group.
-                if used + g_len > max_budget:
-                    break
-                if used + g_len > budget and used > 0:
-                    continue
-                selected_positions.extend(group)
-                used += g_len
-                if used >= budget:
+            # Consume independently sampled n-grams in random order. Adjacent
+            # candidates must remain separate budget units: merging them can
+            # create arbitrarily long spans that exceed max_ngram.
+            for s in torch.randperm(len(candidate_spans), device=input_ids.device).tolist():
+                for i in candidate_spans[s]:
+                    selected_positions.extend(groups[i])
+                    used += len(groups[i])
+                if used >= num_to_predict:
                     break
 
-            if not selected_positions:
-                # Fallback intentionally picks one full group (bounded by
-                # max_preds_per_seq) to preserve whole-word integrity; this may
-                # exceed num_to_predict for long groups and matches DeBERTa's
-                # practical masking behavior.
-                candidates = [
-                    group
-                    for do_mask, group in zip(mask_grams, groups, strict=True)
-                    if do_mask and 0 < len(group) <= max_budget
-                ]
-                if not candidates:
-                    candidates = [group for group in groups if 0 < len(group) <= max_budget]
-                if candidates:
-                    selected_positions.extend(candidates[0])
-            if not selected_positions:
-                continue
-
+            selected_positions.sort()
             selected = torch.tensor(selected_positions, device=input_ids.device, dtype=torch.long)
-            originals = input_ids[b].index_select(0, selected)
-            labels[b].scatter_(0, selected, originals)
-
-            if mask_prob >= 1.0 and random_prob <= 0.0:
-                input_ids[b, selected] = mask_token_id
-                continue
-
-            roll = torch.rand(int(selected.numel()), device=input_ids.device, dtype=torch.float32)
-            mask_sel = roll < mask_prob
-            rand_sel = roll >= (mask_prob + keep_prob)
-
-            if bool(mask_sel.any().item()):
-                input_ids[b, selected[mask_sel]] = mask_token_id
-            if random_prob > 0.0 and bool(rand_sel.any().item()):
-                rand_ids = self._sample_random_words((int(rand_sel.sum().item()),), device=input_ids.device)
-                input_ids[b, selected[rand_sel]] = rand_ids
+            self._apply_mask_replacement_policy(
+                input_ids,
+                labels,
+                b,
+                selected,
+                mask_prob=mask_prob,
+                random_prob=random_prob,
+                keep_prob=keep_prob,
+                mask_token_id=mask_token_id,
+            )
 
         return input_ids, labels
 
@@ -753,26 +917,6 @@ class DebertaV3ElectraCollator:
             scheme = self._infer_word_boundary_scheme_from_tokens(lexical_tokens)
             self._word_boundary_scheme = scheme
 
-        def _is_continuation(tok: str) -> bool:
-            """Detect whether token text continues the previous word.
-
-            :param str tok: Token string from tokenizer.
-            :return bool: True if token should join previous group.
-            """
-            if tok.startswith("##"):
-                return True
-            if scheme == "sentencepiece":
-                return not tok.startswith("▁")
-            if scheme == "gpt2":
-                return not tok.startswith("Ġ")
-            # WordPiece tokenizers often emit plain tokens for word starts and
-            # reserve only '##' for continuations.
-            if scheme == "wordpiece":
-                return False
-            # Conservative fallback: if we cannot infer continuation markers,
-            # avoid over-merging unrelated adjacent tokens.
-            return False
-
         for i, (tok, is_spec) in enumerate(zip(tokens, spec, strict=True)):
             if is_spec:
                 prev_i = None
@@ -794,7 +938,7 @@ class DebertaV3ElectraCollator:
                 start_new = True
             else:
                 # Adjacent: decide based on token string.
-                if not _is_continuation(tok):
+                if not self._is_word_continuation_token(tok, scheme=scheme):
                     start_new = True
 
             if start_new:

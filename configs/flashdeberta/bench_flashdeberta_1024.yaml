@@ -1,0 +1,73 @@
+# Throughput benchmark for the 1024-token FlashDeBERTa production recipe.
+#
+# Identical to pretrain_flashdeberta_1024.yaml in every field that affects per-step cost
+# (backbone, sizes, attention impl, batch, accumulation, precision, packing, dropout). Only the
+# horizon, schedule, logging cadence, and checkpointing differ, so a tok/s figure measured here is
+# comparable to the production run and to the same benchmark at another commit.
+#
+# Measure steady state from the logged rows, not the reported cumulative tok/s: the trainer's
+# tok/s column averages in process startup and Triton autotune warmup. Take the difference in
+# input_tokens_seen between two rows at or after step 100 and divide by their wall-clock gap.
+#
+# Usage:
+#   deberta train configs/flashdeberta/bench_flashdeberta_1024.yaml
+
+model:
+  backbone_type: hf_deberta_v2
+  from_scratch: true
+  embedding_sharing: gdes
+  tokenizer:
+    name_or_path: BEE-spoke-data/wordpiece-tokenizer-32k-en_code-msp
+    allow_vocab_resize: true
+    vocab_multiple: 128
+  hf:
+    model_size: base
+    attention_impl: flash
+    max_position_embeddings: 1024
+  dropout:
+    hidden_prob: 0.0
+    attention_probs_prob: 0.0
+
+data:
+  source:
+    dataset_name: EleutherAI/SmolLM2-1.7B-stage-4-100B
+    dataset_config_name: default
+    train_split: train
+    text_column_name: text
+    streaming: true
+    shuffle_buffer_size: 10000
+  packing:
+    enabled: true
+    max_seq_length: 1024
+    block_cross_document_attention: false
+
+train:
+  max_steps: 250
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 8
+  mixed_precision: bf16
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+  compile:
+    enabled: false
+  checkpoint:
+    output_dir: null
+    # Never reached, so checkpoint I/O stays out of the measured window.
+    save_steps: 100000
+    save_total_limit: 1
+    export_hf_final: false
+
+optim:
+  lr:
+    base: 1.0e-4
+  scheduler:
+    type: linear
+    # Must stay below max_steps; the schedule shape is irrelevant to per-step cost.
+    warmup_steps: 10
+
+logging:
+  project_name: flashdeberta-bench
+  logging_steps: 25
+  wandb:
+    enabled: false

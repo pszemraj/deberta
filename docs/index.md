@@ -7,15 +7,23 @@
 
 ## Guides
 
-- config loading, precedence, defaults, and overrides: [Guides / Configuration](guides/configuration.md)
-- streaming packing, doc-block masking, and collator behavior: [Guides / Data Pipeline](guides/data-pipeline.md)
+- complete per-key training config contract: [Config reference](../configs/config_reference.yaml)
+- dataset loading and packing, doc-block masking, and collator behavior: [Guides / Data Pipeline](guides/data-pipeline.md)
+- checkpoint scoring and metric interpretation: [Guides / Evaluating Checkpoints](guides/evaluating-checkpoints.md)
 - checkpoint consolidation and Hugging Face export: [Guides / Exporting Models](guides/exporting-models.md)
 
 ## Advanced
 
 - `hf_deberta_v2` vs `rope` architecture behavior: [Advanced / Architectures](advanced/architectures.md)
-- accelerate/FSDP usage, resume behavior, and token-weighted GA: [Advanced / Distributed Training](advanced/distributed-training.md)
+- unsupported multi-GPU boundary and experimental FSDP2 scaffolding: [Advanced / Distributed Training](advanced/distributed-training.md)
 - compile scopes and graph-stability guidance: [Advanced / torch.compile](advanced/torch-compile.md)
+- flash routes, kernel tuning, and caveats: [Advanced / FlashDeBERTa attention](advanced/flash-attention.md)
+- per-GPU expectations and tuning for non-`sm_120` hardware: [Advanced / GPU support](advanced/gpu-support.md)
+
+## Development
+
+- pretraining acceptance criteria and staged validation evidence: [RTD validation ledger](development/rtd-validation-ledger.md)
+- parked improvements and open decisions: [Future work](development/future-work.md)
 
 ## API reference
 

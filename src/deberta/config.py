@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 import dataclasses
-import re
+import math
 import warnings
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import InitVar, asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
 
 from deberta.utils.io import load_json_mapping
-from deberta.utils.mapping import flatten_mapping
 from deberta.utils.serialize import asdict_without_private as _asdict_without_private
 from deberta.utils.types import coerce_scalar, unwrap_optional_type
 
 _BACKBONE_CHOICES = {"rope", "hf_deberta_v2"}
-_MODEL_PROFILE_CHOICES = {"modern", "deberta_v3_parity"}
 _NORM_ARCH_CHOICES = {"post", "keel"}
 _ATTN_IMPL_CHOICES = {"sdpa", "eager"}
+_HF_ATTN_IMPL_CHOICES = {"eager", "flash"}
 _FFN_CHOICES = {"swiglu", "mlp"}
 _EMBED_SHARING_CHOICES = {"none", "es", "gdes"}
-_LOGGING_BACKEND_CHOICES = {"none", "tensorboard"}
 _WANDB_WATCH_CHOICES = {"none", "gradients", "parameters", "all"}
 _WANDB_WATCH_ALIASES = {
     "off": "none",
@@ -89,6 +87,27 @@ _TORCH_COMPILE_SCOPE_ALIASES = {
     "disc_ffn": "disc_ffn",
     "discriminator_ffn": "disc_ffn",
 }
+
+# The literal dataclass defaults below describe the default hf_deberta_v2
+# profile. Config-file omissions still need to resolve against the selected
+# backbone without overwriting values explicitly supplied in YAML/JSON or by a
+# programmatic dotted override.
+_BACKBONE_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
+    "hf_deberta_v2": {
+        "train.objective.mask_token_prob": 1.0,
+        "train.objective.random_token_prob": 0.0,
+        "train.objective.disc_loss_weight": 10.0,
+        "optim.lr.base": 1e-4,
+        "optim.adam.epsilon": 1e-6,
+    },
+    "rope": {
+        "train.objective.mask_token_prob": 0.8,
+        "train.objective.random_token_prob": 0.1,
+        "train.objective.disc_loss_weight": 50.0,
+        "optim.lr.base": 5e-4,
+        "optim.adam.epsilon": 1e-8,
+    },
+}
 _TORCH_COMPILE_BACKEND_CHOICES = {"inductor", "aot_eager"}
 _TORCH_COMPILE_BACKEND_ALIASES = {
     "aot-eager": "aot_eager",
@@ -126,11 +145,7 @@ _HF_DEBERTA_PRETRAINED_PREFIXES = (
 _DENSE_DOC_BLOCK_WARN_SEQ_LEN = 2048
 # Pre-stable policy: persisted run schemas may change when needed for correctness/simplicity.
 # Backward checkpoint/resume compatibility is intentionally not guaranteed until a stable release.
-RUN_CONFIG_SCHEMA_VERSION = 4
-_VAR_FULL_RE = re.compile(r"^\$variables\.([A-Za-z0-9_.-]+)$")
-_VAR_INLINE_RE = re.compile(r"\{\$variables\.([A-Za-z0-9_.-]+)\}")
-_VAR_BRACE_RE = re.compile(r"\$\{variables\.([A-Za-z0-9_.-]+)\}")
-_VAR_SUSPICIOUS_RE = re.compile(r"\$variables\.[A-Za-z0-9_.-]+")
+RUN_CONFIG_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -144,11 +159,20 @@ class ModelTokenizerConfig:
 
 
 @dataclass(frozen=True)
+class ModelHFFlashConfig:
+    """FlashDeBERTa runtime policy for native HF DeBERTa-v2/v3 attention."""
+
+    kernel_overrides_path: str | None = field(default=None)
+
+
+@dataclass(frozen=True)
 class ModelHFConfig:
     """HF DeBERTa-v2/v3 backbone synthesis options."""
 
     model_size: str = field(default="base")
     attention_kernel: str = field(default="dynamic")
+    attention_impl: str = field(default="eager")
+    flash: ModelHFFlashConfig = field(default_factory=ModelHFFlashConfig)
     max_position_embeddings: int | None = field(default=None)
 
 
@@ -235,31 +259,6 @@ def _nested_get(obj: Any, path: str) -> Any:
     return cur
 
 
-def _legacy_getattr_from_map(
-    *,
-    obj: Any,
-    name: str,
-    legacy_map: dict[str, str],
-    dynamic_defaults: dict[str, Any] | None = None,
-) -> Any:
-    """Resolve legacy flat config attributes via dotted compatibility maps.
-
-    :param Any obj: Config object.
-    :param str name: Requested attribute name.
-    :param dict[str, str] legacy_map: Mapping of legacy flat names to dotted paths.
-    :param dict[str, Any] | None dynamic_defaults: Optional dynamic fallback values.
-    :raises AttributeError: If ``name`` is not mapped.
-    :return Any: Resolved attribute value.
-    """
-    key = str(name)
-    path = legacy_map.get(key)
-    if path is not None:
-        return _nested_get(obj, path)
-    if dynamic_defaults is not None and key in dynamic_defaults:
-        return dynamic_defaults[key]
-    raise AttributeError(name)
-
-
 def _replace_path(obj: Any, parts: list[str], value: Any) -> Any:
     """Replace one dotted path on a dataclass object.
 
@@ -278,44 +277,10 @@ def _replace_path(obj: Any, parts: list[str], value: Any) -> Any:
     return replace(obj, **{key: new_child})
 
 
-def _apply_dotted_updates(obj: Any, updates: dict[str, Any]) -> Any:
-    """Apply dotted update mapping to a dataclass object.
-
-    :param Any obj: Source dataclass instance.
-    :param dict[str, Any] updates: Dotted updates.
-    :return Any: Updated dataclass object.
-    """
-    out = obj
-    for path, value in updates.items():
-        parts = [str(p).strip() for p in str(path).split(".") if str(p).strip()]
-        if not parts:
-            continue
-        out = _replace_path(out, parts, value)
-    return out
-
-
-def _coerce_subconfig(value: Any, cls: type[Any], *, field_name: str) -> Any:
-    """Coerce constructor subconfig values to dataclass instances.
-
-    :param Any value: Candidate subconfig value.
-    :param type[Any] cls: Subconfig dataclass type.
-    :param str field_name: Field name for error reporting.
-    :return Any: Coerced subconfig dataclass instance.
-    """
-    if value is None:
-        return cls()
-    if isinstance(value, cls):
-        return value
-    if isinstance(value, dict):
-        return _apply_dotted_updates(cls(), flatten_mapping(value))
-    raise TypeError(f"{field_name} must be a {cls.__name__} or mapping, got {type(value).__name__}.")
-
-
 @dataclass(frozen=True)
 class ModelConfig:
     """Model-related arguments."""
 
-    profile: str = field(default="modern")
     backbone_type: str = field(default="hf_deberta_v2")
     from_scratch: bool = field(default=True)
     embedding_sharing: str = field(default="gdes")
@@ -326,166 +291,6 @@ class ModelConfig:
     generator: ModelGeneratorConfig = field(default_factory=ModelGeneratorConfig)
     rope: ModelRopeConfig = field(default_factory=ModelRopeConfig)
     dropout: ModelDropoutConfig = field(default_factory=ModelDropoutConfig)
-
-    _LEGACY_MAP = {
-        "tokenizer_name_or_path": "tokenizer.name_or_path",
-        "tokenizer_allow_vocab_resize": "tokenizer.allow_vocab_resize",
-        "tokenizer_vocab_target": "tokenizer.vocab_target",
-        "tokenizer_vocab_multiple": "tokenizer.vocab_multiple",
-        "hf_attention_kernel": "hf.attention_kernel",
-        "hf_model_size": "hf.model_size",
-        "hf_max_position_embeddings": "hf.max_position_embeddings",
-        "pretrained_discriminator_path": "pretrained.discriminator_path",
-        "pretrained_generator_path": "pretrained.generator_path",
-        "generator_num_hidden_layers": "generator.num_hidden_layers",
-        "generator_hidden_size": "generator.hidden_size",
-        "generator_intermediate_size": "generator.intermediate_size",
-        "generator_num_attention_heads": "generator.num_attention_heads",
-        "hidden_size": "rope.hidden_size",
-        "num_hidden_layers": "rope.num_hidden_layers",
-        "num_attention_heads": "rope.num_attention_heads",
-        "intermediate_size": "rope.intermediate_size",
-        "hidden_act": "rope.hidden_act",
-        "rope_theta": "rope.rope_theta",
-        "rotary_pct": "rope.rotary_pct",
-        "use_absolute_position_embeddings": "rope.use_absolute_position_embeddings",
-        "max_position_embeddings": "rope.max_position_embeddings",
-        "type_vocab_size": "rope.type_vocab_size",
-        "norm_arch": "rope.norm_arch",
-        "norm_eps": "rope.norm_eps",
-        "keel_alpha_init": "rope.keel_alpha_init",
-        "keel_alpha_learnable": "rope.keel_alpha_learnable",
-        "attention_implementation": "rope.attention_implementation",
-        "ffn_type": "rope.ffn_type",
-        "use_bias": "rope.use_bias",
-        "swiglu_adjust_intermediate": "rope.swiglu_adjust_intermediate",
-        "initializer_range": "rope.initializer_range",
-        "pretrained_max_position_embeddings": "rope.pretrained.max_position_embeddings",
-        "pretrained_rope_theta": "rope.pretrained.rope_theta",
-        "pretrained_rotary_pct": "rope.pretrained.rotary_pct",
-        "pretrained_use_absolute_position_embeddings": "rope.pretrained.use_absolute_position_embeddings",
-        "pretrained_type_vocab_size": "rope.pretrained.type_vocab_size",
-        "pretrained_norm_arch": "rope.pretrained.norm_arch",
-        "pretrained_norm_eps": "rope.pretrained.norm_eps",
-        "pretrained_keel_alpha_init": "rope.pretrained.keel_alpha_init",
-        "pretrained_keel_alpha_learnable": "rope.pretrained.keel_alpha_learnable",
-        "pretrained_ffn_type": "rope.pretrained.ffn_type",
-        "pretrained_use_bias": "rope.pretrained.use_bias",
-        "pretrained_initializer_range": "rope.pretrained.initializer_range",
-        "hidden_dropout_prob": "dropout.hidden_prob",
-        "attention_probs_dropout_prob": "dropout.attention_probs_prob",
-    }
-
-    def __init__(
-        self,
-        profile: str = "modern",
-        backbone_type: str = "hf_deberta_v2",
-        from_scratch: bool = True,
-        embedding_sharing: str = "gdes",
-        gradient_checkpointing: bool = False,
-        tokenizer: ModelTokenizerConfig | dict[str, Any] | None = None,
-        hf: ModelHFConfig | dict[str, Any] | None = None,
-        pretrained: ModelPretrainedConfig | dict[str, Any] | None = None,
-        generator: ModelGeneratorConfig | dict[str, Any] | None = None,
-        rope: ModelRopeConfig | dict[str, Any] | None = None,
-        dropout: ModelDropoutConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize model config while accepting legacy flat kwargs.
-
-        :param str profile: Model profile.
-        :param str backbone_type: Backbone type.
-        :param bool from_scratch: Scratch/pretrained mode.
-        :param str embedding_sharing: Embedding sharing policy.
-        :param bool gradient_checkpointing: Gradient checkpointing toggle.
-        :param ModelTokenizerConfig | dict[str, Any] | None tokenizer: Tokenizer config.
-        :param ModelHFConfig | dict[str, Any] | None hf: HF backbone config.
-        :param ModelPretrainedConfig | dict[str, Any] | None pretrained: Pretrained source config.
-        :param ModelGeneratorConfig | dict[str, Any] | None generator: Generator shape overrides.
-        :param ModelRopeConfig | dict[str, Any] | None rope: RoPE config.
-        :param ModelDropoutConfig | dict[str, Any] | None dropout: Dropout config.
-        :param Any legacy_kwargs: Optional legacy flat kwargs.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        tokenizer_cfg = _coerce_subconfig(tokenizer, ModelTokenizerConfig, field_name="tokenizer")
-        hf_cfg = _coerce_subconfig(hf, ModelHFConfig, field_name="hf")
-        pretrained_cfg = _coerce_subconfig(pretrained, ModelPretrainedConfig, field_name="pretrained")
-        generator_cfg = _coerce_subconfig(generator, ModelGeneratorConfig, field_name="generator")
-        rope_cfg = _coerce_subconfig(rope, ModelRopeConfig, field_name="rope")
-        dropout_cfg = _coerce_subconfig(dropout, ModelDropoutConfig, field_name="dropout")
-
-        sub_updates: dict[str, dict[str, Any]] = {
-            "tokenizer": {},
-            "hf": {},
-            "pretrained": {},
-            "generator": {},
-            "rope": {},
-            "dropout": {},
-        }
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            mapped = self._LEGACY_MAP.get(str(key))
-            if mapped is None and "." in str(key):
-                mapped = str(key)
-            if mapped is None:
-                unknown.append(str(key))
-                continue
-            if "." in mapped:
-                root, child = mapped.split(".", 1)
-                if root in sub_updates:
-                    sub_updates[root][child] = value
-                else:
-                    unknown.append(str(key))
-            else:
-                if mapped == "profile":
-                    profile = value
-                elif mapped == "backbone_type":
-                    backbone_type = value
-                elif mapped == "from_scratch":
-                    from_scratch = value
-                elif mapped == "embedding_sharing":
-                    embedding_sharing = value
-                elif mapped == "gradient_checkpointing":
-                    gradient_checkpointing = value
-                else:
-                    unknown.append(str(key))
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"ModelConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if sub_updates["tokenizer"]:
-            tokenizer_cfg = _apply_dotted_updates(tokenizer_cfg, sub_updates["tokenizer"])
-        if sub_updates["hf"]:
-            hf_cfg = _apply_dotted_updates(hf_cfg, sub_updates["hf"])
-        if sub_updates["pretrained"]:
-            pretrained_cfg = _apply_dotted_updates(pretrained_cfg, sub_updates["pretrained"])
-        if sub_updates["generator"]:
-            generator_cfg = _apply_dotted_updates(generator_cfg, sub_updates["generator"])
-        if sub_updates["rope"]:
-            rope_cfg = _apply_dotted_updates(rope_cfg, sub_updates["rope"])
-        if sub_updates["dropout"]:
-            dropout_cfg = _apply_dotted_updates(dropout_cfg, sub_updates["dropout"])
-
-        object.__setattr__(self, "profile", str(profile))
-        object.__setattr__(self, "backbone_type", str(backbone_type))
-        object.__setattr__(self, "from_scratch", bool(from_scratch))
-        object.__setattr__(self, "embedding_sharing", str(embedding_sharing))
-        object.__setattr__(self, "gradient_checkpointing", bool(gradient_checkpointing))
-        object.__setattr__(self, "tokenizer", tokenizer_cfg)
-        object.__setattr__(self, "hf", hf_cfg)
-        object.__setattr__(self, "pretrained", pretrained_cfg)
-        object.__setattr__(self, "generator", generator_cfg)
-        object.__setattr__(self, "rope", rope_cfg)
-        object.__setattr__(self, "dropout", dropout_cfg)
-
-    def __getattr__(self, name: str) -> Any:
-        """Provide runtime read compatibility for legacy flat attributes.
-
-        :param str name: Attribute name.
-        :return Any: Legacy flat value when mapped.
-        """
-        return _legacy_getattr_from_map(obj=self, name=name, legacy_map=self._LEGACY_MAP)
 
 
 @dataclass(frozen=True)
@@ -518,73 +323,6 @@ class DataConfig:
     source: DataSourceConfig = field(default_factory=DataSourceConfig)
     packing: DataPackingConfig = field(default_factory=DataPackingConfig)
 
-    _LEGACY_MAP = {
-        "dataset_name": "source.dataset_name",
-        "dataset_config_name": "source.dataset_config_name",
-        "data_files": "source.data_files",
-        "load_from_disk": "source.load_from_disk",
-        "train_split": "source.train_split",
-        "text_column_name": "source.text_column_name",
-        "streaming": "source.streaming",
-        "shuffle_buffer_size": "source.shuffle_buffer_size",
-        "pack_sequences": "packing.enabled",
-        "max_seq_length": "packing.max_seq_length",
-        "block_cross_document_attention": "packing.block_cross_document_attention",
-    }
-
-    def __init__(
-        self,
-        source: DataSourceConfig | dict[str, Any] | None = None,
-        packing: DataPackingConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize data config while accepting legacy flat kwargs.
-
-        :param DataSourceConfig | dict[str, Any] | None source: Data source config.
-        :param DataPackingConfig | dict[str, Any] | None packing: Packing config.
-        :param Any legacy_kwargs: Optional legacy flat kwargs.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        source_cfg = _coerce_subconfig(source, DataSourceConfig, field_name="source")
-        packing_cfg = _coerce_subconfig(packing, DataPackingConfig, field_name="packing")
-
-        source_updates: dict[str, Any] = {}
-        packing_updates: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            mapped = self._LEGACY_MAP.get(str(key))
-            if mapped is None and "." in str(key):
-                mapped = str(key)
-            if mapped is None:
-                unknown.append(str(key))
-                continue
-            if mapped.startswith("source."):
-                source_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("packing."):
-                packing_updates[mapped.split(".", 1)[1]] = value
-            else:
-                unknown.append(str(key))
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"DataConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if source_updates:
-            source_cfg = _apply_dotted_updates(source_cfg, source_updates)
-        if packing_updates:
-            packing_cfg = _apply_dotted_updates(packing_cfg, packing_updates)
-
-        object.__setattr__(self, "source", source_cfg)
-        object.__setattr__(self, "packing", packing_cfg)
-
-    def __getattr__(self, name: str) -> Any:
-        """Provide runtime read compatibility for legacy flat attributes.
-
-        :param str name: Attribute name.
-        :return Any: Legacy flat value when mapped.
-        """
-        return _legacy_getattr_from_map(obj=self, name=name, legacy_map=self._LEGACY_MAP)
-
 
 @dataclass(frozen=True)
 class TrainDataloaderConfig:
@@ -609,12 +347,12 @@ class TrainObjectiveConfig:
     """RTD/MLM objective controls."""
 
     mlm_probability: float = field(default=0.15)
-    mask_token_prob: float = field(default=0.8)
-    random_token_prob: float = field(default=0.1)
+    mask_token_prob: float = field(default=1.0)
+    random_token_prob: float = field(default=0.0)
     mlm_max_ngram: int = field(default=1)
     sampling_temperature: float = field(default=1.0)
     gen_loss_weight: float = field(default=1.0)
-    disc_loss_weight: float = field(default=50.0)
+    disc_loss_weight: float = field(default=10.0)
 
 
 @dataclass(frozen=True)
@@ -649,187 +387,12 @@ class TrainConfig:
     objective: TrainObjectiveConfig = field(default_factory=TrainObjectiveConfig)
     checkpoint: TrainCheckpointConfig = field(default_factory=TrainCheckpointConfig)
 
-    _LEGACY_MAP = {
-        "dataloader_num_workers": "dataloader.num_workers",
-        "dataloader_pin_memory": "dataloader.pin_memory",
-        "torch_compile": "compile.enabled",
-        "torch_compile_mode": "compile.mode",
-        "torch_compile_scope": "compile.scope",
-        "torch_compile_backend": "compile.backend",
-        "mlm_probability": "objective.mlm_probability",
-        "mask_token_prob": "objective.mask_token_prob",
-        "random_token_prob": "objective.random_token_prob",
-        "mlm_max_ngram": "objective.mlm_max_ngram",
-        "sampling_temperature": "objective.sampling_temperature",
-        "gen_loss_weight": "objective.gen_loss_weight",
-        "disc_loss_weight": "objective.disc_loss_weight",
-        "output_dir": "checkpoint.output_dir",
-        "overwrite_output_dir": "checkpoint.overwrite_output_dir",
-        "save_steps": "checkpoint.save_steps",
-        "save_total_limit": "checkpoint.save_total_limit",
-        "resume_from_checkpoint": "checkpoint.resume_from_checkpoint",
-        "resume_data_strategy": "checkpoint.resume_data_strategy",
-        "resume_replay_max_micro_batches": "checkpoint.resume_replay_max_micro_batches",
-        "export_hf_final": "checkpoint.export_hf_final",
-    }
-
-    _LEGACY_DYNAMIC_DEFAULTS = {
-        "learning_rate": 5e-4,
-        "generator_learning_rate": -1.0,
-        "discriminator_learning_rate": -1.0,
-        "weight_decay": 0.01,
-        "adam_beta1": 0.9,
-        "adam_beta2": 0.999,
-        "adam_epsilon": 1e-8,
-        "warmup_steps": 1_000,
-        "lr_scheduler_type": "linear",
-        "max_grad_norm": 1.0,
-        "project_name": "deberta-train",
-        "run_name": None,
-        "logging_steps": 50,
-        "report_to": "none",
-        "wandb_watch": "gradients",
-        "wandb_watch_log_freq": 100,
-        "debug_metrics": False,
-        "logging_output_dir": None,
-    }
-
-    def __init__(
-        self,
-        seed: int = 42,
-        max_steps: int = 10_000,
-        per_device_train_batch_size: int = 4,
-        gradient_accumulation_steps: int = 1,
-        token_weighted_gradient_accumulation: bool = True,
-        mixed_precision: str = "bf16",
-        tf32: bool = True,
-        sdpa_kernel: str = "auto",
-        decoupled_training: bool = True,
-        dataloader: TrainDataloaderConfig | dict[str, Any] | None = None,
-        compile: TrainCompileConfig | dict[str, Any] | None = None,
-        objective: TrainObjectiveConfig | dict[str, Any] | None = None,
-        checkpoint: TrainCheckpointConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize train config while accepting legacy flat kwargs.
-
-        :param int seed: Random seed.
-        :param int max_steps: Max training steps.
-        :param int per_device_train_batch_size: Micro-batch size.
-        :param int gradient_accumulation_steps: Gradient accumulation steps.
-        :param bool token_weighted_gradient_accumulation: Token-weighted GA toggle.
-        :param str mixed_precision: Mixed precision mode.
-        :param bool tf32: TF32 toggle.
-        :param str sdpa_kernel: SDPA kernel policy.
-        :param bool decoupled_training: Decoupled training toggle.
-        :param TrainDataloaderConfig | dict[str, Any] | None dataloader: Dataloader config.
-        :param TrainCompileConfig | dict[str, Any] | None compile: Compile config.
-        :param TrainObjectiveConfig | dict[str, Any] | None objective: Objective config.
-        :param TrainCheckpointConfig | dict[str, Any] | None checkpoint: Checkpoint config.
-        :param Any legacy_kwargs: Optional legacy flat kwargs.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        dataloader_cfg = _coerce_subconfig(dataloader, TrainDataloaderConfig, field_name="dataloader")
-        compile_cfg = _coerce_subconfig(compile, TrainCompileConfig, field_name="compile")
-        objective_cfg = _coerce_subconfig(objective, TrainObjectiveConfig, field_name="objective")
-        checkpoint_cfg = _coerce_subconfig(checkpoint, TrainCheckpointConfig, field_name="checkpoint")
-
-        dataloader_updates: dict[str, Any] = {}
-        compile_updates: dict[str, Any] = {}
-        objective_updates: dict[str, Any] = {}
-        checkpoint_updates: dict[str, Any] = {}
-        dynamic_overrides: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            mapped = self._LEGACY_MAP.get(str(key))
-            if mapped is None and "." in str(key):
-                mapped = str(key)
-
-            if str(key) in self._LEGACY_DYNAMIC_DEFAULTS:
-                dynamic_overrides[str(key)] = value
-                continue
-
-            if mapped is None:
-                unknown.append(str(key))
-                continue
-            if mapped.startswith("dataloader."):
-                dataloader_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("compile."):
-                compile_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("objective."):
-                objective_updates[mapped.split(".", 1)[1]] = value
-            elif mapped.startswith("checkpoint."):
-                checkpoint_updates[mapped.split(".", 1)[1]] = value
-            elif mapped == "seed":
-                seed = value
-            elif mapped == "max_steps":
-                max_steps = value
-            elif mapped == "per_device_train_batch_size":
-                per_device_train_batch_size = value
-            elif mapped == "gradient_accumulation_steps":
-                gradient_accumulation_steps = value
-            elif mapped == "token_weighted_gradient_accumulation":
-                token_weighted_gradient_accumulation = value
-            elif mapped == "mixed_precision":
-                mixed_precision = value
-            elif mapped == "tf32":
-                tf32 = value
-            elif mapped == "sdpa_kernel":
-                sdpa_kernel = value
-            elif mapped == "decoupled_training":
-                decoupled_training = value
-            else:
-                unknown.append(str(key))
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"TrainConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if dataloader_updates:
-            dataloader_cfg = _apply_dotted_updates(dataloader_cfg, dataloader_updates)
-        if compile_updates:
-            compile_cfg = _apply_dotted_updates(compile_cfg, compile_updates)
-        if objective_updates:
-            objective_cfg = _apply_dotted_updates(objective_cfg, objective_updates)
-        if checkpoint_updates:
-            checkpoint_cfg = _apply_dotted_updates(checkpoint_cfg, checkpoint_updates)
-
-        object.__setattr__(self, "seed", int(seed))
-        object.__setattr__(self, "max_steps", int(max_steps))
-        object.__setattr__(self, "per_device_train_batch_size", int(per_device_train_batch_size))
-        object.__setattr__(self, "gradient_accumulation_steps", int(gradient_accumulation_steps))
-        object.__setattr__(self, "token_weighted_gradient_accumulation", token_weighted_gradient_accumulation)
-        object.__setattr__(self, "mixed_precision", str(mixed_precision))
-        object.__setattr__(self, "tf32", tf32)
-        object.__setattr__(self, "sdpa_kernel", str(sdpa_kernel))
-        object.__setattr__(self, "decoupled_training", decoupled_training)
-        object.__setattr__(self, "dataloader", dataloader_cfg)
-        object.__setattr__(self, "compile", compile_cfg)
-        object.__setattr__(self, "objective", objective_cfg)
-        object.__setattr__(self, "checkpoint", checkpoint_cfg)
-
-        for key, value in dynamic_overrides.items():
-            object.__setattr__(self, str(key), value)
-
-    def __getattr__(self, name: str) -> Any:
-        """Provide runtime read compatibility for legacy flat attributes.
-
-        :param str name: Attribute name.
-        :return Any: Legacy flat value when mapped.
-        """
-        return _legacy_getattr_from_map(
-            obj=self,
-            name=name,
-            legacy_map=self._LEGACY_MAP,
-            dynamic_defaults=self._LEGACY_DYNAMIC_DEFAULTS,
-        )
-
 
 @dataclass(frozen=True)
 class OptimLRConfig:
     """Learning-rate values for optimizer setup."""
 
-    base: float = field(default=5e-4)
+    base: float = field(default=1e-4)
     generator: float = field(default=-1.0)
     discriminator: float = field(default=-1.0)
 
@@ -840,7 +403,7 @@ class OptimAdamConfig:
 
     beta1: float = field(default=0.9)
     beta2: float = field(default=0.999)
-    epsilon: float = field(default=1e-8)
+    epsilon: float = field(default=1e-6)
 
 
 @dataclass(frozen=True)
@@ -860,71 +423,6 @@ class OptimConfig:
     scheduler: OptimSchedulerConfig = field(default_factory=OptimSchedulerConfig)
     weight_decay: float = field(default=0.01)
     max_grad_norm: float = field(default=1.0)
-
-    def __init__(
-        self,
-        lr: OptimLRConfig | dict[str, Any] | None = None,
-        adam: OptimAdamConfig | dict[str, Any] | None = None,
-        scheduler: OptimSchedulerConfig | dict[str, Any] | None = None,
-        weight_decay: float = 0.01,
-        max_grad_norm: float = 1.0,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize optimizer config with nested-dict coercion.
-
-        :param OptimLRConfig | dict[str, Any] | None lr: LR config.
-        :param OptimAdamConfig | dict[str, Any] | None adam: Adam config.
-        :param OptimSchedulerConfig | dict[str, Any] | None scheduler: Scheduler config.
-        :param float weight_decay: Weight decay.
-        :param float max_grad_norm: Gradient clipping norm.
-        :param Any legacy_kwargs: Optional legacy aliases.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        lr_cfg = _coerce_subconfig(lr, OptimLRConfig, field_name="lr")
-        adam_cfg = _coerce_subconfig(adam, OptimAdamConfig, field_name="adam")
-        scheduler_cfg = _coerce_subconfig(scheduler, OptimSchedulerConfig, field_name="scheduler")
-
-        scheduler_updates: dict[str, Any] = {}
-        lr_updates: dict[str, Any] = {}
-        adam_updates: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            k = str(key)
-            if k == "learning_rate":
-                lr_updates["base"] = value
-            elif k == "generator_learning_rate":
-                lr_updates["generator"] = value
-            elif k == "discriminator_learning_rate":
-                lr_updates["discriminator"] = value
-            elif k == "adam_beta1":
-                adam_updates["beta1"] = value
-            elif k == "adam_beta2":
-                adam_updates["beta2"] = value
-            elif k == "adam_epsilon":
-                adam_updates["epsilon"] = value
-            elif k == "lr_scheduler_type":
-                scheduler_updates["type"] = value
-            elif k == "warmup_steps":
-                scheduler_updates["warmup_steps"] = value
-            else:
-                unknown.append(k)
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"OptimConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if lr_updates:
-            lr_cfg = _apply_dotted_updates(lr_cfg, lr_updates)
-        if adam_updates:
-            adam_cfg = _apply_dotted_updates(adam_cfg, adam_updates)
-        if scheduler_updates:
-            scheduler_cfg = _apply_dotted_updates(scheduler_cfg, scheduler_updates)
-
-        object.__setattr__(self, "lr", lr_cfg)
-        object.__setattr__(self, "adam", adam_cfg)
-        object.__setattr__(self, "scheduler", scheduler_cfg)
-        object.__setattr__(self, "weight_decay", float(weight_decay))
-        object.__setattr__(self, "max_grad_norm", float(max_grad_norm))
 
 
 @dataclass(frozen=True)
@@ -951,76 +449,11 @@ class LoggingConfig:
     run_name: str | None = field(default=None)
     output_dir: str | None = field(default=None)
     logging_steps: int = field(default=50)
-    backend: str = field(default="none")
     wandb: LoggingWandbConfig = field(default_factory=LoggingWandbConfig)
     debug: LoggingDebugConfig = field(default_factory=LoggingDebugConfig)
 
-    def __init__(
-        self,
-        project_name: str = "deberta-train",
-        run_name: str | None = None,
-        output_dir: str | None = None,
-        logging_steps: int = 50,
-        backend: str = "none",
-        wandb: LoggingWandbConfig | dict[str, Any] | None = None,
-        debug: LoggingDebugConfig | dict[str, Any] | None = None,
-        **legacy_kwargs: Any,
-    ) -> None:
-        """Initialize logging config with nested-dict coercion.
 
-        :param str project_name: Project name.
-        :param str | None run_name: Run name.
-        :param str | None output_dir: Logging output directory.
-        :param int logging_steps: Logging step interval.
-        :param str backend: Logging backend when W&B disabled.
-        :param LoggingWandbConfig | dict[str, Any] | None wandb: W&B config.
-        :param LoggingDebugConfig | dict[str, Any] | None debug: Debug logging config.
-        :param Any legacy_kwargs: Optional legacy aliases.
-        :raises TypeError: If unknown kwargs are provided.
-        """
-        wandb_cfg = _coerce_subconfig(wandb, LoggingWandbConfig, field_name="wandb")
-        debug_cfg = _coerce_subconfig(debug, LoggingDebugConfig, field_name="debug")
-
-        wandb_updates: dict[str, Any] = {}
-        debug_updates: dict[str, Any] = {}
-        unknown: list[str] = []
-        for key, value in legacy_kwargs.items():
-            k = str(key)
-            if k == "report_to":
-                report_to = str(value).strip().lower()
-                if report_to == "wandb":
-                    wandb_updates["enabled"] = True
-                else:
-                    wandb_updates["enabled"] = False
-                    backend = report_to
-            elif k == "wandb_watch":
-                wandb_updates["watch"] = value
-            elif k == "wandb_watch_log_freq":
-                wandb_updates["watch_log_freq"] = value
-            elif k == "debug_metrics":
-                debug_updates["metrics"] = value
-            else:
-                unknown.append(k)
-
-        if unknown:
-            unknown_rendered = ", ".join(sorted(unknown))
-            raise TypeError(f"LoggingConfig.__init__ got unexpected keyword argument(s): {unknown_rendered}")
-
-        if wandb_updates:
-            wandb_cfg = _apply_dotted_updates(wandb_cfg, wandb_updates)
-        if debug_updates:
-            debug_cfg = _apply_dotted_updates(debug_cfg, debug_updates)
-
-        object.__setattr__(self, "project_name", str(project_name))
-        object.__setattr__(self, "run_name", run_name if run_name is None else str(run_name))
-        object.__setattr__(self, "output_dir", output_dir if output_dir is None else str(output_dir))
-        object.__setattr__(self, "logging_steps", int(logging_steps))
-        object.__setattr__(self, "backend", str(backend))
-        object.__setattr__(self, "wandb", wandb_cfg)
-        object.__setattr__(self, "debug", debug_cfg)
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Config:
     """Top-level training config bundle."""
 
@@ -1029,62 +462,99 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    _explicit_fields: InitVar[frozenset[str] | None] = None
+
+    def __init__(
+        self,
+        model: ModelConfig | None = None,
+        data: DataConfig | None = None,
+        train: TrainConfig | None = None,
+        optim: OptimConfig | None = None,
+        logging: LoggingConfig | None = None,
+        _explicit_fields: frozenset[str] | None = None,
+    ) -> None:
+        """Initialize a config bundle while preserving supplied section values.
+
+        A programmatically supplied ``train`` or ``optim`` section is explicit,
+        including values equal to the literal schema defaults. Omitted sections
+        remain eligible for backbone-profile defaults. File loaders pass exact
+        dotted-field provenance through ``_explicit_fields``.
+
+        :param ModelConfig | None model: Model configuration, defaults to the schema value.
+        :param DataConfig | None data: Data configuration, defaults to the schema value.
+        :param TrainConfig | None train: Explicit training configuration, defaults to omission.
+        :param OptimConfig | None optim: Explicit optimizer configuration, defaults to omission.
+        :param LoggingConfig | None logging: Logging configuration, defaults to the schema value.
+        :param frozenset[str] | None _explicit_fields: Exact loader-owned dotted-field provenance.
+        """
+        object.__setattr__(self, "model", model if model is not None else ModelConfig())
+        object.__setattr__(self, "data", data if data is not None else DataConfig())
+        object.__setattr__(self, "train", train if train is not None else TrainConfig())
+        object.__setattr__(self, "optim", optim if optim is not None else OptimConfig())
+        object.__setattr__(self, "logging", logging if logging is not None else LoggingConfig())
+
+        explicit = set(_explicit_fields or ())
+        if _explicit_fields is None:
+            schema_profile = _BACKBONE_PROFILE_DEFAULTS["hf_deberta_v2"]
+            if train is not None:
+                explicit.update(path for path in schema_profile if path.startswith("train."))
+            if optim is not None:
+                explicit.update(path for path in schema_profile if path.startswith("optim."))
+        self.__post_init__(frozenset(explicit))
+
+    def __post_init__(self, _explicit_fields: frozenset[str] | None) -> None:
+        """Resolve omitted fields against the selected backbone profile.
+
+        :param frozenset[str] | None _explicit_fields: Dotted paths treated as explicit.
+        """
+        explicit = frozenset(_explicit_fields or ())
+        object.__setattr__(self, "_explicit_field_paths", explicit)
+
+        profile = _BACKBONE_PROFILE_DEFAULTS.get(str(self.model.backbone_type).strip().lower())
+        if profile is None:
+            return
+
+        objective_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("train.objective.") and path not in explicit
+        }
+        adam_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("optim.adam.") and path not in explicit
+        }
+        lr_updates = {
+            path.rsplit(".", 1)[-1]: value
+            for path, value in profile.items()
+            if path.startswith("optim.lr.") and path not in explicit
+        }
+        object.__setattr__(
+            self,
+            "train",
+            replace(
+                self.train,
+                objective=replace(self.train.objective, **objective_updates),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "optim",
+            replace(
+                self.optim,
+                lr=replace(self.optim.lr, **lr_updates),
+                adam=replace(self.optim.adam, **adam_updates),
+            ),
+        )
 
 
-def _sync_legacy_train_aliases(
-    *, train_cfg: TrainConfig, optim_cfg: OptimConfig, logging_cfg: LoggingConfig
-) -> None:
-    """Attach dynamic legacy aliases on TrainConfig for runtime compatibility.
+def _explicit_config_fields(cfg: Config) -> frozenset[str]:
+    """Return non-serialized explicit-field provenance for a config bundle.
 
-    :param TrainConfig train_cfg: Train config instance.
-    :param OptimConfig optim_cfg: Optim config instance.
-    :param LoggingConfig logging_cfg: Logging config instance.
+    :param Config cfg: Config bundle.
+    :return frozenset[str]: Explicit dotted field paths.
     """
-    object.__setattr__(train_cfg, "learning_rate", float(optim_cfg.lr.base))
-    object.__setattr__(train_cfg, "generator_learning_rate", float(optim_cfg.lr.generator))
-    object.__setattr__(train_cfg, "discriminator_learning_rate", float(optim_cfg.lr.discriminator))
-    object.__setattr__(train_cfg, "weight_decay", float(optim_cfg.weight_decay))
-    object.__setattr__(train_cfg, "adam_beta1", float(optim_cfg.adam.beta1))
-    object.__setattr__(train_cfg, "adam_beta2", float(optim_cfg.adam.beta2))
-    object.__setattr__(train_cfg, "adam_epsilon", float(optim_cfg.adam.epsilon))
-    object.__setattr__(train_cfg, "warmup_steps", int(optim_cfg.scheduler.warmup_steps))
-    object.__setattr__(train_cfg, "lr_scheduler_type", str(optim_cfg.scheduler.type))
-    object.__setattr__(train_cfg, "max_grad_norm", float(optim_cfg.max_grad_norm))
-
-    report_to = "wandb" if bool(logging_cfg.wandb.enabled) else str(logging_cfg.backend).strip().lower()
-    object.__setattr__(train_cfg, "project_name", str(logging_cfg.project_name))
-    object.__setattr__(train_cfg, "run_name", logging_cfg.run_name)
-    object.__setattr__(train_cfg, "logging_output_dir", logging_cfg.output_dir)
-    object.__setattr__(train_cfg, "logging_steps", int(logging_cfg.logging_steps))
-    object.__setattr__(train_cfg, "report_to", str(report_to))
-    object.__setattr__(train_cfg, "wandb_watch", str(logging_cfg.wandb.watch))
-    object.__setattr__(train_cfg, "wandb_watch_log_freq", int(logging_cfg.wandb.watch_log_freq))
-    object.__setattr__(train_cfg, "debug_metrics", bool(logging_cfg.debug.metrics))
-
-
-def _explicit_fields(cfg_obj: Any) -> set[str]:
-    """Return explicitly provided field names attached to a config object.
-
-    :param Any cfg_obj: Config dataclass object.
-    :return set[str]: Explicitly provided field names.
-    """
-    raw = getattr(cfg_obj, "_explicit_fields", None)
-    if raw is None:
-        return set()
-    if isinstance(raw, set):
-        return {str(x) for x in raw}
-    if isinstance(raw, (list, tuple, frozenset)):
-        return {str(x) for x in raw}
-    return set()
-
-
-def _mark_explicit_fields(cfg_obj: Any, explicit_fields: set[str]) -> None:
-    """Attach explicit-field metadata to a config dataclass.
-
-    :param Any cfg_obj: Config dataclass object.
-    :param set[str] explicit_fields: Explicit field names.
-    """
-    object.__setattr__(cfg_obj, "_explicit_fields", set(str(x) for x in explicit_fields))
+    return frozenset(getattr(cfg, "_explicit_field_paths", frozenset()))
 
 
 def _ensure_choice(name: str, value: str, choices: set[str]) -> str:
@@ -1216,6 +686,16 @@ def _normalize_hf_attention_kernel(value: str) -> str:
     )
 
 
+def _normalize_hf_attention_impl(value: str) -> str:
+    """Normalize and validate native hf_deberta_v2 attention implementation values.
+
+    :param str value: Raw attention implementation value.
+    :return str: Canonical attention implementation name.
+    """
+
+    return _ensure_choice("model.hf.attention_impl", value, _HF_ATTN_IMPL_CHOICES)
+
+
 def normalize_mixed_precision(value: object) -> str:
     """Normalize and validate mixed precision values.
 
@@ -1310,6 +790,60 @@ def _looks_like_hf_deberta_checkpoint(value: str) -> bool:
     )
 
 
+def _apply_backbone_option_severity_policy(cfg: ModelConfig, defaults: ModelConfig) -> None:
+    """Apply the explicit error/warning policy for inactive backbone options.
+
+    :param ModelConfig cfg: Model configuration under validation.
+    :param ModelConfig defaults: Default model configuration for change detection.
+    :raises ValueError: If an inactive option group has error severity.
+    :return None: None.
+    """
+
+    if cfg.backbone_type == "hf_deberta_v2":
+        rules = [
+            (
+                asdict(cfg.rope) != asdict(defaults.rope),
+                "error",
+                "These options are only valid when model.backbone_type='rope': model.rope.*",
+            )
+        ]
+    else:
+        rules = [
+            (
+                cfg.hf.attention_kernel != defaults.hf.attention_kernel,
+                "warning",
+                "model.hf.attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf.attention_kernel!r}) has no effect on the rope backbone.",
+            ),
+            (
+                cfg.hf.max_position_embeddings is not None,
+                "warning",
+                "model.hf.max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf.max_position_embeddings!r}) has no effect on the rope backbone.",
+            ),
+            (
+                cfg.hf.model_size != defaults.hf.model_size,
+                "warning",
+                "model.hf.model_size only applies when model.backbone_type='hf_deberta_v2'. "
+                f"Current value ({cfg.hf.model_size!r}) has no effect on the rope backbone.",
+            ),
+        ]
+    rules.append(
+        (
+            cfg.hf.attention_impl != "flash" and asdict(cfg.hf.flash) != asdict(defaults.hf.flash),
+            "warning",
+            "model.hf.flash.* has no effect unless model.hf.attention_impl='flash'.",
+        )
+    )
+
+    for active, severity, message in rules:
+        if not active:
+            continue
+        if severity == "error":
+            raise ValueError(message)
+        warnings.warn(message, UserWarning, stacklevel=3)
+
+
 def validate_model_config(cfg: ModelConfig) -> None:
     """Validate model config semantics and normalize constrained values.
 
@@ -1318,7 +852,6 @@ def validate_model_config(cfg: ModelConfig) -> None:
     _cfg_set(
         cfg, "backbone_type", _ensure_choice("model.backbone_type", cfg.backbone_type, _BACKBONE_CHOICES)
     )
-    _cfg_set(cfg, "profile", _ensure_choice("model.profile", cfg.profile, _MODEL_PROFILE_CHOICES))
     _cfg_set(
         cfg,
         "embedding_sharing",
@@ -1326,9 +859,23 @@ def validate_model_config(cfg: ModelConfig) -> None:
     )
 
     _cfg_set(cfg.hf, "attention_kernel", _normalize_hf_attention_kernel(cfg.hf.attention_kernel))
+    _cfg_set(cfg.hf, "attention_impl", _normalize_hf_attention_impl(cfg.hf.attention_impl))
     _cfg_set(
         cfg.hf, "model_size", _ensure_choice("model.hf.model_size", cfg.hf.model_size, _HF_MODEL_SIZE_CHOICES)
     )
+    if cfg.hf.flash.kernel_overrides_path is not None:
+        _cfg_set(
+            cfg.hf.flash, "kernel_overrides_path", str(cfg.hf.flash.kernel_overrides_path).strip() or None
+        )
+    if cfg.hf.attention_impl == "flash" and cfg.hf.flash.kernel_overrides_path is not None:
+        from deberta.modeling.flashdeberta_kernel_tuning import (
+            validate_flashdeberta_kernel_overrides,
+        )
+
+        try:
+            validate_flashdeberta_kernel_overrides(cfg.hf.flash.kernel_overrides_path)
+        except ValueError as exc:
+            raise ValueError(f"Invalid model.hf.flash.kernel_overrides_path: {exc}") from exc
 
     _cfg_set(
         cfg.rope, "norm_arch", _ensure_choice("model.rope.norm_arch", cfg.rope.norm_arch, _NORM_ARCH_CHOICES)
@@ -1343,6 +890,16 @@ def validate_model_config(cfg: ModelConfig) -> None:
         ),
     )
     _cfg_set(cfg.rope, "ffn_type", _ensure_choice("model.rope.ffn_type", cfg.rope.ffn_type, _FFN_CHOICES))
+    hidden_act = str(cfg.rope.hidden_act).strip().lower()
+    try:
+        from transformers.activations import ACT2FN
+
+        if hidden_act not in ACT2FN:
+            allowed = "|".join(sorted(ACT2FN))
+            raise ValueError(f"model.rope.hidden_act must be one of: {allowed}. Got: {cfg.rope.hidden_act}")
+    except ImportError:  # pragma: no cover - transformers is a required runtime dependency
+        pass
+    _cfg_set(cfg.rope, "hidden_act", hidden_act)
 
     _cfg_set(cfg.tokenizer, "name_or_path", str(cfg.tokenizer.name_or_path).strip())
     _cfg_set(cfg.pretrained, "discriminator_path", str(cfg.pretrained.discriminator_path or "").strip())
@@ -1359,8 +916,59 @@ def validate_model_config(cfg: ModelConfig) -> None:
 
     if cfg.rope.max_position_embeddings is not None and int(cfg.rope.max_position_embeddings) <= 0:
         raise ValueError("model.rope.max_position_embeddings must be > 0 when provided.")
-    if float(cfg.rope.rotary_pct) <= 0.0 or float(cfg.rope.rotary_pct) > 1.0:
-        raise ValueError("model.rope.rotary_pct must be in (0, 1].")
+    if not math.isfinite(float(cfg.rope.rope_theta)) or float(cfg.rope.rope_theta) <= 0.0:
+        raise ValueError("model.rope.rope_theta must be finite and > 0.")
+    if (
+        not math.isfinite(float(cfg.rope.rotary_pct))
+        or float(cfg.rope.rotary_pct) <= 0.0
+        or float(cfg.rope.rotary_pct) > 1.0
+    ):
+        raise ValueError("model.rope.rotary_pct must be finite and in (0, 1].")
+    if int(cfg.rope.type_vocab_size) < 0:
+        raise ValueError("model.rope.type_vocab_size must be >= 0.")
+    if not math.isfinite(float(cfg.rope.norm_eps)) or float(cfg.rope.norm_eps) <= 0.0:
+        raise ValueError("model.rope.norm_eps must be finite and > 0.")
+    if not math.isfinite(float(cfg.rope.initializer_range)) or float(cfg.rope.initializer_range) < 0.0:
+        raise ValueError("model.rope.initializer_range must be finite and >= 0.")
+    if cfg.rope.keel_alpha_init is not None and not math.isfinite(float(cfg.rope.keel_alpha_init)):
+        raise ValueError("model.rope.keel_alpha_init must be finite when provided.")
+    for field_name in (
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+    ):
+        value = getattr(cfg.generator, field_name)
+        if value is not None and int(value) <= 0:
+            raise ValueError(f"model.generator.{field_name} must be > 0 when provided.")
+    for field_name in ("hidden_prob", "attention_probs_prob"):
+        value = getattr(cfg.dropout, field_name)
+        if value is None:
+            continue
+        probability = float(value)
+        if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
+            raise ValueError(f"model.dropout.{field_name} must be finite and in [0, 1] or null.")
+    if cfg.backbone_type != "hf_deberta_v2" and cfg.hf.attention_impl == "flash":
+        raise ValueError(
+            "model.hf.attention_impl='flash' is only supported with model.backbone_type='hf_deberta_v2'."
+        )
+    if cfg.hf.attention_impl == "flash":
+        dropout_values = {
+            "model.dropout.hidden_prob": cfg.dropout.hidden_prob,
+            "model.dropout.attention_probs_prob": cfg.dropout.attention_probs_prob,
+        }
+        enabled_dropout = [
+            f"{name}={value!r}"
+            for name, value in dropout_values.items()
+            if value is None or float(value) != 0.0
+        ]
+        if enabled_dropout:
+            raise ValueError(
+                "model.hf.attention_impl='flash' requires dropout disabled: both fields must resolve "
+                "to 0.0; "
+                "null preserves backbone/checkpoint dropout and is not accepted. Invalid values: "
+                + ", ".join(enabled_dropout)
+            )
     if int(cfg.tokenizer.vocab_multiple) <= 0:
         raise ValueError("model.tokenizer.vocab_multiple must be >= 1.")
     if cfg.tokenizer.vocab_target is not None and int(cfg.tokenizer.vocab_target) <= 0:
@@ -1376,32 +984,7 @@ def validate_model_config(cfg: ModelConfig) -> None:
                 "model.hf.max_position_embeddings is only supported when model.from_scratch=true "
                 "for hf_deberta_v2 runs."
             )
-
-        rope_changed = asdict(cfg.rope) != asdict(defaults.rope)
-        if rope_changed:
-            raise ValueError("These options are only valid when model.backbone_type='rope': model.rope.*")
-    else:
-        if cfg.hf.attention_kernel != defaults.hf.attention_kernel:
-            warnings.warn(
-                "model.hf.attention_kernel only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Current value ({cfg.hf.attention_kernel!r}) has no effect on the rope backbone.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if cfg.hf.max_position_embeddings is not None:
-            warnings.warn(
-                "model.hf.max_position_embeddings only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Current value ({cfg.hf.max_position_embeddings!r}) has no effect on the rope backbone.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if cfg.hf.model_size != defaults.hf.model_size:
-            warnings.warn(
-                "model.hf.model_size only applies when model.backbone_type='hf_deberta_v2'. "
-                f"Current value ({cfg.hf.model_size!r}) has no effect on the rope backbone.",
-                UserWarning,
-                stacklevel=2,
-            )
+    _apply_backbone_option_severity_policy(cfg, defaults)
 
     if cfg.backbone_type == "rope" and bool(cfg.from_scratch):
         pretrained_changed = asdict(cfg.rope.pretrained) != asdict(defaults.rope.pretrained)
@@ -1437,8 +1020,26 @@ def validate_model_config(cfg: ModelConfig) -> None:
             raise ValueError("model.rope.pretrained.max_position_embeddings must be > 0 when provided.")
         if pre.rotary_pct is not None:
             pct = float(pre.rotary_pct)
-            if pct <= 0.0 or pct > 1.0:
-                raise ValueError("model.rope.pretrained.rotary_pct must be in (0, 1] when provided.")
+            if not math.isfinite(pct) or pct <= 0.0 or pct > 1.0:
+                raise ValueError(
+                    "model.rope.pretrained.rotary_pct must be finite and in (0, 1] when provided."
+                )
+        if pre.rope_theta is not None and (
+            not math.isfinite(float(pre.rope_theta)) or float(pre.rope_theta) <= 0.0
+        ):
+            raise ValueError("model.rope.pretrained.rope_theta must be finite and > 0 when provided.")
+        if pre.type_vocab_size is not None and int(pre.type_vocab_size) < 0:
+            raise ValueError("model.rope.pretrained.type_vocab_size must be >= 0 when provided.")
+        if pre.norm_eps is not None and (
+            not math.isfinite(float(pre.norm_eps)) or float(pre.norm_eps) <= 0.0
+        ):
+            raise ValueError("model.rope.pretrained.norm_eps must be finite and > 0 when provided.")
+        if pre.keel_alpha_init is not None and not math.isfinite(float(pre.keel_alpha_init)):
+            raise ValueError("model.rope.pretrained.keel_alpha_init must be finite when provided.")
+        if pre.initializer_range is not None and (
+            not math.isfinite(float(pre.initializer_range)) or float(pre.initializer_range) < 0.0
+        ):
+            raise ValueError("model.rope.pretrained.initializer_range must be finite and >= 0 when provided.")
         if pre.norm_arch is not None:
             _cfg_set(
                 pre,
@@ -1516,6 +1117,16 @@ def validate_data_config(cfg: DataConfig) -> None:
     src = cfg.source
     pack = cfg.packing
 
+    for field_name in ("dataset_name", "dataset_config_name", "data_files", "load_from_disk"):
+        value = getattr(src, field_name)
+        if value is not None:
+            _cfg_set(src, field_name, str(value).strip() or None)
+    for field_name in ("train_split", "text_column_name"):
+        value = str(getattr(src, field_name)).strip()
+        if not value:
+            raise ValueError(f"data.source.{field_name} must be a non-empty string.")
+        _cfg_set(src, field_name, value)
+
     if src.load_from_disk:
         if src.streaming:
             raise ValueError(
@@ -1562,10 +1173,11 @@ def validate_data_config(cfg: DataConfig) -> None:
         and int(pack.max_seq_length) > int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)
     ):
         warnings.warn(
-            "data.packing.block_cross_document_attention builds dense O(S^2) pairwise masks. "
+            "data.packing.block_cross_document_attention may build dense O(S^2) pairwise masks on "
+            "non-segment-aware attention backends. "
             f"Configured data.packing.max_seq_length={int(pack.max_seq_length)} may be expensive; "
             "consider reducing sequence length or disabling data.packing.block_cross_document_attention "
-            f"until sparse/segment-aware attention support lands (warning threshold: {int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)}).",
+            f"until a segment-aware backend is enabled (warning threshold: {int(_DENSE_DOC_BLOCK_WARN_SEQ_LEN)}).",
             UserWarning,
             stacklevel=2,
         )
@@ -1591,8 +1203,9 @@ def validate_train_config(cfg: TrainConfig) -> None:
         ),
     )
 
-    if cfg.checkpoint.output_dir is not None and not str(cfg.checkpoint.output_dir).strip():
-        _cfg_set(cfg.checkpoint, "output_dir", None)
+    if cfg.checkpoint.output_dir is not None:
+        checkpoint_output_dir = str(cfg.checkpoint.output_dir).strip()
+        _cfg_set(cfg.checkpoint, "output_dir", checkpoint_output_dir or None)
     if cfg.checkpoint.resume_from_checkpoint is not None:
         resume_from_checkpoint = str(cfg.checkpoint.resume_from_checkpoint).strip()
         _cfg_set(
@@ -1620,18 +1233,40 @@ def validate_train_config(cfg: TrainConfig) -> None:
         if int(val) < int(_min):
             raise ValueError(f"train.{_name} must be >= {_min}.")
 
+    seed = int(cfg.seed)
+    if seed < 0 or seed > (2**32 - 1):
+        raise ValueError("train.seed must be between 0 and 2**32 - 1 (inclusive).")
+
     mlm = float(cfg.objective.mlm_probability)
-    if mlm <= 0.0 or mlm >= 1.0:
-        raise ValueError("train.objective.mlm_probability must be in (0, 1).")
+    if not math.isfinite(mlm) or mlm <= 0.0 or mlm >= 1.0:
+        raise ValueError("train.objective.mlm_probability must be finite and in (0, 1).")
     mask_p = float(cfg.objective.mask_token_prob)
     rand_p = float(cfg.objective.random_token_prob)
-    if mask_p < 0.0 or rand_p < 0.0 or (mask_p + rand_p) > 1.0:
+    if (
+        not math.isfinite(mask_p)
+        or not math.isfinite(rand_p)
+        or mask_p < 0.0
+        or rand_p < 0.0
+        or (mask_p + rand_p) > 1.0
+    ):
         raise ValueError(
             "Invalid masking probabilities: train.objective.mask_token_prob + "
-            "train.objective.random_token_prob must be <= 1."
+            "train.objective.random_token_prob must be finite, nonnegative, and <= 1."
         )
-    if float(cfg.objective.sampling_temperature) <= 0.0:
-        raise ValueError("train.objective.sampling_temperature must be > 0.")
+    temperature = float(cfg.objective.sampling_temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("train.objective.sampling_temperature must be finite and > 0.")
+    gen_weight = float(cfg.objective.gen_loss_weight)
+    disc_weight = float(cfg.objective.disc_loss_weight)
+    if (
+        not math.isfinite(gen_weight)
+        or not math.isfinite(disc_weight)
+        or gen_weight < 0.0
+        or disc_weight < 0.0
+    ):
+        raise ValueError("train objective loss weights must be finite and >= 0.")
+    if gen_weight == 0.0 and disc_weight == 0.0:
+        raise ValueError("At least one train objective loss weight must be > 0.")
     if not isinstance(cfg.decoupled_training, bool):
         raise ValueError(
             "train.decoupled_training must be a boolean (true/false). "
@@ -1662,16 +1297,26 @@ def validate_optim_config(cfg: OptimConfig) -> None:
         _ensure_choice("optim.scheduler.type", cfg.scheduler.type, _LR_SCHEDULER_CHOICES),
     )
 
-    if float(cfg.lr.base) <= 0.0:
-        raise ValueError("optim.lr.base must be > 0.")
-    if float(cfg.lr.generator) != -1.0 and float(cfg.lr.generator) <= 0.0:
-        raise ValueError("optim.lr.generator must be -1 (inherit) or > 0.")
-    if float(cfg.lr.discriminator) != -1.0 and float(cfg.lr.discriminator) <= 0.0:
-        raise ValueError("optim.lr.discriminator must be -1 (inherit) or > 0.")
-    if float(cfg.weight_decay) < 0.0:
-        raise ValueError("optim.weight_decay must be >= 0.")
-    if float(cfg.max_grad_norm) < 0.0:
-        raise ValueError("optim.max_grad_norm must be >= 0.")
+    if not math.isfinite(float(cfg.lr.base)) or float(cfg.lr.base) <= 0.0:
+        raise ValueError("optim.lr.base must be finite and > 0.")
+    if float(cfg.lr.generator) != -1.0 and (
+        not math.isfinite(float(cfg.lr.generator)) or float(cfg.lr.generator) <= 0.0
+    ):
+        raise ValueError("optim.lr.generator must be -1 (inherit) or finite and > 0.")
+    if float(cfg.lr.discriminator) != -1.0 and (
+        not math.isfinite(float(cfg.lr.discriminator)) or float(cfg.lr.discriminator) <= 0.0
+    ):
+        raise ValueError("optim.lr.discriminator must be -1 (inherit) or finite and > 0.")
+    for field_name in ("beta1", "beta2"):
+        value = float(getattr(cfg.adam, field_name))
+        if not math.isfinite(value) or value < 0.0 or value >= 1.0:
+            raise ValueError(f"optim.adam.{field_name} must be finite and in [0, 1).")
+    if not math.isfinite(float(cfg.adam.epsilon)) or float(cfg.adam.epsilon) <= 0.0:
+        raise ValueError("optim.adam.epsilon must be finite and > 0.")
+    if not math.isfinite(float(cfg.weight_decay)) or float(cfg.weight_decay) < 0.0:
+        raise ValueError("optim.weight_decay must be finite and >= 0.")
+    if not math.isfinite(float(cfg.max_grad_norm)) or float(cfg.max_grad_norm) < 0.0:
+        raise ValueError("optim.max_grad_norm must be finite and >= 0.")
     if int(cfg.scheduler.warmup_steps) < 0:
         raise ValueError("optim.scheduler.warmup_steps must be >= 0.")
 
@@ -1681,13 +1326,18 @@ def validate_logging_config(cfg: LoggingConfig) -> None:
 
     :param LoggingConfig cfg: Logging config.
     """
-    _cfg_set(cfg, "backend", _ensure_choice("logging.backend", cfg.backend, _LOGGING_BACKEND_CHOICES))
     _cfg_set(cfg.wandb, "watch", _normalize_wandb_watch(cfg.wandb.watch))
 
-    if not str(cfg.project_name).strip():
+    project_name = str(cfg.project_name).strip()
+    if not project_name:
         raise ValueError("logging.project_name must be non-empty.")
-    if cfg.output_dir is not None and not str(cfg.output_dir).strip():
-        _cfg_set(cfg, "output_dir", None)
+    _cfg_set(cfg, "project_name", project_name)
+    if cfg.run_name is not None:
+        run_name = str(cfg.run_name).strip()
+        _cfg_set(cfg, "run_name", run_name or None)
+    if cfg.output_dir is not None:
+        output_dir = str(cfg.output_dir).strip()
+        _cfg_set(cfg, "output_dir", output_dir or None)
     if int(cfg.logging_steps) < 0:
         raise ValueError("logging.logging_steps must be >= 0.")
     if int(cfg.wandb.watch_log_freq) < 1:
@@ -1717,7 +1367,6 @@ def validate_training_workflow_options(
     train_cfg: TrainConfig,
     model_cfg: ModelConfig | None = None,
     optim_cfg: OptimConfig | None = None,
-    logging_cfg: LoggingConfig | None = None,
 ) -> None:
     """Validate options tied to workflow support (for example, eval mode availability).
 
@@ -1725,23 +1374,45 @@ def validate_training_workflow_options(
     :param TrainConfig train_cfg: Training configuration.
     :param ModelConfig | None model_cfg: Optional model configuration.
     :param OptimConfig | None optim_cfg: Optional optimizer configuration.
-    :param LoggingConfig | None logging_cfg: Optional logging configuration.
     """
     sdpa_policy = str(train_cfg.sdpa_kernel).strip().lower()
-    if (
+    reject_flash_sdpa_for_doc_block = (
         bool(data_cfg.packing.enabled)
         and bool(data_cfg.packing.block_cross_document_attention)
         and sdpa_policy == "flash"
-    ):
+        and (model_cfg is None or str(model_cfg.backbone_type).strip().lower() == "rope")
+    )
+    if reject_flash_sdpa_for_doc_block:
         raise ValueError(
             "train.sdpa_kernel=flash is not supported with data.packing.enabled=true. "
             "Packed batches may require 3D document-blocking attention masks that are incompatible "
             "with strict flash SDPA kernels. Use train.sdpa_kernel=auto|mem_efficient|math instead."
         )
 
+    if optim_cfg is not None:
+        scheduler_type = str(optim_cfg.scheduler.type).strip().lower()
+        warmup_steps = int(optim_cfg.scheduler.warmup_steps)
+        max_steps = int(train_cfg.max_steps)
+        if scheduler_type != "constant" and warmup_steps >= max_steps:
+            raise ValueError(
+                "optim.scheduler.warmup_steps must be less than train.max_steps for "
+                f"scheduler type {scheduler_type!r}; got warmup_steps={warmup_steps}, "
+                f"max_steps={max_steps}. Only scheduler type 'constant' ignores warmup_steps."
+            )
+
     if model_cfg is not None:
         backbone_type = str(model_cfg.backbone_type).strip().lower()
         attn_impl = str(model_cfg.rope.attention_implementation).strip().lower()
+        hf_attention_impl = str(model_cfg.hf.attention_impl).strip().lower()
+        if (
+            backbone_type == "hf_deberta_v2"
+            and hf_attention_impl == "flash"
+            and str(train_cfg.mixed_precision).strip().lower() != "bf16"
+        ):
+            raise ValueError(
+                "model.hf.attention_impl='flash' requires train.mixed_precision='bf16'. "
+                "Full-precision tensors are unsupported by the configured FlashDeBERTa kernels."
+            )
         if backbone_type != "rope" and sdpa_policy != "auto":
             warnings.warn(
                 "train.sdpa_kernel has no effect when model.backbone_type='hf_deberta_v2'. "
@@ -1755,23 +1426,20 @@ def validate_training_workflow_options(
                 "train.sdpa_kernel only affects rope attention when model.rope.attention_implementation='sdpa'. "
                 "Set train.sdpa_kernel=auto or switch model.rope.attention_implementation=sdpa."
             )
-        if (
-            backbone_type != "rope"
-            and bool(data_cfg.packing.enabled)
-            and bool(data_cfg.packing.block_cross_document_attention)
-        ):
-            raise ValueError(
-                "data.packing.block_cross_document_attention=true is only supported with model.backbone_type='rope'. "
-                "Use data.packing.block_cross_document_attention=false or switch to model.backbone_type='rope'."
-            )
         embed_sharing = str(model_cfg.embedding_sharing).strip().lower()
         local_optim = optim_cfg or OptimConfig()
-        gen_lr = float(local_optim.lr.generator)
-        if embed_sharing == "es" and gen_lr > 0 and gen_lr != float(local_optim.lr.base):
+        base_lr = float(local_optim.lr.base)
+        gen_lr_raw = float(local_optim.lr.generator)
+        disc_lr_raw = float(local_optim.lr.discriminator)
+        gen_lr = gen_lr_raw if gen_lr_raw > 0 else base_lr
+        disc_lr = disc_lr_raw if disc_lr_raw > 0 else base_lr
+        if embed_sharing == "es" and gen_lr != disc_lr:
             raise ValueError(
                 f"model.embedding_sharing='es' shares embedding parameters between generator and discriminator, "
-                f"but optim.lr.generator ({gen_lr}) differs from optim.lr.base ({local_optim.lr.base}). "
-                "Set optim.lr.generator=-1 (inherit) or match it to optim.lr.base, "
+                f"but their effective learning rates differ "
+                f"(generator={gen_lr}, discriminator={disc_lr}). "
+                "Set optim.lr.generator and optim.lr.discriminator to the same value "
+                "(or use -1 to inherit optim.lr.base), "
                 "or switch to embedding_sharing='gdes'/'none'."
             )
         if bool(train_cfg.decoupled_training) and embed_sharing == "es":
@@ -1782,79 +1450,6 @@ def validate_training_workflow_options(
                 "optimizer zero_grad() because discriminator optimizer param groups do not own those shared params. "
                 "Use embedding_sharing='gdes' or 'none' for decoupled training."
             )
-
-    if logging_cfg is not None:
-        # backend already validated as none|tensorboard.
-        # Effective backend is wandb when enabled; otherwise backend.
-        _ = "wandb" if bool(logging_cfg.wandb.enabled) else str(logging_cfg.backend).strip().lower()
-
-
-def apply_profile_defaults(
-    *,
-    model_cfg: ModelConfig,
-    train_cfg: TrainConfig,
-    optim_cfg: OptimConfig | None = None,
-) -> None:
-    """Apply profile/backbone-specific defaults while preserving explicit values.
-
-    :param ModelConfig model_cfg: Model config to update in-place.
-    :param TrainConfig train_cfg: Train config to update in-place.
-    :param OptimConfig | None optim_cfg: Optim config to update in-place.
-    """
-    # Explicit-field metadata is populated from YAML + dotted CLI flags and is
-    # checked before equality comparisons so explicit values are preserved even
-    # when they match raw dataclass defaults.
-    explicit_model_fields = _explicit_fields(model_cfg)
-    explicit_train_fields = _explicit_fields(train_cfg)
-    explicit_optim_fields = _explicit_fields(optim_cfg) if optim_cfg is not None else set()
-
-    profile = str(model_cfg.profile).strip().lower()
-    model_defaults = ModelConfig()
-    train_defaults = TrainConfig()
-    optim_defaults = OptimConfig()
-
-    if profile == "deberta_v3_parity":
-        if "backbone_type" not in explicit_model_fields and str(model_cfg.backbone_type) == str(
-            model_defaults.backbone_type
-        ):
-            _cfg_set(model_cfg, "backbone_type", "hf_deberta_v2")
-
-        if "embedding_sharing" not in explicit_model_fields and str(model_cfg.embedding_sharing) == str(
-            model_defaults.embedding_sharing
-        ):
-            _cfg_set(model_cfg, "embedding_sharing", "gdes")
-
-        if "hf.attention_kernel" not in explicit_model_fields and str(model_cfg.hf.attention_kernel) == str(
-            model_defaults.hf.attention_kernel
-        ):
-            _cfg_set(model_cfg.hf, "attention_kernel", "dynamic")
-
-    if str(model_cfg.backbone_type).strip().lower() == "hf_deberta_v2":
-        if "objective.mask_token_prob" not in explicit_train_fields and float(
-            train_cfg.objective.mask_token_prob
-        ) == float(train_defaults.objective.mask_token_prob):
-            _cfg_set(train_cfg.objective, "mask_token_prob", 1.0)
-        if "objective.random_token_prob" not in explicit_train_fields and float(
-            train_cfg.objective.random_token_prob
-        ) == float(train_defaults.objective.random_token_prob):
-            _cfg_set(train_cfg.objective, "random_token_prob", 0.0)
-        if "objective.disc_loss_weight" not in explicit_train_fields and float(
-            train_cfg.objective.disc_loss_weight
-        ) == float(train_defaults.objective.disc_loss_weight):
-            _cfg_set(train_cfg.objective, "disc_loss_weight", 10.0)
-        if optim_cfg is not None:
-            if "adam.epsilon" not in explicit_optim_fields and float(optim_cfg.adam.epsilon) == float(
-                optim_defaults.adam.epsilon
-            ):
-                _cfg_set(optim_cfg.adam, "epsilon", 1e-6)
-            if "scheduler.warmup_steps" not in explicit_optim_fields and int(
-                optim_cfg.scheduler.warmup_steps
-            ) == int(optim_defaults.scheduler.warmup_steps):
-                _cfg_set(optim_cfg.scheduler, "warmup_steps", 10_000)
-        if "token_weighted_gradient_accumulation" not in explicit_train_fields and bool(
-            train_cfg.token_weighted_gradient_accumulation
-        ) == bool(train_defaults.token_weighted_gradient_accumulation):
-            _cfg_set(train_cfg, "token_weighted_gradient_accumulation", True)
 
 
 def validate_run_metadata_schema(raw: dict[str, object], *, source: str) -> None:
@@ -1889,6 +1484,7 @@ _SnapshotConfigT = TypeVar(
     "_SnapshotConfigT",
     ModelConfig,
     DataConfig,
+    TrainConfig,
     OptimConfig,
     LoggingConfig,
 )
@@ -1906,26 +1502,24 @@ def _load_snapshot_dataclass(
     :raises ValueError: If unknown keys are present or dataclass construction fails.
     :return _SnapshotConfigT: Parsed dataclass instance.
     """
-    expected_keys = {f.name for f in fields(cls)}
-    unknown = sorted(set(raw) - expected_keys)
+    expected = {f.name for f in fields(cls)}
+    unknown = sorted(set(raw) - expected)
     if unknown:
-        unknown_str = ", ".join(unknown)
         raise ValueError(
-            f"Unsupported {config_name} keys in {source}: {unknown_str}. "
+            f"Unsupported {config_name} keys in {source}: {', '.join(unknown)}. "
             "This snapshot was produced by an older pre-release schema; "
             "backward resume/export compatibility is not guaranteed before stable release."
         )
-    missing = sorted(expected_keys - set(raw))
+    missing = sorted(expected - set(raw))
     if missing:
-        missing_str = ", ".join(missing)
         raise ValueError(
-            f"Missing required {config_name} keys in {source}: {missing_str}. "
+            f"Missing required {config_name} keys in {source}: {', '.join(missing)}. "
             "This snapshot does not match the current config schema."
         )
 
     try:
-        return cls(**raw)
-    except TypeError as e:
+        return _replace_from_mapping_recursive(cls(), dict(raw), section_name=config_name)
+    except (TypeError, ValueError) as e:
         raise ValueError(
             f"Failed to parse {config_name} at {source}. "
             "The persisted config schema does not match this code version."
@@ -1952,6 +1546,16 @@ def load_data_config_snapshot(raw: dict[str, object], *, source: str) -> DataCon
     return _load_snapshot_dataclass(raw, cls=DataConfig, source=source, config_name="data_config.json")
 
 
+def load_train_config_snapshot(raw: dict[str, object], *, source: str) -> TrainConfig:
+    """Parse persisted `train_config.json` into TrainConfig.
+
+    :param dict[str, object] raw: Raw train config mapping.
+    :param str source: Source path for error messages.
+    :return TrainConfig: Parsed training configuration.
+    """
+    return _load_snapshot_dataclass(raw, cls=TrainConfig, source=source, config_name="train_config.json")
+
+
 def load_optim_config_snapshot(raw: dict[str, object], *, source: str) -> OptimConfig:
     """Parse persisted `optim_config.json` into OptimConfig.
 
@@ -1972,141 +1576,52 @@ def load_logging_config_snapshot(raw: dict[str, object], *, source: str) -> Logg
     return _load_snapshot_dataclass(raw, cls=LoggingConfig, source=source, config_name="logging_config.json")
 
 
-def _collect_leaf_paths(value: Any, *, prefix: str = "") -> set[str]:
-    """Collect dotted leaf paths from a nested mapping.
-
-    :param Any value: Nested mapping value.
-    :param str prefix: Prefix path.
-    :return set[str]: Dotted leaf paths.
-    """
-    if isinstance(value, dict):
-        out: set[str] = set()
-        for key, item in value.items():
-            key_s = str(key)
-            child = f"{prefix}.{key_s}" if prefix else key_s
-            out.update(_collect_leaf_paths(item, prefix=child))
-        return out
-    if prefix:
-        return {prefix}
-    return set()
+# Old train-section keys that moved to other sections. Same-section migrations
+# derive from each config class's moved-key table.
+_TRAIN_CROSS_SECTION_SUGGESTIONS: dict[str, str] = {
+    "project_name": "logging.project_name",
+    "run_name": "logging.run_name",
+    "report_to": "logging.wandb.enabled",
+    "logging_steps": "logging.logging_steps",
+    "wandb_watch": "logging.wandb.watch",
+    "wandb_watch_log_freq": "logging.wandb.watch_log_freq",
+    "debug_metrics": "logging.debug.metrics",
+    "learning_rate": "optim.lr.base",
+    "generator_learning_rate": "optim.lr.generator",
+    "discriminator_learning_rate": "optim.lr.discriminator",
+    "weight_decay": "optim.weight_decay",
+    "adam_beta1": "optim.adam.beta1",
+    "adam_beta2": "optim.adam.beta2",
+    "adam_epsilon": "optim.adam.epsilon",
+    "warmup_steps": "optim.scheduler.warmup_steps",
+    "lr_scheduler_type": "optim.scheduler.type",
+    "max_grad_norm": "optim.max_grad_norm",
+}
 
 
 def _legacy_key_suggestion(section_name: str, key: str) -> str | None:
-    """Return actionable migration suggestion for an unknown key.
+    """Return an actionable migration suggestion for an unknown key.
 
     :param str section_name: Section path.
     :param str key: Unknown key.
-    :return str | None: Suggested replacement path.
+    :return str | None: Migration hint for the removed or moved key.
     """
     section = str(section_name)
     k = str(key)
-    model_map = {
-        "tokenizer_name_or_path": "model.tokenizer.name_or_path",
-        "tokenizer_allow_vocab_resize": "model.tokenizer.allow_vocab_resize",
-        "tokenizer_vocab_target": "model.tokenizer.vocab_target",
-        "tokenizer_vocab_multiple": "model.tokenizer.vocab_multiple",
-        "hf_model_size": "model.hf.model_size",
-        "hf_attention_kernel": "model.hf.attention_kernel",
-        "hf_max_position_embeddings": "model.hf.max_position_embeddings",
-        "pretrained_discriminator_path": "model.pretrained.discriminator_path",
-        "pretrained_generator_path": "model.pretrained.generator_path",
-        "hidden_dropout_prob": "model.dropout.hidden_prob",
-        "attention_probs_dropout_prob": "model.dropout.attention_probs_prob",
-        "generator_num_hidden_layers": "model.generator.num_hidden_layers",
-        "generator_hidden_size": "model.generator.hidden_size",
-        "generator_intermediate_size": "model.generator.intermediate_size",
-        "generator_num_attention_heads": "model.generator.num_attention_heads",
-    }
-    data_map = {
-        "dataset_name": "data.source.dataset_name",
-        "dataset_config_name": "data.source.dataset_config_name",
-        "data_files": "data.source.data_files",
-        "load_from_disk": "data.source.load_from_disk",
-        "train_split": "data.source.train_split",
-        "text_column_name": "data.source.text_column_name",
-        "streaming": "data.source.streaming",
-        "shuffle_buffer_size": "data.source.shuffle_buffer_size",
-        "pack_sequences": "data.packing.enabled",
-        "max_seq_length": "data.packing.max_seq_length",
-        "block_cross_document_attention": "data.packing.block_cross_document_attention",
-    }
-    train_map = {
-        "output_dir": "train.checkpoint.output_dir",
-        "overwrite_output_dir": "train.checkpoint.overwrite_output_dir",
-        "save_steps": "train.checkpoint.save_steps",
-        "save_total_limit": "train.checkpoint.save_total_limit",
-        "resume_from_checkpoint": "train.checkpoint.resume_from_checkpoint",
-        "resume_data_strategy": "train.checkpoint.resume_data_strategy",
-        "resume_replay_max_micro_batches": "train.checkpoint.resume_replay_max_micro_batches",
-        "export_hf_final": "train.checkpoint.export_hf_final",
-        "dataloader_num_workers": "train.dataloader.num_workers",
-        "dataloader_pin_memory": "train.dataloader.pin_memory",
-        "torch_compile": "train.compile.enabled",
-        "torch_compile_mode": "train.compile.mode",
-        "torch_compile_scope": "train.compile.scope",
-        "torch_compile_backend": "train.compile.backend",
-        "mlm_probability": "train.objective.mlm_probability",
-        "mask_token_prob": "train.objective.mask_token_prob",
-        "random_token_prob": "train.objective.random_token_prob",
-        "mlm_max_ngram": "train.objective.mlm_max_ngram",
-        "sampling_temperature": "train.objective.sampling_temperature",
-        "gen_loss_weight": "train.objective.gen_loss_weight",
-        "disc_loss_weight": "train.objective.disc_loss_weight",
-        "project_name": "logging.project_name",
-        "run_name": "logging.run_name",
-        "report_to": "logging.wandb.enabled + logging.backend",
-        "logging_steps": "logging.logging_steps",
-        "wandb_watch": "logging.wandb.watch",
-        "wandb_watch_log_freq": "logging.wandb.watch_log_freq",
-        "debug_metrics": "logging.debug.metrics",
-        "learning_rate": "optim.lr.base",
-        "generator_learning_rate": "optim.lr.generator",
-        "discriminator_learning_rate": "optim.lr.discriminator",
-        "weight_decay": "optim.weight_decay",
-        "adam_beta1": "optim.adam.beta1",
-        "adam_beta2": "optim.adam.beta2",
-        "adam_epsilon": "optim.adam.epsilon",
-        "warmup_steps": "optim.scheduler.warmup_steps",
-        "lr_scheduler_type": "optim.scheduler.type",
-        "max_grad_norm": "optim.max_grad_norm",
-    }
-    if section == "model":
-        if k in model_map:
-            return model_map[k]
-        rope_like = {
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "hidden_act",
-            "rope_theta",
-            "rotary_pct",
-            "use_absolute_position_embeddings",
-            "max_position_embeddings",
-            "type_vocab_size",
-            "norm_arch",
-            "norm_eps",
-            "keel_alpha_init",
-            "keel_alpha_learnable",
-            "attention_implementation",
-            "ffn_type",
-            "use_bias",
-            "swiglu_adjust_intermediate",
-            "initializer_range",
-        }
-        if k in rope_like:
-            return f"model.rope.{k}"
-        if k.startswith("pretrained_"):
-            return "model.rope.pretrained.<field>"
-    if section == "data" and k in data_map:
-        return data_map[k]
-    if section == "train" and k in train_map:
-        return train_map[k]
+    if section == "train":
+        replacement = _TRAIN_CROSS_SECTION_SUGGESTIONS.get(k)
+        return f"use {replacement}" if replacement is not None else None
     if section == "root":
         if k == "checkpoint":
-            return "train.checkpoint"
+            return "use train.checkpoint"
         if k == "debug":
-            return "logging.debug"
+            return "use logging.debug"
+    if section == "model" and k == "profile":
+        return "remove model.profile; configure model.backbone_type and explicit fields directly"
+    if section == "model.hf.flash" and k == "docblock_bias_seq_len":
+        return "remove model.hf.flash.docblock_bias_seq_len; packed training uses ragged docblock"
+    if section == "logging" and k == "backend":
+        return "remove logging.backend; only logging.wandb.enabled remains for optional tracking"
     return None
 
 
@@ -2129,6 +1644,7 @@ def _load_raw_config_mapping(path: str | Path) -> tuple[dict[str, Any], str]:
             raise RuntimeError(
                 "pyyaml is required for YAML config files. Install with `pip install pyyaml`."
             ) from e
+
         raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     else:
         raw = load_json_mapping(cfg_path)
@@ -2137,100 +1653,6 @@ def _load_raw_config_mapping(path: str | Path) -> tuple[dict[str, Any], str]:
         raise ValueError("Config file must parse to a dict.")
     format_name = "YAML" if suffix in {".yaml", ".yml"} else "JSON"
     return raw, format_name
-
-
-def _resolve_variables(data: dict[str, Any]) -> dict[str, Any]:
-    """Resolve `$variables.*` references in a config mapping.
-
-    :param dict[str, Any] data: Raw config mapping.
-    :raises ValueError: If a variable reference is missing or circular.
-    :return dict[str, Any]: Mapping with variables expanded and removed.
-    """
-    raw_vars = data.get("variables") or {}
-    if not isinstance(raw_vars, dict):
-        raise ValueError("variables must be a mapping if provided.")
-
-    resolved: dict[str, Any] = {}
-    resolving: set[str] = set()
-
-    def _lookup_var(path: str) -> Any:
-        """Resolve one variable path with cycle detection.
-
-        :param str path: Variable path under ``variables``.
-        :return Any: Resolved variable value.
-        """
-        if path in resolved:
-            return resolved[path]
-        if path in resolving:
-            cycle = " -> ".join(list(resolving) + [path])
-            raise ValueError(f"Circular variable reference: {cycle}")
-
-        cur: Any = raw_vars
-        for part in str(path).split("."):
-            if not isinstance(cur, dict) or part not in cur:
-                raise ValueError(f"Unknown variable reference: variables.{path}")
-            cur = cur[part]
-
-        resolving.add(path)
-        value = _resolve_value(cur)
-        resolving.remove(path)
-        resolved[path] = value
-        return value
-
-    def _sub_var(match: re.Match[str]) -> str:
-        """Render one regex variable match as string.
-
-        :param re.Match[str] match: Regex match object.
-        :return str: String replacement value.
-        """
-        return str(_lookup_var(match.group(1)))
-
-    def _resolve_value(value: Any) -> Any:
-        """Recursively resolve variable references inside nested values.
-
-        :param Any value: Raw nested value.
-        :return Any: Resolved nested value.
-        """
-        if isinstance(value, dict):
-            return {k: _resolve_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [_resolve_value(v) for v in value]
-        if isinstance(value, str):
-            full = _VAR_FULL_RE.fullmatch(value)
-            if full:
-                return _lookup_var(full.group(1))
-            out = _VAR_INLINE_RE.sub(_sub_var, value)
-            out = _VAR_BRACE_RE.sub(_sub_var, out)
-            remaining = _VAR_SUSPICIOUS_RE.findall(out)
-            if remaining:
-                warnings.warn(
-                    f"String contains unresolved variable-like patterns: {remaining}. "
-                    "Use {$variables.name} or ${variables.name} for inline substitution.",
-                    stacklevel=2,
-                )
-            return out
-        return value
-
-    def _collect_var_leaf_paths(prefix: str, value: Any) -> list[str]:
-        """Collect dotted variable leaf paths from a nested variable mapping.
-
-        :param str prefix: Current path prefix.
-        :param Any value: Nested mapping value.
-        :return list[str]: Dotted leaf paths.
-        """
-        if isinstance(value, dict):
-            out: list[str] = []
-            for key, item in value.items():
-                part = str(key).strip()
-                child = f"{prefix}.{part}" if prefix else part
-                out.extend(_collect_var_leaf_paths(child, item))
-            return out
-        return [prefix]
-
-    for var_path in _collect_var_leaf_paths("", raw_vars):
-        _lookup_var(var_path)
-
-    return {k: _resolve_value(v) for k, v in data.items() if k != "variables"}
 
 
 def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, dict[str, Any]]:
@@ -2248,7 +1670,7 @@ def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, 
         for key in unknown_top:
             sug = _legacy_key_suggestion("root", key)
             if sug is not None:
-                details.append(f"{key} (use {sug})")
+                details.append(f"{key} ({sug})")
             else:
                 details.append(str(key))
         raise ValueError(
@@ -2261,6 +1683,23 @@ def _split_full_sections(raw: dict[str, Any], *, format_name: str) -> dict[str, 
         if not isinstance(section, dict):
             raise ValueError(f"{format_name} config section {key!r} must be a dict.")
     return sections
+
+
+def _collect_mapping_leaf_paths(value: Any, *, prefix: str = "") -> set[str]:
+    """Collect dotted leaf paths from a nested config mapping.
+
+    :param Any value: Nested config value.
+    :param str prefix: Current dotted path.
+    :return set[str]: Dotted leaf paths explicitly present in the mapping.
+    """
+    if not isinstance(value, dict):
+        return {prefix} if prefix else set()
+
+    paths: set[str] = set()
+    for key, item in value.items():
+        child = f"{prefix}.{key}" if prefix else str(key)
+        paths.update(_collect_mapping_leaf_paths(item, prefix=child))
+    return paths
 
 
 def _replace_from_mapping_recursive(cfg_obj: Any, mapping: dict[str, Any], *, section_name: str) -> Any:
@@ -2284,7 +1723,7 @@ def _replace_from_mapping_recursive(cfg_obj: Any, mapping: dict[str, Any], *, se
             if sug is None:
                 rendered.append(str(key))
             else:
-                rendered.append(f"{key} (use {sug})")
+                rendered.append(f"{key} ({sug})")
         raise ValueError(f"Unknown keys in section {section_name!r}: {', '.join(rendered)}")
 
     updates: dict[str, Any] = {}
@@ -2362,6 +1801,12 @@ def _coerce_config_mapping_scalar_value(*, raw_value: Any, field_type: Any, fiel
         raise ValueError(f"Config field {path} must be a number, got {type(value).__name__}: {value!r}.")
 
     if target_t is str:
+        if isinstance(value, bool):
+            raise ValueError(
+                f"Config field {path} must be a string, got bool: {value!r}. "
+                "YAML parses unquoted yes/no/true/false as booleans; quote the value "
+                f'(e.g. {path}: "no").'
+            )
         if not isinstance(value, str):
             raise ValueError(f"Config field {path} must be a string, got {type(value).__name__}: {value!r}.")
         return str(value)
@@ -2391,11 +1836,9 @@ def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]])
         LoggingConfig(), section_maps.get("logging", {}), section_name="logging"
     )
 
-    _mark_explicit_fields(model_cfg, _collect_leaf_paths(section_maps.get("model", {})))
-    _mark_explicit_fields(data_cfg, _collect_leaf_paths(section_maps.get("data", {})))
-    _mark_explicit_fields(train_cfg, _collect_leaf_paths(section_maps.get("train", {})))
-    _mark_explicit_fields(optim_cfg, _collect_leaf_paths(section_maps.get("optim", {})))
-    _mark_explicit_fields(logging_cfg, _collect_leaf_paths(section_maps.get("logging", {})))
+    explicit_fields: set[str] = set()
+    for section_name, section_mapping in section_maps.items():
+        explicit_fields.update(_collect_mapping_leaf_paths(section_mapping, prefix=section_name))
 
     cfg = Config(
         model=model_cfg,
@@ -2403,8 +1846,8 @@ def _build_config_from_section_mappings(section_maps: dict[str, dict[str, Any]])
         train=train_cfg,
         optim=optim_cfg,
         logging=logging_cfg,
+        _explicit_fields=frozenset(explicit_fields),
     )
-    _sync_legacy_train_aliases(train_cfg=cfg.train, optim_cfg=cfg.optim, logging_cfg=cfg.logging)
     return cfg
 
 
@@ -2440,44 +1883,39 @@ def apply_dotted_override(cfg: Config, override: str) -> Config:
         )
 
     root = parts[0]
-    if root not in {f.name for f in fields(Config)}:
+    public_roots = {f.name for f in fields(Config) if not f.name.startswith("_")}
+    if root not in public_roots:
         raise ValueError(
-            "Unknown override section "
-            f"{root!r}; expected one of {', '.join(sorted(f.name for f in fields(Config)))}."
+            f"Unknown override section {root!r}; expected one of {', '.join(sorted(public_roots))}."
         )
 
-    def _apply_to_obj(obj: Any, remaining: list[str], value_text: str, full_path: str) -> Any:
-        """Recursively apply one override path to a dataclass instance.
+    def _resolve_override_leaf_type(obj: Any, remaining: list[str], full_path: str) -> Any:
+        """Resolve and validate the leaf field type for one override path.
 
-        :param Any obj: Current dataclass object.
-        :param list[str] remaining: Remaining path parts.
-        :param str value_text: Raw override value text.
+        :param Any obj: Root section dataclass.
+        :param list[str] remaining: Path parts under the section.
         :param str full_path: Full dotted path for error reporting.
-        :return Any: Updated dataclass object.
+        :raises ValueError: If any path segment is unknown.
+        :return Any: Leaf field type hint.
         """
-        key = remaining[0]
-        if not hasattr(obj, key):
+        node = obj
+        for key in remaining[:-1]:
+            if not hasattr(node, key):
+                raise ValueError(f"Unknown override field {full_path!r}.")
+            node = getattr(node, key)
+        leaf = remaining[-1]
+        if not hasattr(node, leaf):
             raise ValueError(f"Unknown override field {full_path!r}.")
-        if len(remaining) == 1:
-            type_hints = get_type_hints(type(obj))
-            field_type = type_hints.get(key, Any)
-            coerced = _coerce_override_value(value_text, field_type)
-            return replace(obj, **{key: coerced})
-        child = getattr(obj, key)
-        new_child = _apply_to_obj(child, remaining[1:], value_text, full_path)
-        return replace(obj, **{key: new_child})
+        return get_type_hints(type(node)).get(leaf, Any)
 
     root_obj = getattr(cfg, root)
-    new_root = _apply_to_obj(root_obj, parts[1:], raw_value, path)
-    explicit_leaf_path = ".".join(parts[1:])
-    _mark_explicit_fields(new_root, _explicit_fields(root_obj) | {explicit_leaf_path})
-    new_cfg = replace(cfg, **{root: new_root})
-
-    # keep runtime train alias mirror coherent.
-    _sync_legacy_train_aliases(
-        train_cfg=new_cfg.train,
-        optim_cfg=new_cfg.optim,
-        logging_cfg=new_cfg.logging,
+    leaf_type = _resolve_override_leaf_type(root_obj, parts[1:], path)
+    coerced_value = _coerce_override_value(raw_value, leaf_type)
+    new_root = _replace_path(root_obj, parts[1:], coerced_value)
+    new_cfg = replace(
+        cfg,
+        **{root: new_root},
+        _explicit_fields=_explicit_config_fields(cfg) | {path},
     )
 
     return new_cfg
@@ -2491,13 +1929,11 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     :return Config: Validated immutable config object.
     """
     raw, format_name = _load_raw_config_mapping(path)
-    resolved_raw = _resolve_variables(raw)
-    section_maps = _split_full_sections(resolved_raw, format_name=format_name)
+    section_maps = _split_full_sections(raw, format_name=format_name)
     cfg = _build_config_from_section_mappings(section_maps)
     if overrides:
         for expr in overrides:
             cfg = apply_dotted_override(cfg, expr)
-    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
     validate_model_config(cfg.model)
     validate_data_config(cfg.data)
     validate_train_config(cfg.train)
@@ -2508,30 +1944,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         train_cfg=cfg.train,
         model_cfg=cfg.model,
         optim_cfg=cfg.optim,
-        logging_cfg=cfg.logging,
     )
-    _sync_legacy_train_aliases(train_cfg=cfg.train, optim_cfg=cfg.optim, logging_cfg=cfg.logging)
     return cfg
-
-
-def iter_leaf_paths_for_dataclass(cls: type[Any], *, prefix: str = "") -> list[tuple[str, Any]]:
-    """List dotted leaf paths and field types for a dataclass type.
-
-    :param type[Any] cls: Dataclass type.
-    :param str prefix: Optional prefix.
-    :return list[tuple[str, Any]]: Leaf path + type tuples.
-    """
-    out: list[tuple[str, Any]] = []
-    type_hints = get_type_hints(cls)
-    for f in fields(cls):
-        path = f"{prefix}.{f.name}" if prefix else str(f.name)
-        field_type = type_hints.get(f.name, f.type)
-        target_t, _allows_none = unwrap_optional_type(field_type)
-        if dataclasses.is_dataclass(target_t):
-            out.extend(iter_leaf_paths_for_dataclass(target_t, prefix=path))
-        else:
-            out.append((path, field_type))
-    return out
 
 
 asdict_without_private = _asdict_without_private
@@ -2540,15 +1954,15 @@ asdict_without_private = _asdict_without_private
 __all__ = [
     "RUN_CONFIG_SCHEMA_VERSION",
     "Config",
+    "ModelHFFlashConfig",
+    "ModelHFConfig",
     "ModelConfig",
     "DataConfig",
     "TrainConfig",
     "OptimConfig",
     "LoggingConfig",
     "apply_dotted_override",
-    "apply_profile_defaults",
     "asdict_without_private",
-    "iter_leaf_paths_for_dataclass",
     "load_config",
     "load_data_config_snapshot",
     "load_logging_config_snapshot",

@@ -1,0 +1,402 @@
+# DeBERTa RTD pretraining configuration reference
+#
+# This comments-only file documents every key accepted by `deberta train`. It is a per-key contract, not a runnable config or task template; worked configs live separately under `configs/`.
+# Dotted paths below map directly to nested YAML or JSON mappings. Files may use `.yaml`, `.yml`, or `.json` and may contain only the top-level `model`, `data`, `train`, `optim`, and `logging` sections; unknown keys fail validation.
+# Every leaf is optional unless marked conditionally required. Omission uses the stated default. YAML booleans must be true/false values, strings must remain strings, numeric strings are accepted, and null is accepted only by `| None` fields.
+# Duplicate mapping keys are not rejected: YAML and JSON parsing retain the last value. Never duplicate a key. Relative paths resolve from the process working directory; only keys that explicitly say so expand `~`.
+# This surface configures RTD pretraining. It does not configure export or downstream fine-tuning/evaluation.
+# GPU count and FSDP are launcher settings, not YAML keys. A one-GPU request needs no extra key and uses this same YAML in one process. Multi-GPU training is currently unsupported; retained Accelerate/FSDP2 templates are experimental scaffolding for a dedicated validation follow-up.
+# The repository is pre-stable. Persisted resume/export snapshots carry a schema version, and incompatible versions are rejected rather than migrated.
+#
+# Backbone-profile omission defaults
+# Five leaves have backbone-dependent omission behavior: `train.objective.mask_token_prob`, `train.objective.random_token_prob`, `train.objective.disc_loss_weight`, `optim.lr.base`, and `optim.adam.epsilon`.
+# Their native/RoPE defaults are documented on each leaf. Any explicit file value wins, including a value equal to the dataclass schema default.
+#
+# Run outputs
+# A null checkpoint directory resolves to `runs/<project>/<timestamp>_<run-or-config-name>`; a null logging directory uses that resolved directory.
+# Training writes model/data/train/optim/logging JSON snapshots and run metadata beside transactional `checkpoint-*` directories. It writes `config_original.yaml` and `config_resolved.yaml` under the logging directory.
+# Flash-configured runs additionally record the configured Flash policy and installed `flashdeberta` version in run metadata; individual attention calls may still take documented eager fallbacks.
+
+# MODEL
+
+# [model.backbone_type] str = "hf_deberta_v2"; values: "hf_deberta_v2" | "rope".
+# `hf_deberta_v2` is the supported repo-native DeBERTa-v2/v3 path; `rope` and every `model.rope.*` key are experimental.
+
+# [model.from_scratch] bool = true; values: true | false.
+# false starts a new step-zero run from `model.pretrained.*`; it does not restore optimizer, scheduler, RNG, step, or data progress. Use checkpoint resume for exact continuation.
+
+# [model.embedding_sharing] str = "gdes"; values: "none" | "es" | "gdes".
+# `none` keeps independent embeddings; `es` aliases them and requires `train.decoupled_training=false` plus equal effective generator/discriminator learning rates; `gdes` uses a synchronized generator base plus trainable discriminator bias and is the recommended RTD default. Shared modes require the same embedding tables with matching shapes in both backbones.
+
+# [model.gradient_checkpointing] bool = false; values: true | false.
+# true checkpoints both backbones, reducing activation memory at the cost of recomputation; enable only after measuring the run's memory/throughput tradeoff.
+
+# model.tokenizer
+
+# [model.tokenizer.name_or_path] str = "microsoft/deberta-v3-base"; must be a non-empty Hugging Face tokenizer id or local directory defining PAD, CLS, SEP, and MASK tokens.
+# Scratch configs copy vocabulary/special IDs; pretrained configs require compatible vocabulary and defined special IDs. Local paths and `~` are passed to the tokenizer loader unchanged.
+
+# [model.tokenizer.allow_vocab_resize] bool = false; values: true | false.
+# true permits upward-only growth when a target/multiple requires it, adding ordinary non-special placeholder tokens; pretrained growth cannot exceed checkpoint `vocab_size`.
+
+# [model.tokenizer.vocab_target] int | None = null; null requests no explicit target, otherwise value must be > 0 and at least the loaded tokenizer size.
+# Growth requires `allow_vocab_resize=true`, is rounded again by `vocab_multiple`, and cannot exceed pretrained checkpoint vocabulary size.
+
+# [model.tokenizer.vocab_multiple] int = 1; must be >= 1.
+# Rounds vocabulary upward; any growth requires `allow_vocab_resize=true` and registers the added placeholder rows as special tokens so masking and RTD sampling cannot select them. Use 128 only when deliberate vocabulary padding justifies changing tokenizer size.
+
+# model.hf — applies to `model.backbone_type="hf_deberta_v2"`; non-default size/kernel/position settings with RoPE are ignored with warnings, while Flash with RoPE is invalid.
+
+# [model.hf.model_size] str = "base"; values: "xsmall" | "small" | "base" | "large".
+# Synthesized scratch discriminator dimensions (hidden/layers/heads/FFN): xsmall 384/12/6/1536, small 768/6/12/3072, base 768/12/12/3072, large 1024/24/16/4096. Pretrained or explicit component configs retain source dimensions.
+
+# [model.hf.attention_kernel] str = "dynamic"; values: "dynamic" | "cached_bmm" | "stable"; aliases: default->dynamic, cache/cached->cached_bmm, safe/compile_safe->stable.
+# Selects native eager disentangled-bias math; `dynamic` uses einsum, while `cached_bmm` and `stable` currently use the same explicit batched-matmul path. It does not enable Flash.
+
+# [model.hf.attention_impl] str = "eager"; values: "eager" | "flash".
+# Every materialized native config accepts only C2P/P2C positional terms; accepted string/list delimiter forms are stored canonically so native training and stock-HF export interpret the same branches. Bucketed relative attention must cover the full advertised position budget because shorter spans use incompatible native and stock-HF bucket rules.
+# Flash is experimental and additionally requires the `flash` extra, CUDA bf16 (`train.mixed_precision="bf16"`), both dropout values resolving to 0.0, at least 8 relative-position buckets, and a power-of-two head dimension of at least 16 for each component. The default relative span is `max_position_embeddings`. Unsupported per-call masks may route to eager; build-time incompatibilities fail.
+
+# model.hf.flash — experimental and inactive unless `model.hf.attention_impl="flash"`; setting its child while Flash is inactive emits a warning.
+
+# [model.hf.flash.kernel_overrides_path] str | None = null; null/blank uses the shipped tuning table, otherwise value names a JSON file containing an object with optional `seq_buckets`, `route_policies`, and `kernels` entries.
+# `~` is expanded and relative paths use the working directory. When Flash is active, the file, supported row fields, required fields, launch values, and numeric bounds are validated during config loading, including `--dry-run`; its contents are snapshotted when each model is constructed, so later rewrites affect only later models. Override buckets replace same-name buckets; policy/kernel rows append and equally specific later rows win. Use measured tuner output that has passed parity on the target GPU.
+# Bucket rows require a non-empty string `name`; optional bounds are `min_seq_len`, `max_seq_len`, `min_density`, `max_density`, and `max_density_exclusive`. Sequence bounds are positive integers with min <= max; densities are finite numbers in [0,1] with min <= either maximum and use active tokens / padded batch capacity. Ordinary padded batches resolve this bucket once and reuse it for route selection plus fixed/varlen forward and backward launches. Policy rows require `seq_bucket` naming `default`, a shipped bucket, or a bucket declared in this file, plus `choice`: padding uses fixed|varlen and local_bias uses local_bias. Optional bounds are `compute_capability`, `min_seq_len`, `max_seq_len`, and `max_batch_size`, with numeric bounds positive integers.
+# Kernel rows require `route`, `kind`, `seq_bucket`, `block_m`, `block_n`, `num_stages`, and `num_warps`; `seq_bucket` follows the same reference rule as policy rows. Supported route/kind pairs are bias:{fwd,bwd,bwd_q,bwd_kv}, bias_docblock_specialized:{bwd,bwd_q,bwd_kv}, dense_bias:{fwd}, docblock:{fwd,bwd_q,bwd_kv}, fixed:{fwd,bwd}, and varlen:{fwd,bwd_q,bwd_kv}; optional match predicates are compute_capability, head_dim, exact/min/max batch_size|query_len|key_len|num_heads, causal, disentangled, has_mask, dtype, and att_span_min. `block_m` and `block_n` must be positive powers of two, their product must not exceed 1,048,576 for dense_bias, `num_stages` must be positive, and `num_warps` must be one of 1|2|4|8. Other numeric kernel constraints are positive integers, each min bound must not exceed its max bound, and an exact value must fall inside its declared range. Unknown row fields are rejected, and a declared predicate cannot match when its runtime fact is unavailable.
+
+# [model.hf.max_position_embeddings] int | None = null; null leaves synthesized scratch native components at 512, otherwise value must be > 0.
+# Valid only for native scratch runs, applied to both components, and must cover `data.packing.max_seq_length`. Pretrained native context cannot be extended through this key.
+
+# model.pretrained
+
+# [model.pretrained.discriminator_path] str = ""; conditionally required and non-empty when `model.from_scratch=false`.
+# Names a checkpoint directory/model id; ignored in scratch mode. The checkpoint family must match the backbone, and Microsoft DeBERTa v2/v3 sources are invalid for RoPE. Local paths and `~` are passed through unchanged.
+
+# [model.pretrained.generator_path] str | None = null; blank normalizes to null, which derives generator config from the discriminator and, in pretrained mode, also loads generator weights from the discriminator source.
+# A non-null source supplies generator config and pretrained weights (config only in scratch mode), must match the backbone/shared-embedding shapes, and makes every `model.generator.*` override invalid. Local paths and `~` are passed through unchanged.
+
+# model.generator — controls a generator derived from the discriminator; all values must be null when `model.pretrained.generator_path` is set.
+
+# [model.generator.num_hidden_layers] int | None = null; null derives half the native discriminator depth or one-third the RoPE depth, minimum 1; explicit values must be > 0.
+# This is the only generator shape override allowed when loading generator weights from `model.pretrained.discriminator_path`.
+
+# [model.generator.hidden_size] int | None = null; null inherits discriminator width, otherwise value must be > 0 and divisible by resolved head count.
+# Invalid in pretrained mode without a separate generator source. Shared embeddings require discriminator width; Flash additionally requires the resulting head dimension to be a power of two.
+
+# [model.generator.intermediate_size] int | None = null; null inherits discriminator FFN width, otherwise value must be > 0.
+# Invalid in pretrained mode without a separate generator source; the explicit width is final and is not adjusted by RoPE SwiGLU scaling.
+
+# [model.generator.num_attention_heads] int | None = null; null inherits discriminator heads, otherwise value must be > 0 and divide resolved generator width.
+# Invalid in pretrained mode without a separate generator source; Flash additionally requires the resulting head dimension to be a power of two.
+
+# model.rope — experimental scratch architecture. These keys are valid only with `model.backbone_type="rope"` and `model.from_scratch=true`; native runs reject changed RoPE settings, and pretrained RoPE requires these scratch keys to stay at schema defaults.
+
+# [model.rope.hidden_size] int = 768; must be > 0 and divisible by `model.rope.num_attention_heads`.
+# Controls embedding, residual, and projection width; changing it changes checkpoint shape.
+
+# [model.rope.num_hidden_layers] int = 12; must be > 0.
+# Sets discriminator depth; a derived generator defaults to one-third this depth.
+
+# [model.rope.num_attention_heads] int = 12; must be > 0 and divide `model.rope.hidden_size`.
+# Head dimension is hidden size divided by this value.
+
+# [model.rope.intermediate_size] int = 3072; must be > 0.
+# With `ffn_type="swiglu"` and adjustment enabled, runtime scales this to about two-thirds and rounds upward to 128.
+
+# [model.rope.hidden_act] str = "gelu"; values: "gelu" | "gelu_10" | "gelu_accurate" | "gelu_fast" | "gelu_new" | "gelu_python" | "gelu_pytorch_tanh" | "laplace" | "leaky_relu" | "linear" | "mish" | "prelu" | "quick_gelu" | "relu" | "relu2" | "relu6" | "sigmoid" | "silu" | "swish" | "tanh".
+# Used by MLP only; SwiGLU always uses SiLU. `gelu` is the comparison/default choice.
+
+# [model.rope.rope_theta] float = 10000.0; must be finite and > 0.
+# Rotary frequency base; keep the default unless reproducing a measured long-context setup.
+
+# [model.rope.rotary_pct] float = 1.0; must be finite and in (0, 1].
+# Runtime floors `head_dim * rotary_pct` to an even dimension; a small accepted fraction can become zero and disable RoPE. Use 1.0 unless intentionally ablating partial rotary.
+
+# [model.rope.use_absolute_position_embeddings] bool = false; values: true | false.
+# true adds learned absolute positions in addition to RoPE and changes checkpoint architecture; false is the modern baseline.
+
+# [model.rope.max_position_embeddings] int | None = null; null uses `data.packing.max_seq_length` for a synthesized scratch config, otherwise value must be > 0 and cover the training length.
+# Sizes the model context budget and any enabled learned absolute-position table.
+
+# [model.rope.type_vocab_size] int = 2; must be >= 0.
+# 0 disables token-type embeddings, 1 permits segment id 0 only, and 2 supports BERT-style 0/1 ids; changing it changes checkpoint shape.
+
+# [model.rope.norm_arch] str = "post"; values: "post" | "keel".
+# `post` applies RMSNorm after residual addition; `keel` enables KEEL residual scaling and activates the two `keel_alpha_*` keys. Use post unless running a KEEL experiment.
+
+# [model.rope.norm_eps] float = 1e-6; must be finite and > 0.
+# RMSNorm epsilon; 1e-6 is the bf16-oriented default, and changing it changes checkpoint numerics.
+
+# [model.rope.keel_alpha_init] float | None = null; null computes `1/sqrt(2 * num_hidden_layers)` when `norm_arch="keel"`, otherwise any finite value is accepted.
+# Inactive with post; a non-null value then emits a warning.
+
+# [model.rope.keel_alpha_learnable] bool = false; values: true | false.
+# Only applies to KEEL and makes its residual scalars trainable; true with post is ignored with a warning.
+
+# [model.rope.attention_implementation] str = "sdpa"; values: "sdpa" | "eager".
+# `sdpa` is controlled by `train.sdpa_kernel`; eager is a parity/debug path and requires `train.sdpa_kernel="auto"`. Use SDPA for normal training.
+
+# [model.rope.ffn_type] str = "mlp"; values: "mlp" | "swiglu".
+# MLP uses `hidden_act`; SwiGLU uses gated SiLU and activates `swiglu_adjust_intermediate`. Changing this changes checkpoint architecture.
+
+# [model.rope.use_bias] bool = false; values: true | false.
+# Adds linear-layer biases and changes checkpoint parameter layout; false is the modern baseline.
+
+# [model.rope.swiglu_adjust_intermediate] bool = true; values: true | false.
+# With SwiGLU, true scales configured FFN width by about 2/3 and rounds to 128; with MLP a non-default false value is ignored with a warning.
+
+# [model.rope.initializer_range] float = 0.02; must be finite and >= 0.
+# Standard deviation for scratch initialization. Zero is accepted for controlled tests but produces degenerate zero-initialized weight matrices; use 0.02 normally.
+
+# model.rope.pretrained — experimental checkpoint adaptations valid only with RoPE and `model.from_scratch=false`. null preserves the checkpoint config; non-null values can alter behavior or tensor layout and should match the source unless adaptation is deliberate.
+
+# [model.rope.pretrained.max_position_embeddings] int | None = null; otherwise must be > 0 and cover `data.packing.max_seq_length`.
+# Changing a checkpoint that uses learned absolute positions can cause position-table shape mismatch.
+
+# [model.rope.pretrained.rope_theta] float | None = null; otherwise must be finite and > 0.
+# Changes rotary frequencies immediately without changing saved tensor shapes.
+
+# [model.rope.pretrained.rotary_pct] float | None = null; otherwise must be finite and in (0, 1].
+# Runtime floors the resolved rotary dimension to even; changing this changes checkpoint behavior and a small value can effectively disable RoPE.
+
+# [model.rope.pretrained.use_absolute_position_embeddings] bool | None = null; values: null | true | false.
+# Must match whether checkpoint weights contain/use the absolute-position table; changing it can create missing or unexpected weights.
+
+# [model.rope.pretrained.type_vocab_size] int | None = null; otherwise must be >= 0.
+# Changes token-type embedding presence/shape and must remain compatible with checkpoint weights and input IDs.
+
+# [model.rope.pretrained.norm_arch] str | None = null; values: null | "post" | "keel".
+# Switching architecture changes residual behavior and parameter expectations; `keel_alpha_*` applies only to resolved KEEL.
+
+# [model.rope.pretrained.norm_eps] float | None = null; otherwise must be finite and > 0.
+# Changes normalization numerics without changing tensor shapes; preserve the checkpoint value unless correcting known compatibility.
+
+# [model.rope.pretrained.keel_alpha_init] float | None = null; otherwise any finite value is accepted.
+# Meaningful only with resolved KEEL and changes residual scaling immediately.
+
+# [model.rope.pretrained.keel_alpha_learnable] bool | None = null; values: null | true | false.
+# Meaningful only with resolved KEEL and must match checkpoint parameter layout.
+
+# [model.rope.pretrained.ffn_type] str | None = null; values: null | "mlp" | "swiglu".
+# Changes FFN architecture and saved tensor shapes; this is not a safe post-hoc performance toggle.
+
+# [model.rope.pretrained.use_bias] bool | None = null; values: null | true | false.
+# Changes linear parameter layout and must match checkpoint weights.
+
+# [model.rope.pretrained.initializer_range] float | None = null; otherwise must be finite and >= 0.
+# Affects only newly initialized/missing parameters; loaded weights are unchanged.
+
+# model.dropout — shared runtime overrides for both backbone families. null preserves the source/preset value; numeric values replace it on both components.
+
+# [model.dropout.hidden_prob] float | None = 0.0; values: null or finite number in [0, 1].
+# Omission disables hidden dropout; null preserves source dropout. Flash requires the resolved value 0.0. Value 1.0 drops every eligible activation and is only sensible for pathological tests.
+
+# [model.dropout.attention_probs_prob] float | None = 0.0; values: null or finite number in [0, 1].
+# Omission disables attention-probability dropout; null preserves source dropout. Flash requires the resolved value 0.0.
+
+# DATA
+
+# data.source — conditionally required: configure `dataset_name`, `data_files`, or `load_from_disk`. `load_from_disk` is exclusive; otherwise `dataset_name` may be used alone or as the builder for `data_files`.
+
+# [data.source.dataset_name] str | None = null; blank normalizes to null, otherwise value is a Hugging Face dataset id/builder name.
+# May be paired with `dataset_config_name` and/or `data_files`; cannot be paired with `load_from_disk`.
+
+# [data.source.dataset_config_name] str | None = null; blank normalizes to null, otherwise value is a dataset subset/config name.
+# Requires `dataset_name` and cannot be paired with `load_from_disk`.
+
+# [data.source.data_files] str | None = null; blank normalizes to null, otherwise value is a comma-separated list of non-empty local paths/URLs.
+# With `dataset_name`, files go to that builder; alone they use the HF text builder. Commas always split, so comma-containing paths cannot be represented; local `~` is passed through unchanged. Cannot be paired with `load_from_disk`.
+
+# [data.source.load_from_disk] str | None = null; blank normalizes to null, otherwise value is a directory created by `Dataset.save_to_disk`.
+# Requires `streaming=false` and forbids `dataset_name`, `dataset_config_name`, and `data_files`; a saved DatasetDict selects `train_split`. Local `~` is passed through unchanged.
+
+# [data.source.train_split] str = "train"; must be a non-empty split name available in the source.
+# Passed to `load_dataset`; selects a DatasetDict entry from `load_from_disk`, while a single saved Dataset ignores it.
+
+# [data.source.text_column_name] str = "text"; must be a non-empty column name available in consumed examples.
+# Missing columns fail when examples are read, including during `--dry-run`.
+
+# [data.source.streaming] bool = true; values: true | false.
+# true uses HF IterableDataset streaming; false loads a map-style dataset and is required by `load_from_disk`. Non-streaming also restricts `shuffle_buffer_size` to 0 or 1.
+
+# [data.source.shuffle_buffer_size] int = 10000; with streaming must be >= 0, with non-streaming must be 0 or 1.
+# Streaming uses this reservoir size (0/1 cannot reorder meaningfully); non-streaming 0 disables shuffle and 1 requests one full dataset shuffle. Larger streaming buffers trade host memory/startup for mixing.
+
+# data.packing
+
+# [data.packing.enabled] bool = true; values: true | false.
+# true concatenates documents into fixed-length rows; false chunks each document to `max_seq_length-2`, adds one outer CLS/SEP pair, and pads on the right to the fixed length. Packing is the throughput-oriented default.
+
+# [data.packing.max_seq_length] int = 512; must be >= 8 and no larger than either component's position budget.
+# Controls the exact row length and right-padding target in both modes; it is the sole training padding-shape control. Choose a hardware/kernel-friendly length (shipped configs use 32, 512, or 1024). Synthesized native configs need `model.hf.max_position_embeddings` above 512; pretrained/explicit configs must already cover the value.
+
+# [data.packing.block_cross_document_attention] bool = false; values: true | false; true requires `data.packing.enabled=true`.
+# true wraps each packed segment with CLS/SEP, restarts its positions, supplies segment-specific RTD context, and prevents cross-document attention. RoPE cannot combine it with `train.sdpa_kernel="flash"`; non-segment-aware routes may materialize quadratic masks and warn above length 2048.
+
+# TRAIN
+
+# [train.seed] int = 42; must be in [0, 2**32 - 1].
+# Seeds initialization, corruption, and data-order setup; exact results still depend on topology, workers, source behavior, and nondeterministic kernels.
+
+# [train.max_steps] int = 10000; must be >= 1.
+# Optimizer-step budget and the only duration control; accumulation changes micro-batches per step. For every scheduler except constant, this value must exceed `optim.scheduler.warmup_steps`. Exact resume requires the source value because it defines the scheduler horizon; a checkpoint already at this step performs no optimization.
+
+# [train.per_device_train_batch_size] int = 4; must be >= 1.
+# Micro-batch examples per process; global examples per optimizer step equal this value times accumulation steps times process count. Training uses `drop_last=true` for stable shapes and fails if a finite source yields no complete batch. Tune against VRAM before increasing accumulation.
+
+# [train.gradient_accumulation_steps] int = 1; must be >= 1.
+# Micro-batches per optimizer step. Exact resume requires this value to match the source train snapshot because it changes update semantics and saved data-progress interpretation.
+
+# [train.token_weighted_gradient_accumulation] bool = true; values: true | false.
+# true weights variable-density micro-batches by active token count rather than equally; keep enabled for packed, padded, or ragged training.
+
+# [train.mixed_precision] str = "bf16"; canonical values: "bf16" | "no"; quoted aliases: bfloat16/true/1/yes/y/on->bf16, none/false/0/off/n->no.
+# fp16 is unsupported. bf16 fails runtime preflight when unsupported; `no` uses full precision and more memory. Quote boolean/numeric-looking aliases in YAML or use canonical strings.
+
+# [train.tf32] bool = true; values: true | false.
+# Enables TF32 matmul policy on supported CUDA hardware and otherwise has no effect; keep true unless strict fp32 matmul parity is required.
+
+# [train.sdpa_kernel] str = "auto"; values: "auto" | "flash" | "mem_efficient" | "math"; aliases: mem/mem-efficient/efficient->mem_efficient, flashattention/flash_attention->flash.
+# Applies only to RoPE with `attention_implementation="sdpa"`; non-auto native values are ignored with a warning and non-auto RoPE eager values are invalid. `flash` is invalid with document blocking. Use auto normally.
+
+# [train.decoupled_training] bool = true; values: true | false.
+# true uses separate generator/discriminator forward-backward phases and optimizers; false uses a joint update. true is incompatible with `embedding_sharing="es"`; exact resume requires this value to match the source train snapshot.
+
+# train.dataloader
+
+# [train.dataloader.num_workers] int = 2; must be >= 0.
+# Worker processes per rank; 0 keeps data loading in the trainer for deterministic debugging. This value must match on resume because it controls source sharding and can change replayed samples. Iterable workers beyond available source shards stay idle; increase only after measuring throughput.
+
+# [train.dataloader.pin_memory] bool = true; values: true | false.
+# Pins host batches for asynchronous CUDA transfer; use true for CUDA and consider false for CPU-only runs or host-memory pressure. This runtime-only setting may change on resume.
+
+# train.compile — experimental. Compile targets inner model paths, never the full RTD wrapper; failures are hard errors with no eager fallback.
+
+# [train.compile.enabled] bool = false; values: true | false.
+# false disables compilation; non-default mode/scope/backend settings are then ignored with warnings. Validate the exact attention/data route before a long compiled run.
+
+# [train.compile.mode] str = "default"; values: "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"; underscore aliases map to their hyphenated forms.
+# Active only when enabled. `reduce-overhead` may use more memory/cudagraphs; max-autotune modes cost more compile time. Start with default.
+
+# [train.compile.scope] str = "auto"; values: "auto" | "backbones" | "encoder" | "gen_encoder" | "disc_encoder" | "ffn" | "gen_ffn" | "disc_ffn".
+# Aliases: both/backbone/full->backbones, encoders->encoder, ffns->ffn, generator_encoder->gen_encoder, discriminator_encoder->disc_encoder, generator_ffn->gen_ffn, discriminator_ffn->disc_ffn; hyphens are accepted in underscore spellings.
+# auto selects both backbones except RoPE document-blocking, where it selects both FFNs to avoid dynamic mask graph churn. Prefix scopes target only the named component; start with auto. Scope may change on resume; effective scope drift emits a warning because it can invalidate compiled graph caches but does not alter checkpoint structure.
+
+# [train.compile.backend] str = "inductor"; values: "inductor" | "aot_eager"; alias: aot-eager->aot_eager.
+# Active only when enabled; inductor is the optimizing backend and aot_eager is for debugging, not throughput.
+
+# train.objective
+
+# [train.objective.mlm_probability] float = 0.15; must be finite and in (0, 1).
+# Sets each row's target budget from eligible lexical tokens, excluding special and inactive positions so padding and packed-document boundary count cannot alter the corruption rate. Unigram selection splits the candidates into exactly that many near-equal windows and draws one position per window, so it meets the budget exactly and masks every candidate position at the same rate for any probability. Whole-word masking may exceed the nominal budget by the remaining tokens in one selected n-gram. 0.15 is the parity default.
+
+# [train.objective.mask_token_prob] float; schema default 1.0; omission is 1.0 for native and 0.8 for RoPE.
+# Must be finite and >= 0; sum with `random_token_prob` must be <= 1. It is the conditional selected-token probability of replacing with MASK; leftover probability keeps the original token.
+
+# [train.objective.random_token_prob] float; schema default 0.0; omission is 0.0 for native and 0.1 for RoPE.
+# Must be finite and >= 0; sum with `mask_token_prob` must be <= 1. It is the conditional selected-token probability of random replacement; special/control IDs are excluded.
+
+# [train.objective.mlm_max_ngram] int = 1; must be >= 1.
+# Maximum DeBERTa windowed masking span; values > 1 request whole-word n-grams, with unsupported tokenizer boundary schemes falling back to conservative token groups with a warning. Special tokens split n-gram windows and sampled spans, so masking never crosses a packed-document boundary. Every partial context window is taken proportionally to its width; if all are rejected, one word group is chosen uniformly across the row. Independently sampled n-grams remain separate budget units and are consumed in random order when the token budget stops selection, keeping the rate positionally uniform while every row retains a masked span.
+
+# [train.objective.sampling_temperature] float = 1.0; must be finite and > 0.
+# Softmax temperature for generator-sampled discriminator replacements; lower is sharper and higher is more random. Use 1.0 unless measuring replacement entropy.
+
+# [train.objective.gen_loss_weight] float = 1.0; must be finite and >= 0; at least one objective weight must be > 0.
+# Multiplies generator MLM loss; in decoupled mode 0 skips generator backward/optimization, while its forward still samples the corruptions required by the discriminator. Exact resume requires this value to match the source train snapshot.
+
+# [train.objective.disc_loss_weight] float; schema default 10.0; omission is 10.0 for native and 50.0 for RoPE.
+# Must be finite and >= 0; at least one objective weight must be > 0. Multiplies RTD loss; in decoupled mode 0 skips the discriminator phase. Exact resume requires this value to match the source train snapshot.
+
+# train.checkpoint
+
+# [train.checkpoint.output_dir] str | None = null; blank normalizes to null, which computes `runs/<project>/<timestamp>_<run-or-config-name>`.
+# Stores snapshots and checkpoints; `~` is expanded and the path becomes absolute. Existing non-empty directories fail unless resume or destructive overwrite is selected; null `logging.output_dir` follows this resolved path.
+
+# [train.checkpoint.overwrite_output_dir] bool = false; values: true | false.
+# true recursively deletes the entire existing non-empty output directory before training; this is irreversible and mutually exclusive with resume. Keep false.
+
+# [train.checkpoint.save_steps] int = 1000; must be >= 0.
+# Periodic checkpoint interval in optimizer steps; 0 disables periodic saves. After a successful run with progress, failure to save the final step fails the command. A single-process crash attempts a best-effort save only while live model, optimizer, data, and RNG state still represent the last committed window; otherwise resume from the last periodic checkpoint. Distributed crash-time saves are skipped because checkpoint collectives may deadlock after rank failure.
+
+# [train.checkpoint.save_total_limit] int = 3; must be >= 0.
+# Retains newest committed `checkpoint-*` directories after each save and deletes older ones; 0 disables rotation and can consume unbounded disk. Deletion is irreversible.
+
+# [train.checkpoint.resume_from_checkpoint] str | None = null; blank/null starts fresh, "auto" searches `output_dir`, otherwise value must name an existing committed `checkpoint-*` directory.
+# Resume restores model, optimizer, scheduler, RNG, global step, recovery multiplier, data progress, and cumulative input-token accounting. The checkpoint must contain `.complete`, current `data_state.json`, and non-empty weights; its source run must contain model/data/train/optim/logging snapshots plus the exact materialized discriminator config, generator config, and tokenizer directory. Resume uses those run-owned artifacts instead of resolving the original mutable pretrained/tokenizer source; run metadata is validated when present.
+# Compatibility checks require model, data, optim, logging, and training-semantics snapshots to match, except `logging.output_dir`, documented inert model fields, `train.dataloader.pin_memory`, `train.compile.scope`, and `train.checkpoint.*`. Start from the source `config_resolved.yaml` and change only documented resume-compatible runtime or checkpoint plumbing.
+# "auto" uses the newest resumable checkpoint, skips incomplete newer ones, starts fresh only when the output directory is empty, and errors on non-empty output with no resumable checkpoint. Explicit paths expand `~`; resume is mutually exclusive with overwrite.
+
+# [train.checkpoint.resume_data_strategy] str = "auto"; values: "auto" | "replay" | "restart_epoch".
+# replay reconsumes saved micro-batches from epoch zero with deterministic worker seeding while preserving checkpoint-restored process RNG, reproducing the next stochastic batch; restart_epoch starts a new epoch offset at restored global step and is not exact data continuation; auto replays only when consumed micro-batches are <= `resume_replay_max_micro_batches`.
+
+# [train.checkpoint.resume_replay_max_micro_batches] int = 10000; must be >= 0.
+# Threshold used only by auto; larger caps improve data alignment but can make resume startup slow, while explicit replay ignores the cap.
+
+# [train.checkpoint.export_hf_final] bool = true; values: true | false.
+# After successful single-process training, requires the committed checkpoint at the final global step and strictly exports only its discriminator to `<output_dir>/final_hf`. Same-directory continuation replaces an existing managed `final_hf` only after the refreshed export passes strict load and output parity. A failed final checkpoint save, missing final checkpoint, state incompatibility, or export failure fails the training command and leaves a previous `final_hf` intact. Disable for probes and every experimental multi-GPU run; use manual `deberta export` for another checkpoint, the generator, both components, or experimental sharded-checkpoint validation.
+
+# OPTIM
+# Every `optim.*` value must match the source snapshot for exact resume. Learning-rate/scheduler changes are new-training decisions, not supported resume overrides.
+
+# [optim.lr.base] float; schema default 0.0001; omission is 0.0001 for native and 0.0005 for RoPE; must be finite and > 0.
+# Base AdamW rate and inheritance source for component rates. Runtime does not scale it for batch, accumulation, process count, sequence length, or token density. Use the native 1e-4 default for DeBERTa RTD; 5e-4 can collapse its discriminator to the replacement-class prior.
+
+# [optim.lr.generator] float = -1.0; value is -1.0 (inherit base) or finite and > 0.
+# With `embedding_sharing="es"`, its effective value must equal the discriminator rate because the shared parameters have one optimizer group.
+
+# [optim.lr.discriminator] float = -1.0; value is -1.0 (inherit base) or finite and > 0.
+# Leave inherited unless measured phase behavior warrants a distinct rate. With `embedding_sharing="es"`, its effective value must equal the generator rate.
+
+# [optim.adam.beta1] float = 0.9; must be finite and in [0, 1).
+# Adam first-moment decay; 0.9 is the established default.
+
+# [optim.adam.beta2] float = 0.999; must be finite and in [0, 1).
+# Adam second-moment decay; lower values adapt variance faster but can make pretraining noisier.
+
+# [optim.adam.epsilon] float; schema default 1e-6; omission is 1e-6 for native and 1e-8 for RoPE; must be finite and > 0.
+# At optimizer construction, bf16 raises any smaller value to 1e-6 for stability.
+
+# [optim.scheduler.type] str = "linear"; values: "linear" | "cosine" | "cosine_with_restarts" | "polynomial" | "constant" | "constant_with_warmup".
+# Linear/cosine/polynomial decay after warmup; restarts adds cycles; constant ignores warmup; constant_with_warmup warms then holds. Linear is the parity default.
+
+# [optim.scheduler.warmup_steps] int = 1000; must be >= 0 and, for every scheduler type except constant, strictly less than `train.max_steps`.
+# Constant ignores this value and accepts any nonnegative setting. Other schedulers ramp throughout warmup, so equality would consume the entire run without reaching the configured learning rate before the last update. The 1000-step default is 10% of the default training horizon; use 0 or another proportionally small value for short runs.
+
+# [optim.weight_decay] float = 0.01; must be finite and >= 0.
+# AdamW decay for decay-eligible groups; 0 disables it. 0.01 is the project starting point.
+
+# [optim.max_grad_norm] float = 1.0; must be finite and >= 0.
+# Global clipping norm; 0 disables clipping. Use the tested 1.0 starting point unless dedicated measurements justify a change.
+
+# LOGGING
+# Exact resume compares every `logging.*` value except `logging.output_dir`; keep project/run identity, cadence, W&B, and debug settings unchanged.
+
+# [logging.project_name] str = "deberta-train"; must be non-empty after whitespace stripping.
+# W&B project and namespace for automatic checkpoint paths; path-like characters are sanitized locally.
+
+# [logging.run_name] str | None = null; blank normalizes to null.
+# Explicit W&B name and auto-output label; null uses config filename/"run" for auto paths and logging-directory basename for W&B. Use stable descriptive names when comparing runs.
+
+# [logging.output_dir] str | None = null; blank/null uses resolved checkpoint output directory.
+# Stores original/resolved configs, W&B files, and debug/crash artifacts; `~` is expanded. A separate existing directory has no checkpoint overwrite guard and its config snapshots are overwritten, so use a fresh path or leave null.
+
+# [logging.logging_steps] int = 50; must be >= 0.
+# Optimizer-step interval for periodic loss/LR/throughput rows; 0 disables them. Joint-training rows report `lr`; decoupled rows report `gen_lr` and/or `disc_lr` for the enabled objectives. RTD rows include the replacement-positive fraction and `gain`, the discriminator BCE improvement over a constant class-prior predictor; positive gain indicates useful discrimination. Without W&B, normal rows are console-only; smaller intervals add synchronization/I/O overhead.
+# Top-level `loss` follows the objective and normalization used for gradient accumulation; `gen_loss` and `disc_loss` are separate token-weighted component diagnostics.
+
+# logging.wandb
+
+# [logging.wandb.enabled] bool = false; values: true | false.
+# true requires the `wandb` extra and authentication/offline setup, uploads config snapshots, and writes local W&B files. Default `watch="gradients"` also enables model watching; use watch none for scalar-only tracking.
+
+# [logging.wandb.watch] str = "gradients"; values: "none" | "gradients" | "parameters" | "all"; aliases: off/disabled/"false"/"0"->none, grad/gradient->gradients, weights/params/param->parameters.
+# Active only when W&B is enabled; non-default values while disabled are ignored with a warning. Gradient/parameter watching can add substantial compute, communication, and memory overhead; quote boolean/numeric-looking aliases in YAML.
+
+# [logging.wandb.watch_log_freq] int = 100; must be >= 1.
+# Passed to `wandb.watch`, active only when W&B and watching are enabled; non-default values while W&B is off warn. Increase it to reduce overhead; it is not guaranteed to map one-to-one to optimizer steps.
+
+# logging.debug
+
+# [logging.debug.metrics] bool = false; values: true | false; diagnostic.
+# true appends periodic zero-token-window counters to `<logging.output_dir>/metrics.jsonl.gz`; it does not persist normal loss/LR/throughput history. Crash rows and nonfinite artifacts may be written independently; keep false unless diagnosing empty/masked windows.

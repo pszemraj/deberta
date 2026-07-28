@@ -12,6 +12,8 @@ from deberta.utils.io import dump_json, load_json_mapping
 EXPORT_CONFIG_STRIP_KEYS = frozenset(
     {
         "hf_attention_kernel",
+        "hf_attention_impl",
+        "hf_flash",
         "use_rmsnorm_heads",
         "cls_token_id",
         "mask_token_id",
@@ -23,21 +25,19 @@ EXPORT_CONFIG_STRIP_KEYS = frozenset(
 _REPO_URL = "https://github.com/pszemraj/deberta"
 
 
-def clean_exported_config(config_path: Path, *, strict: bool) -> None:
+def clean_exported_config(config_path: Path) -> None:
     """Remove training-internal keys from exported HF ``config.json`` files.
 
     :param Path config_path: Path to exported ``config.json``.
-    :param bool strict: Whether malformed JSON should raise ``ValueError``.
-    :raises ValueError: If ``strict=True`` and ``config_path`` is malformed.
+    :raises FileNotFoundError: If the export did not produce a config file.
+    :raises ValueError: If ``config_path`` contains malformed JSON.
     """
     if not config_path.exists():
-        return
+        raise FileNotFoundError(f"Export did not produce required config JSON at {config_path}.")
     try:
         raw = load_json_mapping(config_path)
     except Exception as exc:
-        if strict:
-            raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from exc
-        return
+        raise ValueError(f"Failed to parse exported config JSON at {config_path}.") from exc
 
     cleaned = {k: v for k, v in raw.items() if k not in EXPORT_CONFIG_STRIP_KEYS}
     dump_json(cleaned, config_path)
@@ -81,23 +81,71 @@ def write_export_readme_and_license(
                 continue
         return 0
 
+    def _yes_no_or_unknown(value: bool | None) -> str:
+        """Render an optional boolean as a README-friendly ``yes``/``no``/``unknown`` token.
+
+        :param bool | None value: Boolean to render, or ``None`` when unavailable.
+        :return str: ``"yes"``, ``"no"``, or ``"unknown"``.
+        """
+        if value is None:
+            return "unknown"
+        return "yes" if value else "no"
+
     backbone = str(getattr(model_cfg, "backbone_type", "unknown"))
     runtime_cfg = export_config if export_config is not None else model_cfg
-    hidden = _first_int_attr(runtime_cfg, model_cfg, attr="hidden_size")
-    layers = _first_int_attr(runtime_cfg, model_cfg, attr="num_hidden_layers")
-    heads = _first_int_attr(runtime_cfg, model_cfg, attr="num_attention_heads")
-    seq_len = int(getattr(data_cfg, "max_seq_length", 0) or 0)
+    configured_arch = model_cfg.rope if backbone == "rope" else None
+    hidden = _first_int_attr(runtime_cfg, configured_arch, attr="hidden_size")
+    layers = _first_int_attr(runtime_cfg, configured_arch, attr="num_hidden_layers")
+    heads = _first_int_attr(runtime_cfg, configured_arch, attr="num_attention_heads")
+    seq_len = int(data_cfg.packing.max_seq_length if data_cfg is not None else 0)
     if seq_len == 0:
-        seq_len = _first_int_attr(runtime_cfg, model_cfg, attr="max_position_embeddings")
+        seq_len = _first_int_attr(runtime_cfg, configured_arch, attr="max_position_embeddings")
     steps = int(getattr(train_cfg, "max_steps", 0) or 0)
+
+    # Downstream users need to know whether pretraining packed multiple documents
+    # per sequence and, if so, whether cross-document attention was blocked —
+    # this changes what the encoder learned about document boundaries even though
+    # the exported model itself only ever consumes a standard 2D attention mask.
+    packing_cfg = getattr(data_cfg, "packing", None) if data_cfg is not None else None
+    packing_enabled = bool(getattr(packing_cfg, "enabled", False)) if packing_cfg is not None else None
+    block_cross_document_attention = (
+        bool(getattr(packing_cfg, "block_cross_document_attention", False))
+        if packing_cfg is not None
+        else None
+    )
+    packed_pretraining_str = _yes_no_or_unknown(packing_enabled)
+    block_cross_document_attention_str = _yes_no_or_unknown(block_cross_document_attention)
+
+    if packing_cfg is None:
+        packing_sentence = (
+            "Pretraining packing/attention-blocking configuration is unavailable for this export; "
+            "the exported model consumes standard 2D attention masks at inference."
+        )
+    elif packing_enabled and block_cross_document_attention:
+        packing_sentence = (
+            "Pretrained on packed sequences (multiple documents per sequence) with cross-document "
+            "attention blocking enabled, so tokens could not attend across document boundaries during "
+            "training; the exported model consumes standard 2D attention masks at inference."
+        )
+    elif packing_enabled:
+        packing_sentence = (
+            "Pretrained on packed sequences (multiple documents per sequence) without cross-document "
+            "attention blocking, so tokens could attend across document boundaries during training; "
+            "the exported model consumes standard 2D attention masks at inference."
+        )
+    else:
+        packing_sentence = (
+            "Pretrained without sequence packing (one document per sequence); the exported model "
+            "consumes standard 2D attention masks at inference."
+        )
 
     if backbone == "rope":
         arch_desc = "RoPE encoder (RMSNorm, SwiGLU, rotary embeddings)"
         usage_snippet = """from transformers import AutoTokenizer
 from deberta.modeling.rope_encoder import DebertaRoPEModel
 
-model = DebertaRoPEModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+model = DebertaRoPEModel.from_pretrained("path/to/model/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/export/root")
 """
         compatibility_note = (
             "Note: RoPE exports use a custom `model_type` (`deberta-rope`) and are not currently "
@@ -107,8 +155,8 @@ tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
         arch_desc = "DeBERTa-v2 (disentangled attention, LayerNorm)"
         usage_snippet = """from transformers import AutoModel, AutoTokenizer
 
-model = AutoModel.from_pretrained("path/to/this/dir")
-tokenizer = AutoTokenizer.from_pretrained("path/to/this/dir")
+model = AutoModel.from_pretrained("path/to/model/dir")
+tokenizer = AutoTokenizer.from_pretrained("path/to/export/root")
 """
         compatibility_note = ""
 
@@ -135,17 +183,23 @@ RTD-pretrained encoder ({arch_desc}).
 | Max sequence length | {seq_len} |
 | Embedding sharing | `{embedding_sharing}` |
 | Training steps | {steps} |
+| Packed-sequence pretraining | {packed_pretraining_str} |
+| Cross-document attention blocking | {block_cross_document_attention_str} |
 
 ## Training
 
 Pretrained with replaced-token detection (RTD / ELECTRA-style) using
 [pszemraj/deberta]({_REPO_URL}).
 
+{packing_sentence}
+
 ## Usage
 
 ```python
 {usage_snippet}
 ```
+
+Single-component exports use the same directory for both paths. With `--what both`, use the selected component subdirectory for the model and its parent export directory for the tokenizer.
 {compatibility_note}
 """
     (output_dir / "README.md").write_text(readme, encoding="utf-8")
@@ -190,54 +244,12 @@ def split_pretrainer_state_dict(
     return disc, gen
 
 
-def load_intersection_state_dict(
-    model: Any,
-    state_dict: dict[str, torch.Tensor],
-    *,
-    strict: bool = False,
-    context: str = "state_dict",
-) -> Any:
-    """Load only keys present in both model and source state dict.
-
-    :param Any model: Target model/module exposing ``state_dict`` and ``load_state_dict``.
-    :param dict[str, torch.Tensor] state_dict: Source state dict.
-    :param bool strict: When ``True``, fail on any missing/unexpected keys after overlap filtering.
-    :param str context: Human-readable context included in strict-mode failures.
-    :raises RuntimeError: If ``strict=True`` and the intersection load is partial.
-    :return Any: ``load_state_dict`` return value.
-    """
-    source_keys = set(state_dict.keys())
-    model_keys = set(model.state_dict().keys())
-    filtered = {k: v for k, v in state_dict.items() if k in model_keys}
-    incompatible = model.load_state_dict(filtered, strict=False)
-
-    missing_model_keys = sorted(model_keys - source_keys)
-    unexpected_source_keys = sorted(source_keys - model_keys)
-    missing_loaded = list(getattr(incompatible, "missing_keys", []))
-    unexpected_loaded = list(getattr(incompatible, "unexpected_keys", []))
-
-    if strict and (missing_model_keys or unexpected_source_keys or missing_loaded or unexpected_loaded):
-        missing_preview = ", ".join(missing_model_keys[:8])
-        unexpected_preview = ", ".join(unexpected_source_keys[:8])
-        loaded_missing_preview = ", ".join(missing_loaded[:8])
-        loaded_unexpected_preview = ", ".join(unexpected_loaded[:8])
-        raise RuntimeError(
-            f"{context}: partial state_dict load rejected: "
-            f"missing_model_keys={len(missing_model_keys)} ({missing_preview}), "
-            f"unexpected_source_keys={len(unexpected_source_keys)} ({unexpected_preview}), "
-            f"missing_after_load={len(missing_loaded)} ({loaded_missing_preview}), "
-            f"unexpected_after_load={len(unexpected_loaded)} ({loaded_unexpected_preview})."
-        )
-    return incompatible
-
-
 def merge_embeddings_into_export_backbone(
     *,
     export_model: Any,
     disc_sd: dict[str, torch.Tensor],
     gen_sd: dict[str, torch.Tensor],
     mode: str,
-    fp32_accumulate: bool,
 ) -> None:
     """Merge generator/discriminator embedding tensors into an export backbone.
 
@@ -245,20 +257,20 @@ def merge_embeddings_into_export_backbone(
     :param dict[str, torch.Tensor] disc_sd: Discriminator state dict.
     :param dict[str, torch.Tensor] gen_sd: Generator state dict.
     :param str mode: Embedding sharing mode.
-    :param bool fp32_accumulate: Whether to add tensors in fp32 before casting.
     """
     if mode not in {"es", "gdes"}:
         return
 
-    if not hasattr(export_model, "embeddings"):
-        return
+    embeddings = getattr(export_model, "embeddings", None)
+    if embeddings is None:
+        raise RuntimeError(f"Cannot merge {mode} embeddings: export backbone has no `.embeddings` module.")
 
     def merge_attr(attr: str) -> None:
         """Merge one embedding attribute into the export model.
 
         :param str attr: Embedding attribute name.
         """
-        if not hasattr(export_model.embeddings, attr):
+        if not hasattr(embeddings, attr):
             return
         gen_w = gen_sd.get(f"embeddings.{attr}.weight")
         if gen_w is None:
@@ -270,12 +282,9 @@ def merge_embeddings_into_export_backbone(
             bias = disc_sd.get(f"embeddings.{attr}.bias")
             if bias is None:
                 raise RuntimeError(f"Missing discriminator bias for embeddings.{attr}.bias (gdes)")
-            if fp32_accumulate:
-                merged = gen_w.detach().float() + bias.detach().float()
-            else:
-                merged = gen_w.to(dtype=bias.dtype) + bias
+            merged = gen_w.detach().float() + bias.detach().float()
 
-        emb_mod = getattr(export_model.embeddings, attr)
+        emb_mod = getattr(embeddings, attr)
         if hasattr(emb_mod, "weight") and emb_mod.weight is not None:
             emb_mod.weight.data.copy_(merged.to(emb_mod.weight.dtype))
 

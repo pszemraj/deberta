@@ -16,8 +16,6 @@ from deberta.config import (
     ModelConfig,
     OptimConfig,
     TrainConfig,
-    _sync_legacy_train_aliases,
-    apply_profile_defaults,
     validate_data_config,
     validate_logging_config,
     validate_model_config,
@@ -40,13 +38,10 @@ def _is_no_decay_param(*, name: str, param: torch.Tensor) -> bool:
     :return bool: True when parameter belongs to no-decay groups.
     """
     lname = str(name).lower()
-    # Keep vector/scalar biases in no-decay; high-rank "bias" tensors (for example
-    # GDES embedding deltas) should follow standard weight-decay behavior.
-    if lname.endswith(".bias") and param.dim() <= 1:
-        return True
     if "layernorm" in lname or "layer_norm" in lname or "rmsnorm" in lname or "rms_norm" in lname:
         return True
-    # Scalars and 1D params are typically excluded from decay.
+    # Scalars and 1D params, including conventional biases, skip decay. High-rank
+    # "bias" tensors (for example GDES embedding deltas) retain standard decay.
     if param.dim() <= 1:
         return True
     return False
@@ -120,22 +115,6 @@ def _digest_param_name_order(names: list[str]) -> str:
     return hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
 
 
-def _optimizer_param_order_digest(model: torch.nn.Module) -> str:
-    """Compute digest of trainable parameter names in optimizer insertion order.
-
-    This mirrors `_build_optimizer` ordering (grouped as gen-decay, gen-no-decay,
-    disc-decay, disc-no-decay), not raw ``named_parameters()`` registration order.
-
-    :param torch.nn.Module model: Model whose optimizer ordering to digest.
-    :return str: 16-char hex digest.
-    """
-    partitions = _partition_optimizer_params(model)
-    ordered_names: list[str] = []
-    for key in ("gen_decay", "gen_no_decay", "disc_decay", "disc_no_decay"):
-        ordered_names.extend(partitions[key]["names"])
-    return _digest_param_name_order(ordered_names)
-
-
 def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
     """Return optimizer kwargs enabling fused AdamW when available.
 
@@ -155,27 +134,27 @@ def _maybe_fused_adamw_kwargs() -> dict[str, Any]:
 
 def _resolve_optimizer_hyperparams(
     *,
-    cfg: TrainConfig,
+    cfg: OptimConfig,
     mixed_precision: str,
 ) -> tuple[float, tuple[float, float], float, float, dict[str, Any]]:
     """Resolve shared AdamW hyperparameters for optimizer construction.
 
-    :param TrainConfig cfg: Training configuration.
+    :param OptimConfig cfg: Optimizer configuration.
     :param str mixed_precision: Effective mixed-precision mode.
     :return tuple[float, tuple[float, float], float, float, dict[str, Any]]:
         ``(eps, betas, gen_lr, disc_lr, fused_kwargs)``.
     """
-    eps = float(cfg.adam_epsilon)
+    eps = float(cfg.adam.epsilon)
     if str(mixed_precision).strip().lower() == "bf16" and eps < 1e-6:
         eps = 1e-6
         logger.warning("Raised Adam epsilon to 1e-6 for bf16 stability.")
 
-    base_lr = float(cfg.learning_rate)
-    gen_lr_raw = float(cfg.generator_learning_rate)
-    disc_lr_raw = float(getattr(cfg, "discriminator_learning_rate", -1.0))
+    base_lr = float(cfg.lr.base)
+    gen_lr_raw = float(cfg.lr.generator)
+    disc_lr_raw = float(cfg.lr.discriminator)
     gen_lr = gen_lr_raw if gen_lr_raw > 0 else base_lr
     disc_lr = disc_lr_raw if disc_lr_raw > 0 else base_lr
-    betas = (float(cfg.adam_beta1), float(cfg.adam_beta2))
+    betas = (float(cfg.adam.beta1), float(cfg.adam.beta2))
     fused_kwargs = _maybe_fused_adamw_kwargs()
     return eps, betas, gen_lr, disc_lr, fused_kwargs
 
@@ -206,18 +185,18 @@ def _build_branch_param_groups(
     return groups, ordered_names
 
 
-def _build_optimizer(
+def _prepare_optimizer_groups(
     model: torch.nn.Module,
-    cfg: TrainConfig,
+    cfg: OptimConfig,
     *,
-    mixed_precision: str = "no",
-) -> torch.optim.Optimizer:
-    """Create AdamW with parameter grouping for RTD training.
+    mixed_precision: str,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[str], float, float, dict[str, Any]]:
+    """Resolve ordered branch groups and shared AdamW arguments.
 
-    :param torch.nn.Module model: RTD model.
-    :param TrainConfig cfg: Training configuration.
-    :param str mixed_precision: Effective mixed-precision mode.
-    :return torch.optim.Optimizer: Configured AdamW optimizer.
+    :param torch.nn.Module model: Model whose parameters are partitioned.
+    :param OptimConfig cfg: Optimizer configuration.
+    :param str mixed_precision: Effective precision mode.
+    :return tuple: Generator/discriminator groups, names, learning rates, and shared kwargs.
     """
     eps, betas, gen_lr, disc_lr, fused_kwargs = _resolve_optimizer_hyperparams(
         cfg=cfg,
@@ -236,12 +215,43 @@ def _build_optimizer(
         lr=disc_lr,
         weight_decay=float(cfg.weight_decay),
     )
+    return (
+        gen_groups,
+        gen_names,
+        disc_groups,
+        disc_names,
+        gen_lr,
+        disc_lr,
+        {
+            "betas": betas,
+            "eps": eps,
+            **fused_kwargs,
+        },
+    )
+
+
+def _build_optimizer(
+    model: torch.nn.Module,
+    cfg: OptimConfig,
+    *,
+    mixed_precision: str = "no",
+) -> torch.optim.Optimizer:
+    """Create AdamW with parameter grouping for RTD training.
+
+    :param torch.nn.Module model: RTD model.
+    :param OptimConfig cfg: Optimizer configuration.
+    :param str mixed_precision: Effective mixed-precision mode.
+    :return torch.optim.Optimizer: Configured AdamW optimizer.
+    """
+    gen_groups, gen_names, disc_groups, disc_names, _, disc_lr, adamw_kwargs = _prepare_optimizer_groups(
+        model,
+        cfg,
+        mixed_precision=mixed_precision,
+    )
     optimizer = torch.optim.AdamW(
         [*gen_groups, *disc_groups],
         lr=disc_lr,
-        betas=betas,
-        eps=eps,
-        **fused_kwargs,
+        **adamw_kwargs,
     )
     optimizer._param_order_digest = _digest_param_name_order([*gen_names, *disc_names])
     return optimizer
@@ -249,58 +259,46 @@ def _build_optimizer(
 
 def _build_decoupled_optimizers(
     model: torch.nn.Module,
-    cfg: TrainConfig,
+    cfg: OptimConfig,
     *,
     mixed_precision: str = "no",
 ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
     """Create separate generator/discriminator AdamW optimizers.
 
     :param torch.nn.Module model: RTD model.
-    :param TrainConfig cfg: Training configuration.
+    :param OptimConfig cfg: Optimizer configuration.
     :param str mixed_precision: Effective mixed-precision mode.
     :return tuple[torch.optim.Optimizer, torch.optim.Optimizer]: (generator_optimizer, discriminator_optimizer).
     """
-    eps, betas, gen_lr, disc_lr, fused_kwargs = _resolve_optimizer_hyperparams(
-        cfg=cfg,
-        mixed_precision=mixed_precision,
-    )
-    partitions = _partition_optimizer_params(model)
-    gen_groups, gen_names = _build_branch_param_groups(
-        partitions=partitions,
-        branch_key="gen",
-        lr=gen_lr,
-        weight_decay=float(cfg.weight_decay),
-    )
-    disc_groups, disc_names = _build_branch_param_groups(
-        partitions=partitions,
-        branch_key="disc",
-        lr=disc_lr,
-        weight_decay=float(cfg.weight_decay),
+    gen_groups, gen_names, disc_groups, disc_names, gen_lr, disc_lr, adamw_kwargs = _prepare_optimizer_groups(
+        model, cfg, mixed_precision=mixed_precision
     )
     gen_opt = torch.optim.AdamW(
         gen_groups,
         lr=gen_lr,
-        betas=betas,
-        eps=eps,
-        **fused_kwargs,
+        **adamw_kwargs,
     )
     disc_opt = torch.optim.AdamW(
         disc_groups,
         lr=disc_lr,
-        betas=betas,
-        eps=eps,
-        **fused_kwargs,
+        **adamw_kwargs,
     )
     gen_opt._param_order_digest = _digest_param_name_order(gen_names)
     disc_opt._param_order_digest = _digest_param_name_order(disc_names)
     return gen_opt, disc_opt
 
 
-def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    train_cfg: TrainConfig,
+    optim_cfg: OptimConfig,
+) -> Any:
     """Build a Hugging Face learning-rate scheduler.
 
     :param torch.optim.Optimizer optimizer: Optimizer instance.
-    :param TrainConfig cfg: Training configuration.
+    :param TrainConfig train_cfg: Training step budget.
+    :param OptimConfig optim_cfg: Scheduler configuration.
     :return Any: Scheduler object from ``transformers.get_scheduler``.
     """
     try:
@@ -309,10 +307,10 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Any:
         raise RuntimeError("transformers is required for schedulers.") from e
 
     return get_scheduler(
-        name=cfg.lr_scheduler_type,
+        name=optim_cfg.scheduler.type,
         optimizer=optimizer,
-        num_warmup_steps=int(cfg.warmup_steps),
-        num_training_steps=int(cfg.max_steps),
+        num_warmup_steps=int(optim_cfg.scheduler.warmup_steps),
+        num_training_steps=int(train_cfg.max_steps),
     )
 
 
@@ -332,11 +330,16 @@ def _cycle_dataloader(
     while True:
         set_epoch = getattr(dataset, "set_epoch", None)
         if callable(set_epoch):
-            try:
-                set_epoch(epoch)
-            except Exception:
-                pass
-        yield from dl
+            set_epoch(epoch)
+        produced_batch = False
+        for batch in dl:
+            produced_batch = True
+            yield batch
+        if not produced_batch:
+            raise RuntimeError(
+                "Training dataloader produced zero batches. The finite dataset may contain fewer "
+                "packed rows than per_device_train_batch_size while drop_last=True."
+            )
         epoch += 1
 
 
@@ -346,6 +349,7 @@ def _build_training_collator(
     train_cfg: TrainConfig,
     packed_sequences: bool,
     block_cross_document_attention: bool,
+    emit_flash_metadata: bool = False,
 ) -> DebertaV3ElectraCollator:
     """Build the RTD masking collator from train/data config.
 
@@ -353,68 +357,55 @@ def _build_training_collator(
     :param TrainConfig train_cfg: Training configuration.
     :param bool packed_sequences: Whether dataset packing is enabled.
     :param bool block_cross_document_attention: Whether packed batches should block cross-document attention.
+    :param bool emit_flash_metadata: Whether to build Flash routing metadata.
     :return DebertaV3ElectraCollator: Configured collator.
     """
     return DebertaV3ElectraCollator(
         tokenizer=tokenizer,
         cfg=MLMConfig(
-            mlm_probability=train_cfg.mlm_probability,
-            mask_token_prob=train_cfg.mask_token_prob,
-            random_token_prob=train_cfg.random_token_prob,
-            max_ngram=train_cfg.mlm_max_ngram,
+            mlm_probability=train_cfg.objective.mlm_probability,
+            mask_token_prob=train_cfg.objective.mask_token_prob,
+            random_token_prob=train_cfg.objective.random_token_prob,
+            max_ngram=train_cfg.objective.mlm_max_ngram,
         ),
         packed_sequences=bool(packed_sequences),
         block_cross_document_attention=bool(block_cross_document_attention),
+        emit_flash_metadata=bool(emit_flash_metadata),
     )
 
 
-def _resolve_section_cfg_compat(
-    *,
-    train_cfg: TrainConfig,
-    optim_cfg: OptimConfig | None,
-    logging_cfg: LoggingConfig | None,
-) -> tuple[OptimConfig, LoggingConfig]:
-    """Resolve optional optim/logging configs with train-legacy compatibility.
+def _flashdeberta_runtime_import_error() -> Exception | None:
+    """Return the fixed-kernel import failure for the optional Flash runtime.
 
-    :param TrainConfig train_cfg: Train config object.
-    :param OptimConfig | None optim_cfg: Optional explicit optim config.
-    :param LoggingConfig | None logging_cfg: Optional explicit logging config.
-    :return tuple[OptimConfig, LoggingConfig]: Effective optim/logging configs.
+    :return Exception | None: Import failure, or None when the core runtime is available.
     """
-    if optim_cfg is None:
-        resolved_optim_cfg = OptimConfig(
-            learning_rate=getattr(train_cfg, "learning_rate", 5e-4),
-            generator_learning_rate=getattr(train_cfg, "generator_learning_rate", -1.0),
-            discriminator_learning_rate=getattr(train_cfg, "discriminator_learning_rate", -1.0),
-            weight_decay=getattr(train_cfg, "weight_decay", 0.01),
-            adam_beta1=getattr(train_cfg, "adam_beta1", 0.9),
-            adam_beta2=getattr(train_cfg, "adam_beta2", 0.999),
-            adam_epsilon=getattr(train_cfg, "adam_epsilon", 1e-8),
-            lr_scheduler_type=getattr(train_cfg, "lr_scheduler_type", "linear"),
-            warmup_steps=getattr(train_cfg, "warmup_steps", 1_000),
-            max_grad_norm=getattr(train_cfg, "max_grad_norm", 1.0),
-        )
-    else:
-        resolved_optim_cfg = optim_cfg
 
-    if logging_cfg is None:
-        resolved_logging_cfg = LoggingConfig(
-            project_name=getattr(train_cfg, "project_name", "deberta-train"),
-            run_name=getattr(train_cfg, "run_name", None),
-            output_dir=getattr(train_cfg, "logging_output_dir", None),
-            logging_steps=getattr(train_cfg, "logging_steps", 50),
-            report_to=getattr(train_cfg, "report_to", "none"),
-            wandb_watch=getattr(train_cfg, "wandb_watch", "gradients"),
-            wandb_watch_log_freq=getattr(train_cfg, "wandb_watch_log_freq", 100),
-            debug_metrics=getattr(train_cfg, "debug_metrics", False),
-        )
-    else:
-        resolved_logging_cfg = logging_cfg
-
-    return resolved_optim_cfg, resolved_logging_cfg
+    try:
+        from deberta.modeling.flashdeberta_fixed_op import flashdeberta_fixed_import_error
+    except Exception as exc:  # pragma: no cover - optional import boundary
+        return exc
+    return flashdeberta_fixed_import_error()
 
 
-def _apply_profile_and_validate_training_configs(
+def _validate_flashdeberta_runtime(model_cfg: ModelConfig) -> None:
+    """Fail early when configured FlashDeBERTa dependencies cannot be imported.
+
+    :param ModelConfig model_cfg: Validated model configuration.
+    :raises RuntimeError: If Flash attention is configured without its usable runtime.
+    """
+
+    if str(model_cfg.hf.attention_impl).strip().lower() != "flash":
+        return
+    detail = _flashdeberta_runtime_import_error()
+    if detail is not None:
+        raise RuntimeError(
+            "model.hf.attention_impl='flash' requires the FlashDeBERTa runtime. Install the "
+            "project with the flash extra (`pip install -e '.[flash]'`) and ensure "
+            "FlashDeBERTa and Triton are compatible with the installed PyTorch build."
+        ) from detail
+
+
+def _validate_training_configs(
     *,
     model_cfg: ModelConfig,
     data_cfg: DataConfig,
@@ -422,7 +413,7 @@ def _apply_profile_and_validate_training_configs(
     optim_cfg: OptimConfig,
     logging_cfg: LoggingConfig,
 ) -> None:
-    """Apply profile defaults and validate full training config contract.
+    """Validate the full training config contract.
 
     :param ModelConfig model_cfg: Model config.
     :param DataConfig data_cfg: Data config.
@@ -431,12 +422,6 @@ def _apply_profile_and_validate_training_configs(
     :param LoggingConfig logging_cfg: Effective logging config.
     :return None: None.
     """
-    apply_profile_defaults(model_cfg=model_cfg, train_cfg=train_cfg, optim_cfg=optim_cfg)
-    _sync_legacy_train_aliases(
-        train_cfg=train_cfg,
-        optim_cfg=optim_cfg,
-        logging_cfg=logging_cfg,
-    )
     validate_model_config(model_cfg)
     validate_data_config(data_cfg)
     validate_train_config(train_cfg)
@@ -447,8 +432,8 @@ def _apply_profile_and_validate_training_configs(
         train_cfg=train_cfg,
         model_cfg=model_cfg,
         optim_cfg=optim_cfg,
-        logging_cfg=logging_cfg,
     )
+    _validate_flashdeberta_runtime(model_cfg)
 
 
 def _build_train_dataset_and_collator(
@@ -459,8 +444,9 @@ def _build_train_dataset_and_collator(
     train_cfg: TrainConfig,
     process_index: int,
     num_processes: int,
+    flash_enabled: bool = False,
 ) -> tuple[Any, Any]:
-    """Build streaming train dataset and collator.
+    """Build the training dataset wrapper and collator.
 
     :param Any raw_train: Loaded HF dataset split.
     :param Any tokenizer: Runtime tokenizer.
@@ -468,17 +454,19 @@ def _build_train_dataset_and_collator(
     :param TrainConfig train_cfg: Train config.
     :param int process_index: Current process index.
     :param int num_processes: Total process count.
+    :param bool flash_enabled: Whether Flash metadata should be emitted.
     :return tuple[Any, Any]: ``(train_dataset, collator)``.
     """
-    dataset_cls = PackedStreamingDataset if bool(data_cfg.pack_sequences) else SequentialStreamingDataset
+    dataset_cls = PackedStreamingDataset if bool(data_cfg.packing.enabled) else SequentialStreamingDataset
     train_dataset = dataset_cls(
         hf_dataset=raw_train,
         tokenizer=tokenizer,
         cfg=PackedStreamingConfig(
-            text_column_name=data_cfg.text_column_name,
-            max_seq_length=data_cfg.max_seq_length,
+            text_column_name=data_cfg.source.text_column_name,
+            max_seq_length=data_cfg.packing.max_seq_length,
             seed=train_cfg.seed,
-            shuffle_buffer_size=data_cfg.shuffle_buffer_size,
+            shuffle_buffer_size=data_cfg.source.shuffle_buffer_size,
+            block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
         ),
         process_index=process_index,
         num_processes=num_processes,
@@ -486,7 +474,8 @@ def _build_train_dataset_and_collator(
     collator = _build_training_collator(
         tokenizer=tokenizer,
         train_cfg=train_cfg,
-        packed_sequences=bool(data_cfg.pack_sequences),
-        block_cross_document_attention=bool(data_cfg.block_cross_document_attention),
+        packed_sequences=bool(data_cfg.packing.enabled),
+        block_cross_document_attention=bool(data_cfg.packing.block_cross_document_attention),
+        emit_flash_metadata=bool(flash_enabled),
     )
     return train_dataset, collator

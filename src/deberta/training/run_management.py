@@ -11,7 +11,7 @@ import uuid
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from deberta.utils.io import dump_json, load_json_mapping
 from deberta.utils.paths import validate_existing_output_dir
@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 _RUN_LABEL_CLEAN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _CHECKPOINT_DATA_STATE_FILENAME = "data_state.json"
 _CHECKPOINT_COMPLETE_MARKER = ".complete"
+
+
+class _CheckpointStatus(NamedTuple):
+    """Structural checkpoint classification used by resume discovery."""
+
+    committed: bool
+    has_progress: bool
+    has_weights: bool
+
+    @property
+    def resumable(self) -> bool:
+        """Return whether all resume invariants are satisfied."""
+        return self.committed and self.has_progress and self.has_weights
 
 
 def _sanitize_run_label(raw: str) -> str:
@@ -48,7 +61,7 @@ def _resolve_output_dir(
     :return Path: Concrete output directory path.
     """
     if output_dir is not None and str(output_dir).strip():
-        return Path(str(output_dir))
+        return Path(str(output_dir)).expanduser().resolve()
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name_hint = str(run_name).strip() if run_name is not None else ""
@@ -58,7 +71,7 @@ def _resolve_output_dir(
         name_hint = "run"
     run_name = _sanitize_run_label(name_hint)
     project = _sanitize_run_label(project_name)
-    return Path("runs") / project / f"{stamp}_{run_name}"
+    return (Path("runs") / project / f"{stamp}_{run_name}").resolve()
 
 
 def _broadcast_rank0_payload(
@@ -115,7 +128,7 @@ def _resolve_output_dir_for_accelerator(
     """
     explicit = output_dir is not None and str(output_dir).strip()
     if explicit:
-        return Path(str(output_dir))
+        return Path(str(output_dir)).expanduser().resolve()
 
     num_processes = int(getattr(accelerator, "num_processes", 1))
     if num_processes <= 1:
@@ -145,7 +158,7 @@ def _resolve_output_dir_for_accelerator(
     )
     if resolved is None or not str(resolved).strip():
         raise RuntimeError("Broadcasted output_dir is empty in distributed auto-output-dir resolution.")
-    return Path(str(resolved))
+    return Path(str(resolved)).expanduser().resolve()
 
 
 def _resolve_resume_checkpoint_for_accelerator(
@@ -242,33 +255,58 @@ def _parse_checkpoint_step(path: str) -> int:
     return 0
 
 
-def _find_latest_checkpoint(output_dir: Path) -> Path | None:
-    """Return latest ``checkpoint-*`` directory under ``output_dir``.
+def _select_latest_checkpoint(checkpoints: list[tuple[int, Path]]) -> Path | None:
+    """Select the highest-step checkpoint from precomputed candidates.
 
-    :param Path output_dir: Training output directory.
+    :param list[tuple[int, Path]] checkpoints: ``(step, checkpoint_dir)`` pairs.
     :return Path | None: Latest checkpoint path, or ``None`` if absent.
     """
-    checkpoints = _list_checkpoints(output_dir)
     if not checkpoints:
         return None
+    return max(checkpoints, key=lambda item: item[0])[1]
 
-    checkpoints.sort(key=lambda x: x[0])
-    return checkpoints[-1][1]
+
+def _safetensors_header_is_consistent(path: Path) -> bool:
+    """Cheaply validate a ``.safetensors`` file's header against its actual size.
+
+    Opens the file with :func:`safetensors.safe_open`, which parses the
+    little-endian u64 header-length prefix and the JSON header that follows it,
+    then verifies every tensor's ``data_offsets`` are covered by the file's
+    remaining bytes (i.e. ``file_size == 8 + header_len + max(data_offsets[1])``
+    per the safetensors format spec; the ``__metadata__`` key carries no
+    offsets and is ignored). Tensor payloads are never read or deserialized,
+    so the check stays cheap even for multi-gigabyte checkpoints.
+
+    :param Path path: Candidate ``.safetensors`` file.
+    :return bool: ``True`` when the header parses as JSON and the declared
+        tensor layout matches the file's actual size; ``False`` on any parse
+        failure or size mismatch.
+    """
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt") as handle:
+            handle.keys()
+    except Exception:
+        return False
+    return True
 
 
 def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
-    """Return whether a checkpoint has non-empty model-weight payloads.
+    """Return whether a checkpoint has non-empty, structurally sound model-weight payloads.
 
     This is a structural check intended to catch common crash artifacts
-    (missing/zero-byte model files), not a full deserialization validation.
+    (missing/zero-byte model files, truncated or corrupt ``.safetensors``
+    headers), not a full tensor deserialization validation. FSDP shards and
+    ``.bin`` files only get the existence/size check, since deserializing them
+    cheaply is not possible (``.bin`` is an arbitrary-code-execution risk via
+    ``torch.load``, and DCP shards have no equivalent lightweight header).
 
     :param Path checkpoint_dir: Candidate checkpoint directory.
-    :return bool: ``True`` when model-weight files appear present and non-empty.
+    :return bool: ``True`` when model-weight files appear present, non-empty, and
+        (for ``.safetensors`` files) structurally consistent.
     """
     root_patterns = (
-        "model.safetensors",
-        "pytorch_model.bin",
-        "model.bin",
         "*model*.safetensors",
         "*model*.bin",
     )
@@ -276,9 +314,14 @@ def _checkpoint_weights_appear_valid(checkpoint_dir: Path) -> bool:
         for candidate in checkpoint_dir.glob(pattern):
             if not candidate.is_file():
                 continue
+            size_ok = False
             with suppress(OSError):
-                if int(candidate.stat().st_size) > 0:
-                    return True
+                size_ok = int(candidate.stat().st_size) > 0
+            if not size_ok:
+                continue
+            if candidate.suffix == ".safetensors" and not _safetensors_header_is_consistent(candidate):
+                continue
+            return True
 
     # FSDP sharded model-state directories written by accelerate/torch DCP.
     for subdir in checkpoint_dir.glob("pytorch_model_fsdp*"):
@@ -311,41 +354,33 @@ def _is_checkpoint_committed(checkpoint_dir: Path) -> bool:
     return _checkpoint_complete_marker_path(checkpoint_dir).is_file()
 
 
-def _is_checkpoint_resumable(checkpoint_dir: Path) -> bool:
-    """Return whether a checkpoint satisfies strict resumability invariants.
+def _classify_checkpoint(checkpoint_dir: Path) -> _CheckpointStatus:
+    """Classify a checkpoint against strict resumability invariants.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return bool: ``True`` when marker, metadata, and weights are all present.
+    :return _CheckpointStatus: Marker, progress, and model-weight status.
     """
-    if not _is_checkpoint_committed(checkpoint_dir):
-        return False
-    consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
-    if consumed is None:
-        return False
-    if not _checkpoint_weights_appear_valid(checkpoint_dir):
-        return False
-    return True
+    consumed, _, _, _, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
+    return _CheckpointStatus(
+        committed=_is_checkpoint_committed(checkpoint_dir),
+        has_progress=consumed is not None,
+        has_weights=_checkpoint_weights_appear_valid(checkpoint_dir),
+    )
 
 
-def _find_latest_resumable_checkpoint(output_dir: Path) -> Path | None:
+def _find_latest_resumable_checkpoint(checkpoints: list[tuple[int, Path]]) -> Path | None:
     """Return the latest checkpoint directory that can be resumed safely.
 
     Transactional checkpoints are preferred and identified by a ``.complete``
     marker written only after checkpoint metadata persistence.
 
-    :param Path output_dir: Training output directory.
+    :param list[tuple[int, Path]] checkpoints: Precomputed ``(step, checkpoint_dir)`` pairs.
     :return Path | None: Latest resumable checkpoint path, or ``None`` if absent.
     """
-    checkpoints = _list_checkpoints(output_dir)
-    if not checkpoints:
-        return None
-
-    checkpoints.sort(key=lambda x: x[0], reverse=True)
-    for _, checkpoint_dir in checkpoints:
-        resumable = _is_checkpoint_resumable(checkpoint_dir)
-        if not resumable:
-            consumed, _, _ = _load_checkpoint_data_progress(checkpoint_dir)
-            if consumed is not None and not _checkpoint_weights_appear_valid(checkpoint_dir):
+    for _, checkpoint_dir in sorted(checkpoints, key=lambda item: item[0], reverse=True):
+        status = _classify_checkpoint(checkpoint_dir)
+        if not status.resumable:
+            if status.has_progress and not status.has_weights:
                 logger.warning(
                     "Checkpoint %s has resume metadata but model weights appear missing/empty; "
                     "skipping as unresumable.",
@@ -380,49 +415,48 @@ def _resolve_resume_checkpoint(
         checkpoint_path = Path(resume_value).expanduser()
         if not checkpoint_path.exists():
             raise FileNotFoundError(
-                "train.resume_from_checkpoint was provided but the checkpoint path does not exist: "
+                "train.checkpoint.resume_from_checkpoint was provided but the checkpoint path does not exist: "
                 f"{checkpoint_path}"
             )
         if not checkpoint_path.is_dir():
             raise ValueError(
-                "train.resume_from_checkpoint must point to a checkpoint directory. "
+                "train.checkpoint.resume_from_checkpoint must point to a checkpoint directory. "
                 f"Got a non-directory path: {checkpoint_path}"
             )
-        consumed, _, _ = _load_checkpoint_data_progress(checkpoint_path)
-        weights_ok = _checkpoint_weights_appear_valid(checkpoint_path)
-        committed = _is_checkpoint_committed(checkpoint_path)
-        if not committed:
+        status = _classify_checkpoint(checkpoint_path)
+        if not status.committed:
             raise ValueError(
                 f"Explicit resume checkpoint '{checkpoint_path}' is missing .complete marker. "
                 "Only transactionally committed checkpoints are resumable."
             )
-        if consumed is None:
+        if not status.has_progress:
             raise ValueError(
                 f"Explicit resume checkpoint '{checkpoint_path}' has .complete marker but failed "
                 "resume integrity checks (missing/invalid data_state.json with consumed_micro_batches). "
                 "The checkpoint may be incomplete due to a crashed save."
             )
-        if not weights_ok:
+        if not status.has_weights:
             raise ValueError(
                 f"Explicit resume checkpoint '{checkpoint_path}' has .complete marker but model weights "
                 "appear missing or empty. The checkpoint may be incomplete due to a crashed save."
             )
         return str(checkpoint_path.resolve())
 
-    latest_any = _find_latest_checkpoint(output_dir)
+    checkpoints = _list_checkpoints(output_dir)
+    latest_any = _select_latest_checkpoint(checkpoints)
     if latest_any is None:
         has_existing_contents = output_dir.exists() and any(output_dir.iterdir())
         if has_existing_contents:
             raise ValueError(
                 "resume_from_checkpoint=auto was requested but no checkpoint-* directories were found in "
                 f"non-empty output_dir={output_dir}. Clean the directory, enable "
-                "train.overwrite_output_dir=true, or provide an explicit checkpoint path."
+                "train.checkpoint.overwrite_output_dir=true, or provide an explicit checkpoint path."
             )
         if is_main_process:
             logger.info("resume_from_checkpoint=auto but no checkpoint-* dirs found; starting from scratch.")
         return None
 
-    latest_resumable = _find_latest_resumable_checkpoint(output_dir)
+    latest_resumable = _find_latest_resumable_checkpoint(checkpoints)
     if latest_resumable is None:
         raise ValueError(
             "resume_from_checkpoint=auto found checkpoint-* directories but none are resumable "
@@ -442,16 +476,17 @@ def _resolve_resume_checkpoint(
 
 def _load_checkpoint_progress_metadata(
     checkpoint_dir: Path,
-) -> tuple[int | None, float, str | dict[str, str] | None, int | None, int | None]:
+) -> tuple[int | None, float, str | dict[str, str] | None, int | None, int | None, float | None]:
     """Load persisted resume metadata from ``data_state.json``.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float, str | dict[str, str] | None, int | None, int | None]:
-        ``(consumed_micro_batches, lr_mult, optimizer_param_digest, global_step, gradient_accumulation_steps)``.
+    :return tuple[int | None, float, str | dict[str, str] | None, int | None, int | None, float | None]:
+        ``(consumed_micro_batches, lr_mult, optimizer_param_digest, global_step,
+        gradient_accumulation_steps, input_tokens_seen)``.
     """
     path = checkpoint_dir / _CHECKPOINT_DATA_STATE_FILENAME
     if not path.exists():
-        return None, 1.0, None, None, None
+        return None, 1.0, None, None, None, None
     try:
         raw = load_json_mapping(path)
         val = raw.get("consumed_micro_batches", None)
@@ -469,7 +504,11 @@ def _load_checkpoint_progress_metadata(
         global_step = max(0, int(global_step_raw)) if global_step_raw is not None else None
         ga_steps_raw = raw.get("gradient_accumulation_steps", None)
         ga_steps = max(1, int(ga_steps_raw)) if ga_steps_raw is not None else None
-        return consumed, lr_mult, digest, global_step, ga_steps
+        input_tokens_seen_raw = raw.get("input_tokens_seen", None)
+        input_tokens_seen = (
+            max(0.0, float(input_tokens_seen_raw)) if input_tokens_seen_raw is not None else None
+        )
+        return consumed, lr_mult, digest, global_step, ga_steps, input_tokens_seen
     except (TypeError, ValueError) as exc:
         logger.warning(
             "Checkpoint %s has invalid data_state.json (%s: %s); treating as unresumable.",
@@ -477,42 +516,31 @@ def _load_checkpoint_progress_metadata(
             type(exc).__name__,
             exc,
         )
-        return None, 1.0, None, None, None
+        return None, 1.0, None, None, None, None
     except Exception as exc:
         logger.warning(
             "Unexpected error reading data_state.json for checkpoint %s (%s); treating as unresumable.",
             checkpoint_dir,
             exc,
         )
-        return None, 1.0, None, None, None
-
-
-def _load_checkpoint_data_progress(
-    checkpoint_dir: Path,
-) -> tuple[int | None, float, str | dict[str, str] | None]:
-    """Load persisted data progress, LR multiplier, and optimizer param digest.
-
-    :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float, str | dict[str, str] | None]:
-        ``(consumed_micro_batches, lr_mult, optimizer_param_digest)``.
-    """
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
-    return consumed, lr_mult, digest
+        return None, 1.0, None, None, None, None
 
 
 def _save_checkpoint_data_progress(
     *,
     checkpoint_dir: Path,
     consumed_micro_batches: int,
+    input_tokens_seen: float,
     lr_mult: float = 1.0,
     optimizer_param_digest: str | dict[str, str] | None = None,
     global_step: int | None = None,
     gradient_accumulation_steps: int | None = None,
 ) -> None:
-    """Persist data iterator progress, LR multiplier, and optimizer param digest.
+    """Persist data iterator progress, token accounting, and optimizer state metadata.
 
     :param Path checkpoint_dir: Checkpoint directory.
     :param int consumed_micro_batches: Number of consumed micro-batches.
+    :param float input_tokens_seen: Global active input tokens processed through this checkpoint.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
     :param str | dict[str, str] | None optimizer_param_digest: SHA-256 prefix digest(s) of trainable param names.
     :param int | None global_step: Committed optimizer step at checkpoint save time.
@@ -520,6 +548,7 @@ def _save_checkpoint_data_progress(
     """
     payload: dict[str, Any] = {
         "consumed_micro_batches": int(max(0, consumed_micro_batches)),
+        "input_tokens_seen": float(max(0.0, input_tokens_seen)),
         "lr_mult": float(lr_mult),
     }
     if optimizer_param_digest is not None:
@@ -540,6 +569,7 @@ def _save_training_checkpoint(
     checkpoint_dir: Path,
     output_dir: Path,
     consumed_micro_batches: int,
+    input_tokens_seen: float,
     save_total_limit: int,
     log_label: str,
     lr_mult: float = 1.0,
@@ -553,6 +583,7 @@ def _save_training_checkpoint(
     :param Path checkpoint_dir: Destination checkpoint directory.
     :param Path output_dir: Parent output directory for checkpoint rotation.
     :param int consumed_micro_batches: Data progress to persist.
+    :param float input_tokens_seen: Global active input tokens processed through this checkpoint.
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
@@ -585,12 +616,13 @@ def _save_training_checkpoint(
             _save_checkpoint_data_progress(
                 checkpoint_dir=staging_dir,
                 consumed_micro_batches=consumed_micro_batches,
+                input_tokens_seen=input_tokens_seen,
                 lr_mult=float(lr_mult),
                 optimizer_param_digest=optimizer_param_digest,
                 global_step=global_step,
                 gradient_accumulation_steps=gradient_accumulation_steps,
             )
-            progress_ok = _load_checkpoint_data_progress(staging_dir)[0] is not None
+            progress_ok = _load_checkpoint_progress_metadata(staging_dir)[0] is not None
             weights_ok = _checkpoint_weights_appear_valid(staging_dir)
             if not (progress_ok and weights_ok):
                 raise RuntimeError(
@@ -648,7 +680,8 @@ def _prepare_output_dir(
         allow_nonempty=bool(overwrite_output_dir) or bool(resume_value),
         nonempty_error=(
             f"Output directory exists and is not empty: {output_dir}. "
-            "Set train.overwrite_output_dir=true or set train.resume_from_checkpoint."
+            "Set train.checkpoint.overwrite_output_dir=true or set "
+            "train.checkpoint.resume_from_checkpoint."
         ),
         nondir_error=f"Output directory exists and is not a directory: {output_dir}",
     )
@@ -698,8 +731,6 @@ def _list_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
 
 
 __all__ = [
-    "_find_latest_checkpoint",
-    "_load_checkpoint_data_progress",
     "_load_checkpoint_progress_metadata",
     "_parse_checkpoint_step",
     "_prepare_output_dir",

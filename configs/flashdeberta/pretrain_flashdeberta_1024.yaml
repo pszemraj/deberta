@@ -1,0 +1,62 @@
+# Validated 50k production recipe for native DeBERTa-v3 RTD with FlashDeBERTa at 1024 tokens.
+# The uncompiled 3k convergence gate is recorded in docs/development/rtd-validation-ledger.md.
+# Keep torch.compile disabled unless the exact training route passes a separate validation run.
+
+model:
+  backbone_type: hf_deberta_v2
+  from_scratch: true
+  embedding_sharing: gdes
+  tokenizer:
+    name_or_path: BEE-spoke-data/wordpiece-tokenizer-32k-en_code-msp
+    allow_vocab_resize: true
+    vocab_multiple: 128
+  hf:
+    model_size: base
+    attention_impl: flash
+    max_position_embeddings: 1024
+  dropout:
+    hidden_prob: 0.0
+    attention_probs_prob: 0.0
+
+data:
+  source:
+    dataset_name: EleutherAI/SmolLM2-1.7B-stage-4-100B
+    dataset_config_name: default
+    train_split: train
+    text_column_name: text
+    streaming: true
+    shuffle_buffer_size: 10000
+  packing:
+    enabled: true
+    max_seq_length: 1024
+    block_cross_document_attention: false
+
+train:
+  max_steps: 50000
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 8
+  mixed_precision: bf16
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+  compile:
+    enabled: false
+  checkpoint:
+    output_dir: null
+    save_steps: 5000
+    # Retain the complete 5k-step trajectory for post-run convergence evaluation.
+    save_total_limit: 10
+    export_hf_final: true
+
+optim:
+  lr:
+    base: 1.0e-4
+  scheduler:
+    type: linear
+    warmup_steps: 1000
+
+logging:
+  project_name: flashdeberta
+  logging_steps: 50
+  wandb:
+    enabled: false

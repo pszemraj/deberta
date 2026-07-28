@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import errno
 import logging
 import math
+import re
 
 import pytest
 import torch
+from _config_factories import make_native_deberta_config
 from _fakes import DummyTokenizer
 
 from deberta.data.collator import DebertaV3ElectraCollator, MLMConfig
+from deberta.data.retry import call_with_dataset_retry, is_transient_dataset_error
 from deberta.data.streaming import PackedStreamingConfig, PackedStreamingDataset, SequentialStreamingDataset
-from deberta.training.compile import _build_doc_block_mask
+from deberta.modeling.mask_utils import build_doc_block_mask, reduce_keep_mask_to_2d
 
 
 @pytest.fixture
 def tiny_rope_config_factory():
     """Return a helper that builds tiny DebertaRoPEConfig instances for attention tests."""
-    pytest.importorskip("transformers")
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
 
     base = dict(
@@ -36,10 +39,24 @@ def tiny_rope_config_factory():
     return _build
 
 
+@pytest.fixture
+def packed_doc_collator() -> tuple[DummyTokenizer, DebertaV3ElectraCollator]:
+    """Return the standard tokenizer and document-aware packed collator."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+        packed_sequences=True,
+        block_cross_document_attention=True,
+    )
+    return tokenizer, collator
+
+
 def test_packed_streaming_marks_internal_sep_as_special():
     tok = DummyTokenizer(vocab_size=64)
 
-    # Two docs, each 2 tokens. With max_seq=8, block_len=6, chunk will include internal seps.
+    # Two docs, each 2 tokens. The shared row includes one internal separator.
     hf_dataset = [{"text": "a b"}, {"text": "c d"}]
 
     ds = PackedStreamingDataset(
@@ -51,7 +68,7 @@ def test_packed_streaming_marks_internal_sep_as_special():
     )
 
     ex = next(iter(ds))
-    assert "attention_mask" not in ex
+    assert ex["attention_mask"] == [1, 1, 1, 1, 1, 1, 1, 0]
     input_ids = ex["input_ids"]
     stm = ex["special_tokens_mask"]
 
@@ -62,6 +79,129 @@ def test_packed_streaming_marks_internal_sep_as_special():
     for i, tid in enumerate(input_ids):
         if tid in {tok.sep_token_id, tok.cls_token_id, tok.pad_token_id}:
             assert stm[i] == 1
+
+
+def test_packed_hf_streaming_single_shard_tolerates_extra_dataloader_workers() -> None:
+    import datasets
+
+    raw = datasets.Dataset.from_dict(
+        {"text": ["one two three four five six seven eight"] * 8}
+    ).to_iterable_dataset(num_shards=1)
+    dataset = PackedStreamingDataset(
+        hf_dataset=raw,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+        ),
+    )
+
+    rows = list(torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2))
+
+    assert rows
+    assert all(len(row["input_ids"]) == 8 for row in rows)
+
+
+def test_hf_map_style_source_shards_across_dataloader_workers() -> None:
+    import datasets
+
+    tokens_per_document = 6
+    raw = datasets.Dataset.from_dict(
+        {"text": [" ".join([f"document-{index}"] * tokens_per_document) for index in range(8)]}
+    )
+    dataset = PackedStreamingDataset(
+        hf_dataset=raw,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+        ),
+    )
+
+    rows = list(torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2))
+
+    lexical_tokens = sum(sum(is_special == 0 for is_special in row["special_tokens_mask"]) for row in rows)
+    assert lexical_tokens == len(raw) * tokens_per_document
+
+
+def test_docblock_streaming_gives_every_segment_its_own_cls() -> None:
+    tok = DummyTokenizer(vocab_size=64)
+    ds = PackedStreamingDataset(
+        hf_dataset=[{"text": "a b"}, {"text": "c d"}],
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            block_cross_document_attention=True,
+        ),
+        process_index=0,
+        num_processes=1,
+    )
+
+    rows = list(ds)
+    assert len(rows) == 1
+    assert rows[0]["input_ids"][0] == tok.cls_token_id
+    assert rows[0]["input_ids"][3] == tok.sep_token_id
+    assert rows[0]["input_ids"][4] == tok.cls_token_id
+    assert rows[0]["input_ids"][7] == tok.sep_token_id
+    assert rows[0]["doc_ids"] == [1, 1, 1, 1, 2, 2, 2, 2]
+
+
+def test_docblock_streaming_rows_collate_with_structural_metadata(packed_doc_collator) -> None:
+    """Exercise the normal packer-to-collator structural ``doc_ids`` path."""
+
+    tok, collator = packed_doc_collator
+    dataset = PackedStreamingDataset(
+        hf_dataset=[{"text": "a b"}, {"text": "c d"}, {"text": "e"}],
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            block_cross_document_attention=True,
+        ),
+    )
+    rows = list(dataset)
+    assert len(rows) == 2
+    assert "attention_mask" not in rows[0]
+    assert "attention_mask" in rows[1]
+
+    batch = collator(rows)
+
+    assert torch.equal(batch["doc_ids"][0], torch.tensor([1, 1, 1, 1, 2, 2, 2, 2]))
+    assert torch.equal(batch["doc_ids"][1], torch.tensor([1, 1, 1, 0, 0, 0, 0, 0]))
+    assert torch.equal(batch["position_ids"][0], torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]))
+    assert torch.equal(batch["position_ids"][1], torch.tensor([0, 1, 2, 0, 0, 0, 0, 0]))
+    assert torch.equal(batch["doc_context_index"][0], torch.tensor([0, 0, 0, 0, 4, 4, 4, 4]))
+
+
+def test_docblock_streaming_long_document_chunks_keep_standalone_boundaries() -> None:
+    tok = DummyTokenizer(vocab_size=64)
+    dataset = PackedStreamingDataset(
+        hf_dataset=[{"text": "a b c d e f g h i"}, {"text": "j"}],
+        tokenizer=tok,
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+            block_cross_document_attention=True,
+        ),
+    )
+
+    for row in dataset:
+        doc_ids = row["doc_ids"]
+        for document_id in sorted(set(doc_ids) - {0}):
+            positions = [idx for idx, value in enumerate(doc_ids) if value == document_id]
+            assert row["input_ids"][positions[0]] == tok.cls_token_id
+            assert row["input_ids"][positions[-1]] == tok.sep_token_id
 
 
 def test_packed_streaming_flushes_tail_instead_of_dropping():
@@ -105,27 +245,7 @@ def test_packed_streaming_does_not_emit_separator_tail_chunk():
     assert ex["special_tokens_mask"] == [1, 0, 0, 0, 0, 0, 0, 1]
 
 
-def test_packed_streaming_flush_strips_all_trailing_separators(monkeypatch: pytest.MonkeyPatch):
-    import deberta.data.streaming as streaming_mod
-
-    class _NoopLock:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    class _DummySharedInt:
-        def __init__(self, _typecode: str, value: int) -> None:
-            self.value = int(value)
-            self._lock = _NoopLock()
-
-        def get_lock(self) -> _NoopLock:
-            return self._lock
-
-    monkeypatch.setattr(streaming_mod.mp, "Value", _DummySharedInt)
-
+def test_packed_streaming_preserves_tokenized_separator_ids(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a"}, {"text": "b"}]
 
@@ -137,28 +257,21 @@ def test_packed_streaming_flush_strips_all_trailing_separators(monkeypatch: pyte
         num_processes=1,
     )
 
-    # Pathological tokenizer output: lexical stream itself is separator-only.
-    # Final flush should drop the entire trailing separator run.
+    # A tokenizer can emit a registered special token from raw text even with
+    # add_special_tokens=False. Structural separators must not cause that source
+    # token to be stripped from the rolling buffer.
     monkeypatch.setattr(ds, "_tokenize_text", lambda _raw: [tok.sep_token_id])
     rows = list(ds)
-    assert rows == []
+    assert len(rows) == 1
+    assert rows[0]["input_ids"][1:4] == [tok.sep_token_id] * 3
 
 
-def test_packed_streaming_strips_leading_sep_from_chunk():
+def test_packed_streaming_does_not_carry_separator_into_next_row():
     tok = DummyTokenizer(vocab_size=64)
-    # max_seq=8 => block_len=6.
-    # Doc1 has 5 tokens, so buffer after doc1 = [t1..t5, SEP] (len=6).
-    # First chunk = [t1..t5, SEP] — consumed exactly.
-    # Doc2 has 7 tokens, buffer = [t6..t12, SEP] (len=8).
-    # Second chunk = [t6..t11] (len=6), buffer remainder = [t12, SEP].
-    # But we want to test the case where SEP lands at the start of a chunk.
-    # Doc1 with exactly block_len-1=5 tokens: buffer = [t1..t5, SEP] (len=6).
-    # That's one chunk: [t1..t5, SEP]. After _build_example_from_chunk, SEP is
-    # internal and valid.
-    # Better scenario: doc1 has block_len tokens (6). Buffer = [t1..t6, SEP] (7).
-    # chunk1 = buffer[:6] = [t1..t6], buffer = [SEP].
-    # Doc2 has block_len tokens (6). Buffer = [SEP, t7..t12, SEP] (8).
-    # chunk2 = buffer[:6] = [SEP, t7..t11], which starts with SEP — exactly the bug.
+    # max_seq=8 => six content slots. A separator retained after the first
+    # exactly-full document used to occupy the first slot of the second chunk.
+    # Stripping it happened after consumption, so the second row padded despite
+    # another lexical token still waiting in the source buffer.
     hf_dataset = [{"text": "a b c d e f"}, {"text": "g h i j k l"}]
 
     ds = PackedStreamingDataset(
@@ -170,14 +283,10 @@ def test_packed_streaming_strips_leading_sep_from_chunk():
     )
     rows = list(ds)
 
-    for row in rows:
-        content = row["input_ids"]
-        # After CLS (pos 0), the first content token must not be SEP.
-        assert content[0] == tok.cls_token_id
-        if len(content) > 2:
-            assert content[1] != tok.sep_token_id, (
-                f"Chunk starts with [CLS, SEP, ...]: degenerate empty doc start. ids={content}"
-            )
+    assert len(rows) == 2
+    assert all("attention_mask" not in row for row in rows)
+    assert [sum(value == 0 for value in row["special_tokens_mask"]) for row in rows] == [6, 6]
+    assert all(row["input_ids"][1] != tok.sep_token_id for row in rows)
 
 
 def test_packed_streaming_epoch_changes_shuffle_seed():
@@ -217,6 +326,177 @@ def test_packed_streaming_epoch_changes_shuffle_seed():
     assert probe.last_seed == 10
 
 
+def test_streaming_retries_without_duplicating_examples(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("deberta.data.retry.time.sleep", lambda _delay: None)
+
+    class _FlakyDataset:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            yield {"text": "a"}
+            if self.iterations == 1:
+                raise OSError(errno.ECONNRESET, "temporary shard read failure")
+            yield {"text": "b"}
+            yield {"text": "c"}
+
+    source = _FlakyDataset()
+    dataset = PackedStreamingDataset(
+        hf_dataset=source,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+        ),
+    )
+
+    assert list(dataset._iter_examples()) == [{"text": "a"}, {"text": "b"}, {"text": "c"}]
+    assert source.iterations == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_iterations"),
+    [
+        (ValueError("invalid dataset schema"), 1),
+        (OSError(errno.ETIMEDOUT, "shard unavailable"), 3),
+        (FileNotFoundError(errno.ENOENT, "missing shard path"), 1),
+    ],
+    ids=["non_transient", "transient_exhausted", "permanent_os_error"],
+)
+def test_streaming_retry_failure_policy(
+    error: Exception,
+    expected_iterations: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("deberta.data.retry.time.sleep", lambda _delay: None)
+
+    class _FailingDataset:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            raise error
+            yield
+
+    source = _FailingDataset()
+    dataset = PackedStreamingDataset(
+        hf_dataset=source,
+        tokenizer=DummyTokenizer(vocab_size=64),
+        cfg=PackedStreamingConfig(
+            text_column_name="text",
+            max_seq_length=8,
+            seed=0,
+            shuffle_buffer_size=0,
+        ),
+    )
+
+    with pytest.raises(type(error), match=re.escape(str(error))):
+        list(dataset._iter_examples())
+    assert source.iterations == expected_iterations
+
+
+def test_call_with_dataset_retry_retries_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    retries: list[tuple[int, str]] = []
+    delays: list[float] = []
+    monkeypatch.setattr("deberta.data.retry.time.sleep", delays.append)
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("temporary")
+        return "ok"
+
+    result = call_with_dataset_retry(
+        operation,
+        on_retry=lambda attempt, exc: retries.append((attempt, str(exc))),
+    )
+
+    assert result == "ok"
+    assert calls == 2
+    assert retries == [(1, "temporary")]
+    assert delays == [1.0]
+
+
+def test_call_with_dataset_retry_uses_exponential_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    delays: list[float] = []
+    monkeypatch.setattr("deberta.data.retry.time.sleep", delays.append)
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise TimeoutError("temporary")
+        return "ok"
+
+    assert call_with_dataset_retry(operation, on_retry=lambda *_args: None) == "ok"
+    assert delays == [1.0, 2.0]
+
+
+def test_call_with_dataset_retry_does_not_retry_non_transient_failure() -> None:
+    def operation() -> None:
+        raise ValueError("invalid")
+
+    with pytest.raises(ValueError, match="invalid"):
+        call_with_dataset_retry(
+            operation,
+            on_retry=lambda *_args: pytest.fail("non-transient failure retried"),
+        )
+
+
+@pytest.mark.parametrize("exception_name", ["HTTPError", "HfHubHTTPError", "HTTPStatusError"])
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (429, True),
+        (500, True),
+        (502, True),
+        (503, True),
+        (504, True),
+        (400, False),
+        (404, False),
+        (501, False),
+        (505, False),
+    ],
+)
+def test_dataset_retry_classifies_duck_typed_http_status_errors(
+    exception_name: str,
+    status_code: int,
+    expected: bool,
+) -> None:
+    response = type("Response", (), {"status_code": status_code})()
+    error_type = type(exception_name, (Exception,), {})
+    error = error_type(f"HTTP {status_code}")
+    error.response = response
+
+    assert is_transient_dataset_error(error) is expected
+
+
+def test_dataset_retry_finds_nested_http_status_error() -> None:
+    response = type("Response", (), {"status_code": 502})()
+    status_error = type("HTTPStatusError", (Exception,), {})("HTTP 502")
+    status_error.response = response
+    wrapper = RuntimeError("dataset read failed")
+    wrapper.__cause__ = status_error
+
+    assert is_transient_dataset_error(wrapper) is True
+
+
+def test_dataset_retry_does_not_retry_4xx_with_transient_nested_cause() -> None:
+    response = type("Response", (), {"status_code": 404})()
+    status_error = type("HTTPError", (Exception,), {})("HTTP 404")
+    status_error.response = response
+    status_error.__cause__ = TimeoutError("connection timed out while reading error response")
+
+    assert is_transient_dataset_error(status_error) is False
+
+
 def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
     tok = DummyTokenizer(vocab_size=64)
     hf_dataset = [{"text": "a b c d e f g h i"}]
@@ -238,19 +518,21 @@ def test_sequential_streaming_splits_long_documents_without_cross_doc_packing():
         assert sum(1 for tid in mids if tid == tok.sep_token_id) <= 1
 
 
-def test_collator_emits_document_ids_when_packed():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+def test_collator_emits_document_ids_when_packed(packed_doc_collator):
+    tok, coll = packed_doc_collator
 
     features = [
         {
-            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+            "input_ids": [
+                tok.cls_token_id,
+                11,
+                tok.sep_token_id,
+                tok.cls_token_id,
+                12,
+                tok.sep_token_id,
+            ],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
         }
     ]
     batch = coll(features)
@@ -271,58 +553,303 @@ def test_collator_emits_document_ids_when_packed():
     assert doc_ids[0, 3].item() == doc_ids[0, 5].item()
     # Cross-document ids differ.
     assert doc_ids[0, 1].item() != doc_ids[0, 3].item()
+    flash_meta = batch["_flash_meta"]
+    assert int(flash_meta.active_tokens_scalar) == 6
+    assert torch.equal(flash_meta.doc_segment_offsets[:2], torch.tensor([0, 3], dtype=torch.int32))
+    assert torch.equal(flash_meta.doc_segment_lengths[:2], torch.tensor([3, 3], dtype=torch.int32))
+    assert torch.equal(flash_meta.doc_cu_seqlens[:3], torch.tensor([0, 3, 6], dtype=torch.int32))
+    assert torch.equal(batch["position_ids"], torch.tensor([[0, 1, 2, 0, 1, 2]]))
+    assert torch.equal(batch["doc_context_index"], torch.tensor([[0, 0, 0, 3, 3, 3]]))
 
 
-def test_collator_treats_consecutive_internal_separators_as_single_boundary():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
+@pytest.mark.parametrize(
+    ("padding_side", "expected_doc_ids", "expected_attention_mask"),
+    [
+        ("right", [1, 1, 1, 2, 2, 2, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0]),
+        ("left", [0, 0, 1, 1, 1, 2, 2, 2], [0, 0, 1, 1, 1, 1, 1, 1]),
+    ],
+)
+def test_collator_aligns_document_ids_with_tokenizer_padding_side(
+    padding_side: str,
+    expected_doc_ids: list[int],
+    expected_attention_mask: list[int],
+) -> None:
+    """Custom doc_ids must follow the tokenizer's row-padding offset."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    tokenizer.padding_side = padding_side
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2),
         packed_sequences=True,
         block_cross_document_attention=True,
+        pad_to_multiple_of=8,
     )
+    batch = collator(
+        [
+            {
+                "input_ids": [
+                    tokenizer.cls_token_id,
+                    11,
+                    tokenizer.sep_token_id,
+                    tokenizer.cls_token_id,
+                    12,
+                    tokenizer.sep_token_id,
+                ],
+                "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+                "doc_ids": [1, 1, 1, 2, 2, 2],
+            }
+        ]
+    )
+
+    assert tuple(batch["input_ids"].shape) == (1, 8)
+    assert torch.equal(batch["doc_ids"], torch.tensor([expected_doc_ids]))
+    assert torch.equal(batch["attention_mask"], torch.tensor([expected_attention_mask]))
+
+
+def test_collator_rejects_left_padding_without_document_blocking() -> None:
+    """Left-padded rows must be refused when no doc_context_index will exist."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    tokenizer.padding_side = "left"
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2),
+        pad_to_multiple_of=8,
+    )
+    features = [
+        {
+            "input_ids": [tokenizer.cls_token_id, 11, tokenizer.sep_token_id],
+            "special_tokens_mask": [1, 0, 1],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="position 0 active"):
+        collator(features)
+
+
+def test_collator_rejects_prepadded_rows_with_inactive_first_position() -> None:
+    """Pre-padded features with a dead first position must be refused too."""
+
+    tokenizer = DummyTokenizer(vocab_size=128)
+    collator = DebertaV3ElectraCollator(
+        tokenizer=tokenizer,
+        cfg=MLMConfig(mlm_probability=0.2),
+    )
+    pad_id = tokenizer.pad_token_id
+    features = [
+        {
+            "input_ids": [pad_id, tokenizer.cls_token_id, 11, tokenizer.sep_token_id],
+            "attention_mask": [0, 1, 1, 1],
+            "special_tokens_mask": [1, 1, 0, 1],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="position 0 active"):
+        collator(features)
+
+
+def test_collator_reports_missing_document_ids(packed_doc_collator) -> None:
+    tokenizer, collator = packed_doc_collator
+    feature = {
+        "input_ids": [tokenizer.cls_token_id, 11, tokenizer.sep_token_id],
+        "special_tokens_mask": [1, 0, 1],
+    }
+
+    with pytest.raises(ValueError, match="requires doc_ids on every feature"):
+        collator([feature])
+
+
+def test_collator_rejects_reused_noncontiguous_document_ids(packed_doc_collator) -> None:
+    tokenizer, collator = packed_doc_collator
+    feature = {
+        "input_ids": [
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+        ],
+        "special_tokens_mask": [1, 1, 1, 1, 1, 1],
+        "doc_ids": [1, 1, 2, 2, 1, 1],
+    }
+
+    with pytest.raises(ValueError, match="exactly one contiguous segment"):
+        collator([feature])
+
+
+def test_collator_rejects_legacy_packing_without_per_document_cls(packed_doc_collator):
+    tok, coll = packed_doc_collator
 
     # Boundary-aligned packed chunks can produce consecutive separators.
     features = [
         {
             "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, tok.sep_token_id, 12, tok.sep_token_id],
             "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
         }
     ]
-    batch = coll(features)
-    assert "doc_ids" in batch
-    doc_ids = batch["doc_ids"]
-
-    # Token in doc1 should differ from doc2 token.
-    assert doc_ids[0, 1].item() != doc_ids[0, 4].item()
-    # Consecutive [SEP] should not create an extra phantom boundary — pos 3 and 4 share a doc.
-    assert doc_ids[0, 3].item() == doc_ids[0, 4].item()
+    with pytest.raises(ValueError, match="Every packed document segment must begin with its own CLS"):
+        coll(features)
 
 
-def test_collator_skips_document_ids_for_single_doc_packed_chunk():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.2, max_ngram=1),
-        packed_sequences=True,
-        block_cross_document_attention=True,
-    )
+def test_collator_rejects_document_without_sep_boundary(packed_doc_collator) -> None:
+    tok, collator = packed_doc_collator
+    feature = {
+        "input_ids": [tok.cls_token_id, 11, 12],
+        "special_tokens_mask": [1, 0, 0],
+        "doc_ids": [1, 1, 1],
+    }
+
+    with pytest.raises(ValueError, match="end with its own SEP"):
+        collator([feature])
+
+
+def test_collator_keeps_document_ids_for_single_doc_packed_chunk(packed_doc_collator):
+    tok, coll = packed_doc_collator
 
     features = [
         {
             "input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id],
             "special_tokens_mask": [1, 0, 0, 1],
+            "doc_ids": [1, 1, 1, 1],
         }
     ]
     batch = coll(features)
-    assert "doc_ids" not in batch
+    assert torch.equal(batch["doc_ids"], torch.ones((1, 4), dtype=torch.long))
     assert "attention_mask" not in batch
+
+
+def _assert_active_token_definitions_agree(batch, *, expected_active: int) -> None:
+    """Pin every production active-token definition for one collator batch."""
+
+    from deberta.modeling.mask_utils import attention_mask_to_active_tokens
+    from deberta.training.compile import prepare_flash_attention_batch_metadata
+    from deberta.training.loop_utils import _count_input_tokens_for_batch, _count_rtd_tokens_for_batch
+
+    assert int(batch["doc_ids"].ne(0).sum().item()) == expected_active
+
+    tokens_per_sec_count = _count_input_tokens_for_batch(batch)
+    assert int(tokens_per_sec_count) == expected_active
+
+    _, disc_ga_count = _count_rtd_tokens_for_batch(batch)
+    assert int(disc_ga_count) == expected_active
+
+    rtd_loss_active = attention_mask_to_active_tokens(
+        input_ids=batch["input_ids"],
+        attention_mask=batch.get("attention_mask"),
+    )
+    assert int(rtd_loss_active.sum().item()) == expected_active
+    assert torch.equal(rtd_loss_active, batch["doc_ids"].ne(0))
+
+    # Flash prep consumes the collator's active-token count.
+    prepared, meta = prepare_flash_attention_batch_metadata(
+        batch=dict(batch),
+        backbone_type="hf_deberta_v2",
+        flash_enabled=True,
+    )
+    assert meta is not None
+    assert "_flash_meta" not in prepared
+    assert int(meta.active_tokens_scalar) == expected_active
+    assert torch.equal(prepared["position_ids"], batch["position_ids"])
+    assert torch.equal(prepared["doc_context_index"], batch["doc_context_index"])
+
+
+def test_active_token_definitions_agree_for_packed_docblock_batches(packed_doc_collator):
+    """GA weighting, tokens/sec logging, RTD loss, and flash prep must count the same tokens.
+
+    Four call sites independently derive "active tokens" from a raw collator
+    batch; a drift between any two silently skews per-token effective LR or
+    logged throughput, so this pins them to each other and to doc_ids.ne(0).
+    """
+
+    tok, coll = packed_doc_collator
+
+    # Rows of different lengths force a padded tail on the shorter row.
+    features = [
+        {
+            "input_ids": [
+                tok.cls_token_id,
+                11,
+                tok.sep_token_id,
+                tok.cls_token_id,
+                13,
+                tok.sep_token_id,
+            ],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
+        },
+        {
+            "input_ids": [tok.cls_token_id, 21, 22, tok.sep_token_id],
+            "special_tokens_mask": [1, 0, 0, 1],
+            "doc_ids": [1, 1, 1, 1],
+        },
+    ]
+    batch = coll(features)
+    assert "doc_ids" in batch
+    assert batch.get("attention_mask") is not None
+    _assert_active_token_definitions_agree(batch, expected_active=10)
+
+
+def test_active_token_definitions_agree_for_unpadded_intra_row_packing(packed_doc_collator):
+    """A genuinely packed row (multiple docs, no padding) has no attention_mask at all."""
+
+    tok, coll = packed_doc_collator
+
+    features = [
+        {
+            "input_ids": [
+                tok.cls_token_id,
+                11,
+                tok.sep_token_id,
+                tok.cls_token_id,
+                13,
+                tok.sep_token_id,
+            ],
+            "special_tokens_mask": [1, 0, 1, 1, 0, 1],
+            "doc_ids": [1, 1, 1, 2, 2, 2],
+        }
+    ]
+    batch = coll(features)
+    assert "doc_ids" in batch
+    assert batch.get("attention_mask") is None
+    _assert_active_token_definitions_agree(batch, expected_active=6)
+
+
+def test_packed_document_ids_follow_attention_mask_not_token_values(packed_doc_collator):
+    """Active pad-valued tokens stay live while masked non-pad fillers stay dead."""
+
+    tok, coll = packed_doc_collator
+    batch = coll(
+        [
+            {
+                "input_ids": [
+                    tok.cls_token_id,
+                    11,
+                    tok.pad_token_id,
+                    tok.sep_token_id,
+                    tok.cls_token_id,
+                    12,
+                    tok.sep_token_id,
+                    99,
+                ],
+                "attention_mask": [1, 1, 1, 1, 1, 1, 1, 0],
+                "special_tokens_mask": [1, 0, 1, 1, 1, 0, 1, 0],
+                "doc_ids": [1, 1, 1, 1, 2, 2, 2, 0],
+            }
+        ]
+    )
+
+    assert batch["doc_ids"][0, 2].item() != 0
+    assert batch["doc_ids"][0, 7].item() == 0
+    assert int(batch["_flash_meta"].active_tokens_scalar) == 7
 
 
 def test_build_doc_block_mask_matches_expected_structure():
     # doc_ids: doc1=[1,1,1], doc2=[2,2], pad=[0]
     doc_ids = torch.tensor([[1, 1, 1, 2, 2, 0]], dtype=torch.long)
-    mask = _build_doc_block_mask(doc_ids)
+    mask = build_doc_block_mask(doc_ids)
     assert mask.shape == (1, 6, 6)
     assert mask.dtype == torch.bool
 
@@ -347,19 +874,59 @@ def test_build_doc_block_mask_matches_expected_structure():
     assert mask[0, 5, 0].item() is True
     assert int(mask[0, 5].sum().item()) == 1
 
+    # Left padding: fallback edges must stay off the diagonal so pad tokens
+    # never read as active queries (diagonal == doc_ids != 0).
+    left_doc_ids = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    left_mask = build_doc_block_mask(left_doc_ids)
+    assert torch.equal(
+        torch.diagonal(left_mask, dim1=-2, dim2=-1),
+        left_doc_ids.ne(0),
+    )
+    assert torch.equal(reduce_keep_mask_to_2d(left_mask), left_doc_ids.ne(0))
 
-def test_collator_build_drops_document_mask_when_not_packed():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
+    # Pad query 0 redirects to key 1; other pad queries keep the key-0 edge.
+    assert left_mask[0, 0, 1].item() is True
+    assert int(left_mask[0, 0].sum().item()) == 1
+    assert left_mask[0, 1, 0].item() is True
+    assert int(left_mask[0, 1].sum().item()) == 1
 
-    features = [
-        {
-            "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 1, 0, 0, 1],
-        }
-    ]
-    batch = coll(features)
-    assert "attention_mask" not in batch
+    # Document blocking is unchanged for the active positions.
+    assert left_mask[0, 2, 3].item() is True
+    assert left_mask[0, 2, 4].item() is False
+    assert left_mask[0, 2, 0].item() is False
+
+
+def test_mask_utils_reduce_and_expand_helpers_cover_all_ranks():
+    from deberta.modeling.mask_utils import expand_keep_mask_to_4d, reduce_keep_mask_to_2d
+
+    mask_2d = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.long)
+    expected = mask_2d.bool()
+
+    # 2D passthrough plus optional key-axis slicing.
+    assert torch.equal(reduce_keep_mask_to_2d(mask_2d), expected)
+    assert torch.equal(reduce_keep_mask_to_2d(mask_2d, seq_len=3), expected[:, :3])
+
+    # Pairwise (B,S,S): diagonal encodes per-query activity.
+    pairwise = expected[:, :, None] & expected[:, None, :]
+    assert torch.equal(reduce_keep_mask_to_2d(pairwise), expected)
+
+    # 4D broadcast (B,1,1,S) and head-specific (B,H,S,S) layouts.
+    assert torch.equal(reduce_keep_mask_to_2d(expected[:, None, None, :]), expected)
+    assert torch.equal(reduce_keep_mask_to_2d(pairwise[:, None].expand(-1, 3, -1, -1)), expected)
+
+    # Rank-3 broadcast (B,1,S) keeps the sequence axis instead of truncating
+    # to a bogus (B,1) diagonal -- this was the latent drift between the old
+    # per-module copies of this reduction.
+    assert torch.equal(reduce_keep_mask_to_2d(expected[:, None, :]), expected)
+
+    # Expansion: broadcast by default, EMD outer product on request.
+    assert torch.equal(expand_keep_mask_to_4d(mask_2d), expected[:, None, None, :])
+    assert torch.equal(expand_keep_mask_to_4d(mask_2d, pairwise_2d=True), pairwise[:, None])
+    assert torch.equal(expand_keep_mask_to_4d(pairwise), pairwise[:, None])
+
+    per_head = pairwise[:, None].expand(-1, 2, -1, -1)
+    assert torch.equal(expand_keep_mask_to_4d(per_head), pairwise[:, None])
+    assert torch.equal(expand_keep_mask_to_4d(per_head, collapse_heads=False), per_head)
 
 
 def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: pytest.MonkeyPatch):
@@ -379,33 +946,70 @@ def test_ngram_masking_windowed_selection_matches_deberta_policy(monkeypatch: py
     monkeypatch.setattr(torch, "randint", fake_randint)
     monkeypatch.setattr(torch, "multinomial", fake_multinomial)
 
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=3,
+    )
 
-    # Windowed DeBERTa selection can cover each local context once under deterministic
-    # sampling, yielding four masked lexical tokens in this toy sequence.
-    assert int(labels.ne(-100).sum().item()) == 4
+    # Four lexical candidates at p=0.75 produce a three-token budget. Each
+    # deterministic unigram remains an independent budget unit.
+    assert int(labels.ne(-100).sum().item()) == 3
 
 
-def test_ngram_masking_does_not_split_selected_word_groups():
+def test_ngram_masking_keeps_fallback_word_intact(monkeypatch: pytest.MonkeyPatch):
     tok = DummyTokenizer(
         vocab_size=128,
-        token_map={10: "hello", 11: "##world"},
+        token_map={10: "hello", 11: "##world", 12: "another", 13: "##word"},
         tokenize_output=["hello", "##world"],
         default_token_prefix="tok",
     )
     coll = DebertaV3ElectraCollator(
         tokenizer=tok,
-        # S=4 and p=0.2 -> num_to_predict=1 token budget. Whole-word masking must
-        # still mask the full two-piece word group (allowing bounded overshoot).
-        cfg=MLMConfig(mlm_probability=0.2, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
+        cfg=MLMConfig(mlm_probability=0.3, mask_token_prob=1.0, random_token_prob=0.0, max_ngram=3),
     )
-    input_ids = torch.tensor([[tok.cls_token_id, 10, 11, tok.sep_token_id]], dtype=torch.long)
-    special = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
+    input_ids = torch.tensor(
+        [
+            [
+                tok.cls_token_id,
+                10,
+                11,
+                12,
+                13,
+                tok.sep_token_id,
+                tok.sep_token_id,
+                tok.sep_token_id,
+                tok.sep_token_id,
+                tok.sep_token_id,
+            ]
+        ],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, 0, 0, 0, 0, 1, 1, 1, 1, 1]], dtype=torch.bool)
 
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
-    assert int(labels.ne(-100).sum().item()) == 2
-    assert masked[0, 1].item() == tok.mask_token_id
-    assert masked[0, 2].item() == tok.mask_token_id
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda input, num_samples, replacement=False: torch.tensor([1], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, **kwargs: torch.tensor([0], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *size, **kwargs: torch.ones(size, dtype=torch.float32),
+    )
+
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=3,
+    )
+    assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1, 2]))
+    assert torch.equal(masked[0, 1:3], torch.full((2,), tok.mask_token_id))
 
 
 def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pytest.MonkeyPatch):
@@ -431,7 +1035,11 @@ def test_ngram_masking_samples_random_replacement_per_subtoken(monkeypatch: pyte
         return torch.tensor([50, 51], dtype=torch.long)[:n]
 
     monkeypatch.setattr(coll, "_sample_random_words", _sample_random)
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=3,
+    )
 
     assert calls["n"] == 1
     assert int(labels.ne(-100).sum().item()) == 2
@@ -452,7 +1060,11 @@ def test_ngram_masking_respects_specials():
     )
     special = torch.tensor([[1, 0, 0, 1, 0, 1, 1]], dtype=torch.bool)
 
-    masked, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=3,
+    )
 
     # Never compute loss on specials.
     assert labels[0, 0].item() == -100
@@ -463,6 +1075,83 @@ def test_ngram_masking_respects_specials():
     assert masked[0, 0].item() == tok.cls_token_id
     assert masked[0, 3].item() == tok.sep_token_id
     assert masked[0, 5].item() == tok.pad_token_id
+
+
+def test_ngram_masking_stops_at_special_token_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.5,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=2,
+        ),
+    )
+    input_ids = torch.tensor(
+        [[tok.cls_token_id, 10, tok.sep_token_id, tok.cls_token_id, 11, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, 0, 1, 1, 0, 1]], dtype=torch.bool)
+
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda input, num_samples, replacement=False: torch.tensor([1], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, **kwargs: torch.tensor([0], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *size, **kwargs: torch.ones(size, dtype=torch.float32),
+    )
+
+    masked, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=2,
+    )
+
+    assert torch.equal(torch.nonzero(labels[0].ne(-100)).squeeze(-1), torch.tensor([1]))
+    assert masked[0, 1].item() == tok.mask_token_id
+    assert masked[0, 4].item() == 11
+
+
+def test_collator_never_masks_inactive_nonpad_tokens():
+    from deberta.training.loop_utils import _count_rtd_tokens_for_batch
+
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.999,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=1,
+        ),
+    )
+
+    batch = coll(
+        [
+            {
+                "input_ids": [tok.cls_token_id, 10, 42, tok.sep_token_id],
+                "attention_mask": [1, 1, 0, 1],
+                "special_tokens_mask": [1, 0, 0, 1],
+            }
+        ]
+    )
+
+    assert batch["input_ids"][0, 1].item() == tok.mask_token_id
+    assert batch["labels"][0, 1].item() == 10
+    assert batch["input_ids"][0, 2].item() == 42
+    assert batch["labels"][0, 2].item() == -100
+    assert _count_rtd_tokens_for_batch(batch) == (1.0, 3.0)
 
 
 def test_token_level_masking_uses_fixed_budget_per_sequence():
@@ -478,10 +1167,198 @@ def test_token_level_masking_uses_fixed_budget_per_sequence():
     counts = []
     for seed in range(10):
         torch.manual_seed(seed)
-        _, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
+        _, labels = coll._mask_tokens_unigram_windowed(
+            input_ids,
+            special_tokens_mask=special,
+        )
         counts.append(int(labels.ne(-100).sum().item()))
 
     assert set(counts) == {1}
+
+
+def test_unigram_budget_ignores_packed_document_specials():
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.2,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=1,
+        ),
+    )
+    compact = torch.tensor(
+        [[tok.cls_token_id, 10, 11, 12, 13, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    compact_special = torch.tensor([[1, 0, 0, 0, 0, 1]], dtype=torch.bool)
+    segmented = torch.tensor(
+        [[tok.cls_token_id, 10, 11, tok.sep_token_id, tok.cls_token_id, 12, 13, tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    segmented_special = torch.tensor([[1, 0, 0, 1, 1, 0, 0, 1]], dtype=torch.bool)
+
+    torch.manual_seed(7)
+    _, compact_labels = coll._mask_tokens_unigram_windowed(
+        compact,
+        special_tokens_mask=compact_special,
+    )
+    torch.manual_seed(7)
+    _, segmented_labels = coll._mask_tokens_unigram_windowed(
+        segmented,
+        special_tokens_mask=segmented_special,
+    )
+
+    assert int(compact_labels.ne(-100).sum()) == 1
+    assert int(segmented_labels.ne(-100).sum()) == 1
+
+
+def _coverage_inputs(tok: DummyTokenizer, *, seq_len: int, rows: int):
+    """Build a batch of identical rows with only CLS/SEP marked special."""
+    ids = [tok.cls_token_id, *(10 + (i % 100) for i in range(seq_len - 2)), tok.sep_token_id]
+    input_ids = torch.tensor([ids] * rows, dtype=torch.long)
+    special = torch.zeros((rows, seq_len), dtype=torch.bool)
+    special[:, 0] = True
+    special[:, -1] = True
+    return input_ids, special
+
+
+def test_windowed_unigram_masking_covers_every_candidate_position():
+    seq_len, rows = 64, 128
+    tok = DummyTokenizer(vocab_size=128)
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.15, max_ngram=1))
+    input_ids, special = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
+
+    torch.manual_seed(0)
+    _, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
+    labelled = labels.ne(-100)
+
+    # Windows are sized from the budget, so selection hits it exactly rather than
+    # over-producing at int(1 / 0.15) == 6 and trimming the excess.
+    assert set(labelled.sum(dim=1).tolist()) == {max(1, round((seq_len - 2) * 0.15))}
+
+    # Every candidate must stay reachable. Trimming a sorted selection to the budget
+    # deterministically starved the tail of every sequence.
+    covered = labelled.any(dim=0)
+    assert not bool(covered[0].item()) and not bool(covered[-1].item())
+    assert bool(covered[1:-1].all().item())
+
+
+def test_ngram_masking_rate_is_positionally_uniform():
+    seq_len, rows = 128, 1500
+    tok = DummyTokenizer(
+        vocab_size=256,
+        # Alternating word/continuation ids, so every whole word spans two tokens and the
+        # token budget is reached before every marked group is consumed.
+        token_map={t: (f"w{t}" if t % 2 == 0 else f"##w{t}") for t in range(10, 110)},
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
+    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.15, max_ngram=3))
+    input_ids, special = _coverage_inputs(tok, seq_len=seq_len, rows=rows)
+
+    torch.manual_seed(0)
+    _, labels = coll._mask_tokens_ngram(input_ids, special_tokens_mask=special, max_ngram=3)
+
+    # A trailing partial context window used to mark a full n-gram regardless of its
+    # width, while the budget stop always cut the highest-index groups. The two biases
+    # ran in opposite directions and did not cancel, leaving the tail of a sequence
+    # masked at roughly two thirds the rate of the head.
+    rate = labels.ne(-100).float().mean(dim=0)[1:-1]
+    decile = rate.numel() // 10
+    head = float(rate[:decile].mean())
+    tail = float(rate[-decile:].mean())
+    assert 0.8 < tail / head < 1.25, f"positional mask-rate skew: head={head:.4f} tail={tail:.4f}"
+    assert float(rate.min()) > 0.5 * float(rate.mean())
+
+
+def test_ngram_masking_does_not_privilege_first_packed_document():
+    rows = 2000
+    num_documents = 8
+    tok = DummyTokenizer(
+        vocab_size=256,
+        tokenize_output=["hello", "world"],
+        default_token_prefix="tok",
+    )
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.15,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=3,
+        ),
+    )
+
+    row: list[int] = []
+    special: list[int] = []
+    lexical_positions: list[int] = []
+    for document_index in range(num_documents):
+        row.extend([tok.cls_token_id, 10 + document_index, tok.sep_token_id])
+        special.extend([1, 0, 1])
+        lexical_positions.append(3 * document_index + 1)
+
+    input_ids = torch.tensor([row] * rows, dtype=torch.long)
+    special_tokens_mask = torch.tensor([special] * rows, dtype=torch.bool)
+    torch.manual_seed(0)
+    _, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special_tokens_mask,
+        max_ngram=3,
+    )
+
+    rates = labels.ne(-100).float().mean(dim=0)[lexical_positions]
+    assert float(rates.max() / rates.min()) < 1.25
+
+
+def test_ngram_budget_keeps_adjacent_samples_separate(monkeypatch: pytest.MonkeyPatch):
+    tok = DummyTokenizer(
+        vocab_size=128,
+        tokenize_output=["hello", "world"],
+        default_token_prefix="tok",
+    )
+    coll = DebertaV3ElectraCollator(
+        tokenizer=tok,
+        cfg=MLMConfig(
+            mlm_probability=0.2,
+            mask_token_prob=1.0,
+            random_token_prob=0.0,
+            max_ngram=2,
+        ),
+    )
+    input_ids = torch.tensor(
+        [[tok.cls_token_id, *range(10, 22), tok.sep_token_id]],
+        dtype=torch.long,
+    )
+    special = torch.tensor([[1, *([0] * 12), 1]], dtype=torch.bool)
+    randint_results = iter((8, 0))
+
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda input, num_samples, replacement=False: torch.tensor([1], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, **kwargs: torch.tensor(
+            [next(randint_results)],
+            dtype=torch.long,
+        ),
+    )
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *size, **kwargs: torch.zeros(size, dtype=torch.float32),
+    )
+
+    _, labels = coll._mask_tokens_ngram(
+        input_ids,
+        special_tokens_mask=special,
+        max_ngram=2,
+    )
+
+    assert int(labels.ne(-100).sum()) == 2
 
 
 def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytest.MonkeyPatch):
@@ -493,7 +1370,11 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytes
 
     calls = {"windowed": 0}
 
-    def _windowed(_input_ids: torch.Tensor, *, special_tokens_mask: torch.Tensor):
+    def _windowed(
+        _input_ids: torch.Tensor,
+        *,
+        special_tokens_mask: torch.Tensor,
+    ):
         del special_tokens_mask
         calls["windowed"] += 1
         labels = torch.full_like(_input_ids, -100)
@@ -506,28 +1387,62 @@ def test_mask_tokens_dispatch_uses_windowed_unigram_not_ngram(monkeypatch: pytes
     monkeypatch.setattr(coll, "_mask_tokens_unigram_windowed", _windowed)
     monkeypatch.setattr(coll, "_mask_tokens_ngram", _ngram)
 
-    _ = coll._mask_tokens(input_ids, special_tokens_mask=special)
+    _ = coll._mask_tokens(
+        input_ids,
+        special_tokens_mask=special,
+    )
     assert int(calls["windowed"]) == 1
 
 
-def test_token_level_masking_uses_fixed_budget_for_variable_length_batch():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.4, max_ngram=1))
-
-    features = [
-        {
-            "input_ids": [tok.cls_token_id, 10, 11, 12, tok.sep_token_id],
-            "special_tokens_mask": [1, 0, 0, 0, 1],
+@pytest.mark.parametrize(("max_ngram", "seed"), [(1, 17), (3, 0)])
+def test_masking_budget_is_invariant_to_padding_and_batch_peers(max_ngram: int, seed: int):
+    tok = DummyTokenizer(
+        vocab_size=256,
+        token_map={
+            10: "alpha",
+            11: "##a",
+            12: "beta",
+            13: "##b",
+            14: "gamma",
+            15: "##c",
         },
-        {"input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-    ]
-    batch = coll(features)
-    labels = batch["labels"]
+        tokenize_output=["hello", "##world"],
+        default_token_prefix="tok",
+    )
+    if max_ngram == 1:
+        token_ids = [tok.cls_token_id, *range(10, 30), tok.sep_token_id]
+    else:
+        token_ids = [tok.cls_token_id, 10, 11, 12, 13, 14, 15, tok.sep_token_id]
+    feature = {
+        "input_ids": token_ids,
+        "special_tokens_mask": [1, *([0] * (len(token_ids) - 2)), 1],
+    }
+    cfg = MLMConfig(
+        mlm_probability=0.15,
+        mask_token_prob=1.0,
+        random_token_prob=0.0,
+        max_ngram=max_ngram,
+    )
 
-    masked_counts = labels.ne(-100).sum(dim=1).tolist()
-    # DeBERTa budget uses full sequence length (including specials/pad) before applying
-    # eligibility filtering. In this padded batch that yields [2, 1].
-    assert masked_counts == [2, 1]
+    torch.manual_seed(seed)
+    baseline = DebertaV3ElectraCollator(tokenizer=tok, cfg=cfg)([feature])["labels"][0]
+
+    torch.manual_seed(seed)
+    padded = DebertaV3ElectraCollator(tokenizer=tok, cfg=cfg, pad_to_multiple_of=128)([feature])["labels"][
+        0, : len(token_ids)
+    ]
+
+    long_peer = {
+        "input_ids": [tok.cls_token_id, *([50] * 125), tok.sep_token_id],
+        "special_tokens_mask": [1, *([0] * 125), 1],
+    }
+    torch.manual_seed(seed)
+    beside_peer = DebertaV3ElectraCollator(tokenizer=tok, cfg=cfg)([feature, long_peer])["labels"][
+        0, : len(token_ids)
+    ]
+
+    torch.testing.assert_close(padded, baseline, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(beside_peer, baseline, rtol=0.0, atol=0.0)
 
 
 def test_ngram_wordpiece_like_tokens_do_not_overmerge_groups():
@@ -572,51 +1487,55 @@ def test_collator_warns_when_word_boundary_scheme_is_none_for_ngram(caplog: pyte
     assert "scheme='none'" in caplog.text
 
 
-def test_collator_drops_all_ones_attention_mask():
+def test_collator_drops_all_ones_attention_mask_when_not_packed():
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
 
-    features = [
-        {"input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-        {"input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-    ]
-    batch = coll(features)
-    assert "attention_mask" not in batch
+    feature_sets = (
+        [
+            {
+                "input_ids": [tok.cls_token_id, 11, tok.sep_token_id, 12, 13, tok.sep_token_id],
+                "special_tokens_mask": [1, 0, 1, 0, 0, 1],
+            }
+        ],
+        [
+            {
+                "input_ids": [tok.cls_token_id, 11, 12, tok.sep_token_id],
+                "special_tokens_mask": [1, 0, 0, 1],
+            },
+            {
+                "input_ids": [tok.cls_token_id, 13, 14, tok.sep_token_id],
+                "special_tokens_mask": [1, 0, 0, 1],
+            },
+        ],
+    )
+    for features in feature_sets:
+        assert "attention_mask" not in coll(features)
 
 
-def test_collator_keeps_attention_mask_when_padding_present():
+@pytest.mark.parametrize(
+    "include_attention_mask",
+    [True, False],
+    ids=["provided", "generated"],
+)
+def test_collator_keeps_attention_mask_when_padding_present(include_attention_mask: bool):
     tok = DummyTokenizer(vocab_size=128)
     coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
 
     features = [
         {
             "input_ids": [tok.cls_token_id, 11, tok.sep_token_id],
-            "attention_mask": [1, 1, 1],
             "special_tokens_mask": [1, 0, 1],
         },
         {
             "input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id],
-            "attention_mask": [1, 1, 1, 1],
             "special_tokens_mask": [1, 0, 0, 1],
         },
     ]
+    if include_attention_mask:
+        for feature in features:
+            feature["attention_mask"] = [1] * len(feature["input_ids"])
     batch = coll(features)
-    assert "attention_mask" in batch
-    assert batch["attention_mask"].shape == batch["input_ids"].shape
-    assert (batch["attention_mask"] == 0).any()
-
-
-def test_collator_generates_attention_mask_for_variable_length_inputs():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(tokenizer=tok, cfg=MLMConfig(mlm_probability=0.2, max_ngram=1))
-
-    # No attention_mask in features; tokenizer padding is required.
-    features = [
-        {"input_ids": [tok.cls_token_id, 11, tok.sep_token_id], "special_tokens_mask": [1, 0, 1]},
-        {"input_ids": [tok.cls_token_id, 12, 13, tok.sep_token_id], "special_tokens_mask": [1, 0, 0, 1]},
-    ]
-    batch = coll(features)
-
     assert "attention_mask" in batch
     assert batch["attention_mask"].shape == batch["input_ids"].shape
     assert (batch["attention_mask"] == 0).any()
@@ -643,6 +1562,9 @@ def test_collator_handles_mixed_attention_mask_keys():
         assert "attention_mask" in batch
         assert batch["attention_mask"].shape == batch["input_ids"].shape
         assert (batch["attention_mask"] == 0).any()
+        flash_meta = batch["_flash_meta"]
+        assert torch.equal(flash_meta.seq_lengths.sort().values, torch.tensor([3, 4], dtype=torch.int32))
+        assert int(flash_meta.active_tokens_scalar) == 7
 
 
 def test_collator_infers_special_tokens_mask_when_missing():
@@ -682,28 +1604,8 @@ def test_collator_merges_partial_special_tokens_mask_with_tokenizer_special_ids(
     assert int(batch["labels"][0, 1].item()) == -100
 
 
-def test_collator_random_replacement_avoids_special_ids():
-    tok = DummyTokenizer(vocab_size=128)
-    coll = DebertaV3ElectraCollator(
-        tokenizer=tok,
-        cfg=MLMConfig(mlm_probability=0.999, mask_token_prob=0.0, random_token_prob=1.0, max_ngram=1),
-    )
-
-    torch.manual_seed(0)
-    input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
-    special = torch.zeros_like(input_ids, dtype=torch.bool)
-
-    masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
-    changed = labels.ne(-100)
-    assert bool(changed.any().item())
-
-    replaced = masked[changed]
-    for sid in tok.all_special_ids:
-        assert not bool((replaced == sid).any().item())
-
-
-def test_collator_random_replacement_samples_full_vocab_including_added_tokens():
-    """When len(tokenizer) > tokenizer.vocab_size, random replacement must cover the full range."""
+def test_collator_random_replacement_uses_full_non_special_tokenizer_vocab():
+    """Random replacements must exclude specials while including added-token ids."""
     tok = DummyTokenizer(vocab_size=100, extra_length=10)
     assert len(tok) == 110
     assert tok.vocab_size == 100
@@ -722,9 +1624,15 @@ def test_collator_random_replacement_samples_full_vocab_including_added_tokens()
     torch.manual_seed(42)
     input_ids = torch.arange(10, 266, dtype=torch.long).view(1, -1) % tok.vocab_size
     special = torch.zeros_like(input_ids, dtype=torch.bool)
-    masked, labels = coll._mask_tokens_unigram_windowed(input_ids, special_tokens_mask=special)
+    masked, labels = coll._mask_tokens_unigram_windowed(
+        input_ids,
+        special_tokens_mask=special,
+    )
     changed = labels.ne(-100)
+    assert bool(changed.any().item())
     replaced = masked[changed]
+    for special_id in tok.all_special_ids:
+        assert not bool((replaced == special_id).any().item())
     assert bool((replaced >= 100).any().item()), "Expected some replacement tokens from the added-token range"
 
 
@@ -858,27 +1766,12 @@ def test_self_attention_uses_pairwise_diagonal_for_query_activity(tiny_rope_conf
     assert torch.allclose(out[0, 3], torch.zeros_like(out[0, 3]), atol=1e-6)
 
 
-def test_mlp_has_no_internal_residual_dropout():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP
+def test_mlp_has_no_internal_residual_dropout(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPEMLP
 
     torch.manual_seed(0)
     for ffn_type in ("mlp", "swiglu"):
-        cfg = DebertaRoPEConfig(
-            vocab_size=64,
-            hidden_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            intermediate_size=64,
-            max_position_embeddings=32,
-            type_vocab_size=0,
-            ffn_type=ffn_type,
-            hidden_dropout_prob=0.9,
-            attention_probs_dropout_prob=0.0,
-        )
+        cfg = tiny_rope_config_factory(ffn_type=ffn_type, hidden_dropout_prob=0.9)
         mlp = DebertaRoPEMLP(cfg)
         x = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
 
@@ -891,30 +1784,12 @@ def test_mlp_has_no_internal_residual_dropout():
         torch.testing.assert_close(out_train, out_eval, rtol=0.0, atol=0.0)
 
 
-def test_self_attention_sdpa_matches_eager_with_padding_mask():
-    import pytest
-    import torch.nn.functional as F
-
-    pytest.importorskip("transformers")
-    if not hasattr(F, "scaled_dot_product_attention"):
-        pytest.skip("torch.nn.functional.scaled_dot_product_attention is not available")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPESelfAttention
+def test_self_attention_sdpa_matches_eager_with_padding_mask(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPESelfAttention
 
     torch.manual_seed(0)
-    cfg_kwargs = dict(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    cfg_sdpa = DebertaRoPEConfig(attention_implementation="sdpa", **cfg_kwargs)
-    cfg_eager = DebertaRoPEConfig(attention_implementation="eager", **cfg_kwargs)
+    cfg_sdpa = tiny_rope_config_factory(attention_implementation="sdpa")
+    cfg_eager = tiny_rope_config_factory(attention_implementation="eager")
 
     attn_sdpa = DebertaRoPESelfAttention(cfg_sdpa).eval()
     attn_eager = DebertaRoPESelfAttention(cfg_eager).eval()
@@ -940,26 +1815,10 @@ def test_self_attention_sdpa_matches_eager_with_padding_mask():
     torch.testing.assert_close(out_sdpa, out_eager, rtol=1e-5, atol=1e-6)
 
 
-def test_rope_projections_respect_use_bias_config():
-    import pytest
+def test_rope_projections_respect_use_bias_config(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPEMLP, DebertaRoPESelfAttention
 
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEMLP, DebertaRoPESelfAttention
-
-    base_kwargs = dict(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-
-    cfg_no_bias = DebertaRoPEConfig(use_bias=False, **base_kwargs)
+    cfg_no_bias = tiny_rope_config_factory(use_bias=False)
     attn_no_bias = DebertaRoPESelfAttention(cfg_no_bias)
     mlp_no_bias = DebertaRoPEMLP(cfg_no_bias)
     assert attn_no_bias.qkv.bias is None
@@ -967,7 +1826,7 @@ def test_rope_projections_respect_use_bias_config():
     assert mlp_no_bias.w12.bias is None
     assert mlp_no_bias.w3.bias is None
 
-    cfg_with_bias = DebertaRoPEConfig(use_bias=True, **base_kwargs)
+    cfg_with_bias = tiny_rope_config_factory(use_bias=True)
     attn_with_bias = DebertaRoPESelfAttention(cfg_with_bias)
     mlp_with_bias = DebertaRoPEMLP(cfg_with_bias)
     assert attn_with_bias.qkv.bias is not None
@@ -978,10 +1837,6 @@ def test_rope_projections_respect_use_bias_config():
 
 def test_pretrainer_forward_smoke():
     """Requires transformers; skipped automatically if not installed."""
-
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1044,10 +1899,53 @@ def test_pretrainer_forward_smoke():
     assert out.disc_accuracy.ndim == 0
 
 
-def test_pretrainer_sampler_avoids_configured_special_ids():
-    import pytest
+def test_pretrainer_zero_discriminator_weight_skips_discriminator_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    pytest.importorskip("transformers")
+    cfg = DebertaRoPEConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+        pad_token_id=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        norm_arch="post",
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    )
+
+    def _unexpected_discriminator_forward(**_kwargs: object) -> None:
+        raise AssertionError("disabled discriminator objective must not execute")
+
+    monkeypatch.setattr(model, "forward_discriminator_phase", _unexpected_discriminator_forward)
+    input_ids = torch.tensor([[1, 7, 8, 2]], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, 1] = input_ids[0, 1]
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        gen_loss_weight=1.0,
+        disc_loss_weight=0.0,
+    )
+
+    assert torch.isfinite(out.loss)
+    torch.testing.assert_close(out.disc_token_count, torch.tensor(0.0))
+
+
+def test_pretrainer_sampler_avoids_configured_special_ids():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1094,10 +1992,64 @@ def test_pretrainer_sampler_avoids_configured_special_ids():
         assert not bool((sampled == int(sid)).any().item())
 
 
-def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_active(
+@pytest.mark.parametrize(
+    ("logits", "temperature", "forbidden_mask", "exponential_draws", "expected"),
+    [
+        pytest.param(
+            [0.0, -20.0, -21.0],
+            1e-8,
+            [True, False, False],
+            [1.0, 1.0, 1.0],
+            1,
+            id="forbidden-id-at-low-temperature",
+        ),
+        pytest.param(
+            [1.0, 2.0, -1.0],
+            1e-40,
+            None,
+            [1.0, 1.0, 1.0],
+            1,
+            id="unique-argmax-at-overflowing-temperature",
+        ),
+        pytest.param(
+            [0.0, -15.0],
+            1.0,
+            None,
+            [-math.log(0.5), -math.log(1.0 - 1e-7)],
+            1,
+            id="unclipped-gumbel-tail",
+        ),
+    ],
+)
+def test_pretrainer_gumbel_sampler_preserves_masked_categorical_semantics(
     monkeypatch: pytest.MonkeyPatch,
+    logits: list[float],
+    temperature: float,
+    forbidden_mask: list[bool] | None,
+    exponential_draws: list[float],
+    expected: int,
 ) -> None:
-    pytest.importorskip("transformers")
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    def _fixed_exponential_(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        del args, kwargs
+        return tensor.copy_(
+            torch.tensor(exponential_draws, device=tensor.device, dtype=tensor.dtype),
+        )
+
+    monkeypatch.setattr(torch.Tensor, "exponential_", _fixed_exponential_)
+    sampled = DebertaV3RTDPretrainer._gumbel_sample(
+        torch.tensor([logits], dtype=torch.float32),
+        temperature=temperature,
+        forbidden_vocab_mask=(
+            torch.tensor(forbidden_mask, dtype=torch.bool) if forbidden_mask is not None else None
+        ),
+    )
+
+    assert sampled.item() == expected
+
+
+def test_pretrainer_rejects_z_steps_as_enhanced_mask_decoder_substitute() -> None:
 
     from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1122,69 +2074,66 @@ def test_pretrainer_generator_phase_skips_enhanced_mask_decoder_when_z_steps_act
     )
     disc_cfg = DebertaV2Config(**common_kwargs, z_steps=0)
     gen_cfg = DebertaV2Config(**common_kwargs, z_steps=2)
-    model = DebertaV3RTDPretrainer(
-        discriminator_backbone=DebertaV2Model(disc_cfg),
-        generator_backbone=DebertaV2Model(gen_cfg),
-        disc_config=disc_cfg,
-        gen_config=gen_cfg,
-        embedding_sharing="none",
-    )
-
-    def _raise_if_called(*args, **kwargs) -> torch.Tensor:
-        del args, kwargs
-        raise AssertionError("EnhancedMaskDecoder should be skipped when generator z_steps>1.")
-
-    monkeypatch.setattr(model.enhanced_mask_decoder, "forward", _raise_if_called)
-
-    input_ids = torch.tensor([[1, 7, 8, 9, 2, 0]], dtype=torch.long)
-    labels = torch.full_like(input_ids, -100)
-    labels[0, 2] = input_ids[0, 2]
-
-    out = model.forward_generator_phase(
-        input_ids=input_ids,
-        attention_mask=input_ids.ne(0).long(),
-        labels=labels,
-        sampling_temperature=1.0,
-    )
-
-    assert torch.isfinite(out.gen_loss_raw)
-    assert int(out.gen_token_count.item()) == 1
+    with pytest.raises(ValueError, match="not equivalent to backbone z_steps"):
+        DebertaV3RTDPretrainer(
+            discriminator_backbone=DebertaV2Model(disc_cfg),
+            generator_backbone=DebertaV2Model(gen_cfg),
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
+            embedding_sharing="none",
+        )
 
 
-def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition():
-    import pytest
+def _make_emd_harness(
+    last_layer: torch.nn.Module,
+    *,
+    layer_norm: torch.nn.Module | None = None,
+    num_last_layer_passes: int = 1,
+):
+    """Build an EnhancedMaskDecoder harness around one instrumented last layer.
 
-    pytest.importorskip("transformers")
-
+    The three EMD contract tests share this scaffolding and differ only in the
+    last layer's recording behavior plus their assertions.
+    """
     from deberta.modeling.rtd import EnhancedMaskDecoder
-
-    class _Cfg:
-        position_biased_input = False
 
     class _PositionEmbeddings(torch.nn.Module):
         def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-            bsz, seq_len = position_ids.shape
-            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
-
-    class _ShiftNorm(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls = 0
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            self.calls += 1
-            return x + 5.0
+            offsets = torch.tensor([0.25, -0.5, 1.0, -1.5], dtype=torch.float32)
+            return position_ids.to(dtype=torch.float32).unsqueeze(-1) + offsets
 
     class _Embeddings(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.position_embeddings = _PositionEmbeddings()
-            self.LayerNorm = _ShiftNorm()
+            self.LayerNorm = layer_norm if layer_norm is not None else torch.nn.Identity()
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self, layer: torch.nn.Module) -> None:
+            super().__init__()
+            self.layer = torch.nn.ModuleList([layer])
+
+    decoder = EnhancedMaskDecoder(num_last_layer_passes=num_last_layer_passes)
+    encoder = _Encoder(last_layer)
+    embeddings = _Embeddings()
+    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
+    encoder_hidden_states = [kv_states, kv_states + 1.0]
+    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    return decoder, encoder, embeddings, kv_states, encoder_hidden_states, masked_positions
+
+
+def test_enhanced_mask_decoder_adds_raw_position_states_without_embedding_norm():
+
+    class _ForbiddenNorm(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            del x
+            raise AssertionError("EMD must not apply the input embedding LayerNorm to raw positions.")
 
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.query_states_seen: torch.Tensor | None = None
+            self.hidden_states_seen: list[torch.Tensor] = []
+            self.query_states_seen: list[torch.Tensor] = []
 
         def forward(
             self,
@@ -1196,24 +2145,19 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
             relative_pos: torch.Tensor | None = None,
             rel_embeddings: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, None]:
-            del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
+            del attention_mask, output_attentions, relative_pos, rel_embeddings
             assert query_states is not None
-            self.query_states_seen = query_states.detach().clone()
-            return query_states, None
+            self.hidden_states_seen.append(hidden_states.detach().clone())
+            self.query_states_seen.append(query_states.detach().clone())
+            pass_number = float(len(self.query_states_seen))
+            return query_states + pass_number, None
 
-    class _Encoder(torch.nn.Module):
-        def __init__(self, layer: torch.nn.Module) -> None:
-            super().__init__()
-            self.layer = torch.nn.ModuleList([layer])
-
-    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
     last_layer = _LastLayer()
-    encoder = _Encoder(last_layer)
-    embeddings = _Embeddings()
-
-    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
-    encoder_hidden_states = [kv_states, kv_states + 1.0]
-    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    decoder, encoder, embeddings, kv_states, encoder_hidden_states, masked_positions = _make_emd_harness(
+        last_layer,
+        layer_norm=_ForbiddenNorm(),
+        num_last_layer_passes=2,
+    )
     attention_mask = torch.ones((1, 3), dtype=torch.bool)
 
     masked = decoder(
@@ -1224,33 +2168,21 @@ def test_enhanced_mask_decoder_normalizes_position_states_before_query_addition(
         encoder=encoder,
     )
 
-    expected_query = kv_states + 5.0
-    assert embeddings.LayerNorm.calls == 1
-    assert last_layer.query_states_seen is not None
-    torch.testing.assert_close(last_layer.query_states_seen, expected_query, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(masked, expected_query[:, 1:2, :].reshape(1, 4), rtol=0.0, atol=0.0)
+    position_ids = torch.arange(kv_states.shape[1]).unsqueeze(0)
+    raw_positions = embeddings.position_embeddings(position_ids)
+    first_query = kv_states + raw_positions
+    first_output = first_query + 1.0
+    second_output = first_output + 2.0
+    assert len(last_layer.query_states_seen) == 2
+    assert len(last_layer.hidden_states_seen) == 2
+    torch.testing.assert_close(last_layer.hidden_states_seen[0], kv_states, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(last_layer.hidden_states_seen[1], kv_states, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(last_layer.query_states_seen[0], first_query, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(last_layer.query_states_seen[1], first_output, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(masked, second_output[:, 1:2, :].reshape(1, 4), rtol=0.0, atol=0.0)
 
 
 def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from deberta.modeling.rtd import EnhancedMaskDecoder
-
-    class _Cfg:
-        position_biased_input = False
-
-    class _PositionEmbeddings(torch.nn.Module):
-        def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-            bsz, seq_len = position_ids.shape
-            return torch.zeros((bsz, seq_len, 4), dtype=torch.float32)
-
-    class _Embeddings(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.position_embeddings = _PositionEmbeddings()
-            self.LayerNorm = torch.nn.Identity()
 
     class _LastLayer(torch.nn.Module):
         def __init__(self) -> None:
@@ -1272,19 +2204,8 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
             assert query_states is not None
             return query_states, None
 
-    class _Encoder(torch.nn.Module):
-        def __init__(self, layer: torch.nn.Module) -> None:
-            super().__init__()
-            self.layer = torch.nn.ModuleList([layer])
-
-    decoder = EnhancedMaskDecoder(_Cfg(), num_last_layer_passes=1)
     last_layer = _LastLayer()
-    encoder = _Encoder(last_layer)
-    embeddings = _Embeddings()
-
-    kv_states = torch.arange(0, 12, dtype=torch.float32).view(1, 3, 4)
-    encoder_hidden_states = [kv_states, kv_states + 1.0]
-    masked_positions = torch.tensor([[False, True, False]], dtype=torch.bool)
+    decoder, encoder, embeddings, _, encoder_hidden_states, masked_positions = _make_emd_harness(last_layer)
 
     masked = decoder(
         encoder_hidden_states=encoder_hidden_states,
@@ -1298,10 +2219,75 @@ def test_enhanced_mask_decoder_keeps_none_attention_mask_unmaterialized():
     assert tuple(masked.shape) == (1, 4)
 
 
-def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
-    import pytest
+def test_enhanced_mask_decoder_forwards_flash_metadata_to_last_layer():
 
-    pytest.importorskip("transformers")
+    from deberta.modeling.mask_utils import FlashBatchMeta
+
+    class _LastLayer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: dict[str, torch.Tensor | int | str | None] = {}
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            *,
+            output_attentions: bool = False,
+            query_states: torch.Tensor | None = None,
+            relative_pos: torch.Tensor | None = None,
+            rel_embeddings: torch.Tensor | None = None,
+            flash_meta: FlashBatchMeta | None = None,
+        ) -> tuple[torch.Tensor, None]:
+            del hidden_states, attention_mask, output_attentions, relative_pos, rel_embeddings
+            assert query_states is not None
+            self.seen = {"flash_meta": flash_meta}
+            return query_states, None
+
+    last_layer = _LastLayer()
+    decoder, encoder, embeddings, _, encoder_hidden_states, masked_positions = _make_emd_harness(last_layer)
+    attention_mask = torch.tensor(
+        [[[True, True, False], [True, True, False], [False, False, True]]],
+        dtype=torch.bool,
+    )
+    flash_seq_lengths = torch.tensor([2], dtype=torch.int32)
+    flash_doc_segment_offsets = torch.tensor([0, 2], dtype=torch.int32)
+    flash_doc_segment_lengths = torch.tensor([2, 1], dtype=torch.int32)
+    flash_doc_cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    flash_meta = FlashBatchMeta(
+        seq_lengths=flash_seq_lengths,
+        doc_segment_offsets=flash_doc_segment_offsets,
+        doc_segment_lengths=flash_doc_segment_lengths,
+        doc_cu_seqlens=flash_doc_cu_seqlens,
+        active_tokens_scalar=torch.tensor(3, dtype=torch.int32),
+        doc_num_segments_scalar=torch.tensor(2, dtype=torch.int32),
+        doc_max_segment_length_scalar=torch.tensor(2, dtype=torch.int32),
+        route_hint="docblock_bias",
+    )
+
+    masked = decoder(
+        encoder_hidden_states=encoder_hidden_states,
+        masked_positions=masked_positions,
+        attention_mask=attention_mask,
+        embeddings=embeddings,
+        encoder=encoder,
+        flash_meta=flash_meta,
+    )
+
+    assert tuple(masked.shape) == (1, 4)
+    seen_meta = last_layer.seen["flash_meta"]
+    assert isinstance(seen_meta, FlashBatchMeta)
+    assert seen_meta.route_hint == "docblock_bias"
+    assert torch.equal(seen_meta.seq_lengths, flash_seq_lengths)
+    assert torch.equal(seen_meta.doc_segment_offsets, flash_doc_segment_offsets)
+    assert torch.equal(seen_meta.doc_segment_lengths, flash_doc_segment_lengths)
+    assert torch.equal(seen_meta.doc_cu_seqlens, flash_doc_cu_seqlens)
+    assert int(seen_meta.active_tokens_scalar) == 3
+    assert int(seen_meta.doc_num_segments_scalar) == 2
+    assert int(seen_meta.doc_max_segment_length_scalar) == 2
+
+
+def test_masked_lm_head_has_only_tied_projection_bias():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import MaskedLMHead
@@ -1315,38 +2301,94 @@ def test_masked_lm_head_tied_mode_avoids_unused_decoder_allocation():
         max_position_embeddings=32,
         type_vocab_size=0,
     )
-    head = MaskedLMHead(cfg, tie_word_embeddings=True)
-    assert head.decoder is None
+    head = MaskedLMHead(cfg)
+    assert not hasattr(head, "decoder")
     assert head.bias.shape == (cfg.vocab_size,)
 
 
-def test_masked_lm_head_tied_mode_requires_embedding_weight():
-    import pytest
+@pytest.mark.parametrize("backbone_type", ["native", "rope"])
+def test_pretrainer_uses_repo_owned_initialization_only_for_new_heads(
+    backbone_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    pytest.importorskip("transformers")
+    initializer_range = 0.005
+    if backbone_type == "native":
+        from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
 
-    from deberta.modeling.rope_encoder import DebertaRoPEConfig
-    from deberta.modeling.rtd import MaskedLMHead
+        cfg = DebertaV2Config(
+            vocab_size=96,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=128,
+            max_position_embeddings=16,
+            type_vocab_size=0,
+            initializer_range=initializer_range,
+            position_biased_input=True,
+        )
+        generator = DebertaV2Model(cfg)
+        discriminator = DebertaV2Model(cfg)
+    else:
+        from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
-    cfg = DebertaRoPEConfig(
-        vocab_size=128,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        type_vocab_size=0,
+        cfg = DebertaRoPEConfig(
+            vocab_size=96,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=128,
+            max_position_embeddings=16,
+            type_vocab_size=0,
+            initializer_range=initializer_range,
+        )
+        cfg.use_rmsnorm_heads = True
+        generator = DebertaRoPEModel(cfg)
+        discriminator = DebertaRoPEModel(cfg)
+
+    def _reject_private_initializer(_module: torch.nn.Module) -> None:
+        raise AssertionError("RTD task heads must not use Transformers private initialization APIs")
+
+    monkeypatch.setattr(generator, "_initialize_weights", _reject_private_initializer)
+    monkeypatch.setattr(discriminator, "_initialize_weights", _reject_private_initializer)
+    generator_before = {name: value.detach().clone() for name, value in generator.named_parameters()}
+    discriminator_before = {name: value.detach().clone() for name, value in discriminator.named_parameters()}
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=discriminator,
+        generator_backbone=generator,
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
     )
-    head = MaskedLMHead(cfg, tie_word_embeddings=True)
-    hidden = torch.randn((2, cfg.hidden_size), dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="requires `word_embedding_weight`"):
-        _ = head(hidden)
+
+    for name, value in generator.named_parameters():
+        torch.testing.assert_close(value, generator_before[name], rtol=0.0, atol=0.0)
+    for name, value in discriminator.named_parameters():
+        torch.testing.assert_close(value, discriminator_before[name], rtol=0.0, atol=0.0)
+
+    linears = (
+        model.generator_lm_head.transform.dense,
+        model.discriminator_head.dense,
+        model.discriminator_head.classifier,
+    )
+    for linear in linears:
+        assert float(linear.weight.detach().std(unbiased=False)) == pytest.approx(
+            initializer_range,
+            rel=0.35,
+        )
+        assert linear.bias is not None
+        assert torch.count_nonzero(linear.bias).item() == 0
+    assert torch.count_nonzero(model.generator_lm_head.bias).item() == 0
+
+    norms = (model.generator_lm_head.transform.norm, model.discriminator_head.norm)
+    for norm in norms:
+        torch.testing.assert_close(norm.weight, torch.ones_like(norm.weight))
+        if getattr(norm, "bias", None) is not None:
+            torch.testing.assert_close(norm.bias, torch.zeros_like(norm.bias))
 
 
 def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rtd import MLMTransform, RTDHead
 
@@ -1364,9 +2406,6 @@ def test_mlm_and_rtd_heads_use_layernorm_when_rmsnorm_heads_disabled():
 
 
 def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import MaskedLMHead
@@ -1380,7 +2419,7 @@ def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
         max_position_embeddings=16,
         type_vocab_size=0,
     )
-    head = MaskedLMHead(cfg, tie_word_embeddings=True)
+    head = MaskedLMHead(cfg)
     head.transform = torch.nn.Identity()
 
     hidden = torch.randn((3, cfg.hidden_size), dtype=torch.float64)
@@ -1393,9 +2432,6 @@ def test_masked_lm_head_tied_mode_aligns_to_weight_dtype_outside_autocast():
 
 
 def test_rtd_head_does_not_apply_dropout_in_parity_path():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import RTDHead
@@ -1430,9 +2466,6 @@ def test_rtd_head_does_not_apply_dropout_in_parity_path():
 
 
 def test_rtd_head_applies_cls_conditioning_before_dense_projection():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import RTDHead
@@ -1477,10 +2510,7 @@ def test_rtd_head_applies_cls_conditioning_before_dense_projection():
     assert logits.shape == (2, 3)
 
 
-def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
-    import pytest
-
-    pytest.importorskip("transformers")
+def test_rtd_head_gathers_per_document_cls_for_pairwise_attention_masks():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
     from deberta.modeling.rtd import RTDHead
@@ -1515,20 +2545,439 @@ def test_rtd_head_skips_cls_conditioning_for_pairwise_attention_masks():
         head.classifier.weight.fill_(1.0)
 
     hidden = torch.arange(0, 2 * 3 * cfg.hidden_size, dtype=torch.float32).view(2, 3, cfg.hidden_size)
-    pairwise_mask = torch.ones((2, 3, 3), dtype=torch.bool)
-    logits = head(hidden, attention_mask=pairwise_mask)
+    pairwise_mask = torch.tensor(
+        [
+            [[True, True, False], [True, True, False], [False, False, True]],
+            [[True, True, False], [True, True, False], [False, False, True]],
+        ]
+    )
+    with pytest.raises(RuntimeError, match="requires doc_context_index"):
+        head(hidden, attention_mask=pairwise_mask)
+    doc_context_index = torch.tensor([[0, 0, 2], [0, 0, 2]])
+    logits = head(
+        hidden,
+        attention_mask=pairwise_mask,
+        doc_context_index=doc_context_index,
+    )
 
     assert norm_spy.seen is not None
     assert dense_spy.seen is not None
-    torch.testing.assert_close(norm_spy.seen, hidden)
-    torch.testing.assert_close(dense_spy.seen, hidden)
+    context = hidden.gather(
+        1,
+        doc_context_index.unsqueeze(-1).expand_as(hidden),
+    )
+    torch.testing.assert_close(norm_spy.seen, hidden + context)
+    torch.testing.assert_close(dense_spy.seen, hidden + context)
     assert logits.shape == (2, 3)
 
 
-def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
-    import pytest
+def test_rtd_head_requires_per_document_cls_for_docblock_flash_meta():
+    """Ragged Flash metadata must not silently drop or globalize CLS context.
 
-    pytest.importorskip("transformers")
+    The ragged flash `docblock` route ships a compact 2D keep mask plus
+    `FlashBatchMeta` segment metadata. Position 0 of a packed row belongs to
+    the first document only, so adding it globally would leak document 1 into
+    every other document in the row (regression for the P1 review finding).
+    """
+
+    from deberta.modeling.mask_utils import FlashBatchMeta
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig
+    from deberta.modeling.rtd import RTDHead
+
+    class _Spy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: torch.Tensor | None = None
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.seen = x.detach().clone()
+            return x
+
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+    )
+    head = RTDHead(cfg)
+
+    norm_spy = _Spy()
+    head.norm = norm_spy
+    head.act = torch.nn.Identity()
+
+    hidden = torch.arange(0, 2 * 4 * cfg.hidden_size, dtype=torch.float32).view(2, 4, cfg.hidden_size)
+    keep_mask_2d = torch.ones((2, 4), dtype=torch.bool)
+    docblock_meta = FlashBatchMeta(
+        doc_segment_offsets=torch.tensor([0, 2, 4, 6], dtype=torch.int32),
+        doc_segment_lengths=torch.tensor([2, 2, 2, 2], dtype=torch.int32),
+        doc_cu_seqlens=torch.tensor([0, 2, 4, 6, 8], dtype=torch.int32),
+        route_hint="docblock",
+    )
+
+    with pytest.raises(RuntimeError, match="requires doc_context_index"):
+        head(hidden, attention_mask=keep_mask_2d, flash_meta=docblock_meta)
+    doc_context_index = torch.tensor([[0, 0, 2, 2], [0, 0, 2, 2]])
+    _ = head(
+        hidden,
+        attention_mask=keep_mask_2d,
+        doc_context_index=doc_context_index,
+        flash_meta=docblock_meta,
+    )
+    assert norm_spy.seen is not None
+    context = hidden.gather(1, doc_context_index.unsqueeze(-1).expand_as(hidden))
+    torch.testing.assert_close(norm_spy.seen, hidden + context)
+
+    # The same 2D mask without doc-block metadata keeps the original
+    # single-document behavior: global CLS conditioning stays enabled.
+    _ = head(hidden, attention_mask=keep_mask_2d)
+    torch.testing.assert_close(norm_spy.seen, hidden + hidden[:, 0:1, :])
+
+    assert RTDHead._requires_document_context(keep_mask_2d, flash_meta=docblock_meta) is True
+    assert (
+        RTDHead._requires_document_context(
+            keep_mask_2d,
+            flash_meta=FlashBatchMeta(route_hint="docblock_bias"),
+        )
+        is True
+    )
+    assert (
+        RTDHead._requires_document_context(
+            keep_mask_2d,
+            flash_meta=FlashBatchMeta(route_hint="varlen"),
+        )
+        is False
+    )
+
+
+def test_packed_rtd_matches_standalone_documents_with_local_positions_and_cls() -> None:
+    """Packing must preserve generator and discriminator objective semantics."""
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    torch.manual_seed(41)
+    cfg = DebertaV2Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        max_relative_positions=16,
+        position_buckets=-1,
+        relative_attention=True,
+        pos_att_type=["c2p", "p2c"],
+        position_biased_input=False,
+        z_steps=0,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaV2Model(cfg),
+        generator_backbone=DebertaV2Model(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    ).eval()
+
+    standalone_inputs = (
+        torch.tensor([[1, 10, 3, 2]], dtype=torch.long),
+        torch.tensor([[1, 20, 3, 2]], dtype=torch.long),
+    )
+    standalone_labels = (
+        torch.tensor([[-100, -100, 12, -100]], dtype=torch.long),
+        torch.tensor([[-100, -100, 22, -100]], dtype=torch.long),
+    )
+    standalone_positions = torch.arange(4).unsqueeze(0)
+    standalone_mask = torch.ones((1, 4), dtype=torch.bool)
+    packed_input = torch.cat(standalone_inputs, dim=1)
+    packed_labels = torch.cat(standalone_labels, dim=1)
+    packed_positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+    packed_doc_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]], dtype=torch.long)
+    packed_mask = build_doc_block_mask(packed_doc_ids)
+    packed_context = torch.tensor([[0, 0, 0, 0, 4, 4, 4, 4]], dtype=torch.long)
+
+    def _generator_logits(
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        masked_positions = labels.ne(-100)
+        output = model.generator(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        masked_hidden = model.enhanced_mask_decoder(
+            encoder_hidden_states=output.hidden_states,
+            masked_positions=masked_positions,
+            attention_mask=attention_mask,
+            embeddings=model.generator.embeddings,
+            encoder=model.generator.encoder,
+            position_ids=position_ids,
+        )
+        return model.generator_lm_head(
+            masked_hidden,
+            word_embedding_weight=model._get_generator_word_embedding_weight(),
+        )
+
+    def _discriminator_logits(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        doc_context_index: torch.Tensor | None,
+    ) -> torch.Tensor:
+        output = model.discriminator(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
+        return model.discriminator_head(
+            output.last_hidden_state,
+            attention_mask=attention_mask,
+            doc_context_index=doc_context_index,
+        )
+
+    with torch.no_grad():
+        packed_gen_logits = _generator_logits(
+            packed_input,
+            packed_labels,
+            packed_mask,
+            packed_positions,
+        )
+        standalone_gen_logits = [
+            _generator_logits(ids, labels, standalone_mask, standalone_positions)
+            for ids, labels in zip(standalone_inputs, standalone_labels, strict=True)
+        ]
+        torch.testing.assert_close(
+            packed_gen_logits,
+            torch.cat(standalone_gen_logits, dim=0),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+        packed_gen_phase = model.forward_generator_phase(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            labels=packed_labels,
+            position_ids=packed_positions,
+        )
+        packed_targets = packed_labels[packed_labels.ne(-100)]
+        packed_emd_loss = torch.nn.functional.cross_entropy(
+            packed_gen_logits.float(),
+            packed_targets,
+        )
+        torch.testing.assert_close(
+            packed_gen_phase.gen_loss_raw,
+            packed_emd_loss,
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        standalone_gen_phases = [
+            model.forward_generator_phase(
+                input_ids=ids,
+                attention_mask=standalone_mask,
+                labels=labels,
+                position_ids=standalone_positions,
+            )
+            for ids, labels in zip(standalone_inputs, standalone_labels, strict=True)
+        ]
+        torch.testing.assert_close(
+            packed_gen_phase.gen_loss_raw,
+            torch.stack([phase.gen_loss_raw for phase in standalone_gen_phases]).mean(),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+        packed_corrupted = packed_input.clone()
+        packed_corrupted[0, 2] = 30
+        packed_corrupted[0, 6] = 31
+        packed_disc_labels = torch.zeros_like(packed_input, dtype=torch.float32)
+        packed_disc_labels[0, 2] = 1.0
+        packed_disc_labels[0, 6] = 1.0
+        packed_disc_logits = _discriminator_logits(
+            packed_corrupted,
+            packed_mask,
+            packed_positions,
+            packed_context,
+        )
+        standalone_disc_logits: list[torch.Tensor] = []
+        standalone_disc_losses: list[torch.Tensor] = []
+        for document_idx, ids in enumerate(standalone_inputs):
+            corrupted = ids.clone()
+            corrupted[0, 2] = 30 + document_idx
+            labels = torch.zeros_like(ids, dtype=torch.float32)
+            labels[0, 2] = 1.0
+            standalone_disc_logits.append(
+                _discriminator_logits(
+                    corrupted,
+                    standalone_mask,
+                    standalone_positions,
+                    None,
+                )
+            )
+            standalone_disc_losses.append(
+                model.forward_discriminator_phase(
+                    input_ids=ids,
+                    corrupted_input_ids=corrupted,
+                    disc_labels=labels,
+                    attention_mask=standalone_mask,
+                    position_ids=standalone_positions,
+                ).disc_loss_raw
+            )
+
+        torch.testing.assert_close(
+            packed_disc_logits,
+            torch.cat(standalone_disc_logits, dim=1),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        packed_disc_phase = model.forward_discriminator_phase(
+            input_ids=packed_input,
+            corrupted_input_ids=packed_corrupted,
+            disc_labels=packed_disc_labels,
+            attention_mask=packed_mask,
+            position_ids=packed_positions,
+            doc_context_index=packed_context,
+        )
+        torch.testing.assert_close(
+            packed_disc_phase.disc_loss_raw,
+            torch.stack(standalone_disc_losses).mean(),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+
+def test_packed_rope_rtd_accepts_local_positions_and_matches_standalone() -> None:
+    """RoPE packed training must preserve optional learned absolute positions."""
+
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
+
+    torch.manual_seed(43)
+    cfg = DebertaRoPEConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        type_vocab_size=0,
+        use_absolute_position_embeddings=True,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        attention_implementation="eager",
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        mask_token_id=3,
+    )
+    model = DebertaV3RTDPretrainer(
+        discriminator_backbone=DebertaRoPEModel(cfg),
+        generator_backbone=DebertaRoPEModel(cfg),
+        disc_config=cfg,
+        gen_config=cfg,
+        embedding_sharing="none",
+    ).eval()
+
+    standalone_input = torch.tensor([[1, 10, 3, 2]], dtype=torch.long)
+    standalone_labels = torch.tensor([[-100, -100, 12, -100]], dtype=torch.long)
+    standalone_mask = torch.ones((1, 4), dtype=torch.bool)
+    standalone_positions = torch.arange(4).unsqueeze(0)
+    packed_input = torch.cat((standalone_input, standalone_input), dim=1)
+    packed_labels = torch.cat((standalone_labels, standalone_labels), dim=1)
+    packed_doc_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]], dtype=torch.long)
+    packed_mask = build_doc_block_mask(packed_doc_ids)
+    packed_positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+    packed_context = torch.tensor([[0, 0, 0, 0, 4, 4, 4, 4]], dtype=torch.long)
+
+    with torch.no_grad():
+        standalone_hidden = model.generator(
+            input_ids=standalone_input,
+            attention_mask=standalone_mask,
+            position_ids=standalone_positions,
+            return_dict=True,
+        ).last_hidden_state
+        packed_hidden = model.generator(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            position_ids=packed_positions,
+            return_dict=True,
+        ).last_hidden_state
+        expected_hidden = torch.cat((standalone_hidden, standalone_hidden), dim=1)
+        torch.testing.assert_close(packed_hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+
+        row_global_hidden = model.generator(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            position_ids=torch.arange(8).unsqueeze(0),
+            return_dict=True,
+        ).last_hidden_state
+        assert not torch.allclose(row_global_hidden[:, 4:], standalone_hidden)
+
+        standalone_gen = model.forward_generator_phase(
+            input_ids=standalone_input,
+            attention_mask=standalone_mask,
+            labels=standalone_labels,
+            position_ids=standalone_positions,
+        )
+        packed_gen = model.forward_generator_phase(
+            input_ids=packed_input,
+            attention_mask=packed_mask,
+            labels=packed_labels,
+            position_ids=packed_positions,
+        )
+        torch.testing.assert_close(packed_gen.gen_loss_raw, standalone_gen.gen_loss_raw)
+
+        standalone_corrupted = standalone_input.clone()
+        standalone_corrupted[0, 2] = 30
+        standalone_disc_labels = torch.zeros_like(standalone_input, dtype=torch.float32)
+        standalone_disc_labels[0, 2] = 1.0
+        standalone_disc = model.forward_discriminator_phase(
+            input_ids=standalone_input,
+            corrupted_input_ids=standalone_corrupted,
+            disc_labels=standalone_disc_labels,
+            attention_mask=standalone_mask,
+            position_ids=standalone_positions,
+        )
+        packed_disc = model.forward_discriminator_phase(
+            input_ids=packed_input,
+            corrupted_input_ids=torch.cat((standalone_corrupted, standalone_corrupted), dim=1),
+            disc_labels=torch.cat((standalone_disc_labels, standalone_disc_labels), dim=1),
+            attention_mask=packed_mask,
+            position_ids=packed_positions,
+            doc_context_index=packed_context,
+        )
+        torch.testing.assert_close(packed_disc.disc_loss_raw, standalone_disc.disc_loss_raw)
+
+
+def test_flash_batch_meta_is_cross_document_predicate():
+    from deberta.modeling.mask_utils import FlashBatchMeta
+
+    assert FlashBatchMeta().is_cross_document() is False
+    assert FlashBatchMeta(route_hint="dense").is_cross_document() is False
+    assert FlashBatchMeta(route_hint="varlen").is_cross_document() is False
+    assert FlashBatchMeta(route_hint="docblock").is_cross_document() is True
+    assert FlashBatchMeta(route_hint="docblock_bias").is_cross_document() is True
+    assert (
+        FlashBatchMeta(doc_segment_offsets=torch.tensor([0, 2], dtype=torch.int32)).is_cross_document()
+        is True
+    )
+
+
+def test_pretrainer_raises_clear_error_when_generator_word_embeddings_cannot_be_tied():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1585,7 +3034,6 @@ def test_synced_buffer_embedding_tracks_sync_updates():
     tied = _SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=False,
     )
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
 
@@ -1603,18 +3051,12 @@ def test_synced_buffer_embedding_tracks_sync_updates():
 
 
 def test_synced_buffer_embedding_sync_updates_compiled_module():
-    import pytest
-
-    if not hasattr(torch, "compile"):
-        pytest.skip("torch.compile not available")
-
     from deberta.modeling.rtd import _SyncedBufferEmbedding
 
     init_weight = torch.randn((16, 8), dtype=torch.float32)
     tied = _SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=False,
     )
     compiled = torch.compile(tied, backend="aot_eager", mode="default", dynamic=False)
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
@@ -1631,7 +3073,6 @@ def test_synced_buffer_embedding_sync_updates_compiled_module():
 
 
 def test_synced_buffer_embedding_rejects_sharded_dtensor_sync(monkeypatch):
-    import pytest
 
     from deberta.modeling import rtd as rtd_mod
 
@@ -1639,7 +3080,6 @@ def test_synced_buffer_embedding_rejects_sharded_dtensor_sync(monkeypatch):
     tied = rtd_mod._SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=False,
     )
     new_weight = torch.randn_like(init_weight)
     original_probe = rtd_mod._is_sharded_dtensor
@@ -1661,16 +3101,11 @@ def test_synced_buffer_embedding_gdes_bias_matches_base_weight_dtype():
     tied = _SyncedBufferEmbedding(
         init_weight=init_weight,
         padding_idx=0,
-        add_bias=True,
     )
-    assert tied.bias is not None
     assert tied.bias.dtype == init_weight.dtype
 
 
 def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -1722,10 +3157,39 @@ def test_pretrainer_es_embedding_alias_is_static_after_model_surgery():
         )
 
 
-def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
-    import pytest
+@pytest.mark.parametrize("embedding_sharing", ["es", "gdes"])
+def test_pretrainer_rejects_asymmetric_embedding_table_availability(
+    embedding_sharing: str,
+) -> None:
+    from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+    from deberta.modeling.rtd import DebertaV3RTDPretrainer
 
-    pytest.importorskip("transformers")
+    common = {
+        "vocab_size": 64,
+        "hidden_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "intermediate_size": 64,
+        "max_position_embeddings": 32,
+        "pad_token_id": 0,
+        "hidden_dropout_prob": 0.0,
+        "attention_probs_dropout_prob": 0.0,
+        "norm_arch": "post",
+    }
+    disc_cfg = DebertaRoPEConfig(**common, type_vocab_size=2)
+    gen_cfg = DebertaRoPEConfig(**common, type_vocab_size=0)
+
+    with pytest.raises(ValueError, match="token_type_embeddings"):
+        DebertaV3RTDPretrainer(
+            discriminator_backbone=DebertaRoPEModel(disc_cfg),
+            generator_backbone=DebertaRoPEModel(gen_cfg),
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
+            embedding_sharing=embedding_sharing,
+        )
+
+
+def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
@@ -1750,9 +3214,15 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
             super().__init__()
             self.seen_attention_mask: torch.Tensor | None = None
 
-        def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            *,
+            output_hidden_states: bool,
+        ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
             self.seen_attention_mask = attention_mask
-            return x
+            return x, (x,) if output_hidden_states else None
 
     input_ids = torch.tensor(
         [
@@ -1771,24 +3241,13 @@ def test_rope_model_treats_missing_attention_mask_as_unpadded_contract():
 
 
 def test_native_hf_deberta_v2_forward_smoke():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     model = DebertaV2Model(cfg).eval()
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
@@ -1803,27 +3262,359 @@ def test_native_hf_deberta_v2_forward_smoke():
     torch.testing.assert_close(out_2d, out_3d, rtol=0.0, atol=0.0)
 
 
-def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
-    import pytest
+def test_native_encoder_query_states_keep_tensor_memory_fixed() -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Encoder
 
-    pytest.importorskip("transformers")
+    class _QueryMemorySpy(torch.nn.Module):
+        def __init__(self, delta: float) -> None:
+            super().__init__()
+            self.delta = float(delta)
+            self.kv_seen: list[torch.Tensor] = []
+            self.query_seen: list[torch.Tensor] = []
 
-    from transformers import DebertaV2Config
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            query_states: torch.Tensor | None = None,
+            **_: object,
+        ) -> tuple[torch.Tensor, None]:
+            del attention_mask
+            assert query_states is not None
+            self.kv_seen.append(hidden_states.detach().clone())
+            self.query_seen.append(query_states.detach().clone())
+            return query_states + self.delta, None
 
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        relative_attention=False,
+    )
+    encoder = DebertaV2Encoder(cfg)
+    first = _QueryMemorySpy(1.0)
+    second = _QueryMemorySpy(2.0)
+    encoder.layer = torch.nn.ModuleList([first, second])
+
+    memory = torch.randn((2, 5, 8))
+    query = torch.randn((2, 3, 8))
+    output = encoder(
+        memory,
+        attention_mask=torch.ones((2, 5), dtype=torch.bool),
+        query_states=query,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    torch.testing.assert_close(first.kv_seen[0], memory)
+    torch.testing.assert_close(second.kv_seen[0], memory)
+    torch.testing.assert_close(second.query_seen[0], query + 1.0)
+    torch.testing.assert_close(output.last_hidden_state, query + 3.0)
+    assert output.hidden_states is not None
+    torch.testing.assert_close(output.hidden_states[0], query)
+    torch.testing.assert_close(output.hidden_states[1], query + 1.0)
+    torch.testing.assert_close(output.hidden_states[2], query + 3.0)
+
+
+@pytest.mark.parametrize(
+    ("query_len", "key_len"),
+    [(3, 5), (7, 5)],
+    ids=["query_shorter", "query_longer"],
+)
+def test_native_encoder_query_states_real_layers_match_fixed_memory_and_backprop(
+    query_len: int,
+    key_len: int,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DebertaV2Encoder
+
+    torch.manual_seed(41)
+    config_kwargs = {
+        "hidden_size": 8,
+        "num_attention_heads": 2,
+        "intermediate_size": 16,
+        "num_hidden_layers": 2,
+        "max_position_embeddings": 8,
+        "max_relative_positions": 8,
+        "position_buckets": 8,
+        "relative_attention": True,
+        "pos_att_type": ["c2p", "p2c"],
+        "share_att_key": True,
+        "norm_rel_ebd": "layer_norm",
+    }
+    base_config = make_native_deberta_config(**config_kwargs)
+    base_config.hf_attention_kernel = "dynamic"
+    base_encoder = DebertaV2Encoder(base_config)
+    state = {name: value.detach().clone() for name, value in base_encoder.state_dict().items()}
+
+    memory_source = torch.randn((2, key_len, 8))
+    query_source = torch.randn((2, query_len, 8))
+    key_padding_mask = torch.ones((2, key_len), dtype=torch.bool)
+    key_padding_mask[0, -1] = False
+
+    outputs: dict[str, torch.Tensor] = {}
+    input_gradients: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for kernel in ("dynamic", "cached_bmm", "stable"):
+        config = make_native_deberta_config(**config_kwargs)
+        config.hf_attention_kernel = kernel
+        encoder = DebertaV2Encoder(config).train()
+        encoder.load_state_dict(state, strict=True)
+        memory = memory_source.detach().clone().requires_grad_()
+        query = query_source.detach().clone().requires_grad_()
+
+        with torch.no_grad():
+            manual_mask = encoder.get_attention_mask(key_padding_mask)
+            manual_relative_pos = encoder.get_rel_pos(memory, query_states=query)
+            manual_rel_embeddings = encoder.get_rel_embedding()
+            manual_output = query
+            for layer in encoder.layer:
+                manual_output, _ = layer(
+                    memory,
+                    manual_mask,
+                    query_states=manual_output,
+                    relative_pos=manual_relative_pos,
+                    rel_embeddings=manual_rel_embeddings,
+                )
+
+        result = encoder(
+            memory,
+            attention_mask=key_padding_mask,
+            query_states=query,
+            output_hidden_states=True,
+            output_attentions=True,
+            return_dict=True,
+        )
+
+        torch.testing.assert_close(result.last_hidden_state, manual_output)
+        assert result.hidden_states is not None
+        assert len(result.hidden_states) == 3
+        assert all(hidden_state.shape == (2, query_len, 8) for hidden_state in result.hidden_states)
+        assert result.attentions is not None
+        assert len(result.attentions) == 2
+        for probabilities in result.attentions:
+            assert probabilities.shape == (2, 2, query_len, key_len)
+            assert torch.count_nonzero(probabilities[0, ..., -1]) == 0
+            torch.testing.assert_close(
+                probabilities.sum(dim=-1),
+                torch.ones((2, 2, query_len)),
+            )
+
+        result.last_hidden_state.square().mean().backward()
+        assert memory.grad is not None
+        assert query.grad is not None
+        assert torch.isfinite(memory.grad).all()
+        assert torch.isfinite(query.grad).all()
+        assert torch.count_nonzero(memory.grad) > 0
+        assert torch.count_nonzero(query.grad) > 0
+        parameter_gradients = [
+            parameter.grad for parameter in encoder.parameters() if parameter.grad is not None
+        ]
+        assert parameter_gradients
+        assert all(torch.isfinite(gradient).all() for gradient in parameter_gradients)
+
+        outputs[kernel] = result.last_hidden_state.detach()
+        input_gradients[kernel] = (memory.grad.detach().clone(), query.grad.detach().clone())
+
+    for kernel in ("cached_bmm", "stable"):
+        torch.testing.assert_close(outputs[kernel], outputs["dynamic"], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            input_gradients[kernel][0],
+            input_gradients["dynamic"][0],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            input_gradients[kernel][1],
+            input_gradients["dynamic"][1],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+def test_native_attention_accepts_rectangular_query_key_lengths_with_key_padding_mask() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        relative_attention=False,
+    )
+    attention = DisentangledSelfAttention(cfg).eval()
+
+    memory = torch.randn((2, 5, 8))
+    query = torch.randn((2, 3, 8))
+    key_padding_mask = torch.tensor(
+        [
+            [[[True, True, True, True, False]]],
+            [[[False, False, False, False, False]]],
+        ]
+    )
+
+    output, probabilities = attention(
+        hidden_states=memory,
+        query_states=query,
+        attention_mask=key_padding_mask,
+        output_attentions=True,
+    )
+
+    assert output.shape == (2, 3, 8)
+    assert probabilities is not None
+    assert probabilities.shape == (2, 2, 3, 5)
+    assert torch.count_nonzero(probabilities[..., -1]) == 0
+    assert torch.count_nonzero(probabilities[1]) == 0
+    assert torch.count_nonzero(output[1]) == 0
+
+
+def test_native_attention_uses_row_liveness_for_rectangular_pairwise_masks() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        relative_attention=False,
+    )
+    attention = DisentangledSelfAttention(cfg).eval()
+
+    memory = torch.randn((1, 5, 8))
+    query = torch.randn((1, 3, 8))
+    pairwise_mask = torch.tensor(
+        [
+            [
+                [
+                    [False, True, False, False, False],
+                    [False, False, True, False, False],
+                    [False, False, False, True, False],
+                ]
+            ]
+        ]
+    )
+
+    _, probabilities = attention(
+        hidden_states=memory,
+        query_states=query,
+        attention_mask=pairwise_mask,
+        output_attentions=True,
+    )
+
+    assert probabilities is not None
+    torch.testing.assert_close(
+        probabilities.sum(dim=-1),
+        torch.ones((1, 2, 3)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mask_shape", "message"),
+    [
+        ((1, 1, 1, 4), "key length mismatch"),
+        ((1, 1, 2, 5), "query length mismatch"),
+    ],
+)
+def test_native_attention_rejects_rectangular_mask_dimension_mismatches(
+    mask_shape: tuple[int, ...],
+    message: str,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        relative_attention=False,
+    )
+    attention = DisentangledSelfAttention(cfg).eval()
+
+    with pytest.raises(ValueError, match=message):
+        attention(
+            hidden_states=torch.randn((1, 5, 8)),
+            query_states=torch.randn((1, 3, 8)),
+            attention_mask=torch.ones(mask_shape, dtype=torch.bool),
+        )
+
+
+def test_positional_term_normalization_splits_sequence_items() -> None:
+    from deberta.modeling.deberta_v2_native import _normalize_pos_att_type
+
+    assert _normalize_pos_att_type(["c2p|p2c"]) == ["c2p", "p2c"]
+    assert _normalize_pos_att_type(["p2c,c2p", "P2C"]) == ["p2c", "c2p"]
+    with pytest.raises(TypeError, match="string or sequence of strings"):
+        _normalize_pos_att_type(1)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "p2p",
+        "c2p|p2p",
+        "p2c,p2p",
+        ["c2p", "p2p"],
+        "c2p|pc2",
+    ],
+)
+def test_native_attention_rejects_unsupported_positional_terms(
+    raw: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        relative_attention=True,
+        pos_att_type=raw,
+    )
+    allocations: list[tuple[object, ...]] = []
+    linear = torch.nn.Linear
+
+    def _track_linear(*args: object, **kwargs: object) -> torch.nn.Linear:
+        allocations.append(args)
+        return linear(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn, "Linear", _track_linear)
+
+    with pytest.raises(ValueError, match="supports only c2p and p2c"):
+        DisentangledSelfAttention(cfg)
+    assert allocations == []
+
+
+@pytest.mark.parametrize("raw", [None, "", [], [""]])
+def test_native_attention_requires_positional_terms_when_relative_attention_is_enabled(
+    raw: object,
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        relative_attention=True,
+        pos_att_type=raw,
+    )
+
+    with pytest.raises(ValueError, match="relative_attention=true requires pos_att_type"):
+        DisentangledSelfAttention(cfg)
+
+
+def test_direct_flash_attention_uses_native_positional_term_contract() -> None:
+    from deberta.modeling.flashdeberta_attention import FlashDisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        flash=True,
+        relative_attention=True,
+        pos_att_type="p2p",
+    )
+
+    with pytest.raises(ValueError, match="supports only c2p and p2c"):
+        FlashDisentangledSelfAttention(cfg)
+
+
+def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic() -> None:
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
@@ -1850,24 +3641,246 @@ def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic():
     torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])
-def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: str):
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
+@pytest.mark.parametrize("term", ["c2p", "p2c"])
+@pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])
+def test_native_disentangled_signed_bucket_forward_and_gradients_match_definition(
+    term: str,
+    kernel: str,
+) -> None:
+    """Each positional term must use the same canonical signed q-k bucket."""
 
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    torch.manual_seed(17)
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        position_buckets=-1,
+        relative_attention=True,
+        pos_att_type=term,
+        share_att_key=False,
+    )
+    cfg.hf_attention_kernel = kernel
+    attention = DisentangledSelfAttention(cfg).eval()
+    attention.float()
+
+    batch_size = 2
+    seq_len = 4
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    query_actual = torch.randn((batch_size, cfg.num_attention_heads, seq_len, head_dim), requires_grad=True)
+    key_actual = torch.randn_like(query_actual, requires_grad=True)
+    rel_actual = torch.randn((2 * cfg.max_relative_positions, cfg.hidden_size), requires_grad=True)
+    query_expected = query_actual.detach().clone().requires_grad_()
+    key_expected = key_actual.detach().clone().requires_grad_()
+    rel_expected = rel_actual.detach().clone().requires_grad_()
+    relative_pos = torch.arange(seq_len)[:, None] - torch.arange(seq_len)[None, :]
+    scale_factor = 2
+
+    actual = attention.disentangled_attention_bias(
+        query_layer=query_actual,
+        key_layer=key_actual,
+        relative_pos=relative_pos,
+        rel_embeddings=rel_actual,
+        scale_factor=scale_factor,
+    )
+
+    use_query_projection = term == "p2c"
+    position_scores = attention._project_rel(
+        rel_expected,
+        use_query=use_query_projection,
+    )
+    bucket = (relative_pos + int(attention.pos_ebd_size)).clamp(
+        min=0,
+        max=(2 * int(attention.pos_ebd_size)) - 1,
+    )
+    selected_positions = position_scores[:, bucket, :]
+    content = key_expected[:, :, None, :, :] if term == "p2c" else query_expected[:, :, :, None, :]
+    expected = (content * selected_positions.unsqueeze(0)).sum(dim=-1)
+    expected = expected / math.sqrt(float(head_dim * scale_factor))
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    loss_weight = torch.randn_like(actual)
+    projection = attention.pos_query_proj if term == "p2c" else attention.pos_key_proj
+    assert projection is not None
+    actual_grads = torch.autograd.grad(
+        (actual * loss_weight).sum(),
+        (query_actual, key_actual, rel_actual, projection.weight, projection.bias),
+        allow_unused=True,
+    )
+    expected_grads = torch.autograd.grad(
+        (expected * loss_weight).sum(),
+        (query_expected, key_expected, rel_expected, projection.weight, projection.bias),
+        allow_unused=True,
+    )
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        if actual_grad is None or expected_grad is None:
+            assert actual_grad is None and expected_grad is None
+        else:
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-6, atol=1e-6)
+
+
+def test_native_attention_matches_transformers_reference_on_active_tokens() -> None:
+    """Corrected native attention must match the independent HF implementation."""
+
+    from transformers.models.deberta_v2.modeling_deberta_v2 import (
+        DisentangledSelfAttention as TransformersDisentangledSelfAttention,
+    )
+
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    torch.manual_seed(29)
+    cfg = make_native_deberta_config(
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=8,
+        max_relative_positions=8,
+        position_buckets=-1,
+        relative_attention=True,
+        pos_att_type=["c2p", "p2c"],
+        share_att_key=False,
+    )
+    cfg.hf_attention_kernel = "dynamic"
+    reference = TransformersDisentangledSelfAttention(cfg).eval()
+    native = DisentangledSelfAttention(cfg).eval()
+    native.load_state_dict(reference.state_dict(), strict=True)
+
+    hidden_states = torch.randn((2, 6, cfg.hidden_size), dtype=torch.float32)
+    keep_mask = torch.tensor([[True, True, True, True, False, False], [True, True, True, True, True, False]])
+    attention_mask = keep_mask[:, None, None, :]
+    rel_embeddings = torch.randn((2 * cfg.max_relative_positions, cfg.hidden_size))
+
+    with torch.no_grad():
+        native_out, _ = native(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            rel_embeddings=rel_embeddings,
+        )
+        reference_out, _ = reference(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            rel_embeddings=rel_embeddings,
+        )
+
+    torch.testing.assert_close(native_out[keep_mask], reference_out[keep_mask], rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 4, 4),
+        (1, 2, 4, 4),
+        (2, 1, 4, 4),
+    ],
+)
+def test_native_relative_pos_rejects_non_singleton_batch_or_head_axes(
+    shape: tuple[int, ...],
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+    )
+    attention = DisentangledSelfAttention(cfg)
+
+    with pytest.raises(ValueError, match="specific relative_pos"):
+        attention._normalize_relative_pos(
+            torch.zeros(shape, dtype=torch.long),
+            query_len=4,
+            key_len=4,
+            device=torch.device("cpu"),
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (3, 4),
+        (4, 3),
+        (5, 4),
+        (4, 5),
+    ],
+)
+def test_native_relative_pos_rejects_query_key_shape_mismatch(
+    shape: tuple[int, int],
+) -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+    )
+    attention = DisentangledSelfAttention(cfg)
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        attention._normalize_relative_pos(
+            torch.zeros(shape, dtype=torch.long),
+            query_len=4,
+            key_len=4,
+            device=torch.device("cpu"),
+        )
+
+
+def test_native_relative_pos_accepts_singleton_wrappers_without_changing_values() -> None:
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=4,
+        max_relative_positions=4,
+        relative_attention=True,
+        pos_att_type="c2p|p2c",
+    )
+    attention = DisentangledSelfAttention(cfg)
+    base = torch.arange(16, dtype=torch.long).reshape(4, 4)
+
+    rank2 = attention._normalize_relative_pos(
+        base,
+        query_len=4,
+        key_len=4,
+        device=torch.device("cpu"),
+    )
+    rank3 = attention._normalize_relative_pos(
+        base.unsqueeze(0),
+        query_len=4,
+        key_len=4,
+        device=torch.device("cpu"),
+    )
+    rank4 = attention._normalize_relative_pos(
+        base.unsqueeze(0).unsqueeze(0),
+        query_len=4,
+        key_len=4,
+        device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(rank2, base)
+    torch.testing.assert_close(rank3, base)
+    torch.testing.assert_close(rank4, base)
+
+
+@pytest.mark.parametrize("kernel", ["cached_bmm", "stable"])
+def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: str):
+    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
+
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = kernel
     attn = DisentangledSelfAttention(cfg).eval()
@@ -1904,24 +3917,12 @@ def test_native_hf_deberta_v2_cached_bias_recomputes_for_new_query_key(kernel: s
 def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "cached_bmm"
     attn = DisentangledSelfAttention(cfg).eval()
@@ -1968,24 +3969,12 @@ def test_native_hf_deberta_v2_cached_bmm_casts_relative_bias_to_query_dtype(
 def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "dynamic"
     attn = DisentangledSelfAttention(cfg).eval()
@@ -2029,118 +4018,14 @@ def test_native_hf_deberta_v2_dynamic_bias_casts_relative_bias_to_query_dtype(
     assert {eq for eq, _ in einsum_dtypes} == {"bhqd,hkd->bhqk", "bhkd,hqd->bhkq"}
 
 
-def test_native_hf_deberta_v2_p2p_only_bias_is_nonzero():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
-
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="p2p",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    attn = DisentangledSelfAttention(cfg).eval()
-
-    bsz, nheads, qlen, klen = 2, 4, 8, 8
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
-    query = torch.randn(bsz, nheads, qlen, head_dim)
-    key = torch.randn(bsz, nheads, klen, head_dim)
-    rel_embeddings = torch.randn(2 * cfg.max_position_embeddings, cfg.hidden_size)
-
-    score = attn.disentangled_attention_bias(
-        query_layer=query,
-        key_layer=key,
-        relative_pos=None,
-        rel_embeddings=rel_embeddings,
-        scale_factor=2,  # base 1 + p2p 1
-    )
-    assert score.shape == (bsz, nheads, qlen, klen)
-    assert torch.isfinite(score).all()
-    assert float(score.abs().sum().item()) > 0.0
-
-
-def test_native_hf_deberta_v2_p2p_bias_respects_scale_factor():
-    import math
-
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
-
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="p2p",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    attn = DisentangledSelfAttention(cfg).eval()
-
-    bsz, nheads, qlen, klen = 2, 4, 8, 8
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
-    query = torch.randn(bsz, nheads, qlen, head_dim)
-    key = torch.randn(bsz, nheads, klen, head_dim)
-    rel_embeddings = torch.randn(2 * cfg.max_position_embeddings, cfg.hidden_size)
-
-    with torch.no_grad():
-        score_scale_2 = attn.disentangled_attention_bias(
-            query_layer=query,
-            key_layer=key,
-            relative_pos=None,
-            rel_embeddings=rel_embeddings,
-            scale_factor=2,
-        )
-        score_scale_8 = attn.disentangled_attention_bias(
-            query_layer=query,
-            key_layer=key,
-            relative_pos=None,
-            rel_embeddings=rel_embeddings,
-            scale_factor=8,
-        )
-
-    mean_abs_2 = float(score_scale_2.abs().mean().item())
-    mean_abs_8 = float(score_scale_8.abs().mean().item())
-    assert mean_abs_2 > 0.0
-    assert mean_abs_8 > 0.0
-    ratio = mean_abs_2 / mean_abs_8
-    assert ratio == pytest.approx(math.sqrt(8.0 / 2.0), rel=1e-4, abs=1e-4)
-
-
 @pytest.mark.parametrize("kernel", ["dynamic", "cached_bmm", "stable"])
 def test_native_hf_deberta_v2_c2p_p2c_bias_respects_scale_factor(kernel: str):
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+    cfg = make_native_deberta_config(
         max_position_embeddings=32,
         relative_attention=True,
         pos_att_type="c2p|p2c",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = kernel
     attn = DisentangledSelfAttention(cfg).eval()
@@ -2175,53 +4060,6 @@ def test_native_hf_deberta_v2_c2p_p2c_bias_respects_scale_factor(kernel: str):
     assert ratio == pytest.approx(math.sqrt(12.0 / 3.0), rel=1e-4, abs=1e-4)
 
 
-def test_native_hf_deberta_v2_cached_and_stable_attention_match_dynamic_with_p2p():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DebertaV2Model
-
-    cfg = DebertaV2Config(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="c2p|p2c|p2p",
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-
-    torch.manual_seed(321)
-    cfg.hf_attention_kernel = "dynamic"
-    dynamic_model = DebertaV2Model(cfg).eval()
-    snapshot = {k: v.detach().clone() for k, v in dynamic_model.state_dict().items()}
-
-    cfg.hf_attention_kernel = "cached_bmm"
-    cached_model = DebertaV2Model(cfg).eval()
-    cached_model.load_state_dict(snapshot, strict=True)
-
-    cfg.hf_attention_kernel = "stable"
-    stable_model = DebertaV2Model(cfg).eval()
-    stable_model.load_state_dict(snapshot, strict=True)
-
-    with torch.no_grad():
-        out_dynamic = dynamic_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        out_cached = cached_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        out_stable = stable_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-    torch.testing.assert_close(out_dynamic, out_cached, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(out_dynamic, out_stable, rtol=1e-5, atol=1e-6)
-
-
 def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
     from deberta.modeling.deberta_v2_native import _make_log_bucket_position
 
@@ -2240,22 +4078,32 @@ def test_native_hf_deberta_v2_log_bucket_clamps_relative_positions():
     assert bucket[-2].item() == pos_edge
 
 
+def test_native_hf_deberta_v2_log_bucket_matches_stock_hf_rounding():
+    from transformers.models.deberta_v2.modeling_deberta_v2 import make_log_bucket_position
+
+    from deberta.modeling.deberta_v2_native import _make_log_bucket_position
+
+    relative_pos = torch.arange(-14, 15, dtype=torch.long)
+    expected = make_log_bucket_position(
+        relative_pos,
+        bucket_size=8,
+        max_position=15,
+    ).long()
+    actual = _make_log_bucket_position(
+        relative_pos,
+        bucket_size=8,
+        max_position=15,
+    )
+
+    assert int(expected[0].item()) == -7
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
         type_vocab_size=0,
     )
 
@@ -2264,68 +4112,37 @@ def test_native_hf_deberta_v2_rejects_invalid_attention_kernel_config():
         _ = DebertaV2Model(cfg)
 
 
-def test_native_hf_deberta_v2_stable_attention_handles_fully_masked_rows():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
+@pytest.mark.parametrize(
+    ("num_hidden_layers", "max_position_embeddings", "mask_kind"),
+    [(1, 16, "fully_masked"), (2, 32, "random")],
+    ids=("fully_masked", "random"),
+)
+def test_native_hf_deberta_v2_stable_attention_masks_stay_finite(
+    num_hidden_layers: int,
+    max_position_embeddings: int,
+    mask_kind: str,
+):
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
+        num_hidden_layers=num_hidden_layers,
+        max_position_embeddings=max_position_embeddings,
         relative_attention=True,
         pos_att_type="c2p|p2c",
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "stable"
     model = DebertaV2Model(cfg).eval()
 
+    if mask_kind == "random":
+        torch.manual_seed(7)
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-
-    with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-    assert torch.isfinite(out).all()
-
-
-def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
-    from deberta.modeling.deberta_v2_native import DebertaV2Model
-
-    cfg = DebertaV2Config(
-        vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="c2p|p2c",
-        type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
+    attention_mask = (
+        torch.randint(low=0, high=2, size=input_ids.shape, dtype=torch.long).to(torch.bool)
+        if mask_kind == "random"
+        else torch.zeros_like(input_ids, dtype=torch.bool)
     )
-    cfg.hf_attention_kernel = "stable"
-    model = DebertaV2Model(cfg).eval()
-
-    torch.manual_seed(7)
-    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    attention_mask = torch.randint(low=0, high=2, size=input_ids.shape, dtype=torch.long).to(torch.bool)
 
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -2333,22 +4150,11 @@ def test_native_hf_deberta_v2_stable_attention_random_masks_stay_finite():
 
 
 def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DisentangledSelfAttention
 
-    cfg = DebertaV2Config(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
+    cfg = make_native_deberta_config(
         relative_attention=False,
         pos_att_type="",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     attn = DisentangledSelfAttention(cfg).eval()
     x = torch.randn((1, 4, cfg.hidden_size), dtype=torch.float32)
@@ -2381,28 +4187,13 @@ def test_native_hf_deberta_v2_pairwise_mask_uses_diagonal_for_query_activity():
 
 
 def test_native_hf_deberta_v2_stable_compile_step_is_finite():
-    import pytest
-
-    pytest.importorskip("transformers")
-    if not hasattr(torch, "compile"):
-        pytest.skip("torch.compile not available")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
-        max_position_embeddings=16,
         relative_attention=True,
         pos_att_type="c2p|p2c",
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     cfg.hf_attention_kernel = "stable"
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
@@ -2419,25 +4210,17 @@ def test_native_hf_deberta_v2_stable_compile_step_is_finite():
         assert all(torch.isfinite(g).all().item() for g in grads)
 
 
-def test_native_hf_deberta_v2_forward_with_none_mask():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
+@pytest.mark.parametrize("relative_attention", [False, True], ids=["plain", "disentangled"])
+def test_native_hf_deberta_v2_forward_with_none_mask_matches_all_ones(relative_attention: bool):
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    extra = {"relative_attention": True, "pos_att_type": "c2p|p2c"} if relative_attention else {}
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
+        **extra,
     )
     model = DebertaV2Model(cfg).eval()
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
@@ -2453,24 +4236,13 @@ def test_native_hf_deberta_v2_forward_with_none_mask():
 
 
 def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
     )
     model = DebertaV2Model(cfg).eval()
 
@@ -2478,12 +4250,6 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
     mask_2d = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long)
     attn_mask_4d = model.encoder.get_attention_mask(mask_2d)
     assert attn_mask_4d.shape == (1, 1, 1, 8), f"Expected (1,1,1,8), got {attn_mask_4d.shape}"
-
-    # Conv mask extraction should still work.
-    conv_mask = model.encoder._input_mask_for_conv(attn_mask_4d)
-    assert conv_mask.shape == (1, 8)
-    assert conv_mask[0, 0].item() is True
-    assert conv_mask[0, 7].item() is False
 
     # Full forward with padding: padded positions must be zeroed, active positions finite.
     input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(1, 8), dtype=torch.long)
@@ -2501,45 +4267,20 @@ def test_native_hf_deberta_v2_padding_mask_avoids_quadratic_expansion():
     torch.testing.assert_close(out, out_dense, rtol=0.0, atol=0.0)
 
 
-def test_native_hf_deberta_v2_none_mask_matches_all_ones_with_relative_attention():
-    import pytest
-
-    pytest.importorskip("transformers")
-
-    from transformers import DebertaV2Config
-
+def test_native_hf_deberta_v2_rejects_conv_checkpoint_configs():
     from deberta.modeling.deberta_v2_native import DebertaV2Model
 
-    cfg = DebertaV2Config(
+    cfg = make_native_deberta_config(
         vocab_size=64,
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=64,
         max_position_embeddings=32,
-        relative_attention=True,
-        pos_att_type="c2p|p2c",
         type_vocab_size=0,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
+        conv_kernel_size=3,
     )
-    model = DebertaV2Model(cfg).eval()
-    input_ids = torch.randint(low=0, high=cfg.vocab_size, size=(2, 8), dtype=torch.long)
-    all_ones = torch.ones_like(input_ids, dtype=torch.bool)
-
-    with torch.no_grad():
-        out_none = model(input_ids=input_ids, attention_mask=None).last_hidden_state
-        out_ones = model(input_ids=input_ids, attention_mask=all_ones).last_hidden_state
-
-    assert out_none.shape == (2, 8, 32)
-    assert torch.isfinite(out_none).all()
-    torch.testing.assert_close(out_none, out_ones, rtol=0.0, atol=0.0)
+    with pytest.raises(ValueError, match="conv_kernel_size"):
+        DebertaV2Model(cfg)
 
 
 def test_rope_model_accepts_positional_input_ids_call():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
@@ -2568,9 +4309,6 @@ def test_rope_model_accepts_positional_input_ids_call():
 
 
 def test_rope_keel_default_alpha_matches_paper_contract():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEEncoder
 
@@ -2599,9 +4337,6 @@ def test_rope_keel_default_alpha_matches_paper_contract():
 
 
 def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPELayer
 
@@ -2648,9 +4383,6 @@ def test_rope_keel_learnable_alpha_is_independent_per_residual_sublayer():
 
 
 def test_rope_model_supports_output_hidden_states():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
@@ -2679,10 +4411,7 @@ def test_rope_model_supports_output_hidden_states():
     assert len(out_tuple[1]) == (cfg.num_hidden_layers + 1)
 
 
-def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
-    import pytest
-
-    pytest.importorskip("transformers")
+def test_pretrainer_missing_attention_mask_means_all_tokens_are_active():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -2758,15 +4487,11 @@ def test_pretrainer_ignores_pad_for_disc_loss_when_attention_mask_missing():
         disc_loss_weight=50.0,
     )
 
-    torch.testing.assert_close(
-        out_missing.disc_token_count, out_explicit.disc_token_count, rtol=0.0, atol=0.0
-    )
+    assert out_missing.disc_token_count.item() == input_ids.numel()
+    assert out_explicit.disc_token_count.item() == explicit_mask.sum().item()
 
 
-def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
-    import pytest
-
-    pytest.importorskip("transformers")
+def test_pretrainer_disc_loss_supervises_all_tokens_without_attention_mask():
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -2814,14 +4539,10 @@ def test_pretrainer_disc_loss_supervises_all_non_padding_tokens():
         gen_loss_weight=1.0,
         disc_loss_weight=50.0,
     )
-    expected_active = (input_ids != 0).sum()
-    assert int(out.disc_token_count.item()) == int(expected_active.item())
+    assert int(out.disc_token_count.item()) == input_ids.numel()
 
 
 def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_special(monkeypatch):
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
     from deberta.modeling.rtd import DebertaV3RTDPretrainer
@@ -2879,9 +4600,6 @@ def test_pretrainer_disc_active_keeps_all_non_padding_tokens_even_if_sampled_spe
 
 
 def test_rope_config_rejects_unknown_ffn_type():
-    import pytest
-
-    pytest.importorskip("transformers")
 
     from deberta.modeling.rope_encoder import DebertaRoPEConfig
 
@@ -2895,11 +4613,13 @@ def test_rotary_compile_mode_requires_prefilled_cache(monkeypatch):
     rope = rope_mod.RotaryEmbedding(dim=8, base=10_000.0)
     device = torch.device("cpu")
 
-    monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setattr(rope_mod, "is_torch_compiling", lambda: True)
     with pytest.raises(RuntimeError, match="not prefilled"):
         _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
 
     rope.prefill_cache(8, device=device, dtype=torch.float32)
+    assert rope._cache is not None
+    assert rope._cache_device == rope._cache.cos.device
     cos1, sin1 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     cos2, sin2 = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     assert cos1.data_ptr() == cos2.data_ptr()
@@ -2908,7 +4628,7 @@ def test_rotary_compile_mode_requires_prefilled_cache(monkeypatch):
     with pytest.raises(RuntimeError, match="too short"):
         _ = rope.get_cos_sin(9, device=device, dtype=torch.float32)
 
-    monkeypatch.setattr(rope_mod, "_is_torch_compiling", lambda: False)
+    monkeypatch.setattr(rope_mod, "is_torch_compiling", lambda: False)
     _ = rope.get_cos_sin(8, device=device, dtype=torch.float32)
     assert rope._cache is not None
 
@@ -2917,10 +4637,14 @@ def test_rotary_apply_full_dim_matches_reference():
     from deberta.modeling.rope import RotaryEmbedding, _rotate_half
 
     rope = RotaryEmbedding(dim=8, base=10_000.0)
+    visited: list[torch.nn.Module] = []
+    assert rope.apply(visited.append) is rope
+    assert visited == [rope]
+
     q = torch.randn((2, 3, 5, 8), dtype=torch.float32)
     k = torch.randn((2, 3, 5, 8), dtype=torch.float32)
 
-    q_out, k_out = rope.apply(q, k)
+    q_out, k_out = rope.apply_rotary(q, k)
 
     cos, sin = rope.get_cos_sin(q.shape[-2], device=q.device, dtype=q.dtype)
     cos = cos[None, None, :, :]
@@ -2953,17 +4677,59 @@ def test_rotary_embedding_uses_full_head_dim_for_partial_rope_pct():
     torch.testing.assert_close(rope.inv_freq, expected)
 
 
-def test_rmsnorm_matches_reference_division_form():
-    from deberta.modeling.norm import RMSNorm
+def test_rope_embeddings_rmsnorm_matches_torch_reference(tiny_rope_config_factory):
+    from deberta.modeling.rope_encoder import DebertaRoPEEmbeddings
 
-    torch.manual_seed(0)
-    x = torch.randn((3, 5, 16), dtype=torch.float32)
-    layer = RMSNorm(hidden_size=16, eps=1e-6, elementwise_affine=True).eval()
+    cfg = tiny_rope_config_factory(norm_eps=1e-6)
+    embeddings = DebertaRoPEEmbeddings(cfg).eval()
+    reference = torch.nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps).eval()
+    reference.load_state_dict(embeddings.norm.state_dict())
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
 
     with torch.no_grad():
-        out = layer(x)
-        x_float = x.float()
-        rms = x_float.pow(2).mean(dim=-1, keepdim=True).add(layer.eps).sqrt()
-        ref = (x_float / rms).to(dtype=x.dtype) * layer.weight.to(dtype=x.dtype)
+        actual = embeddings(input_ids)
+        expected = reference(embeddings.word_embeddings(input_ids))
 
-    torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-7)
+    assert isinstance(embeddings.norm, torch.nn.RMSNorm)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_mixed_precision_rmsnorm_preserves_fp32_master_weight_and_gradient():
+    from deberta.modeling.norms import MixedPrecisionRMSNorm
+
+    norm = MixedPrecisionRMSNorm(16, eps=1e-6)
+    hidden_states = torch.randn(2, 3, 16, dtype=torch.bfloat16, requires_grad=True)
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(0.5, 1.5, steps=16))
+        expected = torch.nn.functional.rms_norm(
+            hidden_states.float(),
+            norm.normalized_shape,
+            norm.weight,
+            norm.eps,
+        ).to(dtype=hidden_states.dtype)
+
+    actual = norm(hidden_states)
+    actual.float().sum().backward()
+
+    assert actual.dtype == torch.bfloat16
+    assert norm.weight.dtype == torch.float32
+    assert norm.weight.grad is not None
+    assert norm.weight.grad.dtype == torch.float32
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=8e-3, atol=1.6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused RMSNorm dispatch.")
+def test_mixed_precision_rmsnorm_uses_fused_cuda_dispatch_without_dtype_warning():
+    import warnings
+
+    from deberta.modeling.norms import MixedPrecisionRMSNorm
+
+    norm = MixedPrecisionRMSNorm(768, eps=1e-6, device="cuda")
+    hidden_states = torch.randn(2, 32, 768, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        output = norm(hidden_states)
+
+    assert "FusedRmsNorm" in type(output.grad_fn).__name__
+    assert not any("Mismatch dtype between input and weight" in str(item.message) for item in caught)

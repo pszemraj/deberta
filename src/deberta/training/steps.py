@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Iterator
 from contextlib import suppress
 from typing import Any
 
 import torch
 
+from deberta.modeling.mask_utils import FlashBatchMeta
 from deberta.training.loop_utils import (
     _count_input_tokens_for_batch,
     _count_rtd_tokens_for_batch,
@@ -46,17 +46,6 @@ def _global_grad_l2_norm(model: torch.nn.Module) -> float:
         return 0.0
     total = torch.stack(sq_norms).sum()
     return float(total.sqrt().item())
-
-
-def _has_nonfinite_grad_norm_any_rank(*, accelerator: Any, grad_norm: float) -> bool:
-    """Return whether any rank observed a non-finite gradient norm.
-
-    :param Any accelerator: Accelerator-like runtime object.
-    :param float grad_norm: Local gradient L2 norm.
-    :return bool: True when at least one rank reports non-finite norm.
-    """
-    local_flag = not math.isfinite(float(grad_norm))
-    return _any_rank_flag_true(accelerator=accelerator, flag=local_flag)
 
 
 def _any_rank_flag_true(*, accelerator: Any, flag: bool) -> bool:
@@ -231,21 +220,18 @@ def _collect_ga_window(
     train_iter: Iterator[dict[str, torch.Tensor]],
     ga_steps: int,
     token_weighted_ga: bool,
-    disc_pad_token_id: int | None,
-    include_has_gen_targets: bool,
     default_unweighted_token_count: float,
-) -> tuple[list[Any], int, float, float, float]:
+) -> tuple[list[tuple[dict[str, torch.Tensor], float, float]], int, float, float, float]:
     """Collect one accumulation window and per-window token counts.
 
     :param Iterator[dict[str, torch.Tensor]] train_iter: Batch iterator.
     :param int ga_steps: Accumulation steps per window.
     :param bool token_weighted_ga: Token-weighted GA toggle.
-    :param int | None disc_pad_token_id: Optional discriminator pad token id.
-    :param bool include_has_gen_targets: Whether to append per-batch generator-target flags.
     :param float default_unweighted_token_count: Fallback token count when token weighting is disabled.
-    :return tuple[list[Any], int, float, float, float]: Window payload and local token counters.
+    :return tuple[list[tuple[dict[str, torch.Tensor], float, float]], int, float, float, float]:
+        Window payload and local token counters.
     """
-    window: list[Any] = []
+    window: list[tuple[dict[str, torch.Tensor], float, float]] = []
     consumed_in_window = 0
     local_window_input_tokens = 0.0
     local_gen_tokens = 0.0
@@ -257,21 +243,14 @@ def _collect_ga_window(
         local_window_input_tokens += _count_input_tokens_for_batch(batch)
 
         if token_weighted_ga:
-            gen_count, disc_count = _count_rtd_tokens_for_batch(
-                batch,
-                pad_token_id=disc_pad_token_id,
-            )
+            gen_count, disc_count = _count_rtd_tokens_for_batch(batch)
             local_gen_tokens += gen_count
             local_disc_tokens += disc_count
         else:
             gen_count = float(default_unweighted_token_count)
             disc_count = float(default_unweighted_token_count)
 
-        if include_has_gen_targets:
-            has_gen_targets = bool(batch["labels"].ne(-100).any().item())
-            window.append((batch, gen_count, disc_count, has_gen_targets))
-        else:
-            window.append((batch, gen_count, disc_count))
+        window.append((batch, gen_count, disc_count))
 
     return (
         window,
@@ -340,11 +319,14 @@ def _resolve_window_token_weights(
     )
 
 
-def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     """Move all batch tensors onto a device.
 
-    :param dict[str, torch.Tensor] batch: Tensor batch mapping.
+    :param dict[str, Any] batch: Batch mapping.
     :param torch.device device: Destination device.
-    :return dict[str, torch.Tensor]: Batch placed on ``device``.
+    :return dict[str, Any]: Batch placed on ``device``.
     """
-    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+    return {
+        k: v.to(device, non_blocking=True) if isinstance(v, (torch.Tensor, FlashBatchMeta)) else v
+        for k, v in batch.items()
+    }

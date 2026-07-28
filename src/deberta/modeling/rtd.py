@@ -38,103 +38,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deberta.modeling.activations import get_act_fn
-from deberta.modeling.mask_utils import normalize_keep_mask
-from deberta.modeling.norm import RMSNorm
+from deberta.modeling.mask_utils import (
+    FlashBatchMeta,
+    expand_keep_mask_to_4d,
+    is_pairwise_mask,
+)
+from deberta.modeling.mask_utils import (
+    attention_mask_to_active_tokens as _attention_mask_to_active_tokens,
+)
+from deberta.modeling.norms import MixedPrecisionRMSNorm
 
 try:
     from torch.distributed.tensor import DTensor as _TorchDTensor
 except Exception:  # pragma: no cover - optional distributed dependency
     _TorchDTensor = None
-
-
-# -----------------------------------------------------------------------------
-# Mask utilities
-# -----------------------------------------------------------------------------
-
-
-def attention_mask_to_active_tokens(
-    *,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    pad_token_id: int | None,
-) -> torch.Tensor:
-    """Convert optional attention mask variants into a 2D active-token mask.
-
-    We support the mask layouts used throughout this codebase:
-    - (B,S) key-padding mask
-    - (B,S,S) pairwise keep mask
-    - (B,H,S,S) head-specific keep mask
-
-    :param torch.Tensor input_ids: Input ids with shape ``(B,S)``.
-    :param torch.Tensor | None attention_mask: Optional keep mask in rank-2/3/4 layout.
-    :param int | None pad_token_id: Optional padding id used when inferring activity.
-    :return torch.Tensor: Boolean active-token mask with shape ``(B,S)``.
-    """
-
-    if attention_mask is None:
-        if pad_token_id is None:
-            return torch.ones_like(input_ids, dtype=torch.bool)
-        return input_ids.ne(int(pad_token_id))
-
-    mask = normalize_keep_mask(attention_mask)
-    if mask.ndim == 2:
-        return mask
-
-    if mask.ndim == 3:
-        # Diagonal encodes per-token query activity.
-        active = torch.diagonal(mask, dim1=-2, dim2=-1)
-        if pad_token_id is not None:
-            active = active & input_ids.ne(int(pad_token_id))
-        return active
-
-    if mask.ndim == 4:
-        # Reduce head dimension if present.
-        squeezed = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if squeezed.shape[-2] == 1:
-            # Broadcast path: (B,1,1,S) -> (B,S)
-            active = squeezed[:, 0, :]
-        else:
-            active = torch.diagonal(squeezed, dim1=-2, dim2=-1)
-        if pad_token_id is not None:
-            active = active & input_ids.ne(int(pad_token_id))
-        return active
-
-    raise ValueError("attention_mask must have shape (B,S), (B,S,S), or (B,H,S,S).")
-
-
-def _ensure_emd_pairwise_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Convert mask to a DeBERTa-style pairwise keep mask (B,1,S,S).
-
-    The original DeBERTa EMD code expands 2D input masks to a full pairwise mask
-    via an outer product. This is *not* strictly necessary with our attention
-    implementation (which supports broadcast masks), but keeping this conversion
-    improves parity.
-
-    :param torch.Tensor attention_mask: Input keep mask in rank-2/3/4 layout.
-    :return torch.Tensor: Pairwise keep mask with shape ``(B,1,S,S)``.
-    """
-
-    m = normalize_keep_mask(attention_mask)
-
-    # 2D: (B,S) -> (B,1,S,S) using outer product.
-    if m.ndim == 2:
-        # (B,1,1,S)
-        ext = m[:, None, None, :]
-        # Outer product: key mask * query mask.
-        # (B,1,1,S) * (B,1,S,1) -> (B,1,S,S)
-        return ext & ext.transpose(-1, -2)
-
-    # 3D: (B,S,S) -> (B,1,S,S)
-    if m.ndim == 3:
-        return m[:, None, :, :]
-
-    # 4D: (B,H,S,S) -> (B,1,S,S)
-    if m.ndim == 4:
-        if m.shape[1] == 1:
-            return m
-        return m.any(dim=1, keepdim=True)
-
-    raise ValueError(f"Unsupported attention_mask rank for EMD: {m.ndim}")
 
 
 def _is_sharded_dtensor(tensor: torch.Tensor) -> bool:
@@ -173,13 +90,11 @@ class _SyncedBufferEmbedding(nn.Module):
         *,
         init_weight: torch.Tensor,
         padding_idx: int | None,
-        add_bias: bool,
     ) -> None:
         """Initialize synced embedding buffers.
 
         :param torch.Tensor init_weight: Source embedding matrix.
         :param int | None padding_idx: Optional padding index.
-        :param bool add_bias: Whether to create a trainable additive bias table.
         """
         super().__init__()
         if not isinstance(init_weight, torch.Tensor) or init_weight.ndim != 2:
@@ -189,11 +104,7 @@ class _SyncedBufferEmbedding(nn.Module):
         self.base_weight = nn.Parameter(init_weight.detach().clone(), requires_grad=False)
         self.padding_idx = int(padding_idx) if padding_idx is not None else None
 
-        self.bias: torch.nn.Parameter | None
-        if add_bias:
-            self.bias = nn.Parameter(torch.zeros_like(init_weight))
-        else:
-            self.bias = None
+        self.bias = nn.Parameter(torch.zeros_like(init_weight))
 
     @torch.no_grad()
     def sync_from(self, weight: torch.Tensor) -> None:
@@ -221,9 +132,7 @@ class _SyncedBufferEmbedding(nn.Module):
         :return torch.Tensor: Embedded states.
         """
         out = F.embedding(input_ids, self.base_weight, padding_idx=self.padding_idx)
-        if self.bias is not None:
-            out = out + F.embedding(input_ids, self.bias, padding_idx=self.padding_idx)
-        return out
+        return out + F.embedding(input_ids, self.bias, padding_idx=self.padding_idx)
 
 
 # -----------------------------------------------------------------------------
@@ -250,16 +159,13 @@ class MLMTransform(nn.Module):
         hidden_size = int(config.hidden_size)
         embedding_size = int(getattr(config, "embedding_size", hidden_size))
 
-        self.hidden_size = hidden_size
-        self.embedding_size = embedding_size
-
         self.dense = nn.Linear(hidden_size, embedding_size)
         self.act = get_act_fn(getattr(config, "hidden_act", "gelu"))
 
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", False)):
             # RMSNorm is a modernization option. For strict DeBERTa parity, keep this False.
-            self.norm = RMSNorm(embedding_size, eps=eps)
+            self.norm = MixedPrecisionRMSNorm(embedding_size, eps=eps)
         else:
             self.norm = nn.LayerNorm(embedding_size, eps=eps)
 
@@ -276,72 +182,61 @@ class MLMTransform(nn.Module):
 
 
 class MaskedLMHead(nn.Module):
-    """Masked LM head with optional weight tying.
+    """Masked LM head tied to the generator input word embeddings."""
 
-    Tied mode:
-        logits = (transform(h) @ word_embedding_weight.T) + bias
-
-    Untied mode:
-        logits = decoder(transform(h))
-
-    Notes:
-        - We keep the bias as a dedicated Parameter in tied mode.
-        - We avoid casting the full embedding matrix under mixed precision; we cast
-          activations when needed.
-    """
-
-    def __init__(self, config: Any, *, tie_word_embeddings: bool = True) -> None:
+    def __init__(self, config: Any) -> None:
         """Initialize MLM head.
 
         :param Any config: Backbone config with vocab and hidden sizes.
-        :param bool tie_word_embeddings: Whether to project with tied input embeddings.
         """
         super().__init__()
         self.transform = MLMTransform(config)
-        self.vocab_size = int(config.vocab_size)
+        self.bias = nn.Parameter(torch.zeros(int(config.vocab_size)))
 
-        self.tie_word_embeddings = bool(tie_word_embeddings)
-        if self.tie_word_embeddings:
-            self.decoder = None
-            self.bias = nn.Parameter(torch.zeros(self.vocab_size))
-        else:
-            self.decoder = nn.Linear(self.transform.embedding_size, self.vocab_size, bias=True)
-            self.bias = self.decoder.bias
-
-    def forward(
-        self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *, word_embedding_weight: torch.Tensor) -> torch.Tensor:
         """Project masked hidden states to vocabulary logits.
 
         :param torch.Tensor hidden_states: Hidden states for prediction positions.
-        :param torch.Tensor | None word_embedding_weight: Optional tied embedding matrix.
+        :param torch.Tensor word_embedding_weight: Tied input embedding matrix.
         :return torch.Tensor: Vocabulary logits.
         """
         x = self.transform(hidden_states)
 
-        if self.tie_word_embeddings:
-            if word_embedding_weight is None:
-                raise RuntimeError(
-                    "MaskedLMHead requires `word_embedding_weight` when tie_word_embeddings=True."
-                )
-            if word_embedding_weight.shape[1] != x.shape[-1]:
-                raise RuntimeError(
-                    "Tied word_embedding_weight hidden size mismatch: "
-                    f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
-                )
+        if word_embedding_weight.shape[1] != x.shape[-1]:
+            raise RuntimeError(
+                "Tied word_embedding_weight hidden size mismatch: "
+                f"got {word_embedding_weight.shape[1]}, expected {x.shape[-1]}."
+            )
 
-            w = word_embedding_weight
-            b = self.bias
-            # Never cast full embedding matrix; cast activations if needed.
-            if not torch.is_autocast_enabled() and x.dtype != w.dtype:
-                x = x.to(dtype=w.dtype)
-            if b.dtype != w.dtype:
-                b = b.to(dtype=w.dtype)
-            return F.linear(x, w, b)
+        w = word_embedding_weight
+        b = self.bias
+        # Never cast the full embedding matrix; cast activations if needed.
+        if not torch.is_autocast_enabled() and x.dtype != w.dtype:
+            x = x.to(dtype=w.dtype)
+        if b.dtype != w.dtype:
+            b = b.to(dtype=w.dtype)
+        return F.linear(x, w, b)
 
-        if self.decoder is None:
-            raise RuntimeError("MaskedLMHead decoder is not initialized.")
-        return self.decoder(x)
+
+@torch.no_grad()
+def _initialize_new_head(*, head: nn.Module, config: Any) -> None:
+    """Initialize a newly attached task head from repo-owned config rules.
+
+    :param nn.Module head: Newly constructed task head.
+    :param Any config: Head config providing ``initializer_range``.
+    """
+
+    initializer_range = float(getattr(config, "initializer_range", 0.02))
+    for module in head.modules():
+        if isinstance(module, nn.Linear):
+            module.weight.normal_(mean=0.0, std=initializer_range)
+            if module.bias is not None:
+                module.bias.zero_()
+        elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+            if module.weight is not None:
+                module.weight.fill_(1.0)
+            if getattr(module, "bias", None) is not None:
+                module.bias.zero_()
 
 
 class EnhancedMaskDecoder(nn.Module):
@@ -362,14 +257,12 @@ class EnhancedMaskDecoder(nn.Module):
         still be compiled individually if desired)
     """
 
-    def __init__(self, config: Any, *, num_last_layer_passes: int = 2) -> None:
+    def __init__(self, *, num_last_layer_passes: int = 2) -> None:
         """Initialize Enhanced Mask Decoder.
 
-        :param Any config: Generator backbone config.
         :param int num_last_layer_passes: Number of last-layer EMD reapplication passes.
         """
         super().__init__()
-        self.position_biased_input = bool(getattr(config, "position_biased_input", True))
         self.num_passes = int(num_last_layer_passes)
         if self.num_passes < 1:
             raise ValueError("num_last_layer_passes must be >= 1")
@@ -423,6 +316,7 @@ class EnhancedMaskDecoder(nn.Module):
         encoder: nn.Module,
         position_ids: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> torch.Tensor:
         """Return hidden states for masked positions, using EMD when applicable.
 
@@ -442,15 +336,14 @@ class EnhancedMaskDecoder(nn.Module):
                 Optional position ids (B,S). If None, we create a 0..S-1 range.
             relative_pos:
                 Optional precomputed relative-position ids (for disentangled attention).
+            flash_meta:
+                Optional FlashDeBERTa metadata bundle for the reused last layer.
 
         Returns:
             Tensor (N,H) of contextual states for masked positions.
         """
 
-        if isinstance(encoder_hidden_states, tuple):
-            hs = list(encoder_hidden_states)
-        else:
-            hs = list(encoder_hidden_states)
+        hs = list(encoder_hidden_states)
 
         if len(hs) < 2:
             raise RuntimeError(
@@ -466,15 +359,6 @@ class EnhancedMaskDecoder(nn.Module):
             last = hs[-1]
             return last.reshape(-1, last.shape[-1]).index_select(0, masked_idx)
 
-        # Parity with the original implementation:
-        # - KV states come from the penultimate layer.
-        # - For position_biased_input=True, just use the last layer.
-        if self.position_biased_input:
-            last = hs[-1]
-            flat = last.reshape(-1, last.shape[-1])
-            return flat.index_select(0, masked_idx)
-
-        # --- EMD path (position_biased_input=False) ---
         # KV from penultimate layer.
         kv_states = hs[-2]
         bsz, seq_len, hidden_size = kv_states.shape
@@ -484,10 +368,16 @@ class EnhancedMaskDecoder(nn.Module):
             # Keep true unmasked fast-path behavior. Materializing an explicit
             # all-True (B,1,S,S) keep mask is equivalent but needlessly O(S^2).
             attn = None
+        elif flash_meta is not None:
+            attn = expand_keep_mask_to_4d(attention_mask)
         else:
-            attn = _ensure_emd_pairwise_attention_mask(attention_mask)
+            # Match the original DeBERTa EMD outer-product convention.
+            attn = expand_keep_mask_to_4d(attention_mask, pairwise_2d=True)
 
-        # Position ids default: 0..S-1.
+        # Position ids default: 0..S-1. Correct only for right-aligned rows;
+        # left padding would shift every content token's absolute position, so
+        # the shipped collator rejects left-padded rows outside doc-block
+        # packing (which supplies explicit document-local position_ids).
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=kv_states.device).unsqueeze(0).expand(bsz, -1)
         else:
@@ -497,13 +387,8 @@ class EnhancedMaskDecoder(nn.Module):
         z_states = self._position_states(
             embeddings=embeddings, position_ids=position_ids, hidden_size=hidden_size
         )
-        # Parity with upstream DeBERTa EMD path: normalize position states with
-        # embedding LayerNorm before combining with penultimate hidden states.
-        emb_ln = getattr(embeddings, "LayerNorm", None)
-        if callable(emb_ln):
-            z_states = emb_ln(z_states)
-
-        # Initial query = z + KV (matches original `z_states += hidden_states`).
+        # EMD consumes the raw, optionally projected position embedding. The
+        # input embedding LayerNorm belongs to the token-input path, not z.
         query_states = z_states + kv_states
 
         # Resolve relative-position ids and relative embedding table if available.
@@ -524,23 +409,25 @@ class EnhancedMaskDecoder(nn.Module):
             raise RuntimeError("EnhancedMaskDecoder expects encoder.layer to be a non-empty sequence")
         last_layer = layers[-1]
 
-        outputs: list[torch.Tensor] = []
         for _ in range(self.num_passes):
             # DebertaV2Layer signature: (hidden_states, attention_mask, ..., query_states=...)
+            last_layer_kwargs: dict[str, Any] = {
+                "output_attentions": False,
+                "query_states": query_states,
+                "relative_pos": rel_pos,
+                "rel_embeddings": rel_embeddings,
+            }
+            if flash_meta is not None:
+                last_layer_kwargs["flash_meta"] = flash_meta
             out, _att = last_layer(
                 kv_states,
                 attn,
-                output_attentions=False,
-                query_states=query_states,
-                relative_pos=rel_pos,
-                rel_embeddings=rel_embeddings,
+                **last_layer_kwargs,
             )
             query_states = out
-            outputs.append(out)
 
         # Gather masked positions from the final pass.
-        final = outputs[-1]
-        flat = final.reshape(-1, final.shape[-1])
+        flat = query_states.reshape(-1, query_states.shape[-1])
         return flat.index_select(0, masked_idx)
 
 
@@ -577,50 +464,67 @@ class RTDHead(nn.Module):
 
         eps = float(getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-6)))
         if bool(getattr(config, "use_rmsnorm_heads", False)):
-            self.norm = RMSNorm(hidden_size, eps=eps)
+            self.norm = MixedPrecisionRMSNorm(hidden_size, eps=eps)
         else:
             self.norm = nn.LayerNorm(hidden_size, eps=eps)
 
         self.classifier = nn.Linear(hidden_size, 1)
 
     @staticmethod
-    def _use_global_cls_context(attention_mask: torch.Tensor | None) -> bool:
-        """Return whether global CLS conditioning is safe for this attention mask.
+    def _requires_document_context(
+        attention_mask: torch.Tensor | None,
+        flash_meta: FlashBatchMeta | None = None,
+    ) -> bool:
+        """Return whether the attention graph encodes multiple documents.
 
-        Pairwise masks with an explicit query axis encode per-query visibility
-        (for example packed doc-block masks). In that regime, adding one global
-        CLS vector to all tokens would reintroduce cross-segment information flow.
+        Pairwise masks are the eager/dense representation of document blocking;
+        ragged Flash routes carry the same contract in ``FlashBatchMeta``.
 
         :param torch.Tensor | None attention_mask: Optional attention keep mask.
-        :return bool: ``True`` when global CLS conditioning should be applied.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :return bool: Whether a per-token document context map is required.
         """
-        if attention_mask is None:
+        if flash_meta is not None and flash_meta.is_cross_document():
             return True
-
-        mask = attention_mask
-        if mask.ndim == 4:
-            mask = mask[:, 0] if mask.shape[1] == 1 else mask.any(dim=1)
-        if mask.ndim == 3 and mask.shape[-2] != 1:
+        if attention_mask is None:
             return False
-        return True
+        seq_len = int(attention_mask.shape[-1])
+        return is_pairwise_mask(attention_mask, query_len=seq_len, key_len=seq_len)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        doc_context_index: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> torch.Tensor:
         """Compute per-token replacement logits.
 
         :param torch.Tensor hidden_states: Discriminator hidden states ``(B,S,H)``.
         :param torch.Tensor | None attention_mask: Optional discriminator attention mask.
+        :param torch.Tensor | None doc_context_index: Optional CLS index per token in ``(B,S)``.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
+        :raises RuntimeError: If document-block attention lacks a context map.
         :return torch.Tensor: Per-token logits ``(B,S)``.
         """
-        # hidden_states: (B,S,H)
-        if self._use_global_cls_context(attention_mask):
-            ctx = hidden_states[:, 0:1, :]  # (B,1,H)
-            x = self.norm(hidden_states + ctx)
+        hidden_size = int(hidden_states.shape[-1])
+        if doc_context_index is None:
+            if self._requires_document_context(attention_mask, flash_meta=flash_meta):
+                raise RuntimeError(
+                    "Packed RTD attention requires doc_context_index so each token uses its document CLS."
+                )
+            # Position 0 must hold each row's context token (CLS). Left-padded
+            # rows would read a PAD hidden state here; the shipped collator
+            # rejects them outside doc-block packing, and this compiled forward
+            # cannot re-validate per batch without a device sync.
+            context = hidden_states[:, 0:1, :]
         else:
-            x = self.norm(hidden_states)
+            gather_index = doc_context_index.to(device=hidden_states.device, dtype=torch.long)
+            context = hidden_states.gather(
+                dim=1,
+                index=gather_index.unsqueeze(-1).expand(-1, -1, hidden_size),
+            )
+        x = self.norm(hidden_states + context)
         x = self.dense(x)
         x = self.act(x)
         return self.classifier(x).squeeze(-1)  # (B,S)
@@ -683,8 +587,6 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_config: Any,
         gen_config: Any,
         embedding_sharing: str = "gdes",
-        tie_generator_word_embeddings: bool = True,
-        use_enhanced_mask_decoder: bool = True,
         additional_forbidden_token_ids: Iterable[int] | None = None,
     ) -> None:
         """Initialize RTD pretrainer wrapper.
@@ -694,9 +596,8 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param Any disc_config: Discriminator config.
         :param Any gen_config: Generator config.
         :param str embedding_sharing: Embedding-sharing policy (none|es|gdes).
-        :param bool tie_generator_word_embeddings: Whether MLM head ties word embeddings.
-        :param bool use_enhanced_mask_decoder: Whether EMD is enabled when applicable.
         :param Iterable[int] | None additional_forbidden_token_ids: Extra ids excluded from sampling.
+        :raises ValueError: If generator ``z_steps`` conflicts with Enhanced Mask Decoding.
         """
         super().__init__()
         self.disc_config = disc_config
@@ -705,29 +606,45 @@ class DebertaV3RTDPretrainer(nn.Module):
         self.generator = generator_backbone
         self.discriminator = discriminator_backbone
 
+        # Builder validation gives config-loaded runs an early error; keep this
+        # constructor invariant for callers that assemble backbones directly.
+        pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
+        z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
+        if not pos_biased and z_steps > 1:
+            raise ValueError(
+                "RTD Enhanced Mask Decoding is not equivalent to backbone z_steps; "
+                "set generator z_steps=0 when position_biased_input=false."
+            )
+        self._use_emd = not pos_biased
+
         # Generator heads
-        self.generator_lm_head = MaskedLMHead(gen_config, tie_word_embeddings=tie_generator_word_embeddings)
+        self.generator_lm_head = MaskedLMHead(gen_config)
+        _initialize_new_head(
+            head=self.generator_lm_head,
+            config=gen_config,
+        )
 
         # EMD module (only active when gen_config.position_biased_input=False)
-        self.use_enhanced_mask_decoder = bool(use_enhanced_mask_decoder)
-        self.enhanced_mask_decoder = EnhancedMaskDecoder(gen_config, num_last_layer_passes=2)
+        self.enhanced_mask_decoder = EnhancedMaskDecoder(num_last_layer_passes=2)
 
         # Discriminator head
         self.discriminator_head = RTDHead(disc_config)
+        _initialize_new_head(
+            head=self.discriminator_head,
+            config=disc_config,
+        )
 
         self.embedding_sharing = str(embedding_sharing or "none")
 
         # Special ids excluded from generator sampling.
-        self._forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids(
+        forbidden_sample_token_ids = self._collect_forbidden_sample_token_ids(
             additional_forbidden_token_ids=additional_forbidden_token_ids
         )
 
         vocab_size = int(getattr(self.gen_config, "vocab_size", 0) or 0)
         self.register_buffer(
             "_forbidden_sample_token_mask",
-            self._build_forbidden_token_mask(
-                vocab_size=vocab_size, forbidden_ids=self._forbidden_sample_token_ids
-            ),
+            self._build_forbidden_token_mask(vocab_size=vocab_size, forbidden_ids=forbidden_sample_token_ids),
             persistent=False,
         )
 
@@ -868,7 +785,12 @@ class DebertaV3RTDPretrainer(nn.Module):
             for attr in attrs:
                 gen_mod = getattr(gen_embeddings, attr, None)
                 disc_mod = getattr(disc_embeddings, attr, None)
-                if gen_mod is None or disc_mod is None:
+                if (gen_mod is None) != (disc_mod is None):
+                    raise ValueError(
+                        f"Cannot share embeddings for '{attr}': generator and discriminator "
+                        "must either both materialize the table or both omit it."
+                    )
+                if gen_mod is None:
                     continue
                 gw = _validate(attr, gen_mod, disc_mod)
                 # Keep a true Parameter alias for strict ES semantics; optimizer
@@ -880,11 +802,16 @@ class DebertaV3RTDPretrainer(nn.Module):
         for attr in attrs:
             gen_mod = getattr(gen_embeddings, attr, None)
             disc_mod = getattr(disc_embeddings, attr, None)
-            if gen_mod is None or disc_mod is None:
+            if (gen_mod is None) != (disc_mod is None):
+                raise ValueError(
+                    f"Cannot share embeddings for '{attr}': generator and discriminator "
+                    "must either both materialize the table or both omit it."
+                )
+            if gen_mod is None:
                 continue
             gw = _validate(attr, gen_mod, disc_mod)
 
-            synced = _SyncedBufferEmbedding(init_weight=gw, padding_idx=_padding_idx(disc_mod), add_bias=True)
+            synced = _SyncedBufferEmbedding(init_weight=gw, padding_idx=_padding_idx(disc_mod))
             setattr(disc_embeddings, attr, synced)
             self._gdes_synced_embeddings.append((attr, synced, gen_mod))
 
@@ -951,34 +878,22 @@ class DebertaV3RTDPretrainer(nn.Module):
         if temp <= 0:
             raise ValueError("sampling_temperature must be > 0")
 
-        x = logits.float() / temp
+        x = logits.float()
         if forbidden_vocab_mask is not None and forbidden_vocab_mask.numel() != 0:
             if forbidden_vocab_mask.device != x.device:
                 forbidden_vocab_mask = forbidden_vocab_mask.to(device=x.device)
             mask = forbidden_vocab_mask.to(dtype=torch.bool)
-            if mask.ndim == 1:
-                if int(mask.shape[0]) != int(x.shape[-1]):
-                    raise ValueError(
-                        "forbidden_vocab_mask length must match logits vocabulary dimension: "
-                        f"{int(mask.shape[0])} vs {int(x.shape[-1])}."
-                    )
-            else:
-                if int(mask.shape[-1]) != int(x.shape[-1]):
-                    raise ValueError(
-                        "forbidden_vocab_mask last dimension must match logits vocabulary dimension: "
-                        f"{int(mask.shape[-1])} vs {int(x.shape[-1])}."
-                    )
-                try:
-                    mask = mask.expand_as(x)
-                except RuntimeError as exc:
-                    raise ValueError(
-                        "forbidden_vocab_mask with rank > 1 must be broadcastable to logits."
-                    ) from exc
-            x = x.masked_fill(mask, -1e9)
+            if mask.ndim != 1 or int(mask.shape[0]) != int(x.shape[-1]):
+                raise ValueError(
+                    "forbidden_vocab_mask must have shape (vocab_size,); "
+                    f"got {tuple(mask.shape)} for vocabulary size {int(x.shape[-1])}."
+                )
+            x = x.masked_fill(mask, float("-inf"))
 
-        # Gumbel noise
-        u = torch.rand_like(x).clamp_(min=1e-6, max=1.0 - 1e-6)
-        g = -torch.log(-torch.log(u))
+        # Center before temperature scaling so accepted positive temperatures cannot
+        # overflow the winning logit. Exponential noise is an unclipped Gumbel draw.
+        x = (x - x.amax(dim=-1, keepdim=True)) / temp
+        g = -torch.empty_like(x).exponential_().log()
         return torch.argmax(x + g, dim=-1)
 
     # ------------------------------
@@ -992,7 +907,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> RTDGeneratorPhaseOutput:
         """Run generator forward/corruption only, returning discriminator targets.
 
@@ -1000,7 +917,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor labels: MLM labels with ``-100`` ignore index.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional document-local position ids.
         :param float sampling_temperature: Generator sampling temperature.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return RTDGeneratorPhaseOutput: Generator loss and corruption artifacts.
         """
 
@@ -1014,14 +933,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         masked_idx = torch.nonzero(masked_flat, as_tuple=False).squeeze(-1)  # (N,)
         gen_token_count = masked_flat.sum().to(dtype=torch.float32)
 
-        # EMD is only applicable for DeBERTa-v2/v3 when position_biased_input=False.
-        #
-        # When the generator backbone already applies iterative last-layer passes
-        # via z_steps>1, its output is already in the EMD-style regime; running the
-        # standalone EMD module again would double-apply that path.
-        pos_biased = bool(getattr(self.gen_config, "position_biased_input", True))
-        z_steps = int(getattr(self.generator, "z_steps", getattr(self.gen_config, "z_steps", 0)) or 0)
-        use_emd = bool(self.use_enhanced_mask_decoder) and (not pos_biased) and z_steps <= 1
+        # EMD is the RTD objective-owned decoder whenever absolute positions
+        # are absent from the generator input embedding.
+        use_emd = self._use_emd
 
         gen_forward_kwargs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -1029,6 +943,10 @@ class DebertaV3RTDPretrainer(nn.Module):
             "token_type_ids": token_type_ids,
             "return_dict": True,
         }
+        if position_ids is not None:
+            gen_forward_kwargs["position_ids"] = position_ids
+        if flash_meta is not None:
+            gen_forward_kwargs["flash_meta"] = flash_meta
         if use_emd:
             gen_forward_kwargs["output_hidden_states"] = True
 
@@ -1055,6 +973,8 @@ class DebertaV3RTDPretrainer(nn.Module):
                 attention_mask=attention_mask,
                 embeddings=self.generator.embeddings,
                 encoder=self.generator.encoder,
+                position_ids=position_ids,
+                flash_meta=flash_meta,
             )
         else:
             hidden = gen_out.last_hidden_state
@@ -1066,12 +986,15 @@ class DebertaV3RTDPretrainer(nn.Module):
 
         word_w = self._get_generator_word_embedding_weight()
         gen_logits = self.generator_lm_head(gen_masked_hidden, word_embedding_weight=word_w)
-        gen_loss = F.cross_entropy(gen_logits.float(), masked_labels)
+        # Float once and share: CE and sampling would otherwise each materialize
+        # their own (N, vocab) fp32 copy at peak memory.
+        gen_logits_f = gen_logits.float()
+        gen_loss = F.cross_entropy(gen_logits_f, masked_labels)
 
         with torch.no_grad():
             forbidden_mask = getattr(self, "_forbidden_sample_token_mask", None)
             sampled = self._gumbel_sample(
-                gen_logits,
+                gen_logits_f,
                 temperature=sampling_temperature,
                 forbidden_vocab_mask=forbidden_mask,
             ).to(dtype=input_ids.dtype)
@@ -1100,6 +1023,9 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_labels: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        doc_context_index: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> RTDDiscriminatorPhaseOutput:
         """Run discriminator scoring only, given prebuilt corrupted ids/labels.
 
@@ -1108,23 +1034,34 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor disc_labels: Binary RTD labels.
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional document-local position ids.
+        :param torch.Tensor | None doc_context_index: Optional CLS index per token.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return RTDDiscriminatorPhaseOutput: Discriminator loss and metrics.
         """
 
-        disc_out = self.discriminator(
-            input_ids=corrupted_input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            return_dict=True,
-        )
+        disc_forward_kwargs: dict[str, Any] = {
+            "input_ids": corrupted_input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+            "return_dict": True,
+        }
+        if position_ids is not None:
+            disc_forward_kwargs["position_ids"] = position_ids
+        if flash_meta is not None:
+            disc_forward_kwargs["flash_meta"] = flash_meta
+        disc_out = self.discriminator(**disc_forward_kwargs)
         disc_hidden = disc_out.last_hidden_state
-        disc_logits = self.discriminator_head(disc_hidden, attention_mask=attention_mask)
+        disc_logits = self.discriminator_head(
+            disc_hidden,
+            attention_mask=attention_mask,
+            doc_context_index=doc_context_index,
+            flash_meta=flash_meta,
+        )
 
-        pad_token_id = getattr(self.disc_config, "pad_token_id", None)
-        active = attention_mask_to_active_tokens(
+        active = _attention_mask_to_active_tokens(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            pad_token_id=int(pad_token_id) if pad_token_id is not None else None,
         )
 
         disc_active_f = active.to(dtype=torch.float32)
@@ -1158,12 +1095,15 @@ class DebertaV3RTDPretrainer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        doc_context_index: torch.Tensor | None = None,
         sampling_temperature: float = 1.0,
         gen_loss_weight: float = 1.0,
         disc_loss_weight: float = 50.0,
         phase: str = "both",
         corrupted_input_ids: torch.Tensor | None = None,
         disc_labels: torch.Tensor | None = None,
+        flash_meta: FlashBatchMeta | None = None,
     ) -> RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
         """Run RTD forward in combined or phase-specific mode.
 
@@ -1171,12 +1111,15 @@ class DebertaV3RTDPretrainer(nn.Module):
         :param torch.Tensor | None attention_mask: Optional attention mask.
         :param torch.Tensor | None labels: MLM labels with ``-100`` ignore index.
         :param torch.Tensor | None token_type_ids: Optional token type ids.
+        :param torch.Tensor | None position_ids: Optional document-local position ids.
+        :param torch.Tensor | None doc_context_index: Optional CLS index per token.
         :param float sampling_temperature: Generator sampling temperature.
         :param float gen_loss_weight: Generator loss weight.
         :param float disc_loss_weight: Discriminator loss weight.
         :param str phase: One of ``both|generator|discriminator``.
         :param torch.Tensor | None corrupted_input_ids: Precomputed corrupted ids for ``phase='discriminator'``.
         :param torch.Tensor | None disc_labels: Precomputed RTD labels for ``phase='discriminator'``.
+        :param FlashBatchMeta | None flash_meta: Optional FlashDeBERTa metadata bundle.
         :return RTDOutput | RTDGeneratorPhaseOutput | RTDDiscriminatorPhaseOutput:
             Combined output for ``phase='both'``; phase-local outputs otherwise.
         """
@@ -1189,7 +1132,9 @@ class DebertaV3RTDPretrainer(nn.Module):
                 attention_mask=attention_mask,
                 labels=labels,
                 token_type_ids=token_type_ids,
+                position_ids=position_ids,
                 sampling_temperature=sampling_temperature,
+                flash_meta=flash_meta,
             )
         if phase_norm == "discriminator":
             if corrupted_input_ids is None:
@@ -1202,6 +1147,9 @@ class DebertaV3RTDPretrainer(nn.Module):
                 disc_labels=disc_labels,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                doc_context_index=doc_context_index,
+                flash_meta=flash_meta,
             )
         if phase_norm != "both":
             raise ValueError("phase must be one of: both|generator|discriminator.")
@@ -1213,8 +1161,24 @@ class DebertaV3RTDPretrainer(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
             token_type_ids=token_type_ids,
+            position_ids=position_ids,
             sampling_temperature=sampling_temperature,
+            flash_meta=flash_meta,
         )
+        if float(disc_loss_weight) == 0.0:
+            disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+            total = float(gen_loss_weight) * gen_phase.gen_loss_raw
+            return RTDOutput(
+                loss=total,
+                gen_loss=gen_phase.gen_loss_raw.detach(),
+                disc_loss=disc_zero.detach(),
+                disc_accuracy=disc_zero.detach(),
+                gen_token_count=gen_phase.gen_token_count.detach(),
+                disc_token_count=disc_zero.detach(),
+                disc_positive_count=disc_zero.detach(),
+                gen_loss_raw=gen_phase.gen_loss_raw,
+                disc_loss_raw=disc_zero,
+            )
         if not bool(gen_phase.has_masked_targets):
             disc_zero = torch.zeros((), device=input_ids.device, dtype=torch.float32)
             total = float(gen_loss_weight) * gen_phase.gen_loss_raw
@@ -1233,15 +1197,19 @@ class DebertaV3RTDPretrainer(nn.Module):
         disc_phase = self.forward_discriminator_phase(
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            doc_context_index=doc_context_index,
             input_ids=input_ids,
             corrupted_input_ids=gen_phase.corrupted_input_ids,
             disc_labels=gen_phase.disc_labels,
+            flash_meta=flash_meta,
         )
 
-        total = (
-            float(gen_loss_weight) * gen_phase.gen_loss_raw
-            + float(disc_loss_weight) * disc_phase.disc_loss_raw
-        )
+        total = disc_phase.disc_loss_raw.new_zeros(())
+        if float(gen_loss_weight) != 0.0:
+            total = total + float(gen_loss_weight) * gen_phase.gen_loss_raw
+        if float(disc_loss_weight) != 0.0:
+            total = total + float(disc_loss_weight) * disc_phase.disc_loss_raw
 
         return RTDOutput(
             loss=total,

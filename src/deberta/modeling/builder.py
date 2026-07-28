@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from deberta.config import ModelConfig, validate_model_config
-from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model
+from deberta.modeling.deberta_v2_native import (
+    DebertaV2Config,
+    DebertaV2Model,
+    _validate_pos_att_type,
+)
+from deberta.modeling.flashdeberta_op_utils import (
+    is_flash_attention_impl,
+)
 from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
 
 _SPECIAL_ID_ATTRS = (
@@ -26,7 +33,6 @@ _EXTRA_TOKEN_TEMPLATE = "<|deberta_extra_token_{idx}|>"
 class _ResolvedComponentSources:
     """Resolved config/weight sources for one backbone component.
 
-    :param str component: Component name (discriminator/generator).
     :param str | None config_source: Source used to load the component config, or None for synthetic/derived.
     :param str config_origin: Human-readable config-origin label.
     :param str | None weight_source: Source used to load pretrained weights, or None for scratch init.
@@ -34,7 +40,6 @@ class _ResolvedComponentSources:
     :param bool derived_from_discriminator: Whether this component derives from discriminator config/weights.
     """
 
-    component: _COMPONENT_KIND
     config_source: str | None
     config_origin: str
     weight_source: str | None
@@ -48,6 +53,28 @@ class _ResolvedBackboneSources:
 
     discriminator: _ResolvedComponentSources
     generator: _ResolvedComponentSources
+
+
+def _resolve_generator_sources(model_cfg: ModelConfig) -> _ResolvedComponentSources:
+    """Resolve generator config and weight sources for either backbone family.
+
+    :param ModelConfig model_cfg: User model configuration.
+    :return _ResolvedComponentSources: Resolved generator sources.
+    """
+
+    explicit = model_cfg.pretrained.generator_path or None
+    from_scratch = bool(model_cfg.from_scratch)
+    return _ResolvedComponentSources(
+        config_source=explicit,
+        config_origin=("pretrained_generator_path" if explicit else "derived_from_discriminator_config"),
+        weight_source=(None if from_scratch else explicit or model_cfg.pretrained.discriminator_path),
+        weight_origin=(
+            "scratch"
+            if from_scratch
+            else ("pretrained_generator_path" if explicit else "derived_from_pretrained_discriminator_path")
+        ),
+        derived_from_discriminator=explicit is None,
+    )
 
 
 def _tokenizer_vocab_size(tokenizer: Any) -> int:
@@ -84,7 +111,7 @@ def _resize_tokenizer_to_vocab_size(
     component: _COMPONENT_KIND,
     allow_resize: bool,
 ) -> None:
-    """Grow tokenizer vocabulary to ``target_size`` by adding inert placeholder tokens.
+    """Grow tokenizer vocabulary to ``target_size`` with reserved special tokens.
 
     :param Any tokenizer: Tokenizer instance.
     :param int target_size: Desired tokenizer vocabulary size.
@@ -99,19 +126,24 @@ def _resize_tokenizer_to_vocab_size(
     if not bool(allow_resize):
         raise ValueError(
             f"{component} tokenizer vocab ({current}) is smaller than required size ({target_size}), "
-            "but model.tokenizer_allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
+            "but model.tokenizer.allow_vocab_resize=false. Enable tokenizer resize or align vocab settings."
         )
 
-    add_tokens = getattr(tokenizer, "add_tokens", None)
-    if not callable(add_tokens):
+    add_special_tokens = getattr(tokenizer, "add_special_tokens", None)
+    if not callable(add_special_tokens):
         raise ValueError(
-            f"{component} tokenizer does not support add_tokens(...), cannot grow vocab from "
+            f"{component} tokenizer does not support add_special_tokens(...), cannot grow vocab from "
             f"{current} to {target_size}."
         )
 
     needed = int(target_size) - int(current)
     extra_tokens = [_EXTRA_TOKEN_TEMPLATE.format(idx=idx) for idx in range(int(current), int(target_size))]
-    added = int(add_tokens(extra_tokens, special_tokens=False))
+    added = int(
+        add_special_tokens(
+            {"additional_special_tokens": extra_tokens},
+            replace_additional_special_tokens=False,
+        )
+    )
     final_size = _tokenizer_vocab_size(tokenizer)
     if added != needed or final_size != int(target_size):
         raise RuntimeError(
@@ -139,15 +171,15 @@ def _resolve_required_tokenizer_vocab_size(
     :return int: Required tokenizer size.
     """
     requested_target = (
-        int(model_cfg.tokenizer_vocab_target) if model_cfg.tokenizer_vocab_target is not None else None
+        int(model_cfg.tokenizer.vocab_target) if model_cfg.tokenizer.vocab_target is not None else None
     )
-    multiple = int(model_cfg.tokenizer_vocab_multiple)
+    multiple = int(model_cfg.tokenizer.vocab_multiple)
     desired = int(current_size)
 
     if requested_target is not None:
         if requested_target < int(current_size):
             raise ValueError(
-                f"model.tokenizer_vocab_target ({requested_target}) is smaller than tokenizer size "
+                f"model.tokenizer.vocab_target ({requested_target}) is smaller than tokenizer size "
                 f"({current_size}) for {component}; shrinking tokenizer vocab is not supported."
             )
         desired = max(desired, int(requested_target))
@@ -163,7 +195,7 @@ def _resolve_required_tokenizer_vocab_size(
             )
         # Optional convenience path: when resize is enabled and no explicit target is provided,
         # align tokenizer length to checkpoint vocab_size.
-        if requested_target is None and bool(model_cfg.tokenizer_allow_vocab_resize):
+        if requested_target is None and bool(model_cfg.tokenizer.allow_vocab_resize):
             desired = max(desired, cfg_vocab)
         if desired > cfg_vocab:
             raise ValueError(
@@ -176,7 +208,7 @@ def _resolve_required_tokenizer_vocab_size(
         cfg_vocab = int(config_vocab_size)
         if desired > cfg_vocab:
             raise ValueError(
-                f"model.tokenizer_vocab_multiple={multiple} rounds {component} tokenizer size to {desired}, "
+                f"model.tokenizer.vocab_multiple={multiple} rounds {component} tokenizer size to {desired}, "
                 f"which exceeds checkpoint config vocab_size ({cfg_vocab})."
             )
     return int(desired)
@@ -188,59 +220,28 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
     :param ModelConfig model_cfg: User model configuration.
     :return _ResolvedBackboneSources: Resolved sources for discriminator/generator.
     """
-    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
+    bt = model_cfg.backbone_type.lower()
     from_scratch = bool(model_cfg.from_scratch)
 
     if bt == "hf_deberta_v2":
-        disc_cfg_source = None if from_scratch else model_cfg.pretrained_discriminator_path
+        disc_cfg_source = None if from_scratch else model_cfg.pretrained.discriminator_path
         discriminator = _ResolvedComponentSources(
-            component="discriminator",
             config_source=disc_cfg_source,
             config_origin=(
                 "repo_hf_defaults" if disc_cfg_source is None else "pretrained_discriminator_path"
             ),
-            weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
+            weight_source=(None if from_scratch else model_cfg.pretrained.discriminator_path),
             weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
         )
-        if from_scratch:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.pretrained_generator_path or None,
-                config_origin=(
-                    "pretrained_generator_path"
-                    if model_cfg.pretrained_generator_path
-                    else "derived_from_discriminator_config"
-                ),
-                weight_source=None,
-                weight_origin="scratch",
-                derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
-            )
-        else:
-            gen_weight_src = model_cfg.pretrained_generator_path or model_cfg.pretrained_discriminator_path
-            gen_weight_origin = (
-                "pretrained_generator_path"
-                if model_cfg.pretrained_generator_path
-                else "derived_from_pretrained_discriminator_path"
-            )
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.pretrained_generator_path or None,
-                config_origin=(
-                    "pretrained_generator_path"
-                    if model_cfg.pretrained_generator_path
-                    else "derived_from_discriminator_config"
-                ),
-                weight_source=gen_weight_src,
-                weight_origin=gen_weight_origin,
-                derived_from_discriminator=not bool(model_cfg.pretrained_generator_path),
-            )
-        return _ResolvedBackboneSources(discriminator=discriminator, generator=generator)
+        return _ResolvedBackboneSources(
+            discriminator=discriminator,
+            generator=_resolve_generator_sources(model_cfg),
+        )
 
-    disc_cfg_source = model_cfg.pretrained_discriminator_path
+    disc_cfg_source = model_cfg.pretrained.discriminator_path
     if bt == "rope" and from_scratch:
         discriminator = _ResolvedComponentSources(
-            component="discriminator",
             config_source=None,
             config_origin="synthetic_from_model_cfg",
             weight_source=None,
@@ -249,54 +250,17 @@ def _resolve_backbone_sources(model_cfg: ModelConfig) -> _ResolvedBackboneSource
         )
     else:
         discriminator = _ResolvedComponentSources(
-            component="discriminator",
             config_source=disc_cfg_source,
             config_origin="pretrained_discriminator_path",
-            weight_source=(None if from_scratch else model_cfg.pretrained_discriminator_path),
+            weight_source=(None if from_scratch else model_cfg.pretrained.discriminator_path),
             weight_origin=("scratch" if from_scratch else "pretrained_discriminator_path"),
             derived_from_discriminator=False,
         )
 
-    if from_scratch:
-        if model_cfg.pretrained_generator_path:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.pretrained_generator_path,
-                config_origin="pretrained_generator_path",
-                weight_source=None,
-                weight_origin="scratch",
-                derived_from_discriminator=False,
-            )
-        else:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=None,
-                config_origin="derived_from_discriminator_config",
-                weight_source=None,
-                weight_origin="scratch",
-                derived_from_discriminator=True,
-            )
-    else:
-        if model_cfg.pretrained_generator_path:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=model_cfg.pretrained_generator_path,
-                config_origin="pretrained_generator_path",
-                weight_source=model_cfg.pretrained_generator_path,
-                weight_origin="pretrained_generator_path",
-                derived_from_discriminator=False,
-            )
-        else:
-            generator = _ResolvedComponentSources(
-                component="generator",
-                config_source=None,
-                config_origin="derived_from_discriminator_config",
-                weight_source=model_cfg.pretrained_discriminator_path,
-                weight_origin="derived_from_pretrained_discriminator_path",
-                derived_from_discriminator=True,
-            )
-
-    return _ResolvedBackboneSources(discriminator=discriminator, generator=generator)
+    return _ResolvedBackboneSources(
+        discriminator=discriminator,
+        generator=_resolve_generator_sources(model_cfg),
+    )
 
 
 def _apply_tokenizer_special_ids(cfg: Any, tokenizer: Any) -> None:
@@ -382,7 +346,7 @@ def _align_or_validate_tokenizer_contract(
             tokenizer=tokenizer,
             target_size=required_vocab,
             component=component,
-            allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+            allow_resize=bool(model_cfg.tokenizer.allow_vocab_resize),
         )
         tok_vocab = _tokenizer_vocab_size(tokenizer)
         cfg.vocab_size = tok_vocab
@@ -405,7 +369,7 @@ def _align_or_validate_tokenizer_contract(
         tokenizer=tokenizer,
         target_size=required_vocab,
         component=component,
-        allow_resize=bool(model_cfg.tokenizer_allow_vocab_resize),
+        allow_resize=bool(model_cfg.tokenizer.allow_vocab_resize),
     )
     tok_vocab = _tokenizer_vocab_size(tokenizer)
 
@@ -436,6 +400,69 @@ def _validate_required_max_positions(
         raise ValueError(
             f"{component} max_position_embeddings={int(cfg_max)} is smaller than required "
             f"sequence length {int(required_max_position_embeddings)}."
+        )
+
+
+def _embedding_table_shapes(cfg: Any, *, backbone_type: str) -> dict[str, tuple[int, int]]:
+    """Return materialized embedding-table shapes implied by one backbone config.
+
+    :param Any cfg: Materialized backbone config.
+    :param str backbone_type: Normalized backbone type.
+    :return dict[str, tuple[int, int]]: Embedding attribute to table shape.
+    """
+
+    width = int(getattr(cfg, "embedding_size", None) or cfg.hidden_size)
+    shapes = {
+        "word_embeddings": (int(cfg.vocab_size), width),
+    }
+
+    if backbone_type == "hf_deberta_v2" or bool(getattr(cfg, "use_absolute_position_embeddings", False)):
+        shapes["position_embeddings"] = (
+            int(cfg.max_position_embeddings),
+            width,
+        )
+
+    type_vocab_size = int(getattr(cfg, "type_vocab_size", 0) or 0)
+    if type_vocab_size > 0:
+        shapes["token_type_embeddings"] = (type_vocab_size, width)
+    return shapes
+
+
+def _validate_embedding_sharing_configs(
+    *,
+    model_cfg: ModelConfig,
+    disc_config: Any,
+    gen_config: Any,
+) -> None:
+    """Reject ES/GDES configs that cannot share every materialized embedding table.
+
+    :param ModelConfig model_cfg: User model configuration.
+    :param Any disc_config: Materialized discriminator config.
+    :param Any gen_config: Materialized generator config.
+    :raises ValueError: If shared embedding availability or shapes differ.
+    :return None: None.
+    """
+
+    mode = str(model_cfg.embedding_sharing).strip().lower()
+    if mode == "none":
+        return
+
+    backbone_type = str(model_cfg.backbone_type).strip().lower()
+    disc_shapes = _embedding_table_shapes(disc_config, backbone_type=backbone_type)
+    gen_shapes = _embedding_table_shapes(gen_config, backbone_type=backbone_type)
+    attrs = sorted(set(disc_shapes) | set(gen_shapes))
+    mismatches = {
+        attr: {
+            "discriminator": disc_shapes.get(attr),
+            "generator": gen_shapes.get(attr),
+        }
+        for attr in attrs
+        if disc_shapes.get(attr) != gen_shapes.get(attr)
+    }
+    if mismatches:
+        raise ValueError(
+            f"model.embedding_sharing='{mode}' requires identical generator and "
+            f"discriminator embedding tables; mismatches={mismatches}."
         )
 
 
@@ -471,20 +498,21 @@ def _derive_generator_config(base_cfg: Any, model_cfg: ModelConfig) -> Any:
             default_gen_layers = max(1, disc_layers // 2)
         else:
             default_gen_layers = max(1, disc_layers // 3)
-        gen_cfg.num_hidden_layers = int(model_cfg.generator_num_hidden_layers or default_gen_layers)
+        gen_cfg.num_hidden_layers = int(model_cfg.generator.num_hidden_layers or default_gen_layers)
 
-    if model_cfg.generator_hidden_size is not None:
-        gen_cfg.hidden_size = int(model_cfg.generator_hidden_size)
-    if model_cfg.generator_intermediate_size is not None:
-        gen_cfg.intermediate_size = int(model_cfg.generator_intermediate_size)
-    if model_cfg.generator_num_attention_heads is not None:
-        gen_cfg.num_attention_heads = int(model_cfg.generator_num_attention_heads)
+    if model_cfg.generator.hidden_size is not None:
+        gen_cfg.hidden_size = int(model_cfg.generator.hidden_size)
+    if model_cfg.generator.intermediate_size is not None:
+        gen_cfg.intermediate_size = int(model_cfg.generator.intermediate_size)
+    if model_cfg.generator.num_attention_heads is not None:
+        gen_cfg.num_attention_heads = int(model_cfg.generator.num_attention_heads)
 
     # Sanity
     if getattr(gen_cfg, "hidden_size", None) and getattr(gen_cfg, "num_attention_heads", None):
         if int(gen_cfg.hidden_size) % int(gen_cfg.num_attention_heads) != 0:
             raise ValueError(
-                "generator_hidden_size must be divisible by generator_num_attention_heads. "
+                "model.generator.hidden_size must be divisible by "
+                "model.generator.num_attention_heads. "
                 f"Got hidden_size={gen_cfg.hidden_size}, heads={gen_cfg.num_attention_heads}."
             )
 
@@ -497,10 +525,10 @@ def _apply_dropout_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     """
-    if model_cfg.hidden_dropout_prob is not None:
-        cfg.hidden_dropout_prob = float(model_cfg.hidden_dropout_prob)
-    if model_cfg.attention_probs_dropout_prob is not None:
-        cfg.attention_probs_dropout_prob = float(model_cfg.attention_probs_dropout_prob)
+    if model_cfg.dropout.hidden_prob is not None:
+        cfg.hidden_dropout_prob = float(model_cfg.dropout.hidden_prob)
+    if model_cfg.dropout.attention_probs_prob is not None:
+        cfg.attention_probs_dropout_prob = float(model_cfg.dropout.attention_probs_prob)
 
 
 def _apply_rope_runtime_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
@@ -509,7 +537,7 @@ def _apply_rope_runtime_overrides(cfg: Any, model_cfg: ModelConfig) -> None:
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     """
-    cfg.attention_implementation = str(model_cfg.attention_implementation)
+    cfg.attention_implementation = str(model_cfg.rope.attention_implementation)
     cfg.use_rmsnorm_heads = True
     _apply_dropout_overrides(cfg, model_cfg)
 
@@ -519,7 +547,6 @@ def _apply_rope_scratch_arch_overrides(
     *,
     model_cfg: ModelConfig,
     max_position_embeddings: int,
-    include_arch_from_model_cfg: bool,
     adjust_swiglu_intermediate: bool,
 ) -> None:
     """Apply scratch-only RoPE architecture overrides.
@@ -527,28 +554,28 @@ def _apply_rope_scratch_arch_overrides(
     :param Any cfg: Target config object.
     :param ModelConfig model_cfg: User model configuration.
     :param int max_position_embeddings: Sequence length budget.
-    :param bool include_arch_from_model_cfg: Whether to apply hidden/layer/head/intermediate overrides.
     :param bool adjust_swiglu_intermediate: Whether to apply 2/3 intermediate-size scaling for SwiGLU.
     """
-    if include_arch_from_model_cfg:
-        cfg.hidden_size = int(model_cfg.hidden_size)
-        cfg.num_hidden_layers = int(model_cfg.num_hidden_layers)
-        cfg.num_attention_heads = int(model_cfg.num_attention_heads)
-        cfg.intermediate_size = int(model_cfg.intermediate_size)
-        cfg.hidden_act = str(model_cfg.hidden_act)
+    cfg.hidden_size = int(model_cfg.rope.hidden_size)
+    cfg.num_hidden_layers = int(model_cfg.rope.num_hidden_layers)
+    cfg.num_attention_heads = int(model_cfg.rope.num_attention_heads)
+    cfg.intermediate_size = int(model_cfg.rope.intermediate_size)
+    cfg.hidden_act = str(model_cfg.rope.hidden_act)
 
-    cfg.max_position_embeddings = int(model_cfg.max_position_embeddings or max_position_embeddings)
-    cfg.rope_theta = float(model_cfg.rope_theta)
-    cfg.rotary_pct = float(model_cfg.rotary_pct)
-    cfg.use_absolute_position_embeddings = bool(model_cfg.use_absolute_position_embeddings)
-    cfg.type_vocab_size = int(model_cfg.type_vocab_size)
-    cfg.norm_eps = float(model_cfg.norm_eps)
-    cfg.norm_arch = str(model_cfg.norm_arch)
-    cfg.keel_alpha_init = float(model_cfg.keel_alpha_init) if model_cfg.keel_alpha_init is not None else None
-    cfg.keel_alpha_learnable = bool(model_cfg.keel_alpha_learnable)
-    cfg.ffn_type = str(model_cfg.ffn_type)
-    cfg.use_bias = bool(model_cfg.use_bias)
-    cfg.initializer_range = float(model_cfg.initializer_range)
+    cfg.max_position_embeddings = int(model_cfg.rope.max_position_embeddings or max_position_embeddings)
+    cfg.rope_theta = float(model_cfg.rope.rope_theta)
+    cfg.rotary_pct = float(model_cfg.rope.rotary_pct)
+    cfg.use_absolute_position_embeddings = bool(model_cfg.rope.use_absolute_position_embeddings)
+    cfg.type_vocab_size = int(model_cfg.rope.type_vocab_size)
+    cfg.norm_eps = float(model_cfg.rope.norm_eps)
+    cfg.norm_arch = str(model_cfg.rope.norm_arch)
+    cfg.keel_alpha_init = (
+        float(model_cfg.rope.keel_alpha_init) if model_cfg.rope.keel_alpha_init is not None else None
+    )
+    cfg.keel_alpha_learnable = bool(model_cfg.rope.keel_alpha_learnable)
+    cfg.ffn_type = str(model_cfg.rope.ffn_type)
+    cfg.use_bias = bool(model_cfg.rope.use_bias)
+    cfg.initializer_range = float(model_cfg.rope.initializer_range)
 
     if adjust_swiglu_intermediate:
         curr_intermediate = int(cfg.intermediate_size)
@@ -556,18 +583,18 @@ def _apply_rope_scratch_arch_overrides(
 
 
 _PRETRAINED_OVERRIDE_MAP: tuple[tuple[str, str, type], ...] = (
-    ("pretrained_max_position_embeddings", "max_position_embeddings", int),
-    ("pretrained_rope_theta", "rope_theta", float),
-    ("pretrained_rotary_pct", "rotary_pct", float),
-    ("pretrained_use_absolute_position_embeddings", "use_absolute_position_embeddings", bool),
-    ("pretrained_type_vocab_size", "type_vocab_size", int),
-    ("pretrained_norm_arch", "norm_arch", str),
-    ("pretrained_norm_eps", "norm_eps", float),
-    ("pretrained_keel_alpha_init", "keel_alpha_init", float),
-    ("pretrained_keel_alpha_learnable", "keel_alpha_learnable", bool),
-    ("pretrained_ffn_type", "ffn_type", str),
-    ("pretrained_use_bias", "use_bias", bool),
-    ("pretrained_initializer_range", "initializer_range", float),
+    ("max_position_embeddings", "max_position_embeddings", int),
+    ("rope_theta", "rope_theta", float),
+    ("rotary_pct", "rotary_pct", float),
+    ("use_absolute_position_embeddings", "use_absolute_position_embeddings", bool),
+    ("type_vocab_size", "type_vocab_size", int),
+    ("norm_arch", "norm_arch", str),
+    ("norm_eps", "norm_eps", float),
+    ("keel_alpha_init", "keel_alpha_init", float),
+    ("keel_alpha_learnable", "keel_alpha_learnable", bool),
+    ("ffn_type", "ffn_type", str),
+    ("use_bias", "use_bias", bool),
+    ("initializer_range", "initializer_range", float),
 )
 
 
@@ -578,7 +605,7 @@ def _apply_rope_pretrained_explicit_overrides(cfg: Any, model_cfg: ModelConfig) 
     :param ModelConfig model_cfg: User model configuration.
     """
     for src_attr, dst_attr, cast in _PRETRAINED_OVERRIDE_MAP:
-        val = getattr(model_cfg, src_attr, None)
+        val = getattr(model_cfg.rope.pretrained, src_attr)
         if val is not None:
             setattr(cfg, dst_attr, cast(val))
 
@@ -603,11 +630,68 @@ def _apply_hf_config_normalization(
         component=component,
         model_cfg=model_cfg,
     )
-    if model_cfg.hf_max_position_embeddings is not None:
-        cfg.max_position_embeddings = int(model_cfg.hf_max_position_embeddings)
+    if model_cfg.hf.max_position_embeddings is not None:
+        cfg.max_position_embeddings = int(model_cfg.hf.max_position_embeddings)
     _apply_dropout_overrides(cfg, model_cfg)
-    cfg.hf_attention_kernel = str(model_cfg.hf_attention_kernel)
+    cfg.hf_attention_kernel = str(model_cfg.hf.attention_kernel)
+    cfg.hf_attention_impl = str(model_cfg.hf.attention_impl)
+    cfg.hf_flash = {"kernel_overrides_path": model_cfg.hf.flash.kernel_overrides_path}
     cfg.use_rmsnorm_heads = False
+    cfg.pos_att_type = _validate_pos_att_type(
+        getattr(cfg, "pos_att_type", None),
+        relative_attention=bool(getattr(cfg, "relative_attention", False)),
+    )
+
+    if bool(getattr(cfg, "relative_attention", False)) and int(getattr(cfg, "position_buckets", 0) or 0) > 0:
+        max_relative_positions = int(getattr(cfg, "max_relative_positions", -1) or -1)
+        max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 0) or 0)
+        if max_relative_positions > 0 and max_position_embeddings <= 0:
+            raise ValueError(
+                f"{component} bucketed relative attention cannot verify max_relative_positions="
+                f"{max_relative_positions} covers the position range because "
+                "max_position_embeddings is missing or non-positive."
+            )
+        if 0 < max_relative_positions < max_position_embeddings:
+            raise ValueError(
+                f"{component} bucketed relative attention requires max_relative_positions to cover "
+                f"max_position_embeddings so native training and stock Hugging Face export use "
+                f"identical position buckets; got max_relative_positions={max_relative_positions} < "
+                f"max_position_embeddings={max_position_embeddings}. Set max_relative_positions "
+                "to -1 or at least max_position_embeddings."
+            )
+
+
+def _validate_hf_flash_attention_config(cfg: Any, *, component: _COMPONENT_KIND) -> None:
+    """Reject materialized HF DeBERTa configs that cannot use flash attention.
+
+    :param Any cfg: Materialized DeBERTa-v2/v3 config.
+    :param str component: Component name for diagnostics.
+    :raises ValueError: If flash attention is enabled for an unsupported config.
+    """
+
+    if not is_flash_attention_impl(getattr(cfg, "hf_attention_impl", "eager")):
+        return
+    hidden_size = int(getattr(cfg, "hidden_size", 0) or 0)
+    num_attention_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
+    head_dim = (
+        hidden_size // num_attention_heads
+        if num_attention_heads > 0 and hidden_size % num_attention_heads == 0
+        else 0
+    )
+    if head_dim < 16 or head_dim & (head_dim - 1):
+        raise ValueError(
+            f"{component} flash attention requires hidden_size / num_attention_heads to be a "
+            "positive power of two and at least 16; "
+            f"got hidden_size={hidden_size}, num_attention_heads={num_attention_heads}, head_dim={head_dim}."
+        )
+    if not bool(getattr(cfg, "relative_attention", False)):
+        raise ValueError(f"{component} flash attention requires relative_attention=true.")
+    position_buckets = int(getattr(cfg, "position_buckets", 0))
+    if position_buckets < 8:
+        raise ValueError(
+            f"{component} flash attention requires position_buckets >= 8 so fused Triton "
+            f"routes preserve eager relative-position buckets; got position_buckets={position_buckets}."
+        )
 
 
 def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Config:
@@ -642,7 +726,7 @@ def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Conf
             "intermediate_size": 4096,
         },
     }
-    size_key = str(model_cfg.hf_model_size).strip().lower()
+    size_key = str(model_cfg.hf.model_size).strip().lower()
     dims = presets[size_key]
 
     return DebertaV2Config(
@@ -673,6 +757,35 @@ def _build_repo_hf_deberta_v2_config(*, model_cfg: ModelConfig) -> DebertaV2Conf
     )
 
 
+def _load_pretrained_or_raise(
+    target_cls: type,
+    source: str,
+    *,
+    component: _COMPONENT_KIND,
+    artifact: str,
+    origin: str,
+    loader_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    """Load one pretrained artifact with source-aware failure context.
+
+    :param type target_cls: Config or model class exposing ``from_pretrained``.
+    :param str source: Local path or model id.
+    :param str component: Discriminator or generator.
+    :param str artifact: Artifact description used in diagnostics.
+    :param str origin: Config field from which the source resolved.
+    :param dict[str, Any] | None loader_kwargs: Optional ``from_pretrained`` keyword arguments.
+    :raises RuntimeError: If artifact loading fails.
+    :return Any: Loaded config or model object.
+    """
+
+    try:
+        return target_cls.from_pretrained(source, **(loader_kwargs or {}))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load {component} {artifact} from source '{source}' (resolved from {origin})."
+        ) from exc
+
+
 def _apply_rope_config_normalization(
     cfg: Any,
     *,
@@ -695,8 +808,8 @@ def _apply_rope_config_normalization(
     """
     if model_cfg.from_scratch:
         if explicit_source:
-            if model_cfg.max_position_embeddings is not None:
-                cfg.max_position_embeddings = int(model_cfg.max_position_embeddings)
+            if model_cfg.rope.max_position_embeddings is not None:
+                cfg.max_position_embeddings = int(model_cfg.rope.max_position_embeddings)
             else:
                 cfg_max = getattr(cfg, "max_position_embeddings", None)
                 if cfg_max is None:
@@ -706,14 +819,13 @@ def _apply_rope_config_normalization(
             pass
         else:
             should_adjust_swiglu = bool(
-                str(model_cfg.ffn_type).strip().lower() == "swiglu"
-                and bool(model_cfg.swiglu_adjust_intermediate)
+                str(model_cfg.rope.ffn_type).strip().lower() == "swiglu"
+                and bool(model_cfg.rope.swiglu_adjust_intermediate)
             )
             _apply_rope_scratch_arch_overrides(
                 cfg,
                 model_cfg=model_cfg,
                 max_position_embeddings=max_position_embeddings,
-                include_arch_from_model_cfg=True,
                 adjust_swiglu_intermediate=should_adjust_swiglu,
             )
     else:
@@ -747,50 +859,43 @@ def build_backbone_configs(
       is set, in which case that config is loaded.
     - For backbone_type='rope': returns DebertaRoPEConfig instances.
 
-    Generator config is loaded if specified, otherwise derived from discriminator config.
-
     :param ModelConfig model_cfg: User model configuration.
     :param Any tokenizer: Tokenizer used for vocab/pad metadata.
     :param int max_position_embeddings: Sequence length budget.
     :return tuple[Any, Any]: Discriminator and generator configs.
     """
     validate_model_config(model_cfg)
-    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
+    bt = model_cfg.backbone_type.lower()
     resolved = _resolve_backbone_sources(model_cfg)
 
     if bt == "hf_deberta_v2":
         if resolved.discriminator.config_source is None:
             disc_cfg = _build_repo_hf_deberta_v2_config(model_cfg=model_cfg)
         else:
-            try:
-                disc_cfg = DebertaV2Config.from_pretrained(resolved.discriminator.config_source)
-            except Exception as e:
-                raise RuntimeError(
-                    "Failed to load discriminator HF config from source "
-                    f"'{resolved.discriminator.config_source}' "
-                    f"(resolved from {resolved.discriminator.config_origin})."
-                ) from e
+            disc_cfg = _load_pretrained_or_raise(
+                DebertaV2Config,
+                resolved.discriminator.config_source,
+                component="discriminator",
+                artifact="HF config",
+                origin=resolved.discriminator.config_origin,
+            )
 
         generator_from_explicit_source = resolved.generator.config_source is not None
         if not generator_from_explicit_source:
             gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
         else:
-            try:
-                gen_cfg = DebertaV2Config.from_pretrained(resolved.generator.config_source)
-            except Exception as e:
-                raise RuntimeError(
-                    "Failed to load generator HF config from source "
-                    f"'{resolved.generator.config_source}' "
-                    f"(resolved from {resolved.generator.config_origin})."
-                ) from e
+            gen_cfg = _load_pretrained_or_raise(
+                DebertaV2Config,
+                resolved.generator.config_source,
+                component="generator",
+                artifact="HF config",
+                origin=resolved.generator.config_origin,
+            )
 
-        # Match released DeBERTa-v3 xsmall generator behavior for derived configs.
-        # Explicit generator configs keep their own z_steps contract.
+        # RTD uses the objective-owned Enhanced Mask Decoder. Generic backbone
+        # z_steps starts from a different query state and cannot replace it.
         if not generator_from_explicit_source:
-            if str(model_cfg.hf_model_size).strip().lower() == "xsmall":
-                gen_cfg.z_steps = 2
-            else:
-                gen_cfg.z_steps = 0
+            gen_cfg.z_steps = 0
 
         _apply_hf_config_normalization(
             disc_cfg,
@@ -814,20 +919,41 @@ def build_backbone_configs(
             required_max_position_embeddings=int(max_position_embeddings),
             component="generator",
         )
+        _validate_hf_flash_attention_config(disc_cfg, component="discriminator")
+        _validate_hf_flash_attention_config(gen_cfg, component="generator")
+        if (
+            not bool(getattr(gen_cfg, "position_biased_input", True))
+            and int(getattr(gen_cfg, "z_steps", 0) or 0) > 1
+        ):
+            raise ValueError(
+                "RTD Enhanced Mask Decoding is not equivalent to generator z_steps; "
+                "set generator z_steps=0 when position_biased_input=false."
+            )
 
+        _validate_embedding_sharing_configs(
+            model_cfg=model_cfg,
+            disc_config=disc_cfg,
+            gen_config=gen_cfg,
+        )
         return disc_cfg, gen_cfg
 
     # RoPE backbone
     if resolved.discriminator.config_source is None:
         disc_cfg = DebertaRoPEConfig(
-            hidden_size=model_cfg.hidden_size,
-            num_hidden_layers=model_cfg.num_hidden_layers,
-            num_attention_heads=model_cfg.num_attention_heads,
-            intermediate_size=model_cfg.intermediate_size,
-            hidden_act=model_cfg.hidden_act,
+            hidden_size=model_cfg.rope.hidden_size,
+            num_hidden_layers=model_cfg.rope.num_hidden_layers,
+            num_attention_heads=model_cfg.rope.num_attention_heads,
+            intermediate_size=model_cfg.rope.intermediate_size,
+            hidden_act=model_cfg.rope.hidden_act,
         )
     else:
-        disc_cfg = DebertaRoPEConfig.from_pretrained(resolved.discriminator.config_source)
+        disc_cfg = _load_pretrained_or_raise(
+            DebertaRoPEConfig,
+            resolved.discriminator.config_source,
+            component="discriminator",
+            artifact="RoPE config",
+            origin=resolved.discriminator.config_origin,
+        )
 
     _apply_rope_config_normalization(
         disc_cfg,
@@ -842,7 +968,13 @@ def build_backbone_configs(
     if resolved.generator.config_source is None:
         gen_cfg = _derive_generator_config(disc_cfg, model_cfg)
     else:
-        gen_cfg = DebertaRoPEConfig.from_pretrained(resolved.generator.config_source)
+        gen_cfg = _load_pretrained_or_raise(
+            DebertaRoPEConfig,
+            resolved.generator.config_source,
+            component="generator",
+            artifact="RoPE config",
+            origin=resolved.generator.config_origin,
+        )
 
     _apply_rope_config_normalization(
         gen_cfg,
@@ -854,6 +986,11 @@ def build_backbone_configs(
         derived_from_discriminator=resolved.generator.derived_from_discriminator,
     )
 
+    _validate_embedding_sharing_configs(
+        model_cfg=model_cfg,
+        disc_config=disc_cfg,
+        gen_config=gen_cfg,
+    )
     return disc_cfg, gen_cfg
 
 
@@ -875,63 +1012,38 @@ def build_backbones(
     :return tuple[Any, Any]: Instantiated discriminator and generator modules.
     """
     validate_model_config(model_cfg)
-    bt = (model_cfg.backbone_type or "hf_deberta_v2").lower()
+    _validate_embedding_sharing_configs(
+        model_cfg=model_cfg,
+        disc_config=disc_config,
+        gen_config=gen_config,
+    )
+    bt = model_cfg.backbone_type.lower()
     resolved = _resolve_backbone_sources(model_cfg)
-
-    if bt == "hf_deberta_v2":
-        if model_cfg.from_scratch or not bool(load_pretrained_weights):
-            disc = DebertaV2Model(disc_config)
-            gen = DebertaV2Model(gen_config)
-            return disc, gen
-
-        disc_src = resolved.discriminator.weight_source
-        gen_src = resolved.generator.weight_source
-        if disc_src is None or gen_src is None:
-            raise RuntimeError("Resolved pretrained HF weight source is missing.")
-
-        try:
-            disc = DebertaV2Model.from_pretrained(disc_src, config=disc_config)
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load discriminator HF backbone from "
-                f"source '{disc_src}' (resolved from {resolved.discriminator.weight_origin})."
-            ) from e
-
-        try:
-            gen = DebertaV2Model.from_pretrained(gen_src, config=gen_config)
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load generator HF backbone from "
-                f"source '{gen_src}' (resolved from {resolved.generator.weight_origin})."
-            ) from e
-
-        return disc, gen
-
-    # RoPE backbone
+    model_cls, kind = (
+        (DebertaV2Model, "HF backbone") if bt == "hf_deberta_v2" else (DebertaRoPEModel, "RoPE checkpoint")
+    )
     if model_cfg.from_scratch or not bool(load_pretrained_weights):
-        disc = DebertaRoPEModel(disc_config)
-        gen = DebertaRoPEModel(gen_config)
-        return disc, gen
+        return model_cls(disc_config), model_cls(gen_config)
 
     disc_src = resolved.discriminator.weight_source
     gen_src = resolved.generator.weight_source
     if disc_src is None or gen_src is None:
-        raise RuntimeError("Resolved pretrained RoPE weight source is missing.")
+        raise RuntimeError(f"Resolved pretrained {kind} weight source is missing.")
 
-    try:
-        disc = DebertaRoPEModel.from_pretrained(disc_src, config=disc_config)
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load discriminator RoPE checkpoint with model.from_scratch=false. "
-            f"Resolved source: '{disc_src}' ({resolved.discriminator.weight_origin})."
-        ) from e
-
-    try:
-        gen = DebertaRoPEModel.from_pretrained(gen_src, config=gen_config)
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load generator RoPE checkpoint with model.from_scratch=false. "
-            f"Resolved source: '{gen_src}' ({resolved.generator.weight_origin})."
-        ) from e
-
+    disc = _load_pretrained_or_raise(
+        model_cls,
+        disc_src,
+        component="discriminator",
+        artifact=kind,
+        origin=resolved.discriminator.weight_origin,
+        loader_kwargs={"config": disc_config},
+    )
+    gen = _load_pretrained_or_raise(
+        model_cls,
+        gen_src,
+        component="generator",
+        artifact=kind,
+        origin=resolved.generator.weight_origin,
+        loader_kwargs={"config": gen_config},
+    )
     return disc, gen

@@ -1,34 +1,85 @@
-# ruff: noqa: F403,F405
-from _config_and_training_shared_imports import *
-from test_config_and_training_resume import _checkpoint_saving_accelerator
+import dataclasses
+import gzip
+import json
+import logging
+import re
+import warnings
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
 
+import pytest
+import torch
+from _config_factories import (
+    make_data_config,
+    make_logging_config,
+    make_model_config,
+    make_native_deberta_config,
+    make_optim_config,
+    make_train_config,
+)
+from _fakes import (
+    AcceleratorStateStub,
+    BackboneConfigStub,
+    DummyTokenizer,
+    FakeAccelerator,
+    FakeWandbRun,
+    TinyRTDLikeModel,
+    checkpoint_saving_accelerator,
+    make_checkpoint_saver,
+    setup_pretraining_mocks,
+)
 
-def test_load_hf_dataset_handles_missing_cache_dir_attr(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    def _fake_load_dataset(name: str, **kwargs: Any) -> list[dict[str, str]]:
-        calls.append((str(name), dict(kwargs)))
-        return [{"text": "ok"}]
-
-    fake_datasets = types.SimpleNamespace(
-        load_dataset=_fake_load_dataset,
-        load_from_disk=lambda _path: [],
-        DatasetDict=dict,
-    )
-    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
-
-    cfg = DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy")
-    out = load_hf_dataset(cfg=cfg, split="train", streaming=True)
-
-    assert out == [{"text": "ok"}]
-    assert calls
-    assert calls[0][0] == "hf-internal-testing/librispeech_asr_dummy"
-    assert "cache_dir" in calls[0][1]
-    assert calls[0][1]["cache_dir"] is None
+from deberta.config import (
+    Config,
+    apply_dotted_override,
+    load_config,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
+)
+from deberta.modeling.builder import build_backbone_configs
+from deberta.run_artifacts import (
+    load_materialized_backbone_configs,
+    materialized_tokenizer_path,
+    persist_materialized_run_artifacts,
+)
+from deberta.training.entrypoint import _resolve_entrypoint_profile_sections
+from deberta.training.metrics import (
+    _append_metrics_jsonl_row,
+    _build_runtime_resolved_tracker_config,
+    _coerce_dataclass_payload_types,
+    _flush_loggers,
+)
+from deberta.training.run_management import (
+    _load_checkpoint_progress_metadata,
+    _prepare_output_dir,
+    _resolve_output_dir,
+    _resolve_output_dir_for_accelerator,
+    _resolve_resume_checkpoint,
+    _resolve_resume_checkpoint_for_accelerator,
+    _save_checkpoint_data_progress,
+    _save_training_checkpoint,
+)
+from deberta.training.runtime import (
+    _build_decoupled_optimizers,
+    _build_optimizer,
+    _digest_param_name_order,
+    _partition_optimizer_params,
+)
+from deberta.training.tracker_utils import (
+    _init_trackers,
+    _setup_wandb_watch,
+    _upload_wandb_original_config,
+)
+from deberta.utils.checkpoint import (
+    canonical_compile_state_key,
+    load_checkpoint_model_state_dict,
+    load_model_state_with_compile_key_remap,
+    load_state_with_compile_fallback,
+)
 
 
 def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
-    pytest.importorskip("yaml")
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(
         "\n".join(
@@ -38,6 +89,9 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
                 "    dataset_name: HuggingFaceFW/fineweb-edu",
                 "train:",
                 "  max_steps: 1",
+                "optim:",
+                "  scheduler:",
+                "    warmup_steps: 0",
             ]
         ),
         encoding="utf-8",
@@ -45,139 +99,197 @@ def test_load_config_returns_frozen_top_level_and_sections(tmp_path: Path):
     cfg = load_config(cfg_path)
     assert isinstance(cfg, Config)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        cfg.train = TrainConfig(max_steps=2)  # type: ignore[misc]
+        cfg.train = make_train_config(max_steps=2)  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.optim.scheduler.warmup_steps = 5  # type: ignore[misc]
 
 
-def test_load_config_supports_extended_sections_and_projects_to_runtime_train(tmp_path: Path):
-    pytest.importorskip("yaml")
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 5",
-                "  checkpoint:",
-                "    save_steps: 777",
-                "optim:",
-                "  scheduler:",
-                "    warmup_steps: 222",
-                "logging:",
-                "  backend: none",
-                "  wandb:",
-                "    enabled: true",
-                "    watch: all",
-                "  debug:",
-                "    metrics: true",
-            ]
-        ),
-        encoding="utf-8",
+@pytest.mark.parametrize("source_change", ["mutate", "delete"])
+def test_materialized_run_artifacts_do_not_depend_on_original_config_source(
+    tmp_path: Path,
+    source_change: str,
+) -> None:
+    source_dir = tmp_path / "mutable-source"
+    source_config = make_native_deberta_config(
+        vocab_size=64,
+        max_position_embeddings=32,
+        max_relative_positions=-1,
+        layer_norm_eps=1e-7,
     )
-    cfg = load_config(cfg_path)
-    assert int(cfg.train.warmup_steps) == 222
-    assert int(cfg.train.save_steps) == 777
-    assert str(cfg.train.report_to) == "wandb"
-    assert str(cfg.train.wandb_watch) == "all"
-    assert bool(cfg.train.debug_metrics) is True
+    source_config.save_pretrained(source_dir)
+    model_cfg = make_model_config(
+        from_scratch=False,
+        pretrained={
+            "discriminator_path": str(source_dir),
+            "generator_path": str(source_dir),
+        },
+        tokenizer={
+            "name_or_path": "original-tokenizer",
+            "allow_vocab_resize": False,
+            "vocab_target": None,
+            "vocab_multiple": 1,
+        },
+        dropout={"hidden_prob": None, "attention_probs_prob": None},
+    )
+    tokenizer = DummyTokenizer(vocab_size=64)
+    discriminator_config, generator_config = build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=tokenizer,
+        max_position_embeddings=32,
+    )
+    run_dir = tmp_path / "run"
+    persist_materialized_run_artifacts(
+        run_dir=run_dir,
+        tokenizer=tokenizer,
+        discriminator_config=discriminator_config,
+        generator_config=generator_config,
+    )
+
+    source_config_path = source_dir / "config.json"
+    if source_change == "mutate":
+        source_payload = json.loads(source_config_path.read_text(encoding="utf-8"))
+        source_payload["layer_norm_eps"] = 1e-3
+        source_config_path.write_text(json.dumps(source_payload), encoding="utf-8")
+    else:
+        source_config_path.unlink()
+
+    loaded_discriminator, loaded_generator = load_materialized_backbone_configs(
+        run_dir=run_dir,
+        model_cfg=model_cfg,
+    )
+
+    assert loaded_discriminator.layer_norm_eps == pytest.approx(1e-7)
+    assert loaded_generator.layer_norm_eps == pytest.approx(1e-7)
+    assert materialized_tokenizer_path(run_dir) == run_dir / "tokenizer"
 
 
-def test_load_config_rejects_string_boolean_for_data_streaming(tmp_path: Path) -> None:
-    pytest.importorskip("yaml")
+def test_entrypoint_delegates_omitted_sections_to_config_profile() -> None:
+    model_cfg = make_model_config(backbone_type="rope")
+    expected = Config(model=model_cfg)
+
+    train_cfg, optim_cfg = _resolve_entrypoint_profile_sections(
+        model_cfg=model_cfg,
+        train_cfg=None,
+        optim_cfg=None,
+    )
+
+    assert train_cfg == expected.train
+    assert optim_cfg == expected.optim
+
+
+def test_entrypoint_preserves_supplied_values_equal_to_hf_defaults() -> None:
+    explicit_train = make_train_config(
+        objective={
+            "mask_token_prob": 1.0,
+            "random_token_prob": 0.0,
+            "disc_loss_weight": 10.0,
+        }
+    )
+    explicit_optim = make_optim_config(
+        adam={"epsilon": 1e-6},
+        scheduler={"warmup_steps": 1_000},
+    )
+
+    train_cfg, optim_cfg = _resolve_entrypoint_profile_sections(
+        model_cfg=make_model_config(backbone_type="rope"),
+        train_cfg=explicit_train,
+        optim_cfg=explicit_optim,
+    )
+
+    assert train_cfg is explicit_train
+    assert optim_cfg is explicit_optim
+    assert train_cfg.objective.mask_token_prob == pytest.approx(1.0)
+    assert train_cfg.objective.random_token_prob == pytest.approx(0.0)
+    assert train_cfg.objective.disc_loss_weight == pytest.approx(10.0)
+    assert optim_cfg.lr.base == pytest.approx(1e-4)
+    assert optim_cfg.adam.epsilon == pytest.approx(1e-6)
+    assert optim_cfg.scheduler.warmup_steps == 1_000
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected_error"),
+    [
+        (
+            "data:\n  source:\n    dataset_name: dummy\n    streaming: 'false'\ntrain:\n  max_steps: 1",
+            "data.source.streaming must be a boolean",
+        ),
+        (
+            "data:\n  source:\n    dataset_name: dummy\ntrain:\n  max_steps: 1\n"
+            "  token_weighted_gradient_accumulation: 'false'",
+            "train.token_weighted_gradient_accumulation must be a boolean",
+        ),
+    ],
+    ids=["data-streaming", "token-weighted-gradient-accumulation"],
+)
+def test_load_config_rejects_string_boolean(
+    tmp_path: Path,
+    config_text: str,
+    expected_error: str,
+) -> None:
     cfg_path = tmp_path / "bad_bool.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "    streaming: 'false'",
-                "train:",
-                "  max_steps: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="data.source.streaming must be a boolean"):
-        load_config(cfg_path)
-
-
-def test_load_config_rejects_string_boolean_for_token_weighted_gradient_accumulation(tmp_path: Path) -> None:
-    pytest.importorskip("yaml")
-    cfg_path = tmp_path / "bad_bool_train.yaml"
-    cfg_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  source:",
-                "    dataset_name: HuggingFaceFW/fineweb-edu",
-                "train:",
-                "  max_steps: 1",
-                "  token_weighted_gradient_accumulation: 'false'",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="train.token_weighted_gradient_accumulation must be a boolean"):
+    cfg_path.write_text(config_text, encoding="utf-8")
+    with pytest.raises(ValueError, match=expected_error):
         load_config(cfg_path)
 
 
 def test_apply_dotted_override_supports_nested_section_paths() -> None:
-    cfg = Config(
-        data=DataConfig(source={"dataset_name": "HuggingFaceFW/fineweb-edu"}),
-        train=TrainConfig(max_steps=1),
+    cfg = apply_dotted_override(
+        Config(data=make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})),
+        "train.max_steps=1",
     )
-    cfg2 = apply_dotted_override(cfg, "logging.wandb.watch=all")
+    cfg2 = apply_dotted_override(cfg, "model.backbone_type=rope")
+    assert cfg2.train.objective.mask_token_prob == pytest.approx(0.8)
+    assert cfg2.train.objective.random_token_prob == pytest.approx(0.1)
+    assert cfg2.train.objective.disc_loss_weight == pytest.approx(50.0)
+    assert cfg2.optim.lr.base == pytest.approx(5e-4)
+    assert cfg2.optim.adam.epsilon == pytest.approx(1e-8)
+    assert cfg2.optim.scheduler.warmup_steps == 1_000
+
+    cfg2 = apply_dotted_override(cfg2, "model.backbone_type=hf_deberta_v2")
+    assert cfg2.train.objective.mask_token_prob == pytest.approx(1.0)
+    assert cfg2.train.objective.random_token_prob == pytest.approx(0.0)
+    assert cfg2.train.objective.disc_loss_weight == pytest.approx(10.0)
+    assert cfg2.optim.lr.base == pytest.approx(1e-4)
+    assert cfg2.optim.adam.epsilon == pytest.approx(1e-6)
+    assert cfg2.optim.scheduler.warmup_steps == 1_000
+
+    cfg2 = apply_dotted_override(cfg2, "model.backbone_type=rope")
+    cfg2 = apply_dotted_override(cfg2, "logging.wandb.watch=all")
     cfg2 = apply_dotted_override(cfg2, "optim.scheduler.warmup_steps=123")
+    cfg2 = apply_dotted_override(cfg2, "model.backbone_type=hf_deberta_v2")
     assert cfg2.logging.wandb.watch == "all"
     assert int(cfg2.optim.scheduler.warmup_steps) == 123
-    assert int(cfg2.train.warmup_steps) == 123
 
 
-def test_apply_dotted_override_preserves_existing_explicit_fields_per_section() -> None:
-    cfg = Config()
-    cfg = apply_dotted_override(cfg, "train.objective.mask_token_prob=0.8")
-    cfg = apply_dotted_override(cfg, "train.max_steps=20")
-
-    explicit_train_fields = set(getattr(cfg.train, "_explicit_fields", set()))
-    assert "objective.mask_token_prob" in explicit_train_fields
-    assert "max_steps" in explicit_train_fields
-
-    apply_profile_defaults(model_cfg=cfg.model, train_cfg=cfg.train, optim_cfg=cfg.optim)
-    assert cfg.train.mask_token_prob == pytest.approx(0.8)
-
-
-def test_load_model_config_snapshot_rejects_unknown_legacy_key() -> None:
-    with pytest.raises(ValueError, match="Unsupported model_config.json keys"):
-        load_model_config_snapshot(
-            {"backbone_type": "rope", "legacy_field": 1},
-            source="model_config.json",
+@pytest.mark.parametrize("config_kind", ["model", "data"])
+@pytest.mark.parametrize("invalidity", ["unknown", "missing"])
+def test_config_snapshot_rejects_unknown_or_missing_keys(
+    config_kind: str,
+    invalidity: str,
+) -> None:
+    if config_kind == "model":
+        loader, raw, source, required_key = (
+            load_model_config_snapshot,
+            asdict(make_model_config()),
+            "model_config.json",
+            "backbone_type",
         )
-
-
-def test_load_data_config_snapshot_rejects_unknown_legacy_key() -> None:
-    with pytest.raises(ValueError, match="Unsupported data_config.json keys"):
-        load_data_config_snapshot(
-            {"dataset_name": "HuggingFaceFW/fineweb-edu", "legacy_field": 1},
-            source="data_config.json",
+    else:
+        loader, raw, source, required_key = (
+            load_data_config_snapshot,
+            asdict(make_data_config()),
+            "data_config.json",
+            "source",
         )
+    if invalidity == "unknown":
+        raw["legacy_field"] = 1
+        expected_error = f"Unsupported {source} keys"
+    else:
+        raw.pop(required_key)
+        expected_error = f"Missing required {source} keys"
 
-
-def test_load_model_config_snapshot_rejects_missing_required_key() -> None:
-    model_raw = asdict(ModelConfig())
-    model_raw.pop("backbone_type")
-    with pytest.raises(ValueError, match="Missing required model_config.json keys"):
-        load_model_config_snapshot(model_raw, source="model_config.json")
-
-
-def test_load_data_config_snapshot_rejects_missing_required_key() -> None:
-    data_raw = asdict(DataConfig())
-    data_raw.pop("source")
-    with pytest.raises(ValueError, match="Missing required data_config.json keys"):
-        load_data_config_snapshot(data_raw, source="data_config.json")
+    with pytest.raises(ValueError, match=expected_error):
+        loader(raw, source=source)
 
 
 def test_prepare_output_dir_respects_overwrite_and_resume(tmp_path: Path):
@@ -220,18 +332,6 @@ def test_prepare_output_dir_rejects_nonempty_without_overwrite_or_resume(
         )
 
 
-def test_find_latest_checkpoint_picks_highest_step(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "checkpoint-2").mkdir()
-    (out / "checkpoint-11").mkdir()
-    (out / "checkpoint-4").mkdir()
-
-    latest = _find_latest_checkpoint(out)
-    assert latest is not None
-    assert latest.name == "checkpoint-11"
-
-
 def test_resolve_output_dir_auto_uses_project_and_config_stem():
     out = _resolve_output_dir(
         output_dir=None,
@@ -253,21 +353,24 @@ def test_resolve_output_dir_auto_prefers_run_name():
     assert re.fullmatch(r"\d{8}_\d{6}_my-run", out.name) is not None
 
 
-def test_resolve_output_dir_keeps_explicit_path():
+def test_resolve_output_dir_normalizes_explicit_path():
     out = _resolve_output_dir(
         output_dir="runs/custom/run-01",
         project_name="ignored",
         config_path="configs/pretrain_rope_fineweb_edu.yaml",
     )
-    assert out == Path("runs/custom/run-01")
+    assert out == Path("runs/custom/run-01").resolve()
 
 
 def _accel_stub(*, is_main_process: bool, num_processes: int) -> Any:
     """Return a minimal accelerator-like object for broadcast helper tests."""
-    return types.SimpleNamespace(is_main_process=bool(is_main_process), num_processes=int(num_processes))
+    return AcceleratorStateStub(
+        is_main_process=bool(is_main_process),
+        num_processes=int(num_processes),
+    )
 
 
-def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
+def test_resolve_output_dir_for_accelerator_normalizes_explicit_path():
     called = {"count": 0}
 
     def _fake_broadcast(payload: list[str | None], *, from_process: int = 0) -> None:
@@ -281,7 +384,7 @@ def test_resolve_output_dir_for_accelerator_keeps_explicit_path():
         config_path="cfg.yaml",
         broadcast_fn=_fake_broadcast,
     )
-    assert out == Path("runs/custom/run-02")
+    assert out == Path("runs/custom/run-02").resolve()
     assert called["count"] == 0
 
 
@@ -297,7 +400,7 @@ def test_resolve_output_dir_for_accelerator_uses_broadcasted_auto_value():
         config_path="cfg.yaml",
         broadcast_fn=_fake_broadcast,
     )
-    assert out == Path("runs/demo/20260101_010101_shared")
+    assert out == Path("runs/demo/20260101_010101_shared").resolve()
 
 
 def test_resolve_resume_checkpoint_for_accelerator_uses_rank0_broadcast_value(tmp_path: Path):
@@ -473,76 +576,68 @@ def test_resolve_resume_checkpoint_auto_rejects_when_all_checkpoints_non_resumab
         )
 
 
-def test_checkpoint_data_progress_roundtrip(tmp_path: Path):
+def test_checkpoint_data_progress_roundtrip_without_optimizer_digest(tmp_path: Path) -> None:
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
     assert consumed is None
     assert lr_mult == 1.0
     assert digest is None
+    assert input_tokens_seen is None
 
-    _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123, lr_mult=0.25)
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    _save_checkpoint_data_progress(
+        checkpoint_dir=ckpt,
+        consumed_micro_batches=123,
+        input_tokens_seen=456.0,
+        lr_mult=0.25,
+    )
+    consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 123
     assert abs(lr_mult - 0.25) < 1e-9
     assert digest is None  # no digest was saved
-
-    # With optimizer param digest.
-    _save_checkpoint_data_progress(
-        checkpoint_dir=ckpt,
-        consumed_micro_batches=200,
-        lr_mult=0.5,
-        optimizer_param_digest="abc123deadbeef00",
-        global_step=17,
-        gradient_accumulation_steps=4,
-    )
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
-    assert consumed == 200
-    assert abs(lr_mult - 0.5) < 1e-9
-    assert digest == "abc123deadbeef00"
-    _, _, _, global_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
-    assert global_step == 17
-    assert saved_ga == 4
-
-    # Back-compat: old checkpoints without lr_mult or digest default gracefully.
-    import json
-
-    (ckpt / "data_state.json").write_text(json.dumps({"consumed_micro_batches": 50}))
-    consumed_old, lr_mult_old, digest_old = _load_checkpoint_data_progress(ckpt)
-    assert consumed_old == 50
-    assert lr_mult_old == 1.0
-    assert digest_old is None
+    assert input_tokens_seen == 456.0
 
 
-def test_checkpoint_data_progress_roundtrip_with_dual_optimizer_digest(tmp_path: Path):
+@pytest.mark.parametrize(
+    "optimizer_param_digest",
+    [
+        pytest.param("abc123deadbeef00", id="scalar"),
+        pytest.param(
+            {"generator": "aaaabbbbccccdddd", "discriminator": "1111222233334444"},
+            id="dual",
+        ),
+    ],
+)
+def test_checkpoint_data_progress_roundtrip_with_optimizer_digest(
+    tmp_path: Path,
+    optimizer_param_digest: str | dict[str, str],
+) -> None:
     ckpt = tmp_path / "checkpoint-12"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    dual_digest = {"generator": "aaaabbbbccccdddd", "discriminator": "1111222233334444"}
     _save_checkpoint_data_progress(
         checkpoint_dir=ckpt,
         consumed_micro_batches=77,
+        input_tokens_seen=987.0,
         lr_mult=0.75,
-        optimizer_param_digest=dual_digest,
+        optimizer_param_digest=optimizer_param_digest,
         global_step=9,
         gradient_accumulation_steps=3,
     )
-
-    consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+    consumed, saved_lr_mult, digest, saved_step, saved_ga, input_tokens_seen = (
+        _load_checkpoint_progress_metadata(ckpt)
+    )
     assert consumed == 77
-    assert lr_mult == pytest.approx(0.75)
-    assert isinstance(digest, dict)
-    assert digest == dual_digest
-
-    _, _, digest_meta, saved_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
-    assert isinstance(digest_meta, dict)
-    assert digest_meta == dual_digest
+    assert saved_lr_mult == pytest.approx(0.75)
+    assert isinstance(digest, dict) is isinstance(optimizer_param_digest, dict)
+    assert digest == optimizer_param_digest
     assert saved_step == 9
     assert saved_ga == 3
+    assert input_tokens_seen == 987.0
 
 
-def test_load_checkpoint_data_progress_warns_on_invalid_json(
+def test_load_checkpoint_progress_metadata_warns_on_invalid_json(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     ckpt = tmp_path / "checkpoint-7"
@@ -550,11 +645,12 @@ def test_load_checkpoint_data_progress_warns_on_invalid_json(
     (ckpt / "data_state.json").write_text('{"consumed_micro_batches": ', encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        consumed, lr_mult, digest = _load_checkpoint_data_progress(ckpt)
+        consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
 
     assert consumed is None
     assert lr_mult == 1.0
     assert digest is None
+    assert input_tokens_seen is None
     assert any("invalid data_state.json" in record.message for record in caplog.records)
 
 
@@ -568,34 +664,6 @@ def test_dump_json_is_atomic_on_serialization_failure(tmp_path: Path) -> None:
     assert not target.exists()
     tmp_files = list(tmp_path.glob(".*state.json.*.tmp"))
     assert not tmp_files
-
-
-def test_optimizer_param_order_digest_deterministic() -> None:
-    """Same model produces the same digest across calls."""
-    m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
-    d1 = _optimizer_param_order_digest(m)
-    d2 = _optimizer_param_order_digest(m)
-    assert d1 == d2
-    assert len(d1) == 16  # 16-char hex prefix
-
-
-def test_optimizer_param_order_digest_changes_on_different_params() -> None:
-    """Different parameter names produce a different digest."""
-    m1 = torch.nn.ModuleDict({"alpha": torch.nn.Linear(4, 4), "beta": torch.nn.Linear(4, 2)})
-    m2 = torch.nn.ModuleDict({"gamma": torch.nn.Linear(4, 4), "beta": torch.nn.Linear(4, 2)})
-    d1 = _optimizer_param_order_digest(m1)
-    d2 = _optimizer_param_order_digest(m2)
-    assert d1 != d2, "Different param names must produce different digest"
-
-
-def test_optimizer_param_order_digest_ignores_frozen_params() -> None:
-    """Frozen parameters are excluded from the digest."""
-    m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
-    d_all = _optimizer_param_order_digest(m)
-    m[0].weight.requires_grad_(False)
-    m[0].bias.requires_grad_(False)
-    d_partial = _optimizer_param_order_digest(m)
-    assert d_all != d_partial, "Freezing params changes the trainable param set and digest"
 
 
 def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
@@ -621,27 +689,32 @@ def test_partition_optimizer_params_deduplicates_shared_parameters() -> None:
 
 def test_optimizer_param_order_digest_matches_optimizer_group_insertion_order() -> None:
     model = TinyRTDLikeModel()
-    cfg = TrainConfig()
+    cfg = make_optim_config()
     opt = _build_optimizer(model, cfg)
 
     param_to_name = {id(p): n for n, p in model.named_parameters() if p.requires_grad}
     ordered_names: list[str] = []
     for group in opt.param_groups:
         ordered_names.extend(param_to_name[id(p)] for p in group["params"])
-    expected = hashlib.sha256("\n".join(ordered_names).encode()).hexdigest()[:16]
+    expected = _digest_param_name_order(ordered_names)
 
-    assert _optimizer_param_order_digest(model) == expected
     assert str(opt._param_order_digest) == expected
 
 
-def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None:
+@pytest.mark.parametrize(
+    ("discriminator_lr", "expected_discriminator_lr"),
+    [(None, 5.0e-4), (2.0e-4, 2.0e-4)],
+    ids=["base_discriminator_lr", "explicit_discriminator_lr"],
+)
+def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests(
+    discriminator_lr: float | None,
+    expected_discriminator_lr: float,
+) -> None:
     model = TinyRTDLikeModel()
-    cfg = TrainConfig(
-        learning_rate=5.0e-4,
-        generator_learning_rate=2.5e-4,
-        weight_decay=0.01,
-        mixed_precision="no",
-    )
+    lr = {"base": 5.0e-4, "generator": 2.5e-4}
+    if discriminator_lr is not None:
+        lr["discriminator"] = discriminator_lr
+    cfg = make_optim_config(lr=lr, weight_decay=0.01)
     gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
 
     assert gen_opt.param_groups
@@ -649,7 +722,7 @@ def test_build_decoupled_optimizers_uses_branch_lrs_and_tracks_digests() -> None
     for group in gen_opt.param_groups:
         assert float(group["lr"]) == pytest.approx(2.5e-4)
     for group in disc_opt.param_groups:
-        assert float(group["lr"]) == pytest.approx(5.0e-4)
+        assert float(group["lr"]) == pytest.approx(expected_discriminator_lr)
 
     assert isinstance(getattr(gen_opt, "_param_order_digest", ""), str)
     assert isinstance(getattr(disc_opt, "_param_order_digest", ""), str)
@@ -668,11 +741,9 @@ def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_o
             self.discriminator = torch.nn.Linear(8, 8)
 
     model = _ModelWithEmd()
-    cfg = TrainConfig(
-        learning_rate=5.0e-4,
-        generator_learning_rate=2.5e-4,
+    cfg = make_optim_config(
+        lr={"base": 5.0e-4, "generator": 2.5e-4},
         weight_decay=0.01,
-        mixed_precision="no",
     )
     gen_opt, disc_opt = _build_decoupled_optimizers(model, cfg, mixed_precision="no")
 
@@ -685,45 +756,39 @@ def test_build_decoupled_optimizers_assigns_enhanced_mask_decoder_to_generator_o
     assert emd_param_ids.isdisjoint(disc_param_ids)
 
 
-def test_save_training_checkpoint_persists_optimizer_digest(tmp_path: Path):
-    """_save_training_checkpoint forwards optimizer_param_digest to data_state.json."""
+@pytest.mark.parametrize(
+    "optimizer_param_digest",
+    [
+        pytest.param("deadbeef12345678", id="scalar"),
+        pytest.param(
+            {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"},
+            id="dual",
+        ),
+    ],
+)
+def test_save_training_checkpoint_persists_optimizer_digest(
+    tmp_path: Path,
+    optimizer_param_digest: str | dict[str, str],
+) -> None:
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint-5"
 
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
+    accel = checkpoint_saving_accelerator(is_main_process=True)
     _save_training_checkpoint(
         accelerator=accel,
         checkpoint_dir=ckpt,
         output_dir=out,
         consumed_micro_batches=10,
+        input_tokens_seen=100.0,
         save_total_limit=3,
         log_label="test",
-        optimizer_param_digest="deadbeef12345678",
+        optimizer_param_digest=optimizer_param_digest,
     )
-    _, _, digest = _load_checkpoint_data_progress(ckpt)
-    assert digest == "deadbeef12345678"
-
-
-def test_save_training_checkpoint_persists_dual_optimizer_digest(tmp_path: Path):
-    out = tmp_path / "run"
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = out / "checkpoint-6"
-
-    dual_digest = {"generator": "feedfacecafebeef", "discriminator": "baadf00d12345678"}
-    accel = _checkpoint_saving_accelerator(is_main_process=True)
-    _save_training_checkpoint(
-        accelerator=accel,
-        checkpoint_dir=ckpt,
-        output_dir=out,
-        consumed_micro_batches=15,
-        save_total_limit=3,
-        log_label="test",
-        optimizer_param_digest=dual_digest,
-    )
-    _, _, digest = _load_checkpoint_data_progress(ckpt)
-    assert isinstance(digest, dict)
-    assert digest == dual_digest
+    _, _, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
+    assert isinstance(digest, dict) is isinstance(optimizer_param_digest, dict)
+    assert digest == optimizer_param_digest
+    assert input_tokens_seen == 100.0
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
@@ -735,8 +800,9 @@ def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:
     )
 
 
-def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mod_keys(
-    tmp_path: Path,
+@pytest.mark.parametrize("orig_mod_placement", ["nested", "top_level"])
+def test_load_model_state_with_compile_key_remap_matches_orig_mod_variants(
+    tmp_path: Path, orig_mod_placement: str
 ) -> None:
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
     checkpoint = tmp_path / "checkpoint-1"
@@ -747,32 +813,12 @@ def test_load_model_state_with_compile_key_remap_matches_checkpoint_with_orig_mo
         model[0].bias.fill_(-0.25)
 
     original = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    remapped = {key.replace("0.", "0._orig_mod."): value.detach().clone() for key, value in original.items()}
-    torch.save(remapped, checkpoint / "model.bin")
-
-    with torch.no_grad():
-        model[0].weight.zero_()
-        model[0].bias.zero_()
-
-    stats = load_model_state_with_compile_key_remap(model, checkpoint)
-    assert stats == {"matched": 2}
-    assert torch.allclose(model[0].weight, original["0.weight"])
-    assert torch.allclose(model[0].bias, original["0.bias"])
-
-
-def test_load_model_state_with_compile_key_remap_matches_top_level_orig_mod_keys(
-    tmp_path: Path,
-) -> None:
-    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
-    checkpoint = tmp_path / "checkpoint-1"
-    checkpoint.mkdir(parents=True, exist_ok=True)
-
-    with torch.no_grad():
-        model[0].weight.fill_(0.5)
-        model[0].bias.fill_(0.125)
-
-    original = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    remapped = {f"_orig_mod.{key}": value.detach().clone() for key, value in original.items()}
+    if orig_mod_placement == "nested":
+        remapped = {
+            key.replace("0.", "0._orig_mod."): value.detach().clone() for key, value in original.items()
+        }
+    else:
+        remapped = {f"_orig_mod.{key}": value.detach().clone() for key, value in original.items()}
     torch.save(remapped, checkpoint / "model.bin")
 
     with torch.no_grad():
@@ -926,7 +972,7 @@ def test_flush_loggers_suppresses_handler_flush_errors() -> None:
     assert bad_handler.flush_calls >= 1
 
 
-def test_init_trackers_passes_wandb_name_with_wrapped_signature() -> None:
+def test_init_trackers_passes_wandb_name_and_logging_dir_with_wrapped_signature(tmp_path: Path) -> None:
     class _WrappedAccelerator:
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
@@ -942,34 +988,16 @@ def test_init_trackers_passes_wandb_name_with_wrapped_signature() -> None:
         tracker_cfg={"a": 1},
         report_to="wandb",
         run_name="demo-run",
+        logging_dir=tmp_path,
     )
 
     assert accel.calls
     first = accel.calls[0]
     assert first["project_name"] == "demo-project"
     assert first["init_kwargs"]["wandb"]["name"] == "demo-run"
-
-
-def test_init_trackers_falls_back_without_init_kwargs(caplog: pytest.LogCaptureFixture) -> None:
-    class _LegacyAccelerator:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
-
-        def init_trackers(self, *, project_name: str, config: dict[str, Any]) -> None:
-            self.calls.append({"project_name": project_name, "config": dict(config)})
-
-    accel = _LegacyAccelerator()
-    with caplog.at_level(logging.WARNING):
-        _init_trackers(
-            accelerator=accel,
-            project_name="demo-project",
-            tracker_cfg={"a": 1},
-            report_to="wandb",
-            run_name="demo-run",
-        )
-
-    assert accel.calls
-    assert "rejected init_kwargs" in caplog.text
+    assert first["init_kwargs"]["wandb"]["dir"] == str(tmp_path.resolve())
+    assert first["init_kwargs"]["wandb"]["config"] == {"a": 1}
+    assert "config" not in first
 
 
 def test_setup_wandb_watch_calls_watch_with_mode_and_frequency() -> None:
@@ -1009,7 +1037,7 @@ def test_upload_wandb_original_config_stages_with_expected_filename(tmp_path: Pa
 
     run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=types.SimpleNamespace(is_main_process=True),
+        accelerator=AcceleratorStateStub(is_main_process=True),
         wandb_run=run,
         config_original_path=src,
         run_name="demo-run",
@@ -1028,11 +1056,11 @@ def test_upload_wandb_original_config_uploads_resolved_and_source_files(tmp_path
         "model:\n  backbone_type: hf_deberta_v2\ntrain:\n  warmup_steps: 10000\n", encoding="utf-8"
     )
     src_source = tmp_path / "passed.yaml"
-    src_source.write_text("model:\n  profile: deberta_v3_parity\n", encoding="utf-8")
+    src_source.write_text("model:\n  backbone_type: hf_deberta_v2\n", encoding="utf-8")
 
     run = FakeWandbRun()
     uploaded = _upload_wandb_original_config(
-        accelerator=types.SimpleNamespace(is_main_process=True),
+        accelerator=AcceleratorStateStub(is_main_process=True),
         wandb_run=run,
         config_original_path=src_original,
         config_resolved_path=src_resolved,
@@ -1061,43 +1089,35 @@ def test_coerce_dataclass_payload_types_accepts_mapping_inputs() -> None:
 
 
 def test_build_runtime_resolved_tracker_config_populates_effective_values_and_prunes_none() -> None:
-    model_cfg = ModelConfig(
-        profile="deberta_v3_parity",
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        pretrained_discriminator_path="microsoft/deberta-v3-base",
-        generator_num_hidden_layers=None,
-        hidden_dropout_prob=None,
-        attention_probs_dropout_prob=None,
-        tokenizer_vocab_target=None,
+        pretrained={"discriminator_path": "microsoft/deberta-v3-base"},
+        generator={"num_hidden_layers": None},
+        dropout={"hidden_prob": None, "attention_probs_prob": None},
+        tokenizer={"vocab_target": None},
     )
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig(
-        learning_rate=5e-4,
-        generator_learning_rate=-1.0,
-        discriminator_learning_rate=-1.0,
-    )
-    optim_cfg = OptimConfig(
-        learning_rate=5e-4, generator_learning_rate=-1.0, discriminator_learning_rate=-1.0
-    )
-    logging_cfg = LoggingConfig()
-    disc_cfg = types.SimpleNamespace(
+    data_cfg = make_data_config(source={"dataset_name": "HuggingFaceFW/fineweb-edu"})
+    train_cfg = make_train_config()
+    optim_cfg = make_optim_config(lr={"base": 5e-4, "generator": -1.0, "discriminator": -1.0})
+    logging_cfg = make_logging_config()
+    disc_cfg = BackboneConfigStub(
         num_hidden_layers=12,
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         max_position_embeddings=1024,
-        to_dict=lambda: {
+        payload={
             "num_hidden_layers": 12,
             "hidden_dropout_prob": 0.1,
             "attention_probs_dropout_prob": 0.1,
             "max_position_embeddings": 1024,
         },
     )
-    gen_cfg = types.SimpleNamespace(
+    gen_cfg = BackboneConfigStub(
         num_hidden_layers=6,
         hidden_size=384,
         intermediate_size=1536,
         num_attention_heads=6,
-        to_dict=lambda: {
+        payload={
             "num_hidden_layers": 6,
             "hidden_size": 384,
             "intermediate_size": 1536,
@@ -1132,86 +1152,42 @@ def test_build_runtime_resolved_tracker_config_populates_effective_values_and_pr
     assert "effective" not in payload
 
 
-def test_build_runtime_resolved_tracker_config_omits_effective_backbone_payload() -> None:
-    model_cfg = ModelConfig(profile="deberta_v3_parity", backbone_type="hf_deberta_v2")
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu")
-    train_cfg = TrainConfig()
-    disc_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
-            "model_type": "deberta-v2",
-            "hidden_size": 768,
-            "num_hidden_layers": 12,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-            "vocab_size": 32000,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 3,
-            "max_length": 20,
-            "top_k": 50,
-            "id2label": {"0": "LABEL_0"},
-            "_name_or_path": "",
-        },
-    )
-    gen_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
-            "model_type": "deberta-v2",
-            "hidden_size": 768,
-            "num_hidden_layers": 6,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-            "vocab_size": 32000,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 3,
-            "max_length": 20,
-            "top_k": 50,
-            "id2label": {"0": "LABEL_0"},
-            "_name_or_path": "",
-        },
-    )
-    tokenizer = DummyTokenizer(vocab_size=32000)
-
-    payload = _build_runtime_resolved_tracker_config(
-        model_cfg=model_cfg,
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        disc_config=disc_cfg,
-        gen_config=gen_cfg,
-        tokenizer=tokenizer,
-    )
-
-    assert set(payload.keys()) == {"model", "data", "train", "optim", "logging"}
-    assert "effective" not in payload
-
-
 def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None:
-    model_cfg = ModelConfig(
+    model_cfg = make_model_config(
         backbone_type="hf_deberta_v2",
-        hidden_size="768",  # type: ignore[arg-type]
-        num_hidden_layers="12",  # type: ignore[arg-type]
-        num_attention_heads="12",  # type: ignore[arg-type]
-        intermediate_size="3072",  # type: ignore[arg-type]
-        hidden_dropout_prob="0.0",  # type: ignore[arg-type]
-        attention_probs_dropout_prob="0.0",  # type: ignore[arg-type]
+        rope={
+            "hidden_size": "768",
+            "num_hidden_layers": "12",
+            "num_attention_heads": "12",
+            "intermediate_size": "3072",
+        },  # type: ignore[dict-item]
+        dropout={
+            "hidden_prob": "0.0",
+            "attention_probs_prob": "0.0",
+        },  # type: ignore[dict-item]
     )
-    data_cfg = DataConfig(dataset_name="HuggingFaceFW/fineweb-edu", max_seq_length="1024")  # type: ignore[arg-type]
-    train_cfg = TrainConfig(
+    data_cfg = make_data_config(
+        source={"dataset_name": "HuggingFaceFW/fineweb-edu"},
+        packing={"max_seq_length": "1024"},  # type: ignore[dict-item]
+    )
+    train_cfg = make_train_config(
         token_weighted_gradient_accumulation="true",  # type: ignore[arg-type]
     )
-    optim_cfg = OptimConfig(
-        learning_rate="5e-4",  # type: ignore[arg-type]
-        adam_epsilon="1e-6",  # type: ignore[arg-type]
-        warmup_steps="1000",  # type: ignore[arg-type]
+    optim_cfg = make_optim_config(
+        lr={"base": "5e-4"},  # type: ignore[dict-item]
+        adam={"epsilon": "1e-6"},  # type: ignore[dict-item]
+        scheduler={"warmup_steps": "1000"},  # type: ignore[dict-item]
     )
-    disc_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
+    disc_cfg = BackboneConfigStub(
+        payload={
             "num_hidden_layers": 12,
             "hidden_dropout_prob": 0.0,
             "attention_probs_dropout_prob": 0.0,
             "max_position_embeddings": 1024,
         },
     )
-    gen_cfg = types.SimpleNamespace(
-        to_dict=lambda: {
+    gen_cfg = BackboneConfigStub(
+        payload={
             "num_hidden_layers": 6,
             "hidden_size": 768,
             "intermediate_size": 3072,
@@ -1238,30 +1214,19 @@ def test_build_runtime_resolved_tracker_config_coerces_numeric_strings() -> None
     assert payload["train"]["token_weighted_gradient_accumulation"] is True
 
 
-def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_pretraining_keyboard_interrupt_skips_uncommitted_checkpoint_and_finishes_wandb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
     saved_checkpoints: list[tuple[str, int, str]] = []
 
-    def _fake_save_checkpoint(
-        *,
-        accelerator,
-        checkpoint_dir,
-        output_dir,
-        consumed_micro_batches,
-        save_total_limit,
-        log_label,
-        **kwargs,
-    ):
-        del accelerator, output_dir, save_total_limit, kwargs
-        saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
         accelerator_cls=FakeAccelerator,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        save_checkpoint_fn=make_checkpoint_saver(calls=saved_checkpoints),
     )
 
     # Override cycle to interrupt after first batch.
@@ -1272,38 +1237,35 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
 
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
+    train_cfg = make_train_config(
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
         max_steps=2,
-        save_steps=0,
-        report_to="wandb",
         mixed_precision="no",
         tf32=False,
-        dataloader_num_workers=0,
+        dataloader={"num_workers": 0},
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
-        torch_compile=False,
-        export_hf_final=False,
+        compile={"enabled": False},
     )
 
-    with pytest.raises(KeyboardInterrupt):
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
             train_cfg=train_cfg,
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
+            logging_cfg=make_logging_config(wandb={"enabled": True}),
         )
 
-    metrics_path = Path(train_cfg.output_dir) / "metrics.jsonl.gz"
+    metrics_path = Path(str(train_cfg.checkpoint.output_dir)) / "metrics.jsonl.gz"
     with gzip.open(metrics_path, "rt", encoding="utf-8") as f:
         rows = [json.loads(line) for line in f.read().splitlines()]
     assert rows and rows[-1]["crash"] is True
     assert rows[-1]["crash_type"] == "KeyboardInterrupt"
     assert int(rows[-1]["step"]) == 1
 
-    assert saved_checkpoints
-    assert saved_checkpoints[-1][0].endswith("checkpoint-1")
-    assert saved_checkpoints[-1][1] == 1
-    assert saved_checkpoints[-1][2] == "final"
+    assert saved_checkpoints == []
+    assert "last completed checkpoint is the recovery boundary" in caplog.text
 
     accel = FakeAccelerator.last_instance
     assert accel is not None
@@ -1321,93 +1283,68 @@ def test_run_pretraining_keyboard_interrupt_logs_crash_and_finishes_wandb(
     first_tracker_call = accel.tracker_init_calls[0]
     assert first_tracker_call["project_name"] == "deberta-train"
     assert first_tracker_call["init_kwargs"]["wandb"]["name"] == "run"
+    assert first_tracker_call["init_kwargs"]["wandb"]["config"]
     assert accel.ended is False
 
 
 def test_run_pretraining_logs_crash_save_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from _fakes import _PRETRAINING_BATCH
-
-    def _fake_save_checkpoint(
-        *,
-        accelerator,
-        checkpoint_dir,
-        output_dir,
-        consumed_micro_batches,
-        save_total_limit,
-        log_label,
-        **kwargs,
-    ):
-        del accelerator, checkpoint_dir, output_dir, consumed_micro_batches, save_total_limit, kwargs
-        if str(log_label) == "final":
-            raise RuntimeError("disk full")
+    class _CrashAfterCommitAccelerator(FakeAccelerator):
+        def log(self, row: dict[str, Any], step: int | None = None) -> None:
+            if "loss" in row:
+                raise RuntimeError("tracker failed after committed step")
+            super().log(row, step=step)
 
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        accelerator_cls=_CrashAfterCommitAccelerator,
+        save_checkpoint_fn=make_checkpoint_saver(fail_label="final", failure_message="disk full"),
     )
 
-    def _interrupt_cycle(_loader, *, start_epoch: int = 0):
-        del start_epoch
-        yield _PRETRAINING_BATCH
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
-
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
+    train_cfg = make_train_config(
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
         max_steps=2,
-        save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
-        dataloader_num_workers=0,
+        dataloader={"num_workers": 0},
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
-        torch_compile=False,
-        export_hf_final=False,
+        compile={"enabled": False},
     )
 
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(RuntimeError, match="tracker failed after committed step"):
             pretrain_mod.run_pretraining(
-                model_cfg=ModelConfig(),
-                data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+                model_cfg=make_model_config(),
+                data_cfg=make_data_config(
+                    source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}
+                ),
                 train_cfg=train_cfg,
+                optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
+                logging_cfg=make_logging_config(logging_steps=1, wandb={"enabled": True}),
             )
 
     assert any("Final/crash-time checkpoint save failed" in rec.message for rec in caplog.records)
 
 
-def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_pretraining_crash_does_not_checkpoint_after_partial_next_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from _fakes import _PRETRAINING_BATCH
 
     saved_checkpoints: list[tuple[str, int, str]] = []
 
-    def _fake_save_checkpoint(
-        *,
-        accelerator,
-        checkpoint_dir,
-        output_dir,
-        consumed_micro_batches,
-        save_total_limit,
-        log_label,
-        **kwargs,
-    ):
-        del accelerator, output_dir, save_total_limit, kwargs
-        saved_checkpoints.append((str(checkpoint_dir), int(consumed_micro_batches), str(log_label)))
-
     pretrain_mod = setup_pretraining_mocks(
         monkeypatch,
-        save_checkpoint_fn=_fake_save_checkpoint,
+        save_checkpoint_fn=make_checkpoint_saver(calls=saved_checkpoints),
     )
 
-    # Complete one accumulation window (2 micro-batches), then interrupt in the next
-    # window after fetching one more micro-batch. Final checkpoint should persist only
-    # committed-step progress for checkpoint-{global_step}.
+    # Complete one accumulation window, then interrupt after the next window has
+    # consumed a stochastic micro-batch. The live RNG no longer represents the
+    # committed boundary, so a crash-time checkpoint would not resume exactly.
     def _interrupt_cycle(_loader, *, start_epoch: int = 0):
         del start_epoch
         yield _PRETRAINING_BATCH
@@ -1417,28 +1354,24 @@ def test_run_pretraining_crash_checkpoint_saves_committed_microbatch_progress(
 
     monkeypatch.setattr(pretrain_mod, "_cycle_dataloader", _interrupt_cycle)
 
-    train_cfg = TrainConfig(
-        output_dir=str(tmp_path / "run"),
+    train_cfg = make_train_config(
+        checkpoint={"output_dir": str(tmp_path / "run"), "save_steps": 0, "export_hf_final": False},
         max_steps=3,
-        save_steps=0,
-        report_to="none",
         mixed_precision="no",
         tf32=False,
-        dataloader_num_workers=0,
+        dataloader={"num_workers": 0},
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
-        torch_compile=False,
-        export_hf_final=False,
+        compile={"enabled": False},
     )
 
-    with pytest.raises(KeyboardInterrupt):
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
         pretrain_mod.run_pretraining(
-            model_cfg=ModelConfig(),
-            data_cfg=DataConfig(dataset_name="hf-internal-testing/librispeech_asr_dummy"),
+            model_cfg=make_model_config(),
+            data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
             train_cfg=train_cfg,
+            optim_cfg=make_optim_config(scheduler={"warmup_steps": 0}),
         )
 
-    assert saved_checkpoints
-    assert saved_checkpoints[-1][0].endswith("checkpoint-1")
-    assert saved_checkpoints[-1][1] == 2
-    assert saved_checkpoints[-1][2] == "final"
+    assert saved_checkpoints == []
+    assert "last completed checkpoint is the recovery boundary" in caplog.text

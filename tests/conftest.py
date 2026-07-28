@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 
 @pytest.fixture
@@ -25,9 +27,23 @@ def mock_checkpoint(tmp_path: Path):
         ckpt = parent / str(name)
         ckpt.mkdir(parents=True, exist_ok=True)
         if with_weights:
-            (ckpt / "model.safetensors").write_bytes(b"weights")
+            # A real payload: checkpoint validation parses the safetensors header.
+            save_file({"weight": torch.zeros(4)}, str(ckpt / "model.safetensors"))
         if with_data_state:
-            payload: dict[str, Any] = {"consumed_micro_batches": int(consumed_micro_batches)}
+            try:
+                global_step = int(str(name).rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                global_step = 0
+            payload: dict[str, Any] = {
+                "consumed_micro_batches": int(consumed_micro_batches),
+                "input_tokens_seen": 0.0,
+                "global_step": global_step,
+                "gradient_accumulation_steps": 1,
+                "optimizer_param_digest": {
+                    "generator": "c47801e52addb7bd",
+                    "discriminator": "97f96551c79936d2",
+                },
+            }
             if data_state_extra:
                 payload.update(dict(data_state_extra))
             (ckpt / "data_state.json").write_text(json.dumps(payload), encoding="utf-8")

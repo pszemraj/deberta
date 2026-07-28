@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""CUDA parity check for config-driven FlashDeBERTa attention routes."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from typing import Any
+
+import _bench_common  # noqa: E402,F401  (inserts src/ on sys.path at import)
+import torch
+
+from deberta.modeling.deberta_v2_native import DebertaV2Config, DebertaV2Model  # noqa: E402
+from deberta.modeling.mask_utils import (  # noqa: E402
+    FlashBatchMeta,
+    build_doc_block_mask,
+    build_doc_segment_metadata,
+)
+
+
+@dataclass(frozen=True)
+class ParityCase:
+    """One FlashDeBERTa parity scenario."""
+
+    name: str
+    seq_len: int
+    batch_size: int
+    route_hint: str
+    pad_tail: int = 0
+    pad_front: int = 0
+    docblock: bool = False
+    head_dim: int = 16
+
+
+_PARITY_CASE_NAMES = (
+    "dense",
+    "dense_hd32",
+    "dense_hd128",
+    "fixed_padded",
+    "varlen",
+    "local_bias",
+    "docblock",
+    "docblock_1024",
+    "docblock_2048",
+    "docblock_4096",
+    "docblock_frontpad",
+    "docblock_bias",
+    "docbias_1024_b4",
+    "docbias_1024",
+    "docbias_2048",
+    "docbias_4096",
+)
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse explicit parity-suite controls."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=_PARITY_CASE_NAMES,
+        default=[],
+        help="Run only this case; repeat to select multiple cases.",
+    )
+    parser.add_argument(
+        "--include-docblock-bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include memory-intensive dense doc-block bias cases.",
+    )
+    return parser.parse_args()
+
+
+def _build_tiny_config(*, seq_len: int, flash: bool, head_dim: int) -> DebertaV2Config:
+    """Build a small DeBERTa config suitable for parity testing."""
+
+    return _bench_common.build_synthetic_backbone_config(
+        mode="flash" if bool(flash) else "eager",
+        seq_len=seq_len,
+        vocab_size=128,
+        hidden_size=4 * int(head_dim),
+        num_layers=2,
+        num_heads=4,
+        intermediate_size=8 * int(head_dim),
+    )
+
+
+@torch.no_grad()
+def _copy_weights(src: torch.nn.Module, dst: torch.nn.Module) -> None:
+    """Copy model weights between variants."""
+
+    dst.load_state_dict(src.state_dict(), strict=True)
+
+
+def _doc_ids_for_case(case: ParityCase) -> torch.Tensor:
+    """Build packed document ids with at least three docs per active row.
+
+    Active tokens sit between ``case.pad_front`` leading padding positions
+    and ``case.pad_tail`` trailing padding positions, so a case can exercise
+    front padding, tail padding, or both in the same row.
+
+    :param ParityCase case: Doc-block parity case.
+    :return torch.Tensor: CPU doc ids in ``(B,S)`` layout.
+    """
+
+    if not case.docblock:
+        raise ValueError("_doc_ids_for_case requires a doc-block case.")
+    front = int(case.pad_front)
+    active_len = int(case.seq_len) - int(case.pad_tail) - front
+    if active_len < 3:
+        raise ValueError(f"Doc-block parity case needs at least three active tokens: {case}")
+    first = max(1, active_len // 5)
+    second = max(1, active_len // 3)
+    third = active_len - first - second
+    if third <= 0:
+        third = 1
+        second = max(1, active_len - first - third)
+    lengths = (first, second, third)
+
+    doc_ids = torch.zeros((case.batch_size, case.seq_len), dtype=torch.long)
+    for row in range(case.batch_size):
+        cursor = front
+        rotation = row % len(lengths)
+        row_lengths = lengths[rotation:] + lengths[:rotation]
+        for doc_idx, length in enumerate(row_lengths, start=1):
+            next_cursor = min(front + active_len, cursor + int(length))
+            doc_ids[row, cursor:next_cursor] = int(doc_idx)
+            cursor = next_cursor
+        if cursor < front + active_len:
+            doc_ids[row, cursor : front + active_len] = len(row_lengths)
+    return doc_ids
+
+
+def _case_payload(case: ParityCase, *, cfg: DebertaV2Config, device: torch.device) -> dict[str, Any]:
+    """Build inputs and flash metadata for one route case."""
+
+    input_ids = torch.randint(5, cfg.vocab_size, (case.batch_size, case.seq_len), device=device)
+    attention_mask: torch.Tensor | None = None
+    seq_lengths: torch.Tensor | None = None
+    doc_segment_offsets: torch.Tensor | None = None
+    doc_segment_lengths: torch.Tensor | None = None
+    doc_cu_seqlens: torch.Tensor | None = None
+    doc_ids: torch.Tensor | None = None
+    active_tokens: int | None = None
+    doc_num_segments: int | None = None
+    doc_max_seqlen: int | None = None
+
+    if case.docblock:
+        doc_ids_cpu = _doc_ids_for_case(case)
+        if case.pad_front > 0:
+            input_ids[:, : case.pad_front] = int(cfg.pad_token_id)
+        if case.pad_tail > 0:
+            input_ids[:, -case.pad_tail :] = int(cfg.pad_token_id)
+        doc_ids = doc_ids_cpu.to(device=device)
+        seq_lengths = doc_ids.ne(0).sum(-1, dtype=torch.int32)
+        if case.route_hint == "docblock_bias":
+            attention_mask = build_doc_block_mask(doc_ids)
+        else:
+            attention_mask = doc_ids.ne(0)
+            (
+                doc_segment_offsets,
+                doc_segment_lengths,
+                doc_cu_seqlens,
+                active_tokens,
+            ) = build_doc_segment_metadata(doc_ids_cpu)
+            active_segment_lengths = doc_segment_lengths[doc_segment_lengths.ne(0)]
+            doc_num_segments = int(active_segment_lengths.numel())
+            doc_max_seqlen = int(active_segment_lengths.max()) if doc_num_segments else 0
+            doc_segment_offsets = doc_segment_offsets.to(device=device)
+            doc_segment_lengths = doc_segment_lengths.to(device=device)
+            doc_cu_seqlens = doc_cu_seqlens.to(device=device)
+    elif case.pad_tail > 0:
+        attention_mask = torch.ones((case.batch_size, case.seq_len), device=device, dtype=torch.bool)
+        attention_mask[1, -case.pad_tail :] = False
+        input_ids[1, -case.pad_tail :] = int(cfg.pad_token_id)
+        seq_lengths = attention_mask.sum(-1, dtype=torch.int32)
+
+    flash_meta = FlashBatchMeta(
+        seq_lengths=None if case.docblock else seq_lengths,
+        doc_segment_offsets=doc_segment_offsets,
+        doc_segment_lengths=doc_segment_lengths,
+        doc_cu_seqlens=doc_cu_seqlens,
+        doc_ids=doc_ids,
+        active_tokens_scalar=(
+            torch.tensor(active_tokens, dtype=torch.int32) if active_tokens is not None else None
+        ),
+        doc_num_segments_scalar=(
+            torch.tensor(doc_num_segments, dtype=torch.int32) if doc_num_segments is not None else None
+        ),
+        doc_max_segment_length_scalar=(
+            torch.tensor(doc_max_seqlen, dtype=torch.int32) if doc_max_seqlen is not None else None
+        ),
+        route_hint=case.route_hint,
+    )
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "flash_meta": flash_meta,
+        "loss_mask": doc_ids_cpu.ne(0).to(device=device)
+        if case.docblock
+        else (
+            attention_mask.bool()
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2
+            else None
+        ),
+    }
+
+
+def _build_backward_cotangent(
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+    loss_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Build one deterministic nonuniform cotangent shared by all parity variants."""
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(17)
+    cotangent = torch.empty(shape, device=device, dtype=torch.float32).uniform_(
+        -2.0,
+        2.0,
+        generator=generator,
+    )
+    if isinstance(loss_mask, torch.Tensor):
+        cotangent.mul_(loss_mask.to(device=device, dtype=torch.bool).unsqueeze(-1))
+        active_elements = int(loss_mask.sum().item()) * int(shape[-1])
+    else:
+        active_elements = int(cotangent.numel())
+    return cotangent / max(active_elements, 1)
+
+
+def _run(
+    model: DebertaV2Model,
+    payload: dict[str, Any],
+    *,
+    cotangent: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Run one forward/backward pass with a shared cotangent and return selected gradients."""
+
+    model.zero_grad(set_to_none=True)
+    model_payload = dict(payload)
+    model_payload.pop("loss_mask", None)
+    out = model(**model_payload).last_hidden_state
+    (out.float() * cotangent).sum().backward()
+    grads = {
+        "word_embeddings": model.embeddings.word_embeddings.weight.grad,
+        "rel_embeddings": model.encoder.rel_embeddings.weight.grad,
+        "query": model.encoder.layer[0].attention.self.query_proj.weight.grad,
+        "value": model.encoder.layer[0].attention.self.value_proj.weight.grad,
+    }
+    if any(value is None for value in grads.values()):
+        missing = sorted(key for key, value in grads.items() if value is None)
+        raise RuntimeError(f"Missing gradients for {missing}")
+    return out.detach(), {key: value.detach().float().clone() for key, value in grads.items()}  # type: ignore[union-attr]
+
+
+def _assert_close_to_reference(
+    *,
+    case_name: str,
+    label: str,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    max_abs_limit: float,
+    mean_abs_limit: float,
+) -> tuple[float, float]:
+    """Assert one tensor is close enough to the fp32 eager reference.
+
+    :return tuple[float, float]: Observed max and mean absolute errors.
+    """
+
+    diff = (actual.float() - reference.float()).abs()
+    max_abs = float(diff.max().item())
+    mean_abs = float(diff.mean().item())
+    print(f"{case_name:14s} {label:18s} max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}")
+    if max_abs > float(max_abs_limit) or mean_abs > float(mean_abs_limit):
+        raise AssertionError(
+            f"{case_name} {label} exceeded parity limits: "
+            f"max_abs={max_abs:.4e} > {max_abs_limit:.4e} or "
+            f"mean_abs={mean_abs:.4e} > {mean_abs_limit:.4e}"
+        )
+    return max_abs, mean_abs
+
+
+def _assert_ratio_to_reference(
+    *,
+    case_name: str,
+    label: str,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    eager_err: tuple[float, float],
+) -> tuple[float, float]:
+    """Assert flash error stays within the eager-bf16 error envelope.
+
+    :param str case_name: Case name.
+    :param str label: Tensor label.
+    :param torch.Tensor actual: Flash tensor.
+    :param torch.Tensor reference: fp32 eager reference tensor.
+    :param tuple[float, float] eager_err: Eager ``(max_abs, mean_abs)`` errors.
+    :return tuple[float, float]: Observed flash errors.
+    """
+
+    diff = (actual.float() - reference.float()).abs()
+    max_abs = float(diff.max().item())
+    mean_abs = float(diff.mean().item())
+    max_limit = max(3.0 * float(eager_err[0]), 1e-7)
+    mean_limit = max(3.0 * float(eager_err[1]), 1e-8)
+    print(
+        f"{case_name:14s} {label:18s} max_abs={max_abs:.4e} "
+        f"mean_abs={mean_abs:.4e} limits=({max_limit:.4e},{mean_limit:.4e})"
+    )
+    if max_abs > max_limit or mean_abs > mean_limit:
+        raise AssertionError(
+            f"{case_name} {label} exceeded 3x eager-bf16 error: "
+            f"max_abs={max_abs:.4e} > {max_limit:.4e} or "
+            f"mean_abs={mean_abs:.4e} > {mean_limit:.4e}"
+        )
+    return max_abs, mean_abs
+
+
+def _scaled_grad_limits(reference: torch.Tensor, *, max_rel: float, mean_rel: float) -> tuple[float, float]:
+    """Return scale-aware absolute limits for a gradient tensor."""
+
+    ref_f = reference.detach().float()
+    max_scale = float(ref_f.abs().max().item())
+    mean_scale = float(ref_f.abs().mean().item())
+    return max(max_rel * max_scale, 5e-4), max(mean_rel * mean_scale, 5e-5)
+
+
+def run_case(case: ParityCase, *, device: torch.device) -> None:
+    """Assert one route's forward/backward parity against the fp32 eager reference.
+
+    :param ParityCase case: Route scenario to execute.
+    :param torch.device device: CUDA device to run on.
+    :raises AssertionError: If flash error exceeds the eager-bf16 error envelope.
+    """
+
+    cfg_ref = _build_tiny_config(seq_len=case.seq_len, flash=False, head_dim=case.head_dim)
+    cfg_flash = _build_tiny_config(seq_len=case.seq_len, flash=True, head_dim=case.head_dim)
+
+    torch.manual_seed(0)
+    ref = DebertaV2Model(cfg_ref).to(device=device, dtype=torch.float32).train()
+    eager = DebertaV2Model(cfg_ref).to(device=device, dtype=torch.bfloat16).train()
+    flash = DebertaV2Model(cfg_flash).to(device=device, dtype=torch.bfloat16).train()
+    _copy_weights(ref, eager)
+    _copy_weights(ref, flash)
+
+    payload = _case_payload(case, cfg=cfg_ref, device=device)
+    cotangent = _build_backward_cotangent(
+        shape=(case.batch_size, case.seq_len, int(cfg_ref.hidden_size)),
+        device=device,
+        loss_mask=payload.get("loss_mask"),
+    )
+    ref_payload = dict(payload)
+    ref_payload.pop("flash_meta")
+    if case.route_hint == "docblock":
+        doc_ids = _doc_ids_for_case(case).to(device=device)
+        ref_payload["attention_mask"] = build_doc_block_mask(doc_ids)
+
+    ref_out, ref_grads = _run(ref, ref_payload, cotangent=cotangent)
+    eager_out, eager_grads = _run(eager, ref_payload, cotangent=cotangent)
+    flash_out, flash_grads = _run(flash, payload, cotangent=cotangent)
+    compare_mask = payload.get("loss_mask")
+    if isinstance(compare_mask, torch.Tensor):
+        mask = compare_mask.bool()
+        ref_out = ref_out[mask]
+        eager_out = eager_out[mask]
+        flash_out = flash_out[mask]
+
+    eager_out_max, eager_out_mean = _assert_close_to_reference(
+        case_name=case.name,
+        label="eager_bf16_out",
+        actual=eager_out,
+        reference=ref_out,
+        max_abs_limit=5e-2,
+        mean_abs_limit=8e-3,
+    )
+    _assert_ratio_to_reference(
+        case_name=case.name,
+        label="flash_bf16_out",
+        actual=flash_out,
+        reference=ref_out,
+        eager_err=(eager_out_max, eager_out_mean),
+    )
+    for key in ("word_embeddings", "rel_embeddings", "query", "value"):
+        eager_max_limit, eager_mean_limit = _scaled_grad_limits(
+            ref_grads[key],
+            max_rel=0.35,
+            mean_rel=0.35,
+        )
+        eager_grad_max, eager_grad_mean = _assert_close_to_reference(
+            case_name=case.name,
+            label=f"eager_grad_{key}",
+            actual=eager_grads[key],
+            reference=ref_grads[key],
+            max_abs_limit=eager_max_limit,
+            mean_abs_limit=eager_mean_limit,
+        )
+        _assert_ratio_to_reference(
+            case_name=case.name,
+            label=f"flash_grad_{key}",
+            actual=flash_grads[key],
+            reference=ref_grads[key],
+            eager_err=(eager_grad_max, eager_grad_mean),
+        )
+
+
+def parity_cases(*, include_docblock_bias: bool = True) -> list[ParityCase]:
+    """Return the full route-matrix parity suite.
+
+    This is the single source of truth for parity coverage; ``tests/`` runs the
+    same list so ``pytest`` remains the authoritative gate.
+
+    :param bool include_docblock_bias: Whether to include memory-intensive dense
+        doc-block bias cases.
+    :return list[ParityCase]: Route scenarios to execute.
+    """
+
+    cases = [
+        ParityCase("dense", seq_len=256, batch_size=2, route_hint="dense"),
+        ParityCase("dense_hd32", seq_len=256, batch_size=2, route_hint="dense", head_dim=32),
+        ParityCase("dense_hd128", seq_len=256, batch_size=2, route_hint="dense", head_dim=128),
+        ParityCase("fixed_padded", seq_len=256, batch_size=2, route_hint="fixed", pad_tail=64),
+        ParityCase("varlen", seq_len=256, batch_size=2, route_hint="varlen", pad_tail=64),
+        ParityCase("local_bias", seq_len=1024, batch_size=2, route_hint="local_bias"),
+        ParityCase("docblock", seq_len=256, batch_size=2, route_hint="docblock", pad_tail=32, docblock=True),
+        ParityCase(
+            "docblock_frontpad",
+            seq_len=256,
+            batch_size=2,
+            route_hint="docblock",
+            pad_front=32,
+            docblock=True,
+        ),
+        ParityCase(
+            "docblock_1024",
+            seq_len=1024,
+            batch_size=1,
+            route_hint="docblock",
+            pad_tail=96,
+            docblock=True,
+        ),
+        ParityCase(
+            "docblock_2048",
+            seq_len=2048,
+            batch_size=1,
+            route_hint="docblock",
+            pad_tail=160,
+            docblock=True,
+        ),
+        ParityCase(
+            "docblock_4096",
+            seq_len=4096,
+            batch_size=1,
+            route_hint="docblock",
+            pad_tail=256,
+            docblock=True,
+        ),
+    ]
+    if bool(include_docblock_bias):
+        cases.append(
+            ParityCase("docblock_bias", seq_len=1024, batch_size=2, route_hint="docblock_bias", docblock=True)
+        )
+        cases.extend(
+            [
+                ParityCase(
+                    "docbias_1024_b4",
+                    seq_len=1024,
+                    batch_size=4,
+                    route_hint="docblock_bias",
+                    docblock=True,
+                    head_dim=64,
+                ),
+                ParityCase(
+                    "docbias_1024",
+                    seq_len=1024,
+                    batch_size=1,
+                    route_hint="docblock_bias",
+                    pad_tail=96,
+                    docblock=True,
+                    head_dim=64,
+                ),
+                ParityCase(
+                    "docbias_2048",
+                    seq_len=2048,
+                    batch_size=1,
+                    route_hint="docblock_bias",
+                    pad_tail=160,
+                    docblock=True,
+                    head_dim=64,
+                ),
+                ParityCase(
+                    "docbias_4096",
+                    seq_len=4096,
+                    batch_size=1,
+                    route_hint="docblock_bias",
+                    pad_tail=256,
+                    docblock=True,
+                    head_dim=64,
+                ),
+            ]
+        )
+    return cases
+
+
+def main() -> None:
+    """Run forward/backward parity checks on a CUDA device.
+
+    ``pytest tests/test_flashdeberta_parity.py`` runs the same cases; this CLI
+    exists for selecting and debugging individual routes.
+
+    :raises RuntimeError: If CUDA is unavailable.
+    :raises ValueError: If every case is filtered out.
+    """
+
+    args = _parse_args()
+    cases = parity_cases(include_docblock_bias=bool(args.include_docblock_bias))
+    requested_cases = set(args.case)
+    if requested_cases:
+        cases = [case for case in cases if case.name in requested_cases]
+    if not cases:
+        raise ValueError("No parity cases remain after applying --case and route-family filters.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for tools/flashdeberta_parity_test.py.")
+
+    device = torch.device("cuda")
+    for case in cases:
+        run_case(case, device=device)
+    print("OK")
+
+
+if __name__ == "__main__":
+    main()

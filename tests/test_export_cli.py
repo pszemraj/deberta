@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import tempfile
 import types
@@ -12,64 +11,428 @@ from typing import Any
 
 import pytest
 import torch
-from _fakes import DummyTokenizer, FakeAccelerator
+from _config_factories import (
+    make_data_config,
+    make_model_config,
+    make_native_deberta_config,
+    make_train_config,
+)
+from _fakes import AutoTokenizerStub, BackboneConfigStub, DummyTokenizer, FakeAccelerator
 
 import deberta.export_cli as export_cli
-from deberta.config import RUN_CONFIG_SCHEMA_VERSION, DataConfig, ModelConfig
+from deberta.config import RUN_CONFIG_SCHEMA_VERSION
+from deberta.modeling.export_utils import write_export_readme_and_license
 from deberta.run_layout import validate_run_metadata_file
 
 
-class _FakeExportBackbone:
+class _DistributedTypeStub:
+    FSDP = "FSDP"
+
+
+class _StateDictTypeStub:
+    FULL_STATE_DICT = "FULL_STATE_DICT"
+
+
+class _EmptyPretrainerStub:
+    pass
+
+
+class _StateDictPretrainerStub:
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {
+            "discriminator.weight": torch.tensor(1.0),
+            "generator.weight": torch.tensor(2.0),
+        }
+
+
+class _FakeExportBackbone(torch.nn.Module):
     def __init__(
         self,
         *,
         weight_keys: tuple[str, ...] = ("weight",),
-        forced_missing_keys: tuple[str, ...] | None = None,
         write_config_payload: dict[str, Any] | None = None,
     ) -> None:
-        self._weights: dict[str, torch.Tensor] = {str(key): torch.tensor(0.0) for key in weight_keys}
-        self._forced_missing_keys = list(forced_missing_keys or ())
+        super().__init__()
+        for key in weight_keys:
+            module = self
+            *parents, parameter_name = str(key).split(".")
+            for parent in parents:
+                child = getattr(module, parent, None)
+                if child is None:
+                    child = torch.nn.Module()
+                    module.add_module(parent, child)
+                module = child
+            module.register_parameter(parameter_name, torch.nn.Parameter(torch.tensor(0.0)))
         self._write_config_payload = dict(write_config_payload or {})
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        return self._weights
-
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> Any:
-        del strict
-        model_keys = set(self._weights.keys())
-        source_keys = set(state_dict.keys())
-        missing = sorted(model_keys - source_keys)
-        if self._forced_missing_keys:
-            missing = sorted(set(missing) | set(self._forced_missing_keys))
-        unexpected = sorted(source_keys - model_keys)
-        for key in model_keys & source_keys:
-            self._weights[key] = state_dict[key]
-        return types.SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
 
     def save_pretrained(self, path: str, safe_serialization: bool = True) -> None:
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
-        if self._write_config_payload:
-            (target / "config.json").write_text(
-                json.dumps(self._write_config_payload),
-                encoding="utf-8",
-            )
+        (target / "config.json").write_text(
+            json.dumps(self._write_config_payload),
+            encoding="utf-8",
+        )
         del safe_serialization
         return None
+
+
+@pytest.mark.parametrize(
+    ("backbone_type", "max_seq_length", "required", "forbidden", "extra_required"),
+    [
+        (
+            "rope",
+            777,
+            "DebertaRoPEModel.from_pretrained",
+            'model = AutoModel.from_pretrained("path/to/this/dir")',
+            "model_type",
+        ),
+        ("hf_deberta_v2", 333, "AutoModel.from_pretrained", "DebertaRoPEModel.from_pretrained", None),
+    ],
+)
+def test_write_export_readme_uses_backbone_specific_loading_snippet(
+    tmp_path: Path,
+    backbone_type: str,
+    max_seq_length: int,
+    required: str,
+    forbidden: str,
+    extra_required: str | None,
+) -> None:
+    out_dir = tmp_path / f"{backbone_type}-export"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    write_export_readme_and_license(
+        out_dir,
+        model_cfg=make_model_config(backbone_type=backbone_type),
+        data_cfg=make_data_config(packing={"max_seq_length": max_seq_length}),
+        train_cfg=make_train_config(max_steps=100),
+        embedding_sharing="gdes",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert required in text
+    assert forbidden not in text
+    assert 'from_pretrained("path/to/model/dir")' in text
+    assert 'AutoTokenizer.from_pretrained("path/to/export/root")' in text
+    assert "With `--what both`" in text
+    if extra_required is not None:
+        assert extra_required in text
+    assert f"| Max sequence length | {max_seq_length} |" in text
+    assert (out_dir / "LICENSE").exists()
+
+
+def test_write_export_readme_uses_export_config_dimensions_when_available(tmp_path: Path) -> None:
+    out_dir = tmp_path / "hf-export-effective-config"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    export_cfg = BackboneConfigStub(
+        hidden_size=768,
+        num_hidden_layers=6,
+        num_attention_heads=12,
+        max_position_embeddings=4096,
+    )
+
+    write_export_readme_and_license(
+        out_dir,
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2", hf={"model_size": "small"}),
+        export_config=export_cfg,
+        data_cfg=None,
+        train_cfg=make_train_config(max_steps=100),
+        embedding_sharing="gdes",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "# hf_deberta_v2-768h-6L-12H" in text
+    assert "| Max sequence length | 4096 |" in text
+    assert "| Packed-sequence pretraining | unknown |" in text
+    assert "| Cross-document attention blocking | unknown |" in text
+    assert "packing/attention-blocking configuration is unavailable" in text
+    assert (out_dir / "LICENSE").exists()
+
+
+@pytest.mark.parametrize(
+    ("packing_enabled", "block_cross_document_attention", "expected_phrase"),
+    [
+        (True, True, "cross-document attention blocking enabled"),
+        (True, False, "without cross-document attention blocking"),
+        (False, False, "without sequence packing"),
+    ],
+    ids=["packed-blocked", "packed-unblocked", "unpacked"],
+)
+def test_write_export_readme_discloses_pretraining_packing_regime(
+    tmp_path: Path,
+    packing_enabled: bool,
+    block_cross_document_attention: bool,
+    expected_phrase: str,
+) -> None:
+    out_dir = tmp_path / "packing-export"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_cfg = make_data_config(
+        packing={
+            "max_seq_length": 64,
+            "enabled": packing_enabled,
+            "block_cross_document_attention": block_cross_document_attention,
+        }
+    )
+
+    write_export_readme_and_license(
+        out_dir,
+        model_cfg=make_model_config(backbone_type="hf_deberta_v2"),
+        data_cfg=data_cfg,
+        train_cfg=make_train_config(max_steps=10),
+        embedding_sharing="none",
+    )
+
+    text = (out_dir / "README.md").read_text(encoding="utf-8")
+    packed_str = "yes" if packing_enabled else "no"
+    blocked_str = "yes" if block_cross_document_attention else "no"
+    assert f"| Packed-sequence pretraining | {packed_str} |" in text
+    assert f"| Cross-document attention blocking | {blocked_str} |" in text
+    assert expected_phrase in text
+    assert "standard 2D attention masks at inference" in text
+
+
+def test_verify_staged_encoder_output_parity_checks_reloaded_config(tmp_path: Path) -> None:
+    class _ReloadableEncoder(torch.nn.Module):
+        def __init__(self, *, scale: float, weight: float) -> None:
+            super().__init__()
+            self.config = types.SimpleNamespace(vocab_size=16, max_position_embeddings=8)
+            self.scale = float(scale)
+            self.weight = torch.nn.Parameter(torch.tensor(float(weight)))
+
+        def forward(self, input_ids: torch.Tensor, **kwargs: Any) -> Any:
+            del kwargs
+            hidden = input_ids.float().unsqueeze(-1) * self.weight * self.scale
+            return types.SimpleNamespace(last_hidden_state=hidden)
+
+        def save_pretrained(self, path: str) -> None:
+            target = Path(path)
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "config.json").write_text(
+                json.dumps({"scale": self.scale, "weight": float(self.weight.detach())}),
+                encoding="utf-8",
+            )
+
+        @classmethod
+        def from_pretrained(cls, path: str) -> _ReloadableEncoder:
+            payload = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+            return cls(scale=float(payload["scale"]), weight=float(payload["weight"]))
+
+    component_dir = tmp_path / "staged"
+    source = _ReloadableEncoder(scale=1.0, weight=2.0)
+    source.save_pretrained(str(component_dir))
+
+    export_cli._verify_staged_encoder_output_parity(
+        component="discriminator",
+        export_model=source,
+        component_dir=component_dir,
+    )
+
+    (component_dir / "config.json").write_text(
+        json.dumps({"scale": 3.0, "weight": 2.0}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="Staged discriminator encoder output does not match"):
+        export_cli._verify_staged_encoder_output_parity(
+            component="discriminator",
+            export_model=source,
+            component_dir=component_dir,
+        )
+
+
+@pytest.mark.parametrize("backbone_type", ["hf_deberta_v2", "rope"])
+def test_verify_staged_encoder_output_parity_supports_real_export_backbones(
+    tmp_path: Path,
+    backbone_type: str,
+) -> None:
+    if backbone_type == "hf_deberta_v2":
+        from transformers import AutoModel
+
+        model = AutoModel.from_config(make_native_deberta_config())
+    else:
+        from deberta.modeling.rope_encoder import DebertaRoPEConfig, DebertaRoPEModel
+
+        model = DebertaRoPEModel(
+            DebertaRoPEConfig(
+                vocab_size=64,
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                intermediate_size=64,
+                max_position_embeddings=32,
+                type_vocab_size=0,
+            )
+        )
+
+    component_dir = tmp_path / backbone_type
+    model.save_pretrained(component_dir)
+    export_cli._verify_staged_encoder_output_parity(
+        component="discriminator",
+        export_model=model,
+        component_dir=component_dir,
+    )
+
+
+def _shipped_regime_native_config(**overrides: Any) -> Any:
+    """Build a tiny ``transformers.DebertaV2Config`` at the shipped pretraining attention regime.
+
+    Mirrors the relative-attention knobs ``deberta.modeling.builder._build_repo_hf_deberta_v2_config``
+    sets for shipped runs (``position_buckets>0``, ``relative_attention=True``, ``share_att_key=True``,
+    ``norm_rel_ebd="layer_norm"``, ``pos_att_type=["p2c", "c2p"]``, ``position_biased_input=False``),
+    with small dimensions for fast CPU tests.
+
+    :param Any overrides: Config field overrides layered on top of the shipped-regime defaults.
+    :return Any: Small ``transformers.DebertaV2Config`` instance.
+    """
+    defaults = {
+        "vocab_size": 48,
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "intermediate_size": 64,
+        "max_position_embeddings": 16,
+        "position_buckets": 8,
+        "max_relative_positions": -1,
+        "relative_attention": True,
+        "position_biased_input": False,
+        "share_att_key": True,
+        "norm_rel_ebd": "layer_norm",
+        "pos_att_type": ["p2c", "c2p"],
+        "type_vocab_size": 0,
+        "hidden_dropout_prob": 0.0,
+        "attention_probs_dropout_prob": 0.0,
+        "layer_norm_eps": 1e-7,
+        "pad_token_id": 0,
+    }
+    return make_native_deberta_config(**(defaults | overrides))
+
+
+@pytest.mark.parametrize("export_what", ["discriminator", "generator"])
+def test_native_vs_export_backbone_full_model_output_parity(export_what: str) -> None:
+    """Native training encoder and export-side ``transformers.AutoModel`` encoder must match.
+
+    Training uses ``deberta.modeling.deberta_v2_native.DebertaV2Model`` for the ``hf_deberta_v2``
+    backbone; export instead rebuilds the checkpoint via ``transformers.AutoModel.from_config``
+    (see ``_build_export_backbone``) — an independent implementation. This drives the REAL export
+    seams directly: ``_build_export_backbone`` builds the export model from the exact config object
+    used at training time, and ``_drop_training_only_state_for_strict_load`` performs the same
+    native -> export state-dict adaptation ``_export_component`` applies before its strict load.
+
+    ``_build_export_backbone`` routes both components through the identical ``AutoModel.from_config``
+    branch for backbone_type='hf_deberta_v2' (no discriminator/generator-specific code path), so
+    parametrizing over both components exercises the same code with independently seeded weights.
+    """
+    from deberta.modeling.deberta_v2_native import DebertaV2Model as NativeDebertaV2Model
+
+    torch.manual_seed(1234 if export_what == "discriminator" else 5678)
+    config = _shipped_regime_native_config()
+    model_cfg = make_model_config(backbone_type="hf_deberta_v2")
+
+    native_model = NativeDebertaV2Model(config).eval()
+    export_disc, export_gen = export_cli._build_export_backbone(model_cfg, config, config, export_what)
+    export_model, other = (
+        (export_disc, export_gen) if export_what == "discriminator" else (export_gen, export_disc)
+    )
+    assert other is None
+    export_model = export_model.eval()
+
+    native_state = native_model.state_dict()
+    prepared_state = export_cli._drop_training_only_state_for_strict_load(
+        export_model=export_model,
+        state_dict=native_state,
+        strict_export_load=True,
+    )
+    export_model.load_state_dict(prepared_state, strict=True)
+
+    vocab_size = int(config.vocab_size)
+    pad_id = int(config.pad_token_id)
+
+    # (a) Unpadded batch: no attention mask, every position active.
+    unpadded_ids = (torch.arange(12).reshape(2, 6) % (vocab_size - 1)) + 1
+    with torch.inference_mode():
+        native_out = native_model(input_ids=unpadded_ids, return_dict=True).last_hidden_state
+        export_out = export_model(input_ids=unpadded_ids, return_dict=True).last_hidden_state
+    torch.testing.assert_close(native_out.float(), export_out.float(), rtol=2e-5, atol=2e-6)
+
+    # (b) Right-padded batch with a 2D attention mask; compare active positions only.
+    padded_ids = unpadded_ids.clone()
+    padded_ids[0, 4:] = pad_id
+    padded_ids[1, 5:] = pad_id
+    attention_mask = torch.ones_like(padded_ids)
+    attention_mask[0, 4:] = 0
+    attention_mask[1, 5:] = 0
+    keep = attention_mask.bool()
+
+    with torch.inference_mode():
+        native_padded = native_model(
+            input_ids=padded_ids, attention_mask=attention_mask, return_dict=True
+        ).last_hidden_state
+        export_padded = export_model(
+            input_ids=padded_ids, attention_mask=attention_mask, return_dict=True
+        ).last_hidden_state
+    torch.testing.assert_close(native_padded[keep].float(), export_padded[keep].float(), rtol=2e-5, atol=2e-6)
+
+
+def test_builder_normalized_positional_terms_preserve_native_export_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deberta.modeling.builder as builder_mod
+    from deberta.modeling.deberta_v2_native import DebertaV2Model as NativeDebertaV2Model
+
+    source_config = _shipped_regime_native_config(pos_att_type=["c2p|p2c"])
+
+    def _fake_from_pretrained(cls, src: str):
+        del cls
+        del src
+        return source_config
+
+    monkeypatch.setattr(
+        builder_mod.DebertaV2Config,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+    model_cfg = make_model_config(
+        backbone_type="hf_deberta_v2",
+        from_scratch=False,
+        pretrained={"discriminator_path": "custom-deberta"},
+    )
+    disc_config, _ = builder_mod.build_backbone_configs(
+        model_cfg=model_cfg,
+        tokenizer=DummyTokenizer(vocab_size=48),
+        max_position_embeddings=16,
+    )
+    assert disc_config.pos_att_type == ["c2p", "p2c"]
+
+    torch.manual_seed(2468)
+    native_model = NativeDebertaV2Model(disc_config).eval()
+    export_model, _ = export_cli._build_export_backbone(
+        model_cfg,
+        disc_config,
+        disc_config,
+        "discriminator",
+    )
+    export_state = export_cli._drop_training_only_state_for_strict_load(
+        export_model=export_model,
+        state_dict=native_model.state_dict(),
+        strict_export_load=True,
+    )
+    export_model.load_state_dict(export_state, strict=True)
+    export_model.eval()
+
+    input_ids = torch.tensor([[1, 7, 9, 11, 13, 2]])
+    with torch.inference_mode():
+        native_out = native_model(input_ids=input_ids, return_dict=True).last_hidden_state
+        export_out = export_model(input_ids=input_ids, return_dict=True).last_hidden_state
+    torch.testing.assert_close(native_out.float(), export_out.float(), rtol=2e-5, atol=2e-6)
 
 
 def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    model_cfg = ModelConfig(
-        tokenizer_name_or_path="dummy-tokenizer",
-        embedding_sharing="none",
-    )
+    model_cfg = make_model_config(tokenizer={"name_or_path": "dummy-tokenizer"}, embedding_sharing="none")
     (run_dir / "model_config.json").write_text(
         json.dumps(asdict(model_cfg)),
         encoding="utf-8",
     )
-    data_cfg = DataConfig(dataset_name="dummy-dataset", max_seq_length=32)
+    data_cfg = make_data_config(source={"dataset_name": "dummy-dataset"}, packing={"max_seq_length": 32})
     (run_dir / "data_config.json").write_text(
         json.dumps(asdict(data_cfg)),
         encoding="utf-8",
@@ -82,6 +445,21 @@ def _write_run_layout(tmp_path: Path, *, mock_checkpoint: Any | None = None) -> 
             root=tmp_path, name="checkpoint-10", with_data_state=False, with_complete=False
         )
     return run_dir, checkpoint_dir
+
+
+def test_clean_exported_config_requires_save_pretrained_config(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="did not produce required config JSON"):
+        export_cli.clean_exported_config(tmp_path / "config.json")
+
+
+def test_embedding_merge_rejects_backbone_without_embeddings() -> None:
+    with pytest.raises(RuntimeError, match="export backbone has no `.embeddings` module"):
+        export_cli.merge_embeddings_into_export_backbone(
+            export_model=torch.nn.Linear(2, 2),
+            disc_sd={},
+            gen_sd={},
+            mode="es",
+        )
 
 
 def _new_export_call_counters() -> dict[str, object]:
@@ -106,7 +484,7 @@ def _install_export_fakes(
     load_state_orig_mod_mismatch: bool = False,
 ) -> None:
     fake_utils = types.ModuleType("accelerate.utils")
-    fake_utils.DistributedType = types.SimpleNamespace(FSDP="FSDP")
+    fake_utils.DistributedType = _DistributedTypeStub
 
     if provide_torch_state_dict_api:
 
@@ -129,49 +507,40 @@ def _install_export_fakes(
         monkeypatch.setitem(sys.modules, "torch.distributed.checkpoint.state_dict", fake_torch_state_dict)
 
     fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = types.SimpleNamespace(
-        from_pretrained=lambda *args, **kwargs: DummyTokenizer()
-    )
+    fake_transformers.AutoTokenizer = AutoTokenizerStub
     fake_accelerate = types.ModuleType("accelerate")
 
     def _accelerator_factory(**kwargs: Any) -> FakeAccelerator:
         del kwargs
-        accel = FakeAccelerator(
-            distributed_type=distributed_type
-            if distributed_type is not None
-            else fake_utils.DistributedType.FSDP,
-            is_fsdp2=bool(fsdp2),
-            is_main_process=True,
-        )
 
-        def _prepare(self: FakeAccelerator, model: Any) -> Any:
-            self.calls["prepare"].append("export")
-            return model
-
-        def _load_state(self: FakeAccelerator, _checkpoint_dir: str, **load_kwargs: Any) -> None:
+        def _load_state(_checkpoint_dir: str, load_kwargs: dict[str, Any]) -> None:
             called["load_state_calls"] = list(called["load_state_calls"]) + [dict(load_kwargs)]
             if load_state_orig_mod_mismatch and load_kwargs.get("strict", True):
                 raise RuntimeError("Error(s) in loading state_dict with _orig_mod mismatch")
-            return None
 
-        def _get_state_dict(self: FakeAccelerator, model: Any) -> dict[str, torch.Tensor]:
-            del model
+        def _get_state_dict(model: Any, *, unwrap: bool = True) -> dict[str, torch.Tensor]:
+            del model, unwrap
             called["get_state_dict"] = int(called["get_state_dict"]) + 1
             return {
                 "discriminator.weight": torch.tensor(1.0),
                 "generator.weight": torch.tensor(2.0),
             }
 
-        def _unwrap_model(self: FakeAccelerator, model: Any, **unwrap_kwargs: Any) -> Any:
+        def _unwrap_model(model: Any, **unwrap_kwargs: Any) -> Any:
             del unwrap_kwargs
             called["unwrap_model"] = int(called["unwrap_model"]) + 1
             return model
 
-        accel.prepare = types.MethodType(_prepare, accel)  # type: ignore[method-assign]
-        accel.load_state = types.MethodType(_load_state, accel)  # type: ignore[method-assign]
-        accel.get_state_dict = types.MethodType(_get_state_dict, accel)  # type: ignore[method-assign]
-        accel.unwrap_model = types.MethodType(_unwrap_model, accel)  # type: ignore[method-assign]
-        return accel
+        return FakeAccelerator(
+            distributed_type=distributed_type
+            if distributed_type is not None
+            else fake_utils.DistributedType.FSDP,
+            is_fsdp2=bool(fsdp2),
+            is_main_process=True,
+            load_state_hook=_load_state,
+            get_state_dict_hook=_get_state_dict,
+            unwrap_model_hook=_unwrap_model,
+        )
 
     fake_accelerate.Accelerator = _accelerator_factory
     fake_accelerate.utils = fake_utils
@@ -179,7 +548,17 @@ def _install_export_fakes(
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
     monkeypatch.setitem(sys.modules, "accelerate.utils", fake_utils)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(export_cli, "build_backbone_configs", lambda **kwargs: (object(), object()))
+    materialized_configs = (BackboneConfigStub(), BackboneConfigStub())
+    monkeypatch.setattr(
+        export_cli,
+        "load_materialized_backbone_configs",
+        lambda **kwargs: materialized_configs,
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "materialized_tokenizer_path",
+        lambda run_dir: Path(run_dir) / "tokenizer",
+    )
 
     def _fake_build_backbones(*args: Any, **kwargs: Any) -> tuple[object, object]:
         del args
@@ -187,13 +566,186 @@ def _install_export_fakes(
         return object(), object()
 
     monkeypatch.setattr(export_cli, "build_backbones", _fake_build_backbones)
-    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: types.SimpleNamespace())
+    monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _EmptyPretrainerStub())
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
         lambda model_cfg, disc_config, gen_config, export_what: (_FakeExportBackbone(), None),
     )
     monkeypatch.setattr(export_cli, "merge_embeddings_into_export_backbone", lambda *args, **kwargs: None)
+    monkeypatch.setattr(export_cli, "_verify_staged_encoder_output_parity", lambda **kwargs: None)
+
+
+def test_run_export_meta_carries_no_local_absolute_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=_new_export_call_counters(),
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+        )
+    )
+
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["checkpoint_name"] == checkpoint_dir.name
+    assert meta["run_name"] == run_dir.name
+    assert meta["export_target"] == "discriminator"
+    assert meta["artifact_type"] == "rtd_pretrained_encoder"
+    assert meta["strict_state_load"] is True
+    assert meta["includes_rtd_head"] is False
+    assert meta["embedding_materialization"] == {"discriminator": "discriminator_checkpoint"}
+    assert meta["pretraining_packing"] == {
+        "enabled": True,
+        "block_cross_document_attention": False,
+        "max_seq_length": 32,
+    }
+    # Export directories ship to other machines and the Hub; provenance must
+    # not leak the exporting machine's directory layout.
+    assert str(tmp_path) not in json.dumps(meta)
+
+
+def test_run_export_uses_run_owned_materialized_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+    seen: dict[str, object] = {}
+
+    class _RecordingAutoTokenizer(AutoTokenizerStub):
+        @classmethod
+        def from_pretrained(cls, source: object, **kwargs: Any) -> DummyTokenizer:
+            seen["tokenizer_source"] = source
+            del kwargs
+            return DummyTokenizer()
+
+    sys.modules["transformers"].AutoTokenizer = _RecordingAutoTokenizer  # type: ignore[attr-defined]
+
+    def _load_configs(*, run_dir: Path, model_cfg: Any) -> tuple[Any, Any]:
+        seen["config_run_dir"] = run_dir
+        del model_cfg
+        return BackboneConfigStub(), BackboneConfigStub()
+
+    monkeypatch.setattr(export_cli, "load_materialized_backbone_configs", _load_configs)
+
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(tmp_path / "exported-owned"),
+        )
+    )
+
+    assert seen["tokenizer_source"] == run_dir / "tokenizer"
+    assert seen["config_run_dir"] == run_dir
+
+
+@pytest.mark.parametrize("block_cross_document_attention", [True, False])
+def test_run_export_meta_discloses_pretraining_packing_regime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    block_cross_document_attention: bool,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    data_cfg = make_data_config(
+        source={"dataset_name": "dummy-dataset"},
+        packing={
+            "max_seq_length": 96,
+            "enabled": True,
+            "block_cross_document_attention": block_cross_document_attention,
+        },
+    )
+    (run_dir / "data_config.json").write_text(json.dumps(asdict(data_cfg)), encoding="utf-8")
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=_new_export_call_counters(),
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    out_dir = tmp_path / "exported"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+        )
+    )
+
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["pretraining_packing"] == {
+        "enabled": True,
+        "block_cross_document_attention": block_cross_document_attention,
+        "max_seq_length": 96,
+    }
+
+    readme = (out_dir / "README.md").read_text(encoding="utf-8")
+    assert "| Packed-sequence pretraining | yes |" in readme
+    blocked_str = "yes" if block_cross_document_attention else "no"
+    assert f"| Cross-document attention blocking | {blocked_str} |" in readme
+
+
+@pytest.mark.parametrize("parity_fails", [False, True], ids=["success", "failure"])
+def test_run_export_verifies_staged_encoder_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint: Any,
+    parity_fails: bool,
+) -> None:
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=_new_export_call_counters(),
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+    out_dir = tmp_path / "exported"
+    parity_calls: list[Path] = []
+
+    def _verify_parity(*, component: str, export_model: Any, component_dir: Path) -> None:
+        del export_model
+        assert component == "discriminator"
+        assert component_dir.is_dir()
+        assert not out_dir.exists()
+        parity_calls.append(component_dir)
+        if parity_fails:
+            raise RuntimeError("staged parity failed")
+
+    monkeypatch.setattr(export_cli, "_verify_staged_encoder_output_parity", _verify_parity)
+    cfg = export_cli.ExportConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        run_dir=str(run_dir),
+        output_dir=str(out_dir),
+    )
+
+    if parity_fails:
+        with pytest.raises(RuntimeError, match="staged parity failed"):
+            export_cli.run_export(cfg)
+        assert not out_dir.exists()
+        assert not list(tmp_path.glob(".exported.tmp-*"))
+    else:
+        export_cli.run_export(cfg)
+        assert out_dir.is_dir()
+
+    assert len(parity_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -250,9 +802,46 @@ def test_run_export_fsdp_state_dict_paths(
     assert called["load_state_calls"] == [{}]
 
 
+def test_run_export_rebuilds_flash_checkpoint_with_eager_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    """Checkpoint consolidation must not require the optional flash package."""
+
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    flash_model_cfg = make_model_config(
+        tokenizer={"name_or_path": "dummy-tokenizer"},
+        embedding_sharing="none",
+        hf={"attention_impl": "flash"},
+    )
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(flash_model_cfg)),
+        encoding="utf-8",
+    )
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(tmp_path / "exported"),
+        )
+    )
+
+    build_call = list(called["build_backbones_calls"])[0]
+    assert build_call["model_cfg"].hf.attention_impl == "eager"
+
+
 def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
+    from deberta.utils import checkpoint as checkpoint_utils
+
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     called["remap_calls"] = []
@@ -268,7 +857,7 @@ def test_run_export_retries_compile_wrapper_mismatch_with_key_remap(
         called["remap_calls"] = list(called["remap_calls"]) + [(model, checkpoint_dir_for_remap)]
         return {"matched": 2, "missing": 0, "unexpected": 0}
 
-    monkeypatch.setattr(export_cli, "load_model_state_with_compile_key_remap", _fake_remap)
+    monkeypatch.setattr(checkpoint_utils, "load_model_state_with_compile_key_remap", _fake_remap)
 
     export_cli.run_export(
         export_cli.ExportConfig(
@@ -335,7 +924,7 @@ def test_run_export_non_fsdp2_torch_fsdp_uses_rank0_only_for_full_state_dict_con
 
     fake_fsdp_mod = types.ModuleType("torch.distributed.fsdp")
     fake_fsdp_mod.FullStateDictConfig = _FakeFullStateDictConfig
-    fake_fsdp_mod.StateDictType = types.SimpleNamespace(FULL_STATE_DICT="FULL_STATE_DICT")
+    fake_fsdp_mod.StateDictType = _StateDictTypeStub
     fake_fsdp_mod.FullyShardedDataParallel = _FakeFSDP
     monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp_mod)
     monkeypatch.setattr(export_cli, "DebertaV3RTDPretrainer", lambda *args, **kwargs: _FakeFSDPModel())
@@ -377,6 +966,12 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         fsdp2=False,
         provide_torch_state_dict_api=False,
     )
+    parity_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        export_cli,
+        "_verify_staged_encoder_output_parity",
+        lambda **kwargs: parity_calls.append(dict(kwargs)),
+    )
 
     monkeypatch.setattr(
         export_cli,
@@ -384,17 +979,14 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         lambda model_cfg, disc_config, gen_config, export_what: (
             _FakeExportBackbone(
                 weight_keys=("other_weight",),
-                forced_missing_keys=("weight",),
             ),
             None,
         ),
     )
 
     out_dir = tmp_path / f"exported-{int(allow_partial_export)}"
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
     if expect_error:
-        with pytest.raises(RuntimeError, match="partial state_dict load rejected"):
+        with pytest.raises(RuntimeError, match="Missing key.*other_weight"):
             export_cli.run_export(
                 export_cli.ExportConfig(
                     checkpoint_dir=str(checkpoint_dir),
@@ -416,12 +1008,23 @@ def test_run_export_partial_backbone_load_respects_allow_partial_flag(
         )
         assert out_dir.exists()
         assert not (out_dir / "discriminator").exists()
+        meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+        assert meta["strict_state_load"] is False
+        assert not parity_calls
 
 
 def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    model_cfg = make_model_config(
+        tokenizer={"name_or_path": "dummy-tokenizer"},
+        embedding_sharing="gdes",
+    )
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(model_cfg)),
+        encoding="utf-8",
+    )
     called = _new_export_call_counters()
     _install_export_fakes(
         monkeypatch=monkeypatch,
@@ -448,6 +1051,7 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
             {
                 "embeddings.word_embeddings.base_weight": torch.tensor([1.0]),
                 "embeddings.word_embeddings.bias": torch.tensor([0.2]),
+                "embeddings.position_embeddings.bias": torch.tensor([0.3]),
                 "encoder.weight": torch.tensor([3.0]),
             },
             {"embeddings.word_embeddings.weight": torch.tensor([0.8])},
@@ -466,7 +1070,6 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
             run_dir=str(run_dir),
             output_dir=str(out_dir),
             export_what="discriminator",
-            embedding_sharing="gdes",
         )
     )
 
@@ -474,6 +1077,10 @@ def test_run_export_strict_load_allows_gdes_discriminator_embedding_key_shape(
     assert not (out_dir / "discriminator").exists()
     assert len(merge_calls) == 1
     assert "embeddings.word_embeddings.bias" in merge_calls[0]["disc_sd"]
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["embedding_materialization"] == {
+        "discriminator": "generator_checkpoint_plus_discriminator_bias"
+    }
 
 
 def test_run_export_rejects_non_empty_output_dir_before_loading_model_config(
@@ -531,6 +1138,8 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
                     "model_type": "deberta-v2",
                     "hidden_size": 768,
                     "hf_attention_kernel": "stable",
+                    "hf_attention_impl": "flash",
+                    "hf_flash": {"kernel_overrides_path": None},
                     "use_rmsnorm_heads": False,
                     "legacy": True,
                     "cls_token_id": 1,
@@ -553,6 +1162,8 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     config_path = out_dir / "config.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert "hf_attention_kernel" not in data
+    assert "hf_attention_impl" not in data
+    assert "hf_flash" not in data
     assert "use_rmsnorm_heads" not in data
     assert "cls_token_id" not in data
     assert data["model_type"] == "deberta-v2"
@@ -561,9 +1172,24 @@ def test_run_export_strips_training_internal_keys_from_saved_config(
     assert (out_dir / "README.md").exists()
 
 
-def test_run_export_both_targets_save_into_component_subdirectories(
+def test_run_export_both_targets_strict_load_native_emd_state_and_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
 ) -> None:
+    from transformers import AutoModel
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    config = make_native_deberta_config(
+        position_biased_input=False,
+        type_vocab_size=0,
+    )
+    native_state = DebertaV2Model(config).state_dict()
+    export_disc = AutoModel.from_config(config)
+    export_gen = AutoModel.from_config(config)
+    position_key = "embeddings.position_embeddings.weight"
+    assert position_key in native_state
+    assert position_key not in export_disc.state_dict()
+
     run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
     called = _new_export_call_counters()
     _install_export_fakes(
@@ -572,14 +1198,16 @@ def test_run_export_both_targets_save_into_component_subdirectories(
         fsdp2=False,
         provide_torch_state_dict_api=False,
     )
+    monkeypatch.setattr(
+        export_cli,
+        "split_pretrainer_state_dict",
+        lambda full_sd: (dict(native_state), dict(native_state)),
+    )
 
     monkeypatch.setattr(
         export_cli,
         "_build_export_backbone",
-        lambda model_cfg, disc_config, gen_config, export_what: (
-            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
-            _FakeExportBackbone(write_config_payload={"model_type": "deberta-v2"}),
-        ),
+        lambda model_cfg, disc_config, gen_config, export_what: (export_disc, export_gen),
     )
 
     out_dir = tmp_path / "exported-both"
@@ -596,12 +1224,74 @@ def test_run_export_both_targets_save_into_component_subdirectories(
     assert (out_dir / "generator" / "config.json").exists()
     assert (out_dir / "discriminator" / "README.md").exists()
     assert (out_dir / "generator" / "README.md").exists()
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["artifact_type"] == "rtd_pretrained_encoder_bundle"
+    assert meta["export_target"] == "both"
+    assert meta["includes_rtd_head"] is False
+    assert meta["embedding_materialization"] == {
+        "discriminator": "discriminator_checkpoint",
+        "generator": "generator_checkpoint",
+    }
 
 
-def test_validate_run_metadata_file_accepts_missing_metadata(tmp_path: Path):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    validate_run_metadata_file(run_dir, required=False)
+def test_run_export_es_sharing_strict_load_drops_native_emd_position_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_checkpoint: Any
+) -> None:
+    from transformers import AutoModel
+
+    from deberta.modeling.deberta_v2_native import DebertaV2Model
+
+    config = make_native_deberta_config(
+        position_biased_input=False,
+        type_vocab_size=0,
+    )
+    native_state = DebertaV2Model(config).state_dict()
+    export_disc = AutoModel.from_config(config)
+    position_key = "embeddings.position_embeddings.weight"
+    assert position_key in native_state
+    assert position_key not in export_disc.state_dict()
+
+    run_dir, checkpoint_dir = _write_run_layout(tmp_path, mock_checkpoint=mock_checkpoint)
+    model_cfg = make_model_config(
+        tokenizer={"name_or_path": "dummy-tokenizer"},
+        embedding_sharing="es",
+    )
+    (run_dir / "model_config.json").write_text(
+        json.dumps(asdict(model_cfg)),
+        encoding="utf-8",
+    )
+    called = _new_export_call_counters()
+    _install_export_fakes(
+        monkeypatch=monkeypatch,
+        called=called,
+        fsdp2=False,
+        provide_torch_state_dict_api=False,
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "split_pretrainer_state_dict",
+        lambda full_sd: (dict(native_state), dict(native_state)),
+    )
+    monkeypatch.setattr(
+        export_cli,
+        "_build_export_backbone",
+        lambda model_cfg, disc_config, gen_config, export_what: (export_disc, None),
+    )
+
+    out_dir = tmp_path / "exported-es"
+    export_cli.run_export(
+        export_cli.ExportConfig(
+            checkpoint_dir=str(checkpoint_dir),
+            run_dir=str(run_dir),
+            output_dir=str(out_dir),
+            export_what="discriminator",
+        )
+    )
+
+    assert (out_dir / "config.json").exists()
+    meta = json.loads((out_dir / "export_meta.json").read_text(encoding="utf-8"))
+    assert meta["strict_state_load"] is True
+    assert meta["embedding_materialization"] == {"discriminator": "generator_checkpoint_shared"}
 
 
 def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
@@ -612,13 +1302,22 @@ def test_validate_run_metadata_file_rejects_unknown_schema(tmp_path: Path):
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unsupported run metadata schema"):
-        validate_run_metadata_file(run_dir, required=False)
+        validate_run_metadata_file(run_dir)
+
+
+def test_export_help_documents_boolean_defaults() -> None:
+    parser = argparse.ArgumentParser(prog="deberta export")
+    export_cli.add_export_arguments(parser)
+    help_text = parser.format_help()
+    assert "default, recommended safetensors" in help_text
+    assert "instead of offloading it to CPU" in help_text
+    assert "default rank-0-only gather" in help_text
 
 
 def test_namespace_to_export_config_maps_allow_partial_export() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
-        ns = types.SimpleNamespace(
+        ns = argparse.Namespace(
             checkpoint_dir=str(root / "checkpoint-1"),
             output_dir=str(root / "exported"),
             run_dir=str(root / "run"),
@@ -626,26 +1325,10 @@ def test_namespace_to_export_config_maps_allow_partial_export() -> None:
             safe_serialization=True,
             offload_to_cpu=True,
             rank0=True,
-            embedding_sharing=None,
             allow_partial_export=True,
         )
         cfg = export_cli.namespace_to_export_config(ns)
         assert cfg.allow_partial_export is True
-
-
-def test_export_parser_rejects_conflicting_what_alias_values() -> None:
-    parser = argparse.ArgumentParser(prog="deberta export")
-    export_cli.add_export_arguments(parser)
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "runs/demo/checkpoint-10",
-                "--what",
-                "discriminator",
-                "--export-what",
-                "generator",
-            ]
-        )
 
 
 def test_run_export_rejects_invalid_export_what_before_runtime_imports() -> None:
@@ -676,12 +1359,7 @@ def test_run_export_warns_when_fsdp_only_flags_are_ignored_on_non_fsdp(
     monkeypatch.setattr(
         export_cli,
         "DebertaV3RTDPretrainer",
-        lambda *args, **kwargs: types.SimpleNamespace(
-            state_dict=lambda: {
-                "discriminator.weight": torch.tensor(1.0),
-                "generator.weight": torch.tensor(2.0),
-            }
-        ),
+        lambda *args, **kwargs: _StateDictPretrainerStub(),
     )
 
     with caplog.at_level("WARNING"):
