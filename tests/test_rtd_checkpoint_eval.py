@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import math
 import runpy
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from _config_factories import make_model_config
+from _config_factories import make_data_config, make_model_config, make_train_config
 
 from deberta.modeling.mask_utils import attention_mask_to_active_tokens
 
@@ -20,6 +22,7 @@ _evaluate_checkpoint = _TOOL["_evaluate_checkpoint"]
 _evaluation_provenance = _TOOL["_evaluation_provenance"]
 _forward_discriminator_with_diagnostics = _TOOL["_forward_discriminator_with_diagnostics"]
 _load_checkpoint_artifacts = _TOOL["_load_checkpoint_artifacts"]
+_load_run_config = _TOOL["_load_run_config"]
 _precision_mismatch_warning = _TOOL["_precision_mismatch_warning"]
 _ranking_metrics = _TOOL["_ranking_metrics"]
 _replacement_rate = _TOOL["_replacement_rate"]
@@ -193,6 +196,32 @@ def test_shared_run_dir_rejects_checkpoints_from_different_runs(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="same run"):
         _shared_run_dir([first, second])
+
+
+def test_load_run_config_uses_checkpoint_owned_snapshots(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model = make_model_config(embedding_sharing="none")
+    data = make_data_config(
+        source={"dataset_name": "owned/dataset"},
+        packing={"max_seq_length": 37},
+    )
+    train = make_train_config(
+        per_device_train_batch_size=3,
+        objective={"mlm_probability": 0.27, "sampling_temperature": 0.8},
+    )
+    for filename, payload in (
+        ("model_config.json", asdict(model)),
+        ("data_config.json", asdict(data)),
+        ("train_config.json", asdict(train)),
+    ):
+        (run_dir / filename).write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = _load_run_config(run_dir)
+
+    assert loaded.model == model
+    assert loaded.data == data
+    assert loaded.train == train
 
 
 def test_build_model_overrides_materialized_flash_configs(

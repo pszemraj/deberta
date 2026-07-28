@@ -2,7 +2,7 @@
 """Evaluate RTD checkpoints on a deterministic alternate shuffle of their training source.
 
 Example:
-    python tools/evaluate_rtd_checkpoint.py CONFIG CHECKPOINT \
+    python tools/evaluate_rtd_checkpoint.py CHECKPOINT \
         --output local-scratch/run/eval-checkpoint.json
 """
 
@@ -14,7 +14,7 @@ import json
 import math
 import sys
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,20 +23,45 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from deberta.config import load_config
+from deberta.config import (
+    DataConfig,
+    ModelConfig,
+    TrainConfig,
+    load_data_config_snapshot,
+    load_model_config_snapshot,
+    load_train_config_snapshot,
+    validate_data_config,
+    validate_model_config,
+    validate_train_config,
+)
 from deberta.data.loading import load_hf_dataset
 from deberta.modeling import DebertaV3RTDPretrainer, build_backbones
 from deberta.modeling.mask_utils import attention_mask_to_active_tokens
 from deberta.run_artifacts import load_materialized_backbone_configs, materialized_tokenizer_path
-from deberta.run_layout import infer_run_dir_from_checkpoint
+from deberta.run_layout import (
+    DATA_CONFIG_FILENAME,
+    MODEL_CONFIG_FILENAME,
+    TRAIN_CONFIG_FILENAME,
+    infer_run_dir_from_checkpoint,
+    validate_run_metadata_file,
+)
 from deberta.training.compile import prepare_flash_attention_batch_metadata
 from deberta.training.runtime import _build_train_dataset_and_collator
 from deberta.utils.checkpoint import load_model_state_with_compile_key_remap
+from deberta.utils.io import load_json_mapping
+
+
+@dataclass(frozen=True)
+class _EvaluationConfig:
+    """Run-owned configuration sections needed for checkpoint evaluation."""
+
+    model: ModelConfig
+    data: DataConfig
+    train: TrainConfig
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", type=Path)
     parser.add_argument("checkpoints", nargs="+", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--batches", type=int, default=4)
@@ -189,6 +214,21 @@ def _shared_run_dir(checkpoints: list[Path]) -> Path:
                 f"got '{run_dir}' and '{checkpoint_run_dir}'."
             )
     return run_dir
+
+
+def _load_run_config(run_dir: Path) -> _EvaluationConfig:
+    """Load the run-owned configuration needed for evaluation."""
+    validate_run_metadata_file(run_dir)
+    model_path = run_dir / MODEL_CONFIG_FILENAME
+    data_path = run_dir / DATA_CONFIG_FILENAME
+    train_path = run_dir / TRAIN_CONFIG_FILENAME
+    model = load_model_config_snapshot(load_json_mapping(model_path), source=str(model_path))
+    data = load_data_config_snapshot(load_json_mapping(data_path), source=str(data_path))
+    train = load_train_config_snapshot(load_json_mapping(train_path), source=str(train_path))
+    validate_model_config(model)
+    validate_data_config(data)
+    validate_train_config(train)
+    return _EvaluationConfig(model=model, data=data, train=train)
 
 
 def _build_model(
@@ -487,15 +527,15 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for checkpoint evaluation")
 
-    cfg = load_config(args.config)
+    checkpoints = sorted(args.checkpoints, key=_checkpoint_step)
+    run_dir = _shared_run_dir(checkpoints)
+    cfg = _load_run_config(run_dir)
     sampling_temperature = float(cfg.train.objective.sampling_temperature)
     configured_mixed_precision = str(cfg.train.mixed_precision)
     mismatch_warning = _precision_mismatch_warning(args.precision, configured_mixed_precision)
     if mismatch_warning is not None:
         print(f"WARNING: {mismatch_warning}", file=sys.stderr)
 
-    checkpoints = sorted(args.checkpoints, key=_checkpoint_step)
-    _shared_run_dir(checkpoints)
     tokenizer, disc_cfg, gen_cfg = _load_checkpoint_artifacts(cfg, checkpoints[0])
     batch = _build_eval_batch(cfg, tokenizer, batches=args.batches, seed=args.seed)
     model = (
@@ -547,7 +587,7 @@ def main() -> None:
         attention_mask=attention_mask,
     )
     output = {
-        "config": str(args.config.resolve()),
+        "run_dir": str(run_dir.resolve()),
         "precision": args.precision,
         "evaluation": _evaluation_provenance(
             precision=args.precision,
