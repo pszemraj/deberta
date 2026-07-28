@@ -39,7 +39,7 @@ both C2P and P2C terms. Route changes must not change the encoder's attention fu
 
 Route selection comes from `route_policies` in the JSON tuning table. Upstream FlashDeBERTa environment-variable routing is not consulted. Capability-scoped local-bias behavior is described in [GPU support](gpu-support.md).
 
-Normal packed training always uses ragged `docblock`. Dense `docblock_bias` is retained for benchmark and parity coverage, but it saves one quadratic `(B,H,S,S)` bias per live attention call and cannot be selected safely from sequence and batch dimensions alone.
+Normal packed training always uses the ragged `docblock` route, which avoids materializing a quadratic `(B,H,S,S)` bias on every live attention call. The dense `docblock_bias` route is retained for benchmark and parity coverage only; it cannot be selected safely from sequence and batch dimensions alone.
 
 ## Mask and metadata contracts
 

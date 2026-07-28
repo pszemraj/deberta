@@ -38,7 +38,7 @@ Default output path is `<run_dir>/exported_hf` and must be empty if it already e
 - `--what discriminator` or `--what generator`: writes the model, tokenizer, `export_meta.json`, and supporting files in a flat directory at `--output-dir`.
 - `--what both`: writes model weights, config, README, and license under `--output-dir/discriminator/` and `--output-dir/generator/`; tokenizer files and `export_meta.json` remain at the shared `--output-dir` root. Load the selected model from its component directory and the tokenizer from the root.
 
-`export_meta.json` records `artifact_type` as `rtd_pretrained_encoder` for one component or `rtd_pretrained_encoder_bundle` for both, the requested target, `strict_state_load`, `includes_rtd_head`, and the per-component `embedding_materialization`. Generator materialization is `generator_checkpoint`. Discriminator materialization is `discriminator_checkpoint` for `none`, `generator_checkpoint_shared` for `es`, or `generator_checkpoint_plus_discriminator_bias` for `gdes`.
+`export_meta.json` records `artifact_type` (`rtd_pretrained_encoder` for one component, `rtd_pretrained_encoder_bundle` for both), the requested target, `strict_state_load`, `includes_rtd_head`, and the per-component `embedding_materialization` described under [shared embedding export](#shared-embedding-export).
 
 Native `hf_deberta_v2` exports load through stock Hugging Face `AutoModel` APIs. RoPE exports are
 standalone artifacts but require this package's `DebertaRoPEModel` implementation.
@@ -52,11 +52,24 @@ Training-only keys are removed from exported model configs, and export metadata 
 
 Embedding-sharing behavior is described in [Architectures](../advanced/architectures.md#rtd-architecture-notes).
 Export converts both shared modes back to ordinary embedding weights for word, position, and
-token-type embeddings:
+token-type embeddings, and records the choice as `embedding_materialization` in `export_meta.json`:
 
-- `es`: use the generator embedding weight
-- `gdes`: use `generator_weight + discriminator_bias`
+- `none`: the discriminator keeps its own checkpoint weights (`discriminator_checkpoint`)
+- `es`: use the generator embedding weight (`generator_checkpoint_shared`)
+- `gdes`: use `generator_weight + discriminator_bias` (`generator_checkpoint_plus_discriminator_bias`)
 
-## Partial export mode
+Generator materialization is always `generator_checkpoint`.
 
-Both manual `deberta export` and automatic `train.checkpoint.export_hf_final` are strict on state-dict compatibility by default. Strict exports reload each staged encoder and verify its output against the in-memory materialized encoder before publishing the artifact. On same-directory continuation, automatic export verifies a refresh separately before replacing the previous `final_hf`; a failed refresh leaves the previous artifact intact. On the supported single-process path, a failed final checkpoint save or automatic export fails the training command. Use the manual command with `--allow-partial-export` only for recovery or debugging; partial exports skip staged encoder parity.
+## Strict verification and partial export
+
+Both manual `deberta export` and automatic `train.checkpoint.export_hf_final` are strict by
+default: state-dict loading must be exact, and each staged encoder is reloaded and its outputs
+verified against the in-memory materialized encoder before the artifact is published.
+
+For automatic export on same-directory continuation, the refreshed artifact is verified before it
+replaces the previous `final_hf`, so a failed refresh leaves the previous artifact intact. On the
+supported single-process path, a failed final checkpoint save or automatic export fails the
+training command rather than finishing silently.
+
+`deberta export --allow-partial-export` relaxes both checks (state-dict strictness and staged
+encoder parity). Use it only for recovery or debugging, never for publishing artifacts.

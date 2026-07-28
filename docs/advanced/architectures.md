@@ -36,7 +36,17 @@ Generator defaults are derived from discriminator width/heads/ffn and half depth
 - generic backbone `z_steps` is not an EMD substitute; RTD generators require `z_steps=0`
 - Document-blocked packing preserves standalone objective semantics as described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking).
 
-Decoupled and combined training are separate execution contracts. With the default token-weighted accumulation, decoupled training normalizes each enabled objective over its own token window, performs a generator optimizer step before the discriminator phase, and synchronizes GDES embeddings between those phases. A zero discriminator weight skips the discriminator forward and update. A zero generator weight skips its update but retains the generator forward needed to sample discriminator corruptions. A checkpoint represents only a fully completed accumulation window; if a later decoupled phase fails after an earlier optimizer step, training fails and keeps the previous checkpoint as the recovery boundary. Combined training forms one weighted objective and performs one optimizer step.
+Decoupled and combined training are separate execution contracts:
+
+- Combined training forms one weighted objective and performs one optimizer step.
+- Decoupled training performs a generator optimizer step before the discriminator phase and
+  synchronizes GDES embeddings between those phases. With the default token-weighted accumulation,
+  each enabled objective is normalized over its own token window.
+- A zero discriminator weight skips the discriminator forward and update. A zero generator weight
+  skips its update but keeps the generator forward that samples discriminator corruptions.
+- A checkpoint represents only a fully completed accumulation window: if a later decoupled phase
+  fails after an earlier optimizer step, training fails and the previous checkpoint is the
+  recovery boundary.
 
 ## Parity divergences
 

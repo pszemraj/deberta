@@ -4,12 +4,7 @@ Parked improvements that are out of scope for the current branch but worth revis
 
 ## Decide whether flagship configs should enable cross-document attention blocking
 
-Every shipped config sets `data.packing.block_cross_document_attention: false` (matching the reference default), so the doc-block machinery — pairwise doc masks, per-document CLS conditioning via `doc_context_index`, document-local `position_ids`, and the flash `docblock`/`docblock_bias` kernels — is dormant in every shipped run, including the validated 50k FlashDeBERTa run.
-
-The naive-packing regime this leaves us in has two objective-side consequences (both inherent to packing without blocking, and both fixed by the `true` branch):
-
-- The RTD head conditions every token on the row's *first* CLS (`RTDHead.forward` fallback), so tokens from later packed documents are scored against another document's context vector.
-- EMD absolute positions continue across document boundaries, so a document packed at row offset 500 sees position embeddings 500+ where a standalone copy sees 0+.
+Every shipped config sets `data.packing.block_cross_document_attention: false` (matching the reference default), so the doc-block machinery — pairwise doc masks, per-document CLS conditioning via `doc_context_index`, document-local `position_ids`, and the flash `docblock`/`docblock_bias` kernels — is dormant in every shipped run, including the validated 50k FlashDeBERTa run. The two objective-side consequences of running unblocked (first-CLS RTD conditioning and row-continuous EMD positions) are described in the [data pipeline](../guides/data-pipeline.md#cross-document-attention-blocking); both are fixed by the `true` branch.
 
 Naive packing is standard practice and may well be the right call (cross-document attention acts as benign noise at scale; blocking costs mask/metadata overhead), but today the setting reads as a default rather than a decision. Picking this up means: A/B a short run with blocking on (the flash `docblock` route keeps the cost story reasonable), compare discriminator metrics per document position within packed rows, and either flip the flagship configs or record here why `false` wins.
 
@@ -37,15 +32,14 @@ Non-goals: no change to EMD semantics, pass count, or which positions are superv
 
 ## Keep the vendored positional-gradient addend in fp32 (upstream kernel change)
 
-The pinned `flashDeBERTa==0.0.7` backward kernels round `ds * sm_scale` to the model dtype
-*before* the positional-gradient `tl.atomic_add` (`flashdeberta/ops/flash_attention.py:781`;
-`flash_attention_varlen.py:915`). The wrappers now allocate the atomic destinations as fp32
-(`flashdeberta_fixed_op.py`, `flashdeberta_varlen_op.py` — Triton casts the addend to the
-pointer element type), which removes the dominant order-sensitive accumulation loss, but the
-one-rounding-per-contribution of the bf16 addend itself remains. Fixing that needs the
-kernels to skip the pre-atomic downcast — an upstream PR or vendoring the two backward
-kernels. Low value on its own (~2^-9 relative, unbiased); pick up only if the kernels get
-vendored for another reason.
+The repo already accumulates positional gradients into fp32 destinations (see
+[FlashDeBERTa attention](../advanced/flash-attention.md#positional-gradient-accumulation-in-fp32)),
+which removed the dominant order-sensitive accumulation loss. What remains: the pinned
+`flashDeBERTa==0.0.7` backward kernels round `ds * sm_scale` to the model dtype *before* the
+positional-gradient `tl.atomic_add` (`flashdeberta/ops/flash_attention.py:781`;
+`flash_attention_varlen.py:915`), one rounding per contribution. Fixing that needs the kernels to
+skip the pre-atomic downcast — an upstream PR or vendoring the two backward kernels. Low value on
+its own (~2^-9 relative, unbiased); pick up only if the kernels get vendored for another reason.
 
 Verified non-issue while auditing this: the atomics' `scope="cta"` in the fixed-route
 kernels is correct — `DKPOS`/`DQPOS` writes are always CTA-local (grid axis 0 partitions the

@@ -1,5 +1,9 @@
 # Data pipeline
 
+How raw text becomes training batches: a Hugging Face dataset source is packed into fixed-length
+rows, then a collator applies dynamic MLM masking and attaches the attention and objective
+metadata the model consumes.
+
 ## Dataset source selection
 
 `DataConfig` checks sources in this order:
@@ -59,8 +63,9 @@ The collator also emits two fixed-shape objective tensors for blocked rows:
   gathers that context before LayerNorm, preserving the standalone `LayerNorm(token + CLS)`
   architecture for every packed document.
 
-The collator derives contiguous document starts and ends once in row-major order. The objective tensors and FlashDeBERTa segment descriptors consume those same boundaries.
-Within each row, every nonzero `doc_id` must occupy exactly one contiguous segment. The collator rejects reused IDs because dense equality masks would otherwise disagree with ragged segment metadata.
+Within each row, every nonzero `doc_id` must occupy exactly one contiguous segment; the collator
+rejects reused IDs. Document starts and ends are derived once, in row-major order, and shared by
+the objective tensors and the FlashDeBERTa segment descriptors.
 
 When FlashDeBERTa is enabled, the collator additionally precomputes fixed-capacity segment descriptors and scalar route inputs before device transfer. Eager training does not emit the Flash-only metadata.
 
@@ -106,7 +111,7 @@ Replacement probabilities are conditional on token selection and must sum to at 
 
 Masking uses `attention_mask` liveness captured before padding metadata is simplified. Inactive and special positions are never corruption targets and keep `labels=-100`. Each row's target budget is computed from its eligible lexical tokens, so padding and the number of packed CLS/SEP boundaries cannot change the lexical corruption rate. Whole-word masking applies one complete selected n-gram before checking the budget, so it may overshoot the nominal target by that n-gram's remaining tokens.
 
-Windowed unigram selection sizes its windows from that budget: the candidate positions are split into exactly `num_to_predict` contiguous windows of near-equal size and one position is drawn uniformly from each. This keeps the selection count exact and every candidate position equally likely. Sizing windows from `int(1 / mlm_probability)` instead over-produces whenever the reciprocal is not an integer, and trimming the sorted excess back to the budget silently leaves the tail of every sequence unmasked.
+Windowed unigram selection sizes its windows from that budget: the candidate positions are split into exactly `num_to_predict` contiguous windows of near-equal size and one position is drawn uniformly from each. This keeps the selection count exact and every candidate position equally likely.
 
 Whole-word n-gram selection walks context windows of `n * int(1 / mlm_probability)` word groups. Special tokens split those windows and sampled spans, so an n-gram never crosses a packed-document boundary. Every partial context window is taken with probability proportional to its width; if all are rejected, one word group is selected uniformly across the row. Independently sampled n-grams remain separate budget units and are consumed in random order when stopping at the budget. These rules keep the mask rate positionally uniform without privileging the first document in a packed row.
 
