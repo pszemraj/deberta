@@ -1206,9 +1206,13 @@ def run_pretraining(
                 if probability > 0.0
             )
             disc_loss_gain = disc_prior_loss - disc_loss_window
-            loss = float(train_cfg.objective.gen_loss_weight) * float(gen_loss_window) + float(
-                train_cfg.objective.disc_loss_weight
-            ) * float(disc_loss_window)
+            gen_loss_weight = float(train_cfg.objective.gen_loss_weight)
+            disc_loss_weight = float(train_cfg.objective.disc_loss_weight)
+            loss = 0.0
+            if gen_loss_weight > 0.0:
+                loss += gen_loss_weight * float(gen_loss_window)
+            if disc_loss_weight > 0.0:
+                loss += disc_loss_weight * float(disc_loss_window)
             if loss_override is not None:
                 loss = float(loss_override)
 

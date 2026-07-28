@@ -492,16 +492,17 @@ def test_run_pretraining_decoupled_integration(
 
     monkeypatch.setattr(pretrain_mod, "_build_decoupled_optimizers", _build_logged_decoupled)
 
+    log_metrics = scenario in {"steps_and_sync", "skip_generator_step", "skip_discriminator_phase"}
     pretrain_mod.run_pretraining(
         model_cfg=make_model_config(backbone_type="rope", embedding_sharing="gdes"),
         data_cfg=make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"}),
         train_cfg=train_cfg,
         logging_cfg=make_logging_config(
             wandb={
-                "enabled": scenario == "steps_and_sync",
-                "watch": "none" if scenario == "steps_and_sync" else "gradients",
+                "enabled": log_metrics,
+                "watch": "none" if log_metrics else "gradients",
             },
-            logging_steps=1 if scenario == "steps_and_sync" else 0,
+            logging_steps=1 if log_metrics else 0,
         ),
     )
 
@@ -537,9 +538,13 @@ def test_run_pretraining_decoupled_integration(
     elif scenario == "skip_generator_step":
         assert step_counts == {"gen": 0, "disc": 1}
         assert accel.calls["backward"] == pytest.approx([3.0], rel=0.0, abs=1e-6)
+        step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+        assert step_rows[-1]["loss"] == pytest.approx(3.0)
     elif scenario == "skip_discriminator_phase":
         assert step_counts == {"gen": 1, "disc": 0}
         assert accel.calls["backward"] == pytest.approx([2.0], rel=0.0, abs=1e-6)
+        step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 1]
+        assert step_rows[-1]["loss"] == pytest.approx(2.0)
         model = SimpleRTD.last_instance
         assert model is not None
         assert model.calls["forward_discriminator_phase"] == []
