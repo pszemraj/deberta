@@ -804,6 +804,7 @@ def run_pretraining(
     global_step = 0
     consumed_micro_batches = 0
     consumed_micro_batches_committed = 0
+    resumed_input_tokens_seen = 0.0
     ga_steps = max(1, int(train_cfg.gradient_accumulation_steps))
     last_saved_step = 0
     lr_mult = 1.0
@@ -861,6 +862,8 @@ def run_pretraining(
             output_dir=output_dir,
             global_step=int(global_step),
             consumed_micro_batches_committed=int(consumed_micro_batches_committed),
+            local_input_tokens_seen=float(local_input_tokens_seen),
+            resumed_input_tokens_seen=float(resumed_input_tokens_seen),
             lr_mult=float(lr_mult),
             optimizer_param_digest=param_digest,
             gradient_accumulation_steps=int(ga_steps),
@@ -990,6 +993,7 @@ def run_pretraining(
                 saved_digest,
                 saved_global_step,
                 saved_ga_steps,
+                saved_input_tokens_seen,
             ) = _load_checkpoint_progress_metadata(Path(ckpt))
             if restored is None:
                 raise RuntimeError(
@@ -999,10 +1003,15 @@ def run_pretraining(
                     "Resume from a different checkpoint created by this code version or start a new run."
                 )
             parsed_checkpoint_step = _parse_checkpoint_step(ckpt)
-            if saved_global_step is None or saved_ga_steps is None or saved_digest is None:
+            if (
+                saved_global_step is None
+                or saved_ga_steps is None
+                or saved_digest is None
+                or saved_input_tokens_seen is None
+            ):
                 raise RuntimeError(
                     "Checkpoint resume requires current data_state.json metadata: global_step, "
-                    "gradient_accumulation_steps, and optimizer_param_digest. "
+                    "gradient_accumulation_steps, optimizer_param_digest, and input_tokens_seen. "
                     f"Checkpoint '{ckpt}' was created by an unsupported code revision or is incomplete."
                 )
             global_step = int(max(0, saved_global_step))
@@ -1022,6 +1031,7 @@ def run_pretraining(
                 )
             consumed_micro_batches = int(restored)
             consumed_micro_batches_committed = int(consumed_micro_batches)
+            resumed_input_tokens_seen = float(saved_input_tokens_seen)
             lr_mult = float(restored_lr_mult)
 
             if isinstance(saved_digest, dict):
@@ -1157,7 +1167,7 @@ def run_pretraining(
                 accelerator=accelerator,
                 x=local_input_tokens_since_log,
             )
-            global_input_tokens_seen = _sum_local_scalar(
+            global_input_tokens_seen = float(resumed_input_tokens_seen) + _sum_local_scalar(
                 accelerator=accelerator,
                 x=local_input_tokens_seen,
             )
@@ -2063,11 +2073,16 @@ def run_pretraining(
         ):
             try:
                 final_ckpt = output_dir / f"checkpoint-{final_step}"
+                input_tokens_seen = float(resumed_input_tokens_seen) + _sum_local_scalar(
+                    accelerator=accelerator,
+                    x=local_input_tokens_seen,
+                )
                 _save_training_checkpoint(
                     accelerator=accelerator,
                     checkpoint_dir=final_ckpt,
                     output_dir=output_dir,
                     consumed_micro_batches=consumed_micro_batches_committed,
+                    input_tokens_seen=input_tokens_seen,
                     save_total_limit=int(train_cfg.checkpoint.save_total_limit),
                     log_label="final",
                     lr_mult=lr_mult,

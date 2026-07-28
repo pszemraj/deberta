@@ -360,7 +360,7 @@ def _classify_checkpoint(checkpoint_dir: Path) -> _CheckpointStatus:
     :param Path checkpoint_dir: Checkpoint directory.
     :return _CheckpointStatus: Marker, progress, and model-weight status.
     """
-    consumed, _, _, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
+    consumed, _, _, _, _, _ = _load_checkpoint_progress_metadata(checkpoint_dir)
     return _CheckpointStatus(
         committed=_is_checkpoint_committed(checkpoint_dir),
         has_progress=consumed is not None,
@@ -476,16 +476,17 @@ def _resolve_resume_checkpoint(
 
 def _load_checkpoint_progress_metadata(
     checkpoint_dir: Path,
-) -> tuple[int | None, float, str | dict[str, str] | None, int | None, int | None]:
+) -> tuple[int | None, float, str | dict[str, str] | None, int | None, int | None, float | None]:
     """Load persisted resume metadata from ``data_state.json``.
 
     :param Path checkpoint_dir: Checkpoint directory.
-    :return tuple[int | None, float, str | dict[str, str] | None, int | None, int | None]:
-        ``(consumed_micro_batches, lr_mult, optimizer_param_digest, global_step, gradient_accumulation_steps)``.
+    :return tuple[int | None, float, str | dict[str, str] | None, int | None, int | None, float | None]:
+        ``(consumed_micro_batches, lr_mult, optimizer_param_digest, global_step,
+        gradient_accumulation_steps, input_tokens_seen)``.
     """
     path = checkpoint_dir / _CHECKPOINT_DATA_STATE_FILENAME
     if not path.exists():
-        return None, 1.0, None, None, None
+        return None, 1.0, None, None, None, None
     try:
         raw = load_json_mapping(path)
         val = raw.get("consumed_micro_batches", None)
@@ -503,7 +504,11 @@ def _load_checkpoint_progress_metadata(
         global_step = max(0, int(global_step_raw)) if global_step_raw is not None else None
         ga_steps_raw = raw.get("gradient_accumulation_steps", None)
         ga_steps = max(1, int(ga_steps_raw)) if ga_steps_raw is not None else None
-        return consumed, lr_mult, digest, global_step, ga_steps
+        input_tokens_seen_raw = raw.get("input_tokens_seen", None)
+        input_tokens_seen = (
+            max(0.0, float(input_tokens_seen_raw)) if input_tokens_seen_raw is not None else None
+        )
+        return consumed, lr_mult, digest, global_step, ga_steps, input_tokens_seen
     except (TypeError, ValueError) as exc:
         logger.warning(
             "Checkpoint %s has invalid data_state.json (%s: %s); treating as unresumable.",
@@ -511,29 +516,31 @@ def _load_checkpoint_progress_metadata(
             type(exc).__name__,
             exc,
         )
-        return None, 1.0, None, None, None
+        return None, 1.0, None, None, None, None
     except Exception as exc:
         logger.warning(
             "Unexpected error reading data_state.json for checkpoint %s (%s); treating as unresumable.",
             checkpoint_dir,
             exc,
         )
-        return None, 1.0, None, None, None
+        return None, 1.0, None, None, None, None
 
 
 def _save_checkpoint_data_progress(
     *,
     checkpoint_dir: Path,
     consumed_micro_batches: int,
+    input_tokens_seen: float,
     lr_mult: float = 1.0,
     optimizer_param_digest: str | dict[str, str] | None = None,
     global_step: int | None = None,
     gradient_accumulation_steps: int | None = None,
 ) -> None:
-    """Persist data iterator progress, LR multiplier, and optimizer param digest.
+    """Persist data iterator progress, token accounting, and optimizer state metadata.
 
     :param Path checkpoint_dir: Checkpoint directory.
     :param int consumed_micro_batches: Number of consumed micro-batches.
+    :param float input_tokens_seen: Global active input tokens processed through this checkpoint.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
     :param str | dict[str, str] | None optimizer_param_digest: SHA-256 prefix digest(s) of trainable param names.
     :param int | None global_step: Committed optimizer step at checkpoint save time.
@@ -541,6 +548,7 @@ def _save_checkpoint_data_progress(
     """
     payload: dict[str, Any] = {
         "consumed_micro_batches": int(max(0, consumed_micro_batches)),
+        "input_tokens_seen": float(max(0.0, input_tokens_seen)),
         "lr_mult": float(lr_mult),
     }
     if optimizer_param_digest is not None:
@@ -561,6 +569,7 @@ def _save_training_checkpoint(
     checkpoint_dir: Path,
     output_dir: Path,
     consumed_micro_batches: int,
+    input_tokens_seen: float,
     save_total_limit: int,
     log_label: str,
     lr_mult: float = 1.0,
@@ -574,6 +583,7 @@ def _save_training_checkpoint(
     :param Path checkpoint_dir: Destination checkpoint directory.
     :param Path output_dir: Parent output directory for checkpoint rotation.
     :param int consumed_micro_batches: Data progress to persist.
+    :param float input_tokens_seen: Global active input tokens processed through this checkpoint.
     :param int save_total_limit: Number of checkpoints to retain.
     :param str log_label: Logging label for this save.
     :param float lr_mult: Persistent nonfinite recovery LR multiplier.
@@ -606,6 +616,7 @@ def _save_training_checkpoint(
             _save_checkpoint_data_progress(
                 checkpoint_dir=staging_dir,
                 consumed_micro_batches=consumed_micro_batches,
+                input_tokens_seen=input_tokens_seen,
                 lr_mult=float(lr_mult),
                 optimizer_param_digest=optimizer_param_digest,
                 global_step=global_step,

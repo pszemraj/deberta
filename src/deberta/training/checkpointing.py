@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from deberta.config import TrainConfig
+from deberta.training.loop_utils import _sum_local_scalar
 from deberta.training.run_management import _save_training_checkpoint
 
 
@@ -57,6 +58,8 @@ def _save_periodic_checkpoint_if_due(
     output_dir: Path,
     global_step: int,
     consumed_micro_batches_committed: int,
+    local_input_tokens_seen: float,
+    resumed_input_tokens_seen: float,
     lr_mult: float,
     optimizer_param_digest: str | dict[str, str],
     gradient_accumulation_steps: int,
@@ -69,6 +72,8 @@ def _save_periodic_checkpoint_if_due(
     :param Path output_dir: Output directory containing checkpoints.
     :param int global_step: Current global step.
     :param int consumed_micro_batches_committed: Committed micro-batch progress.
+    :param float local_input_tokens_seen: Active input tokens processed by this rank since startup.
+    :param float resumed_input_tokens_seen: Global active input tokens restored from the checkpoint.
     :param float lr_mult: Persistent recovery LR multiplier.
     :param str | dict[str, str] optimizer_param_digest: Trainable-parameter digest payload.
     :param int gradient_accumulation_steps: Active accumulation steps.
@@ -78,12 +83,17 @@ def _save_periodic_checkpoint_if_due(
     if not train_cfg.checkpoint.save_steps or (global_step % int(train_cfg.checkpoint.save_steps) != 0):
         return int(last_saved_step)
 
+    input_tokens_seen = float(resumed_input_tokens_seen) + _sum_local_scalar(
+        accelerator=accelerator,
+        x=local_input_tokens_seen,
+    )
     ckpt_dir = output_dir / f"checkpoint-{int(global_step)}"
     _save_training_checkpoint(
         accelerator=accelerator,
         checkpoint_dir=ckpt_dir,
         output_dir=output_dir,
         consumed_micro_batches=consumed_micro_batches_committed,
+        input_tokens_seen=input_tokens_seen,
         save_total_limit=int(train_cfg.checkpoint.save_total_limit),
         log_label="periodic",
         lr_mult=float(lr_mult),

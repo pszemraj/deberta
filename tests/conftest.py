@@ -36,6 +36,7 @@ def mock_checkpoint(tmp_path: Path):
                 global_step = 0
             payload: dict[str, Any] = {
                 "consumed_micro_batches": int(consumed_micro_batches),
+                "input_tokens_seen": 0.0,
                 "global_step": global_step,
                 "gradient_accumulation_steps": 1,
                 "optimizer_param_digest": {

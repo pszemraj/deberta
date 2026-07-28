@@ -580,16 +580,23 @@ def test_checkpoint_data_progress_roundtrip_without_optimizer_digest(tmp_path: P
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir(parents=True, exist_ok=True)
 
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
+    consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
     assert consumed is None
     assert lr_mult == 1.0
     assert digest is None
+    assert input_tokens_seen is None
 
-    _save_checkpoint_data_progress(checkpoint_dir=ckpt, consumed_micro_batches=123, lr_mult=0.25)
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
+    _save_checkpoint_data_progress(
+        checkpoint_dir=ckpt,
+        consumed_micro_batches=123,
+        input_tokens_seen=456.0,
+        lr_mult=0.25,
+    )
+    consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 123
     assert abs(lr_mult - 0.25) < 1e-9
     assert digest is None  # no digest was saved
+    assert input_tokens_seen == 456.0
 
 
 @pytest.mark.parametrize(
@@ -612,18 +619,22 @@ def test_checkpoint_data_progress_roundtrip_with_optimizer_digest(
     _save_checkpoint_data_progress(
         checkpoint_dir=ckpt,
         consumed_micro_batches=77,
+        input_tokens_seen=987.0,
         lr_mult=0.75,
         optimizer_param_digest=optimizer_param_digest,
         global_step=9,
         gradient_accumulation_steps=3,
     )
-    consumed, saved_lr_mult, digest, saved_step, saved_ga = _load_checkpoint_progress_metadata(ckpt)
+    consumed, saved_lr_mult, digest, saved_step, saved_ga, input_tokens_seen = (
+        _load_checkpoint_progress_metadata(ckpt)
+    )
     assert consumed == 77
     assert saved_lr_mult == pytest.approx(0.75)
     assert isinstance(digest, dict) is isinstance(optimizer_param_digest, dict)
     assert digest == optimizer_param_digest
     assert saved_step == 9
     assert saved_ga == 3
+    assert input_tokens_seen == 987.0
 
 
 def test_load_checkpoint_progress_metadata_warns_on_invalid_json(
@@ -634,11 +645,12 @@ def test_load_checkpoint_progress_metadata_warns_on_invalid_json(
     (ckpt / "data_state.json").write_text('{"consumed_micro_batches": ', encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
+        consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
 
     assert consumed is None
     assert lr_mult == 1.0
     assert digest is None
+    assert input_tokens_seen is None
     assert any("invalid data_state.json" in record.message for record in caplog.records)
 
 
@@ -768,13 +780,15 @@ def test_save_training_checkpoint_persists_optimizer_digest(
         checkpoint_dir=ckpt,
         output_dir=out,
         consumed_micro_batches=10,
+        input_tokens_seen=100.0,
         save_total_limit=3,
         log_label="test",
         optimizer_param_digest=optimizer_param_digest,
     )
-    _, _, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
+    _, _, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
     assert isinstance(digest, dict) is isinstance(optimizer_param_digest, dict)
     assert digest == optimizer_param_digest
+    assert input_tokens_seen == 100.0
 
 
 def test_canonical_compile_state_key_strips_orig_mod_segments() -> None:

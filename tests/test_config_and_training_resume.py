@@ -299,6 +299,82 @@ def test_run_pretraining_logs_window_averaged_rtd_metrics(
     assert "pos=0.6667" in caplog.text
 
 
+def test_run_pretraining_resume_preserves_input_token_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_checkpoint,
+) -> None:
+    run_dir = tmp_path / "run"
+    checkpoint_dir = mock_checkpoint(
+        root=run_dir,
+        name="checkpoint-1",
+        consumed_micro_batches=0,
+        data_state_extra={
+            "input_tokens_seen": 40.0,
+            "optimizer_param_digest": "test-param-order",
+        },
+    )
+    saved_checkpoints: list[dict[str, Any]] = []
+    pretrain_mod = setup_pretraining_mocks(
+        monkeypatch,
+        accelerator_cls=FakeAccelerator,
+        save_checkpoint_fn=lambda **kwargs: saved_checkpoints.append(dict(kwargs)),
+    )
+    model_cfg = make_model_config()
+    data_cfg = make_data_config(source={"dataset_name": "hf-internal-testing/librispeech_asr_dummy"})
+    train_cfg = make_train_config(
+        checkpoint={
+            "output_dir": str(run_dir),
+            "save_steps": 0,
+            "export_hf_final": False,
+            "resume_from_checkpoint": str(checkpoint_dir),
+        },
+        max_steps=2,
+        mixed_precision="no",
+        tf32=False,
+        dataloader={"num_workers": 0},
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        token_weighted_gradient_accumulation=False,
+        decoupled_training=False,
+        compile={"enabled": False},
+    )
+    optim_cfg = make_optim_config(scheduler={"type": "constant"})
+    logging_cfg = make_logging_config(
+        output_dir=str(run_dir),
+        wandb={"enabled": True, "watch": "none"},
+        logging_steps=1,
+    )
+    source_train_cfg = dataclasses.replace(
+        train_cfg,
+        checkpoint=dataclasses.replace(train_cfg.checkpoint, resume_from_checkpoint=None),
+    )
+    _persist_or_validate_run_configs(
+        output_dir=run_dir,
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=source_train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+        resume_checkpoint=None,
+        is_main_process=True,
+    )
+
+    pretrain_mod.run_pretraining(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        train_cfg=train_cfg,
+        optim_cfg=optim_cfg,
+        logging_cfg=logging_cfg,
+    )
+
+    accel = FakeAccelerator.last_instance
+    assert accel is not None
+    step_rows = [row for row, step in accel.logged_rows if int(step or -1) == 2]
+    assert step_rows[-1]["input_tokens_seen"] == 44.0
+    assert saved_checkpoints[-1]["input_tokens_seen"] == 44.0
+
+
 def test_run_pretraining_keeps_resolved_yaml_roundtrippable_for_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1930,6 +2006,7 @@ def test_save_training_checkpoint_calls_collective_save_on_non_main_rank(tmp_pat
         checkpoint_dir=ckpt,
         output_dir=out,
         consumed_micro_batches=7,
+        input_tokens_seen=28.0,
         save_total_limit=3,
         log_label="periodic",
     )
@@ -1953,6 +2030,7 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
         checkpoint_dir=ckpt,
         output_dir=out,
         consumed_micro_batches=42,
+        input_tokens_seen=168.0,
         save_total_limit=3,
         log_label="final",
     )
@@ -1961,10 +2039,11 @@ def test_save_training_checkpoint_writes_data_progress_on_main_rank(tmp_path: Pa
     staged = Path(str(accel.calls["save_state"][0]))
     assert staged.parent == out
     assert staged.name.startswith(f".{ckpt.name}.tmp-")
-    consumed, lr_mult, digest, _, _ = _load_checkpoint_progress_metadata(ckpt)
+    consumed, lr_mult, digest, _, _, input_tokens_seen = _load_checkpoint_progress_metadata(ckpt)
     assert consumed == 42
     assert lr_mult == 1.0
     assert digest is None  # no digest passed
+    assert input_tokens_seen == 168.0
     assert (ckpt / ".complete").exists()
 
 
@@ -1982,6 +2061,7 @@ def test_save_training_checkpoint_rejects_overwrite_of_nonempty_checkpoint_dir(t
             checkpoint_dir=ckpt,
             output_dir=out,
             consumed_micro_batches=1,
+            input_tokens_seen=4.0,
             save_total_limit=2,
             log_label="periodic",
         )
@@ -2006,6 +2086,7 @@ def test_save_training_checkpoint_rotates_only_after_postsave_validation(tmp_pat
         checkpoint_dir=new_ckpt,
         output_dir=out,
         consumed_micro_batches=2,
+        input_tokens_seen=8.0,
         save_total_limit=1,
         log_label="periodic",
     )
@@ -2035,6 +2116,7 @@ def test_save_training_checkpoint_skips_rotation_when_new_checkpoint_weights_inv
             checkpoint_dir=new_ckpt,
             output_dir=out,
             consumed_micro_batches=2,
+            input_tokens_seen=8.0,
             save_total_limit=1,
             log_label="periodic",
         )
